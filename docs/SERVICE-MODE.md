@@ -47,6 +47,36 @@ lmer chat \
   --checkout ~/myapp
 ```
 
+## Unexpected checkout state
+
+Startup and the lightweight review-followup entry files share
+`service-checkout.jinja2`. The external `develop/followup.txt` and
+`followup/followup.txt` include it before applying review fixes, plus the shared
+commit guidance. Followup retains its existing review instructions and does not
+repeat full branch setup or the complete service environment guide. The
+companion taskdef patch remains unapplied until coordinated distribution.
+
+Before changing branches or files or starting validation, the agent inspects
+the supplied checkout's branch and changes against its task and recorded run
+context. Unexpected pre-existing changes, or a branch that appears to belong
+to another issue, require a stop: report the service/group, branch and
+unexpected state through `lmer-signal ask`, preserve the environment, and wait
+for the operator or orchestrator to resolve it. Often the supplied service
+environment has simply not been reset after a previous task.
+
+The agent must not work around this condition by creating or switching
+worktrees, switching branches, stashing, resetting, discarding, cleaning up or
+otherwise repairing the environment itself. This rule precedes the task's
+branch-setup instructions. The operator may explicitly authorize a specific
+remedy after seeing the blocker.
+
+This is an instruction for the agent's decision-making, not an automatic
+classification of Git status. Changes owned by the current run, known
+provisioned local instructions and ignored files are normal; they must not
+cause repeated stops. A clean, appropriate service checkout remains usable.
+The rule applies to service mode; test runners and non-service workflows are
+unchanged.
+
 ## How It Works
 
 ### Container Resolution
@@ -203,16 +233,16 @@ lmer chat --service web --checkout ~/project/dev-env --match-uid ...
 
 ## Service groups: one session, a whole stack
 
-`--service` binds a session to one container. A stack that runs as a unit — the
-fullctl suite is 12+ containers, all up together — would need twelve sessions
-that way, one per service. `--service-group <compose-project>` attaches **one**
+`--service` binds a session to one container. A stack of twelve containers running
+as a unit would need twelve sessions that way, one per service.
+`--service-group <compose-project>` attaches **one**
 session to the whole project instead, and the agent moves its target around
 inside it:
 
 ```bash
 lmer chat \
-  --service-group fullctl \
-  --checkout ~/fullctl/dev-env
+  --service-group example-stack \
+  --checkout ~/example-stack/dev-env
 ```
 
 ### The group is discovered, not declared
@@ -339,22 +369,73 @@ whatever slot name that session claimed. Without it, fixing an unusable slot's
 preset while a session runs under a different slot on the same service would
 hand the fixed slot a service already in use.
 
-**Two operational preconditions**, both easy to miss:
+**One operational precondition**, easy to miss:
 
-- **`slots` is read when the daemon starts.** `config.json` is resolved once at
-  boot, so a slot you add to a running platform is invisible until you restart
-  it. Fixes to the *presets* file stay hot — which is what makes the
-  `misconfigured` row below recoverable without touching `config.json`.
 - **The daemon's own environment must set `LMER_PRESETS_FILE`.** It is read
   where the daemon runs, not where `lmer` runs. Without it no presets load at
   all and every slot reports so by name — a daemon started from systemd or a
   fresh shell is the usual way to hit this, while `lmer --preset X` keeps
   working fine in your terminal.
 
+`slots` is re-read from `config.json` on every fleet poll and at every spawn, so
+a slot added to a running platform shows up on the next poll and nothing has to
+be restarted. Fixes to the *presets* file are hot in the same way, which is what
+makes the `misconfigured` row below recoverable.
+
 A slot points at a **preset** rather than spelling out the service and
 checkout itself. That keeps host paths in the presets file — the one place
 they already live — and makes occupying a slot and running in service mode the
 same act rather than two settings that have to agree.
+
+### Editing them from the fleet view
+
+The fleet view's **service slots** section edits this list, so declaring a slot
+does not mean opening `config.json` on the host (issue #256). *add slot* declares
+one; the pencil on a row edits or removes it.
+
+Three things the editor does that the file cannot:
+
+- **It shows the verdict before the save.** Every keystroke asks the daemon what
+  the row *would* say — the same resolution the fleet payload runs — so an
+  unknown preset, a preset that sets no service, or a service another slot has
+  already bound is a sentence in the form rather than a broken row afterwards.
+- **The preset is picked from this host's own list**, and a name that is not on
+  it is refused. Presets themselves are deliberately not editable here: they
+  carry host paths, which is exactly what slots keep out of `config.json`. When
+  no presets load at all the refusal says so and names `LMER_PRESETS_FILE`.
+- **It refuses to change things under a running agent.** Removing a slot a live
+  session holds, or re-pointing it at another preset, takes a second, explicit
+  press after the daemon has said who is in it. A description is not gated, and
+  neither is the preview — you can always see what a change *would* do before
+  deciding whether to confirm it.
+
+Editing is a read-modify-write of the file as it is at write time: other keys in
+`config.json` are untouched, so are the slots you are not editing, and so are
+keys a newer build wrote. Each save carries the version the row was read at — the
+version the dialog *opened* at, not the one the last poll delivered — so if the
+entry changed in between (you edited the file, or another operator saved first)
+the save is refused and the view reloads rather than overwriting it. The dialog
+says so as soon as it notices, rather than waiting for the refusal.
+
+If `config.json` cannot be read at all — saved mid-edit, or carrying a `schema`
+a newer build wrote — the fleet view says so instead of showing a host with no
+slots, and the editor says the same thing whether you are previewing a change or
+saving one: nothing is written over a file that could not be read. Resolve it on
+the host.
+
+Three things stay file-only:
+
+- **Renaming** a slot is remove-then-declare: the name is what a running session
+  recorded, so it is not something an edit can move underneath it.
+- A **name that is not a single path segment** — one containing `/`, or `.` or
+  `..` — cannot be declared from the editor, because the edit and remove
+  requests carry the name in the URL. Such a name still works for spawning if it
+  is already in your file; changing it is a file edit.
+- An entry that is **malformed** enough that it never becomes a row (no `name`,
+  no `preset`) has nothing to edit from; the daemon's log names it and the file
+  is where it is fixed. A **duplicate name** is different: the first usable entry
+  is a row like any other, and removing it removes *every* entry carrying that
+  name, so the name is gone rather than falling through to the shadow.
 
 ### Spawning into one
 
@@ -388,7 +469,7 @@ release verb because there is nothing to release.
 | `free` | nothing holds it and its service is running | — |
 | `in use` | a live session holds it; the row links to that run | wait, or use another slot |
 | `service not running` | the definition is fine, the dev service is not up | start the stack |
-| `misconfigured` | see below | fix the presets file — the slot recovers without a config edit |
+| `misconfigured` | see below | fix the presets file — the slot recovers without a config edit — or re-point the slot from the fleet view |
 
 A slot is `misconfigured` when:
 

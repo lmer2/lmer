@@ -57,6 +57,13 @@ identity up front and tracks the run before the container has committed anything
 Without that, a session's first minutes — precisely when someone is watching —
 would show a row with no identity.
 
+One step sits between the URL and the parse, for the project that is reachable at
+more than one remote (D8): the launch URL is folded to that project's PRIMARY
+remote first (:func:`derive_repo_identity`), because that is what the record's
+directory is listed under. Without the fold a launch through a mirror was tracked
+under one identity and listed under another — one directory, two keys, and an
+adoption picker offering back a run this orchestrator had just started.
+
 Which repo URL, though, is a question with four answers, and the last two are why
 ``lmer develop <MR-url>`` needs no repo flag on the command line: **the target
 usually contains the repository**. So a spawn that was handed no URL and has no
@@ -121,17 +128,21 @@ import os
 import pty
 import secrets
 import shutil
+import signal
 import subprocess
+import sys
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from urllib.parse import urlparse
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.container.sources import url_has_embedded_credential
+from lmer_cli.env_sources import env_with_overrides
 from lmer_cli.harness import HARNESSES, known_harnesses
 from lmer_cli.mounts import (
     # Imported rather than restated: credential staging (there) and the
@@ -151,21 +162,34 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, memory, meta, registry, runs, slots, uploads
-from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
+from . import (
+    ask, codex_config, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
+)
+from .config import (
+    assistant_resource_settings,
+    terminal_settings,
+    ENV_REPO_URL,
+    PlatformConfig,
+    configured_repo_url,
+    with_stored_slots,
+)
 from .store import StoreError, append_event, logs_dir, utc_now_iso
+from .thread_targets import validate_thread_targets
 from . import store
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.spawn")
 
 __all__ = [
-    "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied",
+    "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied", "ThreadHeld",
     "live_session_for_run",
-    "SpawnRequest", "SpawnResult", "ANSWER_FLAG",
+    "SpawnRequest", "SpawnResult", "ANSWER_FLAG", "SESSION_FLAG",
     "wait_for_exit_recorded",
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
-    "resolve_lmer_bin", "derive_run_identity", "spawn_session", "log_path_for",
+    "resolve_lmer_bin", "derive_run_identity", "derive_repo_identity",
+    "spawn_session", "log_path_for",
     "token_file_for", "read_control_token", "transcript_dir_for", "ask_dir_for",
+    "status_dir_for",
     "upload_dir_for",
     "container_log_dir_for", "container_log_path_for",
 ]
@@ -192,6 +216,19 @@ _PORT_PICK_ATTEMPTS = 8
 #: :mod:`lmer_platform.answer` because this module both emits it and refuses it in
 #: ``extra_args``; that module re-exports it.
 ANSWER_FLAG = "--answer"
+
+#: The flag ``lmer`` takes the session's own record from, spelled by
+#: :func:`_build_command` from :attr:`SpawnRequest.session_id`. Host-side it
+#: becomes the container's ``LMER_SESSION_ID``, which is the single thing that
+#: decides which ``<project>/_runs/<slug>/<session-id>[--<name>]/`` the launch
+#: writes its record in (spec D22): the container mints one at startup only when
+#: the host injected none, so injecting is how a resume or an answer continues
+#: the record it just read instead of opening a fresh one beside it.
+#:
+#: Reserved in ``extra_args`` for the reason :data:`ANSWER_FLAG` is — it belongs
+#: to verbs that check before they spawn — and emitted from a typed field for
+#: the same reason: which record a session lands in is not caller text.
+SESSION_FLAG = "--session"
 
 #: The flag ``lmer`` selects a named startup preset with, spelled by
 #: :func:`_build_command` from :attr:`SpawnRequest.preset`. The name is resolved
@@ -229,6 +266,22 @@ MODEL_FLAG = "--model"
 #: fleet view and every post-mortem naming a harness the session never ran.
 HARNESS_FLAG = "--harness"
 
+#: The two ``lmer`` flags carrying the supervising assistant's own container
+#: allocation (issue #453), spelled by :func:`_assistant_resource_flags` from
+#: ``LMER_PLATFORM_ASSISTANT_MEMORY`` / ``_CPUS``. Flags rather than environment
+#: because the daemon's own environment is what a spawned session inherits: a
+#: worker default exported there would be indistinguishable from the
+#: assistant's setting, and a preset's env could shadow either.
+MEMORY_FLAG = "--memory"
+CPUS_FLAG = "--cpus"
+
+#: How ``lmer`` is told that something else runs the connectors for its thread
+#: targets. Emitted whenever this module passes thread permalinks: the daemon
+#: runs one connector process per (session, thread) so a connection can be made
+#: and broken while the session runs, and two hosts for one thread would mean two
+#: subscribers on the bus and two copies of every reply in the thread (#412).
+NO_THREAD_CONNECTORS_FLAG = "--no-thread-connectors"
+
 #: How ``lmer`` is told a session deliberately has no repository (spec D17).
 #: Passed in the child's environment rather than as a flag because that is where
 #: ``lmer`` reads it — the host CLI skips repo resolution on it and the
@@ -243,8 +296,10 @@ NO_REPO_ENV = "LMER_NO_REPO"
 #: rather than a caller mistake, hence a refusal rather than a note in the docs.
 #: The first four would move, weaken or delete the control plane the session's
 #: registry entry advertises, leaving an entry that promises a session nobody can
-#: drive; the fifth belongs to a verb that validates before it spawns; the last
-#: three are flags this module emits itself, from typed fields, and records.
+#: drive; the next two belong to verbs that validate before they spawn; the four
+#: after those are flags this module emits itself, from typed fields, and
+#: records; the last two are the assistant's resource bounds, emitted here from
+#: the environment for one session kind.
 _RESERVED_ARGS = (
     # Would replace the token minted here and written 0600, so the entry's
     # token_ref would stop opening anything.
@@ -269,7 +324,19 @@ _RESERVED_ARGS = (
     # through here: it sets SpawnRequest.answer, which is a typed field rather
     # than caller-shaped argv.
     ANSWER_FLAG,
-    # The last four are reserved for a different reason from the rest, and it
+    # Which record the session writes in (spec D22): the container takes this as
+    # its LMER_SESSION_ID, and the record is the whole of what a run *is* in
+    # schema form. The platform emits it from a typed field, but the reason it is
+    # reserved is the answer flag's rather than the recording one below — argv is
+    # last-wins, so a second spelling in extra_args beats the platform's and
+    # points the session at a record it never checked. That is exactly what
+    # lmer_platform.resume and lmer_platform.answer refuse before they spawn: a
+    # session that lands in another run's record applies its answer where no
+    # question was asked, or claims a launch a live container is already writing.
+    # A raw POST /api/sessions must not be able to do from argv what those verbs
+    # will not do from a request body.
+    SESSION_FLAG,
+    # The next four are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
     # four, from typed fields, and writes what it emitted into the registry
     # entry (``task.preset`` / ``task.agents`` / ``task.model`` /
@@ -299,6 +366,14 @@ _RESERVED_ARGS = (
     # "codex"]}`` runs codex while the entry, the fleet view and every
     # post-mortem say claude.
     HARNESS_FLAG,
+    # The assistant's own allocation (issue #453). Emitted here from the
+    # environment for kind="assistant" and for nothing else, so a second
+    # spelling in extra_args would win over it by the same last-wins rule — and
+    # a worker could hand itself a bound the operator never configured, since
+    # extra_args comes verbatim from the POST /api/sessions body. Resource
+    # overrides per spawn are deliberately not a request field.
+    MEMORY_FLAG,
+    CPUS_FLAG,
 )
 
 
@@ -317,6 +392,14 @@ class RunAlreadyLive(SpawnError):
     :class:`CapacityError` is: the request was well formed and the same request
     will work once that session stops, so it is a 409 rather than the 400 a bare
     ``SpawnError`` means.
+    """
+
+
+class ThreadHeld(SpawnError):
+    """A launch target is a chat thread another live session already holds.
+
+    Its own class because the route answers it 409 rather than 400: the request
+    is well formed and works once the holding session lets the thread go.
     """
 
 
@@ -399,13 +482,79 @@ def _reject_option_value(name: str, value: str) -> None:
     *hijack* — this one cannot succeed rather than succeeding as something else —
     but the same reachability: ``POST /api/sessions`` takes every one of those
     fields verbatim from the request body.
+
+    :attr:`SpawnRequest.session_id` comes here too although :func:`_build_command`
+    spells it as one ``--session=<id>`` token, which argparse *does* read as a
+    value. That is the reason to check rather than a reason not to: the ``=``
+    spelling means nothing would stop ``--session=-x`` on the way through, and a
+    record directory named after a flag is not one this platform will point a
+    session at. Every field the platform emits gets the same answer, so which one
+    is refused does not depend on how it happened to be spelled.
     """
     if value.startswith("-"):
         raise SpawnError(
             f"{name} may not begin with a dash ({value!r}): it is passed to "
             "`lmer` as the argument of a flag, and argparse reads a dash-leading "
-            "value as the next option instead — the child would exit 2 with "
-            '"expected one argument" rather than starting a session'
+            "value as the next option instead — a two-token flag exits 2 with "
+            '"expected one argument" rather than starting a session, and the '
+            "one-token `=` spelling that survives that is no reason to let a "
+            "value shaped like a flag through"
+        )
+
+
+def _reject_unsafe_session_id(session_id: str) -> None:
+    """Refuse a session id that is not one directory name.
+
+    :attr:`SpawnRequest.session_id` becomes the container's ``LMER_SESSION_ID``,
+    and the container joins that under the run's grouping dir to make the record
+    it writes: ``<project>/_runs/<slug>/<session-id>/``
+    (``work_repo.run_state._creation_address``, spec D22). So the whole value has
+    to be usable as a single path segment — a ``/`` would put the record in
+    another run's group or outside the run area entirely, ``..`` would walk out
+    of the work repo, ``.`` would make the grouping level itself the record (the
+    one level D22 keeps empty), and a NUL is not a name any filesystem takes.
+
+    Refused rather than sanitised, and refused here rather than left to the
+    container: the value decides where a whole run record lands, and a spawn that
+    quietly wrote in a neighbouring record is the failure the resume and answer
+    verbs check against before they get this far. This is the floor under both,
+    the way :func:`_reject_unsafe_taskdef` is for the run dir's own name.
+
+    A glob character and surrounding whitespace are refused for a second reason,
+    and it is the one that makes this reachable. The value is emitted as
+    ``lmer --session``, and the host CLI refuses exactly those
+    (``lmer_cli.cli._session_id_refusal``: whitespace is not stripped, because
+    rewriting an id sends the launch to a directory nobody named). Without them
+    here the platform would emit a value its own child rejects — and by then the
+    port is drawn, the token minted, the entry registered and the run tracked, so
+    the operator sees an accepted spawn that exits 2, which is precisely what the
+    validation loop below exists to prevent. Nor is it hypothetical: session dirs
+    are named by whatever created them, :func:`lmer_platform.workrepo.
+    record_session_id` deliberately answers with an out-of-form name so the
+    operator can continue a record the fleet view is showing them, and nothing
+    stops a directory called ``2026*``.
+
+    A dot-leading id cannot arrive from :func:`lmer_platform.workrepo.
+    record_session_id` at all — it names a directory taken out of
+    :func:`_sessions_in`, which excludes dot-children — so this clause is the
+    floor holding rather than a case being caught. It is here because the floor
+    has to stay at least as strict as the host's: a rule that admits what
+    ``lmer --session`` refuses is a spawn that registers and then dies as the
+    child's exit 2.
+    """
+    if (
+        session_id in (".", "..")
+        or session_id != session_id.strip()
+        or session_id.startswith(".")
+        or any(bad in session_id for bad in ("/", "\\", "\x00"))
+        or any(char in session_id for char in "*?[")
+    ):
+        raise SpawnError(
+            f"session_id is not a usable directory name ({session_id!r}): it "
+            "names one launch inside the run's group, never a path or a "
+            "pattern — the container joins it under _runs/<slug>/ to make the "
+            "record this session writes in, and `lmer --session` refuses the "
+            "same shapes at the other end"
         )
 
 
@@ -439,6 +588,16 @@ class SpawnRequest:
     question to answer first. That is why ``--answer`` is refused in
     ``extra_args`` (see :data:`_RESERVED_ARGS`) while this field is not — the
     difference between the two is the validation, not the argv.
+
+    ``session_id`` is typed for the same reason as ``answer`` rather than the one
+    below: it says which ``<project>/_runs/<slug>/<session-id>/`` record the
+    session writes in (spec D22), so it decides where a whole run record lands.
+    :mod:`lmer_platform.resume` and :mod:`lmer_platform.answer` fill it with the
+    record they resolved and checked; ``--session`` is refused in ``extra_args``
+    because caller text there would win by being later in argv and point a
+    session at a record nothing checked. ``None`` is the ordinary spawn, which
+    founds a launch rather than continuing one — the container mints its own id
+    and that is exactly right.
 
     ``preset``, ``agents`` and ``model`` are typed for a related but distinct
     reason. All three *are* filled from the HTTP body, so the difference is not
@@ -494,6 +653,12 @@ class SpawnRequest:
     ports: int = 0
     extra_args: tuple = ()
     answer: Optional[str] = None
+    #: The work repo record this session must write in (:data:`SESSION_FLAG`) —
+    #: the launch's ``LMER_SESSION_ID``, e.g. ``20260824-165230-2-31245``, and
+    #: never the ``s-…`` id this platform files the *container* session under.
+    #: The two namespaces both get called a session and neither is derived from
+    #: the other (:mod:`lmer_platform.resume`'s module docstring).
+    session_id: Optional[str] = None
     identity_repo_url: Optional[str] = None
     no_repo: bool = False
     #: What this orchestrator files the run under, one line
@@ -510,6 +675,12 @@ class SpawnRequest:
     #: is the slot's *preset* that is emitted, which is what makes occupying a
     #: slot and running in service mode one act rather than two that must agree.
     slot: Optional[str] = None
+    targets: Optional[list[str]] = None
+    #: Threads this run should *know about* without being connected to them
+    #: (issue #414): ``[{"permalink", "title"?}, …]``. Unlike ``targets`` these
+    #: reach no launch argument — the run is told about them once its bus is up.
+    references: Optional[list] = None
+    workspace_id: Optional[str] = None
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -522,6 +693,35 @@ class SpawnRequest:
         _reject_positional_flag("taskdef", self.taskdef)
         _reject_positional_flag("target", self.target)
         _reject_unsafe_taskdef(self.taskdef)
+        if self.targets is not None:
+            try:
+                validate_thread_targets(self.targets)
+            except ValueError as exc:
+                raise SpawnError(f"targets: {exc}") from exc
+        if self.references is not None:
+            # Shape here, thread-hood in `references.add`.
+            if not isinstance(self.references, list):
+                raise SpawnError("references: must be a list of {permalink, title?}")
+            for item in self.references:
+                if not isinstance(item, dict) or not item.get("permalink"):
+                    raise SpawnError(
+                        "references: each entry is an object naming a permalink"
+                    )
+            try:
+                validate_thread_targets(
+                    [item.get("permalink") for item in self.references]
+                )
+            except ValueError as exc:
+                raise SpawnError(f"references: {exc}") from exc
+            # The title too, before the container starts: a refusal after it is
+            # up can only be logged.
+            from . import references as run_references
+
+            for item in self.references:
+                try:
+                    run_references.checked_title(item.get("title"))
+                except run_references.ThreadReferenceError as exc:
+                    raise SpawnError(f"references: {exc}") from None
         if not isinstance(self.ports, int) or isinstance(self.ports, bool) or self.ports < 0:
             raise SpawnError(f"ports must be a non-negative integer, got {self.ports!r}")
         # Not a second copy of the answer path's own checks (length, emptiness
@@ -531,6 +731,16 @@ class SpawnRequest:
             not isinstance(self.answer, str) or not self.answer.strip()
         ):
             raise SpawnError(f"answer must be non-empty text, got {self.answer!r}")
+        # A record's address, so it is checked as one: a blank or a repr would be
+        # spelled behind the ``=`` like any other text, and the container would
+        # take it as the directory to write this run's whole record in.
+        if self.session_id is not None:
+            if not isinstance(self.session_id, str) or not self.session_id.strip():
+                raise SpawnError(
+                    f"session_id must be non-empty text, got {self.session_id!r}"
+                )
+            _reject_option_value("session_id", self.session_id)
+            _reject_unsafe_session_id(self.session_id)
         # The flag *arguments* the platform emits. Absent is the normal case
         # and says nothing; present and unusable is refused here rather than
         # discovered by the child, which can only report it by exiting 2 — after
@@ -607,6 +817,20 @@ class SpawnResult:
     control_host: str = _CONTROL_HOST
     control_port: Optional[int] = None
     warning: Optional[str] = None
+    model: Optional[str] = None
+
+    def launch_settings(self) -> dict:
+        """Read available launch facts without delaying the spawn acknowledgement."""
+        try:
+            payload = json.loads(ports_file_for(self.session_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "model": self.model or _reported_model(payload),
+            "effort": _reported_effort(payload),
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -623,6 +847,7 @@ class SpawnResult:
             # named by the entry's ``control.token_ref`` — see read_control_token.
             "control": {"host": self.control_host, "port": self.control_port},
             "command": self.command,
+            **self.launch_settings(),
         }
 
 
@@ -647,22 +872,60 @@ def resolve_lmer_bin(config: PlatformConfig) -> str:
 
 
 def derive_run_identity(
-    request: SpawnRequest, repo_url: Optional[str]
+    request: SpawnRequest,
+    repo_url: Optional[str],
+    config: Optional[PlatformConfig] = None,
 ) -> tuple:
     """Predict ``(host, project, slug)`` for the run this spawn will create.
 
     Mirrors what the container itself will compute: the slug from
-    ``run_state.derive_slug`` and the host/project from the repo URL. Returns
-    ``None`` components when the repo URL is absent or unparseable — the session
-    still runs, it just cannot be joined to a run dir until its state is pushed.
+    ``run_state.derive_slug`` and the host/project from the repo URL
+    (:func:`derive_repo_identity`, which is also where the multi-remote fold
+    lives). Returns ``None`` components when the repo URL is absent or
+    unparseable — the session still runs, it just cannot be joined to a run dir
+    until its state is pushed.
 
     The URL is a parameter rather than ``request.repo_url`` because deriving an
     identity from one and recording one as the run's repo are separable; see
     :func:`_repo_urls` for which is which.
     """
     slug = run_state.derive_slug(request.taskdef, request.target)
-    host, project = _parse_repo_url(repo_url or "")
+    host, project = derive_repo_identity(repo_url, config)
     return host, project, slug
+
+
+def derive_repo_identity(
+    repo_url: Optional[str], config: Optional[PlatformConfig] = None
+) -> tuple:
+    """``(host, project)`` the run of a launch at *repo_url* is filed under.
+
+    The URL's own parse, unless the work repo's registry says that URL is a
+    remote of a project it knows — then that project's PRIMARY remote, because
+    the project dir the record lands in is placed across the registry's union
+    (D8) and LISTED under the primary. Deriving from the launch URL verbatim gave
+    one directory two identity keys, one tracked and one listed, which is the
+    defect :func:`lmer_platform.workrepo.primary_remote_identity` sets out in
+    full: the adoption picker offering an already-tracked run, adopting it
+    doubling that run's index row, and :func:`_refuse_if_run_is_live` not seeing
+    two launches through two remotes as one run.
+
+    ``(None, None)`` when neither can answer, which is the case
+    :func:`_untracked_run_warning` speaks to — and it stays that case, since the
+    fold is best-effort by construction and never a refusal.
+
+    *config* is how the manifest reaches identity, and it is the smallest thing
+    that could: it names the daemon's own mirror of the work repo (spec D24),
+    which is where the registry already is and which both callers of this pair
+    already hold (:func:`spawn_session`,
+    :func:`lmer_platform.api._work_repo_taskdef_dirs`, which reads the same
+    registry one call later through ``_plexus_project_dir``). No second manifest
+    reader, no new field on :class:`SpawnRequest` for callers to fill in
+    differently, and no ambient lookup a test cannot see. Omitted — a caller
+    deriving an identity with no orchestrator around it — the answer is the URL's
+    own parse, exactly as it was before this existed.
+    """
+    folded = workrepo.primary_remote_identity(config, repo_url)
+    return folded if folded is not None else _parse_repo_url(repo_url or "")
 
 
 def _identity_url_from_target(target: str) -> Optional[str]:
@@ -958,6 +1221,47 @@ def _write_run_meta(
     return None
 
 
+def _write_run_references(
+    request: SpawnRequest, host: str, project: str, slug: str
+) -> Optional[str]:
+    """Attach the spawn's reference threads to the run it just tracked (#414).
+
+    Nothing is connected and nothing is told here: the daemon's own tick tells the
+    run once its bus is up, which is the only moment there is anything to tell.
+
+    A refusal is a warning rather than an exception, for :func:`_write_run_meta`'s
+    reason — by the time this runs the session is up. A warning and not only a log
+    line, because a 201 with nothing said is how the operator's context thread
+    goes missing.
+    """
+    if not request.references:
+        return None
+    from . import references as run_references
+
+    lost = []
+    for item in request.references:
+        try:
+            run_references.add(
+                host, project, slug, item.get("permalink"),
+                title=item.get("title"), by="operator",
+            )
+        except Exception as exc:
+            logger.warning(
+                "platform_spawn_reference_refused host=%s project=%s slug=%s error=%s "
+                "— the run is running, without that reference",
+                host, project, slug, exc,
+            )
+            lost.append(f"{item.get('permalink')} ({exc})")
+    if not lost:
+        return None
+    return (
+        "the run was started and tracked, but "
+        f"{len(lost)} reference thread(s) were not attached to it: {'; '.join(lost)}. "
+        "Add them from the run's thread menu, or with POST "
+        "/api/sessions/{id}/references."
+    )
+
+
 def log_path_for(session_id: str) -> Path:
     """Where the *host-side* tee of a session's PTY lands.
 
@@ -1176,11 +1480,14 @@ def _reserved_session_destinations() -> dict:
         if harness.session_dir
     }
     reserved.update({
+        _container_dir_key(codex_config.CONTAINER_DIR): "the run's Codex configuration",
         _container_dir_key("/workspace"): "the session's workspace",
         _container_dir_key("/Agents/global"): "the agent-files tree",
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
         _container_dir_key(uploads.CONTAINER_UPLOADS_DIR):
             "the session's chat upload store",
+        _container_dir_key(statusline.CONTAINER_STATUS_DIR):
+            "the session's status document",
         _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
         _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
         _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
@@ -1478,6 +1785,36 @@ def _ask_mount_flags(directory: Path) -> list:
     return ["--mount-dir", f"{directory}:{ask.CONTAINER_ASK_DIR}:rw"]
 
 
+def status_dir_for(session_id: str) -> Path:
+    """Host directory a session publishes its status document into (#248).
+
+    Pass-through to :func:`lmer_platform.statusline.session_status_dir`, kept
+    here so the spawn side has one name for every per-session directory it
+    mounts.
+    """
+    return statusline.session_status_dir(session_id)
+
+
+def _prepare_status_dir(session_id: str) -> Optional[Path]:
+    """Create the session's status directory 0700. ``None`` if that failed.
+
+    Fail-soft with an honest far end, as the ask channel is: with no directory
+    the variable is blank too, so the harness publishes nothing rather than
+    writing where nothing reads.
+    """
+    return statusline.prepare_status_dir(session_id)
+
+
+def _status_mount_flags(directory: Path) -> list:
+    """``lmer`` flags that mount *directory* in for the session's status document.
+
+    ``rw`` because the harness rewrites the document on every render. The
+    destination is the same constant the environment variable points at, so the
+    mount and what the writer is told cannot drift apart.
+    """
+    return ["--mount-dir", f"{directory}:{statusline.CONTAINER_STATUS_DIR}:rw"]
+
+
 def upload_dir_for(session_id: str, kind: str) -> Path:
     """Host directory holding the files the operator attaches to this session's
     chat (issue #246).
@@ -1552,6 +1889,149 @@ def _container_log_mount_flags(directory: Path) -> list:
     one fact rather than two that agree today.
     """
     return ["--mount-dir", f"{directory}:{CONTAINER_SESSION_LOG_DIR}:rw"]
+
+
+class SessionChannels(NamedTuple):
+    """What a session's side channels come to, once they are prepared.
+
+    The caller never sees an individual directory, so it cannot grow a rule
+    about one; :attr:`upload_dir` is out only because the registry entry wants
+    it again.
+    """
+
+    #: ``lmer`` flags binding the prepared directories in, in insertion order.
+    host_flags: list
+    #: ``declared:staged`` pairs for the entrypoint's linker (#293).
+    link_pairs: list
+    #: Environment the child needs to know which channels it actually got.
+    env: dict
+    #: The chat-upload store, or ``None`` — read again by the registry entry.
+    upload_dir: Optional[Path]
+
+
+def _prepare_session_channels(session_id: str, kind: str) -> SessionChannels:
+    """Create this session's side-channel directories and say what follows.
+
+    One decision made once per channel: each is prepared, may fail to be, and
+    has to be reflected in three places at once — a mount flag, possibly a link
+    pair, and an environment variable saying whether the agent has the thing.
+
+    A channel that could not be prepared is announced by **blanking** its
+    variable rather than deleting it: the child is ``lmer``, which seeds its own
+    environment from ``.env`` files first-wins, so a merely absent key is one a
+    file may re-supply.
+
+    :attr:`SessionChannels.host_flags` is in insertion order and the caller
+    inserts it **once** — ``_with_host_flags`` puts flags straight after
+    ``--fastapi``, so two calls would interleave them in reverse.
+    """
+    # One subdirectory per harness, so the file the chat view reads outlives the
+    # container (`lmer` runs it --rm). Only for sessions the platform spawns:
+    # persisting every lmer invocation's transcript is a separate decision.
+    transcript_dir = _prepare_transcript_dir(session_id)
+    transcript_mounts = (
+        _prepare_transcript_subdirs(transcript_dir)
+        if transcript_dir is not None
+        else []
+    )
+    # The session's ask channel (T23).
+    ask_dir = _prepare_ask_dir(session_id)
+    # The directory is the offer; the file inside it is the session's answer, and
+    # an image too old to write one (#150) reads as exactly that.
+    container_log_dir = _prepare_container_log_dir(session_id)
+    # One store per *host* (#325). Gated on the kind, not offered as a request
+    # field — a worker's memory has its own route, the work repo.
+    memory_dir = (
+        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
+    )
+    if memory_dir is not None:
+        memory.observe(memory_dir)
+    # Where files attached to this session's chat land (#246). Every session gets
+    # one; the kind decides only which store that is.
+    upload_dir = _prepare_upload_dir(session_id, kind)
+    # Where the session publishes what its own status line shows (#248). Every
+    # session gets one: which harness the child resolves to is decided inside it,
+    # and an unused directory is cheaper than a missing strip.
+    status_dir = _prepare_status_dir(session_id)
+
+    host_flags: list = []
+    if transcript_mounts:
+        host_flags += _transcript_mount_flags(transcript_mounts)
+    if ask_dir is not None:
+        host_flags += _ask_mount_flags(ask_dir)
+    if container_log_dir is not None:
+        host_flags += _container_log_mount_flags(container_log_dir)
+    if memory_dir is not None:
+        host_flags += memory.mount_flags(memory_dir)
+    if upload_dir is not None:
+        host_flags += _upload_mount_flags(upload_dir)
+    if status_dir is not None:
+        host_flags += _status_mount_flags(status_dir)
+
+    # Filtered to mounts actually prepared: a link pair for a directory nothing
+    # bound would have the entrypoint linking a path onto nothing.
+    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
+    link_pairs = [
+        (declared, staged)
+        for declared, staged in _harness_session_links()
+        if staged in mounted_destinations
+    ]
+    if memory_dir is not None:
+        # Staged like a user harness's session dir, and for the same ownership
+        # reason (#293) — see lmer_platform.memory.
+        link_pairs += memory.memory_links()
+
+    env = {
+        # Gates the prompt fragment telling an agent to read files out of a
+        # directory this session may not have got.
+        uploads.UPLOADS_DIR_ENV: (
+            uploads.CONTAINER_UPLOADS_DIR if upload_dir is not None else ""
+        ),
+        # The flag an agent tests to know it was orchestrated at all.
+        ask.ASK_DIR_ENV: ask.CONTAINER_ASK_DIR if ask_dir is not None else "",
+        # A value without the mount would point the harness's writes at a
+        # container-private directory nothing reads (#248).
+        statusline.STATUS_DIR_ENV: (
+            statusline.CONTAINER_STATUS_DIR if status_dir is not None else ""
+        ),
+    }
+    if kind == registry.ASSISTANT_KIND:
+        # Platform-local only (#325), on the kind and not on the memory mount, so
+        # a store that could not be prepared does not reopen the route it
+        # replaces.
+        env[memory.PERSIST_ENV_VAR] = ""
+    return SessionChannels(
+        host_flags=host_flags,
+        link_pairs=link_pairs,
+        env=env,
+        upload_dir=upload_dir,
+    )
+
+
+def _assistant_resource_flags(kind: str) -> list:
+    """``--memory``/``--cpus`` for the supervising assistant, or nothing.
+
+    Keyed on the registry *kind* rather than on the taskdef (issue #453): a
+    worker spawned with the ``orchestrate`` taskdef is not the supervising
+    session, and giving it the assistant's allocation because its taskdef
+    matched would be wrong in exactly the case an operator would never think
+    to check. One assistant exists at a time and this is the one place it is
+    started, so start, rotate and the supervisor's respawn all pass through
+    here.
+
+    An unset or unusable setting contributes no flag, which leaves the launch
+    on the worker ladder — the documented fallback rather than a guess at what
+    the assistant should have.
+    """
+    if kind != registry.ASSISTANT_KIND:
+        return []
+    settings = assistant_resource_settings()
+    flags: list = []
+    for key, flag in (("memory", MEMORY_FLAG), ("cpus", CPUS_FLAG)):
+        value = settings[key].value
+        if value:
+            flags += [flag, str(value)]
+    return flags
 
 
 def _with_host_flags(command: list, flags: list) -> list:
@@ -1653,11 +2133,17 @@ def _reported_harness(payload: dict) -> Optional[str]:
     return harness.strip()
 
 
+def _reported_effort(payload: dict) -> Optional[str]:
+    """The launcher's resolved effort override, absent on older launchers."""
+    effort = payload.get("effort")
+    return effort.strip() if isinstance(effort, str) and effort.strip() else None
+
+
 def absorb_ports(sessions: list) -> list:
     """Fold what running sessions reported about themselves into their entries.
 
-    Three facts today, all from :func:`ports_file_for`: the published port mapping,
-    model and harness the session resolved. Called on the read path because they
+    Facts from :func:`ports_file_for`: the published port mapping, model,
+    harness and effort the session resolved. Called on the read path because they
     appear *after* the spawn returns — ``lmer`` publishes ports while starting the
     container and settles the model just before that, which is strictly later than
     the moment the registry entry is written.
@@ -1688,8 +2174,9 @@ def absorb_ports(sessions: list) -> list:
         # (lmer_platform.inventory), and it stays exactly as its writer left it.
         wants_model = isinstance(task, dict) and not task.get("model")
         wants_harness = isinstance(task, dict) and not task.get("harness")
+        wants_effort = isinstance(task, dict) and not task.get("effort")
         # Nothing left to learn about this session: stop reading its file.
-        if not session_id or not (wants_ports or wants_model or wants_harness):
+        if not session_id or not (wants_ports or wants_model or wants_harness or wants_effort):
             updated.append(entry)
             continue
         path = ports_file_for(session_id)
@@ -1714,7 +2201,8 @@ def absorb_ports(sessions: list) -> list:
             changes["ports"] = ports
         model = _reported_model(payload)
         harness = _reported_harness(payload)
-        if (wants_model and model) or (wants_harness and harness):
+        effort = _reported_effort(payload)
+        if (wants_model and model) or (wants_harness and harness) or (wants_effort and effort):
             # The whole block, because registry.update merges at the top level
             # only; a bare ``{"model": …}`` would drop the taskdef and target the
             # fleet view labels the row with.
@@ -1723,6 +2211,8 @@ def absorb_ports(sessions: list) -> list:
                 resolved["model"] = model
             if wants_harness and harness:
                 resolved["harness"] = harness
+            if wants_effort and effort:
+                resolved["effort"] = effort
             changes["task"] = resolved
         if not changes:
             updated.append(entry)
@@ -1801,6 +2291,7 @@ def _protected_mount_destinations() -> dict:
         for session_dir in _harness_session_dirs().values()
     }
     protected.update({
+        codex_config.CONTAINER_DIR: "the platform persists the run's Codex configuration there",
         ask.CONTAINER_ASK_DIR: (
             "the platform mounts the session's ask channel there, so redirecting "
             "it would send the session's questions somewhere no operator is "
@@ -1817,6 +2308,12 @@ def _protected_mount_destinations() -> dict:
             "session's chat there, so redirecting it would hand a caller's "
             "directory whatever the operator uploads next — and leave the agent "
             "reading files nobody sent it"
+        ),
+        statusline.CONTAINER_STATUS_DIR: (
+            "the session publishes its status line's numbers there and the "
+            "platform reads them off the host side of that mount, so "
+            "redirecting it would leave every strip in the fleet view blank "
+            "for this session while the harness went on publishing"
         ),
     })
     return protected
@@ -1885,6 +2382,8 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     if len(parts) < 2:
         return
     destination = _container_dir_key(parts[1])
+    if destination == codex_config.CONTAINER_DIR + '/config.toml':
+        raise SpawnError(f"{name} may not redirect the run's persistent Codex configuration")
     if _within_staging_area(destination):
         raise SpawnError(
             f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
@@ -1918,6 +2417,11 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     ``extra_args``, which may end in a bare ``--`` handing the rest to the
     container's own command line.
 
+    ``--session=<id>`` takes the same one-token spelling, so that neither the
+    spelling nor :func:`_reject_option_value` is load-bearing on its own: a record
+    name shaped like a flag is refused before it is built, and could not be read
+    as one if it got here.
+
     ``--preset``, ``--agents``, ``--model`` and ``--harness`` stay two tokens
     rather than following that pattern, because they carry *names* rather than
     prose: a preset, agent, model or harness name that begins with a dash is not
@@ -1928,7 +2432,16 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     """
     _reject_reserved_args(request.extra_args)
     cmd = [resolve_lmer_bin(config)]
-    cmd += [request.taskdef, request.target, "--fastapi"]
+    cmd += [request.taskdef, request.target, *(request.targets or []), "--fastapi"]
+    # The thread permalinks stay positional — they are what sets the container's
+    # chat context and what lets a repo-less `chat` session start — but the
+    # connectors for them are the daemon's, so they can be added and removed
+    # while the session runs (issue #412).
+    #
+    # Unconditional: the flag says the host side of this session belongs to
+    # somebody else, which is true of every session this daemon spawns.
+    # docs/COMMS.md §12 has what emitting it only for thread targets cost.
+    cmd += [NO_THREAD_CONNECTORS_FLAG]
     if request.preset:
         cmd += [PRESET_FLAG, request.preset]
     if request.agents:
@@ -1939,6 +2452,8 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
         cmd += [MODEL_FLAG, request.model]
     if request.ports:
         cmd += ["--ports", str(request.ports)]
+    if request.session_id:
+        cmd += [f"{SESSION_FLAG}={request.session_id}"]
     if request.answer:
         cmd += [f"{ANSWER_FLAG}={request.answer}"]
     cmd += [str(arg) for arg in request.extra_args]
@@ -1946,28 +2461,7 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
 
 
 def _live_worker_count() -> int:
-    """How many *worker* sessions are up — what ``max_concurrent_sessions`` bounds.
-
-    The orchestrating assistant is excluded, which is the whole of the operator's
-    decision that it "gets its own slot" (T75): the platform starts one for itself
-    at boot (:class:`lmer_platform.assistant.Supervisor`), so counting it would
-    silently turn a host configured for four sessions into a host that runs three
-    workers and a chat window. The cap is about how much *work* this host can bear;
-    the assistant is the thing that routes the work, and it is one container
-    whether the cap is set to 1 or 40.
-
-    The exclusion is by ``kind`` and therefore runs in both directions, which is
-    what keeps it one rule rather than two: a worker spawn does not see the
-    assistant in the count, and an assistant spawn does not see a previous
-    incarnation whose entry is still live. What stops a *second* assistant is
-    :func:`lmer_platform.assistant.start`, on the strength of the registry (D11),
-    and that is where the refusal belongs — a cap on workers rejecting an
-    assistant would be the same setting meaning two things.
-
-    Read through :data:`lmer_platform.registry.ASSISTANT_KIND` rather than a
-    literal, and from there rather than from :mod:`lmer_platform.assistant`: this
-    module is what spawns the assistant, so importing it would be a cycle.
-    """
+    """Count live workers, including legacy entries without a recorded kind."""
     return sum(
         1 for entry in registry.list_sessions(live_only=True)
         if entry.get("kind") != registry.ASSISTANT_KIND
@@ -2056,6 +2550,31 @@ def _refuse_if_run_is_live(
         f"that session instead (POST /api/sessions/{entry.get('id')}/input), or "
         "wait for it to stop"
     )
+
+
+def _refuse_if_threads_are_held(targets) -> None:
+    """One live session per chat thread, enforced before a spawn creates anything.
+
+    Here for the reason :func:`_refuse_if_run_is_live` is here — every spawn path
+    passes through — and with the same timing: nothing is started, so a refused
+    launch leaves no session, no connection and no line in the thread (issue
+    #413). The rule itself lives in :mod:`lmer_platform.connectors`, which owns
+    the records it is decided from.
+
+    A host with no connectors component checks nothing: it is the daemon that
+    runs them, so there is no fleet for a thread to be held by.
+    """
+    if not targets:
+        return
+    from . import connectors as thread_connectors
+
+    component = thread_connectors.get_connectors()
+    if component is None:
+        return
+    try:
+        component.refuse_held_targets(targets)
+    except thread_connectors.ThreadError as exc:
+        raise ThreadHeld(str(exc)) from None
 
 
 def _claimed_control_ports() -> set:
@@ -2259,16 +2778,18 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
 
     The registry entry is removed only on a clean exit: an entry surviving with a
     dead PID is the crash signal the inventory reads, so leaving it there is the
-    point, not an oversight.
+    point, not an oversight. The kept entry also *records* the bad exit, so a
+    reader can tell an ending this watched from one it never saw
+    (:func:`lmer_platform.inventory._observed_bad_exit`).
 
-    The transcript scrub is the one piece of cleanup that runs on *both* paths.
-    It happens here rather than in :func:`_drain` because it must not start while
-    anything is still appending to the file, and ``Popen.wait`` returning is the
-    signal that the session's own process is gone — see
-    :func:`_scrub_transcripts` for the case that signal does not cover. It is also
-    the *last* thing this function does: recording how a session ended is the job
-    that must not be lost, and cleanup that walks a file the container wrote is
-    the more surprising of the two.
+    Two pieces of cleanup run on *both* paths, last, because recording how a
+    session ended is the job that must not be lost. The transcript scrub happens
+    here rather than in :func:`_drain` because it must not start while anything
+    is still appending, and ``Popen.wait`` returning is the signal that the
+    session's process is gone — see :func:`_scrub_transcripts` for the case that
+    signal does not cover. The status document goes with it: it describes a
+    session that is *rendering*, so even a kept entry gives it no reader, unlike
+    the ports file (:func:`absorb_ports` still folds those facts in).
     """
     try:
         code = process.wait()
@@ -2288,14 +2809,30 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
         # entry is the crash signal, and an entry whose token_ref resolved to
         # nothing would advertise a session as controllable and then deny it.
         registry.remove(session_id)
-        # The ports file has no readers once the session is gone; both *logs* do
-        # (they are the scrollback source), so only the former is cleaned up.
+        # The ports file has no readers once the session has exited cleanly;
+        # both *logs* do (they are the scrollback source), so only the former is
+        # cleaned up. On the crash path it stays: the entry is kept, and
+        # ``absorb_ports`` still reads this file for one.
         try:
             ports_file_for(session_id).unlink()
         except OSError:
             pass
         logger.info("platform_session_exited id=%s code=%s", session_id, code)
     else:
+        # On the entry, not only in the event above: the fleet view reads the
+        # entry, and survival alone cannot say *why* it survived — without this a
+        # wind-down mark would outrank an exit a watcher saw fail. Fail-soft in
+        # the safe direction: losing it costs the label, never the signal.
+        try:
+            registry.update(
+                session_id, exited={"code": code, "clean": False, "at": utc_now_iso()}
+            )
+        except StoreError as exc:
+            logger.warning(
+                "platform_session_exit_unrecorded id=%s error=%s — the entry "
+                "survives as the crash signal, but a wind-down mark on it can no "
+                "longer be told apart from this death", session_id, exc,
+            )
         logger.warning(
             "platform_session_died id=%s code=%s — registry entry kept as the "
             "crash signal", session_id, code,
@@ -2304,6 +2841,8 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     # Outside the branch, because it belongs to both endings: a crashed session's
     # entry is kept deliberately, its raw credentials are not.
     _scrub_transcripts(session_id)
+    # Both endings, for the reason in the docstring.
+    statusline.discard_status_dir(session_id)
 
     # Last, and in a `finally`-like position by construction: everything above is
     # what "the ending has been recorded" means, so signalling earlier would hand
@@ -2338,19 +2877,18 @@ def _claim_slot(
     The probe is uncached here: a poll can afford a stale answer, an action
     taken on one cannot.
 
-    This does **not** make the claim atomic. The occupancy read and the
-    ``registry.register`` that records it are separated by the process start, so
-    two spawns racing for one free slot can both get past — the same
-    read-then-act window :func:`_refuse_if_run_is_live` and the concurrency cap
-    already have, and left open the same way, because closing it means holding a
-    lock across every spawn rather than changing anything about slots. The cost
-    is therefore reported and not prevented:
-    :func:`lmer_platform.slots._held` returns *every* holder, the row says how
-    many there are, and the daemon logs ``slot_double_occupancy``.
+    The caller holds the daemon's launch lock through registration, so another
+    launch cannot pass this occupancy check before the claim becomes visible.
     """
     if request.slot is None:
+        if projects.enabled():
+            return _claim_equivalent_slots(with_stored_slots(config), request)
         return request, None, None, None
 
+    # The file, not the boot-time config (#256): a slot created through the UI
+    # has to be spawnable into without a restart, and both reads below have to
+    # see the same list.
+    config = with_stored_slots(config)
     status = slots.slot_status(config, request.slot, cached=False)
     if status is None:
         declared = [d.name for d in slots.slot_definitions(config)]
@@ -2361,6 +2899,9 @@ def _claim_slot(
                 if declared else " — this host declares no service slots"
             )
         )
+    applicability = status.definition.applicability_reason(request.workspace_id)
+    if applicability:
+        raise SpawnError(f"service slot {request.slot!r}: {applicability}")
     if status.unusable_reason is not None:
         raise SpawnError(
             f"service slot {request.slot!r} is not usable: "
@@ -2407,12 +2948,91 @@ def _claim_slot(
 
     # ``validate`` has already refused a request naming both, so the preset
     # field is empty and this fills it.
+    if projects.enabled():
+        resolved = replace(request, preset=status.definition.preset)
+        try:
+            actual_service, actual_group, _, _ = slots.equivalent_slots(config, resolved)
+        except ServiceError as exc:
+            raise SpawnError(str(exc)) from exc
+        if (actual_service, actual_group) != (status.service, status.service_group):
+            raise SpawnError("A named slot cannot be redirected to another service by extra arguments.")
     return (
         replace(request, preset=status.definition.preset),
         status.service,
         status.service_group,
         members,
     )
+
+
+def _claim_equivalent_slots(config, request):
+    try:
+        service, group, members, matching = slots.equivalent_slots(config, request)
+    except (ValueError, ServiceError) as exc:
+        raise SpawnError(f"Could not resolve service admission: {exc}") from exc
+    for status in matching:
+        reason = status.definition.applicability_reason(request.workspace_id) or status.unusable_reason
+        if reason:
+            raise SpawnError(f"service slot {status.definition.name!r}: {reason}")
+        if status.occupant or status.service_occupants:
+            raise SlotOccupied(f"service slot {status.definition.name!r} is already held")
+        if status.service_down_reason:
+            raise SpawnError(f"service slot {status.definition.name!r}: {status.service_down_reason}")
+    if matching:
+        request = replace(request, slot=matching[0].definition.name)
+    return request, service, group, members
+
+
+_LAUNCH_LOCK = threading.Lock()
+_UNPUBLISHED_TERM_GRACE = 5.0
+
+
+@dataclass
+class _UnpublishedLaunch:
+    process: subprocess.Popen
+    master_fd: Optional[int]
+    token_file: Path
+    session_id: str
+    stopped: bool = False
+
+    def discard(self) -> None:
+        if not self.stopped:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            # The launcher can exit before its runtime child forwards TERM.
+            time.sleep(_UNPUBLISHED_TERM_GRACE)
+            # Keep the leader unreaped until the final group signal: its PID
+            # cannot be reused while we stop descendants that ignored TERM.
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.process.wait()
+            self.stopped = True
+        if self.master_fd is not None:
+            os.close(self.master_fd)
+            self.master_fd = None
+        self.token_file.unlink(missing_ok=True)
+        registry.remove(self.session_id)
+        if registry.session_path(self.session_id).exists():
+            raise StoreError(f"cannot remove unpublished session {self.session_id}")
+        _exit_event(self.session_id).set()
+
+
+_FAILED_PUBLICATIONS: dict[str, _UnpublishedLaunch] = {}
+
+
+def _cleanup_failed_publications() -> None:
+    for session_id, launch in list(_FAILED_PUBLICATIONS.items()):
+        try:
+            launch.discard()
+        except Exception as exc:
+            raise SpawnError(
+                f"cannot clean up unpublished session {session_id} "
+                f"(pid {launch.process.pid}): {exc}; new launches are blocked"
+            ) from exc
+        del _FAILED_PUBLICATIONS[session_id]
 
 
 def spawn_session(
@@ -2423,14 +3043,13 @@ def spawn_session(
     publish_registration: Optional[
         Callable[[Callable[[], None], str, int], None]
     ] = None,
+    refuse_held_targets: bool = True,
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
-    Raises :class:`CapacityError` when the configured concurrency cap is already
-    met — enforced here rather than in the caller so every spawn path (the API, the
-    assistant's own start) is bounded by the same check. The queue that makes
-    waiting graceful is still unbuilt; until then a spawn over cap is simply
-    refused with the numbers in the message.
+    Raises :class:`CapacityError` when a worker launch would exceed the configured
+    worker cap. Enforced here for every worker entry point, including answer and
+    resume; assistant launches use reserved capacity beside that cap.
 
     Raises :class:`SlotOccupied` — or a bare :class:`SpawnError` for a slot that
     is unknown or unusable — when ``request.slot`` names a service slot this
@@ -2443,17 +3062,55 @@ def spawn_session(
     Raises :class:`RunAlreadyLive` when a live session already holds the run this
     spawn would land in — the one-run-one-session invariant, here for the reason
     the cap is here and with the reasoning in :func:`_refuse_if_run_is_live`.
+
+    Raises :class:`ThreadHeld` when a launch target names a chat thread another
+    live session holds. *refuse_held_targets* turns that off for the one caller
+    that decides it elsewhere: the assistant's targets are its **standing** list,
+    and a standing thread that is held defers rather than refusing, so uber lmer
+    still comes up (:func:`lmer_platform.assistant.start`).
     """
+    # Launch checks and publication must be exclusive, including the Popen gap.
+    with projects.operation(), _LAUNCH_LOCK, project_context.bound(request.workspace_id or project_context.current()):
+        _cleanup_failed_publications()
+        return _spawn_session(
+            config, request, kind=kind, publish_registration=publish_registration,
+            refuse_held_targets=refuse_held_targets,
+        )
+
+
+def _spawn_session(
+    config: PlatformConfig,
+    request: SpawnRequest,
+    *,
+    kind: str,
+    publish_registration: Optional[Callable[[Callable[[], None], str, int], None]],
+    refuse_held_targets: bool,
+) -> SpawnResult:
+    from . import project_requests, project_threads
+
     request = request.validate()
     if kind not in registry.SESSION_KINDS:
         raise SpawnError(f"invalid session kind {kind!r}")
+    workspace_id = request.workspace_id or project_context.current()
+    if projects.enabled():
+        try:
+            projects.get(workspace_id, active=True)
+            if request.targets:
+                for target in request.targets:
+                    project_threads.authorize(target, workspace_id)
+            if kind == registry.ASSISTANT_KIND:
+                projects.require_admission(workspace_id)
+        except projects.ProjectError as exc:
+            raise SpawnError(str(exc)) from exc
 
-    live = _live_worker_count()
-    if live >= config.max_concurrent_sessions:
-        raise CapacityError(
-            f"concurrency cap reached: {live}/{config.max_concurrent_sessions} "
-            "worker sessions already running"
-        )
+    if kind == registry.WORKER_KIND:
+        live = _live_worker_count()
+        worker_cap = projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions
+        if live >= worker_cap:
+            raise CapacityError(
+                f"concurrency cap reached: {live}/{worker_cap} "
+                "worker sessions already running"
+            )
 
     # After the cap, so a host that is simply full says so rather than blaming
     # the slot.
@@ -2462,11 +3119,15 @@ def spawn_session(
     # Two URLs, because "what this run's repo is" and "what its identity is
     # derived from" are separable claims — only the first is recorded anywhere.
     repo_url, identity_url = _repo_urls(request)
-    host, project, slug = derive_run_identity(request, identity_url)
+    host, project, slug = derive_run_identity(request, identity_url, config)
+    if projects.enabled() and host and project and slug:
+        projects.check_home(runs.run_key(host, project, slug), workspace_id)
     # As early as the identity allows, and before the command is built: a spawn
     # refused for a run that is already running leaves nothing behind — no argv, no
     # port drawn, no directory made.
     _refuse_if_run_is_live(host, project, slug)
+    if refuse_held_targets:
+        _refuse_if_threads_are_held(request.targets)
     command = _build_command(config, request)
 
     # Before anything is created on disk, so a range with no free port leaves no
@@ -2482,52 +3143,14 @@ def spawn_session(
     except OSError as exc:
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
-    # The transcript's host home, with one subdirectory per harness mounted in
-    # where that harness writes its session JSONL, so the file the chat view reads
-    # outlives the container (`lmer` runs it --rm) whichever harness ran. Only for
-    # sessions the platform spawns: persisting every lmer invocation's transcript
-    # is a separate decision, and this is not the place to take it.
-    transcript_dir = _prepare_transcript_dir(session_id)
-    transcript_mounts = (
-        _prepare_transcript_subdirs(transcript_dir)
-        if transcript_dir is not None
-        else []
-    )
-    # The session's ask channel (T23): where it posts questions for the operator
-    # and reads the answers back.
-    ask_dir = _prepare_ask_dir(session_id)
-    # Where the session writes its own log, if its image knows how to (#150). The
-    # directory is the offer; the file inside it is the session's answer, and the
-    # read path takes "no file" for exactly the answer it is.
-    container_log_dir = _prepare_container_log_dir(session_id)
-    # The assistant's memory store (#325): one directory per *host*, so what one
-    # incarnation learned is on disk for the next. Gated on the kind, not offered
-    # as a request field — a worker's memory has its own route (the work repo).
-    memory_dir = (
-        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
-    )
-    if memory_dir is not None:
-        memory.observe(memory_dir)
-    # Where the files the operator attaches to this session's chat land (#246).
-    # Every session gets one, worker and assistant alike — a screenshot is most
-    # useful to the run that just built the thing in it — and the *kind* decides
-    # only which store that is.
-    upload_dir = _prepare_upload_dir(session_id, kind)
-
-    # One insertion, not one per mount: _with_host_flags inserts right after
-    # --fastapi, so calling it twice would interleave the mounts in reverse and
-    # make the command's shape depend on the order of these lines.
-    host_flags: list = []
-    if transcript_mounts:
-        host_flags += _transcript_mount_flags(transcript_mounts)
-    if ask_dir is not None:
-        host_flags += _ask_mount_flags(ask_dir)
-    if container_log_dir is not None:
-        host_flags += _container_log_mount_flags(container_log_dir)
-    if memory_dir is not None:
-        host_flags += memory.mount_flags(memory_dir)
-    if upload_dir is not None:
-        host_flags += _upload_mount_flags(upload_dir)
+    try:
+        config_flags = codex_config.mount_flags(host, project, slug, kind, session_id)
+    except OSError as exc:
+        raise SpawnError(f"cannot prepare persistent Codex configuration: {exc}") from exc
+    channels = _prepare_session_channels(session_id, kind)
+    # One call, because _with_host_flags inserts at a fixed anchor and two
+    # would interleave in reverse.
+    host_flags = config_flags + channels.host_flags + _assistant_resource_flags(kind)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -2540,53 +3163,23 @@ def spawn_session(
     # channel. That last one is the flag an agent tests to know it was started by
     # the orchestrator, which is why it is set here and only here: a session
     # spawned without a usable channel directory must not claim to have one.
-    child_env = {
-        **os.environ,
+    invocation_env = {
+        "LMER_WORKSPACE_ID": workspace_id or "",
         "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
+        "LMER_SESSION_KIND": kind,
+        "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
+            terminal_settings()["confirm_seconds"].value
+        ),
     }
-    if upload_dir is not None:
-        child_env[uploads.UPLOADS_DIR_ENV] = uploads.CONTAINER_UPLOADS_DIR
-    else:
-        # Blanked rather than deleted, for ASK_DIR_ENV's reason below: the child
-        # is `lmer`, which seeds its own environment from .env files first-wins,
-        # so a merely absent key is one a file may re-supply — and this variable
-        # is what gates the prompt fragment that tells an agent to read files out
-        # of a directory this session has not got.
-        child_env[uploads.UPLOADS_DIR_ENV] = ""
-    if ask_dir is not None:
-        child_env[ask.ASK_DIR_ENV] = ask.CONTAINER_ASK_DIR
-    else:
-        # Never inherited: the daemon's own environment carrying this variable
-        # (a daemon started from inside a session, say) would otherwise tell an
-        # agent it has a channel that was never mounted. Blank rather than
-        # absent, because the child is `lmer` and it seeds its own environment
-        # from .env files first-wins — a key that is merely absent is a key a
-        # file may re-supply. Blank already reads as unset on every consumer
-        # (resolve_channel_dir strips it; the runners render the ask fragment
-        # only on a non-blank value).
-        child_env[ask.ASK_DIR_ENV] = ""
-    # The declared→staged link pairs for the entrypoint (#293), filtered to
-    # mounts actually prepared. Seeded fresh, never inherited (a daemon's own
-    # environment would carry another session's pairs), and blank rather than
-    # absent for the reason the two variables below give.
-    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
-    link_pairs = [
-        (declared, staged)
-        for declared, staged in _harness_session_links()
-        if staged in mounted_destinations
-    ]
-    if memory_dir is not None:
-        # Staged like a user harness's session dir, and for the same ownership
-        # reason (#293) — see lmer_platform.memory.
-        link_pairs += memory.memory_links()
-    child_env[MOUNT_LINKS_ENV] = format_mount_links("", link_pairs)
+    invocation_env.update(channels.env)
+    invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
         # rather than instructions not to.
-        child_env[NO_REPO_ENV] = "1"
+        invocation_env[NO_REPO_ENV] = "1"
     else:
         # Also never inherited, and for the sharper version of the same reason: a
         # daemon whose shell exported LMER_NO_REPO would otherwise hand every
@@ -2596,26 +3189,30 @@ def spawn_session(
         # environment, and the child's own .env seeding would hand it straight
         # back. Blank is falsy to get_bool_env on the host and never equals "1"
         # in the container, so it reads as unset the whole way down.
-        child_env[NO_REPO_ENV] = ""
-    if kind == registry.ASSISTANT_KIND:
-        # Platform-local only (#325): the shared-work-repo mirror is closed here
-        # rather than left to fail for want of a repo identity. On the kind and
-        # not on the mount above, so a store that could not be prepared does not
-        # reopen the route it replaces; blank rather than deleted for the
-        # LMER_NO_REPO reason.
-        child_env[memory.PERSIST_ENV_VAR] = ""
+        invocation_env[NO_REPO_ENV] = ""
+    child_env = env_with_overrides(invocation_env)
 
     master_fd, slave_fd = pty.openpty()
+    launch_pipe = os.pipe() if projects.enabled() and kind == registry.ASSISTANT_KIND else None
+    launch_error_pipe = os.pipe() if launch_pipe else None
+    child_command = ([sys.executable, str(Path(__file__).with_name("launch_guard.py")),
+                      str(launch_pipe[0]), str(launch_error_pipe[1]), *command]
+                     if launch_pipe else command)
     try:
+        project_requests.effect()
         process = subprocess.Popen(
-            command,
+            child_command,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             env=child_env,
             start_new_session=True,
+            **({"pass_fds": (launch_pipe[0], launch_error_pipe[1])} if launch_pipe else {}),
         )
     except (OSError, ValueError) as exc:
+        if launch_pipe:
+            os.close(launch_pipe[1])
+            os.close(launch_error_pipe[0])
         os.close(master_fd)
         os.close(slave_fd)
         # The token was minted for a process that does not exist; nothing will
@@ -2623,8 +3220,13 @@ def spawn_session(
         # credential does not get left lying around.
         with _suppress_oserror():
             token_file.unlink()
+        if isinstance(exc, projects.ProjectError):
+            raise
         raise SpawnError(f"cannot start {command[0]} ({exc})")
     finally:
+        if launch_pipe:
+            os.close(launch_pipe[0])
+            os.close(launch_error_pipe[1])
         # The child holds its own copy of the slave end.
         with _suppress_oserror():
             os.close(slave_fd)
@@ -2640,6 +3242,7 @@ def spawn_session(
             task={
                 "taskdef": request.taskdef,
                 "target": request.target,
+                "targets": list(request.targets or []),
                 "repo": repo_url,
                 "preset": request.preset,
                 # Names only, which is all that was ever passed: the presets these
@@ -2662,6 +3265,15 @@ def spawn_session(
                 # every poll (issue #312).
                 "slot_service_group": slot_group,
                 "slot_services": slot_services,
+                # No key for ``request.session_id``, and that is a decision
+                # rather than an omission: unlike the flags above, the record a
+                # session writes in accounts for itself. The session appends its
+                # harness id to that record's own lineage (``sessions:``,
+                # ``run_state.session_lineage``, D22), which is written by what
+                # happened rather than by what was asked for, and is where a
+                # post-mortem reads it. A key here would also put a second
+                # namespace's "session" on an entry whose own key is the ``s-…``
+                # container session — the two this file already keeps apart.
             },
             run={"host": host, "project": project, "slug": slug},
             # The *only* record that the slot is taken — nothing writes an occupancy
@@ -2680,19 +3292,53 @@ def spawn_session(
             # spawn has made it (uber lmer's is per host), so its presence says
             # nothing about the container that is running now — see
             # lmer_platform.uploads.registry_pointer.
-            uploads=uploads.registry_pointer(upload_dir),
+            uploads=uploads.registry_pointer(channels.upload_dir),
             started_at=utc_now_iso(),
         )
+        if projects.enabled():
+            projects.bind_session(session_id, workspace_id,
+                                  runs.run_key(host, project, slug) if host and project and slug else None)
+            if host and project and slug:
+                projects.bind_run(runs.run_key(host, project, slug), workspace_id)
+                projects.remember_launch(runs.run_key(host, project, slug), request.slot, request.preset)
 
     # Most sessions publish only their registry entry. The assistant also has a
     # lifecycle-state pointer that must become visible with that entry, so it
     # supplies a tiny publication wrapper. It runs only after process startup and
     # receives registration as a thunk, keeping its lock around the two writes
     # rather than around the whole spawn.
-    if publish_registration is None:
-        register()
-    else:
-        publish_registration(register, session_id, process.pid)
+    try:
+        if publish_registration is None:
+            register()
+        else:
+            publish_registration(register, session_id, process.pid)
+        if launch_pipe:
+            os.write(launch_pipe[1], b"1")
+            error = os.read(launch_error_pipe[0], 4096)
+            if error:
+                raise SpawnError(f"cannot start {command[0]} ({error.decode(errors='replace')})")
+    except BaseException:
+        _FAILED_PUBLICATIONS[session_id] = _UnpublishedLaunch(
+            process, master_fd, token_file, session_id,
+        )
+        _cleanup_failed_publications()
+        raise
+    finally:
+        if launch_pipe:
+            os.close(launch_pipe[1])
+            os.close(launch_error_pipe[0])
+
+    # The launch's thread targets become connections like any other, so the fleet
+    # payload, the routes and the UI see one kind of thing and the reconcile loop
+    # starts their connectors as soon as the control plane answers (issue #412).
+    # After registration, because the reconcile reads the entry; best-effort,
+    # because a session that is already running must not fail over its bookkeeping.
+    if request.targets:
+        from . import connectors as thread_connectors
+
+        component = thread_connectors.get_connectors()
+        if component is not None:
+            project_requests.attach_spawned(component, session_id, request.targets)
 
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed
@@ -2710,6 +3356,10 @@ def spawn_session(
         )
         # Only now: until the call above, this was a run meta.write would refuse.
         warning = _write_run_meta(request, host, project, slug)
+        # Same ordering and the same reason as the metadata above; both warnings
+        # reach the caller, because they are different losses.
+        lost_references = _write_run_references(request, host, project, slug)
+        warning = " ".join(part for part in (warning, lost_references) if part) or None
     elif request.no_repo:
         # Not the failure below, and kept apart from it deliberately: a session
         # with no repository (spec D17) has no run to file anywhere, so nothing
@@ -2770,4 +3420,5 @@ def spawn_session(
         control_host=_CONTROL_HOST,
         control_port=control_port,
         warning=warning,
+        model=request.model,
     )

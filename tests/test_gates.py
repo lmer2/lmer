@@ -47,8 +47,10 @@ def enable_precommit_reuse(monkeypatch, tmp_path):
 class TestGateSystem:
     """Test the GateSystem class functionality"""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def setup_method(self, monkeypatch, tmp_path):
         """Set up test environment"""
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path / "work"))
         self.gate = GateSystem(verbose=True)
 
     def test_init(self):
@@ -3464,11 +3466,12 @@ class TestGateStructure:
         content = main_config.read_text()
         assert "## 🛑 COMMIT GATE" in content
 
-        # Check for numbered steps - updated for gate commands
         assert "1. Run gate check:" in content
         assert "2. Show gate check results" in content
-        assert "3. Get explicit approval:" in content
+        assert "3. Confirm the changes stay within authorized work and no explicit user hold applies" in content
         assert "4. Use gate commit:" in content
+        assert "3. Get explicit approval:" not in content
+        assert 'A user instruction such as "do not commit yet" remains binding' in content
 
     def test_error_gate_structure(self):
         """Verify ERROR GATE has proper format."""
@@ -3622,7 +3625,7 @@ class TestGateStructure:
 
         # Check for checklist items
         assert "- [ ] Summarize what was just completed" in content
-        assert "- [ ] Run rgr-[relevant module]" in content
+        assert "- [ ] Read the relevant file under `/Agents/global/rules/`" in content
         assert "- [ ] State the new objective clearly" in content
 
 

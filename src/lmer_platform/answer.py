@@ -85,6 +85,7 @@ to withhold it.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
@@ -104,7 +105,7 @@ from .spawn import (
     spawn_session,
 )
 from .store import StoreError, append_event
-from .workrepo import RunDirRef, resolve_run_dir
+from .workrepo import RunDirRef, record_session_id, resolve_run_dir
 
 logger = logging.getLogger("lmer_platform.answer")
 
@@ -173,6 +174,10 @@ class AnswerRequest:
     project: str
     slug: str
     answer: str
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "AnswerRequest":
         """Return a normalised copy, or raise :class:`AnswerError`.
@@ -260,6 +265,7 @@ class AnswerResult:
             "session": {
                 "session_id": self.session.session_id,
                 "pid": self.session.pid,
+                **self.session.launch_settings(),
                 "control": {
                     "host": self.session.control_host,
                     "port": self.session.control_port,
@@ -534,6 +540,7 @@ def _identity_repo_url(request: AnswerRequest) -> str:
     return f"https://{request.host}/{request.project}"
 
 
+@run_operation
 def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     """Answer a question-blocked run by respawning it with the answer attached.
 
@@ -560,6 +567,7 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             # Recorded only if the run actually has one — an adopted run that has
@@ -571,6 +579,24 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
             # field is where a validated answer goes, and the flag is refused in
             # the caller-supplied argv beside it.
             answer=request.answer,
+            # The record that ASKED, so the answer is applied in it rather than
+            # in a fresh record the container would otherwise mint beside it
+            # (spec D22: the session is the unit of record, and LMER_SESSION_ID
+            # picks which one a launch writes in). An empty record holding an
+            # answer, with the question still standing in the real one, is the
+            # shape this closes.
+            #
+            # Unconditional, unlike the same injection in
+            # :mod:`lmer_platform.resume`: ``_require_same_run`` above has already
+            # refused every respawn that would derive another run, so there is no
+            # sibling group for this id to be wrong in. ``None`` for a legacy tree
+            # and nothing changes there.
+            #
+            # This is now the direct route. ``work_repo.cli._session_that_asked``
+            # stays as the fallback it describes itself as — it reroutes a launch
+            # carrying ``LMER_ANSWER`` to the record that asked, which is what
+            # covers launchers that carry only the answer and nothing else.
+            session_id=record_session_id(ref),
         ),
     )
 

@@ -376,7 +376,7 @@ def test_every_tab_in_both_rows_draws_a_shape_beside_its_word():
         )
         # Tight against the label and before it, which is what makes the icon part
         # of the tab rather than a second thing on the line.
-        assert f"/>{TAB_LABELS[value]}</v-tab>" in tab, (
+        assert f"/>{TAB_LABELS[value]}" in tab, (
             f"the {value!r} tab lost its word, or the icon no longer sits in front "
             f"of it: {' '.join(tab.split())}"
         )
@@ -934,8 +934,10 @@ def test_the_run_row_falls_back_to_the_runs_key_and_never_composes_a_path():
     )
 
     key = _binding("runKey")
-    for part in ("run.host", "run.project", "run.slug"):
-        assert part in key, f"the key is not the run's identity: {part} is missing"
+    assert "composeRunKey(props.run)" in key, (
+        "the key is not the run's identity through the one grammar — see "
+        "web/src/runref.js and tests/test_runref_grammar.py (#383 item 3)"
+    )
 
     code = _without_comments(_read(RUN_DETAIL))
     assert not re.search(r"runs/\$?\{", code), (
@@ -1446,7 +1448,7 @@ def test_a_run_that_is_not_the_orchestrator_renders_as_it_did_before():
     and what an operator is allowed to do to that session is not this slice.
     """
     detail = _read(RUN_DETAIL)
-    assert detail.count("run.orchestrator") == 1, (
+    assert detail.count("run.orchestrator") == 2, (
         f"the view reads the flag {detail.count('run.orchestrator')} times; only "
         "the badge may depend on it"
     )

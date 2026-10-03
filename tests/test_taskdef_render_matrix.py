@@ -74,6 +74,20 @@ def _assert_fully_rendered(out):
     assert "{%" not in out and "{{" not in out
 
 
+def _prose(out):
+    """Rendered text with its line wrapping collapsed, so a sentence
+    assertion survives a reflow of the paragraph it lives in."""
+    return " ".join(out.split())
+
+
+def _assert_thread_policy(out):
+    prose = _prose(out)
+    assert "at least every few minutes" not in prose
+    assert "a silent session is indistinguishable from a dead one" not in prose
+    policy = (REPO_TASKDEF / "thread-updates.jinja2").read_text()
+    assert prose.count(_prose(policy)) == 1
+
+
 def _assert_mode(out, work_mode, has_phasic_include=True):
     if not has_phasic_include:
         return
@@ -169,16 +183,92 @@ class TestRenderMatrix:
 
     @pytest.mark.parametrize("provider", sorted(PROVIDERS))
     @pytest.mark.parametrize("work_mode", WORK_MODES)
+    @pytest.mark.parametrize("repo_backed", (True, False))
+    @pytest.mark.parametrize("channel", (None, "slack", "matrix", "legacy-slack"))
     def test_builtin_only_chat_renders_with_zero_config(
-        self, work_mode, provider, monkeypatch, capsys
+        self, channel, repo_backed, work_mode, provider, monkeypatch, capsys
     ):
         """chat must work out of the box: no work repo, no external paths."""
-        monkeypatch.setenv("LMER_REPO_HOST", PROVIDERS[provider])
+        host = PROVIDERS[provider]
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        if channel == "legacy-slack":
+            monkeypatch.setenv("LMER_SLACK_CHANNEL", "C123")
+        elif channel:
+            monkeypatch.setenv("LMER_CHAT_CHANNEL", channel)
+        if repo_backed:
+            monkeypatch.setenv(
+                "LMER_REPO_URL", f"https://{host}/acme/widget.git"
+            )
         out = _render(REPO_TASKDEF / "chat" / "instructions.txt", work_mode)
         _assert_fully_rendered(out)
+        _assert_thread_policy(out)
         assert "no fixed script" in out
         banner = capsys.readouterr().out
         assert f"taskdef source: {REPO_TASKDEF} (schema 1)" in banner
+
+    @pytest.mark.parametrize("task", ("develop", "review"))
+    @pytest.mark.parametrize("config", ("workrepo", "dedicated"))
+    @pytest.mark.parametrize("work_mode", WORK_MODES)
+    def test_external_tasks_share_the_builtin_thread_policy(
+        self, task, config, work_mode, tmp_path, monkeypatch
+    ):
+        _, root = _configure_source(config, "schema1", tmp_path, monkeypatch)
+        template = root / task / "instructions.txt"
+        template.parent.mkdir()
+        template.write_text("{% include 'thread-updates.jinja2' ignore missing %}")
+
+        out = _render(template, work_mode)
+
+        _assert_fully_rendered(out)
+        _assert_thread_policy(out)
+
+    @pytest.mark.parametrize("provider", sorted(PROVIDERS))
+    def test_repo_backed_chat_carries_the_provider_tooling_block(
+        self, provider, monkeypatch
+    ):
+        """chat was the one taskdef without the shared block, so a chat run
+        guessed at `glab` and raw API calls the moment the conversation
+        touched an issue (#442)."""
+        host = PROVIDERS[provider]
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        monkeypatch.setenv("LMER_REPO_URL", f"https://{host}/acme/widget.git")
+
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        if provider == "github":
+            assert "github-review" in out
+            assert "gitlab-review" not in out
+        else:
+            assert "gitlab-review" in out
+            assert "github-review" not in out
+
+    def test_chat_without_a_repo_names_the_wrappers_itself(self):
+        """A chat session with no checkout has no host to switch on, so the
+        provider block cannot render — the no-repo branch names the wrappers
+        so the session does not fall back to `glab` or a raw API call."""
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        prose = _prose(out)
+        assert "operations on any GitLab host go through `gitlab-review`" in prose
+        assert "never `glab` and never a hand-built API call" in prose
+        assert "on GitHub use `github-review` and `gh`" in prose
+
+    @pytest.mark.parametrize("channel", ("slack", "matrix"))
+    def test_a_connected_chat_keeps_failed_commands_out_of_the_thread(
+        self, channel, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_CHAT_CHANNEL", channel)
+
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        assert "## Conversation mode" in out
+        assert (
+            "is a note for your report, not a message for the thread"
+            in _prose(out)
+        )
 
     def test_repository_guidance_sends_progress_to_the_work_repository(self):
         guidance = (REPO_TASKDEF.parent / "AGENTS.md").read_text()
@@ -306,6 +396,9 @@ class TestExternalSourceMatrix:
                         monkeypatch.setenv("LMER_REPO_HOST", host)
                         out = _render(template_file, work_mode)
                         _assert_fully_rendered(out)
+                        assert "at least every few minutes" not in _prose(out)
+                        if "thread-updates.jinja2" in template_file.read_text():
+                            _assert_thread_policy(out)
                         rendered += 1
         print(
             f"external-source matrix: {len(taskdef_dirs)} taskdef(s), "

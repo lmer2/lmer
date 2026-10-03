@@ -56,6 +56,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import logging
 import math
 import os
 import secrets
@@ -73,13 +74,22 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
+from . import comms as _comms
+from . import thread_requests as _threads
 from .harness import UnknownHarnessError, resolve_harness, resolve_harness_name
 from .util import decode_escape_bytes
 
 
+ASK_DIR_WATCH_SECONDS = 2.0
+CALLER_CONTROL = "control"
+CALLER_AGENT = "agent"
+CONTROL_TOKEN_HASH_ENV = "LMER_FASTAPI_TOKEN_SHA256"
+
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
 DEFAULT_FASTAPI_HOST = "127.0.0.1"
+# Allow the daemon's five-second reconciliation cycle plus the acknowledgment round trip.
+END_REQUEST_HANDOFF_SECONDS = 6.0
 
 # After the initial ``/start\r`` injection, claude's TUI occasionally shows
 # the typed ``/start`` but never registers the trailing CR — the submit gets
@@ -229,6 +239,8 @@ DEFAULT_SHUTDOWN_CHORD_GAP = 0.5
 DEFAULT_SHUTDOWN_ESCALATE_GRACE = 10.0
 # Poll cadence while waiting for the child to exit between escalation steps.
 SHUTDOWN_POLL_INTERVAL = 0.2
+# A descendant writing after the harness exits must not keep teardown open.
+CHILD_OUTPUT_DRAIN_SECONDS = 1.0
 
 # Where the session's own log goes, and the one rule about these two names: they
 # are a cross-version interface, so they may not change. The orchestrator
@@ -520,6 +532,7 @@ class SessionLog:
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
+    delivery_id: Optional[str] = None
     #: "This is prose meant to steer the session", whether a human composed it
     #: in chat or an assistant sent it through ``lmer-ctl``. Everything else
     #: (which harness is running, what its TUI does with the text) is decided
@@ -529,6 +542,69 @@ class _InputBody(BaseModel):
     #: A steering caller can still intend a registered slash command. This only
     #: narrows ``sanitize``; it never transforms or enables commands by itself.
     preserve_slash_commands: bool = False
+    #: Who is typing, for raw keystrokes only: the terminal line reconstruction
+    #: (issue #407) tags what a browser terminal's user typed with this name.
+    author: Optional[str] = None
+
+
+class _MessageBody(BaseModel):
+    """``POST /messages``: one record for the session bus (issue #407)."""
+
+    kind: str
+    text: str = ""
+    source: dict = Field(default_factory=dict)
+    in_reply_to: Optional[str] = None
+    #: On an answer: the 1-based index of the option the human picked, from a
+    #: channel that showed them a numbered list. The bus resolves it to the
+    #: option's text; nothing is inferred from `text` (#428).
+    #:
+    #: `strict` because lax mode coerces `true` to `1` — silently answering
+    #: with the first option — before `comms.option_index` can refuse it. This
+    #: is the only layer that still has the raw value.
+    option: Optional[int] = Field(default=None, strict=True)
+    options: list = Field(default_factory=list)
+    attachments: list = Field(default_factory=list)
+    meta: dict = Field(default_factory=dict)
+    #: On a question: this caller will be waiting for the answer, so hold it
+    #: for them from now rather than from their first poll (#407 §7).
+    wait: Optional[float] = None
+
+
+class _ThreadRequestBody(BaseModel):
+    """``POST /thread/requests``: work for the host side (issue #414).
+
+    ``permalink`` names a thread, ``channel`` a place to open one in (#429) and
+    ``recipient`` a person to direct-message (#441); which of the three a
+    request needs is its ``op``'s to say, and
+    :meth:`lmer_cli.thread_requests.ThreadRequests.submit` says it.
+    """
+
+    op: str
+    permalink: str = ""
+    channel: str = ""
+    recipient: str = ""
+    limit: int = Field(default=_threads.DEFAULT_READ_LIMIT, ge=1, le=_threads.MAX_READ_LIMIT)
+    text: str = ""
+    attachments: list = Field(default_factory=list)
+
+
+class _ThreadResultBody(BaseModel):
+    """What a servicer answers with. Opaque here: handed back to the asker
+    unread, since this process holds no credential that could check it."""
+
+    result: dict = Field(default_factory=dict)
+
+
+class _AckBody(BaseModel):
+    subscriber: str
+    seq: int = Field(ge=0)
+    #: This subscriber is leaving; the drain should stop waiting for it.
+    final: bool = False
+
+
+class _ReleaseBody(BaseModel):
+    question: str
+    ttl: Optional[float] = None
 
 
 class _OutputResponse(BaseModel):
@@ -656,6 +732,12 @@ def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
         return None
     rows, cols, _, _ = struct.unpack("HHHH", packed)
     return rows, cols
+
+
+def _usable_host_winsize(size: Optional[tuple[int, int]]) -> bool:
+    """Ignore transient host layouts that would destroy the TUI's wrapping."""
+    return bool(size and 5 <= size[0] <= MAX_WINSIZE_DIMENSION
+                and 20 <= size[1] <= MAX_WINSIZE_DIMENSION)
 
 
 def _resolve_submit_enter_delay() -> float:
@@ -1319,6 +1401,102 @@ def _resolve_fastapi_port(options: dict, env: Mapping[str, str]) -> int:
     return _pick_port(options["port_range"], options["host"])
 
 
+def _relay_wanted(log: "_comms.MessageLog", message: "_comms.Message") -> bool:
+    """Whether an accepted record gets a PTY leg: inbound, of a relayed kind,
+    not an answer a waiting CLI already took, and not an answer to a question
+    whose asker is polling the ask directory (issue #421) — that one is
+    delivered by the file it is mirrored into, and a PTY leg would deliver it
+    twice."""
+    if message.source.channel == _comms.CHANNEL_AGENT or message.meta.get("session_origin"):
+        return False
+    if message.kind not in _comms.RELAYED_KINDS:
+        return False
+    if message.kind == _comms.KIND_ANSWER and message.meta.get("delivered") == _comms.DELIVERY_CLI:
+        return False
+    if message.kind == _comms.KIND_ANSWER:
+        question = log.question_of(message)
+        ref = question.source.ref if question is not None else None
+        if _comms.ask_dir_ref_file(ref) is not None:
+            return False
+    return True
+
+
+def _relay_message(
+    log: "_comms.MessageLog",
+    message: "_comms.Message",
+    submit: Callable[[str], tuple[int, str]],
+    harness: str,
+    codex_delivery=None,
+) -> dict:
+    """Deliver an inbound record with its transport receipt.
+
+    Codex uses the durable record ID for native delivery; other runners use PTY
+    submission. See docs/CODEX-DELIVERY.md for confirmation and recovery.
+    """
+    text, tagged = _comms.relay_payload(message, log.question_of(message))
+    if not tagged:
+        text = _rewrite_harness_command(text, harness)
+    payload = text.encode("utf-8")
+    receipt = {
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "payload_length": len(payload),
+        "tagged": tagged,
+    }
+    if codex_delivery is not None:
+        return {**receipt, **codex_delivery.deliver(text, client_id=message.id)}
+    try:
+        written, verdict = submit(text)
+    except OSError as exc:
+        return {**receipt, "bytes_written": 0, "submit_text": SUBMIT_TEXT_UNKNOWN, "error": str(exc)}
+    return {**receipt, "bytes_written": written, "submit_text": verdict}
+
+
+class _InboundRelay:
+    """Queue delivery independently of bus acceptance across startup (§4).
+
+    Callers hold ``lock`` through append and enqueue, then flush outside it.
+    """
+
+    def __init__(self, log, submit, harness, *, startup_pending=False, codex_delivery=None):
+        self.log = log
+        self.submit = submit
+        self.harness = harness
+        self.codex_delivery = codex_delivery
+        self.lock = threading.RLock()
+        self._submit_lock = threading.Lock()
+        self._pending: list[tuple[_comms.Message, dict]] = []
+        self._ready = not startup_pending
+
+    def enqueue(self, message: _comms.Message) -> dict:
+        with self.lock:
+            receipt = {"queued": True, "bytes_written": 0}
+            self._pending.append((message, receipt))
+            return receipt
+
+    def flush(self) -> None:
+        with self.lock:
+            if not self._ready:
+                return
+        with self._submit_lock:
+            while True:
+                with self.lock:
+                    if not self._pending:
+                        return
+                    self._pending.sort(key=lambda item: item[0].seq)
+                    message, receipt = self._pending.pop(0)
+                delivered = _relay_message(
+                    self.log, message, self.submit, self.harness, self.codex_delivery,
+                )
+                with self.lock:
+                    receipt.clear()
+                    receipt.update(delivered)
+
+    def startup_submitted(self) -> None:
+        with self.lock:
+            self._ready = True
+        self.flush()
+
+
 def _build_fastapi_app(
     output: OutputBuffer,
     write_input: "callable[[bytes], int]",
@@ -1327,8 +1505,23 @@ def _build_fastapi_app(
     resize: Optional[Callable[[int, int], None]] = None,
     get_winsize: Optional[Callable[[], Optional[tuple[int, int]]]] = None,
     submit: Optional[Callable[[str], tuple[int, str]]] = None,
+    comms: Optional["_comms.MessageLog"] = None,
+    threads: Optional["_threads.ThreadRequests"] = None,
+    on_raw_input: Optional[Callable[[bytes, Optional[str]], None]] = None,
+    agent_token: Optional[str] = None,
+    token_hash: Optional[str] = None,
+    inbound_relay: Optional[_InboundRelay] = None,
+    terminal_mirror=None,
+    launch_settings: Optional[dict] = None,
+    codex_delivery=None,
 ):
-    """Construct the FastAPI app exposing ``/input``, ``/output`` and ``/resize``.
+    """Construct the FastAPI app exposing ``/input``, ``/output``, ``/resize``
+    and, when a :class:`lmer_cli.comms.MessageLog` is supplied, the session
+    bus under ``/messages`` (issue #407).
+
+    ``on_raw_input`` receives every raw keystroke payload ``/input`` writes
+    (no ``append_newline``) with the caller-supplied author, so the terminal
+    line reconstruction sees what a browser terminal's user typed.
 
     ``write_input`` is called with the bytes to deliver to the wrapped
     process's stdin. ``token`` gates every endpoint via the
@@ -1370,6 +1563,10 @@ def _build_fastapi_app(
 
     app = FastAPI(title="lmer claude supervisor", version="1")
 
+    # Always present, unlike the bus: whether anyone can serve a request is a
+    # question about a servicer polling, not about how this app was built.
+    thread_queue = threads if threads is not None else _threads.ThreadRequests()
+
     def _unlocked_submit(payload: str) -> tuple[int, str]:
         """Fallback for an app with no terminal behind it — see ``submit`` above."""
         return _submit_payload(
@@ -1382,78 +1579,65 @@ def _build_fastapi_app(
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit
+    relay_inbound = inbound_relay or _InboundRelay(
+        comms, submit_payload, _active_harness_name(), codex_delivery=codex_delivery,
+    )
 
-    def _check_auth(authorization):
-        expected = f"Bearer {token}"
-        if not authorization or not secrets.compare_digest(authorization, expected):
-            raise HTTPException(status_code=401, detail="invalid bearer token")
+    def _check_auth(authorization) -> str:
+        """Identify the session credential or the externally held control credential."""
+        presented = None
+        if authorization and authorization.startswith("Bearer "):
+            presented = authorization[len("Bearer "):]
+        if presented:
+            if agent_token and secrets.compare_digest(presented, agent_token):
+                return CALLER_AGENT
+            if token and secrets.compare_digest(presented, token):
+                return CALLER_CONTROL
+            if token_hash and secrets.compare_digest(
+                hashlib.sha256(presented.encode("utf-8")).hexdigest(), token_hash
+            ):
+                return CALLER_CONTROL
+        raise HTTPException(status_code=401, detail="invalid bearer token")
 
     @app.post("/input")
     def post_input(body: _InputBody, authorization: Optional[str] = Header(default=None)):
-        _check_auth(authorization)
+        caller = _check_auth(authorization)
         payload = body.data
-        # The delivery receipt (#197): what this process was asked to type,
-        # as the caller can independently recompute it. A write accepted here
-        # but never submitted used to leave no trace anywhere; the hash and
-        # length let the sender prove after the fact WHAT was handed to the
-        # PTY without the payload's content ever entering a log.
+        # Hash the original wire payload before transport-specific transforms.
         payload_bytes = payload.encode("utf-8")
         receipt = {
             "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
             "payload_length": len(payload_bytes),
         }
-        # After the receipt, deliberately: the receipt exists to prove the wire
-        # was clean, and the sender checks it against the hash of what IT sent
-        # (``session_io.send_input``, which refuses a mismatch loudly). Hashing
-        # the transformed text would turn every sanitized message into that
-        # alarm. What this line does is not corruption in transit — it is what
-        # the caller asked for by setting the flag.
-        if body.sanitize:
+        if body.sanitize and not (codex_delivery is not None and body.append_newline):
             payload = _sanitize_user_chat(
                 payload,
                 _active_harness_name(),
                 preserve_slash_commands=body.preserve_slash_commands,
             )
             payload_bytes = payload.encode("utf-8")
-        # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
-        # the Enter key arrives as \r. \n would be inserted as a literal
-        # newline in the input box and never submit. The field is named
-        # ``append_newline`` for backwards-compatible API shape but the
-        # behavior is "press Enter after the text".
+        # Raw terminal input stays separate from submitted prose.
         if not body.append_newline:
-            return {"bytes_written": write_input(payload_bytes), **receipt}
+            if on_raw_input is not None and caller == CALLER_CONTROL:
+                on_raw_input(payload_bytes, body.author)
+            written = write_input(payload_bytes)
+            return {"bytes_written": written, **receipt}
 
-        # A whole submitted command can use lmer's portable spelling even when
-        # the harness namespaces custom commands.  Deliberately after the raw
-        # keystroke return above: translating one byte at a time is impossible,
-        # and the direct terminal documents Codex's native spelling instead.
+        # Rewrite portable commands only after the raw-keystroke return.
         payload = _rewrite_harness_command(payload, _active_harness_name())
+        if codex_delivery is not None:
+            try:
+                return {**codex_delivery.deliver(payload, client_id=body.delivery_id), **receipt}
+            except OSError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        # Type it and submit it, ONCE — and with the Enter as a write of its own,
-        # because a CR glued to the text is read as part of a paste and inserted
-        # as a newline instead of submitting (#210; :func:`_submit_payload` has
-        # the mechanism and the measurements).
-        #
-        # Still exactly one Enter, and still no follow-up "nudge" CRs — see
-        # :data:`_SUBMIT_UNCONFIRMED_NOTE` for the whole of why, in short: a bare
-        # CR is a no-op only against an empty input box with no dialog on screen,
-        # and this handler cannot see the screen. The auto-start path nudges
-        # because it waits for an observed readiness marker first and runs before
-        # the session can raise a permission prompt at all; this one runs
-        # mid-session, which is exactly when one is up.
+        # Legacy PTY submission sends one separate CR, with no follow-up nudges.
         written, submit_text = submit_payload(payload)
-        # Said in the reply rather than assumed away: the CR went to the PTY, and
-        # whether the TUI registered it as a submit is not something this process
-        # observes. A caller that wants certainty has the terminal view.
         return {
             "bytes_written": written,
             "submit_confirmed": False,
             "note": _SUBMIT_UNCONFIRMED_NOTE,
-            # The one half of the delivery this process can see, and the half that
-            # explains a message left in the box: with the text observed read, the
-            # Enter behind it cannot have been swallowed by the paste this bug is
-            # about. Three values rather than a flag, so "not observed" is read as
-            # neither a failure nor a clean delivery — see :data:`SUBMIT_TEXT_READ`.
+            # PTY readback observes text consumption, not native submission.
             "submit_text": submit_text,
             **receipt,
         }
@@ -1494,6 +1678,246 @@ def _build_fastapi_app(
             ) from exc
         return {"rows": body.rows, "cols": body.cols}
 
+    def _require_comms() -> "_comms.MessageLog":
+        if comms is None:
+            raise HTTPException(
+                status_code=503,
+                detail="comms unavailable: this supervisor keeps no message bus",
+            )
+        return comms
+
+    @app.post("/messages")
+    def post_message(body: _MessageBody, authorization: Optional[str] = Header(default=None)):
+        caller = _check_auth(authorization)
+        log = _require_comms()
+        claimed = (body.source or {}).get("channel") or _comms.CHANNEL_AGENT
+        if caller == CALLER_AGENT and (
+            claimed != _comms.CHANNEL_AGENT or (body.source or {}).get("author")
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"a post from inside the session may only be the agent's own "
+                    f"(claimed {claimed!r}); channels are stamped by the party that "
+                    "vouches for them"
+                ),
+            )
+        with relay_inbound.lock:
+            try:
+                source = _comms.Source.from_dict(
+                    body.source, default_channel=_comms.CHANNEL_AGENT
+                )
+                # On the normalised ref, not the body's: `from_dict` strips, so a
+                # padded copy would be refused as sent and stored as kept (§10).
+                if (source.ref or "").startswith(_comms.ASK_DIR_REF_PREFIX):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"source.ref may not begin with {_comms.ASK_DIR_REF_PREFIX!r}: "
+                            "that prefix is the supervisor's own record of what it lifted "
+                            "out of the ask directory"
+                        ),
+                    )
+                message, accepted = log.append(
+                    kind=body.kind,
+                    text=body.text,
+                    source=source,
+                    in_reply_to=body.in_reply_to,
+                    option=body.option,
+                    options=body.options,
+                    attachments=body.attachments,
+                    meta=body.meta,
+                    session_caller=caller == CALLER_AGENT,
+                )
+                if body.wait and message.kind == _comms.KIND_QUESTION:
+                    log.claim(message.id, ttl=body.wait)
+            except _comms.CommsError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            relay = None
+            if accepted != _comms.ACCEPTED_DUPLICATE and _relay_wanted(log, message):
+                relay = relay_inbound.enqueue(message)
+        if relay is not None:
+            relay_inbound.flush()
+            with relay_inbound.lock:
+                relay = dict(relay)
+        # The receipt (#197) over what was *received*, like `send_input` hashes
+        # before `sanitize`: it answers "did my bytes reach the session?", and
+        # an answer naming its option is stored as the option's text, which the
+        # sender never sent and cannot check. `meta.option` and the record's own
+        # text say what was stored. Not the relay's hash, which covers the
+        # tagged line the PTY got.
+        received = body.text.encode("utf-8")
+        return {
+            "message": message.to_dict(),
+            "accepted_as": accepted,
+            "relay": relay,
+            "receipt": {
+                "payload_sha256": hashlib.sha256(received).hexdigest(),
+                "payload_length": len(received),
+            },
+        }
+
+    @app.get("/messages")
+    def get_messages(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        kinds: Optional[str] = Query(default=None),
+        waiter: Optional[str] = Query(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        log = _require_comms()
+        wanted = [k for k in (kinds or "").split(",") if k] or None
+        waiter_id = None
+        if waiter:
+            state = log.question(waiter)
+            if state is None:
+                raise HTTPException(status_code=400, detail=f"waiter {waiter!r} names no question")
+            waiter_id = state.question.id
+        messages, cursor = log.read_since(
+            since, timeout=timeout, kinds=wanted, waiter=waiter_id, include_local=False,
+        )
+        return {
+            "messages": [m.to_dict() for m in messages],
+            "cursor": cursor,
+            "schema": _comms.SCHEMA_VERSION,
+            **({"terminal_mirror": {"window_seconds": terminal_mirror.window}}
+               if terminal_mirror is not None else {}),
+        }
+
+    @app.post("/messages/terminal-mirror")
+    def configure_terminal_mirror(body: dict, authorization: Optional[str] = Header(default=None)):
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(status_code=403, detail="terminal timing is controlled by the host")
+        if terminal_mirror is None:
+            raise HTTPException(status_code=503, detail="terminal mirror is unavailable")
+        try:
+            terminal_mirror.configure(body.get("window_seconds"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"window_seconds": terminal_mirror.window}
+
+    @app.post("/messages/ack")
+    def post_ack(body: _AckBody, authorization: Optional[str] = Header(default=None)):
+        if _check_auth(authorization) == CALLER_AGENT:
+            # An ack is a subscriber saying it holds a record. The session is
+            # not a subscriber, and one acking on the daemon's behalf would end
+            # the drain grace over records nobody outside has.
+            raise HTTPException(
+                status_code=403, detail="acks come from subscribers, not from the session"
+            )
+        log = _require_comms()
+        try:
+            log.ack(body.subscriber, body.seq, final=body.final)
+        except _comms.CommsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"subscribers": log.subscribers()}
+
+    @app.post("/messages/claim")
+    def post_claim(body: _ReleaseBody, authorization: Optional[str] = Header(default=None)):
+        """A CLI about to wait, holding the answer against the PTY leg."""
+        _check_auth(authorization)
+        log = _require_comms()
+        state = log.question(body.question)
+        if state is None:
+            raise HTTPException(status_code=400, detail=f"{body.question!r} names no question")
+        log.claim(state.question.id, ttl=body.ttl or _comms.CLAIM_GRACE_SECONDS)
+        return {"claimed": state.question.id}
+
+    @app.post("/messages/release")
+    def post_release(body: _ReleaseBody, authorization: Optional[str] = Header(default=None)):
+        """A waiting CLI giving up its claim, so a later answer is typed in."""
+        _check_auth(authorization)
+        log = _require_comms()
+        state = log.question(body.question)
+        if state is None:
+            raise HTTPException(status_code=400, detail=f"{body.question!r} names no question")
+        log.release(state.question.id)
+        return {"released": state.question.id}
+
+    @app.get("/messages/questions")
+    def get_questions(
+        open: bool = Query(default=False),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        log = _require_comms()
+        return {"questions": [state.to_dict() for state in log.questions(open_only=open)]}
+
+    # --- threads this session is not connected to (issue #414) ---------------
+    #
+    # An RPC to the host, deliberately not on the bus — see
+    # :mod:`lmer_cli.thread_requests` and docs/COMMS.md §12.
+
+    def _thread_refusal(exc: "_threads.ThreadRequestError"):
+        return HTTPException(status_code=exc.status, detail=str(exc))
+
+    @app.post("/thread/requests")
+    def post_thread_request(
+        body: _ThreadRequestBody, authorization: Optional[str] = Header(default=None)
+    ):
+        _check_auth(authorization)
+        try:
+            request = thread_queue.submit(
+                body.op, body.permalink, channel=body.channel,
+                recipient=body.recipient, limit=body.limit,
+                text=body.text, attachments=body.attachments,
+            )
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+        return {"request": request.to_dict(include_result=False)}
+
+    @app.get("/thread/requests/{request_id}")
+    def get_thread_request(
+        request_id: str,
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        try:
+            return {"request": thread_queue.await_result(request_id, timeout=timeout).to_dict()}
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+
+    @app.get("/thread/requests")
+    def get_thread_requests(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        """A servicer's poll. Every request it returns is claimed: handed to this
+        caller and never offered again — a post delivered twice is two messages
+        in a thread."""
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "the session may ask for thread work and collect its result, "
+                    "but the work is done on the host — the credentials are there"
+                ),
+            )
+        claimed, cursor = thread_queue.claim(since, timeout=timeout)
+        return {
+            "requests": [request.to_dict(include_result=False) for request in claimed],
+            "cursor": cursor,
+        }
+
+    @app.post("/thread/requests/{request_id}/result")
+    def post_thread_result(
+        request_id: str, body: _ThreadResultBody,
+        authorization: Optional[str] = Header(default=None),
+    ):
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(
+                status_code=403,
+                detail="a thread result comes from the host side, not from the session",
+            )
+        try:
+            request = thread_queue.complete(request_id, body.result)
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+        return {"request": request.to_dict()}
+
     @app.get("/healthz")
     def healthz(authorization: Optional[str] = Header(default=None)):
         _check_auth(authorization)
@@ -1518,6 +1942,9 @@ def _build_fastapi_app(
         # *ends* (spec D24). "Nothing produced yet" answers null, exactly like an
         # unknown geometry, so a reader that renders it has one absent case to
         # handle rather than two.
+        bus_health = comms.health() if comms is not None else None
+        if bus_health is not None and launch_settings is not None:
+            bus_health["launch"] = dict(launch_settings)
         return {
             "ok": True,
             "cursor": output.end_offset,
@@ -1528,6 +1955,13 @@ def _build_fastapi_app(
             # supervisor running a checkout that predated /resize, and every
             # probe of it looked healthy right up until a route was missing.
             "source": __file__,
+            # Absent (null) on a supervisor with no bus. The daemon reads this
+            # key to tell a #407 image from an older one; there is no other
+            # version negotiation.
+            "comms": bus_health,
+            # So "nobody can do this" is an answer rather than a timeout (#414).
+            "threads": thread_queue.health(),
+            **({"codex_delivery": codex_delivery.snapshot()} if codex_delivery is not None else {}),
             **_activity_report(output.idle_seconds),
         }
 
@@ -1629,6 +2063,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
 
     host = args.fastapi_host or os.environ.get("LMER_FASTAPI_HOST") or DEFAULT_FASTAPI_HOST
     token = args.fastapi_token or os.environ.get("LMER_FASTAPI_TOKEN") or ""
+    token_hash = (os.environ.get(CONTROL_TOKEN_HASH_ENV) or "").strip().lower()
 
     delay_raw = args.auto_start_delay
     if delay_raw is None:
@@ -1721,6 +2156,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "port_range": port_range,
         "host": host,
         "token": token,
+        "token_hash": token_hash,
         "auto_start_delay": auto_start_delay,
         "auto_start_nudge_delay": auto_start_nudge_delay,
         "auto_start_ready_marker": auto_start_ready_marker,
@@ -1831,6 +2267,9 @@ def _start_auto_start_thread(
     write: Callable[[bytes], int],
     options: dict,
     cancel: threading.Event,
+    *,
+    submit_start: Optional[Callable[[str], tuple[int, str]]] = None,
+    on_started: Optional[Callable[[], None]] = None,
 ) -> threading.Thread:
     """Spawn the auto-/start daemon thread and return it.
 
@@ -1876,7 +2315,11 @@ def _start_auto_start_thread(
             return
         if settle_delay > 0 and cancel.wait(settle_delay):
             return
-        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay, start_command)
+        submitted = False
+        if start_command:
+            submitted = _inject_auto_start(
+                write, AUTO_START_NUDGE_COUNT, nudge_delay, start_command, submit=submit_start,
+            )
         if start_prompt:
             # Pause so the follow-up doesn't interleave with the trailing CR
             # nudges (which would submit it prematurely or into a non-empty box)
@@ -1888,6 +2331,8 @@ def _start_auto_start_thread(
             _inject_start_prompt(
                 write, start_prompt, AUTO_START_NUDGE_COUNT, nudge_delay
             )
+        if submitted and on_started is not None:
+            on_started()
 
     thread = threading.Thread(
         target=_run, name="lmer-supervisor-auto-start", daemon=True
@@ -1970,7 +2415,9 @@ def _inject_auto_start(
     nudge_count: int,
     nudge_delay: float,
     start_command: str = DEFAULT_START_COMMAND,
-) -> None:
+    *,
+    submit: Optional[Callable[[str], tuple[int, str]]] = None,
+) -> bool:
     """Type the start command and submit it, then send a few bare-CR nudges.
 
     ``start_command`` is claude's native ``/start`` slash command by default;
@@ -1988,13 +2435,23 @@ def _inject_auto_start(
     timer thread this runs on.
     """
     payload = _ensure_submit_cr(start_command).encode("utf-8")
-    with contextlib.suppress(OSError):
-        write(payload)
+    submitted = False
+    try:
+        if submit is None:
+            submitted = write(payload) == len(payload)
+        else:
+            written, _verdict = submit(start_command)
+            submitted = written >= len(payload)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("startup_submit_failed error=%s", exc)
+    if not submitted:
+        logging.getLogger(__name__).warning("startup_submit_incomplete inbound_typing=held")
     for _ in range(nudge_count):
         if nudge_delay > 0:
             time.sleep(nudge_delay)
         with contextlib.suppress(OSError):
             write(_SUBMIT_CR)
+    return submitted
 
 
 def _inject_start_prompt(
@@ -2100,6 +2557,7 @@ def _self_shutdown(
     chord_gap: float = DEFAULT_SHUTDOWN_CHORD_GAP,
     escalate_grace: float = DEFAULT_SHUTDOWN_ESCALATE_GRACE,
     quit_sequence: tuple[bytes, ...] = DEFAULT_QUIT_SEQUENCE,
+    child_exited: Optional[threading.Event] = None,
 ) -> None:
     """Quit the wrapped child on request, escalating until it actually exits.
 
@@ -2112,28 +2570,132 @@ def _self_shutdown(
     3. If it is *still* alive after another ``escalate_grace``, send SIGKILL.
 
     Runs on a daemon thread spawned from the SIGUSR1 handler so the timed gaps
-    don't execute in async-signal context. Signals are sent to the child PID
+    don't execute in async-signal context. A separate writer attempts the quit
+    sequence, so a blocked PTY cannot postpone either escalation deadline.
+    Signals are sent to the child PID
     only (not its group): the child is its own session/group leader (the fork
     path calls ``setsid``), and ``run_supervisor`` reaps it via ``waitpid``.
     """
-    _inject_shutdown_chord(write, chord_gap, quit_sequence)
-    if _wait_child_exit(child_pid, escalate_grace):
+    # Neither a held submit lock nor a full PTY input buffer may stop the clock
+    # that eventually signals the child. The writer dies with this supervisor.
+    threading.Thread(target=_inject_shutdown_chord, args=(write, chord_gap, quit_sequence),
+                     name="lmer-supervisor-quit", daemon=True).start()
+    wait_exited = child_exited.wait if child_exited is not None else (
+        lambda timeout: _wait_child_exit(child_pid, timeout)
+    )
+    if wait_exited(escalate_grace):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(child_pid, signal.SIGTERM)
-    if _wait_child_exit(child_pid, escalate_grace):
+    if wait_exited(escalate_grace):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(child_pid, signal.SIGKILL)
 
 
-def run_supervisor(
+def _open_comms_log(
+    directory: Optional[str] = None, env: Optional[Mapping[str, str]] = None
+) -> "_comms.MessageLog":
+    """The session bus, on disk when the session directory is mounted.
+
+    Must run before the fork: the log's path is exported as
+    :data:`lmer_cli.comms.COMMS_LOG_ENV` so hooks inside the harness can read
+    it, and the child's environment is frozen at exec.
+    """
+    environ = os.environ if env is None else env
+    if directory is None:
+        directory = CONTAINER_SESSION_LOG_DIR
+    path = os.path.join(directory, _comms.COMMS_LOG_NAME) if os.path.isdir(directory) else None
+    session = (environ.get("LMER_SESSION_ID") or "").strip() or f"local-{os.getpid()}"
+    agent_channel = (
+        _comms.CHANNEL_UBER if environ.get("LMER_SESSION_KIND") == "assistant"
+        else _comms.CHANNEL_AGENT
+    )
+    log = _comms.MessageLog(session, path, agent_channel=agent_channel)
+    if log.path and env is None:
+        os.environ[_comms.COMMS_LOG_ENV] = log.path
+    return log
+
+
+def _announce_shutdown(log: "_comms.MessageLog") -> "_comms.Message":
+    """Publish the supervisor's acknowledgment on the authenticated bus."""
+    message, _ = log.append(
+        kind=_comms.KIND_NOTE,
+        text="Session shutdown requested.",
+        source=_comms.Source(_comms.CHANNEL_SUPERVISOR),
+        meta={"event": _comms.EVENT_SESSION_END_REQUESTED},
+    )
+    return message
+
+
+class _ShutdownHandoff:
+    """One delivery deadline shared by quit escalation and API finalization."""
+
+    def __init__(self, log: "_comms.MessageLog", timeout: float) -> None:
+        self.log = log
+        self.deadline = time.monotonic() + timeout
+        self.done = threading.Event()
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def start(self) -> None:
+        threading.Thread(target=self._publish, name="lmer-supervisor-end-handoff", daemon=True).start()
+
+    def _publish(self) -> None:
+        try:
+            message = _announce_shutdown(self.log)
+            if not self.log.wait_acknowledged(_comms.PLATFORM_SUBSCRIBER, message.seq, self.remaining()):
+                logging.getLogger(__name__).warning(
+                    "supervisor_end_handoff_unconfirmed session=%s seq=%s subscriber=%s",
+                    self.log.session, message.seq, _comms.PLATFORM_SUBSCRIBER,
+                )
+        except Exception as exc:  # noqa: BLE001 - delivery failure must not prevent quitting
+            logging.getLogger(__name__).warning("supervisor_end_handoff_failed error=%s", exc)
+        finally:
+            self.done.set()
+
+    def wait(self) -> None:
+        self.done.wait(self.remaining())
+
+
+def _open_ask_projection(
+    log: "_comms.MessageLog", env: Optional[Mapping[str, str]] = None
+) -> "Optional[_comms.AskDirProjection]":
+    """The one-release ask-directory projection, when a channel is mounted."""
+    environ = os.environ if env is None else env
+    directory = (environ.get(_comms_ask_dir_env()) or "").strip()
+    if not directory or not os.path.isdir(directory):
+        return None
+    projection = _comms.AskDirProjection(directory, log)
+    log.add_listener(projection.mirror)
+    return projection
+
+
+def _comms_ask_dir_env() -> str:
+    from ask_channel.protocol import ASK_DIR_ENV
+
+    return ASK_DIR_ENV
+
+
+def run_supervisor(cmd, options, *, stdin_fd=None, stdout_fd=None, write_lock=None):
+    kwargs = dict(stdin_fd=stdin_fd, stdout_fd=stdout_fd, write_lock=write_lock)
+    if _active_harness_name() != "codex":
+        return _run_supervisor(cmd, options, **kwargs)
+    from .codex_delivery import CodexDelivery
+
+    with CodexDelivery(cmd) as delivery:
+        return _run_supervisor(cmd, options, codex_delivery=delivery, **kwargs)
+
+
+def _run_supervisor(
     cmd: list[str],
     options: dict,
     *,
     stdin_fd: Optional[int] = None,
     stdout_fd: Optional[int] = None,
     write_lock: Optional["threading.Lock"] = None,
+    codex_delivery=None,
 ) -> int:
     """Run the supervisor loop.
 
@@ -2157,14 +2719,26 @@ def run_supervisor(
     # frozen and consumers inside the container would have no way to discover
     # an auto-generated token.
     fastapi_token = options["token"]
+    fastapi_token_hash = options.get("token_hash") or ""
     fastapi_host = options["host"]
     fastapi_port: Optional[int] = None
+    agent_token: Optional[str] = None
+    control_origin = (
+        "held outside this container" if fastapi_token_hash
+        else "supplied by the host" if fastapi_token
+        else "generated here; no external holder"
+    )
     if options["fastapi"]:
-        if not fastapi_token:
+        if not fastapi_token and not fastapi_token_hash:
             fastapi_token = secrets.token_urlsafe(32)
+        # The harness gets a credential of its own rather than the one the
+        # daemon uses: with the control token it could post as any human on any
+        # channel (``_check_auth``). Minted here so it exists even when the host
+        # sent only the hash of its own.
+        agent_token = secrets.token_urlsafe(32)
         fastapi_port = _resolve_fastapi_port(options, os.environ)
         os.environ["LMER_FASTAPI_PORT"] = str(fastapi_port)
-        os.environ["LMER_FASTAPI_TOKEN"] = fastapi_token
+        os.environ["LMER_FASTAPI_TOKEN"] = agent_token
 
     # Publish the supervisor's own PID to the wrapped process (and everything it
     # spawns) BEFORE fork, so the child inherits it through its initial
@@ -2172,6 +2746,8 @@ def run_supervisor(
     # SIGUSR1 to ask for a graceful self-shutdown. Set after fork it would not
     # reach the already-frozen child env.
     os.environ[SUPERVISOR_PID_ENV] = str(os.getpid())
+    if codex_delivery is not None:
+        cmd = codex_delivery.start()
 
     # Before the fork, so the file exists from the earliest moment this session
     # could have produced a byte. A reader that finds it treats it as the log of
@@ -2180,6 +2756,16 @@ def run_supervisor(
     # that window, the less of a session's start is described by two different
     # streams.
     session_log = SessionLog.open_if_mounted()
+    comms_log = _open_comms_log()
+    if codex_delivery is not None:
+        def report_codex_delivery(text):
+            logging.getLogger(__name__).warning("%s", text)
+            comms_log.append(
+                kind=_comms.KIND_NOTE, text=text,
+                source=_comms.Source(_comms.CHANNEL_PLATFORM),
+            )
+        codex_delivery.notify = report_codex_delivery
+    ask_projection = _open_ask_projection(comms_log)
 
     master_fd, slave_fd = os.openpty()
 
@@ -2200,8 +2786,7 @@ def run_supervisor(
         _preconfigure_pty_for_injection(slave_fd)
 
     initial_winsize = _get_winsize(stdin_fd) if os.isatty(stdin_fd) else None
-    if initial_winsize:
-        _set_winsize(master_fd, *initial_winsize)
+    _set_winsize(master_fd, *(initial_winsize if _usable_host_winsize(initial_winsize) else (24, 80)))
 
     pid = os.fork()
     if pid == 0:
@@ -2266,9 +2851,71 @@ def run_supervisor(
     # Types a message and presses Enter as two writes with nothing able to land
     # between them — see :func:`_make_submit`, which owns that guarantee and is
     # tested on it directly.
+    harness_name = _active_harness_name()
     submit_to_child = _make_submit(
-        master_fd, write_lock, slave_path, harness=_active_harness_name()
+        master_fd, write_lock, slave_path, harness=harness_name
     )
+
+    inbound_relay = _InboundRelay(
+        comms_log, submit_to_child, harness_name,
+        codex_delivery=codex_delivery,
+        startup_pending=(
+            not options["manual_start"] and bool(options.get("start_command", DEFAULT_START_COMMAND))
+        ),
+    )
+    if codex_delivery is not None:
+        codex_delivery.start_monitor()
+
+    from .terminal_mirror import TerminalMirror, TranscriptReader
+
+    try:
+        transcript_dir = resolve_harness().session_dir
+    except UnknownHarnessError:
+        transcript_dir = None
+    mirror_enabled = _comms.terminal_mirror_enabled()
+    terminal_mirror = TerminalMirror(
+        comms_log, TranscriptReader(transcript_dir if mirror_enabled else None, harness_name),
+        enabled=mirror_enabled,
+    )
+    terminal_mirror.poll()
+    stdin_tracker = _comms.TerminalTracker()
+    raw_input_tracker = _comms.TerminalTracker()
+
+    def on_raw_input(data: bytes, author: Optional[str]) -> None:
+        terminal_mirror.feed(raw_input_tracker, data, author)
+
+    watcher_stop = threading.Event()
+    watcher_thread: Optional[threading.Thread] = None
+
+    def _watch_bus() -> None:
+        """One tick, two jobs: lift what another writer filed in the ask
+        directory — an older daemon's answer, or every record of a session
+        whose own CLI predates the bus (#421) — and type in an answer whose
+        waiting CLI never came back."""
+        while not watcher_stop.wait(ASK_DIR_WATCH_SECONDS):
+            with inbound_relay.lock:
+                if ask_projection is not None:
+                    for message, accepted in ask_projection.lift_foreign_records():
+                        if accepted != _comms.ACCEPTED_DUPLICATE and _relay_wanted(comms_log, message):
+                            inbound_relay.enqueue(message)
+                for message in comms_log.lapsed_answers():
+                    # Deliberately not through `_relay_wanted`: the record says it
+                    # was for the CLI, and this is the case where that stopped
+                    # being true (the process is gone). §7's guarantee is that the
+                    # answer reaches the agent one way or the other.
+                    inbound_relay.enqueue(message)
+
+            inbound_relay.flush()
+
+    watcher_thread = threading.Thread(
+        target=_watch_bus, name="lmer-supervisor-bus-watch", daemon=True
+    )
+    watcher_thread.start()
+    terminal_thread = threading.Thread(
+        target=terminal_mirror.run, args=(watcher_stop,),
+        name="lmer-supervisor-terminal-watch", daemon=True,
+    )
+    terminal_thread.start()
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it
@@ -2293,6 +2940,17 @@ def run_supervisor(
             resize=set_child_winsize,
             get_winsize=get_child_winsize,
             submit=submit_to_child,
+            codex_delivery=codex_delivery,
+            comms=comms_log,
+            on_raw_input=on_raw_input,
+            agent_token=agent_token,
+            token_hash=fastapi_token_hash or None,
+            inbound_relay=inbound_relay,
+            terminal_mirror=terminal_mirror,
+            launch_settings={
+                "preset": os.environ.get("LMER_SESSION_PRESET") or None,
+                "model": os.environ.get("LMER_LLM_NAME") or None,
+            },
         )
         server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
         # Status line carries only host + port (no secret value): the bearer
@@ -2301,7 +2959,10 @@ def run_supervisor(
         # secret-bearing options dict.
         sys.stderr.write(
             f"🛰  lmer-supervisor FastAPI listening on http://{fastapi_host}:{fastapi_port} "
-            f"(bearer token in LMER_FASTAPI_TOKEN)\n"
+            f"(the session's own bearer token is in LMER_FASTAPI_TOKEN; the "
+            f"control credential is "
+            + control_origin
+            + ")\n"
             # Which file this control plane is actually running. A supervisor
             # imported from the wrong tree serves whatever routes THAT code has,
             # and #236 was diagnosed by noticing the mismatch — this line puts
@@ -2314,13 +2975,19 @@ def run_supervisor(
     auto_start_thread: Optional[threading.Thread] = None
     auto_start_cancel = threading.Event()
     if not options["manual_start"]:
-        auto_start_thread = _start_auto_start_thread(
-            output, write_to_child, options, auto_start_cancel
-        )
+        if codex_delivery is not None:
+            auto_start_thread = codex_delivery.auto_start(
+                options, auto_start_cancel, inbound_relay.startup_submitted,
+            )
+        else:
+            auto_start_thread = _start_auto_start_thread(
+                output, write_to_child, options, auto_start_cancel,
+                submit_start=submit_to_child, on_started=inbound_relay.startup_submitted,
+            )
 
     def _apply_host_winsize_to_master() -> None:
         size = _get_winsize(stdin_fd)
-        if size:
+        if _usable_host_winsize(size):
             _set_winsize(master_fd, *size)
 
     winsize_recheck_timer: Optional[threading.Timer] = None
@@ -2352,18 +3019,29 @@ def run_supervisor(
     # flips the flag (idempotent — repeated signals don't spawn racing threads)
     # and kicks the thread off.
     shutdown_requested = threading.Event()
+    shutdown_handoff: Optional[_ShutdownHandoff] = None
+    child_exited = threading.Event()
+    child_status: Optional[int] = None
+    child_output_deadline: Optional[float] = None
 
     def request_shutdown(*_args) -> None:
+        nonlocal shutdown_handoff
         if shutdown_requested.is_set():
             return
+        handoff = shutdown_handoff = _ShutdownHandoff(comms_log, END_REQUEST_HANDOFF_SECONDS)
         shutdown_requested.set()
-        threading.Thread(
-            target=_self_shutdown,
-            args=(write_to_child, pid),
-            kwargs={"quit_sequence": options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE)},
-            name="lmer-supervisor-self-shutdown",
-            daemon=True,
-        ).start()
+
+        def shutdown() -> None:
+            handoff.start()
+            handoff.wait()
+            if not child_exited.is_set():
+                _self_shutdown(
+                    write_to_child, pid,
+                    quit_sequence=options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE),
+                    child_exited=child_exited,
+                )
+
+        threading.Thread(target=shutdown, name="lmer-supervisor-self-shutdown", daemon=True).start()
 
     previous_winch = signal.signal(signal.SIGWINCH, forward_winsize) if hasattr(signal, "SIGWINCH") else None
     previous_int = signal.signal(signal.SIGINT, forward_signal)
@@ -2383,20 +3061,33 @@ def run_supervisor(
     # stdin is left out of the select set while anything is queued, so a later
     # keystroke cannot overtake an earlier one.
     pending_stdin = b""
+    master_open = True
     try:
         while True:
-            watch = [master_fd]
+            if child_status is None:
+                reaped, status = os.waitpid(pid, os.WNOHANG)
+                if reaped:
+                    child_status = status
+                    child_exited.set()
+                    child_output_deadline = time.monotonic() + CHILD_OUTPUT_DRAIN_SECONDS
+            if child_output_deadline is not None and time.monotonic() >= child_output_deadline:
+                break
+            # PTY EOF and child exit are independent: a child may close stdio
+            # early, or a descendant may keep the slave open after it exits.
+            watch = [master_fd] if master_open else []
             # Nothing to read stdin *for* while a keystroke is still waiting on
             # the lock: stop selecting on it so the loop spins on master_fd
             # instead of re-reading input it cannot yet deliver.
-            if stdin_open and not pending_stdin:
+            if stdin_open and not pending_stdin and child_status is None:
                 watch.append(stdin_fd)
             try:
                 # A held-back keystroke needs a wake-up that does not depend on
                 # either fd becoming readable, since the thing being waited for is
                 # a lock release.
                 rlist, _, _ = select.select(
-                    watch, [], [], STDIN_RETRY_SECONDS if pending_stdin else None
+                    watch, [], [], 0 if child_status is not None else (
+                        STDIN_RETRY_SECONDS if pending_stdin else SHUTDOWN_POLL_INTERVAL
+                    )
                 )
             except InterruptedError:
                 continue
@@ -2405,13 +3096,19 @@ def run_supervisor(
                     break
                 raise
 
+            if child_status is not None and not rlist:
+                break
+
             if master_fd in rlist:
                 try:
                     chunk = os.read(master_fd, 4096)
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    break
+                    master_open = False
+                    stdin_open = False
+                    pending_stdin = b""
+                    continue
                 output.append(chunk)
                 # Persisted before it is forwarded, deliberately: the file is the
                 # copy that has to survive, stdout is the copy that might not, and
@@ -2440,8 +3137,9 @@ def run_supervisor(
                     stdin_open = False
                 else:
                     pending_stdin += chunk
+                    terminal_mirror.feed(stdin_tracker, chunk)
 
-            if pending_stdin:
+            if pending_stdin and child_status is None:
                 accepted = None
                 with contextlib.suppress(OSError):
                     accepted = try_write_to_child(pending_stdin)
@@ -2450,10 +3148,30 @@ def run_supervisor(
                     # remainder stays queued instead of being dropped.
                     pending_stdin = pending_stdin[accepted:]
     finally:
+        if child_status is None:
+            # An exceptional forwarding exit still owns a live child. Keep the
+            # API and its signal handlers until the same bounded ladder reaps it.
+            if not shutdown_requested.is_set():
+                threading.Thread(
+                    target=_self_shutdown, args=(write_to_child, pid),
+                    kwargs={"child_exited": child_exited,
+                            "quit_sequence": options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE)},
+                    daemon=True,
+                ).start()
+            _, child_status = os.waitpid(pid, 0)
+            child_exited.set()
         if auto_start_thread is not None:
             auto_start_cancel.set()
+        if codex_delivery is not None:
+            if auto_start_thread is not None:
+                auto_start_thread.join(timeout=4.0)
+            codex_delivery.close()
         if winsize_recheck_timer is not None:
             winsize_recheck_timer.cancel()
+        if shutdown_handoff is not None:
+            # Natural harness exit does not mean the daemon has received the
+            # request. Share the original deadline, without joining a PTY writer.
+            shutdown_handoff.wait()
         if previous_winch is not None and hasattr(signal, "SIGWINCH"):
             signal.signal(signal.SIGWINCH, previous_winch)
         signal.signal(signal.SIGINT, previous_int)
@@ -2464,6 +3182,10 @@ def run_supervisor(
             with contextlib.suppress(termios.error):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
         if fastapi_shutdown is not None:
+            terminal_mirror.poll()
+            # The daemon reads the bus over this control plane and nowhere
+            # else, so the last records must be fetched before it goes.
+            comms_log.wait_drained(_comms.drain_grace())
             fastapi_shutdown()
         if server_thread is not None:
             server_thread.join(timeout=2.0)
@@ -2471,8 +3193,14 @@ def run_supervisor(
         # that has just ended and someone is about to read it back.
         if session_log is not None:
             session_log.close()
+        watcher_stop.set()
+        if watcher_thread is not None:
+            watcher_thread.join(timeout=ASK_DIR_WATCH_SECONDS + 1.0)
+        terminal_thread.join(timeout=1.0)
+        comms_log.close()
+        os.close(master_fd)
 
-    _, status = os.waitpid(pid, 0)
+    status = child_status
     # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so
     # the orchestrator (e.g. the Slack session reaper) frees the slot quietly and
     # does NOT post a crash notice — even if the quit chord had to be escalated to

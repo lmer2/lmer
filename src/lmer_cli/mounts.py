@@ -8,10 +8,12 @@ SELinux labeling requirements for Podman.
 """
 
 import os
+import stat
+import subprocess
 import sys
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Iterable, List, NamedTuple, Optional, Tuple
+from typing import Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 from lmer_cli import user_harnesses
 from lmer_cli.harness import get_harness
@@ -57,6 +59,16 @@ CONTAINER_MOUNT_STAGING_DIR = "/home/developer/.lmer-mounts"
 # :func:`format_mount_links` for the grammar.
 MOUNT_LINKS_ENV = "LMER_MOUNT_LINKS"
 
+# Written by Ctl/container/setup-mount-links.sh, read by
+# :func:`read_link_marker`; tests/test_mount_links_script.py pins the two
+# spellings together, because they are one name in two languages (#383 item 2).
+MOUNT_LINK_MARKER = ".lmer-mount-link"
+
+# `detail` and `at` are required, not optional: docs/PLATFORM-QUICKSTART.md
+# promises a false verdict names its obstruction and dates itself, and a
+# truncated file would otherwise satisfy the reader without either.
+_MARKER_REQUIRED = ("declared", "staged", "linked", "detail", "at")
+
 # Fixed path inside the container where the release SSH signing key is
 # mounted (release-taskdef sessions only; spec §4/§5 of the release-flow
 # bundle). The release session gate in cli.py forwards this path via
@@ -64,6 +76,21 @@ MOUNT_LINKS_ENV = "LMER_MOUNT_LINKS"
 # at it; every non-release session must receive neither the mount nor the
 # variable.
 CONTAINER_RELEASE_SIGNING_KEY_PATH = "/release-signing-key"
+
+# Fixed paths inside the container for gpg-agent forwarding (ansible-taskdef
+# sessions only, issue #355). The socket is the host gpg-agent's **extra**
+# socket — the one designed for forwarding: a client reaching the agent
+# through it can sign and decrypt but cannot export or reconfigure keys, so
+# the secret key never enters a container. The keyring lands beside it under
+# CONTAINER_GPG_PUBRING_PREFIX plus its host suffix, which is what tells the
+# entrypoint (and gpg) which keyring format it is holding.
+CONTAINER_GPG_AGENT_SOCKET_PATH = "/gpg-agent"
+CONTAINER_GPG_PUBRING_PREFIX = "/gpg-pubring"
+
+# The two keyring formats gpg reads by name, newest first. Also the suffix
+# allowlist: a keyring with any other suffix is refused rather than mounted
+# under a guessed name (gpg picks its parser from the file name).
+GPG_PUBRING_SUFFIXES = (".kbx", ".gpg")
 
 
 def _below_container_home(container_path: str) -> bool:
@@ -403,6 +430,34 @@ def format_mount_links(inherited: str, pairs: Iterable[Tuple[str, str]]) -> str:
     entries = [entry for entry in inherited.split(",") if entry.strip()]
     entries += [f"{declared}:{staged}" for declared, staged in pairs]
     return ",".join(entries)
+
+
+def read_link_marker(directory) -> Optional[dict]:
+    """What the container's linker recorded about *directory*, or ``None``.
+
+    ``None`` for every way of not having the fact — no marker, an unreadable
+    one, a `linked` field that is not the yes/no the writer emits — because an
+    uninterpretable marker is the same absence as none, not a weaker fact.
+    Unknown keys are tolerated so the writer can grow a field without this
+    becoming a two-image change. See docs/PLATFORM-QUICKSTART.md, "uber lmer's
+    memory", for what the record is for.
+    """
+    path = Path(directory) / MOUNT_LINK_MARKER
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    record: dict = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            record.setdefault(key.strip(), value.strip())
+    if not all(record.get(field) for field in _MARKER_REQUIRED):
+        return None
+    if record["linked"] not in ("yes", "no"):
+        return None
+    record["linked"] = record["linked"] == "yes"
+    return record
 
 
 def build_user_mounts(
@@ -938,6 +993,224 @@ def build_release_signing_key_mount(
         )
     se = selinux_opt(runtime)
     return ["-v", f"{key}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro{se}"], None
+
+
+def _gpgconf_dir(key: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Ask gpgconf for one of its ``--list-dirs`` paths.
+
+    gpgconf's own answer, not a parse of some rendering of it: where each
+    socket lives depends on gnupg's socketdir rules, and asking the producer
+    is what keeps lmer out of reimplementing them.
+
+    Returns ``(path, None)`` or ``(None, reason)``.
+    """
+    cmd = ["gpgconf", "--list-dirs", key]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"cannot run `{' '.join(cmd)}` to resolve the gpg-agent socket: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+        return None, f"`{' '.join(cmd)}` failed: {detail}"
+    value = proc.stdout.strip()
+    if not value:
+        return None, f"`{' '.join(cmd)}` printed no path"
+    return Path(value), None
+
+
+def _refuse_main_agent_socket(sock: Path) -> Optional[str]:
+    """Refuse the agent's MAIN socket when an explicit path names it.
+
+    Forwarding the main socket would hand the container an unrestricted
+    agent connection — secret-key export, passphrase changes, key deletion
+    — which is the whole reason this feature forwards the *extra* socket
+    instead. ``auto`` cannot get this wrong (gpgconf answers with the extra
+    socket by name); an explicit path can, and ``S.gpg-agent`` is the
+    obvious-looking of the two names.
+
+    Two checks, strongest first:
+
+    1. gpgconf's own ``agent-socket`` answer. A fact from the producer, and
+       the same source ``auto`` already trusts — but it only speaks for the
+       gpg home gpgconf itself resolves.
+    2. Failing that, the name: ``S.gpg-agent`` with a sibling
+       ``S.gpg-agent.extra`` beside it. A gnupg naming convention rather
+       than a promise, which is why it is the fallback and why it demands
+       the sibling — the extra socket it would have the operator use must
+       actually be there.
+
+    Beyond these an explicit path is trusted as given: a socket under some
+    other home, with no ``.extra`` sibling and unknown to gpgconf, is
+    indistinguishable from a deliberately-placed forwarding socket. Returns
+    a reason string to refuse with, or ``None`` to accept.
+    """
+    resolved = sock.resolve()
+    main_socket, _ = _gpgconf_dir("agent-socket")
+    if main_socket is not None and main_socket.expanduser().absolute().resolve() == resolved:
+        extra, _ = _gpgconf_dir("agent-extra-socket")
+        hint = f" — forward {extra} instead" if extra is not None else ""
+        return (
+            f"{sock} is the gpg-agent MAIN socket (gpgconf names it "
+            f"agent-socket): a container reaching the agent through it could "
+            f"export secret keys{hint}, or set LMER_ANSIBLE_GPG_AGENT=auto"
+        )
+    if sock.name == "S.gpg-agent" and (sock.parent / "S.gpg-agent.extra").exists():
+        return (
+            f"{sock} looks like the gpg-agent MAIN socket (an "
+            f"S.gpg-agent.extra sits beside it): a container reaching the "
+            f"agent through it could export secret keys — forward "
+            f"{sock.parent / 'S.gpg-agent.extra'} instead, or set "
+            f"LMER_ANSIBLE_GPG_AGENT=auto"
+        )
+    return None
+
+
+def resolve_gpg_extra_socket(
+    configured: str,
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve the host gpg-agent **extra** socket to forward (issue #355).
+
+    ``configured`` is the operator's ``LMER_ANSIBLE_GPG_AGENT`` value:
+    ``auto`` asks gpgconf, anything else is taken as the socket path.
+
+    Guards: the path must exist and be a **socket**, and an explicit path
+    must not name the agent's MAIN socket (see
+    :func:`_refuse_main_agent_socket` — ``auto`` cannot, since gpgconf
+    answers with the extra socket by name). Deliberately no under-home
+    constraint — unlike the release signing key, the extra socket's natural
+    home is under ``/run/user/<uid>/``, so that rule would reject the
+    normal case.
+
+    **Pure** apart from the gpgconf query: a refusal comes back as
+    ``(None, reason)`` for the caller to decide on (fatal for the ansible
+    session it was configured for, and for nothing else).
+    """
+    value = configured.strip()
+    explicit = value.lower() != "auto"
+    if explicit:
+        candidate = Path(value).expanduser()
+    else:
+        candidate, reason = _gpgconf_dir("agent-extra-socket")
+        if reason:
+            return None, reason
+    sock = candidate.absolute()
+    if not sock.exists():
+        return None, (
+            f"gpg-agent socket {sock} does not exist — start the agent "
+            "(`gpg-connect-agent /bye`) or point LMER_ANSIBLE_GPG_AGENT at "
+            "the right path"
+        )
+    if not stat.S_ISSOCK(sock.stat().st_mode):
+        return None, f"gpg-agent socket {sock} is not a socket"
+    if explicit:
+        reason = _refuse_main_agent_socket(sock)
+        if reason:
+            return None, reason
+    return sock, None
+
+
+def resolve_gpg_pubring(
+    configured: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve the **public** keyring to mount alongside the agent socket.
+
+    Decryption needs the keyring to resolve a keygrip (the secret key stays
+    in the host agent) and encryption needs the recipients, so forwarding
+    the socket alone is not enough. ``pubring.kbx`` is public material by
+    construction — a gpg keyring holds no secret key material, which
+    lives in the agent's own key store.
+
+    ``configured`` (``LMER_ANSIBLE_GPG_PUBRING``) names the keyring
+    outright. Unset, exactly two candidates are tried inside the host's gpg
+    home (``$GNUPGHOME``, else ``~/.gnupg``): ``pubring.kbx`` then
+    ``pubring.gpg``. No further guessing — a layout neither candidate
+    covers is a named refusal pointing at the override.
+
+    Guards: a regular file, a suffix gpg actually reads
+    (:data:`GPG_PUBRING_SUFFIXES` — the file name is what picks gpg's
+    parser), and a **resolved** path that stays under the host home or
+    under the directory the operator named. That last one is the release
+    key's containment rule adapted: a symlink must not swing the mount onto
+    a keyring naming recipients the operator never chose.
+    """
+    environ = os.environ if env is None else env
+    explicit = (configured or "").strip()
+    if explicit:
+        named = Path(explicit).expanduser().absolute()
+        candidates = [named]
+        # The directory the operator named — the containment root for the
+        # explicit case, since their keyring may legitimately live outside
+        # the home (a shared vault dir, a removable volume).
+        root = named.parent.resolve()
+        missing = f"gpg public keyring {named} does not exist"
+    else:
+        gpg_home = Path(
+            environ.get("GNUPGHOME") or (Path.home() / ".gnupg")
+        ).expanduser().absolute()
+        candidates = [gpg_home / f"pubring{suffix}" for suffix in GPG_PUBRING_SUFFIXES]
+        root = gpg_home.resolve()
+        missing = (
+            f"no gpg public keyring found in {gpg_home} (looked for "
+            + " and ".join(c.name for c in candidates)
+            + ") — name one with LMER_ANSIBLE_GPG_PUBRING"
+        )
+
+    found = next((c for c in candidates if c.exists()), None)
+    if found is None:
+        return None, missing
+    if not found.is_file():
+        return None, f"gpg public keyring {found} is not a regular file"
+    if found.suffix not in GPG_PUBRING_SUFFIXES:
+        return None, (
+            f"gpg public keyring {found} must be named "
+            + " or ".join(f"*{suffix}" for suffix in GPG_PUBRING_SUFFIXES)
+            + " — gpg picks its keyring parser from the file name"
+        )
+    resolved = found.resolve()
+    if not (
+        resolved.is_relative_to(Path.home().resolve())
+        or resolved.is_relative_to(root)
+    ):
+        return None, (
+            f"gpg public keyring {found} resolves to {resolved}, outside both "
+            f"the host home and {root}"
+        )
+    return found, None
+
+
+def container_gpg_pubring_path(pubring_path: Path) -> str:
+    """Where a resolved host keyring is mounted inside the container.
+
+    The host suffix rides along so the container side keeps reading the
+    same keyring format it was handed.
+    """
+    return f"{CONTAINER_GPG_PUBRING_PREFIX}{pubring_path.suffix}"
+
+
+def build_gpg_agent_mounts(
+    runtime: str, socket_path: Path, pubring_path: Path
+) -> List[str]:
+    """Build the read-only binds that forward gpg into an ansible session.
+
+    Same mechanics as the ``SSH_AUTH_SOCK`` forward in
+    :func:`build_user_mounts`: the socket is bound as-is, never copied, and
+    ``:ro``. **Pure** — both paths arrive already validated by
+    :func:`resolve_gpg_extra_socket` / :func:`resolve_gpg_pubring`.
+
+    The container env carries only the remapped destinations; the
+    entrypoint turns them into a GNUPGHOME (a copy of the keyring, plus a
+    ``%Assuan%`` redirect file written into the socket directory gpgconf
+    reports for that home), because modern gpg derives the agent socket
+    from its own configuration and ignores the environment for it.
+    """
+    se = selinux_opt(runtime)
+    return [
+        "-v",
+        f"{socket_path}:{CONTAINER_GPG_AGENT_SOCKET_PATH}:ro{se}",
+        "-v",
+        f"{pubring_path}:{container_gpg_pubring_path(pubring_path)}:ro{se}",
+    ]
 
 
 def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:

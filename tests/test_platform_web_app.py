@@ -60,7 +60,12 @@ def test_no_external_hosts_referenced(source):
     text = source.read_text(encoding="utf-8")
     offenders = re.findall(r"https?://[^\s'\"`)]+", text)
     allowed = ("http://127.0.0.1", "http://localhost", "https://git.example.com",
-               "https://gitlab.example.com")
+               "https://gitlab.example.com",
+               # Placeholder text in the thread-connect field (issue #412): the
+               # example shape of a Slack permalink, and matrix.to, which is what
+               # a matrix client actually puts on the clipboard. Both are strings
+               # in a form hint; neither is ever fetched.
+               "https://example.slack.com", "https://matrix.to")
     for url in offenders:
         # Interpolated hosts are built from window.location at runtime (a link to
         # a port on the operator's own machine), so they name no fixed host and
@@ -127,6 +132,7 @@ def test_dependency_set_is_minimal():
     reviewed act instead of something that drifts in with a feature:
 
     - vue, vite, @vitejs/plugin-vue — the app and its build
+    - jsdom, @vue/test-utils, vitest — mounted DOM tests; rationale in web/docs/TESTING.md
     - vuetify — the component library the UI is built from
     - vite-plugin-vuetify — resolves the components each template uses, so the
       bundle carries those rather than the whole framework
@@ -144,14 +150,23 @@ def test_dependency_set_is_minimal():
       which executes both against hostile input rather than reading the source.
       (T44 moved the renderer out of Chat.vue into one shared component, and the
       executed probes moved with it.)
+    - d3-force — the constellation map's layout, and layout only: it computes
+      node positions and never touches the DOM, so Vue keeps ownership of the
+      SVG and the map themes and reads to a screen reader like any other part of
+      this UI. Four packages, not one — it brings d3-dispatch, d3-quadtree and
+      d3-timer — which is the honest cost and is why the alternative considered
+      was writing the force model by hand. A canvas/WebGL graph library was
+      rejected for the opposite reason: it would own its own rendering surface
+      and take the theming and the accessibility with it.
     """
     payload = json.loads((WEB / "package.json").read_text(encoding="utf-8"))
     assert set(payload["dependencies"]) == {
         "vue", "vuetify", "@mdi/js", "@xterm/xterm", "@xterm/addon-fit",
-        "markdown-it", "dompurify",
+        "markdown-it", "dompurify", "d3-force",
     }
     assert set(payload["devDependencies"]) == {
         "@vitejs/plugin-vue", "vite", "vite-plugin-vuetify",
+        "jsdom", "@vue/test-utils", "vitest",
     }
 
 
@@ -440,6 +455,8 @@ def test_api_client_uses_relative_paths():
 #: Adding one is meant to be a deliberate, reviewed act — the same reason the
 #: dependency set is an exact allowlist rather than a count.
 ALLOWED_STORAGE_KEYS = {
+    # The viewer's choice to expand usage details, never a session setting.
+    "USAGE_DETAILS_STORAGE_KEY",
     # x1/x1.5/x2 terminal height: a property of the operator's screen, not of any
     # session, and re-picking it on every run is the annoyance it exists to remove.
     "HEIGHT_STORAGE_KEY",
@@ -466,6 +483,12 @@ ALLOWED_STORAGE_KEYS = {
     # request is made by the answer being "on". The drawer's own open state is still
     # deliberately not stored (tests/test_platform_web_assistant.py).
     "NARROW_STORAGE_KEY",
+    # Whether this operator reads the fleet as the list or as the constellation
+    # map (#141 fleet map). Global and not per run, like the five above: it is a
+    # property of how somebody reads a fleet, not a fact about any run in it.
+    # `list` is the first mode and therefore the default, so an operator who
+    # never touches the switch sees the view they already had.
+    "FLEET_VIEW_STORAGE_KEY",
 }
 
 
@@ -680,8 +703,22 @@ def test_the_list_can_be_searched_over_what_the_row_shows():
     #: Row facts a substring search cannot help with, and why. Times are rendered
     #: relative ("3m ago"), so a query never means one; the ledger is a count; and
     #: the session block and the liveness flag are read by the row to *derive* what
-    #: it shows — the state word is what carries them into the search.
-    unsearchable = {"updated", "session", "ledger", "live"}
+    #: it shows — the state word is what carries them into the search. The status
+    #: line is percentages that change on every render, so a query over it is
+    #: never a way to find a run (issue 248).
+    unsearchable = {
+        "updated", "session", "ledger", "live", "statusline",
+        # Chat-thread connections (issue #412): a list of records, not text — what
+        # a query would match is a channel id (`C0123ABCDEF`) or a room id, which
+        # is not how anyone looks for a run. The icons are how the row answers
+        # "is this one in a thread".
+        "threads",
+        # Reference threads (issue #414), for the same reason and one more: their
+        # titles are the operator's words about a *thread*, not about the run, so a
+        # run matching one would match on something the row does not show and does
+        # not claim to be about.
+        "references",
+    }
     card = re.sub(r"<!--.*?-->", "", RUN_CARD.read_text(encoding="utf-8"), flags=re.S)
     card = re.sub(r"^\s*//.*$", "", card, flags=re.M)
     shown = {match for match in re.findall(r"\brun\.(\w+)", card)} - unsearchable
@@ -773,7 +810,7 @@ def test_a_forget_is_one_tap_with_no_dialog():
         "only one of the two sections can forget a run"
     )
     for confirming in ("<v-dialog", "window.confirm", "confirm("):
-        assert confirming not in text, (
+        assert confirming not in _function("forget", text), (
             f"forgetting goes through {confirming}; the undo window is the confirm"
         )
 

@@ -239,16 +239,13 @@ def test_both_credentials_open_the_api_and_are_told_apart(config, long_lived):
 
 
 def _guard_of(app):
-    """The app's ``require_secret``, reachable for a direct call.
-
-    Read off a route's dependant rather than re-derived, so the thing under test
-    is the function the served routes actually gate on.
-    """
+    """Read the authenticator used by the served route's binding dependency."""
     for route in app.routes:
         for dependency in getattr(route, "dependencies", ()):
             call = dependency.dependency
             if getattr(call, "__name__", "") == "require_secret":
-                return call
+                guard = next(item for item in route.dependant.dependencies if item.call is call)
+                return next(item.call for item in guard.dependencies if item.call.__name__ == "authenticate")
     raise AssertionError("no require_secret dependency on any route")
 
 
@@ -266,6 +263,92 @@ def test_the_minted_credential_is_attributed_to_the_assistant(config, long_lived
     operator = guard(f"Bearer {SECRET}")
     assert operator.kind == api.CALLER_OPERATOR
     assert not operator.is_assistant
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("boundary", ["credential_read", "after_auth", "during_post"])
+def test_public_reply_keeps_the_authenticated_generation_across_rotation(
+    config, long_lived, monkeypatch, tmp_path, boundary, legacy,
+):
+    from lmer_cli import thread_access, thread_posts
+    from lmer_platform import assistant_history
+    from tests.test_lmer_thread_access import FakeSlack, SLACK_LINK
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setattr(thread_posts, "REGISTRY_DIR", str(tmp_path / "thread-posts"))
+    slack = FakeSlack()
+    monkeypatch.setattr(thread_access, "_slack_client", lambda credential: slack)
+    cfg.ensure_secret(config)
+    client = client_for(config)
+    original = assistant.start(config)
+    minted = cfg.active_assistant_credential()
+    if legacy:
+        with assistant_history._database() as db:
+            db.execute("DELETE FROM credentials")
+    replacements = []
+
+    def rotate():
+        replacements.append(assistant.rotate(config))
+
+    if boundary == "credential_read":
+        active = api.active_assistant_credential
+
+        def read_then_rotate():
+            captured = active()
+            rotate()
+            return captured
+
+        monkeypatch.setattr(api, "active_assistant_credential", read_then_rotate)
+    elif boundary == "after_auth":
+        label = api._thread_label
+
+        def label_after_rotation(caller):
+            rotate()
+            return label(caller)
+
+        monkeypatch.setattr(api, "_thread_label", label_after_rotation)
+    else:
+        post = thread_access.post_thread
+
+        def post_then_rotate(*args, **kwargs):
+            result = post(*args, **kwargs)
+            rotate()
+            return result
+
+        monkeypatch.setattr(thread_access, "post_thread", post_then_rotate)
+
+    try:
+        response = client.post("/api/comms/thread", headers=bearer(minted),
+                               json={"permalink": SLACK_LINK, "text": "original generation reply"})
+        assert response.status_code == 200, response.text
+        assert response.json()["pane_recorded"] is True
+        assert len(slack.posted) == len(replacements) == 1
+        old = assistant_history.page(original.session_id)["messages"]
+        new = assistant_history.page(replacements[0].session_id)["messages"]
+        own = [row for row in old if row["text"] == "original generation reply"]
+        assert len(own) == 1
+        assert own[0]["session"] == original.session_id
+        assert own[0]["generation"] == original.generation
+        assert all(row["text"] != "original generation reply" for row in new)
+    finally:
+        assistant.stop()
+
+
+def test_an_unattributed_launch_does_not_inherit_a_stale_credential(config, long_lived, monkeypatch):
+    from lmer_platform import assistant_history
+
+    cfg.ensure_secret(config)
+    stale = cfg.mint_assistant_credential()
+
+    def refuse():
+        raise cfg.ConfigError("disk is full")
+
+    monkeypatch.setattr(assistant, "mint_assistant_credential", refuse)
+    with started(config) as status:
+        assert status.session_id
+        assert assistant.authenticated_generation(stale) is None
+    assistant.stop()
+    assert assistant_history.credential_owner(stale) is None
 
 
 def test_a_revoked_credential_stops_authenticating(config, long_lived):
@@ -318,3 +401,63 @@ def test_the_scrub_cannot_reach_a_revoked_credential_and_says_so(
     )
     client = client_for(config)
     assert client.get("/api/state", headers=bearer(minted)).status_code == 401
+
+
+# --- self-rotation (issue #446) -----------------------------------------------
+#
+# The assistant rotating *itself* adds a caller to an existing route rather than a
+# route: the minted credential already opens what the shared secret opens, so what
+# these pin is that it stays that way in both directions — the assistant can, and
+# nothing unauthenticated can.
+
+def test_the_assistant_can_rotate_itself_with_its_own_credential(
+    config, long_lived
+):
+    cfg.ensure_secret(config)
+    with started(config) as status:
+        minted = cfg.active_assistant_credential()
+        client = client_for(config)
+        reply = client.post(
+            "/api/assistant/rotate",
+            headers=bearer(minted),
+            json={"handoff": "two runs in flight; the review on the second is posted"},
+        )
+        try:
+            assert reply.status_code == 200, reply.text
+            body = reply.json()
+            assert body["generation"] == status.generation + 1
+            assert body["handoff"].startswith("two runs in flight")
+            assert body["session_id"] != status.session_id
+        finally:
+            kill(assistant.status().pid)
+
+
+def test_a_rotation_keeps_the_spool_for_the_successor(config, long_lived):
+    """The digests are the successor's inheritance: an incarnation that rotated
+    because its window filled has by definition not drained everything, and a
+    rotation that emptied the spool would lose exactly what it was told last."""
+    cfg.ensure_secret(config)
+    with started(config):
+        assistant.notify("a question opened on develop-446")
+        minted = cfg.active_assistant_credential()
+        reply = client_for(config).post(
+            "/api/assistant/rotate", headers=bearer(minted), json={},
+        )
+        try:
+            assert reply.status_code == 200, reply.text
+            assert reply.json()["pending"] == 1
+            assert len(assistant.read_state().pending) == 1
+        finally:
+            kill(assistant.status().pid)
+
+
+def test_rotate_still_refuses_a_caller_with_no_credential(config, long_lived):
+    """No widening: the route this adds a caller to is the one it always was."""
+    cfg.ensure_secret(config)
+    with started(config):
+        client = client_for(config)
+        assert client.post("/api/assistant/rotate", json={}).status_code == 401
+        assert client.post(
+            "/api/assistant/rotate", headers=bearer("not-a-credential"), json={},
+        ).status_code == 401
+        assert assistant.status().generation == 1, "nothing rotated"

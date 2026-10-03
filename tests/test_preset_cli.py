@@ -10,8 +10,7 @@ the preset:
 
 - preset args (plus ``--checkout``/``--service`` derived from the preset
   fields) are prepended to argv, so explicit flags override them;
-- preset ``env`` is applied only over keys that are unset or ``.env``-sourced,
-  never over exported environment variables (but it does beat ``.env`` files);
+- explicit exports beat preset ``env``, which beats ``.env`` defaults;
 - the merged argument set is re-validated, so a preset can also fail the
   normal mutual-exclusion checks.
 
@@ -193,29 +192,30 @@ class TestPresetPrecedence:
             f"got {captured.get('LMER_CHECKOUT_BRANCH')!r}"
         )
 
-    def test_exported_env_beats_preset_env(self, presets_file, tmp_path):
-        """An exported LMER_LLM_NAME wins over the preset's env entry."""
+    @pytest.mark.parametrize("key,exported,preset", [
+        ("LMER_LLM_NAME", "sonnet", "opus"),
+        ("LMER_REASONING_EFFORT", "low", "xhigh"),
+    ])
+    def test_exported_env_beats_preset_env(self, presets_file, tmp_path, key, exported, preset):
+        presets_file.write_text(json.dumps({"demo": {"env": {key: preset}}}))
         captured: dict = {}
         rc = _run_main(
             ["--preset", "demo", *_EXEC_ARGS],
             env_in={
                 "LMER_PRESETS_FILE": str(presets_file),
-                "LMER_LLM_NAME": "sonnet",
+                key: exported,
             },
             captured_env=captured,
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_LLM_NAME") == "sonnet", (
-            "Exported environment must win over preset env; "
-            f"got {captured.get('LMER_LLM_NAME')!r}"
-        )
+        assert captured.get(key) == exported
 
     def test_preset_env_beats_dotenv_value(
         self, presets_file, tmp_path, monkeypatch
     ):
         """A preset env entry overrides the same key sourced from a .env file
-        (preset > .env, but < exported env)."""
+        (preset > .env)."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".env").write_text("LMER_LLM_NAME=from-dotenv\n")
         captured: dict = {}
@@ -230,6 +230,24 @@ class TestPresetPrecedence:
             "Preset env must win over a .env-file value; "
             f"got {captured.get('LMER_LLM_NAME')!r}"
         )
+
+    def test_explicit_model_flag_beats_preset_and_host(self, presets_file, tmp_path):
+        captured = {}
+        assert _run_main(
+            ["--preset", "demo", "--model", "haiku", *_EXEC_ARGS],
+            env_in={"LMER_PRESETS_FILE": str(presets_file), "LMER_LLM_NAME": "sonnet"},
+            captured_env=captured, home=tmp_path,
+        ) == 0
+        assert captured["LMER_LLM_NAME"] == "haiku"
+
+    def test_no_preset_preserves_host_effort(self, presets_file, tmp_path):
+        captured = {}
+        assert _run_main(
+            _EXEC_ARGS,
+            env_in={"LMER_PRESETS_FILE": str(presets_file), "LMER_REASONING_EFFORT": "high"},
+            captured_env=captured, home=tmp_path,
+        ) == 0
+        assert captured["LMER_REASONING_EFFORT"] == "high"
 
     def test_preset_args_are_revalidated(self, presets_file, tmp_path, capsys):
         """A preset arg that collides with an explicit flag fails the normal
@@ -460,7 +478,9 @@ class TestContainerUserFromDotenv:
     def _run_capturing_user(self, argv, env_in=None, home=None):
         captured_users: list = []
 
-        def _capture_base_run_args(runtime, exec_mode, container_user):
+        def _capture_base_run_args(
+            runtime, exec_mode, container_user, limits=None, gpu=None
+        ):
             captured_users.append(container_user)
             return []
 
@@ -1084,3 +1104,160 @@ class TestListPresets:
         assert "preset (demo)" in out, (
             f"--show-env must label preset-sourced vars; got: {out!r}"
         )
+
+
+@pytest.mark.parametrize("selector", ["flag", "env"])
+def test_resolved_preset_and_model_metadata_reach_the_container(presets_file, tmp_path, selector):
+    captured = {}
+    env = {"LMER_PRESETS_FILE": str(presets_file), "LMER_SESSION_PRESET": "stale"}
+    argv = ["--model", "requested-model", *_EXEC_ARGS]
+    if selector == "flag":
+        argv = ["--preset", "demo", *argv]
+        env["LMER_PRESET"] = "other"
+    else:
+        env["LMER_PRESET"] = "demo"
+    assert _run_main(argv, env_in=env, captured_env=captured, home=tmp_path) == 0
+    assert captured["LMER_SESSION_PRESET"] == "demo"
+    assert captured["LMER_LLM_NAME"] == "requested-model"
+
+
+def test_no_selected_preset_does_not_forward_an_inherited_label(tmp_path):
+    captured = {}
+    assert _run_main(_EXEC_ARGS, env_in={"LMER_SESSION_PRESET": "stale"},
+                     captured_env=captured, home=tmp_path) == 0
+    assert captured.get("LMER_SESSION_PRESET") is None
+
+
+def test_resolved_preset_is_reported_by_show_env(presets_file, tmp_path, capsys):
+    assert _run_main(["--show-env", "--preset", "demo"],
+                     env_in={"LMER_PRESETS_FILE": str(presets_file)}, home=tmp_path) == 0
+    output = capsys.readouterr().out
+    assert "LMER_SESSION_PRESET" in output and "demo" in output
+
+
+def test_resolved_preset_has_an_explicit_container_passthrough():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "src/lmer_cli/cli.py").read_text()
+    assert '"LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET")' in source
+
+
+class TestScopedResourceLimitsAgainstPresets:
+    """The point of issue #453: a taskdef's allocation survives model/preset
+    selection, whichever preset the supervising assistant picks that day."""
+
+    @pytest.fixture
+    def resource_presets(self, tmp_path):
+        path = tmp_path / "resource-presets.json"
+        path.write_text(
+            json.dumps({
+                "astra": {"env": {"LMER_LLM_NAME": "opus", "LMER_MEMORY": "9g"}},
+                "plain": {"env": {"LMER_LLM_NAME": "opus"}},
+            })
+        )
+        return path
+
+    def _limits(self, argv, env_in, tmp_path):
+        """The resource plan main() hands to base_run_args."""
+        captured: list = []
+
+        def _capture(runtime, exec_mode, container_user, limits=None, gpu=None):
+            captured.append(limits)
+            return []
+
+        env = {**_BASE_ENV, **env_in, "HOME": str(tmp_path)}
+        with patch.dict(os.environ, env, clear=True):
+            with _make_main_mocks():
+                with patch("lmer_cli.cli.base_run_args", side_effect=_capture):
+                    from lmer_cli.cli import main
+
+                    rc = main(argv)
+        assert rc == 0, f"main() must succeed; rc={rc}"
+        assert captured and captured[0] is not None
+        return {limit.flag: (limit.value, limit.source) for limit in captured[0]}
+
+    def test_a_presets_own_memory_does_not_displace_the_taskdef_value(
+        self, resource_presets, tmp_path
+    ):
+        """Scope specificity still decides between distinct environment keys."""
+        limits = self._limits(
+            ["--preset", "astra", "develop", REPO_URL, "--exec", "true"],
+            {
+                "LMER_PRESETS_FILE": str(resource_presets),
+                "LMER_DEVELOP_MEMORY": "4g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_the_presets_memory_is_what_applies_when_nothing_is_more_specific(
+        self, resource_presets, tmp_path
+    ):
+        """The other half of the case above: the preset's value really does
+        reach the environment, so the test above is a comparison and not a
+        preset that was inert all along."""
+        limits = self._limits(
+            ["--preset", "astra", "develop", REPO_URL, "--exec", "true"],
+            {"LMER_PRESETS_FILE": str(resource_presets)},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("9g", "LMER_MEMORY")
+
+    def test_a_dotenv_scoped_value_beats_an_exported_general_one(self, tmp_path):
+        """Specificity over source tier, in the combination that makes the
+        feature worth having: the scoped value is in a file and the general one
+        is exported, and the scoped one still wins."""
+        (tmp_path / ".env").write_text("LMER_DEVELOP_MEMORY=4g\n")
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            limits = self._limits(
+                ["develop", REPO_URL, "--exec", "true"],
+                {"LMER_MEMORY": "2g"},
+                tmp_path,
+            )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_the_same_value_applies_with_no_preset_at_all(self, tmp_path):
+        limits = self._limits(
+            ["develop", REPO_URL, "--exec", "true"],
+            {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "4g"},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_a_flag_beats_the_ladder_the_preset_could_not_reach(
+        self, resource_presets, tmp_path
+    ):
+        limits = self._limits(
+            [
+                "--preset", "astra", "--memory", "16g",
+                "develop", REPO_URL, "--exec", "true",
+            ],
+            {
+                "LMER_PRESETS_FILE": str(resource_presets),
+                "LMER_MEMORY": "2g",
+                "LMER_DEVELOP_MEMORY": "4g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("16g", "--memory")
+
+    def test_another_taskdef_keeps_the_general_limit(self, tmp_path):
+        limits = self._limits(
+            ["review", REPO_URL, "--exec", "true"],
+            {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "4g"},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("2g", "LMER_MEMORY")
+
+    def test_the_repo_tier_reaches_the_launch(self, tmp_path):
+        """The per-taskdef-per-repo spelling, end to end: owner/repo derives
+        OWNER_REPO and outranks both the taskdef and the general value."""
+        limits = self._limits(
+            ["develop", REPO_URL, "--exec", "true"],
+            {
+                "LMER_MEMORY": "2g",
+                "LMER_DEVELOP_MEMORY": "4g",
+                "LMER_DEVELOP__OWNER_REPO__MEMORY": "8g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("8g", "LMER_DEVELOP__OWNER_REPO__MEMORY")

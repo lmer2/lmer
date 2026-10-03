@@ -297,7 +297,7 @@ def test_runs_on_a_fresh_orchestrator_explains_the_scope(platform_root, capsys):
 
 
 def test_adopt_then_runs_then_forget(platform_root, capsys):
-    assert daemon.main(["adopt", "gitlab.example.com/agents/global/develop-issue-141"]) == 0
+    assert daemon.main(["--workspace-id", "general", "adopt", "gitlab.example.com/agents/global/develop-issue-141"]) == 0
     # The key, which is what was typed and what the index holds. Not
     # `…/runs/<slug>`: these verbs touch no directory, and for a named run that
     # path is one nobody can open (T96).
@@ -319,7 +319,7 @@ def test_adopt_then_runs_then_forget(platform_root, capsys):
 
 
 def test_adopt_warns_when_the_run_is_not_in_the_mirror(platform_root, capsys):
-    daemon.main(["adopt", "gitlab.example.com/agents/global/nowhere"])
+    daemon.main(["--workspace-id", "general", "adopt", "gitlab.example.com/agents/global/nowhere"])
     assert "no such run dir is in the mirror" in capsys.readouterr().err
 
 
@@ -366,6 +366,77 @@ def test_runs_candidates_lists_the_shared_repo(platform_root, capsys, monkeypatc
     assert "these are everyone's, not the fleet view" in out
     assert "tracked] gitlab.example.com/agents/global/runs/mine" in out
     assert "-] gitlab.example.com/colleague/home/runs/theirs" in out
+
+
+# --- the CLI twin of /api/runs/candidates folds identities the same way ------
+#
+# Two surfaces answering "is this directory tracked" have to answer it the same
+# way, or the operator gets one answer from `lmer platform runs --candidates`
+# and the other from the HTTP route about the same directory — and acting on
+# the CLI's answer writes the second index row the fold exists to prevent
+# (!269 review round 2).
+
+CANDIDATE_PRIMARY = "gitlab.example.com/acme/widgets"
+CANDIDATE_SECONDARY = "github.com/acme/widgets"
+
+
+def _register_widgets_for_daemon(config):
+    """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 1\nname: example-plexus\nprojects:\n  widgets:\n"
+        f"    repo: {CANDIDATE_PRIMARY}\n    remotes: [{CANDIDATE_SECONDARY}]\n",
+        encoding="utf-8",
+    )
+
+
+def test_runs_candidates_folds_both_sides_like_the_http_route(
+    platform_root, capsys, monkeypatch
+):
+    """A row tracked under the project's SECONDARY remote, and the walk keying
+    the same directory on the PRIMARY: raw pairs never match, so this listing
+    offered for adoption a run the platform already had."""
+    from lmer_platform import runs as run_index
+    from lmer_platform.config import load as load_config
+    from lmer_platform.workrepo import RunDirRef
+
+    config = load_config()
+    _register_widgets_for_daemon(config)
+    secondary_host, secondary_project = CANDIDATE_SECONDARY.split("/", 1)
+    run_index.track(secondary_host, secondary_project, "review-mr-1",
+                    source="adopted")
+    primary_host, primary_project = CANDIDATE_PRIMARY.split("/", 1)
+    monkeypatch.setattr(daemon, "run_dirs", lambda config: [
+        RunDirRef(primary_host, primary_project, "review-mr-1", platform_root),
+    ])
+
+    daemon.main(["runs", "--candidates"])
+    out = capsys.readouterr().out
+
+    assert "[tracked]" in out, (
+        "the CLI listing offered for adoption a directory already tracked "
+        f"under one of its own remotes; the HTTP route calls it tracked:\n{out}"
+    )
+
+
+def test_runs_candidates_still_offers_a_genuinely_untracked_run(
+    platform_root, capsys, monkeypatch
+):
+    """The converse, so folding both sides here is not a widening."""
+    from lmer_platform.config import load as load_config
+    from lmer_platform.workrepo import RunDirRef
+
+    config = load_config()
+    _register_widgets_for_daemon(config)
+    primary_host, primary_project = CANDIDATE_PRIMARY.split("/", 1)
+    monkeypatch.setattr(daemon, "run_dirs", lambda config: [
+        RunDirRef(primary_host, primary_project, "review-mr-2", platform_root),
+    ])
+
+    daemon.main(["runs", "--candidates"])
+    out = capsys.readouterr().out
+
+    assert "[      -]" in out
 
 
 def test_runs_candidates_empty_mirror_is_explained(platform_root, capsys):
@@ -507,6 +578,116 @@ def test_spawn_verb_treats_a_held_run_like_capacity(platform_root, capsys,
     )
     assert daemon.main(["spawn", "develop", "t"]) == 1
     assert "run is held" in capsys.readouterr().err
+
+
+# --- resume verb ------------------------------------------------------------
+
+RESUME_RUN = "gitlab.example.com/agents/global/develop-141"
+
+
+def _fake_resume_result(**overrides):
+    from lmer_platform.resume import ResumeResult
+
+    payload = {
+        "host": "gitlab.example.com", "project": "agents/global",
+        "slug": "develop-141", "taskdef": "develop", "target": "issue-141",
+        "continued": True, "started_slug": "develop-141",
+        "session": _fake_result(),
+        "rel_path": "agents/global/_runs/develop-141/20260824-165230-2-31245",
+    }
+    payload.update(overrides)
+    return ResumeResult(**payload)
+
+
+def test_resume_verb_reports_the_run_it_continued(platform_root, capsys,
+                                                  monkeypatch):
+    monkeypatch.setattr(daemon, "resume_run", lambda c, r: _fake_resume_result())
+    assert daemon.main(["resume", RESUME_RUN]) == 0
+
+    out = capsys.readouterr().out
+    assert "resumed gitlab.example.com/agents/global/runs/develop-141" in out
+    assert "session : s-1 (pid 4242)" in out
+
+
+#: The two spellings of one launch's address: the id the container minted, and
+#: the ``<session-id>--<name>`` the naming rename produced. Both are what a fleet
+#: row can show, so both have to survive the terminal unchanged — the resolution
+#: is ``resume._require_session``'s job, not this parser's.
+SESSION_SPELLINGS = [
+    pytest.param("20260824-165230-2-31245", id="bare id"),
+    pytest.param("20260824-165230-2-31245--auth-rate-limit", id="named record"),
+]
+
+
+@pytest.mark.parametrize("session_id", SESSION_SPELLINGS)
+def test_resume_verb_passes_the_named_launch_through(platform_root, monkeypatch,
+                                                     session_id):
+    """The flag has to reach ``ResumeRequest.session_id``, not merely parse.
+
+    A ``--session`` that argparse accepts and nobody reads is the worst shape
+    this can take: the resume continues whichever launch the run resolves to —
+    the newest — and reports success about a record the operator did not name.
+    """
+    seen = {}
+
+    def capture(config, request):
+        seen["request"] = request
+        return _fake_resume_result()
+
+    monkeypatch.setattr(daemon, "resume_run", capture)
+    daemon.main([
+        "resume", RESUME_RUN, "--session", session_id,
+        "--prompt", "finish the migration",
+        "--repo", "https://gitlab.example.com/agents/global.git",
+    ])
+    request = seen["request"]
+
+    assert request.session_id == session_id
+    assert (request.host, request.project, request.slug) == (
+        "gitlab.example.com", "agents/global", "develop-141"
+    )
+    assert request.direction == "finish the migration"
+    assert request.repo_url == "https://gitlab.example.com/agents/global.git"
+
+
+def test_resume_without_a_session_continues_the_newest_launch(platform_root,
+                                                              monkeypatch):
+    """Omitted is ``None``, which is what ``resume_run`` reads as "the record the
+    run resolves to" — the one-tap continue, and the only behaviour a terminal
+    had before the flag existed."""
+    seen = {}
+
+    def capture(config, request):
+        seen["request"] = request
+        return _fake_resume_result()
+
+    monkeypatch.setattr(daemon, "resume_run", capture)
+    daemon.main(["resume", RESUME_RUN])
+
+    assert seen["request"].session_id is None
+
+
+def test_resume_verb_refuses_an_unresolvable_session_with_its_list(
+    platform_root, capsys, monkeypatch
+):
+    """The refusal an operator actually hits: an id that names no launch here.
+
+    Exit 2 because the remedy is a different id, and the message is passed
+    through rather than restated — ``resume.SessionNotFound`` is the only thing
+    that knows which launches the group holds.
+    """
+    from lmer_platform.resume import SessionNotFound
+
+    refusal = SessionNotFound(
+        "agents/global/_runs/develop-141 holds no session 'nope' — this run's "
+        "launches are: 20260824-165230-2-31245"
+    )
+    monkeypatch.setattr(
+        daemon, "resume_run",
+        lambda c, r: (_ for _ in ()).throw(refusal),
+    )
+    assert daemon.main(["resume", RESUME_RUN, "--session", "nope"]) == 2
+    assert "launches are: 20260824-165230-2-31245" in capsys.readouterr().err
 
 
 # --- lmer CLI dispatch ------------------------------------------------------

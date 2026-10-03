@@ -27,6 +27,7 @@ its registry entry reaped by the watcher thread, so any assertion about a
 import contextlib
 import json
 import os
+import re
 import signal
 import threading
 import stat
@@ -37,9 +38,10 @@ from dotenv import dotenv_values
 
 from lmer_cli import cli, resolve
 from lmer_cli.harness import HARNESSES
+from lmer_cli.mounts import MOUNT_LINK_MARKER
 from lmer_platform import assistant
 from lmer_platform import config as cfg
-from lmer_platform import memory, registry, runs, spawn, store
+from lmer_platform import connectors, memory, registry, runs, spawn, store
 from tests.conftest import strip_lmer_env
 
 
@@ -1310,27 +1312,16 @@ def test_an_installed_host_defers_to_the_container(config, long_lived, monkeypat
         assert status.running is True
 
 
-def test_a_host_whose_workers_fill_the_cap_refuses_the_assistant(
-    platform_root, fake_lmer
+def test_a_host_whose_workers_fill_the_cap_starts_the_assistant(
+    platform_root, fake_lmer, long_lived
 ):
-    """The assistant's slot is reserved, not conjured (T75).
-
-    ``max_concurrent_sessions`` counts workers and the assistant is not one of
-    them — but workers already holding every slot are holding the one it wanted
-    too, so the start is refused with the numbers and the setting to raise. The
-    daemon starts the assistant before it serves anything, so in practice it is
-    first; this refusal is for the manual start on a host that came up busy.
-    """
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
 
-    with pytest.raises(assistant.AssistantCapacityError) as caught:
-        assistant.start(config)
-    assert caught.value.status == 429
-    assert "max_concurrent_sessions (1)" in str(caught.value)
-    assert "1/1" in str(caught.value), "the numbers belong in the refusal"
-    assert "Free a worker slot" in str(caught.value), "name what to free"
-    assert events_of("assistant_start_refused")[-1]["data"]["reason"] == "cap_reached"
+    with started(config) as status:
+        assert status.running is True
+        assert spawn._live_worker_count() == 1
+        assert events_of("assistant_start_refused") == []
 
 
 def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer,
@@ -1354,12 +1345,18 @@ def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer
             kill(worker.pid)
 
 
-def test_a_capacity_refusal_leaves_the_state_untouched(platform_root, fake_lmer):
+def test_start_at_capacity_carries_the_existing_handoff_and_pending(
+    platform_root, fake_lmer, long_lived
+):
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
-    with pytest.raises(assistant.AssistantCapacityError):
-        assistant.start(config)
-    assert assistant.read_state().generation == 0
+    assistant.set_handoff("The worker is waiting on review")
+    assistant.notify("A question opened")
+    pending = assistant.read_state().pending
+    with started(config) as status:
+        assert status.generation == 1
+        assert status.handoff == "The worker is waiting on review"
+        assert assistant.read_state().pending == pending
 
 
 def test_a_dead_worker_does_not_block_the_assistant(platform_root, fake_lmer,
@@ -1818,7 +1815,7 @@ def test_the_env_file_lands_in_an_owner_only_directory(config, monkeypatch):
     directory = assistant.env_file_path().parent
     directory.chmod(0o755)
 
-    path, _reach = assistant._prepare_environment(config)
+    path, _reach, _credential = assistant._prepare_environment(config)
     assert path is not None, "the env file did not write at all"
     mode = stat.S_IMODE(directory.stat().st_mode)
     assert mode == 0o700, f"the state dir is mode {mode:o}"
@@ -1927,7 +1924,9 @@ def test_an_unwritable_env_file_costs_the_credentials_not_the_chat(
 ORCHESTRATE_ROUTES = (
     "/api/state",
     "/api/sessions",
-    "/api/sessions/{id}/input",
+    # Since the unified channel (#407) the assistant's steering verb posts a
+    # record on the session's bus; `/input` keeps the keystroke form only.
+    "/api/sessions/{id}/comms",
     "/api/sessions/{id}/messages",
     "/api/sessions/{id}/ask/{qid}/answer",
     "/api/runs/answer",
@@ -1964,6 +1963,18 @@ def orchestrate_prose():
     single tokens and read the same either way.
     """
     return " ".join(orchestrate_instructions().split())
+
+
+def orchestrate_section_of(phrase):
+    """The `##` section of the instructions holding *phrase*, whitespace-joined.
+
+    Rendering proves a paragraph is in the text; it cannot prove the text around
+    it does not tell the session to skip it. Section membership can.
+    """
+    sections = re.split(r"^## ", orchestrate_instructions(), flags=re.M)
+    holding = [s for s in sections if phrase in " ".join(s.split())]
+    assert len(holding) == 1, f"{phrase!r} is in {len(holding)} sections, expected 1"
+    return " ".join(holding[0].split())
 
 
 def test_the_taskdef_documents_the_api_behind_the_cli(platform_root):
@@ -2186,6 +2197,13 @@ def test_the_taskdef_only_advertises_an_api_it_was_actually_given(
         "the CLI reads the same two variables, so a session that was given "
         "neither has no more use for it than for the routes"
     )
+    # Issue #423, the other direction: what the session *has* is not conditional
+    # on the API, and the unreachable incarnation is the one with nothing else.
+    for fact in ("the same tokens every normal run gets", "fully functional clone"):
+        assert fact in " ".join(rendered.split()), (
+            f"{fact!r} reaches only one kind of session; a host with no API has "
+            "nothing but `/work` and a forge token to answer from"
+        )
 
 
 def render_unreachable_taskdef(monkeypatch, reason):
@@ -2302,6 +2320,7 @@ def test_start_with_no_settings_is_todays_behaviour(config, long_lived):
             assert task.get(key) is None
         assert assistant.status().settings == {
             "model": None, "harness": None, "preset": None, "agents": None,
+            "threads": [],
         }
     # ``started`` SIGKILLs the stub and returns; the registry entry goes when the
     # spawn's watcher thread records the exit, which is asynchronous — so this
@@ -2542,7 +2561,95 @@ def test_the_status_body_carries_the_store(platform_root):
     """``to_dict`` is what ``GET /api/assistant`` answers with."""
     body = assistant.status().to_dict()
     assert body["memory"]["path"] == str(memory.memory_dir())
-    assert set(body["memory"]) == {"path", "files", "bytes", "truncated", "large"}
+    assert set(body["memory"]) == {
+        "path", "files", "bytes", "truncated", "large", "link",
+    }
+
+
+def test_a_store_with_no_recorded_link_says_so_rather_than_guessing(platform_root):
+    """``None`` is the honest answer when no incarnation has left the fact."""
+    assert assistant.status().memory["link"] is None
+
+
+def test_the_status_carries_what_the_container_recorded_about_the_link(
+    platform_root,
+):
+    """The fact a host measurement cannot reach: whether the declared memory
+    path was actually put onto this store."""
+    directory = memory.prepare_memory_dir()
+    (directory / MOUNT_LINK_MARKER).write_text(
+        "schema=1\ndeclared=/home/developer/.claude/x\n"
+        f"staged={memory.CONTAINER_STAGED_DIR}\nlinked=no\n"
+        "detail=cannot create the parent directory\nat=2026-09-03T12:00:00Z\n",
+        encoding="utf-8",
+    )
+
+    reported = assistant.status().memory
+    assert reported["files"] == 0, "the marker is not one of the store's files"
+    assert reported["link"]["linked"] is False
+    assert "parent directory" in reported["link"]["detail"]
+
+
+def write_link_marker(directory, *, at="2026-09-03T12:00:00Z", linked="yes"):
+    (directory / MOUNT_LINK_MARKER).write_text(
+        "schema=1\ndeclared=/home/developer/.claude/x\n"
+        f"staged={memory.CONTAINER_STAGED_DIR}\nlinked={linked}\n"
+        f"detail=linked\nat={at}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_link_record_older_than_the_running_session_is_flagged_stale(
+    config, long_lived,
+):
+    """Only a session that ran the linker rewrites the marker, so one whose image
+    predates it leaves the previous incarnation's answer sitting there."""
+    write_link_marker(memory.prepare_memory_dir(), at="2020-01-01T00:00:00Z")
+    assistant.start(config)
+
+    assert assistant.status().memory["link"]["stale"] is True
+
+
+def test_a_link_record_this_session_wrote_is_not_stale(config, long_lived):
+    write_link_marker(memory.prepare_memory_dir(), at="2099-01-01T00:00:00Z")
+    assistant.start(config)
+
+    assert assistant.status().memory["link"]["stale"] is False
+
+
+@pytest.mark.parametrize("at, started", [
+    ("not-a-timestamp", "2026-09-03T17:00:00Z"),
+    ("2026-09-03T17:00:00Z", "nope"),
+    ("2026-09-03T17:00:00.500Z", "2026-09-03T17:00:00Z"),
+    ("2026-09-03T17:00:01+00:00", "2026-09-03T17:00:00Z"),
+    ("", "2026-09-03T17:00:00Z"),
+], ids=["marker unreadable", "session unreadable", "marker has millis",
+        "marker has an offset", "marker empty"])
+def test_a_timestamp_it_cannot_read_is_unanswerable_rather_than_current(at, started):
+    """A lexicographic compare answers confidently for input it cannot judge —
+    `"not-a-timestamp" < started` is a definite "current". The differently-shaped
+    stamps are the drift case between the container's `date` and `TS_FORMAT`."""
+    snapshot = {"link": {"linked": True, "at": at}}
+
+    out = assistant._with_link_age(snapshot, {"started_at": started})
+
+    assert out["link"]["stale"] is None
+
+
+def test_with_no_record_there_is_no_stale_key_to_read(platform_root):
+    """With no record the snapshot comes back untouched: `link` is null and
+    `stale` is not a key at all."""
+    out = assistant._with_link_age({"link": None}, {"started_at": "x"})
+
+    assert out["link"] is None
+
+
+def test_with_nothing_running_the_records_age_is_unanswerable(platform_root):
+    """`None` rather than `False`: "we cannot tell" and "it is current" are the
+    two answers this feature exists to stop conflating."""
+    write_link_marker(memory.prepare_memory_dir())
+
+    assert assistant.status().memory["link"]["stale"] is None
 
 
 def test_a_large_store_says_so_in_the_status(platform_root):
@@ -2576,6 +2683,81 @@ def test_the_taskdef_tells_the_assistant_where_its_memory_lives(platform_root):
     )
 
 
+def test_the_taskdef_states_the_credentials_and_the_writable_work_clone(
+    platform_root,
+):
+    """Issue #423. Both facts had to be repeated to live incarnations, which is
+    what missing from the starting context looks like: the file named only the
+    platform secret, so a session inferred a reader's forge credentials, and the
+    only thing it said about the work repo was which `work` verbs fail, so
+    `/work` read as a snapshot. The writer half is asserted with them — it is
+    the true half of the sentence the correction replaced.
+    """
+    text = orchestrate_prose()
+    assert "the same tokens every normal run gets" in text, (
+        "nothing says the assistant's forge credentials are an ordinary run's, "
+        "so it infers a reader's from the platform secret being the only one named"
+    )
+    assert "fully functional clone" in text and "not a frozen read view" in text, (
+        "`/work` reads as a view of the work repo unless it is called a clone"
+    )
+    assert "pulls and pushes with plain `git`" in text, (
+        "an assistant that is not told the clone is pushable routes an artifact "
+        "through a worker session instead of pushing it"
+    )
+    assert "Pull before you read anything time-sensitive" in text, (
+        "a clone from session start answers questions about runs that have moved"
+    )
+    # #423's own wording was "tell the owning run to pull before its next
+    # `work commit`"; that couples the notice to a commit that integrates the
+    # push by itself (commit_work_path is commit-FIRST). What the run cannot do
+    # by itself is *see* the file — its clone is a different clone.
+    assert "tell the owning run that the file is there" in text, (
+        "a push into a run's dir that the run is never told about is a file only "
+        "the next incarnation of that run might stumble on"
+    )
+    assert "its own clone needs a pull to see it" in text, (
+        "the run's clone is not this one, so the artifact is invisible there "
+        "until it pulls"
+    )
+    for verb in ("work log", "work commit", "work report"):
+        assert f"`{verb}`" in text, (
+            f"`{verb}` is a writer that genuinely fails, and the clone correction "
+            "must not read as making every `work` write available"
+        )
+    # Measured on a repo-less invocation: the writers exit 1, and `work state`,
+    # `ledger`, `goals`, `resume` and `sessions` print `No run context` and exit 0
+    # — a silent no-op that reads like an empty run, which is the worse failure.
+    assert "The readers are worse" in text and "exit **0**" in text, (
+        "an assistant told only the writers are gone runs `work state` to answer "
+        "'what is that run doing', gets a clean exit, and reports the run empty"
+    )
+    assert "no flag points one at another run" in text, (
+        "there is no --run/--slug/--host/--project on any `work` subparser, so "
+        "'no run context' is not something a flag can supply"
+    )
+    # The push is the half that fails silently often: every writer in the repo
+    # goes commit-first -> pull --rebase -> push (git_ops._push_with_rebase_retries),
+    # because a pull-first sequence refuses outright on a dirty tree.
+    assert "commit first, then `pull --rebase`, then push" in text, (
+        "a bare push into this repo is rejected non-fast-forward whenever any "
+        "other session has pushed since the clone, which on a live fleet is the "
+        "common case"
+    )
+    # Issue #423 asked for these facts next to the platform-API section. Inside
+    # it, the unreachable branch's closing "skip the rest of this section" covers
+    # them — on precisely the host that has nothing but `/work` and a token.
+    section = orchestrate_section_of("Your credentials are an ordinary run's")
+    assert "skip the rest of this section" not in section, (
+        "these two facts share a section with an instruction to skip the rest of "
+        "it; they need their own heading (or a place above that section)"
+    )
+    assert "fully functional clone" in section, (
+        "the two facts belong to one section — splitting them lets a future "
+        "edit move one back under the skip instruction"
+    )
+
+
 def test_the_memory_walk_does_not_run_under_the_publication_lock(
     platform_root, monkeypatch
 ):
@@ -2602,3 +2784,215 @@ def test_the_memory_walk_does_not_run_under_the_publication_lock(
     monkeypatch.setattr(memory, "measure", lambda directory=None: probe())
     assistant.status()
     assert held == [False], "the lock was held while the store was measured"
+
+
+# --- a thread another run holds (issue #413) --------------------------------
+#
+# uber lmer starts through the same spawn as every worker, so the
+# one-live-session-per-thread rule reaches it too — but its ``threads`` come
+# from two different places and the layer decides the posture: an explicit ask
+# is refused, the standing list defers so the orchestrator still comes up.
+
+HELD_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
+
+
+class _ThreadFake:
+    def __init__(self, argv, env):
+        self.argv, self.env, self.pid, self.returncode = list(argv), dict(env), os.getpid(), None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.fixture
+def thread_component(platform_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        connectors.thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"),
+    )
+    built = connectors.ThreadConnectors(
+        runner=lambda argv, env, log_path=None, *, pass_fds=(): _ThreadFake(argv, env),
+        environ={"SLACK_BOT_TOKEN": "xoxb-test"},
+        slack_client=lambda token: _ThreadSlack(),
+        clock=lambda: 0.0,
+    )
+    connectors.register_connectors(built)
+    yield built
+    built.stop()
+    connectors.register_connectors(None)
+
+
+class _ThreadSlack:
+    def get_replies(self, channel, ts, oldest=None):
+        return [{"ts": ts}]
+
+
+def worker_holding(component, link=HELD_LINK, *, session_id="s-worker"):
+    """A live worker session with *link* connected, as the operator would see it."""
+    registry.register(
+        session_id,
+        kind="worker",
+        pid=os.getpid(),
+        run={"host": "gitlab.example.com", "project": "agents/global", "slug": "develop-412"},
+        task={"taskdef": "develop", "target": "issue-412"},
+        control={
+            "host": "127.0.0.1",
+            "port": 8123,
+            "token_ref": str(spawn.token_file_for(session_id)),
+        },
+        started_at="2026-09-05T09:00:00Z",
+    )
+    spawn.token_file_for(session_id).write_text("control-token", encoding="utf-8")
+    component.connect(session_id, link, by="operator")
+    return session_id
+
+
+def test_an_explicitly_asked_for_thread_that_is_held_refuses_the_start(
+    config, thread_component, long_lived,
+):
+    worker_holding(thread_component)
+
+    with pytest.raises(assistant.AssistantThreadHeld) as caught:
+        assistant.start(config, settings={"threads": [HELD_LINK]})
+
+    assert caught.value.status == 409
+    assert "develop-412" in str(caught.value)
+    assert assistant.status().running is False, "nothing was started"
+    assert [e["data"]["reason"] for e in events_of("assistant_start_refused")] == [
+        "thread_held"
+    ]
+
+
+def test_a_held_thread_in_the_standing_list_still_lets_the_assistant_up(
+    config, thread_component, long_lived,
+):
+    """The orchestrator must come back up. The thread is recorded rather than
+    connected, so the pane can show it as not running with the holder named, and
+    it attaches by itself once the worker lets go."""
+    cfg.update_stored({"assistant_threads": [HELD_LINK]})
+    worker_holding(thread_component)
+
+    with started(config) as status:
+        assert status.running is True
+        assert [
+            record["permalink"]
+            for record in thread_component.records(status.session_id)
+        ] == [HELD_LINK]
+
+
+def test_a_rotation_may_name_the_threads_the_incumbent_itself_holds(
+    config, thread_component, long_lived,
+):
+    """The incumbent is about to stop, so its own claim must not refuse the
+    rotation that replaces it."""
+    with started(config) as first:
+        thread_component.connect(first.session_id, HELD_LINK, by="operator")
+
+        rotated = assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        try:
+            assert rotated.running is True
+            assert rotated.session_id != first.session_id
+        finally:
+            kill(rotated.pid)
+            wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+def test_a_thread_taken_during_the_rotation_does_not_cost_the_assistant(
+    config, thread_component, long_lived, monkeypatch,
+):
+    """The window between `stop()` and the respawn belongs to nobody.
+
+    A spawn or a live connect landing in it takes the thread on
+    `connectors._lock`, which does not serialise against this module's `_LOCK` —
+    so a `start()` that asked again would answer for a moment the caller never
+    saw, and its answer would be "no assistant at all". The question is settled
+    once, before the stop; the thread comes back as a deferred connection.
+    """
+    real_stop = assistant.stop
+
+    with started(config) as first:
+        thread_component.connect(first.session_id, HELD_LINK, by="operator")
+
+        def stop_then_lose_the_thread(**kwargs):
+            stopped = real_stop(**kwargs)
+            thread_component.drop_session(first.session_id)
+            worker_holding(thread_component)
+            return stopped
+
+        monkeypatch.setattr(assistant, "stop", stop_then_lose_the_thread)
+        rotated = assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        try:
+            assert rotated.running is True
+            assert [
+                record["permalink"]
+                for record in thread_component.records(rotated.session_id)
+            ] == [HELD_LINK]
+        finally:
+            kill(rotated.pid)
+            wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+def test_a_refused_rotation_has_its_own_history_and_keeps_the_incumbent(
+    config, thread_component, long_lived, caplog,
+):
+    with started(config) as first:
+        worker_holding(thread_component)
+        with pytest.raises(assistant.AssistantThreadHeld):
+            assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        assert assistant.status().session_id == first.session_id
+        assert assistant.status().running
+        events = events_of("assistant_rotate_refused")
+        assert len(events) == 1
+        assert events[0]["data"]["reason"] == "thread_held"
+        assert "develop-412" in events[0]["data"]["detail"]
+        assert events_of("assistant_start_refused") == []
+        assert "platform_assistant_rotate_refused" in caplog.text
+
+
+def test_start_passes_the_configured_resource_flags(config, long_lived, monkeypatch):
+    """The assistant's own allocation reaches its launch (issue #453).
+
+    Asserted on the argv the start actually spawns rather than on the registry
+    entry, which records launch settings and not resource bounds: the claim is
+    that the container gets them, and argv is where that is true or not.
+    """
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MEMORY, "2g")
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_CPUS, "2")
+    seen: list = []
+    original = spawn.subprocess.Popen
+
+    def capture(*args, **kwargs):
+        seen.append(list(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    with started(config):
+        assert seen, "the start must have spawned something"
+        command = seen[0]
+        assert command[command.index("--memory") + 1] == "2g"
+        assert command[command.index("--cpus") + 1] == "2"
+
+
+def test_start_without_resource_settings_passes_no_such_flags(
+    config, long_lived, monkeypatch
+):
+    monkeypatch.delenv(cfg.ENV_ASSISTANT_MEMORY, raising=False)
+    monkeypatch.delenv(cfg.ENV_ASSISTANT_CPUS, raising=False)
+    seen: list = []
+    original = spawn.subprocess.Popen
+
+    def capture(*args, **kwargs):
+        seen.append(list(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    with started(config):
+        assert seen and "--memory" not in seen[0] and "--cpus" not in seen[0]

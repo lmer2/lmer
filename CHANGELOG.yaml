@@ -5,6 +5,443 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.10.0:
+  added:
+  - 'gpg-agent forwarding for `ansible`-taskdef sessions: sign and decrypt with the
+    host key, which never enters the container'
+  - "`lmer-schema validate <path>` checks a work repo against the lmer schema and\
+    \ prints an ordered fix-list: exit 0 clean, 1 errors, 2 unusable input. A tree\
+    \ with no manifest is checked at a lenient tier, so its output is a migration\
+    \ aid rather than a gate \u2014 warnings never block."
+  - '`lmer-schema --list-checks` prints every check code with its severity, its legacy-tier
+    severity where they differ, and what it reports. `--json` on either command emits
+    one document for tooling to consume.'
+  - '`_plexus.yaml` support: a work repo can now declare its own schema version, name
+    its projects (each with a primary `repo:`, additional `remotes:`, or no remote
+    at all), fold in its `sources:` declarations, and set a `housekeeping:` policy.
+    A repo without one keeps working exactly as before.'
+  - A project named in `_plexus.yaml` gets a short-name directory of its own, so a
+    project with several remotes lands in one tree however it was cloned. An unregistered
+    repo's work still lands under `{host}/{project}/` and is never renamed automatically.
+  - "`work sessions [--running] [--json]` lists the launches of a run \u2014 id, address,\
+    \ status, phase, and whether a record looks orphaned \u2014 so a crashed session\
+    \ can be found rather than mistaken for a finished one."
+  - '`work session-start --session <id>` and `work resume --session <id>` continue
+    a specific earlier launch instead of opening a new one.'
+  - "`lmer --session <id>` starts a container in an existing run record instead of\
+    \ opening a new one: the id names one launch inside the run's group (a session\
+    \ dir's `<session-id>`, or its full `<session-id>--<name>` as `work sessions`\
+    \ prints it), and everything in the container writes there. It is the only source\
+    \ \u2014 a host-exported or `.env` `LMER_SESSION_ID` is never forwarded, because\
+    \ every lmer container exports one and a session that spawned a child would otherwise\
+    \ hand the child its own record. A value that could not be a directory name is\
+    \ refused before the container starts."
+  - '`lmer platform resume --session <id>` and `lmer-ctl runs resume --session <id>`
+    say which launch of a run to continue from a terminal, the way `POST /api/runs/resume`
+    already could. Omitted, both continue the newest launch as before; an id that
+    names no launch of that run is refused with the list of the ones there are.'
+  - "`docs/SCHEMA.md`: the normative description of everything lmer reads and writes\
+    \ outside the code repos \u2014 every path, its writer, whether it is required,\
+    \ and how strictly it is checked."
+  - Added docs/HOW-LMER-WORKS.md, a one-page end-user overview of how lmer's components
+    interact, with diagrams and the design's strong points
+  - The run view, run list and uber lmer chat pane show a session's context use, 5h/7d
+    plan usage and effort
+  - The assistant memory store now reports whether the container actually linked it,
+    and whether that record is the running session's, so an empty store is diagnosable
+    instead of ambiguous.
+  - Service slots can be created, edited and removed from the fleet view, with the
+    same validation the rows report
+  - The fleet view says when config.json could not be read, instead of showing a host
+    with no service slots
+  - 'Unified session communications: supervisor records fan out to connected channels;
+    inbound messages reach the harness with source tags.'
+  - '`lmer-signal` adds note, post, ask, wait, close and list verbs; bare text remains
+    a milestone.'
+  - Platform fleet and session communications APIs expose journaled records; connector
+    credentials bind posts to their registered channel.
+  - The chat pane shows source chips and message kinds across the session conversation;
+    agent posts and relayed inbound messages are drawn once.
+  - Host Slack and Matrix connectors serve thread targets; both provide standalone
+    entrypoints, and `lmer-matrix-listener` starts sessions from allowlisted mentions.
+  - Questions accept answers interchangeably from the platform, Slack and Matrix;
+    the first answer wins and is echoed to other channels.
+  - '`lmer-signal end-session` says goodbye on the bus and ends the session across
+    connected channels.'
+  - Platform spawns accept thread targets; uber lmer settings persist Slack and Matrix
+    threads across rotations, with independent connectors for every thread.
+  - A `chrome-agent` skill drives a real Chrome from inside the container over CDP,
+    with the escalation ladder, memory budget and teardown rules it needs to be used
+    safely.
+  - Xvfb and xdotool ship in the image, so browser work can run headed when a site
+    scores behaviour rather than input trust. Headless stays the default.
+  - '`chrome-agent-launch` starts a browser and records it as the session''s, so the
+    browsers a session leaves behind are stopped when it ends and no other session''s
+    are touched. Teardown during a run is still the skill''s job.'
+  - Connect and disconnect a running session to Slack and matrix threads from the
+    platform UI, the API and lmer-ctl
+  - Chat-thread connectors for platform-spawned sessions run as daemon processes that
+    reattach after a daemon restart
+  - Sessions can read and post into any Slack or matrix thread by permalink, without
+    connecting to it
+  - The platform and `lmer-ctl thread` can read and post a thread by permalink with
+    the daemon's own credentials
+  - A run can be pointed at reference threads from its thread menu or when it is spawned;
+    it is told about each once
+  - Answers may name one of a question's options by its 1-based index, on the bus,
+    both platform routes and lmer-ctl answer --option N
+  - 'A run can be given a brand-new Slack or matrix thread: name a channel in its
+    thread menu, with `lmer-ctl threads open`, or from inside the session with `lmer-signal
+    thread open`, and the root message is posted and the run connected in one step'
+  - A session can connect and disconnect its own chat threads with `lmer-signal thread
+    connect` / `disconnect`, without an operator at the control UI
+  - "Audit your Slack app before opening a thread: `lmer-signal thread open` (and\
+    \ the `open` route behind the UI prompt) refuses a bot token carrying `chat:write.public`\
+    \ by name, because that scope lets it post into channels nobody invited it to\
+    \ and suppresses the `not_in_channel` lmer relies on there. Remove the scope from\
+    \ the app's bot token scopes; the documented scope set needs no change. Connecting\
+    \ an existing thread is unaffected \u2014 it is guarded by Slack's own answer\
+    \ when the thread is read"
+  - Copy message source and fenced code from the platform chat views
+  - Keep the newest operator-chat entries with a saved retention setting, message
+    count, and unread indicator
+  - Show waiting, working, idle, or offline fleet state in the browser tab title
+  - Forget all completed, stopped runs from the fleet view after confirmation
+  - Projects can configure parallel test-runner overrides in the work repository,
+    selected by resource requirements with an explicit normal-runner override.
+  - Container memory and CPU limits can be set per taskdef and per repository, with
+    LMER_DEVELOP_MEMORY and LMER_DEVELOP__AGENTS_GLOBAL__MEMORY style variables
+  - --memory and --cpus set one launch's container limits, overriding the environment
+  - LMER_PLATFORM_ASSISTANT_MEMORY and LMER_PLATFORM_ASSISTANT_CPUS give the platform's
+    orchestrating assistant its own allocation
+  - '`lmer-signal dm` sends one private message to a Slack or matrix user, gated by
+    that transport''s host-side allow list: `LMER_SLACK_DM_ALLOWED_USERS` or `LMER_MATRIX_ALLOWED_USERS`'
+  - Added opt-in, task- and repository-scoped NVIDIA GPU passthrough for Docker and
+    Podman session containers
+  - 'Fleet view can be read as a constellation map: runs clustered by project, coloured
+    by run state, with a line between runs you have related. Switch between the map
+    and the list from the app bar; the choice is remembered, and the list stays the
+    default.'
+  - The fleet payload now carries every relation in the fleet, so the map draws its
+    edges without a request per run.
+  - Configure visual graph groups in Platform settings using ordered, case-insensitive text matches; unconfigured repositories keep their own clusters.
+  - "Every cluster the map draws is named \u2014 a run with no project committed yet\
+    \ reads `unidentified` instead of a dash."
+  - The map carries a legend for the tones it paints, the attention ring and the relation
+    line, and a hovered star names the run, its state and its project.
+  - 'uber lmer is not drawn on the map: it is the session supervising the runs rather
+    than one of them. The app bar''s robot control is painted from its state instead,
+    and says on hover what it is doing or what it needs.'
+  - Slack and Matrix mentions and threaded replies to assistant DMs can reach Uber
+    Lmer with source context and replay protection.
+  - uber lmer can rotate itself with `lmer-ctl rotate`, writing its successor's handover
+    in the same command.
+  - A context-fullness threshold, off by default, that has the daemon recommend a
+    rotation before uber lmer's window fills.
+  - The platform daemon receives Slack and Matrix assistant requests without standalone
+    listeners and reports ingress health in the API and UI.
+  - '`chat_show_transcript` on `GET`/`POST /api/assistant/config`: the platform-side
+    switch for the uber lmer pane''s working transcript, stored in config.json.'
+  - Retain the assistant conversation across rotations, with paged history, original
+    attachment ownership, and guidance to recover missing context on demand.
+  - Agents can publish authorized rebased branches through gate-push using explicit
+    force-with-lease protection.
+  - Leased pushes require explicit human permission and a command-scoped approval
+    value of exactly 1 before any gates, source pinning or transport.
+  - Lease inspection displays transport/host/port and a branch commit, omitting URL
+    userinfo/path/query/fragment and captured Git failure output while disabling Git
+    diagnostic trace sinks.
+  - Leased pushes refuse custom remote service selectors and unsupported URL helpers
+    while retaining credential, proxy and SSH routing.
+  - Exposed read-only service-slot holdings across projects and per-project eligibility/current
+    availability, with a link to existing slot management.
+  - Added bounded peer UL discovery and standing-instruction reads, plus authenticated
+    native peer messages with explicit session addressing, provenance and durable
+    send receipts.
+  - Added named project workspaces with independent uber lmer context, durable assistant
+    admission, project-bound routing, inactive run moves, project navigation/settings,
+    archive/restore and slot applicability.
+  - Routed Slack and Matrix bot mentions by case-insensitive leading project name,
+    defaulting unbound plain mentions to General while preserving ownership, durable
+    request receipts and source-thread replies.
+  - Operators can assign a genuinely unowned inactive run to an active project, and
+    can forget a completed unassigned run without inventing a project for it
+  fixed:
+  - "`work log` no longer destroys a run's worklog when `log.yaml` cannot be parsed.\
+    \ Appending reads the whole file, adds the entry and writes it back \u2014 and\
+    \ an unparseable or non-list file read as an empty list, so the write replaced\
+    \ every entry already in the log with the single new one and `work log` printed\
+    \ its success tick over the top. Nothing warned first: displaying the log prints\
+    \ raw lines and never parses, so it read fine until the next append emptied it.\
+    \ A corrupt log is now moved aside as `log.yaml.bad-<utc>` and the append refuses,\
+    \ the way `release.yaml` has always behaved \u2014 a failed append that keeps\
+    \ your history beats a successful one that ate it. A file that merely cannot be\
+    \ read right now (a permissions or IO problem) is refused without being moved,\
+    \ and an empty file is still just the first append."
+  - '`lmer-schema validate` no longer reports findings from the legacy `{host}/{project}/{task_type}/{target}/`
+    tree, which the schema puts out of scope. A `runs/` directory left inside one
+    made the validator descend into it and report its contents as errors, so a tree
+    could fail validation entirely on the strength of a location the schema does not
+    check. Recognised by shape rather than by name, because `{task_type}` is whatever
+    `LMER_TASK` was and every one of those names is also a legal project name.'
+  - "A `_plexus.yaml` that puts `ref:` on a source that does not take one is now warned\
+    \ about. `ref:` is `sources.taskdef`'s alone, and a standalone `sources.yaml`\
+    \ has always refused it elsewhere \u2014 but the manifest accepted it silently,\
+    \ so it sat there taking effect nowhere. Nothing reads the manifest's `sources:`\
+    \ section yet; the warning exists now so that when something does, a manifest\
+    \ already carrying one is a warning to fix rather than a tree that refuses to\
+    \ start."
+  - A run directory move that fails no longer leaves an empty directory sitting on
+    the address it reached for. Both the re-slug and the initial seed created the
+    destination before the move and did not remove it when the move failed; because
+    a bare directory counts as that slug being taken, the next release run then quietly
+    took a stamped address (`<slug>-v1.2.3-<timestamp>`) for a run that had never
+    been created. A group directory another launch is already using is never removed.
+  - "In a schema-form work repo, a second launch of one run no longer removes the\
+    \ first launch's spec from the specs index. Index entries were named for the RUN,\
+    \ so two launches that nobody had named composed the same entry name and the second\
+    \ one silently re-pointed the first's entry at its own file (same day) or unlinked\
+    \ it outright (any other day) \u2014 the spec still on disk, gone from the index,\
+    \ nothing raised and nothing logged. Entry names in a schema-form tree now carry\
+    \ the launch's session id as well, which is the one component nobody chooses:\
+    \ `2026-08-25-develop-issue-353-20260824-165230-2-31245--spec.md`. The names are\
+    \ longer, deliberately \u2014 a long name that names one record beats a short\
+    \ one that hides another. Legacy work repos are untouched: one target has one\
+    \ run directory there, so their entry names are exactly what they were."
+  - "A run launched through one of a project's secondary `remotes:` is no longer tracked\
+    \ under one identity and listed under another. The launch URL decided the tracked\
+    \ identity while the record's directory is listed under the project's primary\
+    \ `repo:`, so one directory answered to two keys: the adoption picker offered\
+    \ back a run this orchestrator had just started, and adopting it \u2014 which\
+    \ the picker invites \u2014 gave that one directory two rows with separate titles\
+    \ and check-in marks. A second launch through the other remote was not recognised\
+    \ as the same run either, so the one-live-session-per-run refusal did not fire.\
+    \ The launch URL is now folded to the project's primary remote where the identity\
+    \ is derived. Best-effort throughout: no mirror, no manifest, a manifest this\
+    \ build cannot read, or a URL the registry does not know all leave the identity\
+    \ exactly as it was \u2014 the fold can cost itself, never the session."
+  - "Resuming a run, or answering one that stopped on a question, no longer opens\
+    \ a fresh empty record beside the record it continued. The platform resolved the\
+    \ launch you asked for, checked it, and then started a container that minted a\
+    \ new session id \u2014 so the run you resumed sat untouched with its question\
+    \ still standing, and the work repo grew a second, empty record for it that `work\
+    \ sessions` listed as another launch. The resolved record's id is now handed to\
+    \ the container, which writes in it; a resume that overrides the taskdef still\
+    \ starts a sibling run of its own, and legacy work repos are unaffected."
+  - "Container start no longer leaves an empty `<session-id>/` directory beside the\
+    \ record a resumed launch is about to write in \u2014 a named record (`<session-id>--<name>/`)\
+    \ meant the group showed two directories for one launch, with no way to tell which\
+    \ was the run."
+  - "`work memory persist` no longer deletes or overwrites memories belonging to other\
+    \ sessions. It used to mirror the memory directory into the work repo, so a session\
+    \ that had merely read a memory would delete it (if it never had it) or revert\
+    \ someone's edit to it (if it held an older copy) \u2014 a real loss on a shared\
+    \ work repo, in both the legacy and the new layout. Persist now merges: it acts\
+    \ only on files it was actually handed and has since changed or removed, and a\
+    \ session with no record of what it was given deletes nothing at all."
+  - '`work memory persist` no longer discards a retirement that empties a memory scope,
+    or leaves a retyped memory shadowing its own correction.'
+  - '`work memory persist` now applies a retirement of every memory at once, instead
+    of leaving them all in the work repo.'
+  - The crash digest no longer reports a run's state as never committed when the work-repo
+    mirror was simply a pull behind; the claim is checked against a refreshed mirror
+    first.
+  - A session the operator asked to wind down is no longer labelled crashed when it
+    exits, unless a watcher recorded that it exited badly. Its stale entry is cleaned
+    up rather than accumulating.
+  - Removing a session's registry entry can no longer be undone by an update already
+    in flight, which left the fleet view showing a deliberately stopped session as
+    crashed.
+  - A platform settings write no longer replaces config.json when the file exists
+    but cannot be read
+  - An open chat pane no longer draws a message twice when a late transcript row renumbers
+    the conversation underneath it.
+  - Alternate links to one thread connect once; Slack messages with equal timestamps
+    in different threads remain distinct.
+  - Invalid Slack timestamps are refused before platform session launch or assistant
+    rotation.
+  - The assistant's supervisor stamps its own replies as uber lmer without echoing
+    them into its PTY; workers remain agent-origin.
+  - Connectors wait for supervisor startup; Matrix also replays replies arriving between
+    its history snapshot and initial sync.
+  - '`lmer-ctl send` accepts path-leading prose; a lone command-shaped token points
+    to `lmer-ctl command` for execution.'
+  - Files arriving in a connected matrix thread are size-capped and written without
+    following a symlink, as Slack's already were
+  - 'Claude Code sessions no longer stop at the folder-trust or first-run onboarding
+    dialog: lmer pre-trusts the container workspace at every session start'
+  - Refused a second session attaching to a chat thread another live run holds, instead
+    of the two connectors stopping and restarting each other
+  - Questions and milestones from a session whose in-container CLI predates the unified
+    channel reach the operator and the orchestrator again
+  - Fan-out children no longer stall before startup when spawn-harness inherits an
+    open standard-input socket
+  - A thread post from another lmer session or the platform now reaches the run connected
+    to that thread instead of being skipped as an echo
+  - A run attaching to a thread a previous run held is now replayed that run's side
+    of the conversation, not only the human messages
+  - Connected sessions receive backlog notices instead of old messages; inbound typing
+    waits for the launcher to submit its startup command. (#432)
+  - Attach notices exclude marked connector status posts across reconnects and offer
+    a read command within the existing message limit. (#432)
+  - Made memory and work publication reject unsafe Git state and unapplied autostashes,
+    preserve unrelated edits and staging on refusal, and verify remote reachability.
+  - The assistant no longer receives digests of its own records; its milestones remain
+    in platform history.
+  - Platform history distinguishes a refused assistant rotation from a refused start.
+  - Sessions finish shutdown despite blocked terminal input; stuck teardown is reported
+    with a configurable grace, and terminal width is preserved. (#434)
+  - "Slack and matrix attachment notices name the session\u2019s launch preset and\
+    \ model."
+  - Terminal dialog input stays out of connected chat threads; prompt mirroring waits
+    for transcript confirmation within a configurable window.
+  - Sessions are notified on each chat thread disconnect or held-thread refusal, including
+    later losses after reconnecting.
+  - Launches refuse unverifiable thread identities so alternate links cannot bypass
+    an existing thread holder.
+  - Keep Slack and Matrix connector delivery recoverable across worker exceptions,
+    child replacement and module reloads, with exclusive ownership and explicit per-operation
+    recovery (#449).
+  - Preserve durable receipt ownership beyond echo-cache eviction and checkpoint failure,
+    recover interrupted send-marker and retry transitions, and include finalization
+    in the connector drain deadline (#449).
+  - Avoid connector shutdown deadlocks when SIGTERM interrupts polling, and honor
+    stop requests during reload finalization (#449).
+  - Bind platform connector leases and orphan recovery to the supervisor session instead
+    of the platform registry ID (#449).
+  - Matrix room creation preserves concurrent configuration edits when saving the
+    new room id.
+  - Isolated gate unit tests from operator policy and increased connector test timing
+    budgets for parallel test runs.
+  - Widened the Slack connector tests' drain and wait budgets so parallel gate runs
+    no longer fail on timing.
+  - Tests that spawn real processes now scale every wall-clock wait by one factor
+    and run on a single parallel worker.
+  - Quiet progress notes no longer clutter connected threads and keep listener-owned
+    sessions alive during long work.
+  - Connected threads acknowledge unanswered human messages with a delayed receipt
+    reaction instead of an extra message.
+  - Slack receipts bound DNS, I/O, and cleanup, preserve trusted CA files and directories,
+    and cancel correctly after slow sends or replies addressed to the same thread.
+  - Thread connectors recover safe pending sends automatically and expose host recovery
+    commands and actionable attention for parked sends (#482).
+  - Fixed uber lmer startup and rotation at full worker capacity while preserving
+    the worker limit and existing assistant continuity.
+  - Allowed operator-only retained conversation, terminal-log and ask-history reads
+    for unassigned sessions without granting project or mutation authority.
+  - Exposed unassigned recovery entries in operator-wide lists and limited Slack mention-prefix
+    removal to the authenticated bot identity.
+  - Kept recovered project assistants visible after platform restart by retiring superseded
+    crash rows from the fleet and distinguishing repository-free session identities,
+    while retaining current failures and history.
+  - Retained incoming transport events before acknowledgement, enforced operator-only
+    project sharing and durable request action context, and kept pre-effect refusals
+    retryable.
+  - Bound reopened assistant chats to their intended project and retained editable
+    queued drafts alongside previous conversation history.
+  - Kept connector-health-only events out of assistant digests and wake-ups while
+    preserving worker conversations and real supervision events.
+  - Retained mentions across unavailable Slack identity lookups, added operator parking
+    for uncertain replies without replay, and preserved staged attachments through
+    rotation.
+  - Fixed fleet startup reads after legacy-session migration by resolving nested inventory
+    session IDs while preserving existing and unassigned ownership.
+  - Kept every project visible in the sidebar, combined project chat and assistant
+    status, compacted the project toolbar, and moved platform settings to the global
+    header.
+  - Added All-project completed-run cleanup, accessible global toolbar tooltips, editable
+    collapsed project instructions, colored archive controls, scoped assistant selection,
+    simpler sidebar groups and adjacent numeric capacity inputs; removed redundant
+    project detail badges.
+  - Clarified the existing native peer reply and standing-instruction sharing workflow
+    without changing API permissions.
+  - Connected-thread mentions use the effective daemon endpoint, including CLI bind/port
+    overrides; delivery retry status survives connector restart (#528).
+  - Authorized source-thread worker launches retain safe request briefing and replies;
+    blocked requests expose receipt-preserving pending/operator recovery and refreshed
+    UI status (#530).
+  - Authorized routine commits no longer stop for blanket confirmation; required gates
+    and explicit user holds remain binding (#532).
+  - Daemon-owned Slack and Matrix connectors preserve relative credential-file paths
+    across child working-directory changes (#533).
+  - Service-mode agents stop for unexpected checkout state and ask the operator instead
+    of creating alternate worktrees (#531).
+  - Service review followups receive checkout inspection and authorized commit guidance
+    without repeating branch setup (#531).
+  - An unassigned run is labelled **Unassigned** instead of **Unavailable project**,
+    and its Move to project action now recovers it; move and forget errors appear
+    beside the control that was used
+  - Codex automated delivery uses a private shared backend to preserve model selection
+    and payload through latency menus, with native receipts and visible failures (#450).
+  - Codex digest wake-ups now reach active conversations, coalescing pending notifications
+    without draining the spool (#450).
+  - Empty Codex exec wrapper rows collapse while prose, useful output, errors and
+    raw details remain available (#450).
+  - Container rule-reading guidance now points to installed files instead of unavailable
+    host shortcuts (#450).
+  - Codex platform sessions report dated token and quota usage and preserve run-scoped
+    preferences across container replacements.
+  - Codex usage strips show consumed context and main account windows, with persistent
+    optional details and matching assistant status.
+  - Preset environment overrides host file defaults across session launches while
+    preserving explicit exports and invocation controls, and resolved reasoning effort
+    appears beside the model in platform run views.
+  changed:
+  - 'Agent memory now routes by a memory''s own `metadata.type`: `project` memories
+    stay with their project, while `user`, `feedback` and `reference` memories go
+    to a work-repo-wide scope shared by every project, so a fact about you is recalled
+    everywhere rather than only where you learned it. Recall reads both. A work repo
+    without `_plexus.yaml` keeps one scope and behaves as before.'
+  - In a schema-form work repo each launch owns its own record directory, so two sessions
+    on the same target no longer interleave in one directory and either can be resumed
+    by name. The legacy layout is read and written exactly as before, in the same
+    place.
+  - The fleet view, the resume flow and the work CLI read both layouts, so a work
+    repo can be migrated without a flag day and mixed states resolve.
+  - Container start, the session hooks and the harness shells accept the schema's
+    `_agents/claude` and `_agents/mirrors` locations alongside the existing `agent-files/`
+    and `mirrors/`.
+  - Service slot definitions take effect on the next poll instead of needing a daemon
+    restart
+  - Only `0`, `no`, or `false` disable `LMER_COMMS_TERMINAL_MIRROR`; `off` uses the
+    default and leaves mirroring enabled.
+  - '`lmer-ctl send` posts a source-tagged bus message; `lmer-ctl command` runs a
+    slash command.'
+  - Slack bot and Matrix account credentials remain with host connectors and never
+    enter chat containers.
+  - Containers receive only the control credential digest; the supervisor mints a
+    separate session credential that cannot publish records as a human.
+  - Thread messages answer questions only through explicit replies, matching options,
+    or the first free-text reply after an optionless question.
+  - A chat-thread connector announces itself in the thread on attach and says so when
+    it stops listening
+  - A connector attaching to a thread with history replays the whole backlog as one
+    message instead of one per message
+  - The orchestrate taskdef states the assistant's credentials are an ordinary run's
+    and that /work is a pushable clone, not a read view (#423)
+  - "The orchestrate taskdef no longer claims the work CLI can read a run \u2014 its\
+    \ readers exit 0 saying 'No run context' (#423)"
+  - The chat taskdef now names `gitlab-review` / `github-review` for issue and merge-request
+    work, and keeps failed commands out of the connected thread (#442)
+  - A verbose launch now reports the container limits it resolved and which setting
+    supplied each one
+  - A containerized platform now forwards the container resource limits from the host,
+    so they reach the sessions it spawns
+  - 'Breaking: inbound Slack DMs now require `LMER_SLACK_DM_ALLOWED_USERS`; unset
+    or empty refuses everyone, as it does for outbound Slack DMs and both directions
+    on matrix'
+  - The uber lmer pane draws the conversation only by default; tool calls, watch events,
+    hook re-prompts and unposted prose sit muted behind a settings switch.
+  - 'The reply-routing Stop hook checks the ending turn only: a posted turn passes
+    whatever follows, and a turn that wrote nothing may end empty.'
+  deprecated:
+  - '`lmer-ask` and `lmer-slack post` forward to `lmer-signal` for one release; Slack
+    history, watch and poll yield to automatic inbound turns.'
+  - Steering through `POST /api/sessions/{id}/input` becomes a bus message for one
+    release; use `POST /api/sessions/{id}/comms`.
+  removed:
+  - The pre-wired Playwright MCP server and its `mcp__playwright__*` pre-approval.
+    lmer now ships no MCP server; Playwright itself and its browsers stay in the image.
 0.9.0:
   added:
   - "`lmer-matrix-bridge`: reach one platform daemon from a Matrix room \u2014 a run\

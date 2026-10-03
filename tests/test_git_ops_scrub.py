@@ -81,20 +81,41 @@ class TestScrubCredentials:
 class TestPushWithRebaseRetries:
     """The retry path prints on every attempt — each line is a leak site."""
 
-    def test_no_credential_in_any_failure_line(self, monkeypatch, capsys, tmp_path):
-        monkeypatch.setattr(git_ops, "run_git_command", _fixed_result(1, FATAL))
+    @pytest.mark.parametrize("failure", ["pull", "push", "fetch", "merge-base"])
+    def test_no_credential_in_any_failure_line(self, monkeypatch, capsys, tmp_path, failure):
+        def fake_git(cmd, cwd, check=True):
+            if cmd[0] == failure:
+                return 1, FATAL
+            if cmd[0] == "for-each-ref":
+                return 0, "origin\0refs/heads/main\n"
+            return 0, "refs/heads/main\n" if cmd[0] == "symbolic-ref" else ""
+
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+        monkeypatch.setattr(git_ops, "_git_directory", lambda *args: tmp_path)
+        monkeypatch.setattr(git_ops, "run_git_command", fake_git)
         rc = git_ops._push_with_rebase_retries(tmp_path, "work repo")
         err = capsys.readouterr().err
         assert rc == 1
         assert SAMPLE not in err
         assert "oauth2:" not in err
-        # Every printed line is still a usable diagnostic.
-        assert "git pull --rebase warning" in err
-        assert "git push rejected" in err
-        assert f"git push failed after {git_ops.PUSH_RETRIES} attempts" in err
-        assert err.count("git.example.com/agents/work.git") >= git_ops.PUSH_RETRIES
+        assert "failed" in err
+        assert "git.example.com/agents/work.git" in err
+        expected = {
+            "pull": "git pull --rebase failed",
+            "push": "git push failed after",
+            "fetch": "post-push git fetch failed",
+            "merge-base": "remote reachability check failed",
+        }
+        assert expected[failure] in err
+        if failure == "push":
+            assert err.count("git.example.com/agents/work.git") >= git_ops.PUSH_RETRIES
+            for attempt in range(1, git_ops.PUSH_RETRIES + 1):
+                assert f"attempt {attempt}/{git_ops.PUSH_RETRIES}" in err
 
     def test_successful_push_prints_nothing(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+        monkeypatch.setattr(git_ops, "_verify_published", lambda *args: 0)
+        monkeypatch.setattr(git_ops, "_publication_destination", lambda *args: ("origin", "refs/heads/main"))
         monkeypatch.setattr(git_ops, "run_git_command", _fixed_result(0, ""))
         assert git_ops._push_with_rebase_retries(tmp_path, "work repo") == 0
         assert capsys.readouterr().err == ""
@@ -143,7 +164,12 @@ class TestClaimPushOnce:
 class TestCommitPaths:
     """The staging/commit failures print git output too (work repo and napkin)."""
 
+    @pytest.fixture(autouse=True)
+    def snapshot(self, monkeypatch):
+        monkeypatch.setattr(git_ops, "_index_snapshot", lambda repo: (repo / ".test-index", None))
+
     def test_work_repo_add_failure_is_scrubbed(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
         (tmp_path / "notes.md").write_text("x\n")
         monkeypatch.setattr(git_ops, "run_git_command", _fixed_result(1, FATAL))
@@ -154,6 +180,7 @@ class TestCommitPaths:
         assert SAMPLE not in err
 
     def test_napkin_add_failure_is_scrubbed(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
         napkin = tmp_path / "napkin"
         (napkin / ".git").mkdir(parents=True)
         monkeypatch.setenv("LMER_NAPKIN_PATH", str(napkin))

@@ -42,6 +42,19 @@ The 📦 (container) and ⚡ (danger zone) indicators previously appended by
 the ``claude-status`` bash wrapper are preserved here and are not part of
 the configurable segment list.
 
+Publishing the status document (issue #248)
+-------------------------------------------
+This process is the only one that sees these numbers, so after printing
+the line it also publishes them as a JSON document into
+``$LMER_STATUS_DIR`` for the platform to read — format and rationale in
+``docs/SESSION-STATUS.md``. No variable, no directory, no document.
+
+The publish deliberately ignores ``LMER_STATUSLINE`` (that selects what
+the *terminal line* renders; the platform strip is composed platform-side,
+so trimming the line must not blank the strip — operator decision on
+#248), and it never affects the line: it happens after the print and
+swallows every failure.
+
 Constraints (this runs on every status render): stdlib only, no network,
 no project imports, and the only subprocesses are up to two short-timeout
 git calls — run only when the repo/branch segments are configured. Every
@@ -57,6 +70,7 @@ import math
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 # A status render must never stall the session on a slow/hung git.
 GIT_TIMEOUT_SECONDS = 2
@@ -74,6 +88,29 @@ SIZE_KEYS = ("context_window_size", "size", "max_tokens")
 
 # Rendered when LMER_STATUSLINE is unset/blank — the pre-#121 line.
 DEFAULT_SEGMENTS = ("repo", "branch", "task", "ctx")
+
+# Container-side directory the platform mounts for this session's status
+# document, and the document's name inside it. Absent is ordinary: only a
+# platform-spawned session has the mount.
+STATUS_DIR_ENV = "LMER_STATUS_DIR"
+STATUS_FILENAME = "status.json"
+
+# The document format spoken here (docs/SESSION-STATUS.md) and the harness it
+# is published on behalf of.
+STATUS_SCHEMA = 1
+STATUS_HARNESS = "claude"
+
+# Short labels for the usage windows this renderer knows the names of, and the
+# order they read in. A *label* table, deliberately not an allowlist: what is
+# published is whatever ``rate_limits`` carries (see :func:`limit_keys`), since
+# those keys are Claude Code's to name and a renamed one would otherwise be
+# dropped silently.
+STATUS_LIMIT_LABELS = {"five_hour": "5h", "seven_day": "7d"}
+
+# How many windows one document may carry. Mirrors the platform reader's own
+# cap, so an implausible payload cannot grow a file the platform then refuses
+# for its size.
+STATUS_LIMIT_CAP = 8
 
 
 # ---------------------------------------------------------------------------
@@ -189,26 +226,80 @@ def cost_text(payload) -> str | None:
     return None if usd is None else f"${usd:.2f}"
 
 
-def rate_limit_text(payload, window: str, label: str) -> str | None:
-    """A usage-limit segment (``5h 24%``) from ``rate_limits.<window>``;
-    None when the payload carries no such window (e.g. non-subscription
-    sessions)."""
+def limit_keys(payload) -> list:
+    """Usage-window keys to publish, in reading order.
+
+    Labelled ones first, then every other key ``rate_limits`` carries — a window
+    this renderer has never heard of is published unlabelled rather than
+    dropped. Capped, since the payload is somebody else's data structure.
+    """
+    if not isinstance(payload, dict):
+        return []
+    limits = payload.get("rate_limits")
+    if not isinstance(limits, dict):
+        return []
+    known = [key for key in STATUS_LIMIT_LABELS if key in limits]
+    rest = [
+        key for key in limits
+        if isinstance(key, str) and key and key not in STATUS_LIMIT_LABELS
+    ]
+    return (known + rest)[:STATUS_LIMIT_CAP]
+
+
+def _limit_window(payload, window: str) -> dict | None:
+    """The ``rate_limits.<window>`` object, or None when absent/malformed.
+
+    Absent is the ordinary case: the payload carries ``rate_limits`` only on
+    subscription sessions and only after the first API response, and Claude Code
+    drops a window once its reset time passes.
+    """
     if not isinstance(payload, dict):
         return None
     limits = payload.get("rate_limits")
     if not isinstance(limits, dict):
         return None
     entry = limits.get(window)
-    if not isinstance(entry, dict):
+    return entry if isinstance(entry, dict) else None
+
+
+def limit_percent(payload, window: str) -> int | None:
+    """Percentage of the ``<window>`` usage limit consumed, 0–100."""
+    entry = _limit_window(payload, window)
+    if entry is None:
         return None
     percent = _number(entry.get("used_percentage"))
-    if percent is None:
+    return None if percent is None else _clamp_percent(percent)
+
+
+def limit_resets_at(payload, window: str) -> int | None:
+    """Unix epoch seconds at which the ``<window>`` usage limit resets.
+
+    Independently absent from ``used_percentage``, so a window reports one, both
+    or neither. Non-positive values are dropped: an epoch of 0 renders as 1970,
+    which reads as a window that reset long ago.
+    """
+    entry = _limit_window(payload, window)
+    if entry is None:
         return None
-    return f"{label} {_clamp_percent(percent)}%"
+    resets = _number(entry.get("resets_at"))
+    if resets is None or resets <= 0:
+        return None
+    return int(resets)
 
 
-def effort_text(payload) -> str | None:
-    """The reasoning-effort segment from ``effort.level``, e.g. ``eff high``."""
+def rate_limit_text(payload, window: str, label: str) -> str | None:
+    """A usage-limit segment (``5h 24%``) from ``rate_limits.<window>``;
+    None when the payload carries no such window (e.g. non-subscription
+    sessions)."""
+    percent = limit_percent(payload, window)
+    return None if percent is None else f"{label} {percent}%"
+
+
+def effort_level(payload) -> str | None:
+    """The reasoning-effort level from ``effort.level``, e.g. ``high``.
+
+    Absent whenever the session's model takes no effort parameter.
+    """
     if not isinstance(payload, dict):
         return None
     effort = payload.get("effort")
@@ -216,8 +307,14 @@ def effort_text(payload) -> str | None:
         return None
     level = effort.get("level")
     if isinstance(level, str) and level.strip():
-        return f"eff {level.strip()}"
+        return level.strip()
     return None
+
+
+def effort_text(payload) -> str | None:
+    """The reasoning-effort segment from ``effort.level``, e.g. ``eff high``."""
+    level = effort_level(payload)
+    return None if level is None else f"eff {level}"
 
 
 def duration_text(payload) -> str | None:
@@ -314,6 +411,44 @@ def build_line(
     return line
 
 
+def status_document(payload, *, updated: str) -> dict:
+    """The status document (``docs/SESSION-STATUS.md``, schema 1) for *payload*.
+
+    Each of the three optional blocks is present only when the payload carries
+    it, which is what lets the platform treat absence as "not reported" instead
+    of zero. *updated* is passed in rather than read from the clock so this
+    stays a pure function. Not a rendering of the status *line*: everything here
+    is published whatever ``LMER_STATUSLINE`` says.
+    """
+    document = {
+        "schema": STATUS_SCHEMA,
+        "harness": STATUS_HARNESS,
+        "updated": updated,
+    }
+    percent = context_percent(payload)
+    if percent is not None:
+        document["context"] = {"percent": percent}
+    limits = []
+    for window in limit_keys(payload):
+        percent = limit_percent(payload, window)
+        if percent is None:
+            continue
+        entry = {"key": window, "percent": percent}
+        label = STATUS_LIMIT_LABELS.get(window)
+        if label:
+            entry["label"] = label
+        resets_at = limit_resets_at(payload, window)
+        if resets_at is not None:
+            entry["resets_at"] = resets_at
+        limits.append(entry)
+    if limits:
+        document["limits"] = limits
+    level = effort_level(payload)
+    if level is not None:
+        document["effort"] = {"level": level}
+    return document
+
+
 # ---------------------------------------------------------------------------
 # Impure gatherers — every one fails open by returning None on any error.
 # ---------------------------------------------------------------------------
@@ -356,6 +491,50 @@ def gather_branch(cwd: str) -> str | None:
 def gather_task() -> str | None:
     """Task segment: LMER_TASK."""
     return os.environ.get("LMER_TASK", "").strip() or None
+
+
+def _utc_now() -> str:
+    """Now, as the UTC ISO-8601 the platform's wire format uses."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def publish_status(document: dict, directory: str) -> bool:
+    """Write *document* into *directory*, atomically. False on any failure.
+
+    Atomic because the reader is another process across a bind mount and this
+    runs on every render: a torn file reads as a session with no status rather
+    than as a write in progress.
+    """
+    target = os.path.join(directory, STATUS_FILENAME)
+    temporary = f"{target}.{os.getpid()}.tmp"
+    try:
+        handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream)
+        os.replace(temporary, target)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def publish_if_mounted(payload) -> bool:
+    """Publish the status document when the platform mounted a directory for it.
+
+    The directory must already exist — it is one half of a mount the platform
+    made, so creating one here would leave a document in a container-private
+    directory nobody reads.
+    """
+    directory = os.environ.get(STATUS_DIR_ENV, "").strip()
+    if not directory or not os.path.isdir(directory):
+        return False
+    return publish_status(status_document(payload, updated=_utc_now()), directory)
 
 
 # Segment name → gatherer. Called only for configured segments, so the git
@@ -410,6 +589,13 @@ def main() -> int:
     except Exception:
         line = ""
     print(line)
+
+    # After the line and swallowing everything: the platform's copy (#248) is an
+    # errand, and the status line must not depend on a mount or a disk.
+    try:
+        publish_if_mounted(payload)
+    except Exception:
+        pass
     return 0
 
 

@@ -438,6 +438,173 @@ def test_the_fleet_payload_did_not_grow_a_file_list(platform_root, mirror):
     assert not {"files", "run_files"} & fields, sorted(fields)
 
 
+# --- the schema-form session record (issue #353, D22) ------------------------
+#
+# In schema form the unit of record is the SESSION: one launch owns
+# ``<project>/_runs/<slug>/<session-id>[--<name>]/`` and ``<project>`` is the
+# registered short name, a flat top-level dir with no host segment (D7). So the
+# path this route links is no longer derivable from the ``(host, project, slug)``
+# it is asked with — it is the *address* the ref carries
+# (``RunDirRef.rel_path``), and the tests below pin that the reply renders that
+# address and never re-composes one. The run's identity is unchanged: the same
+# host, project and slug the tracked index has always carried.
+#
+# Real trees and the real resolver throughout, as everywhere else in this file:
+# a route that renders an address it was handed and a resolver that records the
+# address it found are two halves of one link, and a stubbed ref would prove
+# only that the halves each work in isolation.
+
+#: A session id in the schema-form grammar: timestamp-first, so ``ls`` lists
+#: launches in start order (docs/SCHEMA.md).
+SESSION_ID = "20260824-165230-2-31245"
+#: The registered short name the fixture's repo resolves to — the address; HOST
+#: and PROJECT above stay the identity (D8).
+SHORT_NAME = "widgets"
+SESSION_REL = f"{SHORT_NAME}/_runs/{SLUG}/{SESSION_ID}"
+
+
+@pytest.fixture
+def session_mirror(tmp_path):
+    """A mirror in schema form: one registered project, one session dir.
+
+    The registry entry binds ``widgets/`` to the very repo the legacy fixture
+    files its runs under, so the route is asked the same ``(host, project,
+    slug)`` in both shapes and only the address moves.
+    """
+    root = tmp_path / "schema-mirror"
+    root.mkdir()
+    (root / "_plexus.yaml").write_text(
+        "schema: 1\n"
+        "name: example-plexus\n"
+        "projects:\n"
+        f"  {SHORT_NAME}:\n"
+        f"    repo: https://{HOST}/{PROJECT}.git\n",
+        encoding="utf-8",
+    )
+    session = root / SHORT_NAME / "_runs" / SLUG / SESSION_ID
+    session.mkdir(parents=True)
+    for name in RUN_FILES:
+        (session / name).write_text("x\n", encoding="utf-8")
+    _git(root, "init", "-q", "-b", "main")
+    return root
+
+
+def test_a_session_dir_run_links_to_the_session_dir(platform_root, session_mirror):
+    """The whole record of one launch lives in the session dir, so that is the
+    directory a human opens — not the grouping level above it, which nothing is
+    ever written at (D22)."""
+    payload = _files(_client(_config(session_mirror))).json()
+    by_name = {entry["name"]: entry["url"] for entry in payload["files"]}
+
+    assert payload["present"] is True
+    assert payload["rel_path"] == SESSION_REL
+    assert payload["run"] == {"host": HOST, "project": PROJECT, "slug": SLUG}
+    assert payload["run_dir_url"] == f"{CLEAN_BASE}/-/tree/main/{SESSION_REL}"
+    assert by_name["spec.md"] == f"{CLEAN_BASE}/-/blob/main/{SESSION_REL}/spec.md"
+
+
+def test_a_session_dir_runs_links_are_still_scrubbed(platform_root, session_mirror):
+    """The load-bearing property does not belong to one tree shape: the second
+    shape moves the path, and the base it is joined to is the same tokenised
+    configured URL going through the same scrub."""
+    payload = _files(_client(_config(session_mirror))).json()
+
+    body = json.dumps(payload)
+    assert TOKEN not in body
+    assert "oauth2" not in body
+    assert CLEAN_BASE in body
+
+
+def test_a_named_session_dir_is_linked_under_the_name_it_was_frozen_into(
+    platform_root, session_mirror
+):
+    """The container's one name-bearing rename lands on the SESSION dir in this
+    shape (``<session-id>--<name>``), which is exactly the case a composed
+    address gets wrong — and the run is still asked for, and reported, by slug."""
+    session = session_mirror / SHORT_NAME / "_runs" / SLUG / SESSION_ID
+    named = session.with_name(f"{SESSION_ID}--the-name")
+    session.rename(named)
+    (named / "state.yaml").write_text(
+        f"schema: 1\nslug: {SLUG}\n", encoding="utf-8"
+    )
+
+    payload = _files(_client(_config(session_mirror))).json()
+
+    assert payload["run"] == {"host": HOST, "project": PROJECT, "slug": SLUG}
+    assert payload["rel_path"] == f"{SESSION_REL}--the-name"
+    assert payload["run_dir_url"] == (
+        f"{CLEAN_BASE}/-/tree/main/{SESSION_REL}--the-name"
+    )
+    assert payload["files"][0]["url"].startswith(
+        f"{CLEAN_BASE}/-/blob/main/{SESSION_REL}--the-name/"
+    )
+
+
+def test_the_bundle_inside_a_session_dir_is_listed_and_linked(
+    platform_root, session_mirror
+):
+    """A masterplan bundle is flat inside the session dir (D12), and it is part
+    of that launch's record — so it lists like any other file the run wrote,
+    under the session dir it sits in."""
+    bundle = session_mirror / SHORT_NAME / "_runs" / SLUG / SESSION_ID / "masterplan"
+    bundle.mkdir()
+    (bundle / "spec.md").write_text("# spec\n", encoding="utf-8")
+
+    payload = _files(_client(_config(session_mirror))).json()
+    by_name = {entry["name"]: entry["url"] for entry in payload["files"]}
+
+    assert by_name["masterplan/spec.md"] == (
+        f"{CLEAN_BASE}/-/blob/main/{SESSION_REL}/masterplan/spec.md"
+    )
+
+
+def test_a_host_bucket_session_dir_links_under_the_bucket(platform_root, tmp_path):
+    """A repo nobody has named yet keeps its work at ``{host}/{project}/`` (D9),
+    in the session shape. The bucket path is the address; nothing about it is
+    schema form, and the link still points at the dir on the forge."""
+    root = tmp_path / "bucket-mirror"
+    session = root / HOST / PROJECT / "_runs" / SLUG / SESSION_ID
+    session.mkdir(parents=True)
+    (session / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+    (session / "plan.md").write_text("# plan\n", encoding="utf-8")
+    _git(root, "init", "-q", "-b", "main")
+
+    payload = _files(_client(_config(root))).json()
+    rel = f"{HOST}/{PROJECT}/_runs/{SLUG}/{SESSION_ID}"
+
+    assert payload["rel_path"] == rel
+    assert payload["run_dir_url"] == f"{CLEAN_BASE}/-/tree/main/{rel}"
+    assert [entry["name"] for entry in payload["files"]] == ["plan.md", "state.yaml"]
+
+
+def test_a_legacy_run_in_a_project_that_also_holds_sessions_is_unmoved(
+    platform_root, mirror
+):
+    """Co-existence is real, not promised (D16): a project mid-migration holds
+    both areas, and the legacy run's address is byte-identical to what it always
+    was."""
+    (mirror / HOST / PROJECT / "_runs" / "develop-issue-2" / SESSION_ID).mkdir(
+        parents=True
+    )
+
+    payload = _files(_client(_config(mirror))).json()
+
+    assert payload["rel_path"] == REL
+    assert payload["run_dir_url"] == f"{CLEAN_BASE}/-/tree/main/{REL}"
+
+
+def test_reading_a_session_dirs_files_does_not_pull_the_mirror(
+    platform_root, session_mirror, monkeypatch
+):
+    """The no-pull rule is a property of the request path, not of the shape the
+    run happens to be stored in."""
+    pulls = []
+    monkeypatch.setattr(api, "pull", lambda *a, **k: pulls.append(a))
+
+    assert _files(_client(_config(session_mirror))).status_code == 200
+    assert pulls == []
+
+
 # --- where it is in the UI ---------------------------------------------------
 
 def test_the_file_list_is_in_the_overview_panel_rather_than_a_fifth_tab():

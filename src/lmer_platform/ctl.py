@@ -46,7 +46,10 @@ Answering — two routes, and never each other's::
 Steering::
 
     spawn TASKDEF TARGET            POST /api/sessions
-    send SESSION TEXT               POST /api/sessions/{id}/input
+    send SESSION TEXT               POST /api/sessions/{id}/comms
+    peers list                      GET  /api/assistant/peers
+    peers orders PROJECT --purpose TEXT   GET /api/assistant/peers/{id}/instructions
+    peers receipt REF               GET  /api/assistant/peers/receipts/{ref}
     wind-down SESSION               POST /api/sessions/{id}/wind-down
     exit SESSION                    POST /api/sessions/{id}/exit
     runs resume KEY                 POST /api/runs/resume
@@ -70,6 +73,8 @@ The assistant's own state::
     handoff get                     GET  /api/assistant/handoff
     handoff set TEXT                POST /api/assistant/handoff
     pending take                    POST /api/assistant/pending
+    rotate                          POST /api/assistant/handoff, then
+                                    POST /api/assistant/rotate
 
 A run is named by one ``host/project/slug`` key — see :func:`_run_fields`.
 
@@ -115,8 +120,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from pathlib import Path
 from typing import Any, Optional, Sequence
+
+from lmer_cli import routing_receipts, runref
 
 from lmer_platform.client import (
     Call,
@@ -158,6 +167,17 @@ ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
 EXIT_FAILURE = 1
+
+#: ``rotate``'s help, shown in both places argparse shows help (issue #446).
+_ROTATE_HELP = (
+    "Rotate YOURSELF: write the handover, then replace this incarnation with a "
+    "fresh context window (POST /api/assistant/handoff, then "
+    "POST /api/assistant/rotate). THIS CALL DOES NOT RETURN — the daemon ends "
+    "this container to start the successor, so a dropped connection is what "
+    "success looks like from here and the receipt is the next incarnation's "
+    "generation on `me`. Rotate at a breakpoint: no question of yours open, no "
+    "digest taken and not yet acted on, no half-finished brief."
+)
 
 #: One number for every verb, sized for the slowest rather than the typical: a
 #: spawn answers only once the container is up, and a fleet view may be served
@@ -277,13 +297,14 @@ def _run_fields(key: str) -> dict:
     emptiness or existence, so a key naming no run reaches the daemon and comes
     back as its refusal, which names the field it disliked.
     """
-    parts = key.split("/")
-    if len(parts) < 3:
+    parts = runref.split(key)
+    if parts is None:
         raise CtlError(
             f"{key!r} is not a run key — a run is named host/project/slug, as "
             "the fleet view names it (gitlab.example.com/group/project/develop-141)"
         )
-    return {"host": parts[0], "project": "/".join(parts[1:-1]), "slug": parts[-1]}
+    host, project, slug = parts
+    return {"host": host, "project": project, "slug": slug}
 
 
 # --- the verbs: one route each ----------------------------------------------
@@ -310,25 +331,75 @@ def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
         "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
-        "title", "description",
+        "title", "description", "targets",
     )))
+    if args.references:
+        body["references"] = [_reference_of(spec) for spec in args.references]
     return Call("POST", "/api/sessions", body=body)
 
 
+def _reference_of(spec: str) -> dict:
+    """``<permalink>[|<title>]`` — the one flag spelling that carries both.
+
+    A pipe because a permalink cannot contain one and a title can contain
+    anything else; split at the first, so a title with a pipe in it survives.
+    """
+    permalink, _, title = spec.partition("|")
+    reference = {"permalink": permalink.strip()}
+    if title.strip():
+        reference["title"] = title.strip()
+    return reference
+
+
 def _call_send(args) -> Call:
+    """Send on the bus; the server assigns worker or peer UL provenance."""
+    text = _text(args.text)
+    if args.no_newline:
+        return Call(
+            "POST",
+            f"/api/sessions/{args.session}/input",
+            body={"data": text, "append_newline": False},
+        )
+    if re.fullmatch(r"/[A-Za-z][\w-]*", text):
+        raise CtlError(
+            f"{text!r} looks like a harness command. To run it: "
+            f"lmer-ctl command {args.session} {text!r}. "
+            "To discuss it as prose, use lmer-ctl send with a sentence around it."
+        )
     return Call(
         "POST",
-        f"/api/sessions/{args.session}/input",
-        body={
-            "data": _text(args.text),
-            "append_newline": not args.no_newline,
-            # This command steers another session with prose. The supervisor
-            # must not execute a sentence beginning with a harness escape, but
-            # slash commands are deliberate on this orchestration path.
-            "sanitize": True,
-            "preserve_slash_commands": True,
-        },
+        f"/api/sessions/{args.session}/comms",
+        body={"kind": "message", "text": text, **_given(args, ("ref", "generation"))},
     )
+
+
+def _call_peers(args) -> Call:
+    if args.peer_action == "list":
+        return Call("GET", "/api/assistant/peers")
+    if args.peer_action == "orders":
+        return Call("GET", f"/api/assistant/peers/{args.project}/instructions",
+                    params=_given(args, ("purpose", "offset", "limit")))
+    return Call("GET", f"/api/assistant/peers/receipts/{args.ref}")
+
+
+def _call_command(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/comms",
+        body={"kind": "command", "text": _text(args.text)},
+    )
+
+
+def _call_comms(args) -> Call:
+    return Call(
+        "GET",
+        f"/api/sessions/{args.session}/comms",
+        params=_given(args, ("since", "timeout")),
+    )
+
+
+def _call_feed(args) -> Call:
+    return Call("GET", "/api/comms/feed", params=_given(args, ("since", "timeout", "session")))
 
 
 def _call_log(args) -> Call:
@@ -352,11 +423,90 @@ def _call_questions(args) -> Call:
 
 
 def _call_answer(args) -> Call:
+    if args.option is None and args.text is None:
+        raise CtlError(
+            "an answer needs the option's text or --option N, and this has neither"
+        )
+    if args.option is not None and args.text is not None:
+        # The bus refuses the pair too. Caught here so the words are still in
+        # front of the operator rather than in a 400 that does not quote them.
+        raise CtlError(
+            "an answer names its option by index or in its text, not both — "
+            f"drop one of --option {args.option} and {args.text!r}"
+        )
+    body: dict = {}
+    if args.text is not None:
+        body["answer"] = _text(args.text)
+    if args.option is not None:
+        body["option"] = args.option
     return Call(
         "POST",
         f"/api/sessions/{args.session}/ask/{args.question}/answer",
-        body={"answer": _text(args.text)},
+        body=body,
     )
+
+
+def _call_thread_read(args) -> Call:
+    return Call(
+        "GET",
+        "/api/comms/thread",
+        params={"permalink": _text(args.permalink), **_given(args, ("limit",))},
+    )
+
+
+def _call_thread_post(args) -> Call:
+    return Call(
+        "POST",
+        "/api/comms/thread",
+        body={"permalink": _text(args.permalink), "text": _text(args.text)},
+    )
+
+
+def _call_threads_list(args) -> Call:
+    return Call("GET", f"/api/sessions/{args.session}/threads")
+
+
+def _call_threads_connect(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/threads",
+        body={"permalink": _text(args.permalink)},
+    )
+
+
+def _call_threads_open(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/threads",
+        body={"channel": _text(args.channel), **_given(args, ("title",))},
+    )
+
+
+def _call_threads_references(args) -> Call:
+    return Call("GET", f"/api/sessions/{args.session}/references")
+
+
+def _call_threads_reference(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/references",
+        body={"permalink": _text(args.permalink), **_given(args, ("title",))},
+    )
+
+
+def _call_threads_unreference(args) -> Call:
+    return Call("DELETE", f"/api/sessions/{args.session}/references/{args.reference}")
+
+
+def _call_threads_disconnect(args) -> Call:
+    return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
+
+
+def _call_threads_recover(args) -> Call:
+    return Call("POST", f"/api/sessions/{args.session}/threads/{args.thread}/recover", body={
+        "action": args.action, "operation": args.operation, "remote_ref": args.remote_ref,
+        "acknowledge_duplicate": args.acknowledge_duplicate, "reason": args.reason,
+    })
 
 
 def _call_wind_down(args) -> Call:
@@ -389,7 +539,8 @@ def _call_runs_forget(args) -> Call:
 def _call_runs_answer(args) -> Call:
     return Call(
         "POST", "/api/runs/answer",
-        body={**_run_fields(args.key), "answer": _text(args.text)},
+        body={**_run_fields(args.key), "answer": _text(args.text),
+              **_given(args, ("slot", "home_revision", "confirm_project"))},
     )
 
 
@@ -398,7 +549,7 @@ def _call_runs_resume(args) -> Call:
         "POST", "/api/runs/resume",
         body={
             **_run_fields(args.key),
-            **_given(args, ("taskdef", "repo_url", "direction")),
+            **_given(args, ("taskdef", "repo_url", "direction", "session_id", "slot", "home_revision", "confirm_project")),
         },
     )
 
@@ -462,6 +613,49 @@ def _call_pending_take(args) -> Call:
     return Call("POST", "/api/assistant/pending", body={})
 
 
+def _call_rotate(args) -> list:
+    """The one verb that is two calls, and the order is the point (issue #446).
+
+    The handover is written **first**, through its own route, rather than ridden
+    into the rotate body it would also fit. What that buys is the refusal case: a
+    rotation the daemon declines — a thread the successor's settings ask for is
+    held, say — leaves the note stored anyway, so the operator's own rotate, or
+    the supervisor's respawn after a crash, is as briefed as the planned rotation
+    would have been. A note that travelled in the rotate body would have gone with
+    the refusal.
+
+    Omitting the note is allowed and means "carry the recorded one forward", which
+    is the route's own default; it is what a rotation *after* a separate
+    ``handoff set`` looks like.
+    """
+    calls = []
+    note = _handoff_note(args)
+    if note is not None:
+        calls.append(
+            Call("POST", "/api/assistant/handoff", body={"handoff": note})
+        )
+    calls.append(Call("POST", "/api/assistant/rotate", body={}))
+    return calls
+
+
+def _handoff_note(args) -> Optional[str]:
+    """The note a rotation carries, from whichever source named it.
+
+    Three sources for one value because a handover is the text most likely to
+    contain backticks, ``$`` and quotes: the flag, ``-`` for stdin (this CLI's
+    convention, :func:`_text`), and a file, which is what an agent that composed
+    the note in a scratch file already has.
+    """
+    if args.handoff_file is not None:
+        try:
+            return Path(args.handoff_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CtlError(f"cannot read the handover note ({exc})")
+    if args.handoff is None:
+        return None
+    return _text(args.handoff)
+
+
 # --- arguments ---------------------------------------------------------------
 
 def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
@@ -471,9 +665,12 @@ def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
     )
 
 
-def _add_text(parser: argparse.ArgumentParser, label: str) -> None:
+def _add_text(
+    parser: argparse.ArgumentParser, label: str, *, optional: bool = False
+) -> None:
     parser.add_argument(
         "text",
+        nargs="?" if optional else None,
         help=(
             f"{label} '-' reads it from stdin, which is what to use for anything "
             "multi-line or containing backticks, $ or quotes."
@@ -504,7 +701,53 @@ def create_parser() -> argparse.ArgumentParser:
             "answers only once the container is up."
         ),
     )
+    parser.add_argument("--workspace-id", default=os.environ.get("LMER_WORKSPACE_ID"),
+                        help="Explicit named project identity; inherited by project assistants.")
+    parser.add_argument("--request-id", help="Bind an action to its originating conversation request.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    workspaces = sub.add_parser("projects", help="Named workspaces, separate from forge repositories.")
+    workspace_sub = workspaces.add_subparsers(dest="project_command")
+    workspace_sub.add_parser("list").set_defaults(call=lambda _args: Call("GET", "/api/projects"))
+    create = workspace_sub.add_parser("create")
+    create.add_argument("name")
+    create.set_defaults(call=lambda args: Call("POST", "/api/projects", body={"name": args.name}))
+    context = workspace_sub.add_parser("context", help="Explicit read-only fleet excerpt with named provenance.")
+    context.add_argument("source_workspace_id")
+    context.set_defaults(call=lambda args: Call("GET", "/api/project-context", params={"source_workspace_id": args.source_workspace_id}))
+    relay = workspace_sub.add_parser("relay", help="Relay the supplied text, with source project provenance.")
+    relay.add_argument("destination_id")
+    relay.add_argument("text")
+    relay.set_defaults(call=lambda args: Call("POST", "/api/project-relay", body={"destination_id": args.destination_id, "text": _text(args.text)}))
+    for action in ("archive", "restore"):
+        command = workspace_sub.add_parser(action)
+        command.add_argument("identity")
+        command.set_defaults(call=lambda args, action=action: Call("POST", f"/api/projects/{args.identity}/{action}"))
+    move = workspace_sub.add_parser("move-run")
+    _add_run_key(move)
+    move.add_argument("destination_id")
+    move.add_argument("--home-revision", type=int, required=True)
+    move.set_defaults(call=lambda args: Call("POST", "/api/runs/move", body={**_run_fields(args.key), "destination_id": args.destination_id, "home_revision": args.home_revision}))
+
+    requests = sub.add_parser("requests", help="Source-bound conversation requests.")
+    requests_sub = requests.add_subparsers(dest="requests_command")
+    requests_list = requests_sub.add_parser("list")
+    requests_list.set_defaults(call=lambda _args: Call("GET", "/api/assistant/requests"))
+    requests_reply = requests_sub.add_parser("reply")
+    requests_reply.add_argument("identity")
+    requests_reply.add_argument("text")
+    requests_reply.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/reply",
+                                                      body={"text": _text(args.text)}))
+    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining uncertain delivery.")
+    requests_park.add_argument("identity")
+    requests_park.add_argument("reason")
+    requests_park.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/park",
+                                                     body={"reason": _text(args.reason)}))
+    requests_release = requests_sub.add_parser("release", help="Operator-only: release a blocked request with no uncertain effects.")
+    requests_release.add_argument("identity")
+    requests_release.add_argument("reason")
+    requests_release.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/release",
+                                                        body={"reason": _text(args.reason)}))
 
     status = sub.add_parser(
         "status",
@@ -540,6 +783,18 @@ def create_parser() -> argparse.ArgumentParser:
     spawn.add_argument(
         "--repo-url", dest="repo_url", help="Overrides the host default."
     )
+    spawn.add_argument(
+        "--target-thread", dest="targets", action="append",
+        help="Slack or matrix thread permalink to connect (repeatable).",
+    )
+    spawn.add_argument(
+        "--reference-thread", dest="references", action="append", metavar="PERMALINK[|TITLE]",
+        help=(
+            "A thread the run should know about without being connected to it "
+            "(repeatable). It is told once and reads or posts it with "
+            "`lmer-signal read` / `post --thread`."
+        ),
+    )
     spawn.add_argument("--preset", help="A preset name from spawn-options.")
     spawn.add_argument("--agents", help="Fan-out spec for --agents.")
     spawn.add_argument("--harness", help="claude, codex, pi — whatever the host has.")
@@ -562,18 +817,68 @@ def create_parser() -> argparse.ArgumentParser:
     send = sub.add_parser(
         "send",
         help=(
-            "Type into a live session — this is how a /followup is delivered "
-            "(POST /api/sessions/{id}/input)."
+            "Send a message to a live session on its bus; the agent sees it "
+            "tagged [uber lmer] for workers, or [peer UL message] for an explicitly "
+            "addressed peer UL. Peer sends require --ref, remain native and never mirror to external threads "
+            "(POST /api/sessions/{id}/comms)."
         ),
     )
     send.add_argument("session", help="Session id.")
-    _add_text(send, "What to type.")
+    send.add_argument("--ref", help="Stable peer-send reference; reuse only for an identical retry. Required across projects.")
+    send.add_argument("--generation", type=int, help="Expected peer UL generation; stale addresses are refused, never retargeted.")
+    _add_text(send, "What to say.")
     send.add_argument(
         "--no-newline",
         action="store_true",
-        help="Do not submit: leave the text in the prompt without a newline.",
+        help=(
+            "Type without submitting, as raw keystrokes (POST /api/sessions/{id}/input) "
+            "— not a message, nothing else sees it."
+        ),
     )
     send.set_defaults(call=_call_send)
+
+    peers = sub.add_parser("peers", help="Project UL metadata, explicit standing-order reads and native send receipts.")
+    peer_verbs = peers.add_subparsers(dest="peer_action")
+    peer_list = peer_verbs.add_parser("list", help="Discover peer names, current UL sessions/generations and connected thread links.")
+    peer_list.set_defaults(call=_call_peers)
+    peer_orders = peer_verbs.add_parser("orders", help="Read bounded peer standing orders for a human-directed task; adapt relevant material only.")
+    peer_orders.add_argument("project", help="Peer project ID from peers list.")
+    peer_orders.add_argument("--purpose", required=True, help="Human-requested task requiring this explicit read.")
+    peer_orders.add_argument("--offset", type=int)
+    peer_orders.add_argument("--limit", type=int, help="Characters to read, 1-4000 (default 2000).")
+    peer_orders.set_defaults(call=_call_peers)
+    peer_receipt = peer_verbs.add_parser("receipt", help="Inspect this project's original peer-send result without resending.")
+    peer_receipt.add_argument("ref")
+    peer_receipt.set_defaults(call=_call_peers)
+
+    command = sub.add_parser(
+        "command",
+        help=(
+            "Run a harness slash command in a live session, e.g. /followup "
+            "(POST /api/sessions/{id}/comms with kind=command)."
+        ),
+    )
+    command.add_argument("session", help="Session id.")
+    _add_text(command, "The command, starting with /.")
+    command.set_defaults(call=_call_command)
+
+    comms = sub.add_parser(
+        "comms",
+        help="One session's conversation on its bus (GET /api/sessions/{id}/comms).",
+    )
+    comms.add_argument("session", help="Session id.")
+    comms.add_argument("--since", type=int, help="Only records after this sequence number.")
+    comms.add_argument("--timeout", type=float, help="Long-poll this many seconds for the next record (max 30).")
+    comms.set_defaults(call=_call_comms)
+
+    feed = sub.add_parser(
+        "feed",
+        help="The fleet-wide comms feed (GET /api/comms/feed).",
+    )
+    feed.add_argument("--since", type=int, help="Only events after this cursor.")
+    feed.add_argument("--timeout", type=float, help="Long-poll this many seconds (max 30).")
+    feed.add_argument("--session", help="Only this session's records.")
+    feed.set_defaults(call=_call_feed)
 
     log = sub.add_parser(
         "log",
@@ -630,7 +935,17 @@ def create_parser() -> argparse.ArgumentParser:
     )
     answer.add_argument("session", help="Session id.")
     answer.add_argument("question", help="Question id, from `questions`.")
-    _add_text(answer, "The answer.")
+    _add_text(answer, "The answer, unless --option names it.", optional=True)
+    answer.add_argument(
+        "--option", type=int, metavar="N",
+        help=(
+            "Answer by picking one of the question's options: N is 1-based into "
+            "the `options` array `questions` prints, in the order it prints "
+            "them. The session is handed the option's text. Not combinable with "
+            "the text argument. A number typed as the answer text is never read "
+            "as an option."
+        ),
+    )
     answer.set_defaults(call=_call_answer)
 
     wind_down = sub.add_parser(
@@ -643,6 +958,121 @@ def create_parser() -> argparse.ArgumentParser:
     wind_down.add_argument("session", help="Session id.")
     wind_down.add_argument("--note", help="One clause riding on the end of the prompt.")
     wind_down.set_defaults(call=_call_wind_down)
+
+    thread = sub.add_parser(
+        "thread",
+        help=(
+            "Read or post one Slack or matrix thread by permalink, connecting "
+            "nothing to it (/api/comms/thread)."
+        ),
+    )
+    thread_sub = thread.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    thread_read = thread_sub.add_parser(
+        "read", help="Print a thread's most recent messages.",
+    )
+    thread_read.add_argument("permalink", help="Thread permalink.")
+    thread_read.add_argument(
+        "--limit", type=int, help="How many of the most recent messages (default 20).",
+    )
+    thread_read.set_defaults(call=_call_thread_read)
+    thread_post = thread_sub.add_parser(
+        "post",
+        help=(
+            "Post once into a thread. The post is attributed to this credential "
+            "— `uber lmer` or `operator` — not to anything in the text."
+        ),
+    )
+    thread_post.add_argument("permalink", help="Thread permalink.")
+    thread_post.add_argument("text", help="What to post; `-` reads it from stdin.")
+    thread_post.set_defaults(call=_call_thread_post)
+
+    threads = sub.add_parser(
+        "threads",
+        help=(
+            "The chat threads a running session is mirrored into: open one, "
+            "connect one, disconnect one, or list them "
+            "(/api/sessions/{id}/threads)."
+        ),
+    )
+    threads_sub = threads.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    threads_list = threads_sub.add_parser(
+        "list", help="What this session is connected to, and whether each connector is running.",
+    )
+    threads_list.add_argument("session", help="Session id.")
+    threads_list.set_defaults(call=_call_threads_list)
+    threads_connect = threads_sub.add_parser(
+        "connect",
+        help=(
+            "Connect this session to a Slack or matrix thread. The transport "
+            "comes from the link; the daemon runs the connector."
+        ),
+    )
+    threads_connect.add_argument("session", help="Session id.")
+    threads_connect.add_argument("permalink", help="Thread permalink.")
+    threads_connect.set_defaults(call=_call_threads_connect)
+    threads_open = threads_sub.add_parser(
+        "open",
+        help=(
+            "Open a new thread in a channel and connect this session to it. The "
+            "bot must already be in the channel."
+        ),
+    )
+    threads_open.add_argument("session", help="Session id.")
+    threads_open.add_argument(
+        "channel",
+        help="Slack channel id or #name, or matrix room id or alias.",
+    )
+    threads_open.add_argument(
+        "--title",
+        help="First line of the root message, in place of the run's own title.",
+    )
+    threads_open.set_defaults(call=_call_threads_open)
+    threads_disconnect = threads_sub.add_parser(
+        "disconnect", help="Stop mirroring one thread. The thread is told.",
+    )
+    threads_disconnect.add_argument("session", help="Session id.")
+    # The id and not the permalink: a permalink is a URL, and a URL cannot be one
+    # path segment — %2F is normalised back to a separator before the route is
+    # matched, so it would 404. `threads list` is where the id comes from.
+    threads_disconnect.add_argument("thread", help="Thread id, as `threads list` reports it.")
+    threads_disconnect.set_defaults(call=_call_threads_disconnect)
+    threads_recover = threads_sub.add_parser(
+        "recover", help="Inspect or recover a pending send in the host connector state.",
+    )
+    threads_recover.add_argument("session", help="Session id.")
+    threads_recover.add_argument("thread", help="Thread id from threads list.")
+    threads_recover.add_argument("action", choices=("inspect", "receipt", "retry", "clear"))
+    threads_recover.add_argument("--operation", help="Exact pending operation id from inspect.")
+    threads_recover.add_argument("--remote-ref", help="Receipt to verify against the remote thread.")
+    threads_recover.add_argument("--acknowledge-duplicate", action="store_true",
+                                 help="Required for clear: the selected send may be duplicated.")
+    threads_recover.add_argument("--reason", help="Required for clear: why the marker is being removed.")
+    threads_recover.set_defaults(call=_call_threads_recover)
+    threads_references = threads_sub.add_parser(
+        "references",
+        help="The threads this run has been pointed at, connected to none of them.",
+    )
+    threads_references.add_argument("session", help="Session id.")
+    threads_references.set_defaults(call=_call_threads_references)
+    threads_reference = threads_sub.add_parser(
+        "reference",
+        help=(
+            "Point this run at a thread: it is told once, and reads or posts it "
+            "with `lmer-signal read` / `post --thread`. Nothing is connected."
+        ),
+    )
+    threads_reference.add_argument("session", help="Session id.")
+    threads_reference.add_argument("permalink", help="Thread permalink.")
+    threads_reference.add_argument("--title", help="What this thread is, in one line.")
+    threads_reference.set_defaults(call=_call_threads_reference)
+    threads_unreference = threads_sub.add_parser(
+        "unreference", help="Drop one reference. The run is not told.",
+    )
+    threads_unreference.add_argument("session", help="Session id.")
+    threads_unreference.add_argument(
+        "reference", help="Reference id, as `threads references` reports it.",
+    )
+    threads_unreference.set_defaults(call=_call_threads_unreference)
 
     exit_p = sub.add_parser(
         "exit",
@@ -700,6 +1130,31 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     take.set_defaults(call=_call_pending_take)
+
+    # The only verb carrying a `description` as well as a `help`: argparse shows
+    # `help` in the parent's listing and `description` in `rotate --help`, and the
+    # fact that the call does not return has to reach whichever one an agent read.
+    rotate = sub.add_parser(
+        "rotate",
+        description=_ROTATE_HELP,
+        help=_ROTATE_HELP,
+    )
+    # Exclusive rather than one silently winning: the two name the same field,
+    # and a note that was quietly ignored is discovered by the successor.
+    note = rotate.add_mutually_exclusive_group()
+    note.add_argument(
+        "--handoff",
+        help=(
+            "The note your successor is told. '-' reads it from stdin, which is "
+            "what to use for anything multi-line or containing backticks, $ or "
+            "quotes. Omit it to carry forward the note already recorded."
+        ),
+    )
+    note.add_argument(
+        "--handoff-file",
+        help="Read the note from this file instead of the command line.",
+    )
+    rotate.set_defaults(call=_call_rotate)
 
     return parser
 
@@ -771,6 +1226,9 @@ def _add_runs(sub) -> None:
     )
     _add_run_key(answer)
     _add_text(answer, "The answer.")
+    answer.add_argument("--slot")
+    answer.add_argument("--home-revision", type=int)
+    answer.add_argument("--confirm-project", action="store_true", default=None)
     answer.set_defaults(call=_call_runs_answer)
 
     resume = runs_sub.add_parser(
@@ -787,6 +1245,16 @@ def _add_runs(sub) -> None:
     )
     resume.add_argument("--repo-url", dest="repo_url", help="If the run needs one.")
     resume.add_argument("--direction", help="What the next session should do.")
+    resume.add_argument(
+        "--session", dest="session_id",
+        help="One launch of the run's group: a session dir's <session-id> or its "
+             "full <session-id>--<name>. Defaults to the newest launch; an id "
+             "that names none of them is refused with the list rather than "
+             "resolved to a neighbouring record.",
+    )
+    resume.add_argument("--slot")
+    resume.add_argument("--home-revision", type=int)
+    resume.add_argument("--confirm-project", action="store_true", default=None)
     resume.set_defaults(call=_call_runs_resume)
 
     meta = runs_sub.add_parser(
@@ -842,7 +1310,11 @@ def _add_runs(sub) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
-    """Parse, issue one request, print the reply. Returns the exit code.
+    """Parse, issue the verb's requests, print the last reply. Returns the exit code.
+
+    One request for every verb but ``rotate``, which is two and says why
+    (:func:`_call_rotate`). A sequence stops at the first refusal, so the reply
+    printed is either the last call's or the one that declined.
 
     *transport* is the injectable HTTP seam — see :func:`lmer_platform.client.request`.
     """
@@ -862,10 +1334,29 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
 
     try:
         endpoint = resolve_endpoint()
-        call = args.call(args)
-        response = _request(
-            endpoint, call, timeout=args.timeout, transport=transport
-        )
+        calls = args.call(args)
+        if isinstance(calls, Call):
+            calls = [calls]
+        for index, call in enumerate(calls):
+            headers = {}
+            if args.workspace_id:
+                headers["X-Lmer-Workspace-ID"] = args.workspace_id
+            if args.request_id:
+                headers["X-Lmer-Request-ID"] = args.request_id
+            response = _request(
+                endpoint, call, timeout=args.timeout, transport=transport,
+                **({"headers": headers} if headers else {}),
+            )
+            if call.method == "POST" and call.path == "/api/comms/thread" and 200 <= response.status_code < 300:
+                payload = _payload(response.text)
+                posted = payload.get("posted") if isinstance(payload, dict) else None
+                if isinstance(posted, dict):
+                    routing_receipts.record("post", posted.get("ref"))
+            # A verb made of several calls stops at the first refusal and reports
+            # it, rather than pressing on with a step whose precondition the
+            # daemon just declined. The last call's reply is the verb's reply.
+            if index < len(calls) - 1 and not 200 <= response.status_code < 300:
+                break
     except CtlError as exc:
         print(json.dumps({"error": exc.error, "detail": str(exc)}), file=sys.stderr)
         return EXIT_FAILURE

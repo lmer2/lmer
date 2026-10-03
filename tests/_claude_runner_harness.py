@@ -48,7 +48,9 @@ def _make_executable(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_claude_runner(tmp_path, env=None, *, expose_python3=False, stub_work=False):
+def run_claude_runner(
+    tmp_path, env=None, *, expose_python3=False, stub_work=False, cwd=None
+):
     """Run claude-runner.sh with a stubbed claude binary.
 
     The stub writes its argv to a file so callers can inspect what flags
@@ -66,6 +68,8 @@ def run_claude_runner(tmp_path, env=None, *, expose_python3=False, stub_work=Fal
             to find pyvenv.cfg).
         stub_work: also stub the ``work`` binary, appending each invocation's
             argv to a capture file (returned as ``work_calls``).
+        cwd: directory to run the script from. The runner pre-trusts its own
+            cwd (claude inherits it), so tests about trust need to pin it.
     """
     argv_file = tmp_path / "claude_argv.txt"
     work_calls_file = tmp_path / "work_calls.txt"
@@ -103,6 +107,9 @@ def run_claude_runner(tmp_path, env=None, *, expose_python3=False, stub_work=Fal
         # not exist so the merges stay inert unless a test opts in.
         "LMER_SETTINGS_LOCAL_FILE": str(tmp_path / "no-settings.local.json"),
         "LMER_MCP_LOCAL_FILE": str(tmp_path / "no-mcp.local.json"),
+        # Same reason, one step further: the workspace pre-trust *writes* its
+        # config, and the runner hardcodes HOME=/home/developer.
+        "LMER_CLAUDE_CONFIG_FILE": str(tmp_path / "claude.json"),
     }
     if env:
         run_env.update(env)
@@ -110,6 +117,7 @@ def run_claude_runner(tmp_path, env=None, *, expose_python3=False, stub_work=Fal
     result = subprocess.run(
         ["bash", str(CLAUDE_RUNNER)],
         env=run_env,
+        cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
         timeout=30,

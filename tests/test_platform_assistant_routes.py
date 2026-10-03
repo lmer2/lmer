@@ -23,8 +23,8 @@ What is worth pinning here:
 - **A read stays a read.** ``ensure_running`` sits in the same module as
   ``status``, and a UI polls the status route; wiring the idempotent starter to a
   GET would make opening a page cost a session slot.
-- **The refusals keep their own status** (409 for a second assistant, 429 at the
-  cap, 503 for a host that cannot see the taskdef), because that is the whole
+- **The refusals keep their own status** (409 for a second assistant, 429 for a
+  full inbox, 503 for a host that cannot see the taskdef), because that is the whole
   reason the code rides on the exception.
 
 Sessions are started for real against the stub standing in for ``lmer`` that
@@ -54,6 +54,7 @@ SECRET = "test-secret-value"
 #: from the app — so a route added later without an entry in ``GET /api`` fails
 #: there rather than being silently unreachable for the assistant.
 ASSISTANT_ROUTES = (
+    ("GET", "/api/assistant/history/{session_id}"),
     ("GET", "/api/assistant"),
     ("POST", "/api/assistant/start"),
     ("POST", "/api/assistant/stop"),
@@ -62,7 +63,15 @@ ASSISTANT_ROUTES = (
     ("POST", "/api/assistant/handoff"),
     ("GET", "/api/assistant/instructions"),
     ("POST", "/api/assistant/instructions"),
+    ("GET", "/api/assistant/peers"),
+    ("GET", "/api/assistant/peers/{peer_id}/instructions"),
+    ("GET", "/api/assistant/peers/receipts/{ref}"),
     ("POST", "/api/assistant/pending"),
+    ("POST", "/api/assistant/requests"),
+    ("GET", "/api/assistant/requests"),
+    ("POST", "/api/assistant/requests/{request_id}/reply"),
+    ("POST", "/api/assistant/requests/{request_id}/park"),
+    ("POST", "/api/assistant/requests/{request_id}/release"),
     ("GET", "/api/assistant/config"),
     ("POST", "/api/assistant/config"),
 )
@@ -457,21 +466,13 @@ def test_a_refused_start_does_not_rewrite_the_live_ones_environment(
         )
 
 
-def test_a_start_at_capacity_is_a_429_with_the_numbers(platform_root, fake_lmer):
-    """The assistant counts against the global cap like any other container, so the
-    refusal has to say what to free — "I cannot open the chat" needs a reason."""
+def test_a_start_at_capacity_uses_the_reserved_slot(platform_root, fake_lmer, long_lived):
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
 
-    response = client_for(config).post(
-        "/api/assistant/start", headers=bearer_header()
-    )
-
-    assert response.status_code == 429
-    detail = response.json()["detail"]
-    assert "1/1" in detail
-    assert "max_concurrent_sessions (1)" in detail
-    assert assistant.status().running is False
+    with running(client_for(config)) as status:
+        assert status["running"] is True
+        assert registry.is_live(registry.read_session("s-worker"))
 
 
 def test_a_host_that_cannot_see_the_taskdef_is_a_503(client, tmp_path, monkeypatch):
@@ -1454,6 +1455,73 @@ def test_config_write_clears_a_nudge_knob_back_to_the_default(
     assert threshold["stored"] is None
 
 
+# --- the rotation threshold rides the same routes (issue #446) -----------------
+#
+# A group of one, so what these pin is that it is *its own* group — an operator
+# reading `nudge` must not find a setting about their own context window in it —
+# and that the surface takes the two values the issue's acceptance names: the
+# threshold, and 0 for off.
+
+def test_config_serves_the_rotation_threshold_in_its_own_group(
+    client, platform_root
+):
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["rotation"]["context_threshold"] == {
+        "value": cfg.DEFAULT_ROTATION_CONTEXT_THRESHOLD,
+        "source": "default",
+        "stored": None,
+    }
+    assert "context_threshold" not in body["nudge"]
+    assert "context_threshold" not in body["settings"]
+
+
+def test_config_write_persists_the_rotation_threshold(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": 70},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["rotation"]["context_threshold"]["value"] == 70
+    assert reply.json()["changed"] == ["rotation_context_threshold"]
+    assert cfg.load().rotation_context_threshold == 70
+
+
+def test_config_write_accepts_zero_to_turn_the_reminder_off(
+    client, platform_root
+):
+    cfg.update_stored({"rotation_context_threshold": 70})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": 0},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["rotation"]["context_threshold"]["value"] == 0
+
+
+@pytest.mark.parametrize("bad", [-1, 101, "soon", 3.5, True])
+def test_config_write_refuses_an_unusable_rotation_threshold(
+    client, platform_root, bad
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "rotation_context_threshold" in reply.json()["detail"]
+
+
+def test_the_scope_note_says_the_rotation_group_needs_no_rotation(
+    client, platform_root
+):
+    """The group whose name most invites the wrong inference: changing it does
+    not rotate anything, and the next tick is when it starts being read."""
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    note = reply.json()["note"]
+    assert "rotation groups on its next tick" in note
+
+
 def test_an_unknown_setting_refusal_names_every_accepted_key(
     client, platform_root
 ):
@@ -1466,7 +1534,7 @@ def test_an_unknown_setting_refusal_names_every_accepted_key(
     assert reply.status_code == 400, reply.text
     detail = reply.json()["detail"]
     for key in ("nudge_after_seconds", "nudge_pending_threshold",
-                "checkin_window_seconds", "model"):
+                "checkin_window_seconds", "chat_show_transcript", "model"):
         assert key in detail
 
 
@@ -1490,3 +1558,252 @@ def test_config_write_refuses_a_threshold_above_the_spools_capacity(
         json={"nudge_pending_threshold": assistant.MAX_PENDING},
     )
     assert at_capacity.status_code == 200, at_capacity.text
+
+
+THREADS = [
+    "https://team.slack.com/archives/C1/p1700000000000001",
+    "https://team.slack.com/archives/C2/p1700000000000002",
+    "https://matrix.to/#/!room:example.org/$root",
+]
+
+
+def test_assistant_threads_persist_and_reach_rotations(client, config, long_lived, monkeypatch):
+    from lmer_cli.cli import parse_args
+    from lmer_platform import spawn
+
+    commands = []
+    original = spawn.spawn_session
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        commands.append(result.command)
+        return result
+    monkeypatch.setattr(spawn, "spawn_session", capture)
+    saved = client.post("/api/assistant/config", headers=bearer_header(), json={"threads": THREADS})
+    assert saved.status_code == 200, saved.text
+    assert store.read_json(cfg.config_path())["assistant_threads"] == THREADS
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["settings"]["threads"] == {
+        "stored": THREADS, "value": THREADS, "source": "config.json",
+    }
+    with running(client) as first:
+        assert first["settings"]["threads"] == THREADS
+        for override, expected in (({}, THREADS), ({"threads": []}, []), ({}, THREADS)):
+            rotated = client.post("/api/assistant/rotate", headers=bearer_header(), json=override)
+            assert rotated.status_code == 200, rotated.text
+            current = rotated.json()
+            try:
+                assert current["settings"]["threads"] == expected
+                task = registry.read_session(current["session_id"])["task"]
+                assert task["targets"] == expected
+                assert parse_args(commands[-1][1:])[0].target == ["fleet", *expected]
+            finally:
+                kill(current.get("pid"))
+
+
+@pytest.mark.parametrize("value", [
+    "https://team.slack.com/archives/C1/p1700000000000001", {}, 7, ["--exec"], ["https://example.org/repo"], [None],
+    ["https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP"],
+    [THREADS[0] + "?thread_ts=not-a-ts"],
+    [THREADS[0] + "?thread_ts="],
+    ["https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP?thread_ts=1700000000.000001"],
+])
+def test_bad_thread_settings_are_refused_before_rotation(client, long_lived, value):
+    with running(client) as first:
+        for route in ("config", "rotate"):
+            response = client.post(f"/api/assistant/{route}", headers=bearer_header(), json={"threads": value})
+            assert response.status_code == 400, response.text
+            assert "threads" in response.json()["detail"]
+            assert assistant.status().session_id == first["session_id"]
+
+
+@pytest.mark.parametrize("link", [
+    "https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP",
+    THREADS[0] + "?thread_ts=not-a-ts",
+    THREADS[0] + "?thread_ts=1700000000.abcdef",
+])
+def test_invalid_slack_timestamps_never_launch_sessions(client, monkeypatch, link):
+    from lmer_platform import spawn
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("invalid thread target reached process launch")
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", unexpected_launch)
+    for route, body in (
+        ("/api/sessions", {"taskdef": "chat", "target": "fleet", "targets": [link]}),
+        ("/api/assistant/start", {"threads": [link]}),
+    ):
+        response = client.post(route, headers=bearer_header(), json=body)
+        assert response.status_code == 400, response.text
+
+
+def test_start_threads_override_is_temporary_and_saved_empty_list_disconnects(client, long_lived):
+    with running(client, threads=THREADS) as current:
+        assert current["settings"]["threads"] == THREADS
+        assert client.get("/api/assistant/config", headers=bearer_header()).json()["settings"]["threads"]["value"] is None
+    for value in (THREADS, [], None):
+        response = client.post("/api/assistant/config", headers=bearer_header(), json={"threads": value})
+        assert response.status_code == 200, response.text
+        assert response.json()["settings"]["threads"]["value"] == value
+
+
+def test_session_api_threads_reach_the_launch(client, monkeypatch):
+    from lmer_cli.cli import parse_args
+
+    captured = []
+    original = api.spawn_session
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        captured.append(result.command)
+        return result
+    monkeypatch.setattr(api, "spawn_session", capture)
+    response = client.post("/api/sessions", headers=bearer_header(), json={
+        "taskdef": "chat", "target": "fleet", "targets": THREADS,
+    })
+    assert response.status_code == 201, response.text
+    assert parse_args(captured[0][1:])[0].target == ["fleet", *THREADS]
+    bad = client.post("/api/sessions", headers=bearer_header(), json={
+        "taskdef": "chat", "target": "fleet", "targets": "--exec",
+    })
+    assert bad.status_code == 400, bad.text
+
+
+def test_chat_retention_defaults_off_and_round_trips_through_config(client, platform_root):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"]["keep_last"] == {
+        "value": 0, "source": "default", "stored": None,
+    }
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (25, 0, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={"chat_keep_last": value},
+        )
+        assert reply.status_code == 200
+        expected = {
+            "value": value or 0,
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == ["chat_keep_last"]
+        assert reply.json()["chat"]["keep_last"] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["keep_last"] == expected
+        assert cfg.load().chat_keep_last == (value or 0)
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert "chat_keep_last" not in stored
+        else:
+            assert stored["chat_keep_last"] == value
+
+
+@pytest.mark.parametrize("bad", [-1, True, 1.5, "many", [], {}])
+def test_chat_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"chat_keep_last": bad},
+    )
+    assert reply.status_code == 400
+    assert "chat_keep_last" in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+
+
+# The uber lmer pane's transcript toggle (issue #488): a boolean beside
+# ``keep_last`` in the ``chat`` group, stored platform-side so it survives
+# browsers, applied on the pane's next config refresh rather than at a rotate.
+
+
+def test_chat_transcript_toggle_defaults_off_and_round_trips_through_config(client, platform_root):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": None,
+    }
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (True, False, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={"chat_show_transcript": value},
+        )
+        assert reply.status_code == 200, reply.text
+        expected = {
+            "value": bool(value),
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == ["chat_show_transcript"]
+        assert reply.json()["chat"]["show_transcript"] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["show_transcript"] == expected
+        assert cfg.load().chat_show_transcript is bool(value)
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert "chat_show_transcript" not in stored
+        else:
+            assert stored["chat_show_transcript"] is value
+    # The pane's own note about scope names it beside keep_last.
+    assert "chat_show_transcript" in reply.json()["note"]
+
+
+@pytest.mark.parametrize("bad", [1, 0, "yes", "on", 1.5, [], {}])
+def test_chat_transcript_toggle_refuses_non_booleans_without_writing(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"chat_show_transcript": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "chat_show_transcript" in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+
+
+def test_a_hand_written_true_in_the_file_reads_as_on_and_junk_reads_as_off(client, platform_root):
+    """The file layer is lenient the way the integer settings' is: a spelled-out
+    ``"true"`` is honoured, anything else costs that layer with a warning rather
+    than a daemon that will not load its config."""
+    cfg.update_stored({"assistant_model": "kept"})
+    path = cfg.config_path()
+    written = store.read_json(path)
+    written["chat_show_transcript"] = "TRUE"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": True, "source": "config.json", "stored": "TRUE",
+    }
+    assert cfg.load().chat_show_transcript is True
+    written["chat_show_transcript"] = "sometimes"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": "sometimes",
+    }
+    assert cfg.load().chat_show_transcript is False
+
+
+# The assistant's own container allocation (issue #453). Read-only and
+# environment-only by decision, so the route reports it and no write accepts it.
+
+def test_config_serves_the_assistant_resources_in_their_own_group(
+    client, platform_root, monkeypatch
+):
+    monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+    monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert body["resources"]["memory"] == {"value": "2g", "source": "env", "stored": None}
+    assert body["resources"]["cpus"] == {"value": "2", "source": "env", "stored": None}
+    assert "memory" not in body["settings"], (
+        "a resource bound is not one of the four launch settings a write persists"
+    )
+
+
+def test_config_reports_unset_resources_rather_than_omitting_them(
+    client, platform_root, monkeypatch
+):
+    """An operator reading the screen has to be able to tell 'not configured'
+    from 'this group does not exist'."""
+    monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+    monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert body["resources"]["memory"]["value"] is None
+    assert body["resources"]["cpus"]["value"] is None
+
+
+def test_config_note_says_the_resources_do_not_resize_a_running_container(
+    client, platform_root
+):
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert "does not resize a running container" in body["note"]

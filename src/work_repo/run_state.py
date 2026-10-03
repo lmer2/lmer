@@ -19,6 +19,80 @@ renamed, a directory name is never a valid address: every lookup goes
 through find_run_dir(), which matches on state.yaml content (slug, then
 name), with find_successor_run_dir() covering the re-slug case.
 
+The run area is form-routed (issue #353 D20): `{work}/{host}/{project}/runs/`
+in a legacy tree, `<project>/_runs/` under the registry-resolved project dir
+in a schema-form one. This module never re-derives that mapping — runs_base()
+asks `utils.project_area`, the one module that knows the second set of names,
+and run_rel_for_dir_name() derives the commit-staging path from the same
+resolved base so the path staged is always the path written.
+
+The session is the unit of record (issue #353 D22)
+--------------------------------------------------
+In schema form one launch owns one complete directory,
+`<project>/_runs/<slug>/<session-id>[--<name>]/`, holding exactly the files
+this module already writes — the location changes, the shapes do not (see
+docs/RUN-STATE.md, "Schema form: the run dir is the session dir"). What
+changes here is the level: `_runs/<slug>/` GROUPS every launch against one
+(taskdef, target) pair and NOTHING is ever created or written at that level.
+Two launches on one target are two records that never touch each other, so
+single-writer discipline falls out of the layout and no claim is arbitrated.
+A legacy `runs/<slug>/` tree keeps its one shared dir per target, read and
+written byte-for-byte as before — there is no migration here, only a second
+shape this module can meet.
+
+Six decisions, each made once and spelled out at the function that carries it:
+
+1. **Which session dir this launch is** (:func:`_session_dir`). An explicit
+   session id wins (a resume naming a launch), then `LMER_SESSION_ID`'s own
+   dir, then a dir whose recorded lineage says this harness id writes there,
+   then the creation address `<group>/<LMER_SESSION_ID>`. An id and its
+   post-freeze `<sid>--<name>` spelling are the same session throughout. Both
+   ids are a path SEGMENT naming one launch, checked as one
+   (:func:`_usable_session_id`) and then matched by listing the group — an id
+   that is joined and globbed instead addresses the grouping level, or a
+   launch nobody named.
+2. **No `LMER_SESSION_ID`** (:func:`_session_dir`). Such an invocation is not
+   a launch, so it never invents a launch's identity: it addresses the
+   group's newest session, and only an EMPTY group makes it start a record,
+   at an id synthesized in the launcher's own form (never `unknown/`, which
+   two contextless invocations would share and the validator would warn on).
+   The synthesized id is per PROCESS, because one `work` invocation's writes
+   must not scatter across dirs; the next invocation joins the record this
+   one made, by the newest-session rule above.
+3. **The resolvers descend by SHAPE, not by form** (:func:`_record_scan`). A
+   state-bearing child of the run area IS a record and is never descended
+   into; any other directory is a grouping level whose state-bearing children
+   are records. One walk therefore serves both shapes and any base handed in
+   (the platform's mirror walk), the grouping dir itself is never a record
+   however exactly its name matches the slug asked for, and an adopted tree
+   whose runs have not been migrated yet — `_runs/<slug>/state.yaml`, moved
+   by `work adopt` before `work migrate` — is still read, and still WRITTEN,
+   where it lies. Slug resolution therefore means "one group" in schema form:
+   the slug picks the group, the rules above pick the dir inside it.
+4. **Picking between sessions** (:func:`_newest_record`). When several
+   sessions of one group answer, the newest by session-id form wins — the
+   rule `lmer_platform.workrepo._newest_session` uses for the fleet view and
+   the resume resolver, so a run's row and its record can never quote
+   different directories. Out-of-form names are passed over rather than
+   sorted with (a `backup-before-i-broke-it/` sorts after `2026…`).
+5. **The freeze rename lands on the SESSION dir** (:func:`freeze_run_dir`):
+   `<sid>` → `<sid>--<name>`, inside its group, still exactly once. It
+   reports run-area-RELATIVE names (`<slug>/<sid>`), which is what the specs
+   index needs to rewrite a `../_runs/<slug>/<sid>/` symlink target and what
+   makes the caller's staging path address the dir that moved. A re-slug
+   moves the session to the group its NEW identity addresses
+   (:func:`reslug_run`) and takes an emptied group away with it.
+6. **Resume is a lineage, not a claim** (:func:`attach_session`). A resumed
+   session dir records each later harness id in an append-only `sessions:`
+   list in its own state.yaml; the schema int stays 1 (an additive optional
+   field) and `owner` stays what it was — bookkeeping about which process is
+   live in this dir, never arbitration. The chain is also what ROUTES the
+   rest of that launch: the resume handshake happens once, and every later
+   `work` invocation is a new process that finds the same dir because the
+   record itself says this harness id writes here. A legacy run dir gets no
+   chain — several sessions interleave in it, so the list would be a claim
+   the directory cannot make; its session history stays in events.jsonl.
+
 Legacy runs that predate the state-file rename still hold state.yml:
 load_state() reads it when state.yaml is absent, and the first
 write_state() migrates it aside as state.yml.migrated.
@@ -31,6 +105,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -43,7 +118,13 @@ from typing import Optional
 import yaml
 
 from . import specs_index
-from .utils import _work_repo_base, redact_secrets, sanitize_task_target
+from .utils import (
+    project_area,
+    redact_secrets,
+    sanitize_task_target,
+    work_repo_layout,
+    work_repo_root,
+)
 
 SCHEMA_VERSION = 1
 STATE_FILE = "state.yaml"
@@ -62,6 +143,22 @@ TASK_STATUSES = ("pending", "in-progress", "done", "deferred", "dropped")
 TMP_DIR_PREFIX = ".new-"
 # The archived-runs subtree shares the runs/ namespace; the resolver skips it.
 ARCHIVE_DIR = "archive"
+# A launcher's session id (`LMER_SESSION_ID`, minted by
+# clone_and_exec.mint_session_id): UTC timestamp, pid, random suffix —
+# timestamp-first, so a directory listing of one group is start order
+# (docs/SCHEMA.md, "Sessions and runs"). SESSION_DIR_RE adds the `--<name>`
+# suffix the freeze rename appends; the two spellings are ONE session.
+SESSION_ID_RE = re.compile(r"\d{8}-\d{6}-\d+-\d+")
+SESSION_DIR_RE = re.compile(rf"{SESSION_ID_RE.pattern}(?:--.+)?")
+# The append-only lineage of harness ids that have written in a session dir
+# (D22 resume). Optional and additive: a record without it is a record from
+# before the field, or a legacy run dir, which never grows one.
+SESSIONS_FIELD = "sessions"
+# A session id names one directory inside a group, so: the segments
+# `lmer_platform.answer._reject_traversal` refuses, and the characters
+# `Path.glob` would expand rather than compare (see _usable_session_id).
+_UNSAFE_SESSION_SEGMENTS = frozenset({"", ".", ".."})
+_SESSION_PATTERN_CHARS = "*?["
 # Phases whose (case-insensitive) prefix marks the run as still planning —
 # the first `work state set --phase` OUTSIDE this family is the pre-execution
 # freeze gate that takes the single name-bearing dir rename (issue #87 D2).
@@ -76,8 +173,14 @@ PLANNING_PHASE_PREFIXES = (
 )
 # A bare full SHA-1 task target; slugs use its 12-char short form (D4).
 _FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
-# Masterplan bundles nest at <run>/masterplan/<mp-slug>/; these well-known
-# artifacts get relative symlinks at the run-dir root when present (spec §6).
+# A masterplan bundle sits under <record>/masterplan/; these well-known
+# artifacts get relative symlinks at the record root when present (spec §6).
+# WHERE inside it they sit follows the form (issue #353 D12): flat, at
+# <session-dir>/masterplan/<artifact>, in schema form — one bundle per
+# session dir, because the session dir IS the fragment (D22) — and one level
+# further down, at <run>/masterplan/<mp-slug>/<artifact>, in a legacy tree,
+# whose one shared run dir per target can hold several bundles. See
+# :func:`_masterplan_bundle_artifacts`.
 MASTERPLAN_DIR = "masterplan"
 MASTERPLAN_ARTIFACTS = ("spec.md", "goals.md", "plan.md", "plan.html", "retro.md")
 # `aborted` is the release-run terminal (abort_run): it rides the
@@ -154,10 +257,219 @@ def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> 
 
 
 def runs_base() -> Optional[Path]:
-    base = _work_repo_base()
-    if base is None:
+    """The run area of this session's project dir: `<project>/runs` in a
+    legacy tree, `<project>/_runs` in a schema-form one (issue #353 D20).
+
+    Routed through `utils.project_area`, which owns the legacy→schema name
+    mapping and the project dir it hangs off — in schema form that dir is
+    whatever the registry resolved (a short name, or a host bucket for a repo
+    nobody has named yet), not a `{host}/{project}` path. None when nothing
+    resolves, including the fail-closed case of a present-but-unusable
+    manifest: a run record written at the legacy names inside a schema tree
+    is the split tree the validator flags.
+    """
+    return project_area("runs", "_runs")
+
+
+def is_session_form() -> bool:
+    """Whether this session's work repo keeps the D22 session-unit record —
+    `_runs/<slug>/<session-id>/` per launch — rather than the legacy shared
+    `runs/<slug>/`.
+
+    The form question, asked of `utils.work_repo_layout()` (the one module
+    that knows the second set of names) and asked ONLY where a path is
+    created: the resolvers below decide by shape instead, so they work under
+    any base handed in and meet an unmigrated record wherever it lies.
+    """
+    return work_repo_layout().is_schema
+
+
+def _usable_session_id(session: Optional[str]) -> bool:
+    """Whether *session* can name ONE session dir inside a group.
+
+    The value is a path SEGMENT: `lmer_platform.answer._reject_traversal`'s
+    rule (no separator, no empty/`.`/`..` segment), which is what
+    `lmer_platform.resume._clean_session_id` puts a resume request's session
+    id through before `_require_session` looks for it. The wildcard half is
+    this module's, for the same reason stated the other way round: a value
+    that is EXPANDED rather than compared silently answers with a launch
+    nobody named, and `_require_session` refuses even an honest id that hits
+    two records because a whole run record is not worth guessing at.
+
+    A DOT-LEADING id is refused for a different reason from the rest, and it is
+    the sharpest one here: the name is not unsafe, it is RESERVED. Every walk
+    over a group skips dot-children by design — :func:`_session_dirs` and
+    `lmer_platform.workrepo._sessions_in` both do, because a dot-dir under a
+    run area is a `.new-*` seed mid-rename and never a record. So an id like
+    `.hidden` does not fail to open a record; it opens one that is written,
+    complete, and invisible to `work sessions`, to the fleet view, to
+    :func:`resolve_run_dir` and to every later resume. That is worse than the
+    quiet degradation this function exists to produce, because the session
+    itself sees nothing wrong.
+
+    No grammar beyond that, deliberately: the `--<name>` half of a session dir
+    is unconstrained (docs/SCHEMA.md) and a launcher's out-of-form id is used
+    verbatim (:func:`_session_dir_id`), so a regex here would refuse ids that
+    are on disk right now.
+    """
+    if not isinstance(session, str) or not session:
+        return False
+    segments = session.replace("\\", "/").split("/")
+    if len(segments) > 1 or session in _UNSAFE_SESSION_SEGMENTS:
+        return False
+    if session.startswith("."):
+        return False
+    return not any(char in session for char in _SESSION_PATTERN_CHARS)
+
+
+def launch_session_id() -> Optional[str]:
+    """This launch's `LMER_SESSION_ID`, or None when there is not one.
+
+    Distinct from :func:`current_session_id`, whose `"unknown"` default is a
+    LABEL for an event or an owner claim and stays exactly what it has always
+    been. This one is asked when the answer decides a directory NAME or a
+    lineage entry, where "unknown" is not an identity: two contextless
+    invocations would share the dir and neither could be resumed by id.
+
+    A value that cannot BE a directory name (:func:`_usable_session_id` — a
+    separator, `.`/`..`, a glob character) is not one either, and answering
+    with it would compose a record address outside the group or at the
+    grouping level itself. Such an invocation is treated as having no launch
+    id at all: it addresses the newest session and creates under a synthesized
+    id, which is the same answer an unset variable gets. The refusal is loud
+    only where a caller ASKED for a session (:func:`_session_dir`) — this
+    value is the launcher's own, arrives on every `work` invocation including
+    the hook-facing ones, and there is nothing here for it to refuse.
+    """
+    session = os.environ.get("LMER_SESSION_ID")
+    if not session or not _usable_session_id(session):
         return None
-    return base / "runs"
+    return session
+
+
+#: The id a contextless invocation records a fresh session under, minted once
+#: per process (see :func:`_session_dir_id`).
+_SYNTHESIZED_SESSION_ID: Optional[str] = None
+
+
+def _reset_synthesized_session_id() -> None:
+    """Forget this process's synthesized session id — the test seam for "a
+    later `work` invocation is a different process"."""
+    global _SYNTHESIZED_SESSION_ID
+    _SYNTHESIZED_SESSION_ID = None
+
+
+def _session_dir_id() -> str:
+    """The session id a NEW record is created under: `LMER_SESSION_ID` when
+    the launcher set one, else an id synthesized in the launcher's own form.
+
+    Verbatim the spelling `lmer_cli.container.clone_and_exec.mint_session_id`
+    uses (UTC timestamp, pid, random suffix) rather than an import of it: the
+    work CLI runs where that module may not, and the shape is the schema's
+    (`SESSION_ID_RE`), not that function's private business. Minted at most
+    once per process — one invocation's writes must all land in one dir — and
+    never `"unknown"`, which is a label for an unknown writer and would make
+    every contextless invocation share one launch's record.
+    """
+    global _SYNTHESIZED_SESSION_ID
+    session = launch_session_id()
+    if session:
+        return session
+    if _SYNTHESIZED_SESSION_ID is None:
+        _SYNTHESIZED_SESSION_ID = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            f"-{os.getpid()}-{random.randint(0, 32767)}"
+        )
+    return _SYNTHESIZED_SESSION_ID
+
+
+def session_id_of(dir_name: str) -> str:
+    """The session id a session dir name carries: the name itself, or its
+    half before the `--<name>` the freeze rename appends. `<sid>` and
+    `<sid>--<name>` are the same session, everywhere in this module."""
+    return str(dir_name).split("--", 1)[0]
+
+
+def session_lineage(state: Optional[dict]) -> tuple[str, ...]:
+    """The harness ids recorded as having written in this session dir, in
+    stored order (D22 resume).
+
+    Optional and append-only, like `reslugged_from`: defining its accepted
+    persisted shape here keeps the work CLI, the platform and any later
+    reader from drifting on a malformed or legacy value. Anything that is
+    not a list of strings reads as no lineage at all.
+    """
+    if not isinstance(state, dict):
+        return ()
+    raw = state.get(SESSIONS_FIELD)
+    if not isinstance(raw, list):
+        return ()
+    return tuple(session for session in raw if isinstance(session, str))
+
+
+def has_session(state: Optional[dict], session_id: str) -> bool:
+    """Whether *state* records *session_id* as one of its writers."""
+    return isinstance(session_id, str) and session_id in session_lineage(state)
+
+
+def _chain_session(state: dict, session_id: str) -> bool:
+    """Append *session_id* to the lineage unless it is already there. Pure
+    (the caller persists); True when the state changed."""
+    if not session_id or has_session(state, session_id):
+        return False
+    state[SESSIONS_FIELD] = list(session_lineage(state)) + [session_id]
+    return True
+
+
+def attach_session(
+    rdir: Path, state: dict, session_id: Optional[str] = None
+) -> bool:
+    """Record this harness id in a session dir's lineage. True when written.
+
+    A resumed session dir is a lineage across process deaths (D22): the
+    directory name is the id that started it and every later harness id
+    chains in here, so `work sessions` can say what has run in a record and
+    :func:`_session_dir` can route a resumed launch's later invocations back
+    to it with no second environment variable. No claim is taken — a session
+    writes only its own dir, so `owner` stays bookkeeping (:func:`claim_status`
+    is a different mechanism, for the release single-flight) and this function
+    never touches it.
+
+    Two things are deliberately NOT chained. A legacy run dir holds several
+    sessions' history at once, so a lineage list would be a claim the
+    directory cannot make (its history is in events.jsonl, where it has
+    always been) — hence the session-dir test. And a synthesized id
+    (:func:`_session_dir_id`) names a process, not a session anyone can
+    resume, so a contextless invocation writes nothing here.
+    """
+    if not _is_session_record(rdir):
+        return False
+    session_id = session_id or launch_session_id()
+    if not session_id or not _chain_session(state, session_id):
+        return False
+    write_state(rdir, state)
+    return True
+
+
+def _is_session_record(rdir: Path) -> bool:
+    """Whether *rdir* is a D22 session dir — a record one level below the run
+    area — rather than a record sitting directly in it (legacy, or a tree
+    adopted but not yet migrated)."""
+    base = runs_base()
+    return base is not None and rdir.parent != base
+
+
+def _area_rel_name(base: Path, path: Path) -> str:
+    """*path* named relative to the run area: `<dir>` for a legacy run dir,
+    `<slug>/<sid>` for a session dir. THE spelling handed to callers that
+    address a record by name — the specs index's symlink prefix and the
+    commit-staging path both need the group level, and a bare directory name
+    cannot carry it. Falls back to the plain name for a path outside the
+    area, which stages nothing rather than a path a commit would misread."""
+    try:
+        return path.relative_to(base).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _read_sibling_state(rdir: Path) -> Optional[dict]:
@@ -176,6 +488,126 @@ def _read_sibling_state(rdir: Path) -> Optional[dict]:
     return None
 
 
+def _session_dirs(group: Path) -> list[Path]:
+    """The record-holding children of one `_runs/<slug>/` group, oldest first.
+
+    THE definition of "which children of a grouping dir are records": the
+    ones carrying a state file. Dot-dirs are a session's transient seed or a
+    cleaner's litter and are never records — the same rule (and the same
+    reason) as `lmer_platform.workrepo._sessions_in`, which walks the mirror
+    of this tree. Any fs error is "no sessions": a resolver hook-facing
+    always-exit-0 commands sit on never raises out.
+    """
+    try:
+        children = sorted(group.iterdir())
+    except OSError:
+        return []
+    sessions = []
+    for child in children:
+        try:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if _state_path(child) is not None:
+                sessions.append(child)
+        except OSError:
+            continue
+    return sessions
+
+
+def _newest_record(records: list[Path]) -> Optional[Path]:
+    """THE launch a set of candidate session dirs is addressed at, or None.
+
+    The newest among the dirs named in the session-id form, by name: those
+    names are timestamp-first, so name order is start order (docs/SCHEMA.md,
+    "Sessions and runs"). Restricting the comparison to that form is the
+    point — a hand-made `backup-before-i-broke-it/` sorts after `2026…` and
+    would otherwise be quoted as the run. A set with no in-form member is
+    still addressed, at the newest mtime (ties by name, so the answer is
+    stable), because yielding nothing would strand the record entirely.
+
+    This is `lmer_platform.workrepo._newest_session`'s rule, deliberately:
+    the picker, the platform's resolver and this kernel must never quote
+    different directories of one group.
+    """
+    if not records:
+        return None
+    in_form = [rdir for rdir in records if SESSION_DIR_RE.fullmatch(rdir.name)]
+    if in_form:
+        return max(in_form, key=lambda rdir: rdir.name)
+    return max(records, key=lambda rdir: (_mtime(rdir), rdir.name))
+
+
+def _mtime(path: Path) -> float:
+    """Modification time for ordering, or 0.0 when it cannot be read — a path
+    that vanished under the walk sorts oldest, the harmless direction."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _record_scan(base: Path) -> list[tuple[Path, list[Path]]]:
+    """`[(group, records)]` under a run area, in directory-name order.
+
+    THE walk, and the one place the two shapes are reconciled — by SHAPE, not
+    by form, so it answers the same way under a base handed in (the
+    platform's mirror walk) as under this session's own:
+
+    - a state-bearing child of the area IS a record and is never descended
+      into (whatever is inside it is the run's own content — a bundle, a
+      checkout — never a second record). Its group is itself, so a legacy
+      area scans exactly as it always did, one singleton group per run dir;
+    - any other directory is a GROUPING level (D22) whose state-bearing
+      children are the records of one (taskdef, target).
+
+    Dot-dirs (`.new-*` seeds and orphans) and the `archive/` subtree are
+    skipped at the area level, dot-dirs at the grouping level, and any fs
+    error resolves to "nothing here" rather than raising.
+
+    The tolerance runs both ways on purpose. A schema tree adopted before its
+    runs were migrated holds `_runs/<slug>/state.yaml` — a legacy record at
+    the group's address — and refusing to see it would strand a live run.
+    The only shape whose answer this walk changes in a legacy tree is a run
+    record nested inside a non-record directory under `runs/`, which nothing
+    writes (`archive/` is skipped by name).
+    """
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        return []
+    scan: list[tuple[Path, list[Path]]] = []
+    for child in children:
+        try:
+            if (
+                not child.is_dir()
+                or child.name.startswith(".")
+                or child.name == ARCHIVE_DIR
+            ):
+                continue
+            if _state_path(child) is not None:
+                scan.append((child, [child]))
+                continue
+        except OSError:
+            continue
+        sessions = _session_dirs(child)
+        if sessions:
+            scan.append((child, sessions))
+    return scan
+
+
+def iter_record_dirs(base: Optional[Path] = None) -> list[Path]:
+    """Every run record under the run area, in scan order: the session dirs
+    of each `_runs/<slug>/` group in schema form, the run dirs themselves in
+    a legacy tree. One walk for the resolvers, the listing and every later
+    caller, so they can never meet different sets (see :func:`_record_scan`).
+    """
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return []
+    return [rdir for _group, records in _record_scan(base) for rdir in records]
+
+
 def find_run_dir(
     identifier: str,
     base: Optional[Path] = None,
@@ -183,40 +615,48 @@ def find_run_dir(
 ) -> Optional[Path]:
     """Resolve a run dir by CONTENT, never by directory name (issue #87 D1).
 
-    Scans runs/*/state.yaml for `state.slug == identifier`; with
-    `match_names`, falls back to `state.name == identifier` (a slug match
-    always wins — names are unique per project). Session-level resolution
-    keeps `match_names` off so a run *name* can never hijack another
-    session's derived slug; explicit lookups (e.g. `work seed`'s duplicate
-    check) opt in. Dot-dirs (`.new-*` orphans), the archive/ subtree, and
-    corrupt siblings are skipped, and any fs error during the scan resolves
-    to "no match" — a broken runs/ tree must never raise out of a resolver
-    that hook-facing always-exit-0 commands sit on. Returns None when
-    nothing matches — dirs can be renamed, so `dir name == slug` is not a
-    valid address.
+    Scans every record under the run area — `runs/*/state.yaml` in a legacy
+    tree, `_runs/*/<session-id>/state.yaml` in schema form (:func:`_record_scan`
+    walks both) — for `state.slug == identifier`; with `match_names`, falls
+    back to `state.name == identifier` (a slug match always wins — names are
+    unique per project). Session-level resolution keeps `match_names` off so
+    a run *name* can never hijack another session's derived slug; explicit
+    lookups (e.g. `work seed`'s duplicate check) opt in. Dot-dirs (`.new-*`
+    orphans), the archive/ subtree, and corrupt siblings are skipped, and any
+    fs error during the scan resolves to "no match" — a broken runs/ tree
+    must never raise out of a resolver that hook-facing always-exit-0
+    commands sit on. Returns None when nothing matches — dirs can be renamed,
+    so `dir name == slug` is not a valid address, and a GROUPING dir named
+    exactly the slug is not one either (D22: it holds no record of its own).
+
+    In schema form several sessions of one group record one slug — that is
+    what "two launches on one target" means — so the group's answer is its
+    newest session by :func:`_newest_record`, the rule the platform's fleet
+    view uses. Which of them THIS launch writes in is a different question,
+    asked by :func:`run_dir`.
     """
     if base is None:
         base = runs_base()
     if base is None:
         return None
     name_match: Optional[Path] = None
-    try:
-        children = sorted(base.iterdir())
-    except OSError:
-        return None
-    for child in children:
-        try:
-            if not child.is_dir() or child.name.startswith(".") or child.name == ARCHIVE_DIR:
+    for _group, records in _record_scan(base):
+        slug_hits, name_hits = [], []
+        for child in records:
+            try:
+                state = _read_sibling_state(child)
+            except OSError:
                 continue
-            state = _read_sibling_state(child)
-        except OSError:
-            continue
-        if state is None:
-            continue
-        if state.get("slug") == identifier:
-            return child
-        if match_names and name_match is None and state.get("name") == identifier:
-            name_match = child
+            if state is None:
+                continue
+            if state.get("slug") == identifier:
+                slug_hits.append(child)
+            elif match_names and state.get("name") == identifier:
+                name_hits.append(child)
+        if slug_hits:
+            return _newest_record(slug_hits)
+        if name_match is None and name_hits:
+            name_match = _newest_record(name_hits)
     return name_match
 
 
@@ -249,6 +689,15 @@ def slug_available(
     that satisfies this (release_run.unique_release_slug) rather than give up
     when it is False: an address that cannot be freed is what wedges a
     repository.
+
+    In schema form the address `_runs/<slug>` is a GROUP, so what occupies it
+    is its session dirs: a group holding only the asking run is free (the
+    re-slug crash window again, one level down), and a group holding another
+    launch is not. A directory that holds no record at all — an empty group a
+    crash left between mkdir and rename — occupies its address exactly as an
+    empty `runs/<slug>` always has: the conservative answer both shapes give,
+    and the reason :func:`reslug_run` takes an emptied group away rather than
+    leaving one behind.
     """
     if base is None:
         base = runs_base()
@@ -260,7 +709,9 @@ def slug_available(
     try:
         bare = base / slug
         if bare.exists() and bare != exclude:
-            return False
+            occupants = _session_dirs(bare) or [bare]
+            if any(occupant != exclude for occupant in occupants):
+                return False
         return not any(d for d in base.glob(f"{slug}--*") if d != exclude)
     except OSError:
         return False
@@ -298,14 +749,8 @@ def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Opti
     if base is None:
         return None
     matches: list[tuple[str, str, Path]] = []
-    try:
-        children = sorted(base.iterdir())
-    except OSError:
-        return None
-    for child in children:
+    for child in iter_record_dirs(base):
         try:
-            if not child.is_dir() or child.name.startswith(".") or child.name == ARCHIVE_DIR:
-                continue
             state = _read_sibling_state(child)
         except OSError:
             continue
@@ -313,7 +758,7 @@ def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Opti
             continue
         if not has_vacated(state, identifier):
             continue
-        matches.append((str(state.get("created") or ""), child.name, child))
+        matches.append((str(state.get("created") or ""), _area_rel_name(base, child), child))
     if not matches:
         return None
     return max(matches)[2]
@@ -370,20 +815,151 @@ def _unreadable_state_candidate(base: Path, slug: str) -> Optional[Path]:
     return None
 
 
-def run_dir(slug: Optional[str] = None) -> Optional[Path]:
+def _named_session(group: Path, session: str) -> Optional[Path]:
+    """The session dir of *group* that *session* names, or None.
+
+    Matched by LISTING the group and comparing names — the directory's own
+    name first and the id the freeze rename suffixed second (`<sid>--<name>`),
+    because the id is what an operator wrote down and the suffix arrives
+    later, mid-life. That is the rule `lmer_platform.resume._require_session`
+    matches a resume request by, so an address a fleet row shows can be pasted
+    back verbatim; composing `group / session` and globbing the group instead
+    made `.` address the grouping level D22 keeps empty and made `2026*`
+    resolve to a launch the caller never named (:func:`_usable_session_id`
+    refuses both before this is reached). By NAME, not by state CONTENT: a
+    launch must find its own dir even when the state file in it is corrupt,
+    which is exactly when it needs recovering. Two dirs answering one id (the
+    name half has no charset in any document) resolve by :func:`_newest_record`
+    rather than raising — the platform refuses there because it can ask the
+    operator; this kernel is under a hook that must still exit 0.
+    """
+    sessions = _session_dirs(group)
+    found = [rdir for rdir in sessions if rdir.name == session] or [
+        rdir for rdir in sessions if rdir.name.startswith(f"{session}--")
+    ]
+    return _newest_record(found)
+
+
+def _lineage_session(group: Path, session: str) -> Optional[Path]:
+    """The session dir of *group* whose recorded lineage says *session*
+    writes there — how a RESUMED launch finds the record it continues.
+
+    The resume handshake happens once (`work` is told the session id, and
+    :func:`attach_session` chains this harness id into that dir's state);
+    every later invocation of the same launch is a fresh process that knows
+    only its own `LMER_SESSION_ID`, and finds the dir here. The record itself
+    carries the routing, so no second environment variable has to be minted,
+    forwarded into the container and kept in step with the directory.
+    """
+    matches = [
+        rdir
+        for rdir in _session_dirs(group)
+        if has_session(_read_sibling_state(rdir), session)
+    ]
+    return _newest_record(matches)
+
+
+def _session_dir(group: Path, session: Optional[str] = None) -> Path:
+    """Which session dir of *group* this call writes in (D22).
+
+    In order: an EXPLICIT session id (a resume naming one launch), then this
+    launch's own dir, then the dir whose lineage records this harness id,
+    then the creation address `<group>/<LMER_SESSION_ID>`. The launch's own
+    NAME beats the lineage because a dir named for this id was created by
+    this launch itself; the two can only disagree in a shape nothing writes.
+
+    With no `LMER_SESSION_ID` there is no launch to be independent OF, so
+    inventing one would multiply empty records — one per `work` invocation,
+    since each is its own process. Such a call addresses the group's newest
+    session instead (:func:`_newest_record`, the platform's rule), and only
+    an EMPTY group makes it start a record, under an id synthesized in the
+    launcher's form (:func:`_session_dir_id`). The next invocation then joins
+    what this one wrote, by that same newest-session rule.
+
+    An id nothing occupies resolves to where it WOULD be written — the same
+    contract the slug has, so the caller decides whether to seed. An id that
+    is not a usable directory name is refused here rather than resolved: this
+    is the point where the consequence appears (the same place the platform
+    puts its check), it is the only path that takes a value from outside, and
+    a `.` addressing the group would put a record at the one level D22 keeps
+    empty — where nothing later can tell it from a tree adopted before its
+    runs were migrated.
+    """
+    if session is not None and not _usable_session_id(session):
+        raise RunStateError(
+            f"session id {session!r} is not a usable directory name — it names "
+            "one launch inside the run's group, never a path or a pattern"
+        )
+    if session:
+        return _named_session(group, session) or group / session
+    launch = launch_session_id()
+    if launch:
+        return (
+            _named_session(group, launch)
+            or _lineage_session(group, launch)
+            or group / launch
+        )
+    return _newest_record(_session_dirs(group)) or group / _session_dir_id()
+
+
+def _creation_address(
+    base: Path, slug: str, session: Optional[str] = None
+) -> Path:
+    """Where a run this call CREATES goes: `runs/<slug>` in a legacy tree,
+    this launch's session dir under `_runs/<slug>/` in schema form.
+
+    Deliberately the bare address in both shapes, resolving no content: the
+    address is exactly what a re-slugged run vacates, and following its
+    successor here would make the next release adopt the run that moved away
+    instead of seeding the fresh one the move was for. Callers that must not
+    create beside an existing run resolve first (:func:`ensure_run`, `work
+    seed`'s duplicate check) — this answers where, not whether.
+
+    A record already at the run-area level is answered as itself: a tree
+    adopted before its runs were migrated holds `_runs/<slug>/state.yaml`,
+    and a session dir nested inside another record is not a shape anything
+    should write.
+    """
+    if not is_session_form():
+        return base / slug
+    group = base / slug
+    if _state_path(group) is not None:
+        return group  # an unmigrated record already sits at this address
+    return _session_dir(group, session)
+
+
+def _record_address(
+    base: Path, slug: str, session: Optional[str] = None
+) -> Path:
+    """Where this call's record is — the dir it resolves to, or the address
+    it would be created at (:func:`_creation_address`). THE composition of
+    the two levels, so the dir a caller resolves and the dir a seed creates
+    can never be two different paths.
+
+    A record at the run-area level is answered as itself in either shape: a
+    legacy run dir, or a tree adopted before its runs were migrated, is
+    written where it lies and never given a session dir nested inside it.
+    """
+    found = resolve_run_dir(slug, base) or _unreadable_state_candidate(base, slug)
+    if found is None:
+        return _creation_address(base, slug, session)
+    if not is_session_form() or found.parent == base:
+        return found
+    return _session_dir(found.parent, session)
+
+
+def run_dir(
+    slug: Optional[str] = None, session: Optional[str] = None
+) -> Optional[Path]:
     """The current run's directory: resolved by state content when the run
-    exists (rename-proof), else the canonical `runs/<slug>` creation address."""
+    exists (rename-proof), else the canonical creation address —
+    `runs/<slug>` in a legacy tree, `_runs/<slug>/<session-id>` in schema
+    form, where `session` (a resume) or `LMER_SESSION_ID` picks the launch
+    (:func:`_session_dir`)."""
     base = runs_base()
     if base is None:
         return None
-    slug = slug or derive_slug()
-    found = resolve_run_dir(slug, base)
-    if found is not None:
-        return found
-    corrupt = _unreadable_state_candidate(base, slug)
-    if corrupt is not None:
-        return corrupt
-    return base / slug
+    return _record_address(base, slug or derive_slug(), session)
 
 
 def run_rel_path(slug: Optional[str] = None) -> Optional[str]:
@@ -392,20 +968,59 @@ def run_rel_path(slug: Optional[str] = None) -> Optional[str]:
     return rels[0] if rels else None
 
 
+def run_area_rel_name(rdir: Path) -> Optional[str]:
+    """*rdir* named the way the movers name the dir they moved: run-area
+    relative (`<slug>/<sid>` in schema form, the bare dir name in a legacy
+    tree), which is the spelling :func:`run_rel_for_dir_name` composes a
+    staging path from. None when there is no run area to be relative to.
+
+    THE way a caller holding a PATH asks for that name. `freeze_run_dir` and
+    `reslug_run` hand back the name of the address a record vacated, and the
+    other end of the same move is a path the caller has in hand — so both ends
+    have to be spelled the same way or the commit stages one of them at an
+    address nothing wrote. `rdir.name` was that spelling before the session
+    level and is now half an address (issue #353 D22).
+    """
+    base = runs_base()
+    if base is None:
+        return None
+    return _area_rel_name(base, rdir)
+
+
 def run_rel_for_dir_name(dir_name: str) -> Optional[str]:
-    """The work-repo-relative path of a run dir by NAME:
-    `{host}/{project}/runs/<dir_name>`, or None when the repo identity is
-    not in the environment.
+    """The work-repo-relative path of a run dir by NAME —
+    `{host}/{project}/runs/<dir_name>` in a legacy tree, `<project>/_runs/
+    <dir_name>` under the resolved project dir in a schema-form one — or
+    None when nothing resolves.
+
+    The name is run-area-RELATIVE (:func:`_area_rel_name`), which in schema
+    form means it carries the `<slug>/` grouping level a session dir hangs
+    off: `<slug>/<sid>`. That is what every producer of one hands back —
+    :func:`freeze_run_dir` and :func:`reslug_run` return the name the record
+    moved FROM — so a caller staging the pre-rename path addresses the
+    directory that actually moved. A bare slug names the group, which is the
+    right thing to stage for an address a run vacated: it covers whatever is
+    left there, including nothing.
 
     One owner for the shape. Callers that stage a run dir for commit build
     this path, and every copy of it also copies the host/project fallback —
     so it lives here, beside run_rel_path_candidates, which is built on it.
+
+    Derived from runs_base() rather than re-composed from the env trio
+    (issue #353): the two must name the same directory, and in schema form
+    the project dir is the registry's answer (a short name, or a host
+    bucket), which no re-composition can reach. A base outside the work repo
+    has no relative path and stages nothing — the same refusal as no base at
+    all, never a path a commit would take literally.
     """
-    host = os.environ.get("LMER_REPO_HOST")
-    project = os.environ.get("LMER_REPO_PROJECT")
-    if not host or not project:
+    base = runs_base()
+    if base is None:
         return None
-    return f"{host}/{project}/runs/{dir_name}"
+    try:
+        rel = base.relative_to(work_repo_root())
+    except ValueError:
+        return None
+    return f"{rel.as_posix()}/{dir_name}"
 
 
 def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
@@ -414,12 +1029,19 @@ def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
     commit after a dir rename pick up the old path's deletions even when
     the rename-time push failed (commit_work_path skips clean paths) — the
     naming freeze's rename and the release re-slug's alike, since the bare
-    slug is exactly the address a re-slugged run vacated."""
+    slug is exactly the address a re-slugged run vacated.
+
+    In schema form the bare address is the `_runs/<slug>/` GROUP, so the two
+    candidates are the resolved session dir and everything else the run has
+    under that slug — this launch's own dir included, whether or not it is
+    the one the resolver quotes. Nothing is staged per session: a group is a
+    directory, and a directory stages what is in it."""
     slug = slug or derive_slug()
+    base = runs_base()
     rels = []
     found = resolve_run_dir(slug)
-    if found is not None:
-        resolved = run_rel_for_dir_name(found.name)
+    if found is not None and base is not None:
+        resolved = run_rel_for_dir_name(_area_rel_name(base, found))
         if resolved is None:
             return []
         rels.append(resolved)
@@ -461,6 +1083,7 @@ def seed_run_dir(
     target: str,
     note: Optional[str] = None,
     adopt_existing: bool = True,
+    session: Optional[str] = None,
 ) -> tuple[Path, dict]:
     """Create a run dir via the tmp-dir-then-rename lifecycle (issue #87 D2).
 
@@ -475,19 +1098,47 @@ def seed_run_dir(
     the race window is silently replaced — POSIX rename semantics — which
     is harmless: an empty dir holds no run.) Writes only — pushing is the
     caller's business.
+
+    In schema form the destination is this launch's SESSION dir,
+    `_runs/<slug>/<session-id>/` (:func:`_record_address`, so the dir a
+    caller resolved and the dir seeded here are one path), and the seed
+    itself still lands in `_runs/.new-<session-id>-*`: the RUN AREA, one
+    level above the group. That is the seed's documented home (docs/SCHEMA.md
+    and the §6 external cleaner contract both look for `.new-*` there, and
+    the validator's `record.seed-dir-leftover` warns on one that is), it
+    keeps the lifecycle identical in both shapes — one mkdtemp in the area,
+    one rename — and it keeps the grouping level clear: a leftover inside a
+    group would be litter nobody sweeps and nobody reports. The group dir
+    itself is created here, empty, and stays that way (D22).
     """
     base = runs_base()
     if base is None:
         raise RunStateError("no run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
     base.mkdir(parents=True, exist_ok=True)
+    # The destination is computed BEFORE the temp dir exists: it resolves no
+    # content (see :func:`_creation_address`) but it is where an unusable
+    # explicit session id is refused, and a refusal after the mkdtemp would
+    # leave a `.new-*` orphan for the external cleaner to sweep.
+    final = _creation_address(base, slug, session)
     tmp = Path(
-        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{current_session_id()}-", dir=base)
+        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{_seed_session_label()}-", dir=base)
     )
     os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
     state = seed_state(slug, taskdef, target)
+    if is_session_form():
+        # The chain starts with the launch that opened the record, so a
+        # resumed dir reads as the lineage it is. A synthesized id names a
+        # process, not a session anyone can resume, and is left out.
+        _chain_session(state, launch_session_id() or "")
     write_state(tmp, state)
     append_event(tmp, "run_seeded", note=note)
-    final = base / slug
+    # Whose directory the group is, recorded BEFORE the mutation — the same
+    # question, and the same answer, as the re-slug path below. `mkdir` with
+    # `exist_ok=True` cannot report whether it created anything, so this is the
+    # only thing that tells "the address I just made" from "an address that was
+    # already there holding other launches".
+    created_group = not final.parent.exists()
+    final.parent.mkdir(parents=True, exist_ok=True)
     try:
         tmp.rename(final)
     except OSError as exc:
@@ -495,6 +1146,21 @@ def seed_run_dir(
         if not final.exists():
             # Not a collision — EACCES/ENOSPC/EXDEV/...: report the real
             # error, or "already exists" would send debugging the wrong way.
+            #
+            # Unwind the group this call created and never filled. Leaving it
+            # is not cosmetic: `slug_available` counts a bare directory as the
+            # slug being taken, so `release_run.unique_release_slug` then hands
+            # the next release a stamped address (`<slug>-v1.2.3-<utc>`) for a
+            # run that was never seeded — the same drift the re-slug path
+            # below fixes, reached through the other door. `rmdir` and not
+            # `rmtree`: it refuses a non-empty directory atomically, so a
+            # launch that raced a record into the address keeps it. Failure to
+            # clean up is never a reason to change the error being raised.
+            if created_group:
+                try:
+                    final.parent.rmdir()
+                except OSError:
+                    pass
             raise RunStateError(f"cannot seed run at {final}: {exc}")
         if not adopt_existing:
             raise RunStateError(f"run '{slug}' already exists at {final}")
@@ -508,12 +1174,26 @@ def seed_run_dir(
     return final, state
 
 
+def _seed_session_label() -> str:
+    """The writer id a `.new-*` seed dir carries. The launch's session id in
+    schema form — `.new-<session-id>-*` is the documented seed name and the
+    litter should say whose it is — and `current_session_id()`'s label in a
+    legacy tree, unchanged."""
+    return _session_dir_id() if is_session_form() else current_session_id()
+
+
 def ensure_run(
     slug: Optional[str] = None,
     taskdef: Optional[str] = None,
     target: Optional[str] = None,
+    session: Optional[str] = None,
 ) -> tuple[Path, dict]:
     """Load the current run's state, creating the run when needed.
+
+    `session` names the launch to continue (a resume). Whatever record this
+    call lands in, the launch's harness id is chained into its lineage
+    (:func:`attach_session`) — at most one extra state write per launch, and
+    the thing that routes this launch's LATER invocations back here.
 
     Fresh runs are created through seed_run_dir (tmp-then-rename); a dir
     that already exists but lacks readable state is reseeded IN PLACE — it
@@ -527,7 +1207,7 @@ def ensure_run(
     (schema newer than this kernel) propagates.
     """
     slug = slug or derive_slug()
-    rdir = run_dir(slug)
+    rdir = run_dir(slug, session)
     if rdir is None:
         raise RunStateError("no run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
     try:
@@ -547,8 +1227,92 @@ def ensure_run(
             write_state(rdir, state)
             append_event(rdir, "run_seeded")
         else:
-            rdir, state = seed_run_dir(slug, taskdef, target)
+            rdir, state = seed_run_dir(slug, taskdef, target, session=session)
+    attach_session(rdir, state)
     return rdir, state
+
+
+def list_sessions(
+    base: Optional[Path] = None,
+    now: Optional[str] = None,
+    stale_after_minutes: float = STALE_CLAIM_MINUTES,
+) -> list[dict]:
+    """One row per run record under the run area, in start order — what
+    `work sessions` renders (D22).
+
+    In schema form each row is one launch: `id` is its session id (the dir
+    name without the freeze's `--<name>` suffix — `<sid>` and `<sid>--<name>`
+    are the same session) and the group order plus the timestamp-first ids
+    make the listing start order. A legacy run dir is listed too, so one verb
+    answers "what is running" in both shapes, but its `id` is None: several
+    sessions interleave in one such dir, so no session id describes it.
+
+    `orphaned` is the verdict the view is built on — True for an `in-progress`
+    record with nothing live in it: no `owner`, or an owner claim older than
+    `stale_after_minutes` (the same advisory window `claim_status` uses; a
+    harness that died never cleared it). An orphan is listable, resumable and
+    NEVER auto-ended. It is a different question from the validator's
+    `record.session-stale`, which asks whether a record has been ABANDONED
+    (its own, much longer window on `updated`) rather than whether a process
+    is in it right now.
+
+    A record whose state cannot be read is listed with None fields and
+    `orphaned=None` — no verdict, rather than a verdict of "fine". Dropping
+    it would be how a live run disappears from the operator's view, which is
+    the failure this listing exists to prevent.
+    """
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return []
+    now = now or utc_now_iso()
+    rows = []
+    for rdir in iter_record_dirs(base):
+        state = _read_sibling_state(rdir)
+        is_session = rdir.parent != base
+        row = {
+            "id": session_id_of(rdir.name) if is_session else None,
+            "dir_name": rdir.name,
+            "path": rdir,
+            "slug": None,
+            "name": None,
+            "status": None,
+            "phase": None,
+            "created": None,
+            "updated": None,
+            "owner": None,
+            "orphaned": None,
+        }
+        if state is not None:
+            row.update(
+                {
+                    "slug": state.get("slug"),
+                    "name": state.get("name"),
+                    "status": state.get("status"),
+                    "phase": state.get("phase"),
+                    "created": state.get("created"),
+                    "updated": state.get("updated"),
+                    "owner": state.get("owner"),
+                    "orphaned": _is_orphaned(state, now, stale_after_minutes),
+                }
+            )
+        rows.append(row)
+    return rows
+
+
+def _is_orphaned(state: dict, now: str, stale_after_minutes: float) -> bool:
+    """Whether an `in-progress` record has nothing live in it (see
+    :func:`list_sessions`). The owner claim is the evidence — it is the field
+    a session takes at start and clears at end — and its age bounds clock
+    skew in BOTH directions for the reason :func:`claim_status` gives."""
+    if state.get("status") != "in-progress":
+        return False
+    owner = state.get("owner")
+    if not owner:
+        return True
+    claimed_at = owner.get("claimed_at") if isinstance(owner, dict) else None
+    age = _iso_to_minutes_apart(str(claimed_at or ""), now)
+    return age is None or abs(age) >= stale_after_minutes
 
 
 def is_planning_phase(phase: Optional[str]) -> bool:
@@ -571,45 +1335,62 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     one" durable, so there is no second chance. Fail-soft: a rename that
     cannot happen (target taken, fs error) is reported and skipped.
 
-    Returns (possibly-renamed rdir, previous dir name when a rename
-    happened, else None).
+    In schema form the rename lands on the SESSION dir and nothing else
+    (D22): `_runs/<slug>/<sid>/` → `_runs/<slug>/<sid>--<name>/`, inside its
+    own group, which neither moves nor is written to. The stem is therefore
+    the session id, not the slug — the slug is the group's name, and a
+    session dir has never carried it — and `work name` names the launch,
+    which is what a name is for once two launches share a target.
+
+    Returns (possibly-renamed rdir, previous run-area-relative dir name when
+    a rename happened, else None). Run-area-relative (`<slug>/<sid>`, and
+    just `<dir>` in a legacy tree) because both consumers need the group:
+    the specs index rewrites `../_runs/<slug>/<sid>/…` symlink targets, and
+    the caller stages the pre-rename path so the old path's deletion lands in
+    the same commit (:func:`run_rel_for_dir_name`).
     """
     state["frozen"] = utc_now_iso()
     name = state.get("name")
     slug = state.get("slug") or rdir.name
     if not name:
         return rdir, None
-    final_name = f"{slug}--{name}"
+    base = runs_base()
+    group = rdir.parent
+    is_session = _is_session_record(rdir)
+    stem = session_id_of(rdir.name) if is_session else slug
+    final_name = f"{stem}--{name}"
     if rdir.name == final_name:
         return rdir, None
-    target = rdir.parent / final_name
+    target = group / final_name
     if target.exists():
         print(f"⚠️  run-dir rename skipped: {target} already exists")
         return rdir, None
     old_name = rdir.name
+    old_rel = _area_rel_name(base, rdir) if base is not None else old_name
+    new_rel = f"{group.name}/{final_name}" if is_session else final_name
     try:
         rdir = rdir.rename(target)
     except OSError as exc:
-        print(f"⚠️  run-dir rename failed (continuing at runs/{old_name}): {exc}")
+        print(f"⚠️  run-dir rename failed (continuing at runs/{old_rel}): {exc}")
         return rdir, None
     # The rename has happened — the caller MUST get the new path back even
     # if recording the audit event fails, or its next state write would
     # recreate the old dir and fork the run.
     try:
-        append_event(rdir, "run_dir_renamed", note=f"runs/{old_name} -> runs/{final_name}")
+        append_event(rdir, "run_dir_renamed", note=f"runs/{old_rel} -> runs/{new_rel}")
     except OSError as exc:
         print(f"⚠️  run_dir_renamed event not recorded: {exc}")
-    # Specs-index entries are relative symlinks into runs/<dirname>/ — the
+    # Specs-index entries are relative symlinks into the record dir — the
     # rename would leave them dangling (and the label change from slug to
     # name defeats upsert's stale-cleanup), so re-point them now. Fail-soft
     # both here and inside (index maintenance never fails a freeze).
     try:
         specs_index.repoint_run_dir_entries(
-            old_name, final_name, specs_index.run_label(rdir, state)
+            old_rel, new_rel, specs_index.run_label(rdir, state)
         )
     except Exception as exc:
         print(f"⚠️  specs index re-point failed (continuing): {exc}")
-    return rdir, old_name
+    return rdir, old_rel
 
 
 def reslug_run(
@@ -641,19 +1422,44 @@ def reslug_run(
     distinct lifecycle event from the freeze gate's one-shot naming rename
     (issue #87 D2), which is untouched.
 
-    Returns (possibly-renamed rdir, state, previous dir name when a rename
-    happened, else None) — the caller stages the previous path so the old
-    path's deletion lands in the same commit.
+    In schema form the identity is the GROUP's name and the dir's own name is
+    the session id, so the move is sideways: the session dir goes to
+    `_runs/<new-slug>/<sid>/` keeping its name, and the group it leaves is
+    removed when it is empty. Same guard, same order, same crash windows —
+    the resource that must not be double-booked is still the directory the
+    next release would seed at, which is now that group (D22). A move that
+    fails also gives back the group it had to CREATE to attempt the rename:
+    the §6 cleaner contract sweeps `.new-*` seeds and nothing else, so a husk
+    left at the destination address is permanent, and it holds that address
+    against the retry. Both ends of the move leave the run area as they found
+    it — the vacated group taken away, the unreached one never kept.
+
+    Returns (possibly-renamed rdir, state, previous run-area-relative dir
+    name when a rename happened, else None) — the caller stages the previous
+    path so the old path's deletion lands in the same commit.
     """
     old_slug = state.get("slug")
     if not new_slug or new_slug == old_slug:
         return rdir, state, None
     name = state.get("name")
-    target_name = f"{new_slug}--{name}" if name else new_slug
+    base = runs_base()
+    group = rdir.parent
+    is_session = _is_session_record(rdir)
+    area = base if is_session and base is not None else group
+    if is_session:
+        # The session is the unit of record, so it MOVES to the group its new
+        # identity addresses (`_runs/<new-slug>/<sid>/`) rather than dragging
+        # the group — which is an address, and may hold other launches of the
+        # identity being left behind. The dir's own name (the session id, plus
+        # any freeze suffix) does not change: the launch is the same launch.
+        target_name = rdir.name
+        target = area / new_slug / target_name
+    else:
+        target_name = f"{new_slug}--{name}" if name else new_slug
+        target = group / target_name
     old_dir_name: Optional[str] = None
-    if rdir.name != target_name:
-        target = rdir.parent / target_name
-        if not slug_available(new_slug, rdir.parent, exclude=rdir):
+    if target != rdir:
+        if not slug_available(new_slug, area, exclude=rdir):
             # The guard is on the SLUG, not on the path: a named run holds
             # `<new_slug>--<name>` while leaving `runs/<new_slug>` free, and
             # letting the move through there would leave two runs recording
@@ -666,15 +1472,52 @@ def reslug_run(
             # stderr for every warning on this path: it runs inside
             # `work release claim`, whose --json form parses stdout.
             print(f"⚠️  re-slug skipped: '{new_slug}' is already taken "
-                  f"(run stays at runs/{rdir.name})", file=sys.stderr)
+                  f"(run stays at runs/{_area_rel_name(area, rdir)})",
+                  file=sys.stderr)
             return rdir, state, None
-        old_dir_name = rdir.name
+        old_dir_name = _area_rel_name(area, rdir)
+        # In schema form the destination GROUP has to exist before the session
+        # can be renamed into it, so the move creates an address before it can
+        # know the move will happen. A rename that fails would leave that
+        # address standing as an empty group, and nothing ever takes one away:
+        # no resolver reads it (resolution is by content), the validator has
+        # no finding for it, and the §6 cleaner sweeps only `.new-*` seeds.
+        # What it does do is OCCUPY the address — `slug_available` counts a
+        # dir holding no record as taken, exactly as an empty `runs/<slug>`
+        # has always been — so the retry finds its own abandoned destination
+        # held against it and drifts to `unique_release_slug`'s stamped
+        # variant, parking the release run at a name nothing in the tree
+        # accounts for. The failure path takes back what this call put down.
+        created_group = not target.parent.exists()
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
             rdir = rdir.rename(target)
         except OSError as exc:
+            if created_group:
+                try:
+                    target.parent.rmdir()
+                except OSError:
+                    # Only ever a group this call created, and rmdir refuses a
+                    # non-empty one — so the sole way here is another launch
+                    # seeding into the address between the mkdir and now, whose
+                    # record must outlive this failure. Nothing to report:
+                    # either the husk is gone or the address is legitimately
+                    # occupied.
+                    pass
             print(f"⚠️  re-slug rename failed (continuing at "
                   f"runs/{old_dir_name}): {exc}", file=sys.stderr)
             return rdir, state, None
+        if is_session:
+            # An address whose last session moved out is gone, not left as a
+            # husk: an empty group would occupy the address it names
+            # (`slug_available`) and wedge the next release out of the bare
+            # one. rmdir refuses a group another launch still occupies, which
+            # is exactly the distinction wanted, and any failure is nothing
+            # to say — the group is empty and harmless either way.
+            try:
+                group.rmdir()
+            except OSError:
+                pass
     # The rename has happened — from here the caller MUST get the new path
     # back even if a bookkeeping step fails, or its next write would
     # recreate the old dir and fork the run.
@@ -697,11 +1540,14 @@ def reslug_run(
     except OSError as exc:
         print(f"⚠️  run_reslugged event not recorded: {exc}", file=sys.stderr)
     if old_dir_name is not None:
-        # Index entries are relative symlinks into runs/<dirname>/ — same
-        # re-point the freeze rename does, fail-soft for the same reason.
+        # Index entries are relative symlinks into the record dir — same
+        # re-point the freeze rename does, fail-soft for the same reason, and
+        # named the same run-area-relative way so the group level is carried.
         try:
             specs_index.repoint_run_dir_entries(
-                old_dir_name, target_name, specs_index.run_label(rdir, state)
+                old_dir_name,
+                _area_rel_name(area, rdir),
+                specs_index.run_label(rdir, state),
             )
         except Exception as exc:
             print(f"⚠️  specs index re-point failed (continuing): {exc}",
@@ -1597,18 +2443,74 @@ def format_brief(
     return "\n".join(lines)
 
 
+def _masterplan_bundle_artifacts(rdir: Path) -> list[tuple[Path, str, str]]:
+    """Every well-known bundle artifact `rdir` carries, in link order, as
+    `(bundle file, record-root link name, relative link target)`.
+
+    The FORM decides the shape (issue #353 D12), because the form is what
+    decided it when the bundle was WRITTEN: masterplan is handed its bundle
+    root by `lmer_cli.container.masterplan.masterplan_runs_dir()`, which is
+    `run_dir() / "masterplan"`, and in schema form that run dir is this
+    launch's own session dir (D22). One launch, one session dir, one bundle —
+    so the bundle is flat, `<session-dir>/masterplan/<artifact>`, with no
+    `<mp-slug>` level to iterate and nothing to disambiguate: the multi-bundle
+    `<mp-slug>-<name>` link prefix retires with the nesting (docs/SCHEMA.md,
+    the `<session-dir>/masterplan/` inventory row and Appendix A).
+
+    Asking for the five names it knows, rather than listing, is also what
+    keeps the bundle OPAQUE: it is a foreign writer's tree, validated no
+    further than its existence (D12), so nothing here walks into it — and a
+    `<mp-slug>` dir a not-yet-adapted writer leaves inside a session bundle
+    is bundle internals, not a second bundle.
+
+    A legacy `runs/<slug>/` dir is one shared dir per target, which is what
+    made several bundles possible in the first place, so it keeps today's
+    iteration, ordering and prefixing byte for byte — schema-1 tooling never
+    restructures a legacy record (§3.5).
+    """
+    mp_dir = rdir / MASTERPLAN_DIR
+    if not mp_dir.is_dir():
+        return []
+    if is_session_form():
+        return [
+            (mp_dir / name, name, os.path.join(MASTERPLAN_DIR, name))
+            for name in MASTERPLAN_ARTIFACTS
+            if (mp_dir / name).is_file()
+        ]
+    bundles = sorted(
+        (p for p in mp_dir.iterdir() if p.is_dir()), key=lambda p: p.name
+    )
+    prefixed = len(bundles) > 1
+    found: list[tuple[Path, str, str]] = []
+    for bundle in bundles:
+        for name in MASTERPLAN_ARTIFACTS:
+            if not (bundle / name).is_file():
+                continue
+            found.append((
+                bundle / name,
+                f"{bundle.name}-{name}" if prefixed else name,
+                os.path.join(MASTERPLAN_DIR, bundle.name, name),
+            ))
+    return found
+
+
 def sync_masterplan_artifacts(rdir: Path) -> list[str]:
-    """Surface masterplan bundle artifacts at the run-dir root (spec §6).
+    """Surface masterplan bundle artifacts at the record root (spec §6).
 
-    Discovers masterplan/<mp-slug>/ bundle dirs under `rdir` and creates
-    RELATIVE symlinks at the run-dir root for each well-known artifact
-    (MASTERPLAN_ARTIFACTS) that is present — relative because both ends live
-    in the same work-repo checkout, so the links survive git round-trips.
+    Finds the well-known artifacts (MASTERPLAN_ARTIFACTS) of the bundle under
+    `rdir` — flat in schema form, one `<mp-slug>` level down in a legacy tree
+    (:func:`_masterplan_bundle_artifacts` owns that split) — and creates a
+    RELATIVE symlink at the record root for each: relative because both ends
+    live in the same work-repo checkout, so the links survive git round-trips
+    and satisfy the index-link shape rules (`index.link-not-relative`,
+    `index.link-escapes`) the validator applies in every form.
 
-    Collision policy: a single bundle links under the plain artifact names;
-    multiple bundles prefix each link `<mp-slug>-<name>`. A pre-existing
-    regular file at a link name is replaced (the bundle copy is canonical);
-    an already-correct symlink is left alone, so the sync is idempotent.
+    Collision policy: a schema-form session dir holds at most one bundle, so
+    its links are the plain artifact names. In a legacy tree a single bundle
+    links under the plain names and multiple bundles prefix each link
+    `<mp-slug>-<name>`. A pre-existing regular file at a link name is
+    replaced (the bundle copy is canonical); an already-correct symlink is
+    left alone, so the sync is idempotent.
 
     Every linked name is registered in state.artifacts through the single
     writer (load_state → write_state); the state file is only rewritten when
@@ -1618,43 +2520,31 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
 
     Bundle specs also land in the project-level specs index (issue #101),
     linked to the BUNDLE file — the one canonical target — never to the
-    run-root convenience symlink made here.
+    record-root convenience symlink made here.
 
-    Returns the list of link names now present at the run-dir root.
+    Returns the list of link names now present at the record root.
     """
     linked: list[str] = []
-    spec_files: list[tuple[Path, str]] = []  # (bundle file, run-root link name)
+    spec_files: list[tuple[Path, str]] = []  # (bundle file, record-root link name)
     try:
-        mp_dir = rdir / MASTERPLAN_DIR
-        if not mp_dir.is_dir():
-            return []
-        bundles = sorted(
-            (p for p in mp_dir.iterdir() if p.is_dir()), key=lambda p: p.name
-        )
-        prefixed = len(bundles) > 1
-        for bundle in bundles:
-            for name in MASTERPLAN_ARTIFACTS:
-                if not (bundle / name).is_file():
-                    continue
-                link_name = f"{bundle.name}-{name}" if prefixed else name
-                if specs_index.is_spec_artifact(name):
-                    spec_files.append((bundle / name, link_name))
-                target = os.path.join(MASTERPLAN_DIR, bundle.name, name)
-                link_path = rdir / link_name
-                try:
-                    if link_path.is_symlink():
-                        if os.readlink(link_path) == target:
-                            linked.append(link_name)  # already correct
-                            continue
-                        link_path.unlink()
-                    elif link_path.exists():
-                        # Regular file (e.g. a manually copied spec.md):
-                        # the bundle copy is canonical — replace it.
-                        link_path.unlink()
-                    link_path.symlink_to(target)
-                    linked.append(link_name)
-                except OSError as exc:
-                    print(f"⚠️  masterplan artifact sync: skipped {link_name}: {exc}")
+        for bundle_file, link_name, target in _masterplan_bundle_artifacts(rdir):
+            if specs_index.is_spec_artifact(bundle_file.name):
+                spec_files.append((bundle_file, link_name))
+            link_path = rdir / link_name
+            try:
+                if link_path.is_symlink():
+                    if os.readlink(link_path) == target:
+                        linked.append(link_name)  # already correct
+                        continue
+                    link_path.unlink()
+                elif link_path.exists():
+                    # Regular file (e.g. a manually copied spec.md):
+                    # the bundle copy is canonical — replace it.
+                    link_path.unlink()
+                link_path.symlink_to(target)
+                linked.append(link_name)
+            except OSError as exc:
+                print(f"⚠️  masterplan artifact sync: skipped {link_name}: {exc}")
         if linked:
             try:
                 state = load_state(rdir)

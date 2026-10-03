@@ -494,8 +494,10 @@ class TestSpawnWithPreset:
         os.close(session.master_fd)
 
         assert list(captured["args"]) == ["lmer", "chat", PERMALINK]
-        # Inherits the listener environment unchanged.
-        assert captured["kwargs"]["env"] == dict(os.environ)
+        # Inherits the listener environment, plus the one fact this listener
+        # imposes on its child: it announces the thread itself, so the child's
+        # connector does not (issue #412).
+        assert captured["kwargs"]["env"] == dict(os.environ) | {"LMER_CHAT_ATTACH_ACK": "0"}
 
     @pytest.mark.asyncio
     async def test_full_preset_builds_command_and_env(

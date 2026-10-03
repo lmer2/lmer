@@ -29,6 +29,14 @@ This is why the inventory must run **before** :func:`registry.prune_dead`: the
 stale entry *is* the crash signal, and pruning it is how an operator
 acknowledges the crash and clears it from the list.
 
+One dead entry is **not** that evidence: a session the operator asked to wind
+down leaves a ``lifecycle`` record and then ends exactly as asked, with no reaper
+to clear it (#324). Two facts decide it — :func:`_was_wound_down` for what was
+asked, :func:`_observed_bad_exit` for what a watcher saw — because the request
+alone carries no exit code and nothing that clears it. Wound down and then dead
+under a watcher is still a crash; wound down with nothing else recorded reads
+``dormant``. See docs/PLATFORM-QUICKSTART.md, "Wound down, not crashed".
+
 **Sessions can exist before their run dir does.** A freshly spawned session does
 not appear in the mirror until it runs its first ``work commit`` — seconds or
 minutes later. Iterating run dirs alone would make a just-spawned session
@@ -122,6 +130,7 @@ from work_repo import run_state
 
 from . import assistant, meta, transcripts
 from .config import DEFAULT_STALL_BACKSTOP_SECONDS, DEFAULT_STALL_IDLE_SECONDS
+from .lifecycle import VERB_WIND_DOWN
 from .reattach import OUTPUT_CONTROL_PLANE, OUTPUT_SESSION_LOG, detached_record
 from .registry import is_live
 from .runs import RunIndexError, run_key
@@ -147,6 +156,7 @@ __all__ = [
 #: happen. See :mod:`lmer_platform.reattach`.
 RUN_STATES = (
     "running",
+    "stuck_teardown",
     "detached",
     "held",
     "feedback",
@@ -184,6 +194,7 @@ ATTENTION_REASONS = (
     "cap_reached",
     "slot_contention",
     "stalled",
+    "stuck_teardown",
 )
 
 #: Sort order for the attention list: a direct question outranks a crash, because
@@ -200,6 +211,7 @@ ATTENTION_PRIORITY = {
     "yield": 3,
     "cap_reached": 4,
     "stalled": 5,
+    "stuck_teardown": 5,
     "critical_error": 6,
     "crashed": 7,
     "slot_contention": 8,
@@ -225,6 +237,10 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: the tests, which pin each field to the code that reads it, so widening this is
 #: a deliberate act rather than the side effect of writing a new key onto an entry.
 #:
+#: ``exited`` and ``lifecycle`` only mean something together: a row showing
+#: ``wind_down`` beside state ``crashed`` needs the record that decided between
+#: them, so the deciding evidence travels with the verdict.
+#:
 #: ``activity`` is the one member that is not on the registry entry as written: it
 #: is folded onto a copy of it while the row is built (see the module docstring on
 #: why it can only come from the container, and what bounds the read). It crosses
@@ -233,7 +249,9 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: the live session and nothing else: it is unknowable for a run with no session,
 #: it dies with the entry, and a row-level ``idle`` would invite a client to read
 #: it on a dormant run and get a null it could not explain.
-SESSION_FIELDS = ("id", "pid", "started_at", "log_path", "lifecycle", "activity")
+SESSION_FIELDS = (
+    "id", "pid", "started_at", "log_path", "lifecycle", "exited", "activity",
+)
 
 #: Taskdefs whose sessions are quiet *by design*, so silence means nothing about
 #: them. A denylist rather than an allowlist of "real" taskdefs: taskdefs are
@@ -309,6 +327,14 @@ class RunView:
     status: Optional[str] = None
     stop_reason: Optional[str] = None
     updated: Optional[str] = None
+    #: Where the run's record was FOUND, work-repo-relative, or ``None`` when no
+    #: directory was found for it at all — a freshly spawned run that has pushed
+    #: nothing is a state, not an error, and a client renders a path only when
+    #: there is one. Never composed here: the address is whatever found the
+    #: directory (:attr:`lmer_platform.workrepo.RunDirRef.rel_path`), which is
+    #: `{host}/{project}/runs/<dir>` in a legacy tree and the session dir
+    #: `<project>/_runs/<slug>/<session-id>` in schema form (D22) — two shapes
+    #: one composition here could only get wrong for one of them.
     rel_path: Optional[str] = None
     attention: Optional[Attention] = None
     session: Optional[dict] = None
@@ -327,6 +353,12 @@ class RunView:
     #: for, and the history a crashed run can show would vanish the moment the
     #: crash was acknowledged.
     last_session_id: Optional[str] = None
+    #: What the run's *live* session last published about itself
+    #: (:mod:`lmer_platform.statusline`). On the row for the reason the
+    #: questions are: both the run list and the run view read this field, and a
+    #: request per row is the wrong trade for a view polled from a phone.
+    #: ``None`` for every dormant run and every harness that does not report.
+    statusline: Optional[dict] = None
 
     @property
     def live(self) -> bool:
@@ -433,20 +465,13 @@ class RunView:
 
     @property
     def model(self) -> Optional[str]:
-        """The model driving the harness, as the session itself resolved it.
-
-        ``None`` only when the session predates T51 or resolved no model at all —
-        it is no longer the standing answer. The reason this could not simply be
-        read off the daemon still holds and is why the value takes the long way
-        round: the model is resolved *inside* the session, and an exported
-        ``LMER_LLM_NAME`` beats a preset's value host-side (:mod:`lmer_cli.cli`),
-        so inferring it from the daemon's own environment would be wrong for
-        precisely the runs that name a preset — the ones whose model actually
-        varies. So the session reports what it resolved, late, through
-        :func:`lmer_platform.spawn.ports_file_for`, and ``absorb_ports`` folds it
-        in without overwriting a model the spawn request named.
-        """
+        """The requested model, or the launcher's later report when none was named."""
         return self._task.get("model")
+
+    @property
+    def effort(self) -> Optional[str]:
+        """The resolved effort override, or None when the launcher reported none."""
+        return self._task.get("effort")
 
     @property
     def session_for_client(self) -> Optional[dict]:
@@ -460,10 +485,18 @@ class RunView:
         A field the entry does not carry is present as ``None`` rather than
         omitted, so the keys a client sees do not depend on how much the daemon
         had learned by the last time it wrote the entry.
+
+        ``exited`` is the exception: :func:`_observed_bad_exit` makes the
+        *presence* of that key the fact, and a present ``null`` serialises
+        identically to an absent one — so it is normalised to ``{}``, which is
+        what an unreadable record means and what the caption renders.
         """
         if not self.session:
             return None
-        return {key: self.session.get(key) for key in SESSION_FIELDS}
+        block = {key: self.session.get(key) for key in SESSION_FIELDS}
+        if "exited" in self.session and not isinstance(block["exited"], dict):
+            block["exited"] = {}
+        return block
 
     @property
     def session_id_for_history(self) -> Optional[str]:
@@ -524,6 +557,9 @@ class RunView:
             "events": self.events,
             "ports": self.ports,
             "questions": self.questions,
+            # Beside the session block rather than inside it: SESSION_FIELDS
+            # narrows a *registry entry*, and this is not one (#248).
+            "statusline": self.statusline,
             # How the session was launched. Flat fields, read out of the entry's
             # ``task`` block here rather than left for a client to dig out of:
             # that block does not cross at all (SESSION_FIELDS), and a UI reading
@@ -533,6 +569,7 @@ class RunView:
             "agents": self.agents,
             "harness": self.harness,
             "model": self.model,
+            "effort": self.effort,
         }
 
 
@@ -914,6 +951,66 @@ class StallPolicy:
             return None
 
 
+def _was_wound_down(session: Optional[dict]) -> bool:
+    """Did the platform record *asking* this session to end?
+
+    The platform reading back its own action rather than inferring one from how
+    a session died. It says nothing about how the session went, which is why
+    nothing acts on it alone — see :func:`_observed_bad_exit`.
+    """
+    lifecycle = (session or {}).get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return False
+    return lifecycle.get("verb") == VERB_WIND_DOWN
+
+
+def _observed_bad_exit(session: Optional[dict]) -> bool:
+    """Did a watcher see this session's process exit badly?
+
+    The bound on the wind-down mark. ``False`` when nothing is recorded, which is
+    the case that mark is genuinely the best evidence for: a re-attached session
+    or one ``lmer platform spawn`` started has no watcher, so its entry survives
+    a clean exit too and says nothing either way.
+
+    The **presence of the key** is the fact — tested with ``in``, so a truncated
+    ``exited: null`` still counts — and only an explicit ``clean`` takes it back.
+    That inverts this module's usual read-a-wrong-type-as-missing tolerance,
+    because the two directions are not symmetric: read as "nothing was seen", a
+    corrupt record retires a death nobody is told about and lets
+    :func:`lmer_platform.detect._ended_as_asked` delete its only evidence. Read
+    the other way it costs a wound-down run a label an operator can dismiss.
+
+    ``clean: True`` has no writer today — :func:`lmer_platform.spawn._watch`
+    removes the entry outright on a clean exit — and is honoured anyway because
+    this reads a hand-editable file.
+    """
+    session = session or {}
+    if "exited" not in session:
+        return False
+    exited = session["exited"]
+    if isinstance(exited, dict) and exited.get("clean") is True:
+        return False
+    return True
+
+
+def _stuck_teardown(session: Optional[dict]) -> Optional[Attention]:
+    if not session or not session.get("live"):
+        return None
+    record = session.get("teardown")
+    if not isinstance(record, dict) or not record.get("stuck_at"):
+        return None
+    return Attention(
+        reason="stuck_teardown",
+        note=(
+            f"Session {session.get('id')} has stuck teardown: its launcher is alive "
+            f"but its control plane has been unreachable for at least "
+            f"{record.get('grace_seconds')} seconds after accepting shutdown. "
+            "Decide whether to exit the session."
+        ),
+        since=record["stuck_at"],
+    )
+
+
 def _derive(
     state: Optional[dict],
     session: Optional[dict],
@@ -935,6 +1032,9 @@ def _derive(
     holding a slot — while the attention record says a person is the only thing it
     is waiting for.
     """
+    teardown_attention = _stuck_teardown(session)
+    if teardown_attention is not None:
+        return "stuck_teardown", teardown_attention
     if unreadable:
         return "unknown", Attention(
             reason="unreadable",
@@ -1005,6 +1105,9 @@ def _derive(
         )
 
     if stale_entry:
+        if _was_wound_down(session) and not _observed_bad_exit(session):
+            # The one dead entry that is not evidence of a death (#324).
+            return "dormant", None
         # Evidence, not inference: a clean exit removes its registry entry, so a
         # leftover entry with a dead PID means something actually died.
         return "crashed", Attention(
@@ -1025,6 +1128,7 @@ def _view_from_run_dir(
     questions: Optional[list] = None,
     title: Optional[str] = None,
     stall: Optional[StallPolicy] = None,
+    statusline: Optional[dict] = None,
 ) -> RunView:
     state, error = _load_state_tolerantly(ref)
     run_state_state, attention = _derive(
@@ -1033,6 +1137,7 @@ def _view_from_run_dir(
     state = state or {}
     return RunView(
         questions=list(questions or []),
+        statusline=statusline,
         last_session_id=last_session_id,
         host=ref.host,
         project=ref.project,
@@ -1060,6 +1165,7 @@ def _view_from_session(
     questions: Optional[list] = None,
     *,
     title: Optional[str] = None,
+    statusline: Optional[dict] = None,
 ) -> RunView:
     """A session whose run dir has not reached the mirror yet.
 
@@ -1067,25 +1173,38 @@ def _view_from_session(
     run state to read. The row exists so a just-spawned session is visible
     immediately rather than after its first ``work commit``.
 
+    Which bounds what a dead one of these rows may claim: the mirror is
+    git-eventual (spec D24), so an absent run dir is not proof that nothing was
+    pushed, and the note says where it looked rather than what was never done
+    (#324).
+
     A question asked in those first minutes is the *likeliest* one — "which repo
     did you mean?" comes before the first ``work commit``, not after — so this row
     carries the ask channel too rather than being the one place it goes missing.
+    A dead session has none that matter: whatever it was asking, nothing is there
+    to answer.
     """
     run = entry.get("run") or {}
     task = entry.get("task") or {}
+    assistant_session = entry.get("kind") == assistant.KIND and _session_key(entry) is None
     live = bool(entry.get("live"))
+    wound_down = (
+        not live and _was_wound_down(entry) and not _observed_bad_exit(entry)
+    )
     if not live:
-        state = "crashed"
+        state = "dormant" if wound_down else "crashed"
     else:
         state = "detached" if _is_blind(entry) else "running"
-    attention = None
-    if not live:
+    attention = _stuck_teardown(entry)
+    if attention is not None:
+        state = "stuck_teardown"
+    if not live and not wound_down:
         attention = Attention(
             reason="crashed",
-            note="session process is gone and no run state was ever committed",
+            note="session process is gone and its run state is not in the mirror",
             since=entry.get("started_at"),
         )
-    elif questions:
+    elif live and questions and attention is None:
         attention = Attention(
             reason="live_question",
             note=_live_question_note(questions),
@@ -1094,9 +1213,9 @@ def _view_from_session(
     return RunView(
         host=run.get("host") or "—",
         project=run.get("project") or "—",
-        slug=run.get("slug") or entry.get("id") or "—",
+        slug=(entry.get("id") if assistant_session else run.get("slug")) or entry.get("id") or "—",
         state=state,
-        name=run.get("name"),
+        name=run.get("name") or (run.get("slug") if assistant_session else None),
         title=title,
         taskdef=task.get("taskdef"),
         target=task.get("target"),
@@ -1105,6 +1224,7 @@ def _view_from_session(
         attention=attention,
         session=entry,
         questions=list(questions or []),
+        statusline=statusline,
     )
 
 
@@ -1149,6 +1269,7 @@ def build_inventory(
     titles: Optional[Mapping] = None,
     activity: Optional[Mapping] = None,
     stall: Optional[StallPolicy] = None,
+    statusline: Optional[Mapping] = None,
 ) -> Inventory:
     """Join run dirs against session entries into the fleet view.
 
@@ -1187,8 +1308,14 @@ def build_inventory(
     *stall* is the halt-detection policy (#243). ``None`` means the shipped
     defaults with the real reader; ``StallPolicy(idle_after=0, backstop_after=0)``
     asks for no stall opinion at all.
+
+    *statusline* maps a session id to what that session published about itself
+    (:func:`lmer_platform.statusline.by_session`). On the *questions* convention
+    rather than the titles': ``None`` means "no statuses", not "go and read
+    them".
     """
     by_session_questions = dict(questions or {})
+    by_session_statusline = dict(statusline or {})
     by_title = _titles() if titles is None else dict(titles)
     by_activity = None if activity is None else dict(activity)
     by_key: dict[tuple, dict] = {}
@@ -1235,6 +1362,10 @@ def build_inventory(
         session_id = (entry or {}).get("id")
         return list(by_session_questions.get(session_id) or [])
 
+    def statusline_for(entry: Optional[dict]) -> Optional[dict]:
+        session_id = (entry or {}).get("id")
+        return by_session_statusline.get(session_id)
+
     def title_for(entry: dict) -> Optional[str]:
         run = entry.get("run") or {}
         return _title_for(
@@ -1254,6 +1385,7 @@ def build_inventory(
                 questions=questions_for(entry),
                 title=_title_for(by_title, ref.host, ref.project, ref.slug),
                 stall=stall,
+                statusline=statusline_for(entry),
             )
         )
 
@@ -1274,13 +1406,15 @@ def build_inventory(
             continue
         runs.append(
             _view_from_session(
-                entry, questions_for(entry), title=title_for(entry)
+                entry, questions_for(entry), title=title_for(entry),
+                statusline=statusline_for(entry),
             )
         )
     for entry in unmatched:
         runs.append(
             _view_from_session(
-                entry, questions_for(entry), title=title_for(entry)
+                entry, questions_for(entry), title=title_for(entry),
+                statusline=statusline_for(entry),
             )
         )
 

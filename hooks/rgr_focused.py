@@ -16,7 +16,7 @@ COMMAND_MAP = {
         'name': 'Git & Version Control',
         'key_points': [
             '🚨 NEVER push without permission',
-            '🚨 NEVER commit without review',
+            '🚨 Use required gates for authorized routine commits; respect explicit user holds',
             '📋 Check repository allow list',
             '🔍 Run git remote -v before push'
         ]

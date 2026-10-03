@@ -55,6 +55,12 @@ TASKDEF = "develop"
 TARGET = "https://gitlab.example.com/agents/global/-/work_items/141"
 RUN_REF = f"{HOST}/{PROJECT}/{SLUG}"
 REL_PATH = f"{HOST}/{PROJECT}/runs/{SLUG}"
+#: One launch of a slug that groups several (spec D22) — the work repo's record
+#: dir, not the ``s-…`` container session a spawn starts. The two are different
+#: namespaces (see :mod:`lmer_platform.resume`), which is why this is not spelled
+#: like ``spawn_result``'s ``session_id``.
+SESSION_ID = "20260824-165230-2-31245"
+SESSION_REL_PATH = f"{HOST}/{PROJECT}/_runs/{SLUG}/{SESSION_ID}"
 
 RESUME_BODY = {"host": HOST, "project": PROJECT, "slug": SLUG}
 
@@ -117,7 +123,7 @@ def spawn_result(platform_root, session_id="s-resume", **overrides):
 
 
 def resume_result(platform_root, request, *, continued=True, started_slug=None,
-                  **session_overrides):
+                  rel_path=None, **session_overrides):
     return resume_mod.ResumeResult(
         host=request.host,
         project=request.project,
@@ -127,6 +133,7 @@ def resume_result(platform_root, request, *, continued=True, started_slug=None,
         continued=continued,
         started_slug=started_slug or request.slug,
         session=spawn_result(platform_root, **session_overrides),
+        rel_path=rel_path,
     )
 
 
@@ -193,6 +200,13 @@ def test_the_route_is_listed_in_the_api_index(client):
     assert "POST /api/runs/resume" in body
     assert "sibling run" in body, (
         "the entry has to say that naming a taskdef starts a different run"
+    )
+    assert "session_id?" in body, (
+        "an operator reading the index has to be able to see that a resume can "
+        "name one launch of a slug that groups several"
+    )
+    assert resume_mod.SessionNotFound.code in body, (
+        "and that naming one that is not there is its own refusal, not a 500"
     )
 
 
@@ -269,6 +283,88 @@ def test_an_absent_option_stays_absent_rather_than_becoming_blank(client, resume
     assert (request.taskdef, request.repo_url, request.direction) == (None, None, None)
 
 
+def test_a_resume_naming_a_session_carries_it_through(client, resumed):
+    """The one-tap continue takes the newest launch; this is how a caller means
+    another one.
+
+    A slug groups several complete records now (spec D22), so *which* launch a
+    resume reads is a caller's choice rather than a detail — and a route that
+    dropped the field would silently continue a different one, which is the whole
+    failure the field exists to prevent.
+    """
+    response = client.post(
+        "/api/runs/resume",
+        headers=bearer_header(),
+        json={**RESUME_BODY, "session_id": SESSION_ID},
+    )
+
+    assert response.status_code == 202
+    assert resumed.calls[0].session_id == SESSION_ID
+
+
+def test_a_resume_without_a_session_id_says_nothing_about_one(client, resumed):
+    """Absent means "the record the run resolves to", not "no launch at all".
+
+    The ordinary continue is one tap on a row that has already named its address,
+    and a legacy tree has nothing to choose between — so an omitted field has to
+    reach the module as ``None`` rather than as a blank it would have to interpret.
+    """
+    client.post("/api/runs/resume", headers=bearer_header(), json=RESUME_BODY)
+    assert resumed.calls[0].session_id is None
+
+
+def test_a_session_id_is_passed_through_verbatim(client, resumed):
+    """Unstripped and unparsed, like ``taskdef`` and ``direction``.
+
+    The route knows nothing about session dir names: the ``--<name>`` half is
+    deliberately unconstrained (docs/SCHEMA.md), and normalising here would be a
+    second, quieter answer to a question :mod:`lmer_platform.resume` already
+    answers — where a mismatch is a refusal that lists the launches there are.
+    """
+    client.post(
+        "/api/runs/resume",
+        headers=bearer_header(),
+        json={**RESUME_BODY, "session_id": f"  {SESSION_ID}--named  "},
+    )
+    assert resumed.calls[0].session_id == f"  {SESSION_ID}--named  "
+
+
+def test_a_non_string_session_id_keeps_its_own_refusal(client, platform_root):
+    """The un-coerced field again, for the newest one: ``{"session_id": 5}`` must
+    be refused as a session id rather than as a run that has none."""
+    response = client.post(
+        "/api/runs/resume",
+        headers=bearer_header(),
+        json={**RESUME_BODY, "session_id": 5},
+    )
+
+    assert response.status_code == 400
+    assert "session_id must be a string" in response.json()["detail"]["message"]
+
+
+def test_the_reply_names_the_record_the_checks_were_made_against(
+    client, monkeypatch, platform_root
+):
+    """``rel_path`` is the address of the launch that was read — which for a slug
+    that groups several is the only thing saying *which*. A client that showed only
+    ``run`` could not tell an operator whether their named session was the one."""
+    def fake_resume(config, request):
+        return resume_result(platform_root, request, rel_path=SESSION_REL_PATH)
+
+    monkeypatch.setattr(api, "resume_run", fake_resume)
+    payload = client.post(
+        "/api/runs/resume",
+        headers=bearer_header(),
+        json={**RESUME_BODY, "session_id": SESSION_ID},
+    ).json()
+
+    assert payload["rel_path"] == SESSION_REL_PATH
+    assert payload["run"] == {"host": HOST, "project": PROJECT, "slug": SLUG}, (
+        "the identity is still the run the operator pointed at — the session id is "
+        "part of the address and never the key"
+    )
+
+
 def test_a_non_string_option_keeps_its_own_refusal(client, platform_root):
     """Which is what the un-coerced field buys, so it is checked through the route."""
     response = client.post(
@@ -328,6 +424,7 @@ def test_a_warning_from_the_spawn_reaches_the_caller(client, monkeypatch,
     (resume_mod.NotResumable, 409, "not_resumable"),
     (resume_mod.RunIsLive, 409, "live_session"),
     (resume_mod.QuestionOpen, 409, "question_open"),
+    (resume_mod.SessionNotFound, 409, "session_not_found"),
 ])
 def test_every_refusal_reaches_the_client_with_its_status_and_code(
     client, monkeypatch, error, status, code
@@ -807,19 +904,15 @@ def test_the_terminal_is_still_only_loaded_when_it_is_opened():
 
 
 def test_the_resume_section_hardcodes_no_colour_and_no_swept_out_variant():
-    """House style: the theme owns colour, and `outlined`/`flat` were swept out of
-    every component — tonal and elevated are what this app uses.
-
-    The hex scan runs on the comment-stripped source: an MR reference in a comment
-    ("MR #164") is hex-shaped to a regex, and a colour cannot act from inside a
-    comment — the same reading test_platform_lifecycle.py gives this guard.
-    """
+    """Lifecycle controls keep theme styling; project identity uses its named palette."""
     detail = RUN_DETAIL.read_text(encoding="utf-8")
     detail = re.sub(r"<!--.*?-->", "", detail, flags=re.DOTALL)
     detail = re.sub(r"^\s*//.*$", "", detail, flags=re.MULTILINE)
     assert not re.findall(r"#[0-9a-fA-F]{3,8}\b", detail)
     assert 'variant="outlined"' not in detail
-    assert 'variant="flat"' not in detail
+    identity = re.search(r'<v-chip\b[^>]*:color="projectColor\(run.workspace_color\)"[^>]*>', detail)
+    assert identity is not None
+    assert 'variant="flat"' not in detail.replace(identity.group(), '')
 
 
 def test_the_run_detail_view_renders_no_raw_html():

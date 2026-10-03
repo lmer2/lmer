@@ -10,6 +10,8 @@ import inspect
 import json
 import os
 import stat
+import time
+from dataclasses import replace
 
 import pytest
 
@@ -551,6 +553,39 @@ def test_binding_notice_names_file_as_source(platform_root):
 
 def test_binding_notice_names_default_as_source(platform_root):
     assert "bind from default" in cfg.binding_notice(cfg.load())
+
+
+# --- the link a person in a chat thread can open -----------------------------
+
+
+def test_control_ui_url_prefers_what_the_operator_configured(platform_root):
+    """The bridge's own key, for the bridge's own reason: a reverse proxy or a
+    tunnel is not derivable from a bind pair (docs/MATRIX-CHAT.md)."""
+    config = cfg.load({"matrix": {"control_url": "https://lmer.example.org/"}})
+    assert cfg.control_ui_url(config) == "https://lmer.example.org"
+
+
+def test_a_routable_bind_is_a_link_somebody_else_can_dial(platform_root):
+    assert cfg.control_ui_url(cfg.load({"bind_address": "10.0.0.5"})) == "http://10.0.0.5:8600"
+
+
+def test_a_loopback_or_wildcard_bind_yields_no_link_at_all(platform_root):
+    """``http://127.0.0.1:8600`` posted into somebody's Slack channel is not a
+    link, and a wildcard address is not a destination."""
+    assert cfg.control_ui_url(cfg.load()) is None
+    assert cfg.control_ui_url(cfg.load({"bind_address": "0.0.0.0"})) is None
+
+
+def test_a_configured_url_that_is_not_one_falls_through_and_says_so(
+    platform_root, caplog,
+):
+    """Review aside on !299: the bridge refuses a malformed one outright, so
+    dropping it here without a word is how a typo becomes an invisible wrong
+    link."""
+    config = cfg.load({"matrix": {"control_url": "lmer.example.org"}})
+    with caplog.at_level("WARNING"):
+        assert cfg.control_ui_url(config) is None
+    assert "platform_control_url_unusable" in caplog.text
 
 
 # --- the docker bridge gateway probe ----------------------------------------
@@ -1155,6 +1190,124 @@ def test_update_stored_writes_slots_without_baking_in_the_environment(
     assert "bind_address" not in stored
 
 
+def test_stored_slots_reads_the_file_as_it_is_now(platform_root):
+    """Issue #256's first obstacle: the daemon holds one config for its life."""
+    config = cfg.load()
+    assert config.slots == ()
+
+    cfg.update_stored({"slots": [{"name": "webapp", "preset": "webapp_dev"}]})
+
+    assert config.slots == (), "the resolved config is still the boot-time one"
+    assert cfg.stored_slots() == ({"name": "webapp", "preset": "webapp_dev"},)
+    assert cfg.with_stored_slots(config).slots == cfg.stored_slots()
+
+
+def test_with_stored_slots_changes_nothing_else(platform_root, monkeypatch):
+    """It is the slots seam, not a reload — an export must not be re-resolved."""
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.1")
+    config = cfg.load()
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.2")
+
+    refreshed = cfg.with_stored_slots(config)
+
+    assert refreshed.bind_address == "10.0.0.1"
+    assert refreshed == replace(config, slots=cfg.stored_slots())
+
+
+def test_stored_slots_survives_an_unreadable_file(platform_root, caplog):
+    """Read on the fleet poll and at the spawn gate: it may not raise."""
+    path = cfg.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level("ERROR", logger="lmer_platform.config"):
+        assert cfg.stored_slots() == ()
+
+    assert "platform_config_unreadable" in caplog.text
+
+
+def test_stored_slots_applies_the_house_rule_to_a_non_list(platform_root, caplog):
+    store.write_json(cfg.config_path(), {"slots": {"webapp": "webapp_dev"}})
+
+    with caplog.at_level("WARNING", logger="lmer_platform.config"):
+        assert cfg.stored_slots() == ()
+
+    assert "field=slots" in caplog.text
+
+
+# --- the locked read-modify-write (mutate_stored, issue #256) ----------------
+
+def test_mutate_stored_computes_its_changes_from_the_current_file(platform_root):
+    cfg.update_stored({"slots": [{"name": "one", "preset": "p"}]})
+    seen = []
+
+    def compute(current):
+        seen.append(current)
+        return {"slots": list(current["slots"]) + [{"name": "two", "preset": "p"}]}
+
+    stored = cfg.mutate_stored(compute)
+
+    assert seen == [{"slots": [{"name": "one", "preset": "p"}]}]
+    assert [entry["name"] for entry in stored["slots"]] == ["one", "two"]
+
+
+def test_mutate_stored_writes_nothing_when_the_callback_raises(platform_root):
+    """How a precondition that can only be checked under the lock refuses."""
+    cfg.update_stored({"slots": [{"name": "one", "preset": "p"}]})
+
+    class Refused(RuntimeError):
+        pass
+
+    def compute(_current):
+        raise Refused("not on my watch")
+
+    with pytest.raises(Refused):
+        cfg.mutate_stored(compute)
+
+    assert cfg.load().slots == ({"name": "one", "preset": "p"},)
+
+
+def test_mutate_stored_serialises_two_writers(platform_root):
+    """Two threads each appending: the lock is what keeps both changes.
+
+    Without it the merge happens outside the lock and the later write is
+    computed from a list that no longer exists — one operator's change silently
+    gone.
+    """
+    import threading
+
+    cfg.update_stored({"slots": []})
+    start = threading.Barrier(2)
+
+    def append(name):
+        start.wait()
+
+        def compute(current):
+            entries = list(current.get("slots") or [])
+            # Widen the window the lock has to cover.
+            time.sleep(0.01)
+            return {"slots": entries + [{"name": name, "preset": "p"}]}
+
+        cfg.mutate_stored(compute)
+
+    threads = [
+        threading.Thread(target=append, args=(name,)) for name in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(
+        entry["name"] for entry in cfg.load().slots
+    ) == ["a", "b"]
+
+
+def test_mutate_stored_refuses_an_unknown_field(platform_root):
+    with pytest.raises(cfg.ConfigError, match="assistant_effort"):
+        cfg.mutate_stored(lambda _current: {"assistant_effort": "high"})
+
+
 def test_no_environment_variable_declares_slots(platform_root, monkeypatch):
     """Declaring slots is once-per-host file work; a JSON list in an export is
     a footgun, so there is deliberately no override for it."""
@@ -1218,7 +1371,7 @@ def test_an_unusable_window_costs_its_layer_not_the_daemon(
     makes it the one memo here with no stat key to expire it — so this test
     clears it rather than assuming nothing earlier in the session tripped it.
     """
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     store.write_json(cfg.config_path(), {"checkin_window_seconds": 900})
     monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "soon")
     # Both readers, and the same answer from each: the loaded config and the
@@ -1299,7 +1452,7 @@ def test_a_threshold_of_zero_is_a_mistake_not_an_off_switch(
     """The one place the two knobs' rules differ, and it is the whole reason
     they carry a minimum each: a nudge about an empty spool is not a feature
     somebody switched on, and the refusal says where the off-switch is."""
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     monkeypatch.setenv(cfg.ENV_NUDGE_PENDING_THRESHOLD, "0")
 
     assert cfg.load().nudge_pending_threshold == 1
@@ -1318,7 +1471,7 @@ def test_a_threshold_of_zero_is_a_mistake_not_an_off_switch(
 def test_an_unusable_nudge_layer_costs_only_itself(
     platform_root, monkeypatch, caplog
 ):
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     store.write_json(cfg.config_path(), {"nudge_after_seconds": 300})
     monkeypatch.setenv(cfg.ENV_NUDGE_AFTER_SECONDS, "soon")
 
@@ -1338,18 +1491,75 @@ def test_a_negative_interval_in_the_file_falls_back_to_the_default(platform_root
     assert cfg.load().nudge_after_seconds == 180
 
 
-def test_the_two_setting_groups_warn_under_their_own_log_keys(platform_root):
+# The rotation group (issue #446). One knob on the same chain, so what these pin
+# is what is different: it is off by default — the reading it needs is published
+# by the harness and not every harness publishes one — and it has a ceiling,
+# because the figure it is compared against is itself a percentage.
+
+def test_the_rotation_threshold_is_off_until_an_operator_sets_it(platform_root):
+    config = cfg.load()
+    assert config.rotation_context_threshold == 0
+    setting = cfg.rotation_settings()["context_threshold"]
+    assert (setting.value, setting.source) == (0, "default")
+
+
+def test_the_rotation_threshold_resolves_env_over_file_over_default(
+    platform_root, monkeypatch
+):
+    store.write_json(cfg.config_path(), {"rotation_context_threshold": 70})
+    assert cfg.load().rotation_context_threshold == 70
+    assert cfg.rotation_settings()["context_threshold"].source == "config.json"
+
+    monkeypatch.setenv(cfg.ENV_ROTATION_CONTEXT_THRESHOLD, "85")
+    threshold = cfg.rotation_settings()["context_threshold"]
+    assert (threshold.value, threshold.source) == (85, "env")
+    assert threshold.stored == 70, "the screen edits the file, not the export"
+
+
+def test_a_threshold_above_a_hundred_is_refused_as_a_second_off_switch(
+    platform_root, monkeypatch, caplog
+):
+    """The ceiling exists for the reason the nudge threshold's does: a value the
+    reading can never reach would be an off-switch nobody documented, and the one
+    that is documented is 0."""
+    cfg._WARNED_LAYER_SETTINGS.clear()
+    monkeypatch.setenv(cfg.ENV_ROTATION_CONTEXT_THRESHOLD, "150")
+
+    assert cfg.load().rotation_context_threshold == 0
+    assert cfg.rotation_settings()["context_threshold"].source == "default"
+    assert any(
+        "platform_rotation_threshold_invalid" in record.message
+        for record in caplog.records
+    )
+    with pytest.raises(cfg.ConfigError) as excinfo:
+        cfg.validate_int_setting("rotation_context_threshold", 101)
+    assert "rotation_context_threshold=0" in str(excinfo.value)
+
+
+def test_zero_stays_writable_because_it_is_the_off_switch(platform_root):
+    cfg.update_stored({"rotation_context_threshold": 60})
+    cfg.update_stored({"rotation_context_threshold": 0})
+    assert cfg.load().rotation_context_threshold == 0
+    assert cfg.rotation_settings()["context_threshold"].value == 0
+
+
+def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     """One machinery, one log key each, because a grep for one misconfiguration
     must not turn up the others (:data:`cfg.INT_SETTINGS`)."""
     keys = {rule.log_key for rule in cfg.INT_SETTINGS.values()}
     assert len(keys) == len(cfg.INT_SETTINGS)
     assert set(cfg.INT_SETTINGS) == {
-        "checkin_window_seconds", "nudge_after_seconds",
+        "max_live_assistants", "max_concurrent_sessions",
+        "chat_keep_last", "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
+        "terminal_confirm_seconds",
         # The chat upload cap (issue 246) resolves through the same warn-
         # don't-refuse path: a host that will not boot cannot be reconfigured
         # through its own UI, and this is a number bounding one request.
         "upload_max_bytes",
+        # The context-fullness threshold (issue #446), for the same reason: a
+        # typo in it must cost the reminder, never the daemon.
+        "rotation_context_threshold",
     }
 
 
@@ -1452,3 +1662,51 @@ def test_a_disabled_backstop_is_not_read_as_an_inverted_pair(platform_root):
         "stall_idle_seconds": 600, "stall_backstop_seconds": 0,
     })
     assert config.stall_backstop_seconds == 0
+
+
+class TestAssistantResourceSettings:
+    """LMER_PLATFORM_ASSISTANT_MEMORY / _CPUS (issue #453): one layer, the
+    environment, and the warn-never-refuse posture every standing layer here
+    takes."""
+
+    def test_unset_reports_no_value(self, monkeypatch):
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value is None
+        assert settings["cpus"].value is None
+
+    def test_a_configured_value_is_reported_with_its_source(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        settings = cfg.assistant_resource_settings()
+        assert (settings["memory"].value, settings["memory"].source) == ("2g", "env")
+        assert (settings["cpus"].value, settings["cpus"].source) == ("2", "env")
+
+    def test_blank_reads_as_unset(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "   ")
+        assert cfg.assistant_resource_settings()["memory"].value is None
+
+    def test_an_unusable_value_falls_back_rather_than_refusing(self, monkeypatch):
+        """A typo in an export costs the allocation, never the assistant's
+        ability to start."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "heaps")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "0")
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value is None
+        assert settings["cpus"].value is None
+
+    def test_the_grammar_is_the_cli_grammar(self, monkeypatch):
+        """A value this accepts is one the spawned lmer accepts — the
+        validators are imported from the CLI rather than restated."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "512m")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "0.5")
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value == "512m"
+        assert settings["cpus"].value == "0.5"
+
+    def test_it_is_not_a_writable_launch_setting(self):
+        """Read-only and environment-only by decision: no config.json key, so
+        no write route can persist one."""
+        assert "memory" not in cfg.ASSISTANT_SETTING_KEYS
+        assert "cpus" not in cfg.ASSISTANT_SETTING_KEYS

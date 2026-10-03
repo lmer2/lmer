@@ -10,6 +10,8 @@ import {
   ago, attentionLabel, checkinLabel, driverLabel, duration, ledgerSummary,
   portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
+import StatusStrip from './StatusStrip.vue'
+import ThreadLinks from './ThreadLinks.vue'
 
 // Which kind of thing the run is against. The word in the chip says it too, and
 // that is the point: main.js names colour-carrying-a-signal-alone as this UI's
@@ -36,7 +38,7 @@ const props = defineProps({
   now: { type: Number, default: () => Date.now() },
 })
 
-defineEmits(['open', 'forget', 'open-chat'])
+defineEmits(['open', 'forget', 'open-chat', 'threads-changed'])
 
 const meta = computed(() => stateMeta(props.run.state))
 const ledger = computed(() => ledgerSummary(props.run.ledger))
@@ -334,6 +336,10 @@ const forgettable = computed(
             : 'nothing has read this run yet'"
         >{{ checkin }}</span>
         <span :title="run.updated || ''">{{ ago(run.updated, now) }}</span>
+        <!-- The live session's own status line (issue 248). In this line rather
+             than a chip group of its own for `idle`'s reason: a fact the state
+             chip does not contain, not a competing verdict. -->
+        <StatusStrip :status="run.statusline" :now="now" compact />
       </div>
 
       <!-- Why a row is at the top of the fleet, and therefore never cut away: the
@@ -430,6 +436,16 @@ const forgettable = computed(
           aria-label="talk to uber lmer"
           @click="$emit('open-chat')"
         >chat</v-btn>
+        <!-- Which chat threads this run is mirrored into, and the way to change
+             it. On the row because that is where an operator decides a run needs
+             a human in a thread, and the fleet poll already carries the answer. -->
+        <ThreadLinks
+          :session-id="run.session?.id"
+          :threads="run.threads"
+          :references="run.references || []"
+          :live="run.live"
+          @changed="$emit('threads-changed')"
+        />
         <v-btn
           v-if="answerable"
           variant="tonal"

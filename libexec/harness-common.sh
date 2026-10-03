@@ -17,12 +17,46 @@
 # are left untouched.
 HARNESS_MANAGED_MARKER="<!-- lmer-managed context: regenerated each session -->"
 
-# Root of the work repo's agent-files tree, for harness_provision_config
-# overrides ("" when the work repo carries none). LMER_WORK_AGENT_FILES_ROOT
-# overrides the path for non-standard layouts and tests (mirrors
-# LMER_SETTINGS_FILE in claude-runner.sh).
-WORK_AGENT_FILES_ROOT="${LMER_WORK_AGENT_FILES_ROOT:-/work/agent-files}"
-[ -d "$WORK_AGENT_FILES_ROOT" ] || WORK_AGENT_FILES_ROOT=""
+# ── Work agent-files tree ──
+# Root of the work repo's agent-files tree for one harness leaf, consulted
+# by harness_provision_config and harness_render_prompt_templates ("" when
+# the work repo carries none). The tree has two names (lmer schema, D18):
+# schema-form `_agents/` (holding `claude/`, `mirrors/`, `memory/`) and the
+# legacy bare `agent-files/`, read in place until the tree migrates. That
+# migration is NOT one move — spec §9 step 3 is three independent ones, so
+# `_agents/` can exist (holding only `memory/`) while `agent-files/claude/`
+# is still the live tree. Resolution is therefore PER LEAF: the root that
+# actually holds the requested leaf (`claude`, `codex`, `pi`, ...) wins,
+# `_agents/<leaf>` before `agent-files/<leaf>`; when both hold it the schema
+# form is read and a one-line notice on stderr names the ignored legacy copy
+# (stdout is the return channel), so a session never loses its skills
+# silently. Precedence: LMER_WORK_AGENT_FILES_ROOT (non-standard layouts and
+# tests — mirrors LMER_SETTINGS_FILE in claude-runner.sh; taken as-is, "" when
+# it does not exist, no leaf check) > `_agents/` holding <leaf> >
+# `agent-files/` holding <leaf> > "". The work dir defaults to
+# $LMER_WORK_REPO_PATH, the in-container clone location (/work).
+#
+# claude-runner.sh carries a verbatim copy (it does not source this file —
+# see the header); tests/test_work_agent_files_second_name.py guards the two
+# against drift.
+#   harness_work_agent_files_root <leaf> [work-dir]
+harness_work_agent_files_root() {
+    local leaf="${1:?harness_work_agent_files_root: leaf required}"
+    local work="${2:-${LMER_WORK_REPO_PATH:-/work}}"
+    if [ -n "${LMER_WORK_AGENT_FILES_ROOT:-}" ]; then
+        [ -d "$LMER_WORK_AGENT_FILES_ROOT" ] && echo "$LMER_WORK_AGENT_FILES_ROOT"
+        return 0
+    fi
+    if [ -e "$work/_agents/$leaf" ]; then
+        if [ -e "$work/agent-files/$leaf" ]; then
+            echo "⚠️  Work agent-files: reading $work/_agents/$leaf; the legacy $work/agent-files/$leaf also exists and is ignored (migration leftover: merge it into _agents/$leaf and remove it)" >&2
+        fi
+        echo "$work/_agents"
+    elif [ -e "$work/agent-files/$leaf" ]; then
+        echo "$work/agent-files"
+    fi
+    return 0
+}
 
 # ── Session id ──
 # Mint a stable per-session id for run-state owner claims and event
@@ -274,9 +308,11 @@ harness_render_global_context() {
 #       "$HARNESS_DIR/agent-files/settings.json"
 #   harness_provision_config <relative-path-under-agent-files> <target-path> [fallback-source]
 harness_provision_config() {
-    local rel="$1" target="$2" fallback="${3:-}" source=""
-    if [ -n "$WORK_AGENT_FILES_ROOT" ] && [ -f "$WORK_AGENT_FILES_ROOT/$rel" ]; then
-        source="$WORK_AGENT_FILES_ROOT/$rel"
+    local rel="$1" target="$2" fallback="${3:-}" source="" work_root
+    # <rel> is <harness-leaf>/<file>; the work root is resolved for that leaf.
+    work_root="$(harness_work_agent_files_root "${rel%%/*}")"
+    if [ -n "$work_root" ] && [ -f "$work_root/$rel" ]; then
+        source="$work_root/$rel"
     elif [ -n "$HARNESS_GLOBAL_DIR" ] && [ -f "$HARNESS_GLOBAL_DIR/agent-files/$rel" ]; then
         source="$HARNESS_GLOBAL_DIR/agent-files/$rel"
     elif [ -n "$fallback" ] && [ -f "$fallback" ]; then
@@ -303,12 +339,13 @@ harness_provision_config() {
 harness_render_prompt_templates() {
     local target="$1"
     [ -n "$target" ] || return 0
-    local sources=()
+    local sources=() work_root
     if [ -n "$HARNESS_GLOBAL_DIR" ] && [ -d "$HARNESS_GLOBAL_DIR/agent-files/claude/commands" ]; then
         sources+=("$HARNESS_GLOBAL_DIR/agent-files/claude/commands")
     fi
-    if [ -n "$WORK_AGENT_FILES_ROOT" ] && [ -d "$WORK_AGENT_FILES_ROOT/claude/commands" ]; then
-        sources+=("$WORK_AGENT_FILES_ROOT/claude/commands")
+    work_root="$(harness_work_agent_files_root claude)"
+    if [ -n "$work_root" ] && [ -d "$work_root/claude/commands" ]; then
+        sources+=("$work_root/claude/commands")
     fi
     [ "${#sources[@]}" -gt 0 ] || return 0
     if ! "${LMER_PYTHON:-python3}" -m lmer_cli.container.prompt_templates \

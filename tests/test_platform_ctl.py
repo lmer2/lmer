@@ -36,6 +36,7 @@ session that never existed — are the ones the CLI is seen to pass through.
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -390,18 +391,23 @@ ROUTE_TABLE = [
     (["spawn", "develop", "issue-245", "--slot", "webapp"],
      "POST", "/api/sessions", None,
      {"taskdef": "develop", "target": "issue-245", "slot": "webapp"}),
-    (["send", "s-1", "/followup rebase please"], "POST",
-     "/api/sessions/s-1/input", None,
-     {"data": "/followup rebase please", "append_newline": True,
-      "sanitize": True, "preserve_slash_commands": True}),
+    # #407: a message rides the session's bus, stamped with this caller's
+    # channel; the keystroke form (--no-newline) stays a raw PTY write.
+    (["send", "s-1", "the review is posted, fix the two majors"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "message", "text": "the review is posted, fix the two majors"}),
     (["send", "s-1", "!206 was merged"], "POST",
-     "/api/sessions/s-1/input", None,
-     {"data": "!206 was merged", "append_newline": True, "sanitize": True,
-      "preserve_slash_commands": True}),
+     "/api/sessions/s-1/comms", None,
+     {"kind": "message", "text": "!206 was merged"}),
     (["send", "s-1", "half a thought", "--no-newline"], "POST",
      "/api/sessions/s-1/input", None,
-     {"data": "half a thought", "append_newline": False, "sanitize": True,
-      "preserve_slash_commands": True}),
+     {"data": "half a thought", "append_newline": False}),
+    (["command", "s-1", "/followup rebase please"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "command", "text": "/followup rebase please"}),
+    (["comms", "s-1", "--since", "40", "--timeout", "10"], "GET",
+     "/api/sessions/s-1/comms", {"since": 40, "timeout": 10.0}, None),
+    (["feed", "--since", "7"], "GET", "/api/comms/feed", {"since": 7}, None),
     (["log", "s-1"], "GET", "/api/sessions/s-1/log", {}, None),
     (["log", "s-1", "--offset", "-4096", "--limit", "4096",
       "--source", "host"],
@@ -412,6 +418,8 @@ ROUTE_TABLE = [
     (["questions", "s-1"], "GET", "/api/sessions/s-1/ask", None, None),
     (["answer", "s-1", "q-7", "prep-release"], "POST",
      "/api/sessions/s-1/ask/q-7/answer", None, {"answer": "prep-release"}),
+    (["answer", "s-1", "q-7", "--option", "2"], "POST",
+     "/api/sessions/s-1/ask/q-7/answer", None, {"option": 2}),
     (["wind-down", "s-1"], "POST", "/api/sessions/s-1/wind-down", None, {}),
     (["wind-down", "s-1", "--note", "skip the MR"], "POST",
      "/api/sessions/s-1/wind-down", None, {"note": "skip the MR"}),
@@ -435,6 +443,19 @@ ROUTE_TABLE = [
     (["runs", "resume", RUN_KEY, "--taskdef", "review", "--direction", "go on"],
      "POST", "/api/runs/resume", None,
      {**RUN_FIELDS, "taskdef": "review", "direction": "go on"}),
+    # --session has to arrive as the body's session_id: dropped, the resume
+    # continues whichever launch the run resolves to — the newest — so an
+    # operator naming an older one would be answered about a different record.
+    (["runs", "resume", RUN_KEY, "--session", "20260824-165230-2-31245"],
+     "POST", "/api/runs/resume", None,
+     {**RUN_FIELDS, "session_id": "20260824-165230-2-31245"}),
+    # The named spelling travels verbatim too, so the address a fleet row shows
+    # can be pasted straight back (lmer_platform.resume._require_session matches
+    # on both halves).
+    (["runs", "resume", RUN_KEY, "--session",
+      "20260824-165230-2-31245--auth-rate-limit"],
+     "POST", "/api/runs/resume", None,
+     {**RUN_FIELDS, "session_id": "20260824-165230-2-31245--auth-rate-limit"}),
     (["runs", "meta", "get", RUN_KEY], "GET", "/api/runs/meta",
      RUN_FIELDS, None),
     (["runs", "meta", "set", RUN_KEY, "--title", "auth fix"], "POST",
@@ -479,6 +500,23 @@ def test_every_route_this_cli_names_is_served_by_the_app(client):
         assert any(pattern.match(built) for _served, pattern in patterns), (
             f"{' '.join(argv)} names {built}, which this build does not serve"
         )
+
+
+def test_an_answer_with_neither_text_nor_an_option_is_refused_before_the_request():
+    """#428: the text argument is optional now, so the CLI has to be the one to
+    notice an invocation that names nothing — the route would see an empty body."""
+    with pytest.raises(ctl.CtlError, match="--option"):
+        build("answer", "s-1", "q-7")
+
+
+def test_an_answer_with_both_text_and_an_option_is_refused_with_the_words_shown():
+    """Round 2, major: this invocation used to be sent as both fields and the bus
+    dropped the words. The CLI cannot know whether they name the same option — it
+    never sees the question — so it refuses the pair and quotes what it would
+    have discarded."""
+    with pytest.raises(ctl.CtlError, match="not both") as caught:
+        build("answer", "s-1", "q-7", "prep-release, but rebase first", "--option", "2")
+    assert "prep-release, but rebase first" in str(caught.value)
 
 
 def test_the_two_answer_verbs_are_two_routes():
@@ -620,8 +658,21 @@ def test_a_channel_whose_session_is_gone_passes_the_410_through(
 def test_typing_into_a_session_that_never_existed_passes_the_404_through(
     configured, client, platform_root, capsys
 ):
-    payload = refused(["send", "s-nope", "/followup"], client, capsys)
+    payload = refused(["send", "s-nope", "carry on"], client, capsys)
     assert payload["status"] == 404
+
+
+def test_send_refuses_a_slash_command_and_names_the_verb_that_runs_it(
+    configured, client, platform_root, capsys
+):
+    """`send` carried live slash commands before the unified channel. A message
+    is relayed tagged now and the tag takes column one, so `/followup` would
+    reach the harness as prose — silently, on the assistant's main steering
+    path."""
+    payload = refused(["send", "s-1", "/followup"], client, capsys)
+    assert payload.get("status") != 200
+    message = json.dumps(payload)
+    assert "lmer-ctl command" in message and "prose" in message
 
 
 def test_a_run_key_round_trips_through_adopt_and_meta(
@@ -747,3 +798,122 @@ def test_an_occupied_slot_comes_back_as_a_409_the_assistant_can_relay(
 
     assert payload["status"] == 409
     assert "s-7" in payload["body"]["detail"]
+
+
+@pytest.mark.parametrize("text", ["/tmp/build.log has the traceback", "/tmp/build.log", "/followup please explain"])
+def test_send_accepts_path_and_slash_leading_prose(text):
+    import argparse
+    call = ctl._call_send(argparse.Namespace(text=text, session="s-1", no_newline=False))
+    assert call.body == {"kind": "message", "text": text}
+
+
+def test_spawn_accepts_repeatable_thread_targets():
+    links = ["https://team.slack.com/archives/C1/p1700000000000001", "https://matrix.to/#/!room:example.org/$root"]
+    call = build("spawn", "develop", "issue", "--target-thread", links[0], "--target-thread", links[1])
+    assert call.body == {"taskdef": "develop", "target": "issue", "targets": links}
+    assert "targets" not in build("spawn", "develop", "issue").body
+
+
+# --- rotate: the one verb that is two calls (issue #446) -----------------------
+#
+# Self-rotation is the assistant ending its own context window, so what these pin
+# is the order (the note is stored before anything can refuse the rotation), the
+# three ways the note can arrive, and that a refusal stops the sequence rather
+# than being pressed past.
+
+def test_rotate_writes_the_handover_before_it_rotates():
+    calls = build("rotate", "--handoff", "two runs in flight, one merge request open")
+    assert [(call.method, call.path) for call in calls] == [
+        ("POST", "/api/assistant/handoff"),
+        ("POST", "/api/assistant/rotate"),
+    ]
+    assert calls[0].body == {"handoff": "two runs in flight, one merge request open"}
+    assert calls[1].body == {}, (
+        "the note is already stored; sending it twice would make the rotate the "
+        "writer of a document the handoff route already owns"
+    )
+
+
+def test_rotate_without_a_note_carries_the_recorded_one_forward():
+    calls = build("rotate")
+    assert [(call.method, call.path) for call in calls] == [
+        ("POST", "/api/assistant/rotate"),
+    ]
+
+
+def test_rotate_reads_the_note_from_stdin(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("a note with `backticks` and $HOME"))
+    calls = build("rotate", "--handoff", "-")
+    assert calls[0].body == {"handoff": "a note with `backticks` and $HOME"}
+
+
+def test_rotate_reads_the_note_from_a_file(tmp_path):
+    note = tmp_path / "handover.md"
+    note.write_text("what is in flight\nwhat I promised", encoding="utf-8")
+    calls = build("rotate", "--handoff-file", str(note))
+    assert calls[0].body == {"handoff": "what is in flight\nwhat I promised"}
+
+
+def test_rotate_refuses_an_unreadable_note_before_any_request(tmp_path):
+    with pytest.raises(ctl.CtlError) as excinfo:
+        build("rotate", "--handoff-file", str(tmp_path / "missing.md"))
+    assert "handover note" in str(excinfo.value)
+
+
+def test_both_of_rotates_routes_are_served_by_the_app(client):
+    served = {
+        route.path for route in client.app.routes if getattr(route, "path", None)
+    }
+    for call in build("rotate", "--handoff", "x"):
+        assert call.path in served
+
+
+def test_rotate_issues_both_calls_in_order(configured, capsys):
+    recorder = Recorder()
+    ok(["rotate", "--handoff", "the fleet is quiet"], recorder, capsys)
+    assert [(call["method"], call["url"]) for call in recorder.calls] == [
+        ("POST", f"{BASE_URL}/api/assistant/handoff"),
+        ("POST", f"{BASE_URL}/api/assistant/rotate"),
+    ]
+
+
+def test_a_refused_handoff_stops_the_rotation(configured, capsys):
+    """The precondition the daemon just declined is the successor's whole
+    briefing. Rotating anyway would end this context window and leave the next one
+    with a note nobody could write."""
+    recorder = Recorder(reply=Reply(status_code=400, text='{"detail": "too long"}'))
+    body = refused(["rotate", "--handoff", "x" * 10], recorder, capsys)
+    assert len(recorder.calls) == 1, "the rotate must not have been attempted"
+    assert body["status"] == 400
+
+
+def test_a_rotate_that_never_answers_is_reported_as_unreachable(
+    configured, capsys
+):
+    """What a *successful* self-rotation looks like from inside the container the
+    daemon just ended. The CLI claims nothing about it: a dropped connection is
+    equally consistent with a daemon that died, and the receipt an agent is told
+    to read is its successor's generation on `me`."""
+    class _Dropped:
+        def request(self, method, url, **kwargs):
+            if url.endswith("/api/assistant/rotate"):
+                raise ctl.TransportError("connection reset by peer")
+            return Reply()
+
+    body = refused(["rotate", "--handoff", "going now"], _Dropped(), capsys)
+    assert body["error"]
+
+
+def test_the_help_says_the_call_does_not_return():
+    """The one fact an agent cannot discover by experiment: by the time the
+    connection drops there is nobody left in this container to read the error."""
+    parser = ctl.create_parser()
+    help_text = parser.format_help()
+    assert "rotate" in help_text
+    rotate = [
+        action for action in parser._subparsers._group_actions[0].choices.items()
+        if action[0] == "rotate"
+    ][0][1]
+    text = rotate.format_help()
+    assert "DOES NOT RETURN" in text
+    assert "breakpoint" in text

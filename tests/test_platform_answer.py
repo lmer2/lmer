@@ -83,7 +83,10 @@ def answer_recording_lmer(tmp_path):
         "from lmer_cli.cli import parse_args\n"
         "ns, rest = parse_args(sys.argv[1:])\n"
         "payload = {'argv': sys.argv[1:], 'answer': ns.answer, 'task': ns.task,\n"
-        "           'target': ns.target, 'rest': rest}\n"
+        "           'target': ns.target, 'rest': rest,\n"
+        # getattr rather than ns.session so a suite run against a CLI without the
+        # flag reports the missing *flag* rather than dying inside the stub.
+        "           'session': getattr(ns, 'session', None)}\n"
         f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
         # Staying alive is how a test keeps the session's registry entry around; a
         # clean exit reaps it, which would race any assertion about a live one.
@@ -126,6 +129,7 @@ def plant_run(
     question=QUESTION,
     status="in-progress",
     recorded_slug=...,
+    session_id=None,
     extra="",
 ):
     """Write one run dir into the mirror the way a pushed run appears there.
@@ -133,9 +137,17 @@ def plant_run(
     Written as YAML text rather than through ``run_state.write_state`` on purpose:
     the mirror is a *read* surface for the platform, and planting bytes is the only
     way a test can be sure nothing in the answer path wrote to it.
+
+    ``session_id`` plants the schema-form shape instead, the same way
+    tests/test_platform_resume.py's planter does: the record is the SESSION dir
+    ``<project>/_runs/<slug>/<session-id>/`` and ``_runs/<slug>/`` is a grouping
+    level nothing is ever written at (D22).
     """
     slug = slug if slug is not None else run_state.derive_slug(taskdef, target)
-    path = config.mirror_path / host / project / "runs" / slug
+    if session_id is None:
+        path = config.mirror_path / host / project / "runs" / slug
+    else:
+        path = config.mirror_path / host / project / "_runs" / slug / session_id
     path.mkdir(parents=True, exist_ok=True)
     lines = ["schema: 1", f"status: {status}"]
     recorded = slug if recorded_slug is ... else recorded_slug
@@ -405,6 +417,93 @@ def test_answering_a_renamed_run_dir_still_targets_the_recorded_slug(config):
     assert runs.get_tracked(HOST, PROJECT, f"{recorded}--nice-name").last_session_id == (
         result.session.session_id
     ), "the key the operator answered must follow the session that was started"
+
+
+# --- the record the answering session writes in (issue #353, D22) ------------
+#
+# In schema form the question was asked by ONE launch, in its own record. The
+# relaunch that carries the answer is a new container with a new
+# ``LMER_SESSION_ID`` unless the host injects one, so with nothing injected the
+# answer lands in a fresh record beside the one that asked: an empty record with
+# an answer in it, and the question still standing in the real one. Unlike a
+# resume there is no sibling case to guard — ``_require_same_run`` refuses every
+# respawn that would derive another run — so the id is carried unconditionally.
+
+#: A record dir in the ``LMER_SESSION_ID`` grammar (timestamp-first, so names
+#: sort into start order), not a container session id.
+SESSION_ID = "20260824-165230-2-31245"
+LATER_SESSION_ID = "20260825-090000-2-31300"
+
+
+def test_the_answer_lands_in_the_record_that_asked(config, answer_recording_lmer):
+    _script, dump = answer_recording_lmer
+    plant_run(config, session_id=SESSION_ID)
+    track_run()
+
+    answer_mod.answer_run(config, request_for())
+
+    payload = child_payload(dump)
+    assert f"{spawn.SESSION_FLAG}={SESSION_ID}" in payload["argv"], (
+        "without the id the container mints a fresh one and the answer is "
+        "applied in a record nobody asked a question in"
+    )
+    assert spawn.SESSION_FLAG not in payload["argv"], (
+        "a bare --session token means the id was passed as a separate argument"
+    )
+    assert payload["session"] == SESSION_ID, (
+        "the id has to be one lmer's own parser recovers, not merely a string "
+        "this package built"
+    )
+    assert payload["rest"] == [], (
+        "an unrecognised flag lands in rest and reaches nothing but the "
+        "container's own command line"
+    )
+
+
+def test_the_record_answered_is_the_one_the_question_was_read_from(
+    config, answer_recording_lmer
+):
+    """Two launches of one run, and only the newest is the record the platform
+    reads its question out of — so it is the record the answer has to reach."""
+    _script, dump = answer_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield", question=None)
+    plant_run(config, session_id=LATER_SESSION_ID)
+    track_run()
+
+    answer_mod.answer_run(config, request_for())
+
+    argv = child_payload(dump)["argv"]
+    assert f"{spawn.SESSION_FLAG}={LATER_SESSION_ID}" in argv
+    assert f"{spawn.SESSION_FLAG}={SESSION_ID}" not in argv
+
+
+def test_the_id_carried_is_the_launch_and_not_the_named_dir(
+    config, answer_recording_lmer
+):
+    """``work name`` renames the session dir; ``<sid>`` and ``<sid>--<name>`` are
+    one session and the id is ``<sid>``."""
+    _script, dump = answer_recording_lmer
+    plant_run(config, session_id=f"{SESSION_ID}--nice-name")
+    track_run()
+
+    answer_mod.answer_run(config, request_for())
+
+    argv = child_payload(dump)["argv"]
+    assert f"{spawn.SESSION_FLAG}={SESSION_ID}" in argv
+    assert f"{spawn.SESSION_FLAG}={SESSION_ID}--nice-name" not in argv
+
+
+def test_a_legacy_tree_answer_carries_no_session_id(config, waiting_run,
+                                                    answer_recording_lmer):
+    """One shared record per target, read in place: it is already the dir that
+    asked, and the reroute in ``work_repo.cli._session_that_asked`` returns
+    ``None`` there too. Byte-identical to what a legacy answer always did."""
+    _script, dump = answer_recording_lmer
+    answer_mod.answer_run(config, request_for())
+
+    assert not any(
+        arg.startswith(spawn.SESSION_FLAG) for arg in child_payload(dump)["argv"]
+    )
 
 
 # --- the platform writes no run state (spec D3) ------------------------------

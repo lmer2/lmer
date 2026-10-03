@@ -91,7 +91,7 @@ def test_the_reference_carries_no_action():
         if line.strip().startswith("return { host")
     ]
     assert lines == [
-        "return { host, project, slug, key: `${host}/${project}/${slug}` }"
+        "return { host, project, slug, key: runKey({ host, project, slug }) }"
     ], lines
 
 
@@ -108,7 +108,7 @@ def test_the_shell_registers_a_resolver_and_reports_an_untracked_run():
     # Against the fleet this shell already holds, not by a fetch of its own.
     resolver = text[text.index("function openRunRef"):]
     resolver = resolver[:resolver.index("\n}")]
-    assert "runs.value.find" in resolver
+    assert "state.value?.runs || []).find" in resolver
     assert "open(run)" in resolver
 
 

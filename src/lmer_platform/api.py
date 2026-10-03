@@ -57,7 +57,7 @@ import json
 import logging
 import os
 import secrets as secrets_mod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -90,11 +90,25 @@ from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
 from . import checkin
+from . import comms
+from . import connectors
 from . import lifecycle
+from lmer_cli import comms as bus_comms
+from lmer_cli import thread_access
+from lmer_cli import thread_posts
+from lmer_cli import thread_requests as thread_queue
+from lmer_cli.assistant_mentions import Settings as MentionSettings
+from lmer_cli.threads import ThreadError
+
 from . import meta
+from . import mention_routing
+from .ingress import Ingress
+from . import references
 from . import reattach
 from . import relations
 from . import session_io
+from . import session_threads
+from . import statusline
 from . import transcripts
 from . import uploads
 from .answer import AnswerError, AnswerRequest, answer_run
@@ -103,19 +117,33 @@ from .uploads import UploadError
 from .assistant import AssistantError
 from .config import (
     ASSISTANT_SETTING_KEYS,
+    BOOL_SETTINGS,
     INT_SETTINGS,
     ConfigError,
     PlatformConfig,
     active_assistant_credential,
+    active_connectors,
+    assistant_resource_settings,
     assistant_settings,
+    chat_settings,
+    list_connectors,
     checkin_settings,
+    _slots_value,
     configured_repo_url,
+    fleet_group_settings,
+    mutate_stored,
     nudge_settings,
+    rotation_settings,
+    terminal_settings,
     upload_settings,
     upload_types,
     update_stored,
     validate_assistant_override,
+    validate_bool_setting,
     validate_int_setting,
+    validate_fleet_groups,
+    stored_slots_or_problem,
+    with_stored_slots,
 )
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
@@ -124,7 +152,7 @@ from .registry import list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
-    RunIndexError, forget, list_tracked, run_for_session, run_key, track,
+    RunIndexError, filter_forgotten, forget, list_tracked, run_for_session, run_key, track,
 )
 from .session_io import ControlPlaneError, SessionIOError
 # ``_repo_urls`` and ``derive_run_identity`` are the pair that predicts a run's
@@ -132,27 +160,48 @@ from .session_io import ControlPlaneError, SessionIOError
 # that pair (T73). Private and reused deliberately, the same trade this module
 # already makes with ``lmer_cli.cli``'s discovery helpers: a second reading of a
 # repo URL here would offer the operator a tier the container never searches.
-from .slots import slot_rows
+# Both reason helpers are private and imported deliberately, the trade this
+# module already makes with ``_discover_all_tasks``: the form's refusal and the
+# row's reason for the same fault must be one sentence, and a second copy of it
+# is a copy that will be improved once.
+from .slots import (
+    _KNOWN_KEYS,
+    _no_presets_reason,
+    _unknown_preset_reason,
+    parse_slots,
+    slot_rows,
+    slot_status,
+)
 from .spawn import (
     CapacityError,
     RunAlreadyLive,
     SlotOccupied,
     SpawnError,
     SpawnRequest,
+    ThreadHeld,
     _repo_urls,
     absorb_ports,
     derive_run_identity,
     spawn_session,
 )
-from .store import utc_now_iso
+from .store import StoreError, utc_now_iso
 from .ui_build import dist_dir
-from .workrepo import mirror_status, pull, resolve_run_dir, run_dirs
+from .workrepo import (
+    fold_registry,
+    folded_identity,
+    mirror_status,
+    pull,
+    resolve_run_dir,
+    run_dirs,
+)
+from . import projects, project_context as project_scope, project_requests, project_threads
 
 logger = logging.getLogger("lmer_platform.api")
 
 __all__ = [
     "build_state", "create_app", "discover_spawn_options", "REALM",
     "WS_POLICY_VIOLATION", "Caller", "CALLER_ASSISTANT", "CALLER_OPERATOR",
+    "CALLER_CONNECTOR",
 ]
 
 REALM = "lmer platform"
@@ -163,6 +212,7 @@ REALM = "lmer platform"
 #: indistinguishable, which is why the assistant got its own.
 CALLER_OPERATOR = "operator"
 CALLER_ASSISTANT = "assistant"
+CALLER_CONNECTOR = "connector"
 
 #: Close code for a tty socket the platform will not serve. 1008 (policy
 #: violation) rather than a private code because a browser can read neither: a
@@ -179,6 +229,9 @@ _WS_REASON_LIMIT = 120
 #: from the table the validator indexes: a hand-written copy admitting a name absent
 #: from :data:`lmer_platform.config.INT_SETTINGS` would 500 on a ``KeyError``.
 _INT_SETTING_KEYS = tuple(sorted(INT_SETTINGS))
+
+#: The boolean settings' keys (issue #488), derived for the same reason.
+_BOOL_SETTING_KEYS = tuple(sorted(BOOL_SETTINGS))
 
 #: What a starting assistant is told when its predecessor left it nothing (T60).
 #: A fact about the host rather than an error, and the ``orchestrate`` taskdef
@@ -296,10 +349,11 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "base_url": config.base_url,
         "work_repo_url": mirror.get("url"),
         "work_repo_pull_interval": config.work_repo_pull_interval,
-        "max_concurrent_sessions": config.max_concurrent_sessions,
+        "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions,
         "max_followup_rounds": config.max_followup_rounds,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
+        **fleet_group_settings(),
     }
 
 
@@ -424,10 +478,15 @@ def _handoff_reply(state) -> dict:
     carries the one distinction a starting assistant has to be able to make —
     see :data:`_NO_HANDOFF_NOTE`.
     """
+    from . import assistant_history
+
+    latest = assistant_history.latest()
+    previous = assistant_history.reference(latest["previous_session"]) if latest else None
     return {
         "handoff": state.handoff,
         "handoff_at": state.handoff_at,
         "generation": state.generation,
+        "previous_session": previous,
         "limit": assistant.MAX_HANDOFF_CHARS,
         "note": None if state.handoff else _NO_HANDOFF_NOTE,
     }
@@ -468,12 +527,17 @@ def _instructions_reply(state) -> dict:
 #: persisted value that never takes effect looks broken unless the reply says an
 #: export is standing in front of it.
 _CONFIG_SCOPE_NOTE = (
-    "settings apply to the NEXT incarnation: the running assistant keeps its "
+    "launch settings apply to the NEXT incarnation: the running assistant keeps its "
     "context window until it is stopped or rotated. A value whose source is "
     "'env' is an export shadowing config.json — what POST persists here has no "
-    "effect until that export is removed. The checkin and nudge groups are the "
-    "exception to the first sentence: the daemon reads both on its next tick, so "
-    "a change there takes effect without a rotation."
+    "effect until that export is removed. The daemon reads the checkin, nudge and "
+    "rotation groups on its next tick, so a change there takes effect without a "
+    "rotation. "
+    "chat_keep_last and chat_show_transcript are browser display settings "
+    "applied on config refresh; neither requires an assistant rotation. The "
+    "resources group is "
+    "read-only and environment-only, and like the launch settings it applies "
+    "to the next incarnation: changing it does not resize a running container."
 )
 
 
@@ -494,8 +558,11 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
             key: setting.to_dict()
             for key, setting in assistant_settings().items()
         },
-        # Their own groups rather than more entries above (issues #244, #317):
-        # those four are argv tokens, these are read on the daemon's own tick.
+        # These groups can apply without restarting the assistant.
+        "chat": {
+            key: setting.to_dict()
+            for key, setting in chat_settings().items()
+        },
         "checkin": {
             key: setting.to_dict()
             for key, setting in checkin_settings().items()
@@ -503,6 +570,18 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "nudge": {
             key: setting.to_dict()
             for key, setting in nudge_settings().items()
+        },
+        # The context-fullness reminder (issue #446). Beside nudge rather than
+        # under it: what it watches is the assistant's own window, not the
+        # spool, and it is the one setting here whose effect is a recommendation
+        # to end the incarnation reading it.
+        "rotation": {
+            key: setting.to_dict()
+            for key, setting in rotation_settings().items()
+        },
+        "terminal": {
+            key: setting.to_dict()
+            for key, setting in terminal_settings().items()
         },
         # The chat-upload group (issue 246). Here because the write route already
         # accepts ``upload_max_bytes`` — it is in ``INT_SETTINGS`` — and a key a
@@ -518,8 +597,22 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
             },
             "types": list(upload_types()),
         },
+        # The assistant's own container allocation (issue #453). Read-only:
+        # these resolve from the daemon's environment alone, so there is no
+        # stored value for a write route to persist — reported here because a
+        # setting an operator cannot see the effect of is one they cannot
+        # check, and the source says whether an export is answering.
+        "resources": {
+            key: setting.to_dict()
+            for key, setting in assistant_resource_settings().items()
+        },
         "note": _CONFIG_SCOPE_NOTE,
     }
+    if projects.enabled() and project_scope.current():
+        overrides = projects.get(project_scope.current())["settings"]
+        for key, value in assistant._launch_settings(None)[0].items():
+            if key in payload["settings"]:
+                payload["settings"][key].update(value=value, source="project" if key in overrides else payload["settings"][key]["source"])
     payload.update(extra or {})
     return payload
 
@@ -537,7 +630,7 @@ def _body_launch_settings(payload: dict) -> Optional[dict]:
     module's refusal (400, naming the field) instead of arriving as ``None``
     and reading as "leave it alone".
     """
-    named = {key: value for key, value in payload.items() if key != "handoff"}
+    named = {key: value for key, value in payload.items() if key not in ("handoff", "workspace_id")}
     return named or None
 
 
@@ -599,6 +692,16 @@ def _run_files_reply(
 
     A run absent from the mirror answers ``present: false`` with no files, which
     is a state and not an error: a freshly spawned run has pushed nothing yet.
+
+    Every path in the reply is ``ref.rel_path`` — the address the resolver
+    recorded — joined with a file name, and never a path composed from the
+    ``(host, project, slug)`` the request carried. Those three are the run's
+    IDENTITY and two of them are not where it lives: a named run sits in
+    ``runs/<slug>--<name>`` (T90), and in schema form the whole record is a
+    session dir under a project named by the registry rather than by its repo
+    (issue #353, D7/D22). Composing here would produce a link to a directory that
+    does not exist, which is the shape of the bug T90 fixed and the reason
+    :class:`lmer_platform.workrepo.RunDirRef` carries an address at all.
 
     The forge is resolved exactly as ``web_url_for`` resolves it — the operator's
     ``work_repo_forge`` when set, then the host, then GitLab. T66 shipped this call
@@ -674,6 +777,91 @@ def _fold_checkins(payload: dict) -> None:
             row["checkin"] = checkin.row_checkin(row, marks, window=window)
 
 
+def _fold_threads(payload: dict) -> None:
+    """Put each row's chat-thread connections on the row, in place (issue #412).
+
+    On the payload for the same reason as the check-ins above it: the icons are
+    drawn on every row of the first screen the app paints, and a request per row
+    to find out whether a run is mirrored into a thread is one per tracked run.
+
+    Keyed by the row's *current* session, because that is what a connection is a
+    connection to. A row whose session has ended keeps its connections and shows
+    them as not running, rather than losing them the moment the run stops.
+
+    Both lists get it: ``attention`` holds separate copies of the same rows.
+    """
+    component = connectors.get_connectors()
+    if component is None:
+        return
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        session = row.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
+        row["threads"] = component.listing(session_id) if session_id else []
+
+
+def _fold_relations(payload: dict) -> None:
+    """Put every related pair in the fleet on the payload, once.
+
+    On the payload for the reason the open questions and the statusline are: the
+    view that wants these renders the *whole* fleet at once, so one relation
+    request per run per poll is the wrong shape rather than a constant factor to
+    accept. :func:`lmer_platform.relations.all_pairs` is a single file read and
+    already yields each pair once, so nothing here de-duplicates.
+
+    An edge is kept only when both of its runs are rows on this payload. An
+    endpoint with no row is an edge attached to nothing — and dropping it here
+    keeps the two lists honest with each other, so a consumer can join on
+    ``run_key`` without checking. Relations naming an untracked run are not
+    lost: they stay where they have always been shown and named, on that run's
+    own detail view (``GET /api/runs/relations``), which this does not touch.
+    """
+    keys = set()
+    for row in payload.get("runs") or []:
+        if not isinstance(row, dict):
+            continue
+        # The row names its run in full at the top level
+        # (:class:`lmer_platform.inventory.RunView`), which is the same shape
+        # ``runKey()`` composes from in the browser — so the client joins these
+        # edges to its nodes without parsing anything.
+        try:
+            keys.add(run_key(row.get("host"), row.get("project"), row.get("slug")))
+        except Exception:
+            continue
+    payload["relations"] = [
+        {"a": first, "b": second}
+        for first, second in relations.all_pairs()
+        if first in keys and second in keys
+    ]
+
+
+def _fold_references(payload: dict) -> None:
+    """Put each row's reference threads on the row, in place (issue #414).
+
+    On the payload for :func:`_fold_threads`'s reason, but keyed by the **run**
+    rather than by its session, which it outlives.
+
+    Both lists get it: ``attention`` holds separate copies of the same rows.
+    """
+    stored = references.load_all()
+    if not stored:
+        return
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        run = row.get("run") if isinstance(row.get("run"), dict) else {}
+        try:
+            key = run_key(run.get("host"), run.get("project"), run.get("slug"))
+        except Exception:
+            continue
+        row["references"] = [
+            item for item in (references.ThreadReference.from_dict(raw) for raw in stored.get(key) or [])
+            if item is not None
+        ]
+        row["references"] = [item.to_dict() for item in row["references"]]
+
+
 def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     """Assemble the fleet view for the runs **this orchestrator tracks**.
 
@@ -690,7 +878,12 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     mirror = pull(config, force=force_pull).to_dict()
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
-    sessions = absorb_ports(list_sessions(live_only=False))
+    with assistant._PUBLICATION_LOCK:
+        sessions = projects.inventory_sessions(list_sessions(live_only=False))
+    # A forgotten run's index entry is gone, but its retained registry sessions
+    # are evidence: leave them on disk and out of the fleet view (#527).
+    sessions = filter_forgotten(sessions)
+    sessions = absorb_ports(sessions)
     tracked = list_tracked()
     refs = [
         ref
@@ -705,6 +898,10 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # these is waiting on me" is the question it exists to answer.
     inventory = build_inventory(
         refs, sessions, tracked=tracked, questions=ask.pending_by_session(sessions),
+        # What each live session last published about itself (#248), read here
+        # for the same reason its questions are: the run list and the run view
+        # both want it, and neither should cost a request per row.
+        statusline=statusline.by_session(sessions),
         # Resolved here, where config is in hand: defaulting deeper would leave
         # a host's config.json with no effect (#243).
         stall=StallPolicy(
@@ -713,6 +910,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         ),
     )
 
+    slot_entries, slots_problem = stored_slots_or_problem()
     payload = {
         "schema": SCHEMA_VERSION,
         "generated_at": utc_now_iso(),
@@ -727,10 +925,28 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         # The sessions read above are passed in to save a registry read;
         # ``slot_rows`` filters them for liveness itself, which matters because
         # this list deliberately includes dead entries.
-        "slots": [row.to_dict() for row in slot_rows(config, sessions=sessions)],
+        #
+        # Slots are re-read from ``config.json`` here rather than taken off the
+        # boot-time config (#256): this daemon is what writes that file now, and
+        # a row that could not show the operator's own edit until a restart is
+        # the failure the editor exists to remove.
+        "slots": [
+            row.to_dict()
+            for row in slot_rows(
+                replace(config, slots=slot_entries), sessions=sessions,
+            )
+        ],
+        # ``None`` unless ``config.json`` exists and could not be read. Empty
+        # slots is otherwise a claim about the host — "this one declares none" —
+        # and a file saved mid-edit would make that claim while the spawn gate
+        # refused by the wrong name.
+        "slots_problem": slots_problem,
     }
     payload.update(inventory.to_dict())
     _fold_checkins(payload)
+    _fold_threads(payload)
+    _fold_references(payload)
+    _fold_relations(payload)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -741,8 +957,14 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     return payload
 
 
-#: What a root has to call the directory its taskdefs live in.
+#: What a root has to call the directory its taskdefs live in. Two names in the
+#: work repo: ``_taskdef`` is the schema-owned one (issue #353, D6/§2) and the
+#: bare name is grandfathered until a tree migrates, so both are read, in that
+#: order — the container's own order (:func:`lmer_cli.container.taskdefs.
+#: work_repo_taskdef_dirs`). The built-in root below keeps the bare name alone:
+#: it is a code checkout, not a plexus.
 _TASKDEF_DIRNAME = "taskdef"
+_WORK_TASKDEF_DIRNAMES = ("_taskdef", _TASKDEF_DIRNAME)
 
 
 def _package_taskdef_root() -> Path:
@@ -810,24 +1032,120 @@ def _builtin_taskdef_root() -> Optional[Path]:
     return None
 
 
-def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]:
-    """``{mirror}/{host}/{project}``, or ``None`` when that is not inside the mirror.
+def _inside_mirror(root: Path, candidate: Path) -> Optional[Path]:
+    """*candidate* resolved, or ``None`` when it does not land inside *root*.
 
     The containment re-check is the one in :func:`_safe_asset`, for the same
-    reason: ``host``/``project`` come out of a repo URL a caller supplied, and
+    reason: the segments below come out of a repo URL a caller supplied, and
     ``_parse_repo_url`` hands back whatever path that URL had — ``..`` segments
     included. Without this, a crafted repo URL would aim the taskdef search at a
     directory outside the mirror and the menu would report what it found there.
+    Resolving first also refuses a project dir that is a *symlink* out of the
+    mirror. *root* is expected already resolved.
+    """
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
+def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]:
+    """``{mirror}/{host}/{project}``, or ``None`` when that is not inside the mirror.
+
+    The host bucket (issue #353, D9): where a repo nobody has named yet keeps its
+    work, and where every project in a tree with no manifest lives. Positional on
+    purpose — that path is derived from the remote, so it is the one place the
+    work repo still encodes identity — and it is a permanent holding form rather
+    than a transitional one, so this never retires. Which record areas the
+    project holds (``runs/``, ``_runs/``, both) is not part of the question.
     """
     if not (host and project):
         return None
     root = mirror.resolve()
+    return _inside_mirror(root, root / host / project)
+
+
+def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
+    """``(schema-form project dir, problem)`` for *repo_url* in the mirror (D20).
+
+    The second tree shape (issue #353): with a ``_plexus.yaml`` at the mirror
+    root the project dir is a flat top-level SHORT NAME (D7), and nothing in a
+    repo URL says which name that is — only the registry does (D8). So the URL is
+    looked up across every entry's ``repo:`` and ``remotes:`` through
+    :mod:`lmer_schema`, which is the one definition of both the normalization
+    (D21) and the registry rules; a second copy here would offer the operator a
+    menu the container disagrees with, the same trade the taskdef discovery
+    imports at the top of this module make.
+
+    Three answers, and the third is the one that matters:
+
+    - **no manifest** — the tree is legacy, ``(None, None)``, and the caller
+      falls through to the host bucket exactly as it always did;
+    - **no registry entry** — the repo is unnamed, also ``(None, None)``: names
+      are never derived (D9), so its work is in the bucket and stays there,
+      visibly unnamed, until a human names it;
+    - **a manifest that is present but unusable** — ``(None, <reason>)``, and the
+      caller drops BOTH project tiers. Fail-closed, matching
+      :func:`lmer_cli.container.taskdefs._plexus_project_dir`: a one-character
+      typo in a migrated tree must not silently point the search back at the
+      stale pre-migration ``{host}/{project}`` bucket, which is the demotion D20
+      exists to make impossible. The global tier is not a project claim and is
+      unaffected.
+
+    A failure to *import* the core is not a broken manifest — it is a checkout
+    with nothing schema-shaped in it — so it degrades to legacy and says
+    nothing, the split D20 draws for the work CLI's resolver.
+    """
     try:
-        candidate = (root / host / project).resolve()
-        candidate.relative_to(root)
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return candidate
+        from lmer_schema import ManifestError, has_manifest, load_registry
+    except ImportError:  # pragma: no cover - the package ships with this one
+        return None, None
+    if not has_manifest(mirror):
+        return None, None
+    try:
+        registry = load_registry(mirror)
+    except ManifestError as exc:
+        return None, str(exc)
+    except OSError as exc:  # pragma: no cover - load_manifest wraps these
+        return None, f"unreadable: {exc}"
+    if registry is None or not repo_url:
+        return None, None
+    project = registry.lookup(repo_url)
+    if project is None:
+        return None, None
+    return _inside_mirror(mirror.resolve(), project.dir(mirror)), None
+
+
+def _mirror_project_dirs(
+    mirror: Path, host: str, project: str, repo_url: Optional[str]
+) -> list:
+    """Every project dir in the mirror this repo's work could be filed under.
+
+    Schema form first, then the host bucket — the container's order, and the
+    order the schema gives them: a migrated tree answers from its registry, and
+    the bucket is what holds a repo the registry does not name (D9). Both are
+    offered when both exist, because a tree migrates one project at a time and
+    the taskdefs may not have moved with the runs yet.
+
+    Empty on an unusable manifest, which drops the bucket too — see
+    :func:`_plexus_project_dir` for why that is not merely conservative.
+    """
+    schema_dir, problem = _plexus_project_dir(mirror, repo_url)
+    if problem is not None:
+        logger.warning(
+            "platform_mirror_manifest_unusable path=%s problem=%s — the project "
+            "taskdef tier is dropped rather than resolved against the "
+            "pre-migration path",
+            mirror / "_plexus.yaml", problem,
+        )
+        return []
+    roots = [schema_dir] if schema_dir is not None else []
+    bucket = _mirror_project_dir(mirror, host, project)
+    if bucket is not None:
+        roots.append(bucket)
+    return roots
 
 
 def _work_repo_taskdef_dirs(
@@ -838,13 +1156,17 @@ def _work_repo_taskdef_dirs(
 ) -> list:
     """The work repo's taskdef tiers, read off this daemon's mirror (T73).
 
-    The container searches ``{work}/{host}/{project}/taskdef`` and then
-    ``{work}/taskdef`` before anything else
+    The container searches the project's own tiers and then the work repo's
+    global one before anything else
     (:func:`lmer_cli.container.taskdefs.work_repo_taskdef_dirs`), and the mirror
     (spec D24) is a full checkout of that same repo — so the tiers the operator
     keeps their own taskdefs in were never invisible from the host, only unwired.
     Returned in the container's order, existing directories only, so the search
-    below reads as the precedence it implements.
+    below reads as the precedence it implements. That order is now over two tree
+    shapes (issue #353): the registered project dir (:func:`_plexus_project_dir`)
+    and the ``{host}/{project}`` host bucket (:func:`_mirror_project_dir`),
+    each probed for ``_taskdef/`` and then the grandfathered ``taskdef/``, and
+    the mirror root itself last for the global tier.
 
     The project tier needs a project, which is why *target* and *repo_url* are
     here: they go through the same pair the spawn itself would
@@ -874,14 +1196,23 @@ def _work_repo_taskdef_dirs(
             taskdef="", target=target or "", repo_url=repo_url or None
         )
         # The slug is discarded: a taskdef tier is a property of the repository,
-        # not of the run. This call is here for the host/project pair only.
-        host, project, _slug = derive_run_identity(request, _repo_urls(request)[1])
+        # not of the run. This call is here for the host/project pair only. The
+        # identity URL is kept because in schema form the project dir is resolved
+        # by registry lookup of that same URL, not by a path built from the pair.
+        #
+        # The config is passed for the same reason the spawn passes it: a launch
+        # URL that is a project's secondary remote derives the project's PRIMARY
+        # identity (D8), so the host bucket probed below is the one that project's
+        # pre-migration work sits in rather than a bucket named after a mirror.
+        identity_url = _repo_urls(request)[1]
+        host, project, _slug = derive_run_identity(request, identity_url, config)
 
         dirs = []
-        project_root = _mirror_project_dir(mirror, host or "", project or "")
-        if project_root is not None:
-            dirs.append(project_root / _TASKDEF_DIRNAME)
-        dirs.append(mirror / _TASKDEF_DIRNAME)
+        roots = _mirror_project_dirs(
+            mirror, host or "", project or "", identity_url
+        ) + [mirror]
+        for root in roots:
+            dirs.extend(root / name for name in _WORK_TASKDEF_DIRNAMES)
         return [path for path in dirs if path.is_dir()]
     # Deliberately everything, and scoped tighter than the caller's catch: a
     # mirror that is a broken symlink, or a repo URL nothing can be parsed out
@@ -1031,6 +1362,255 @@ def discover_spawn_options(
     }
 
 
+# --- editing service slots (issue #256) --------------------------------------
+
+#: What a slot write may name, taken from the file's own vocabulary rather than
+#: copied from it: :mod:`lmer_platform.slots` is built to tolerate a key a newer
+#: build wrote, so a hand copy here would silently start refusing what the
+#: loader accepts.
+SLOT_BODY_KEYS = tuple(sorted(_KNOWN_KEYS))
+
+#: The subset an *edit* may change. The name is not among them: it is what a
+#: running session recorded and what the row is addressed by, so moving it is
+#: remove-then-declare rather than an edit.
+SLOT_EDIT_KEYS = tuple(key for key in SLOT_BODY_KEYS if key != "name")
+
+
+class SlotWriteRefused(Exception):
+    """A slot write that must not happen, and the answer the route gives.
+
+    Carried rather than raised as an ``HTTPException`` because these checks run
+    inside :func:`lmer_platform.config.mutate_stored`'s callback — under the
+    write lock, where FastAPI is not in scope — and because the refusals are the
+    feature: each one is a sentence an operator reads on the form.
+    """
+
+    def __init__(self, status: int, message: str, *, code: Optional[str] = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.code = code
+
+
+def _unreadable_config_reason(problem: str) -> str:
+    """What every slot route says when ``config.json`` cannot be read.
+
+    One sentence for the write and for the preview, because the editor shows
+    both in the same box: a form that answered "this host declares no such
+    slot" to a preview and "nothing was written" to the save would be two
+    accounts of one file nobody could read. The same rule
+    :func:`lmer_platform.slots._unknown_preset_reason` exists for.
+    """
+    return f"{problem}; nothing was changed — resolve the file on the host first"
+
+
+def _slot_entries(stored: Optional[dict] = None) -> list:
+    """The raw ``slots`` entries, from *stored* or from the file as it is now.
+
+    Reading from the file **refuses** rather than answering ``()`` when the file
+    exists and cannot be read: every caller here is deciding something on the
+    operator's behalf, and an empty list would let a preview report "this host
+    declares no service slot" about a file nothing could read — the claim
+    ``slots_problem`` exists to stop the fleet view making. The swallowing form
+    is :func:`lmer_platform.config.stored_slots`, for the spawn gate, which has
+    nowhere to report to.
+    """
+    if stored is None:
+        entries, problem = stored_slots_or_problem()
+        if problem:
+            raise SlotWriteRefused(
+                409, _unreadable_config_reason(problem), code="config_unreadable",
+            )
+        return list(entries)
+    return list(_slots_value(stored.get("slots")))
+
+
+def _entry_name(entry: object) -> Optional[str]:
+    """A raw entry's name as :func:`lmer_platform.slots.parse_slots` reads it."""
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    return name.strip() if isinstance(name, str) else None
+
+
+def _slot_at(entries: list, name: str) -> tuple:
+    """``(index, definition)`` for the entry *name* resolves to, or ``(None, None)``.
+
+    Through :func:`lmer_platform.slots.parse_slots`, so the etag an ``If-Match``
+    is compared against is the one the row published — same parser, same digest.
+
+    Index and definition come out of the *same* answer, and that is the point:
+    ``parse_slots`` skips a malformed entry, so a file carrying
+    ``[{"name": "x"}, {"name": "x", "preset": "p"}]`` has a first entry with the
+    name and a second one the daemon actually reads under it. An edit that
+    landed on the first would change something nothing reads and leave the live
+    definition untouched.
+
+    The index matters because the one-service-one-slot rule is decided in
+    declaration order, so an edit puts the entry back where it was.
+    """
+    for definition in parse_slots(entries):
+        if definition.name != name:
+            continue
+        for index, entry in enumerate(entries):
+            if entry == definition.entry:
+                return index, definition
+        # Unreachable: the definition was built from one of these entries.
+        raise SlotWriteRefused(
+            500, f"service slot {name!r} could not be located in the file",
+        )
+    return None, None
+
+
+def _slot_text(body: dict, key: str) -> Optional[str]:
+    """One text field out of a request body, or ``None`` when it is cleared.
+
+    A browser sends an emptied field as ``""``; that is a request to clear it,
+    the same reading ``POST /api/assistant/config`` gives.
+    """
+    value = body.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SlotWriteRefused(400, f"{key} must be text, not {type(value).__name__}")
+    return value.strip() or None
+
+
+#: Slot names the ``PUT``/``DELETE`` routes cannot address, because they carry
+#: the name as one path segment. Measured against the real routes rather than
+#: reasoned about: a percent-encoded ``/`` is resolved before routing and never
+#: matches (404), and the client's URL parser collapses ``.``/``..`` before routing.
+#: Everything else round-trips — spaces, ``?``, ``#``, ``%``, ``:`` and
+#: non-ASCII all resolve, so none of them is refused.
+_UNADDRESSABLE_NAMES = frozenset({".", ".."})
+
+
+def _addressable(name: str) -> str:
+    """*name*, if the edit and remove routes will be able to find it again.
+
+    Checked where a name is *created* rather than at load: a slot declared with
+    a ``/`` in it renders a row whose pencil 404s on its own preview, so the
+    editor would create something only a text editor can then change — the one
+    operation this feature exists to remove. A name already in a file keeps
+    working for spawning; it stays file-only work, like a malformed entry.
+    """
+    if "/" in name or name in _UNADDRESSABLE_NAMES:
+        raise SlotWriteRefused(
+            400,
+            f"slot name {name!r} cannot be addressed by the edit and remove "
+            "routes, which carry the name in the URL path — use a name without "
+            "'/' that is not '.' or '..'",
+            code="unaddressable_name",
+        )
+    return name
+
+
+def _checked_preset(name: str) -> str:
+    """*name*, if this host has a preset called that.
+
+    The issue's rule, and the reason it is a refusal rather than a warning: a
+    slot's preset is what puts the session into service mode, so a name nothing
+    resolves declares a slot that can never be used. When *nothing* loads, the
+    refusal is :func:`lmer_platform.slots._no_presets_reason`'s sentence — the
+    same words the row uses — because "no such preset" would send the operator
+    to fix a file that is fine.
+    """
+    presets = load_presets()
+    if name in presets:
+        return name
+    if not presets:
+        raise SlotWriteRefused(400, _no_presets_reason(name), code="no_presets")
+    # The row's own sentence, not a second spelling of it: this refusal and a
+    # `misconfigured` row for the same fault can be in one viewport at once (the
+    # presets file is hot). The list of what the host *does* have is already in
+    # the editor's select, so it is not repeated here.
+    raise SlotWriteRefused(
+        400, _unknown_preset_reason(name), code="unknown_preset",
+    )
+
+
+def _slot_row(config: PlatformConfig, entries: list, name: str) -> dict:
+    """The row *name* would have if ``config.json`` held *entries*.
+
+    The whole point of the editor's preview, and the reason it resolves a
+    candidate list through :func:`lmer_platform.slots.slot_rows` rather than
+    checking anything itself: the sentence the form shows is then the sentence
+    the row shows, by construction, and the rules it reports — unknown preset, a
+    preset that sets no service, a service another slot already bound — have
+    exactly one implementation.
+    """
+    rows = slot_rows(replace(config, slots=tuple(entries)))
+    for row in rows:
+        if row.definition.name == name:
+            return row.to_dict()
+    # Only reachable if ``parse_slots`` dropped the entry this route just built,
+    # which would mean the shape rules and these checks disagree.
+    raise SlotWriteRefused(
+        400, f"slot {name!r} is not a usable slot entry", code="unusable_entry",
+    )
+
+
+def _refuse_if_occupied(config: PlatformConfig, name: str, what: str) -> None:
+    """Refuse *what* while a live session holds slot *name* (409).
+
+    Measured from the running sessions, and therefore deliberately **outside**
+    the config write lock: that lock protects the file, and whether an agent is
+    running against the dev service right now is not a fact about the file. The
+    read-then-act window this leaves is the one every slot decision has
+    (:func:`lmer_platform.spawn._claim_slot` states it), and the cost of losing
+    the race here is a row that says what happened, not a corrupted write.
+
+    Only holders of this slot's own *name* count. A session holding the same
+    service under a **different** slot is not something editing this one can
+    disturb — that row already says so, and refusing here would make a slot
+    unfixable for the reason it needs fixing.
+    """
+    status = slot_status(with_stored_slots(config), name)
+    if status is None or not status.occupants:
+        return
+    who = ", ".join(
+        str(held.get("session_id")) for held in status.occupants
+    )
+    raise SlotWriteRefused(
+        409,
+        f"service slot {name!r} is held by {who} — {what} under a running "
+        "session changes what that session is bound to; pass confirm=true to "
+        "do it anyway",
+        code="slot_occupied",
+    )
+
+
+def _matched_etag(entries: list, name: str, etag: Optional[str]):
+    """The definition *etag* was taken from, or a refusal saying why not.
+
+    The concurrency check, and it is a **measurement** rather than a hope: the
+    entry is re-parsed from the file as it is at write time and its digest
+    recomputed, so an edit made in an editor between the form's read and its
+    submit is detected instead of overwritten.
+    """
+    _index, definition = _slot_at(entries, name)
+    if definition is None:
+        raise SlotWriteRefused(
+            404, f"this host declares no service slot called {name!r}",
+            code="no_such_slot",
+        )
+    if not etag:
+        raise SlotWriteRefused(
+            428,
+            "send the slot's etag as If-Match — it is on the row, and it is "
+            "what keeps this edit from overwriting one made in the file",
+            code="etag_required",
+        )
+    if etag.strip('"') != definition.etag:
+        raise SlotWriteRefused(
+            412,
+            f"service slot {name!r} changed since it was read — reload the "
+            "fleet view and make the edit again",
+            code="slot_changed",
+        )
+    return definition
+
+
 def _index_file():
     """The built SPA entry point, or ``None`` when the UI has not been built."""
     dist = dist_dir()
@@ -1097,10 +1677,58 @@ class Caller:
     """
 
     kind: str
+    #: For a connector credential (issue #407): which connector, and the one
+    #: channel it may post as. Identification still, not authorization — the
+    #: channel is what the bus stamps on the record, so a source tag cannot be
+    #: forged by naming another channel in the body.
+    name: Optional[str] = None
+    channel: Optional[str] = None
+    session_id: Optional[str] = None
 
     @property
     def is_assistant(self) -> bool:
         return self.kind == CALLER_ASSISTANT
+
+    @property
+    def source_channel(self) -> str:
+        """The bus channel this caller's posts are stamped with."""
+        if self.kind == CALLER_ASSISTANT:
+            return "uber-lmer"
+        if self.kind == CALLER_CONNECTOR and self.channel:
+            return self.channel
+        return "platform"
+
+
+#: What ``POST …/input``'s steering form answers once it rides the bus.
+_SUBMIT_VIA_BUS_NOTE = (
+    "Delivered as a message on the session's bus (POST …/comms is the current "
+    "route; this form is deprecated and goes away next release). Enter was sent "
+    "after the tagged text; whether the TUI registered it is not observable here."
+)
+
+
+def _author_of(caller: "Caller", requested: object) -> Optional[str]:
+    """The author a post is stamped with.
+
+    The assistant has none (its tag is ``uber lmer``); anyone else may name the
+    human behind the call — an operator identity, a Slack display name — and an
+    operator who names nothing is ``operator``.
+    """
+    if caller.kind == CALLER_ASSISTANT:
+        return None
+    if isinstance(requested, str) and requested.strip():
+        return requested.strip()[:200]
+    return "operator" if caller.kind == CALLER_OPERATOR else None
+
+
+def _thread_label(caller: "Caller") -> str:
+    """Who a thread is told wrote a post the platform made: from the credential,
+    never from the body — the rule the bus already applies to ``source.channel``."""
+    if caller.is_assistant:
+        return "uber lmer"
+    if caller.kind == CALLER_CONNECTOR and caller.channel:
+        return caller.channel
+    return CALLER_OPERATOR
 
 
 def _note_check(
@@ -1157,6 +1785,7 @@ def create_app(
     secret: str,
     *,
     state_builder: Optional[Callable[..., dict]] = None,
+    ingress: Optional[Ingress] = None,
 ):
     """Build the FastAPI app.
 
@@ -1166,15 +1795,26 @@ def create_app(
     import anyio
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
-        FileResponse, PlainTextResponse, StreamingResponse,
+        FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
     )
     from starlette.websockets import WebSocketDisconnect
+    from starlette.requests import Request
+
+    from . import peers, project_api
 
     if not secret:
         raise ValueError("refusing to serve without a shared secret")
 
     builder = state_builder or build_state
-    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION))
+    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
+                  lifespan=ingress.lifespan if ingress else None)
+    app.router.route_class = project_api.WorkspaceRoute
+
+    @app.exception_handler(projects.ProjectError)
+    async def project_error(_request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": {"code": exc.code, "message": str(exc)}})
+    mention_settings = ingress.settings if ingress else MentionSettings.from_env()
+    ingress_status = ingress or Ingress(mention_settings)
 
     # The UI bundle is ~550 kB uncompressed and ~130 kB gzipped, almost all of it
     # Vuetify's precompiled utilities sheet, which does not tree-shake. That
@@ -1194,7 +1834,7 @@ def create_app(
     # exactly one app in exactly one process (see session_io on why that matters).
     tickets = session_io.TicketStore()
 
-    def require_secret(
+    def authenticate(
         authorization: Optional[str] = Header(default=None)
     ) -> Caller:
         """Authenticate, and say who called (issue #244).
@@ -1227,14 +1867,31 @@ def create_app(
             offered = presented.encode("utf-8")
             if secrets_mod.compare_digest(offered, secret.encode("utf-8")):
                 return Caller(CALLER_OPERATOR)
+            if projects.enabled():
+                for project in projects.listing(archived=False):
+                    with project_scope.bound(project["id"]):
+                        minted = active_assistant_credential()
+                        if minted and secrets_mod.compare_digest(offered, minted.encode("utf-8")):
+                            owner = assistant.authenticated_generation(minted)
+                            if owner:
+                                return Caller(CALLER_ASSISTANT, session_id=owner["session"])
             minted = active_assistant_credential()
             if minted and secrets_mod.compare_digest(
                 offered, minted.encode("utf-8")
             ):
-                # Which incarnation it is is deliberately not read: that cost an
-                # `assistant.read_state()` per request — file, handoff re-scrub and
-                # up to MAX_PENDING notes — for a field nothing consumed.
-                return Caller(CALLER_ASSISTANT)
+                try:
+                    owner = assistant.authenticated_generation(minted)
+                except StoreError as exc:
+                    logger.warning("assistant_identity_unavailable error=%s", exc)
+                    owner = None
+                return Caller(CALLER_ASSISTANT, session_id=owner["session"] if owner else None)
+            # Connector credentials (#407): compared one by one so timing tells
+            # nothing about which one matched; the set is small by construction.
+            for credential, identity in active_connectors().items():
+                if secrets_mod.compare_digest(offered, credential.encode("utf-8")):
+                    return Caller(
+                        CALLER_CONNECTOR, name=identity["name"], channel=identity["channel"]
+                    )
         logger.warning(
             "platform_auth_rejected scheme=%s",
             (authorization or "").partition(" ")[0].lower() or "none",
@@ -1246,7 +1903,37 @@ def create_app(
             headers={"WWW-Authenticate": f'Basic realm="{REALM}"'},
         )
 
+    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+        body = {}
+        if "application/json" in request.headers.get("content-type", ""):
+            try:
+                value = await request.json()
+                body = value if isinstance(value, dict) else {}
+            except ValueError:
+                pass
+        with project_api.bind(request, caller, body):
+            yield caller
+
+    require_secret.__annotations__["request"] = Request
     guard = [Depends(require_secret)]
+
+    def _unreadable_config(exc: StoreError) -> HTTPException:
+        """``config.json`` exists and could not be read, so nothing was written.
+
+        409 rather than 500: the daemon is fine and the request was well formed
+        — the file on disk is in a state only a person can resolve, and the
+        store's own sentence is the one that says which state (a schema a newer
+        build wrote, a file that could not be opened). Answering 200 over a
+        write that did not happen, or writing anyway, are the two things this
+        must not do.
+        """
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "config_unreadable",
+                "message": _unreadable_config_reason(str(exc)),
+            },
+        )
 
     @app.get("/", dependencies=guard)
     def root():
@@ -1281,15 +1968,20 @@ def create_app(
             "  GET  /api/state             fleet view: runs THIS orchestrator\n"
             "                              tracks. A run's session block is\n"
             "                              narrowed to the fields a client reads,\n"
-            "                              not the whole registry entry\n"
+            "                              not the whole registry entry;\n"
+            "                              `statusline` carries what its live\n"
+            "                              session published about its own status\n"
+            "                              line (context, usage windows, effort)\n"
             "  POST /api/sessions          spawn {taskdef,target,repo_url,\n"
-            "                              preset,agents,harness,ports,\n"
+            "                              preset,agents,harness,ports,targets?,\n"
             "                              title?,description?,...} — title names\n"
             "                              the run in the fleet view, exactly as\n"
             "                              POST /api/runs/meta would afterwards;\n"
             "                              it is written once the run is tracked,\n"
             "                              and a 201 says so in warning if it\n"
-            "                              could not be\n"
+            "                              could not be. A target thread another\n"
+            "                              live run holds is 409 and starts\n"
+            "                              nothing\n"
             "  GET  /api/spawn-options     taskdefs and preset names this host\n"
             "                              can see — suggestions, not a\n"
             "                              vocabulary: any taskdef may be named;\n"
@@ -1344,10 +2036,15 @@ def create_app(
             "                              fresh session carrying the answer\n"
             "  POST /api/runs/resume       continue a tracked run by starting its\n"
             "                              next session {host,project,slug,\n"
-            "                              taskdef?,repo_url?,direction?}. The\n"
-            "                              taskdef defaults to the run's recorded\n"
-            "                              one; naming another starts a sibling run\n"
-            "                              against the same target. A refusal here\n"
+            "                              taskdef?,repo_url?,direction?,\n"
+            "                              session_id?}. The taskdef defaults to\n"
+            "                              the run's recorded one; naming another\n"
+            "                              starts a sibling run against the same\n"
+            "                              target. session_id continues ONE launch\n"
+            "                              of a slug that groups several — the\n"
+            "                              newest by default — and an id that names\n"
+            "                              none of them is a 409 session_not_found\n"
+            "                              listing the ones there are. A refusal\n"
             "                              carries {code,message} — two of them ask\n"
             "                              for one more field rather than failing\n\n"
             "One session's terminal:\n"
@@ -1395,13 +2092,14 @@ def create_app(
             "itself, and the thing the operator chats with:\n"
             "  GET  /api/assistant          whether one is running, which session,\n"
             "                               how old, how many digests are spooled\n"
-            "                               for it, and the handover note it starts\n"
-            "                               from. A read: it starts nothing. The\n"
+            "                               for it, its own status line, and the\n"
+            "                               handover note it starts from. A read:\n"
+            "                               it starts nothing. The\n"
             "                               pending count here is the only\n"
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"
             "  POST /api/assistant/start    start it {handoff?, model?, harness?,\n"
-            "                               preset?, agents?} — 409 when one is\n"
+            "                               preset?, agents?, threads?} — 409 when one is\n"
             "                               already up, which is how the incumbent\n"
             "                               keeps its context window. 200, not 202:\n"
             "                               the session is up when this returns\n"
@@ -1413,9 +2111,12 @@ def create_app(
             "  POST /api/assistant/rotate   replace it with a fresh context window,\n"
             "                               carrying {handoff?} over — one call, so\n"
             "                               no start lands in the gap. Takes the\n"
-            "                               same launch overrides as start\n"
+            "                               same launch overrides as start. The\n"
+            "                               assistant may call it for itself; the\n"
+            "                               call does not return, because its own\n"
+            "                               container is what this ends\n"
             "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
-            "                               model/harness/preset/agents, each with\n"
+            "                               model/harness/preset/agents/threads, with\n"
             "                               the layer that decided it (env /\n"
             "                               config.json / default). What the running\n"
             "                               one uses is on GET /api/assistant\n"
@@ -1423,12 +2124,21 @@ def create_app(
             "                               a patch of the keys named; null clears\n"
             "                               one. Changes nothing about the running\n"
             "                               incarnation: rotate to apply. The\n"
-            "                               checkin/nudge integers are the\n"
-            "                               exception — the next tick reads them\n"
+            "                               checkin/nudge/rotation integers are\n"
+            "                               the exception — the next tick reads\n"
+            "                               them. rotation.context_threshold is\n"
+            "                               the percentage of the context window\n"
+            "                               at which the daemon recommends a\n"
+            "                               rotation; 0 turns that off\n"
             "  GET  /api/assistant/handoff  the note the last incarnation left. A\n"
             "                               null one with a note means nobody left\n"
             "                               you anything, which is not the same as\n"
             "                               this route being absent\n"
+            "                               previous_session names the prior transcript;\n"
+            "                               read it only when relevant context is missing\n"
+            "  GET  /api/assistant/history/{session_id}  retained generation pages\n"
+            "                               since/before, limit 1-500, view=conversation|transcript;\n"
+            "                               history.previous_session links earlier generations\n"
             "  POST /api/assistant/handoff  write it {handoff} — what an assistant\n"
             "                               tells its successor before a rotation\n"
             "  GET  /api/assistant/instructions   the operator's standing orders.\n"
@@ -1440,6 +2150,25 @@ def create_app(
             "                               writes after the operator states a\n"
             "                               standing preference in chat. Re-read\n"
             "                               first; this is not a patch\n"
+            "  GET  /api/projects          list named workspaces and assistant lifecycle\n"
+            "  GET  /api/assistant/peers    peer UL names, live session/generation and thread links\n"
+            "  GET  /api/assistant/peers/{peer_id}/instructions  explicit purpose, offset, limit (max 4000)\n"
+            "  GET  /api/assistant/peers/receipts/{ref}  this project's retained peer-send receipt\n"
+            "  POST /api/sessions/{id}/comms  peer UL message: {kind:message,text,ref,generation?}; no controls\n"
+            "  POST /api/projects          create {name}, queue its assistant\n"
+            "  PATCH /api/projects/{workspace_id}  change name, color, repositories, settings\n"
+            "  POST /api/projects/{workspace_id}/archive  archive eligible project\n"
+            "  POST /api/projects/{workspace_id}/restore  restore stopped\n"
+            "  GET|POST /api/settings      fleet assistant capacity\n"
+            "  POST /api/runs/move         inactive run: assign/transfer to destination_id,\n"
+            "                               with workspace_id and home_revision\n"
+            "  GET  /api/project-context   explicit source_workspace_id excerpt\n"
+            "  POST /api/project-relay     explicit destination_id and text, with provenance\n"
+            "  GET  /api/assistant/requests  durable conversation requests and delivery state\n"
+            "  POST /api/assistant/requests/{request_id}/reply  reply to recorded source once\n"
+            "  POST /api/assistant/requests/{request_id}/park  operator parks uncertainty without resending\n"
+            "  POST /api/assistant/requests/{request_id}/release  operator releases a blocked request with known effects\n"
+            "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
             "                               GET; the status carries the count, so\n"
@@ -1450,6 +2179,94 @@ def create_app(
             "The fleet view is scoped to runs this orchestrator spawned or\n"
             "adopted — never the whole shared work repo.\n"
         )
+
+    @app.get("/api/projects", dependencies=guard)
+    def project_list(caller: Caller = Depends(require_secret)) -> dict:
+        rows = projects.listing()
+        if caller.is_assistant:
+            rows = [row for row in rows if row["id"] == project_scope.current()]
+        return {"projects": [{**project_api.public_project(row), "assistant": projects.status(row["id"])}
+                             for row in rows], "colors": projects.COLORS, "max_live_assistants": projects.limit()}
+
+    @app.get("/api/assistant/peers", dependencies=guard)
+    def peer_list(caller: Caller = Depends(require_secret)) -> dict:
+        return peers.directory(caller)
+
+    @app.get("/api/assistant/peers/{peer_id}/instructions", dependencies=guard)
+    def peer_instructions(peer_id: str, purpose: str = Query(min_length=1, max_length=500),
+                          offset: int = Query(default=0, ge=0, le=4000),
+                          limit: int = Query(default=2000, ge=1, le=4000),
+                          caller: Caller = Depends(require_secret)) -> dict:
+        return peers.instructions(caller, peer_id, purpose, offset, limit)
+
+    @app.get("/api/assistant/peers/receipts/{ref}", dependencies=guard)
+    def peer_receipt(ref: str, caller: Caller = Depends(require_secret)) -> dict:
+        return peers.receipt(caller, ref)
+
+    @app.post("/api/projects", dependencies=guard, status_code=201)
+    def project_create(body: dict) -> dict:
+        row = projects.create(body.get("name"))
+        projects.reconcile(config)
+        return {**project_api.public_project(projects.get(row["id"])), "assistant": projects.status(row["id"])}
+
+    @app.patch("/api/projects/{workspace_id}", dependencies=guard)
+    def project_update(workspace_id: str, body: dict) -> dict:
+        return project_api.public_project(projects.update(workspace_id, body))
+
+    @app.post("/api/projects/{workspace_id}/archive", dependencies=guard)
+    def project_archive(workspace_id: str) -> dict:
+        return project_api.public_project(projects.archive(workspace_id, builder(config)))
+
+    @app.post("/api/projects/{workspace_id}/restore", dependencies=guard)
+    def project_restore(workspace_id: str) -> dict:
+        return project_api.public_project(projects.restore(workspace_id))
+
+    @app.post("/api/runs/move", dependencies=guard)
+    def move_run(body: dict) -> dict:
+        key = run_key(body.get("host") or "", body.get("project") or "", body.get("slug") or "")
+        return projects.move(key, body.get("destination_id"), expected_project=project_scope.current(),
+                             expected_revision=body.get("home_revision"))
+
+    @app.get("/api/project-context", dependencies=guard)
+    def project_context(source_workspace_id: str) -> dict:
+        source = projects.get(source_workspace_id)
+        payload = project_api.annotate(builder(config), workspace_id=source_workspace_id)
+        fields = {"host", "project", "slug", "title", "label", "state", "status", "phase", "attention"}
+        return {"source": {"id": source["id"], "name": source["name"]},
+                "runs": [{key: value for key, value in row.items() if key in fields}
+                         for row in payload.get("runs", [])]}
+
+    @app.post("/api/project-relay", dependencies=guard)
+    def project_relay(body: dict) -> dict:
+        source = projects.get(project_scope.current(), active=True)
+        destination = projects.get(body.get("destination_id"), active=True)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 16384:
+            raise projects.ProjectError("Relay text must contain 1–16384 characters.")
+        with project_scope.bound(destination["id"]):
+            assistant.notify(f"Explicit relay from {source['name']}: {text.strip()}", kind="project_relay",
+                             data={"workspace_id": destination["id"], "source_workspace_id": source["id"],
+                                   "source_name": source["name"]})
+        return {"source_workspace_id": source["id"], "destination_id": destination["id"], "queued": True}
+
+    @app.get("/api/settings", dependencies=guard)
+    def platform_settings() -> dict:
+        with project_scope.bound(None):
+            return {**_assistant_config_reply(), "max_live_assistants": projects.limit(),
+                    "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions),
+                    **fleet_group_settings()}
+
+    @app.post("/api/settings", dependencies=guard)
+    def set_platform_settings(body: dict) -> dict:
+        with project_scope.bound(None):
+            changes = {}
+            if "fleet_groups" in body:
+                try:
+                    changes["fleet_groups"] = validate_fleet_groups(body["fleet_groups"])
+                except ConfigError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            _write_assistant_settings({key: value for key, value in body.items() if key != "fleet_groups"}, changes)
+            return platform_settings()
 
     @app.get("/api/health", dependencies=guard)
     def health() -> dict:
@@ -1464,6 +2281,7 @@ def create_app(
             "schema": SCHEMA_VERSION,
             "at": utc_now_iso(),
             "bind": config.base_url,
+            "ingress": ingress_status.snapshot(),
             "mirror": {
                 "present": status.present,
                 "healthy": status.healthy,
@@ -1473,12 +2291,14 @@ def create_app(
 
     @app.get("/api/state", dependencies=guard)
     def state() -> dict:
-        return builder(config)
+        payload = builder(config)
+        return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.post("/api/rescan", dependencies=guard)
     def rescan() -> dict:
         """Re-read from ground truth, skipping the pull throttle."""
-        return builder(config, force_pull=True)
+        payload = builder(config, force_pull=True)
+        return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.get("/api/spawn-options", dependencies=guard)
     def spawn_options(
@@ -1521,10 +2341,17 @@ def create_app(
         ``title`` that was refused is reported the same way and for the same
         reason — the session is already running by the time it is written.
         """
+        project_requests.preflight()
         try:
             request = SpawnRequest(
+                workspace_id=project_scope.current(),
                 taskdef=body.get("taskdef") or "",
                 target=body.get("target") or "",
+                targets=body.get("targets"),
+                # Threads the run should know about but not be connected to
+                # (issue #414). Not a launch argument: nothing reaches the
+                # container, and the daemon tells the run once its bus is up.
+                references=body.get("references"),
                 repo_url=body.get("repo_url"),
                 # Typed fields, never appended to extra_args: the platform emits
                 # each flag itself and records what it emitted, so a second
@@ -1564,6 +2391,11 @@ def create_app(
         # an occupied slot is a well-formed request that works once the holding
         # session ends. Unknown or unusable falls through to the 400 (#245).
         except SlotOccupied as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        # 409 for the third instance of the reason above: a thread has one live
+        # session at a time (issue #413), so a target another run holds is a
+        # request that works once that run lets it go. Nothing was started.
+        except ThreadHeld as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -1645,6 +2477,54 @@ def create_app(
                 status_code=400,
                 detail="input needs a string 'data' field (\"\" is allowed)",
             )
+        # The steering form — prose meant for the agent, submitted — is a
+        # message, and since #407 a message travels the bus. Converted here for
+        # one release so an older lmer-ctl or UI bundle lands in the comms too;
+        # the keystroke form (no Enter) stays a PTY write for good.
+        hub = comms.ensure_hub()
+        if (
+            body.get("append_newline") and body.get("sanitize")
+            and hub is not None and hub.supports(session_id)
+        ):
+            kind = comms.KIND_COMMAND if (
+                body.get("preserve_slash_commands") and data.startswith("/")
+                and caller.kind in comms.COMMAND_CALLERS
+            ) else comms.KIND_MESSAGE
+            try:
+                session_io.require_session(session_id)
+                result = hub.post(
+                    session_id, kind=kind, text=data.rstrip("\r\n"),
+                    channel=caller.source_channel,
+                    author=_author_of(caller, body.get("author")),
+                )
+            except SessionIOError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            except comms.CommsError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            relay = result.get("relay") or {}
+            receipt = result.get("receipt") or {}
+            _note_check(caller, session_id=session_id)
+            return JSONResponse({
+                "session": session_id,
+                "bytes_written": relay.get("bytes_written"),
+                "queued": bool(relay.get("queued")),
+                "submit_confirmed": False,
+                "note": (
+                    "Accepted; typing is held until startup submission completes. "
+                    if relay.get("queued") else ""
+                ) + _SUBMIT_VIA_BUS_NOTE,
+                "submit_text": relay.get("submit_text"),
+                "deprecated": True,
+                "message_id": (result.get("message") or {}).get("id"),
+                # §8.3: the reply keeps its shape, receipt included, so a client
+                # that verified delivery before this change still can.
+                "payload_sha256": receipt.get("payload_sha256"),
+                "payload_length": receipt.get("payload_length"),
+            }, headers={
+                # §8.3, in the reply's own metadata rather than only in its body.
+                "Deprecation": "true",
+                "Link": f'</api/sessions/{session_id}/comms>; rel="successor-version"',
+            })
         try:
             reply = session_io.send_input(
                 session_id, data,
@@ -1765,6 +2645,48 @@ def create_app(
             "entries": [entry.to_dict() for entry in entries],
         }
 
+    def _option_index(value: object) -> Optional[int]:
+        """A body's ``option`` as a 1-based index, refused as a 400.
+
+        The shape check itself is the bus's, so this door and `POST /messages`
+        cannot drift apart on what an index is; the range is checked wherever
+        the question's own options are held.
+        """
+        try:
+            return bus_comms.option_index(value)
+        except bus_comms.CommsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _answer_target(hub, session_id: str, question_id: str) -> Optional[str]:
+        """The bus question this answer names, or ``None`` to answer by file.
+
+        A session can have a bus and still ask through the ask directory: its
+        image carries the supervisor but the CLI that asked predates it, which
+        is every self-dev run on a checkout older than the unified channel
+        (issue #421). The question is then in the directory, and the bus either
+        does not know it or knows it under an id of its own — never under the
+        entry id, which counts something else.
+
+        So the id is looked up rather than computed. A question the directory
+        does not hold at all leaves the bus to answer, refusal included; one it
+        holds goes to the bus only if the bus can be shown to hold the same
+        question, and otherwise to the file, which is where its asker is
+        waiting.
+        """
+        entry = ask.question_on_channel(session_id, question_id)
+        if entry is None:
+            return question_id
+        if entry.closure is not None and entry.answer is None:
+            # The session stopped waiting, and the file holds the reason it gave.
+            # The bus would refuse this too, as a late answer — but "already
+            # answered" names an event that did not happen and drops the one
+            # thing the operator can act on.
+            return None
+        return hub.question_for_ask_entry(
+            session_id, question_id,
+            mirrored=ask.entry_is_the_bus_projection(session_id, question_id),
+        )
+
     @app.post(
         "/api/sessions/{session_id}/ask/{question_id}/answer", dependencies=guard
     )
@@ -1786,17 +2708,61 @@ def create_app(
         on disk and the session's next poll — seconds away — picks it up. Nothing
         is spawned, so there is no "started, will apply later" to report.
 
+        ``option`` names one of the question's options by its 1-based index,
+        for an operator who read a numbered list rather than the option's text
+        (#428). It may stand alone: the resolved option becomes the answer.
+
         The answer text is not echoed back. The operator already has it, and the
         one thing a reply body would add is another copy of it in a log.
         """
+        option = _option_index(body.get("option"))
         text = body.get("answer")
+        if text is None and option is not None:
+            text = ""
         if not isinstance(text, str):
             raise HTTPException(
-                status_code=400, detail="answer must be text"
+                status_code=400,
+                detail="answer must be text, or name an option by its index",
             )
+        # A session on the bus (#407) takes its answer there, so the supervisor
+        # arbitrates first-answer-wins and every channel sees who answered. The
+        # reply keeps this route's shape; a late answer keeps its 409.
+        hub = comms.ensure_hub()
+        target = (
+            _answer_target(hub, session_id, question_id)
+            if hub is not None and hub.supports(session_id) else None
+        )
+        if target is not None:
+            try:
+                session_io.require_session(session_id)
+                result = hub.post(
+                    session_id, kind="answer", text=text, in_reply_to=target,
+                    option=option,
+                    channel=caller.source_channel,
+                    author=_author_of(caller, body.get("author")),
+                )
+            except SessionIOError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            except comms.CommsError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            if result.get("accepted_as") == "late":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"question {question_id} was already answered",
+                )
+            _note_check(caller, session_id=session_id)
+            record = result.get("message") or {}
+            return {
+                "session": session_id,
+                "question_id": question_id,
+                "answered_at": record.get("at"),
+                "message_id": record.get("id"),
+            }
         try:
             session_io.require_session(session_id)
-            recorded = ask.answer_question(session_id, question_id, text)
+            recorded = ask.answer_question(
+                session_id, question_id, text, option=option
+            )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         except AskChannelError as exc:
@@ -1807,6 +2773,463 @@ def create_app(
             "question_id": recorded["question_id"],
             "answered_at": recorded["answered_at"],
         }
+
+    # Comms source channels are stamped from credentials, not request bodies.
+
+    def _require_hub() -> "comms.CommsHub":
+        return comms.ensure_hub()
+
+    def _require_connectors() -> "connectors.ThreadConnectors":
+        return connectors.ensure_connectors()
+
+    def _comms_reply(session_id: str, hub, page: tuple) -> dict:
+        events, cursor = page
+        return {
+            "session": session_id,
+            "messages": [event.message for event in events],
+            "cursor": cursor,
+            "live": session_io.session_is_live(session_id),
+        }
+
+    @app.get("/api/sessions/{session_id}/comms", dependencies=guard)
+    def session_comms(
+        session_id: str,
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """One session's conversation as the daemon journaled it.
+
+        ``since`` is the **fleet cursor** of the last event the caller saw, not
+        the session's own ``seq`` — the journal is what is served, so the
+        cursor is the journal's. ``cursor`` in the reply is what to pass next.
+        """
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        hub = _require_hub()
+        _note_check(caller, session_id=session_id)
+        return _comms_reply(
+            session_id, hub, hub.feed(since, timeout=timeout, session=session_id, limit=limit)
+        )
+
+    @app.post("/api/sessions/{session_id}/comms", dependencies=guard)
+    def session_comms_post(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Post one record on a session's bus, stamped with the caller's channel.
+
+        The operator's credential posts as ``platform`` (with ``author`` from the
+        body when given), a project UL's as ``uber-lmer`` to workers or
+        ``peer-ul`` to an explicit peer, and a connector's as its bound channel.
+        Peer ULs receive messages only.
+        """
+        if project_api.capture().get("peer"):
+            project_requests.preflight()
+            return peers.send(caller, session_id, body, _require_hub())
+        project_requests.preflight()
+        if (caller.source_channel == "peer-ul" or "generation" in body
+                or isinstance(body.get("meta"), dict) and "peer" in body["meta"]
+                or isinstance(body.get("source"), dict) and body["source"].get("channel") == "peer-ul"):
+            raise HTTPException(status_code=403, detail="Peer provenance is assigned only to authenticated cross-project UL messages.")
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        hub = _require_hub()
+        kind = body.get("kind") or "message"
+
+        option = _option_index(body.get("option"))
+        text = body.get("text")
+        if text is None and option is not None:
+            text = ""
+        if not isinstance(kind, str) or not isinstance(text, str):
+            raise HTTPException(status_code=400, detail="comms needs string 'kind' and 'text'")
+        if kind == comms.KIND_COMMAND and caller.kind not in comms.COMMAND_CALLERS:
+            raise HTTPException(
+                status_code=403,
+                detail="only the operator and the assistant may run a harness command",
+            )
+        options = body.get("options") or []
+        attachments = body.get("attachments") or []
+        if not isinstance(options, list) or not isinstance(attachments, list):
+            raise HTTPException(status_code=400, detail="options and attachments must be lists")
+        project_requests.effect()
+        try:
+            result = hub.post(
+                session_id,
+                kind=kind,
+                text=text,
+                channel=caller.source_channel,
+                author=_author_of(caller, body.get("author")),
+                ref=body.get("ref") if isinstance(body.get("ref"), str) else None,
+                in_reply_to=body.get("in_reply_to") if isinstance(body.get("in_reply_to"), str) else None,
+                option=option,
+                options=[str(item) for item in options],
+                attachments=[item for item in attachments if isinstance(item, dict)],
+                meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
+            )
+        except comms.NoBus:
+            if option is not None and kind == comms.KIND_ANSWER:
+                # Nothing on this path holds the question's options — a bus-less
+                # session's question lives in the ask directory, and `in_reply_to`
+                # names a bus id that is not there — so the index resolves against
+                # nothing and typing an unresolved number in is the failure #428
+                # exists to stop. Retrying here with the text would 409 again on
+                # the kind, so the detail names the door that can answer it.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"session {session_id} has no message bus, so an option "
+                        "index cannot be resolved here — answer it through "
+                        f"POST /api/sessions/{session_id}/ask/{{question_id}}/answer, "
+                        "which reads the question's options from the ask directory"
+                    ),
+                )
+            # A session started from an image older than the unified channel
+            # (spec §8's third row). It has no bus, but it has the route the bus
+            # replaced, and during the deployment window it is every session
+            # already running: without this the chat composer and `lmer-ctl
+            # send` fail with a 409 at the exact moment they used to work.
+            return _post_without_a_bus(session_id, kind, text, caller, body)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except comms.CommsError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"session": session_id, **result}
+
+    def _post_without_a_bus(
+        session_id: str, kind: str, text: str, caller: Caller, body: dict,
+    ) -> dict:
+        """The pre-#407 path for one record: type it in, say the bus was absent.
+
+        Only prose reaches a session this way — a `command` keeps its leading
+        slash, everything else is guarded as before — and nothing else on the
+        session hears it, because there is nothing to hear it with.
+        """
+        if kind not in (comms.KIND_MESSAGE, comms.KIND_COMMAND):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"session {session_id} has no message bus (its image predates the "
+                    f"unified channel), so a {kind!r} record has nowhere to go"
+                ),
+            )
+        try:
+            reply = session_io.send_input(
+                session_id, text, append_newline=True, sanitize=True,
+                preserve_slash_commands=(kind == comms.KIND_COMMAND),
+            )
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {
+            "session": session_id,
+            "message": None,
+            "accepted_as": "typed",
+            "relay": {
+                "bytes_written": reply.get("bytes_written"),
+                "submit_text": reply.get("submit_text"),
+            },
+            "receipt": {
+                key: reply.get(key) for key in ("payload_sha256", "payload_length")
+                if reply.get(key) is not None
+            } or None,
+            "bus": False,
+            "note": (
+                "this session predates the unified channel: the text was typed into "
+                "the harness and no other channel saw it"
+            ),
+        }
+
+    @app.get("/api/comms/feed", dependencies=guard)
+    def comms_feed(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        session: Optional[str] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+    ) -> dict:
+        """The fleet feed: every journaled record, with its session and run.
+
+        A platform-side client's whole subscription is a loop over this route
+        passing back ``cursor``; ``since=0`` replays from the journal's start.
+        """
+        hub = _require_hub()
+        events, cursor = hub.feed(since, timeout=timeout, session=session, limit=limit)
+        if projects.enabled() and project_scope.current():
+            events = [event for event in events if projects.session_home(event.session) == project_scope.current()]
+        return {"events": [event.to_dict() for event in events], "cursor": cursor}
+
+    @app.post("/api/comms/ack", dependencies=guard)
+    def comms_ack(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        hub = _require_hub()
+        cursor = body.get("cursor")
+        connector = body.get("connector") or caller.name or caller.kind
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise HTTPException(status_code=400, detail="cursor must be a non-negative integer")
+        if not isinstance(connector, str) or not connector.strip():
+            raise HTTPException(status_code=400, detail="connector must be a name")
+        hub.ack_connector(connector.strip(), cursor)
+        return {"connectors": hub.connectors()}
+
+    @app.get("/api/comms/connectors", dependencies=guard)
+    def comms_connectors() -> dict:
+        hub = _require_hub()
+        return {
+            "connectors": hub.connectors(),
+            "credentials": list_connectors(),
+        }
+
+    @app.get("/api/comms/questions", dependencies=guard)
+    def comms_questions(open: bool = Query(default=False)) -> dict:
+        hub = _require_hub()
+        questions = hub.questions(open_only=open)
+        if projects.enabled() and project_scope.current():
+            questions = [question for question in questions if projects.session_home(question["session"]) == project_scope.current()]
+        return {"questions": questions}
+
+    # --- chat-thread connections (issue #412) --------------------------------
+    #
+    # Three routes over one record: a connection is a (session, thread) pair the
+    # daemon keeps and runs a connector process for, which is what makes connect
+    # and disconnect things that happen to a session that is already up. Every
+    # refusal comes out of :mod:`lmer_platform.connectors` carrying the status it
+    # should answer with — the reason is known there, and re-deriving it from the
+    # message at each caller is how the route and `lmer-ctl` start disagreeing.
+
+    @app.get("/api/sessions/{session_id}/threads", dependencies=guard)
+    def session_thread_list(session_id: str) -> dict:
+        """This session's chat-thread connections, and what each connector is doing.
+
+        A record whose connector is not running is still a record and still
+        listed, with ``detail`` saying why — a thread that has gone quiet
+        otherwise looks exactly like one that is working.
+        """
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {
+            "schema": connectors.SCHEMA,
+            "threads": _require_connectors().listing(session_id),
+        }
+
+    @app.post("/api/sessions/{session_id}/threads", dependencies=guard, status_code=201)
+    def session_thread_connect(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Connect a running session to a thread, or open a new one for it.
+
+        ``{"permalink": …}`` connects a thread that exists. ``{"channel": …,
+        "title": …?}`` opens one there and connects that (issue #429), and the
+        record it answers with carries the new thread's permalink. Never both:
+        a permalink's channel is read out of the link, so a body naming the two
+        is naming a thread and a place to make one.
+
+        On the live assistant's session this also edits the standing ``threads``
+        setting, so a thread connected from the chat pane survives a rotation.
+        """
+        channel, permalink = body.get("channel"), body.get("permalink")
+        by = _author_of(caller, None) or caller.source_channel
+        try:
+            if channel and permalink:
+                raise connectors.ThreadError(
+                    "give a permalink to connect a thread that exists, or a "
+                    "channel to open a new one — not both",
+                )
+            if channel:
+                record = session_threads.open_for(
+                    session_id, channel, title=body.get("title"), by=by,
+                    # A root the *platform* posted, and stamped as such (#427):
+                    # nobody's session wrote it, and the run this thread is being
+                    # opened for should read it as the operator addressing it
+                    # rather than as its own echo to skip.
+                    poster=thread_posts.Poster.for_platform(_thread_label(caller)),
+                )
+            else:
+                record = session_threads.connect(session_id, permalink, by=by)
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"thread": record}
+
+    @app.post("/api/sessions/{session_id}/threads/{thread_id}/recover", dependencies=guard)
+    def session_thread_recover(
+        session_id: str, thread_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Inspect or recover the selected operation in the host's connector state."""
+        if caller.kind not in comms.COMMAND_CALLERS:
+            raise HTTPException(status_code=403, detail="thread recovery requires an operator or assistant credential")
+        try:
+            result = _require_connectors().recover(
+                session_id, thread_id, body.get("action"), operation=body.get("operation"),
+                remote_ref=body.get("remote_ref"), reason=body.get("reason"),
+                acknowledge_duplicate=body.get("acknowledge_duplicate", False),
+                by=f"{caller.kind}:{caller.name}" if caller.name else caller.kind,
+            )
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return result
+
+    @app.delete("/api/sessions/{session_id}/threads/{thread_id}", dependencies=guard)
+    def session_thread_disconnect(
+        session_id: str, thread_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Stop mirroring one thread. The connector posts a line saying so."""
+        try:
+            record = session_threads.disconnect(session_id, thread_id)
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"disconnected": record}
+
+    # --- threads a run is pointed at, without connecting them (issue #414) ---
+    #
+    # Session-scoped because that is where the operator is, stored against the
+    # run because that is what outlives the session (docs/COMMS.md §12).
+
+    def _run_of_session(session_id: str) -> tuple:
+        session_io.require_session(session_id)
+        identity = run_for_session(session_id)
+        if identity is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"session {session_id} belongs to no run this orchestrator "
+                    "tracks, and a reference thread is attached to a run"
+                ),
+            )
+        return identity
+
+    @app.get("/api/sessions/{session_id}/references", dependencies=guard)
+    def session_references(session_id: str) -> dict:
+        """The threads this run has been pointed at. Connected to nothing."""
+        try:
+            identity = _run_of_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {
+            "run": dict(zip(("host", "project", "slug"), identity)),
+            "references": references.listing(*identity),
+            "local": True,
+            "note": references.LOCALITY_NOTE,
+        }
+
+    @app.post("/api/sessions/{session_id}/references", dependencies=guard, status_code=201)
+    def session_reference_add(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Point this run at a thread: no connector, no ack in the thread, no
+        claim on it. The run is told once, when its bus is up."""
+        try:
+            identity = _run_of_session(session_id)
+            record = references.add(
+                *identity, body.get("permalink"), title=body.get("title"),
+                by=_author_of(caller, None) or caller.source_channel,
+            )
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except references.ThreadReferenceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"reference": record.to_dict(), "note": references.LOCALITY_NOTE}
+
+    @app.delete("/api/sessions/{session_id}/references/{reference_id}", dependencies=guard)
+    def session_reference_remove(
+        session_id: str, reference_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        try:
+            identity = _run_of_session(session_id)
+            record = references.remove(*identity, reference_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except references.ThreadReferenceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"removed": record.to_dict()}
+
+    # --- a thread nothing here is connected to (issue #414) ------------------
+    #
+    # The session's two verbs, done here with the daemon's own credentials for
+    # the UI and for uber lmer. No session and no connection is involved.
+
+    @app.get("/api/comms/thread", dependencies=guard)
+    def comms_thread_read(
+        permalink: str = "",
+        limit: int = Query(
+            default=thread_queue.DEFAULT_READ_LIMIT, ge=1, le=thread_queue.MAX_READ_LIMIT
+        ),
+    ) -> dict:
+        """A thread's most recent messages, as the records a session would see.
+
+        No upload store: no session is behind this call, so a file is described
+        rather than copied anywhere.
+        """
+        try:
+            return thread_access.read_thread(permalink, limit=limit)
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.post("/api/comms/thread", dependencies=guard)
+    def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Post once into a thread, attributed to whoever holds the credential."""
+        label = _thread_label(caller)
+        from . import assistant_conversation
+        from lmer_cli.routing_receipts import receipt
+
+        try:
+            binding = project_api.capture()
+            if binding.get("request_id"):
+                request = project_requests.get(binding["request_id"])
+                target = thread_access.parse_thread(body.get("permalink"))
+                source = thread_access.parse_thread(request["payload"]["permalink"])
+                if target != source:
+                    raise projects.ProjectError("Reply in the request's original source thread.", status=409)
+                result = project_requests.reply(request["id"], body.get("text"), workspace_id=project_scope.current(),
+                                                session_id=caller.session_id)
+                return {**result, "thread": thread_access._thread_summary(source),
+                        **receipt("post", result["posted"].get("ref"))}
+            ref, client = None, None
+            private = False
+            if caller.is_assistant:
+                if projects.enabled():
+                    project_threads.authorize(body.get("permalink"), project_scope.current())
+                ref, client, _ = thread_access.resolve_thread(body.get("permalink"))
+                private = assistant_conversation.private_thread(ref, client)
+            result = thread_access.post_thread(
+                body.get("permalink"), body.get("text") or "", label=label,
+                ref=ref, client=client,
+                # Stamped like a run's own post (#427), so a connector watching
+                # that thread relays this instead of taking it for its own echo.
+                # No session is behind it, so the credential's name is the label.
+                poster=thread_posts.Poster.for_platform(label),
+            )
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        result.update(receipt("post", result["posted"].get("ref")))
+        if caller.is_assistant:
+            try:
+                if not caller.session_id:
+                    raise StoreError("authenticated assistant generation is unavailable")
+                text = body.get("text") or ""
+                if private:
+                    text = f"🔒 direct reply sent — {len(text)} characters, body not recorded"
+                assistant_conversation.record(
+                    text, kind="reply",
+                    thread=result["thread"]["permalink"],
+                    session_id=caller.session_id,
+                )
+                result["pane_recorded"] = True
+            except StoreError as exc:
+                logger.warning("assistant_reply_record_failed error=%s", exc)
+                result["pane_recorded"] = False
+        return result
 
     # --- files the operator hands a session (issue #246) ---------------------
     #
@@ -1998,7 +3421,7 @@ def create_app(
         _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
-            "ticket": tickets.mint(session_id),
+            "ticket": tickets.mint(session_id, binding=project_api.capture()),
             "expires_in": tickets.ttl,
         }
 
@@ -2025,8 +3448,9 @@ def create_app(
         """Push the backlog and then every new byte, until the session ends."""
         try:
             async for chunk in session_io.follow_log(session_id, offset=offset):
+                await asyncio.to_thread(project_api.invoke_captured, websocket.state.project_binding, lambda: None)
                 await websocket.send_json({"type": "data", **chunk.to_dict()})
-        except SessionIOError as exc:
+        except (SessionIOError, projects.ProjectError) as exc:
             await send_status(websocket, "log_failed", str(exc))
             return
         await send_status(
@@ -2047,12 +3471,14 @@ def create_app(
                 return
             try:
                 await asyncio.to_thread(
+                    project_api.invoke_captured, websocket.state.project_binding,
                     session_io.send_input,
                     session_id,
                     data,
                     append_newline=bool(frame.get("append_newline")),
+                    mutation=True,
                 )
-            except SessionIOError as exc:
+            except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "input_failed", str(exc))
             return
 
@@ -2067,7 +3493,8 @@ def create_app(
                 return
             try:
                 report = await asyncio.to_thread(
-                    session_io.apply_resize, session_id, rows, cols
+                    project_api.invoke_captured, websocket.state.project_binding,
+                    session_io.apply_resize, session_id, rows, cols, mutation=True
                 )
             except ControlPlaneError as exc:
                 # Not the same as a refused resize, and collapsing the two cost an
@@ -2080,7 +3507,7 @@ def create_app(
                 # cleared, on a session that was about to be perfectly fine.
                 await send_status(websocket, "resize_deferred", str(exc))
                 return
-            except SessionIOError as exc:
+            except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "resize_failed", str(exc))
                 return
             if not report.applied:
@@ -2157,16 +3584,18 @@ def create_app(
         offset = _query_int(
             websocket.query_params, "offset", -session_io.DEFAULT_TAIL_BYTES
         )
-        if not tickets.redeem(ticket, session_id):
+        binding = tickets.consume(ticket, session_id)
+        if binding is None:
             logger.warning("platform_tty_ticket_rejected session=%s", session_id)
             await websocket.close(
                 code=WS_POLICY_VIOLATION,
                 reason="invalid, expired or already-used ticket",
             )
             return
+        websocket.state.project_binding = binding
         try:
-            live = await asyncio.to_thread(_session_preamble, session_id)
-        except SessionIOError as exc:
+            live = await asyncio.to_thread(project_api.invoke_captured, binding, _session_preamble, session_id)
+        except (SessionIOError, projects.ProjectError) as exc:
             await websocket.close(
                 code=WS_POLICY_VIOLATION, reason=str(exc)[:_WS_REASON_LIMIT]
             )
@@ -2197,7 +3626,23 @@ def create_app(
         why it is a separate route with a name that says so. Tracked runs are
         flagged so the list is usable as a picker.
         """
-        tracked_keys = {(e.host, e.project, e.slug) for e in list_tracked()}
+        # Both sides of the membership test are folded to the project's
+        # primary remote (D8), for the reason `workrepo.folded_identity`
+        # gives: a row adopted by hand under the secondary spelling — the URL
+        # the operator actually cloned from — is keyed there, while the walk
+        # keys every directory on the primary. Comparing raw pairs read that
+        # disagreement as "untracked" and invited a second row for a
+        # directory that already had one, which is the defect the fold exists
+        # to close, reappearing one level up. A no-op in a legacy tree, and
+        # for every row whose key is already the primary.
+        # Read the registry ONCE for the whole listing: every row and every
+        # walked directory is folded, and re-parsing `_plexus.yaml` per fold
+        # meant twenty-odd reads of one unchanging file to answer one question.
+        registry = fold_registry(config)
+        tracked_keys = {
+            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
+            for e in list_tracked()
+        }
         return {
             "candidates": [
                 {
@@ -2205,7 +3650,11 @@ def create_app(
                     "project": ref.project,
                     "slug": ref.slug,
                     "rel_path": ref.rel_path,
-                    "tracked": (ref.host, ref.project, ref.slug) in tracked_keys,
+                    "tracked": folded_identity(
+                        config, ref.host, ref.project, registry=registry
+                    )
+                    + (ref.slug,)
+                    in tracked_keys,
                 }
                 for ref in run_dirs(config)
             ],
@@ -2236,6 +3685,14 @@ def create_app(
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        if removed:
+            # Its chat-thread connections go with it (issue #412): a crashed
+            # session's registry entry is kept on purpose as the crash signal, so
+            # the reconcile's prune would leave the records of a run this
+            # orchestrator has been told to forget.
+            _require_connectors().drop_run(
+                (body.get("host"), body.get("project"), body.get("slug"))
+            )
         return {"forgotten": removed}
 
     # --- what a run is about (T52) -------------------------------------------
@@ -2475,6 +3932,8 @@ def create_app(
         """
         try:
             request = AnswerRequest(
+                workspace_id=project_scope.current(), home_revision=body.get("home_revision"),
+                confirm_project=body.get("confirm_project") is True, slot=body.get("slot"),
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
@@ -2505,10 +3964,20 @@ def create_app(
         Keyed on the **run** and shaped like ``/api/runs/answer`` for the same
         reason: the session that stopped has exited (spec D15), so there is nothing
         to type into and continuing means spawning. The body is
-        ``/api/runs/adopt``'s plus the three things a caller may say about a resume
+        ``/api/runs/adopt``'s plus the four things a caller may say about a resume
         — ``taskdef`` (the override that starts a sibling run against the same
-        target), ``repo_url`` and ``direction``. All three are optional, and none is
-        coerced: a non-string keeps its own refusal instead of arriving as ``None``.
+        target), ``repo_url``, ``direction`` and ``session_id``. All four are
+        optional, and none is coerced: a non-string keeps its own refusal instead of
+        arriving as ``None``.
+
+        ``session_id`` names ONE launch of a slug that now groups several complete
+        records (spec D22), and it is the work repo's record dir rather than the
+        ``s-…`` session this route starts — two different namespaces, neither
+        derived from the other (:mod:`lmer_platform.resume`). Omitted means the
+        record the run resolves to, which is the newest launch and the one the
+        fleet view offers; an id naming none of them, or two, is refused as
+        ``session_not_found`` (409) carrying the list of launches there are, so a
+        client can turn it into a picker rather than into "cannot".
 
         **202, not 200**, exactly as the answer route is: when this returns a
         session has been started and nothing else has happened yet. The run claims
@@ -2530,12 +3999,18 @@ def create_app(
         """
         try:
             request = ResumeRequest(
+                workspace_id=project_scope.current(), home_revision=body.get("home_revision"),
+                confirm_project=body.get("confirm_project") is True, slot=body.get("slot"),
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
                 taskdef=body.get("taskdef"),
                 repo_url=body.get("repo_url"),
                 direction=body.get("direction"),
+                # Verbatim, like the three above: the resume path validates it as a
+                # path segment and imposes no grammar beyond that, because the
+                # ``--<name>`` half of a session dir has none (docs/SCHEMA.md).
+                session_id=body.get("session_id"),
             )
             result = resume_run(config, request)
         except ResumeError as exc:
@@ -2599,7 +4074,29 @@ def create_app(
         The same body start, stop and rotate answer with, so a client renders one
         shape however it arrived at it.
         """
+        if projects.enabled():
+            return projects.status(project_scope.current())
         return assistant.status().to_dict()
+
+    @app.get("/api/assistant/history/{session_id}", dependencies=guard)
+    def assistant_history_page(
+        session_id: str,
+        since: int = -40,
+        before: Optional[str] = Query(default=None, max_length=2048),
+        limit: int = Query(default=40, ge=1, le=transcripts.MAX_MESSAGE_LIMIT),
+        view: str = Query(default="conversation", pattern="^(conversation|transcript)$"),
+    ) -> dict:
+        """One bounded generation page, with an explicit link to its predecessor."""
+        from . import assistant_history
+
+        try:
+            if assistant.history_for(session_id) is None:
+                raise HTTPException(status_code=404, detail="This assistant generation is not recorded.")
+            return assistant_history.page(session_id, since=since, before=before, limit=limit, view=view)
+        except assistant_history.HistoryError as exc:
+            raise HTTPException(status_code=409 if before is not None else 404, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise HTTPException(status_code=503, detail=f"Assistant history is unavailable: {exc}") from exc
 
     @app.post("/api/assistant/start", dependencies=guard)
     def assistant_start(body: Optional[dict] = None) -> dict:
@@ -2633,12 +4130,22 @@ def create_app(
         branched on it would be reading the daemon's wiring out of an assistant's
         status.
 
-        ``model``/``harness``/``preset``/``agents`` are the per-call launch
+        ``model``/``harness``/``preset``/``agents``/``threads`` are the per-call launch
         overrides (issue #234), beating the standing chain the way an explicit
         override beats an export everywhere else in the config; omitted keys fall
         through to it (:func:`lmer_platform.assistant._launch_settings`).
         """
         payload = body or {}
+        if projects.enabled():
+            settings = _body_launch_settings(payload)
+            if settings:
+                project = projects.get(project_scope.current())
+                projects.update(project["id"], {"settings": {**project["settings"], **settings}})
+            if payload.get("handoff") is not None:
+                assistant.set_handoff(payload["handoff"])
+            projects.request_start(project_scope.current())
+            projects.reconcile(config)
+            return projects.status(project_scope.current())
         try:
             started = assistant.start(
                 config,
@@ -2679,6 +4186,10 @@ def create_app(
         # caller mistake and gets the module's refusal, instead of being quietly
         # recorded as an operator stop.
         reason = payload.get("reason", "operator")
+        if projects.enabled():
+            if payload.get("handoff") is not None:
+                assistant.set_handoff(payload["handoff"])
+            return projects.stop(project_scope.current())
         try:
             stopped = assistant.stop(reason=reason, handoff=payload.get("handoff"))
         except AssistantError as exc:
@@ -2710,6 +4221,9 @@ def create_app(
         """
         payload = body or {}
         try:
+            if projects.enabled():
+                return projects.rotate(project_scope.current(), config, handoff=payload.get("handoff"),
+                                       settings=_body_launch_settings(payload))
             rotated = assistant.rotate(
                 config,
                 handoff=payload.get("handoff"),
@@ -2779,24 +4293,10 @@ def create_app(
 
     @app.post("/api/assistant/instructions", dependencies=guard)
     def set_assistant_instructions(body: dict) -> dict:
-        """Replace the standing-orders document. The chat is the write path (T87).
+        """Replace the scoped document and return its bounded, scrubbed value.
 
-        Written by the assistant, in the operator's words, after it has confirmed
-        the wording back to them — the operator asked for exactly that instead of a
-        settings screen, so the UI shows this read-only and the conversation is the
-        only thing that edits it. Which makes the text agent-authored and therefore
-        untrusted twice over: it is scrubbed and bounded in
-        :func:`lmer_platform.assistant.set_instructions`, and the ``limit`` in the
-        reply is the number that will actually refuse it.
-
-        Whole-document, not a patch, and the reply is what was stored: an assistant
-        composing a rewrite has to re-read first, and being handed back the result
-        is what lets it check that the rule it just promised the operator is the one
-        in the file.
-
-        Recorded whether or not an assistant is running, like the handoff — a
-        preference stated to an incarnation that then dies is still the operator's
-        preference.
+        The operator can edit project settings or direct the assistant in chat.
+        Instructions persist even when the assistant is stopped.
         """
         try:
             # Uncoerced, as with the handoff: a non-string keeps the module's own
@@ -2805,6 +4305,41 @@ def create_app(
         except AssistantError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return _instructions_reply(state)
+
+    @app.post("/api/assistant/requests", dependencies=guard)
+    def assistant_request(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Admit an authenticated host listener event to the assistant inbox."""
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only a host listener may submit transport events")
+        try:
+            return mention_routing.receive(body, mention_settings)
+        except (ThreadError, AssistantError) as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.get("/api/assistant/requests", dependencies=guard)
+    def conversation_requests() -> dict:
+        return {"requests": project_requests.listing(project_scope.current())}
+
+    @app.post("/api/assistant/requests/{request_id}/reply", dependencies=guard)
+    def conversation_reply(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        try:
+            return project_requests.reply(request_id, body.get("text"), workspace_id=project_scope.current(),
+                                          session_id=caller.session_id)
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.post("/api/assistant/requests/{request_id}/park", dependencies=guard)
+    def conversation_park(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only an operator may park an uncertain reply")
+        return project_requests.park(request_id, body.get("reason"), workspace_id=project_scope.current())
+
+    @app.post("/api/assistant/requests/{request_id}/release", dependencies=guard)
+    def conversation_release(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Release a known blocked request without sending or repeating work."""
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only an operator may release a blocked request")
+        return project_requests.release(request_id, body.get("reason"), workspace_id=project_scope.current())
 
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:
@@ -2868,11 +4403,13 @@ def create_app(
         never an env-resolved value baked in where it would outlive the export
         (:func:`lmer_platform.config.update_stored`).
 
-        Keys are the four launch-setting names plus the integer settings
-        (``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
-        ``nudge_pending_threshold`` from #317), which are spelled as their config
+        Keys are the launch-setting names (including ``threads``) plus the integer settings
+        (pane-only ``chat_keep_last``, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
+        ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
+        #446) and the boolean ``chat_show_transcript`` (#488), which are spelled as their config
         fields because they are not launch flags and do not share their
-        short-name vocabulary. Omitted keys
+        short-name vocabulary. A boolean takes ``true``/``false`` (the JSON
+        values, or the two words as strings) and nothing looser. Omitted keys
         are left alone, so this is a patch of exactly what the caller named.
         ``null`` — and the emptied text field a browser sends as ``""`` — clears
         the key, letting the layer below show through. Anything else must be a
@@ -2886,8 +4423,20 @@ def create_app(
         one call away when the operator wants the new settings live. The integer
         settings need neither — the daemon's next tick reads them.
         """
-        accepted = sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS)
-        if not isinstance(body, dict) or not body:
+        if projects.enabled() and project_scope.current():
+            project = projects.get(project_scope.current())
+            settings = {**project["settings"], **{key: value for key, value in body.items()
+                                                 if key != "workspace_id"}}
+            projects.update(project["id"], {"settings": settings})
+            return _assistant_config_reply({"changed": sorted(settings)})
+        return _write_assistant_settings(body)
+
+    def _write_assistant_settings(body: dict, changes: Optional[dict] = None) -> dict:
+        changes = dict(changes or {})
+        accepted = (
+            sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS) + list(_BOOL_SETTING_KEYS)
+        )
+        if not isinstance(body, dict) or not (body or changes):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -2895,7 +4444,6 @@ def create_app(
                     f"{', '.join(accepted)}"
                 ),
             )
-        changes: dict = {}
         for key, value in body.items():
             if key in _INT_SETTING_KEYS:
                 if value is None or (isinstance(value, str) and not value.strip()):
@@ -2903,6 +4451,15 @@ def create_app(
                     continue
                 try:
                     changes[key] = validate_int_setting(key, value)
+                except ConfigError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                continue
+            if key in _BOOL_SETTING_KEYS:
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    changes[key] = None
+                    continue
+                try:
+                    changes[key] = validate_bool_setting(key, value)
                 except ConfigError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 continue
@@ -2933,7 +4490,261 @@ def create_app(
             update_stored(changes)
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
         return _assistant_config_reply({"changed": sorted(body)})
+
+    def _slot_refusal(exc: SlotWriteRefused) -> HTTPException:
+        """One refusal, in the shape ``web/src/api.js`` already unpacks.
+
+        A structured detail rather than a bare sentence because two of these are
+        things the view acts on rather than prints: a changed slot means reload
+        and re-edit, and an occupied one means offer the confirm. The prose is
+        still what gets shown.
+        """
+        return HTTPException(
+            status_code=exc.status,
+            detail=(
+                {"code": exc.code, "message": exc.message}
+                if exc.code else exc.message
+            ),
+        )
+
+    def _store_slots(mutate: Callable[[list], list]) -> list:
+        """Apply *mutate* to the slot list under the config write lock.
+
+        *mutate* is handed the entries as the file has them **now** and answers
+        the list to store; every precondition that compares against the current
+        file is checked in there, so a concurrent write — this daemon's or an
+        operator's editor — cannot slip between the check and the write
+        (:func:`lmer_platform.config.mutate_stored`).
+
+        Returns the entries as written.
+        """
+        try:
+            stored = mutate_stored(
+                lambda current: {"slots": mutate(_slot_entries(current))}
+            )
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+        return _slot_entries(stored)
+
+    def _write_slot(name: str, mutate: Callable[[list], list]) -> dict:
+        """:func:`_store_slots`, answering with the row *name* ended up with."""
+        try:
+            return _slot_row(config, _store_slots(mutate), name)
+        except SlotWriteRefused as exc:  # pragma: no cover - see _slot_row
+            raise _slot_refusal(exc) from exc
+
+    def _slot_preview(name: str, mutate: Callable[[list], list]) -> dict:
+        """The row *mutate* would produce, without writing (``dry_run``).
+
+        Every check the write runs, and nothing written — which is what makes
+        the form's verdict the row's verdict rather than a second opinion that
+        agrees today. That includes the reads: a preview against a
+        ``config.json`` nobody can read refuses in the same words the save
+        would, rather than describing a host it never saw.
+        """
+        try:
+            return _slot_row(config, mutate(_slot_entries()), name)
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+    @app.post("/api/slots", dependencies=guard)
+    def create_slot(body: dict, dry_run: bool = Query(default=False)):
+        """Declare a service slot (issue #256).
+
+        ``{"name": …, "preset": …, "description": …}``. The preset must be one
+        this host has: a slot is only a slot because its preset puts the session
+        into service mode, so a name nothing resolves declares something that
+        can never be used, and the row would say so after the save instead of
+        the form saying so before it.
+
+        ``?dry_run=true`` runs every check and writes nothing, answering with
+        the row the slot *would* have — the editor's live preview. The write
+        takes effect on the next fleet poll: ``slots`` is re-read per request
+        now, so nothing has to be restarted.
+        """
+        unknown = sorted(set(body) - set(SLOT_BODY_KEYS))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown slot field(s): {', '.join(unknown)} — a slot is "
+                    f"{', '.join(SLOT_BODY_KEYS)}"
+                ),
+            )
+        try:
+            name = _slot_text(body, "name")
+            preset = _slot_text(body, "preset")
+            if not name:
+                raise SlotWriteRefused(400, "a slot needs a name")
+            _addressable(name)
+            if not preset:
+                raise SlotWriteRefused(400, "a slot needs a preset")
+            entry = {"name": name, "preset": _checked_preset(preset)}
+            description = _slot_text(body, "description")
+            if description:
+                entry["description"] = description
+            if "applicable_projects" in body:
+                entry["applicable_projects"] = projects.validate_assignments(body["applicable_projects"])
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+        def mutate(entries: list) -> list:
+            if _slot_at(entries, name)[1] is not None:
+                raise SlotWriteRefused(
+                    409,
+                    f"this host already declares a service slot called "
+                    f"{name!r}",
+                    code="name_taken",
+                )
+            return entries + [entry]
+
+        if dry_run:
+            return _slot_preview(name, mutate)
+        # 201 for the write and 200 for the preview, which is why the code is set
+        # here rather than on the decorator: a dry run creates nothing.
+        return JSONResponse(_write_slot(name, mutate), status_code=201)
+
+    @app.put("/api/slots/{name}", dependencies=guard)
+    def update_slot(
+        name: str,
+        body: dict,
+        dry_run: bool = Query(default=False),
+        confirm: bool = Query(default=False),
+        if_match: Optional[str] = Header(default=None, alias="If-Match"),
+    ) -> dict:
+        """Change a slot's preset or description (issue #256).
+
+        A patch of what the body names, applied **onto the stored entry** rather
+        than replacing it: keys a newer build wrote survive, and so does the
+        entry's position, which decides who wins the one-service-one-slot rule.
+
+        ``If-Match`` carries the etag the row published. It is required, and a
+        mismatch is a 412 rather than a merge: the other writer is an operator
+        in an editor, and quietly winning the race is the failure this route
+        exists to avoid.
+
+        Changing the ``preset`` of a slot a live session holds re-binds what
+        that session is running against, so it is refused unless
+        ``?confirm=true``. An edit that leaves the binding where it is — a
+        description, or a preset re-sent unchanged — is not gated.
+        """
+        unknown = sorted(set(body) - set(SLOT_EDIT_KEYS))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown slot field(s): {', '.join(unknown)} — an edit may "
+                    f"change {', '.join(SLOT_EDIT_KEYS)}"
+                ),
+            )
+        if not body:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"name at least one of {', '.join(SLOT_EDIT_KEYS)} to change"
+                ),
+            )
+        try:
+            preset = None
+            if "preset" in body:
+                preset = _slot_text(body, "preset")
+                if not preset:
+                    raise SlotWriteRefused(400, "a slot needs a preset")
+                preset = _checked_preset(preset)
+            # Only an actual change of binding is gated. A body that re-sends
+            # the preset it already has is what the editor's live preview does
+            # on every keystroke, and refusing that would make an occupied slot
+            # impossible to even look at.
+            #
+            # A dry run is never gated: it writes nothing, so there is nothing
+            # to refuse — and refusing it hid the very verdict the operator
+            # needs in order to decide whether to confirm.
+            _index, current = _slot_at(_slot_entries(), name)
+            rebinding = (
+                preset is not None
+                and current is not None
+                and current.preset != preset
+            )
+            if rebinding and not confirm and not dry_run:
+                _refuse_if_occupied(config, name, "changing its preset")
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+        def mutate(entries: list) -> list:
+            _matched_etag(entries, name, if_match)
+            index, _definition = _slot_at(entries, name)
+            edited = dict(entries[index])
+            if "applicable_projects" in body:
+                edited["applicable_projects"] = projects.validate_assignments(body["applicable_projects"])
+            if preset is not None:
+                edited["preset"] = preset
+            if "description" in body:
+                description = _slot_text(body, "description")
+                if description:
+                    edited["description"] = description
+                else:
+                    edited.pop("description", None)
+            return entries[:index] + [edited] + entries[index + 1:]
+
+        if dry_run:
+            return _slot_preview(name, mutate)
+        return _write_slot(name, mutate)
+
+    @app.delete("/api/slots/{name}", dependencies=guard)
+    def delete_slot(
+        name: str,
+        confirm: bool = Query(default=False),
+        if_match: Optional[str] = Header(default=None, alias="If-Match"),
+    ) -> dict:
+        """Remove a slot (issue #256).
+
+        Refused while a live session holds it unless ``?confirm=true``: the
+        session keeps running either way — occupancy is derived from the
+        registry, not from this file — but the guarantee it was spawned under
+        stops being declared anywhere, and the next spawn against that dev
+        service has nothing to refuse it.
+
+        ``If-Match`` as on the edit, and for the same reason.
+
+        **Every** entry carrying the name goes, not just the one the row is.
+        ``parse_slots`` keeps the first usable entry for a name and skips the
+        rest, so a file with two ``web`` entries shows one row sitting on a
+        shadow — removing only the resolved index leaves the row on screen
+        backed by the next entry, and the button reads as broken. An *edit*
+        still lands on the resolved index alone (commit fe843af9): changing the
+        slot means changing the definition in effect, while removing it means
+        the name is gone.
+        """
+        removed: list = []
+
+        def mutate(entries: list) -> list:
+            _matched_etag(entries, name, if_match)
+            kept = []
+            for entry in entries:
+                if _entry_name(entry) == name:
+                    removed.append(entry)
+                else:
+                    kept.append(entry)
+            return kept
+
+        try:
+            if not confirm:
+                _refuse_if_occupied(config, name, "removing it")
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+        remaining = _store_slots(mutate)
+        return {
+            # The list, so a caller can see that a duplicate went with it.
+            "removed": removed,
+            "slots": len(remaining),
+        }
 
     @app.post("/api/prune", dependencies=guard)
     def prune() -> dict:

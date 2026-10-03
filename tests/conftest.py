@@ -6,11 +6,24 @@ import inspect
 import os
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 from unittest import mock
 import pytest
 
 from lmer_cli import gate_lock, precommit_cache, user_harnesses
+
+# The shared lmer-schema (plexus) fixture trees (issue #353) live in
+# tests/plexus_fixtures.py; re-exporting the fixtures here is what registers
+# them for every module. `pytest_plugins` is not an option in this conftest
+# (it is not the rootdir one), and the builder module deliberately imports
+# nothing from here, so this import cannot cycle. It is keyed on the sibling
+# file because TestLeakGuardEndToEnd (test_workrepo_isolation_guard.py) copies
+# this conftest verbatim into a pytester dir and needs it self-contained; in
+# the real tree a missing sibling still fails loud, as "fixture not found" in
+# every consumer.
+if Path(__file__).with_name("plexus_fixtures.py").is_file():
+    from tests.plexus_fixtures import legacy_plexus, schema_plexus  # noqa: F401
 
 _OUTDATED_TREE_MSG = (
     "tests/conftest.py needs the #233 write-attribution layer "
@@ -46,6 +59,9 @@ REQUIRE_NODE_ENV = "LMER_TESTS_REQUIRE_NODE"
 #: not arm the strict mode by accident.
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: Harness policy, preserved when tests strip session context from the environment.
+WAIT_SCALE_ENV = "LMER_TESTS_WAIT_SCALE"
+
 #: LMER_* vars :func:`strip_lmer_env` leaves alone: switches that tell the *test
 #: harness* how strict to be, which are not run context. Stripping one would let
 #: any module that isolates its environment silently disarm a guard.
@@ -60,6 +76,7 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: operational cache merely because this project is opted in.
 _HARNESS_ENV = frozenset({
     REQUIRE_NODE_ENV,
+    WAIT_SCALE_ENV,
     gate_lock.LOCK_DIR_ENV,
     precommit_cache.CACHE_DIR_ENV,
 })
@@ -81,6 +98,42 @@ def strip_lmer_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("LMER_") and key not in _HARNESS_ENV:
             monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture
+def routing_call(tmp_path, monkeypatch):
+    """A shell invocation's harness identity and isolated producer records."""
+    import json
+    import tempfile
+    from lmer_cli import routing_receipts
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("LMER_SESSION_ID", "routing-test-session")
+
+    def select(tool="call", session="claude-test"):
+        monkeypatch.setenv(routing_receipts.CONTEXT_ENV, json.dumps({"session": session, "tool": tool}))
+
+    select()
+    return select
+
+
+def drain_connectors(instances, budget, *, announce=True):
+    """Shared teardown for the connector suites' autouse lifetime fixtures.
+
+    Finalizers must finish before the caller's registry monkeypatches are
+    restored, or a late one writes into the operator's real registry (#461).
+    Only a drained connector is waited on: ``_threads`` also holds the
+    connect/inbound/outbound workers, so joining one that will not cancel
+    would hide the failed-drain assertion behind a hung suite (#471).
+    """
+    for built in instances:
+        drained = built.stop(timeout=budget, announce=announce)
+        if drained:
+            deadline = time.monotonic() + budget
+            for worker in built._threads:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        assert drained, "test connector did not drain"
 
 
 def node_is_expected():
@@ -769,6 +822,17 @@ def _isolate_user_harnesses(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _isolate_dm_registry(tmp_path_factory):
+    """Keep shared DM sends out of the operator's durable room registry."""
+    from lmer_cli import dm_parents
+
+    original = dm_parents.REGISTRY_DIR
+    dm_parents.REGISTRY_DIR = str(tmp_path_factory.mktemp("dm-registry"))
+    yield
+    dm_parents.REGISTRY_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _isolate_platform_state(tmp_path_factory):
     """Point platform state away from the real ~/.lmer/platform (issue #141).
 
@@ -1060,3 +1124,23 @@ def slot_host(tmp_path, monkeypatch):
     slots_mod.clear_probe_cache()
     yield calls
     slots_mod.clear_probe_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_comms_hub():
+    """Drop the process-wide comms hub between tests (issue #407).
+
+    ``lmer_platform.comms.ensure_hub`` registers a hub on first use, and its
+    journal path is resolved from the platform state dir at that moment — so a
+    hub left over from one test would journal a later test's traffic into the
+    earlier test's tmp dir. Cheap: a lazy import and a lock.
+    """
+    yield
+    try:
+        from lmer_platform import comms as platform_comms
+    except Exception:  # pragma: no cover - the package is always importable here
+        return
+    hub = platform_comms.get_hub()
+    if hub is not None:
+        hub.stop()
+    platform_comms.register_hub(None)

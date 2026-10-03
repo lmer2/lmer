@@ -290,6 +290,66 @@ section "🔗 Declared Sources"
 # container) — git receives it through ephemeral GIT_CONFIG_* env, the same
 # never-in-argv rule the clone cache follows.
 SOURCES_YAML="${LMER_WORK_REPO_PATH:-/work}/sources.yaml"
+PLEXUS_MANIFEST="${LMER_WORK_REPO_PATH:-/work}/_plexus.yaml"
+# --- Sources precedence (lmer schema spec §4) ---
+# env override > `_plexus.yaml sources:` > legacy standalone sources.yaml.
+# Resolution is per source: an env override covers its own key and the
+# file covers the rest (clone_and_exec resolution matrix). The manifest
+# tier is DECLARED-ONLY today — its loader is a spec §10 follow-up and
+# nothing consumes it yet — so doctor reports the rule and warns when the
+# legacy file is the tier in effect, but never claims the manifest is.
+# The env var names mirror lmer_cli.container.sources.SOURCE_ENV_OVERRIDES
+# (pinned by tests/test_doctor_sources.py). Only the NAMES are printed: an
+# override value can carry a credential and never reaches output.
+SOURCES_PRECEDENCE_RULE="env override > _plexus.yaml sources: > legacy sources.yaml"
+SOURCES_ENV_OVERRIDE_VARS="LMER_TASKDEF_REPO LMER_NAPKIN_REPO"
+SOURCES_ENV_IN_EFFECT=""
+for var in $SOURCES_ENV_OVERRIDE_VARS; do
+    if [[ -n "${!var:-}" ]]; then
+        SOURCES_ENV_IN_EFFECT="${SOURCES_ENV_IN_EFFECT:+$SOURCES_ENV_IN_EFFECT, }$var"
+    fi
+done
+if [[ -n "$SOURCES_ENV_IN_EFFECT" ]]; then
+    pass "env override tier in effect for: $SOURCES_ENV_IN_EFFECT (precedence: $SOURCES_PRECEDENCE_RULE)"
+fi
+# Manifest tier: same guarded-python3 + PyYAML approach as the taskdef
+# schema check below. Detection only — nothing is loaded from it.
+PLEXUS_SOURCES_STATE="absent"
+if [[ -f "$PLEXUS_MANIFEST" ]]; then
+    PLEXUS_SOURCES_STATE="$("${LMER_PYTHON:-python3}" -c '
+import sys
+try:
+    import yaml
+except Exception:
+    print("noyaml"); sys.exit(0)
+try:
+    with open(sys.argv[1]) as f:
+        data = yaml.safe_load(f)
+except Exception:
+    print("unreadable"); sys.exit(0)
+sources = data.get("sources") if isinstance(data, dict) else None
+print("declared" if isinstance(sources, dict) and sources else "none")
+' "$PLEXUS_MANIFEST" 2>/dev/null)" || true
+    [[ -n "$PLEXUS_SOURCES_STATE" ]] || PLEXUS_SOURCES_STATE="nopython"
+fi
+# Three "could not look" states are kept apart so the operator fixes the
+# right thing: the interpreter, its PyYAML, or the manifest. All are notes
+# only (detail, never warn/error): manifest shape is the validator's job,
+# not doctor's, and none of them changes the exit code.
+case "$PLEXUS_SOURCES_STATE" in
+    declared)
+        warn "$PLEXUS_MANIFEST declares a sources: section but this lmer does not load it yet (loader is a spec §10 follow-up) — declared-only, not loaded; keep the env override or legacy sources.yaml until the loader lands"
+        ;;
+    nopython)
+        detail "$PLEXUS_MANIFEST present but ${LMER_PYTHON:-python3} unavailable — sources: section unknown"
+        ;;
+    noyaml)
+        detail "$PLEXUS_MANIFEST present but PyYAML unavailable to ${LMER_PYTHON:-python3} — sources: section unknown (not a manifest problem)"
+        ;;
+    unreadable)
+        detail "$PLEXUS_MANIFEST present but not parseable here — sources: section unknown"
+        ;;
+esac
 # Renderer-supported taskdef schemas, captured from the helper's doctor
 # document (supported_taskdef_schemas) — never re-derived in shell. Filled
 # by the META record below; the taskdef schema check re-asks the helper if
@@ -302,6 +362,14 @@ if [[ ! -f "$SOURCES_YAML" ]]; then
         echo "  - no sources.yaml at $SOURCES_YAML — silent legacy mode, checks skipped"
     fi
 else
+    # The legacy standalone file is the tier in effect (for every source an
+    # env override does not cover). A warning, not an error: the file is
+    # recognized and honored; it retires when the tree migrates (spec §4).
+    LEGACY_TIER_SCOPE=""
+    if [[ -n "$SOURCES_ENV_IN_EFFECT" ]]; then
+        LEGACY_TIER_SCOPE=" for sources not overridden by env"
+    fi
+    warn "legacy sources.yaml tier in effect ($SOURCES_YAML)$LEGACY_TIER_SCOPE — precedence: $SOURCES_PRECEDENCE_RULE; the _plexus.yaml sources: tier is declared-only until its loader lands; the standalone file retires when the tree migrates"
     # One helper invocation. --path is passed explicitly even though the
     # helper's own default resolves to the same $LMER_WORK_REPO_PATH file:
     # the path checked above is the one reported in the messages below, and

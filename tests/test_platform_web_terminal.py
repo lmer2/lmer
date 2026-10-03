@@ -1808,6 +1808,32 @@ def _redrawn(cases):
     return json.loads(result.stdout)
 
 
+def test_control_failure_and_exit_preserve_the_emulators_width():
+    """Teardown status must leave the final transcript readable (#434)."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    handler = _function_body(_read(TERMINAL), "function handleStatus")
+    script = """
+const term = {rows: 24, cols: 100, options: {disableStdin: false}}
+const resizeSupported = {value: true}, resizeOptIn = {value: true}
+const phase = {value: 'live'}, notice = {value: ''}, problem = {value: ''}
+let finished = false
+""" + handler + """
+handleStatus({event: 'resize_failed', message: 'control plane unavailable'})
+const failed = {rows: term.rows, cols: term.cols, problem: problem.value}
+handleStatus({event: 'ended', message: 'session exited'})
+console.log(JSON.stringify({failed, rows: term.rows, cols: term.cols,
+  readOnly: term.options.disableStdin, phase: phase.value}))
+"""
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    actual = json.loads(result.stdout)
+    assert actual["failed"] == {"rows": 24, "cols": 100, "problem": "control plane unavailable"}
+    assert (actual["rows"], actual["cols"]) == (24, 100)
+    assert actual["readOnly"] and actual["phase"] == "history"
+
+
 def test_the_redraw_repairs_this_client_always_and_the_session_only_where_asked():
     """The two halves of one tap, and which of them is allowed to leave the browser.
 

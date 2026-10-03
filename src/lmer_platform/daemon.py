@@ -41,15 +41,30 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from typing import Optional
 
+from lmer_cli import comms as bus_comms
+from lmer_cli import runref
+from lmer_cli.tls import ensure_ca_bundle
+
 from .api import build_state, create_app
 from .assistant import Supervisor, register_supervisor
+from .comms import CommsHub, register_hub
+from .connectors import ThreadConnectors, register_connectors
+from .thread_service import ThreadServices, register_services
+from .config import (
+    connector_path,
+    list_connectors,
+    mint_connector_credential,
+    revoke_connector_credential,
+)
 from .config import (
     ConfigError, binding_notice, ensure_secret, load as load_config, read_secret,
 )
 from .detect import Detector
+from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import forget, list_tracked, run_key, track
@@ -59,7 +74,15 @@ from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
 )
-from .workrepo import mirror_status, pull, resolve_run_dir, run_dirs
+from .workrepo import (
+    fold_registry,
+    folded_identity,
+    mirror_status,
+    pull,
+    resolve_run_dir,
+    run_dirs,
+)
+from . import projects, assistant, detect, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -72,6 +95,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run and inspect the lmer orchestrator platform.",
     )
     sub = parser.add_subparsers(dest="command")
+    parser.add_argument("--workspace-id", default=os.environ.get("LMER_WORKSPACE_ID"),
+                        help="Named project identity for new work (distinct from repository).")
 
     def add_bind_flags(target: argparse.ArgumentParser) -> None:
         target.add_argument(
@@ -142,10 +167,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of host ports to publish for the session",
     )
 
+    connector = sub.add_parser(
+        "connector",
+        help="Mint, list or revoke a channel-bound connector credential (#407)",
+    )
+    connector_sub = connector.add_subparsers(dest="connector_action")
+    connector_add = connector_sub.add_parser("add", help="Mint a credential; prints it once")
+    connector_add.add_argument("name", help="Connector name, e.g. slack-bridge")
+    connector_add.add_argument(
+        "--channel", required=True,
+        help="The bus channel its posts are stamped with, e.g. slack",
+    )
+    connector_remove = connector_sub.add_parser("remove", help="Revoke a credential")
+    connector_remove.add_argument("name")
+    connector_sub.add_parser("list", help="Names and channels, never the values")
+    connector.set_defaults(connector_action="list")
+
     resume_cmd = sub.add_parser(
         "resume", help="Continue a tracked run by starting its next session"
     )
     resume_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    resume_cmd.add_argument("--slot")
+    resume_cmd.add_argument("--home-revision", type=int)
+    resume_cmd.add_argument("--confirm-project", action="store_true")
     resume_cmd.add_argument(
         "--taskdef",
         help="Run this taskdef against the run's target instead of the one it "
@@ -166,6 +210,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="What the next session should do — the run's seed direction. Required "
              "to reopen a run that is already complete or archived",
     )
+    # The API field is `session_id` and the flag is spelled --session because that
+    # is what the host CLI takes (`lmer --session`), which is where the value ends
+    # up. Without it a terminal resume gets whichever launch the picker resolves —
+    # the newest — so an operator continuing an older one had no way to say so.
+    resume_cmd.add_argument(
+        "--session", dest="session_id",
+        help="Which launch of the run's group to continue: a session dir's "
+             "<session-id>, or its full <session-id>--<name>. Omit it to continue "
+             "the newest launch, which is the ordinary one-tap case; an id that "
+             "names none of them is refused with the list of the ones there are, "
+             "never resolved to a neighbouring record",
+    )
 
     return parser
 
@@ -173,17 +229,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _split_run_ref(raw: str) -> tuple:
     """Parse ``<host>/<project>/<slug>`` where *project* may contain slashes.
 
-    Project paths are not a fixed number of segments (``group/project`` versus
-    ``group/subgroup/project``), so the split is first-segment host,
-    last-segment slug, everything between is the project.
+    The split is :func:`lmer_cli.runref.split`; what stays here is this command
+    line's own tolerance for what a human pastes at a shell. That normalisation
+    is deliberately not in the shared function: a splitter that repaired keys
+    would make two spellings resolve to one run everywhere rather than only
+    where somebody typed it.
     """
-    parts = [p for p in (raw or "").strip().strip("/").split("/") if p]
-    if len(parts) < 3:
+    parts = runref.split("/".join(
+        p for p in (raw or "").strip().strip("/").split("/") if p
+    ))
+    if parts is None:
         raise ConfigError(
             f"expected <host>/<project>/<slug>, got {raw!r} — the project may "
             "contain slashes, but host and slug are one segment each"
         )
-    return parts[0], "/".join(parts[1:-1]), parts[-1]
+    return parts
 
 
 def _overrides(args: argparse.Namespace) -> dict:
@@ -268,6 +328,11 @@ def _supervise_assistant(config) -> Supervisor:
     :func:`lmer_platform.assistant.register_supervisor` for why that is
     process-wide state rather than an argument to the app.
     """
+    if projects.enabled():
+        supervisor = projects.Supervisor(config)
+        print(supervisor.first_start(), flush=True)
+        supervisor.start()
+        return supervisor
     supervisor = Supervisor(config)
     print(supervisor.first_start().notice, flush=True)
     supervisor.start()
@@ -301,6 +366,10 @@ def _watch_for_attention(config) -> Detector:
 def _cmd_run(args: argparse.Namespace) -> int:
     import uvicorn
 
+    logging.basicConfig(level=logging.DEBUG if args.log_level == "trace" else args.log_level.upper(),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    ensure_ca_bundle()
+    ingress = Ingress()
     config = load_config(_overrides(args))
     secret = ensure_secret(config)
 
@@ -342,6 +411,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if notice:
         print(notice, flush=True)
 
+    projects.migrate()
+
     # After the re-attach and before the server, in that order for both halves:
     # a surviving assistant has to be re-attached first or this would see it as
     # unmarked and the ensure would race the marking, and an assistant that is up
@@ -353,8 +424,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # about correctness — it is that the assistant's own row is in the fleet view
     # the first tick baselines against, so its start is never itself an event.
     detector = _watch_for_attention(config)
+    hub = _subscribe_to_comms()
+    threads = _run_thread_connectors(config)
+    services = _serve_thread_requests()
 
-    app = create_app(config, secret)
+    app = create_app(config, secret, ingress=ingress)
     uvicorn.run(
         app,
         host=config.bind_address,
@@ -377,13 +451,154 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # detector sitting in its interval would otherwise keep fetching a mirror for
     # a daemon that has stopped.
     detector.stop()
+    hub.stop()
+    register_hub(None)
+    # Last, and after the hub: a connector still running would go on posting
+    # into a thread from a daemon that has stopped watching it, and the note it
+    # posts on the way out is the only thing that tells the thread so.
+    threads.stop()
+    register_connectors(None)
+    # The servicers hold nothing between requests, so this is only about not
+    # answering for a daemon that has stopped.
+    services.stop()
+    register_services(None)
+    return 0
+
+
+def _run_thread_connectors(config=None) -> ThreadConnectors:
+    """Start the chat-thread connectors: one process per (session, thread), and
+    the loop that keeps that set equal to the recorded connections (issue #412).
+
+    Published like the hub because the routes write the records this reconciles,
+    and started here because a daemon restart with connections recorded has to
+    reattach them — which is the same first pass as any other tick.
+    """
+    threads = ThreadConnectors(platform_config=config)
+    threads.start()
+    register_connectors(threads)
+    return threads
+
+
+def _serve_thread_requests() -> ThreadServices:
+    """Start the thread servicers: one per live session, so a session can read
+    and post threads it is not connected to (issue #414).
+
+    Published like the hub because the daemon's own ``/api/comms/thread`` routes
+    do the same work in the same process, and started here because a restart
+    with sessions already up has to pick them all back up — which is the same
+    first pass as any other tick.
+    """
+    services = ThreadServices()
+    services.start()
+    register_services(services)
+    return services
+
+
+def _subscribe_to_comms() -> CommsHub:
+    """Start the comms hub: one subscriber per session bus, one fleet journal
+    (issue #407). Published like the assistant supervisor so the API routes and
+    the detector can reach it; milestones it delivers are skipped by the ask-dir
+    reader, and everything else it sees is batched into the assistant's spool.
+    """
+    hub = CommsHub()
+    hub.add_consumer(_assistant_consumer(hub))
+    hub.start()
+    register_hub(hub)
+    return hub
+
+
+def _assistant_consumer(hub: CommsHub):
+    """Record milestones and spool worker and human records to the assistant."""
+    from .store import append_event
+
+    def consume(event) -> None:
+        message = event.message
+        source = message.get("source") or {}
+        meta = message.get("meta") or {}
+        own = source.get("channel") == "uber-lmer" or meta.get("session_origin") is True
+        if meta.get("notification_class") == "connector_health":
+            return
+        if message.get("kind") == "milestone":
+            run = event.run or {}
+            identity = None
+            if run.get("host") and run.get("project") and run.get("slug"):
+                identity = (run["host"], run["project"], run["slug"])
+            entry_id = _ask_dir_entry(message) or str(message.get("seq", "")).zfill(6)
+            signal = detect.SessionSignal(
+                session=event.session,
+                entry_id=entry_id,
+                seq=int(entry_id or 0),
+                text=str(message.get("text", "")),
+                at=str(message.get("at", "")),
+                host=identity[0] if identity else None,
+                project=identity[1] if identity else None,
+                slug=identity[2] if identity else None,
+            )
+            append_event(detect.SESSION_SIGNALLED, note=event.session, data=signal.event_data())
+            if not own and not projects.enabled():
+                assistant.notify(signal.digest, kind=detect.SIGNAL_DIGEST_KIND, data=signal.data())
+            try:
+                # Share the ask-directory mark to avoid duplicate history on recovery.
+                detect.record_ingested_signals([signal])
+            except Exception as exc:
+                logger.warning("platform_comms_mark_failed session=%s error=%s", event.session, exc)
+            return
+        if not own:
+            hub.queue_digest(event)
+
+    return consume
+
+
+def _ask_dir_entry(message: dict) -> Optional[str]:
+    """The ask-directory entry id a lifted record came from, if it was lifted.
+
+    ``lmer_cli.comms.AskDirProjection`` puts the file name in ``source.ref``;
+    that module owns the parser.
+    """
+    source = message.get("source")
+    ref = source.get("ref") if isinstance(source, dict) else None
+    return bus_comms.ask_dir_ref_stem(ref)
+
+
+def _cmd_connector(args: argparse.Namespace) -> int:
+    """Mint, list or revoke connector credentials (#407, spec decision 6)."""
+    action = args.connector_action
+    if action == "add":
+        credential = mint_connector_credential(args.name, args.channel)
+        print(credential)
+        print(
+            f"# connector {args.name!r} posts as channel {args.channel!r}; stored in "
+            f"{connector_path(args.name)} (mode 0600). Shown once — put it in the "
+            "connector's environment, e.g. LMER_PLATFORM_SECRET.",
+            file=sys.stderr,
+        )
+        return 0
+    if action == "remove":
+        removed = revoke_connector_credential(args.name)
+        print("revoked" if removed else "no such connector", file=sys.stderr)
+        return 0 if removed else 1
+    for item in list_connectors():
+        print(f"{item['name']}\t{item['channel']}")
     return 0
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:
     config = load_config()
     if args.candidates:
-        tracked_keys = {(e.host, e.project, e.slug) for e in list_tracked()}
+        # The CLI twin of `GET /api/runs/candidates`, and it has to make the
+        # SAME comparison: both sides folded to the project's primary remote
+        # (D8), from one registry read. Comparing raw pairs here while the HTTP
+        # route folded them let the two surfaces disagree about the same
+        # directory — the route saying `tracked`, this listing offering it for
+        # adoption — and adopting from this listing wrote the second row for a
+        # run the platform had already spawned, which is the defect the fold
+        # exists to close. A no-op in a legacy tree and for any row already
+        # keyed on the primary.
+        registry = fold_registry(config)
+        tracked_keys = {
+            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
+            for e in list_tracked()
+        }
         found = run_dirs(config)
         if not found:
             print("no runs found in the work-repo mirror "
@@ -392,7 +607,10 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"{len(found)} run(s) in the shared work repo "
               "— these are everyone's, not the fleet view:")
         for ref in found:
-            mark = "tracked" if (ref.host, ref.project, ref.slug) in tracked_keys else "-"
+            key = folded_identity(
+                config, ref.host, ref.project, registry=registry
+            ) + (ref.slug,)
+            mark = "tracked" if key in tracked_keys else "-"
             print(f"  [{mark:>7}] {ref.rel_path}")
         return 0
 
@@ -472,6 +690,10 @@ def _cmd_spawn(args: argparse.Namespace) -> int:
         return 2
 
     print(f"✅ spawned {result.session_id} (pid {result.pid})")
+    settings = result.launch_settings()
+    driver = " · ".join(value for value in settings.values() if value)
+    if driver:
+        print(f"   model / effort: {driver}")
     # The identity is the host and the project. The slug is derived from the
     # taskdef and the target, so it is *always* set (``run_state.derive_slug``
     # answers for any taskdef) — testing it here printed
@@ -520,6 +742,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         taskdef=args.taskdef,
         repo_url=args.repo_url,
         direction=args.direction,
+        session_id=args.session_id,
+        slot=getattr(args, "slot", None), home_revision=getattr(args, "home_revision", None),
+        confirm_project=getattr(args, "confirm_project", False),
     )
     try:
         result = resume_run(config, request)
@@ -578,6 +803,7 @@ _COMMANDS = {
     "forget": _cmd_forget,
     "spawn": _cmd_spawn,
     "resume": _cmd_resume,
+    "connector": _cmd_connector,
 }
 
 
@@ -594,8 +820,10 @@ def _load_env_files() -> None:
     inherit the result (they also load ``.env`` themselves, harmlessly).
     """
     from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
+    from lmer_cli.env_sources import remember_env_defaults
 
     loaded = apply_env_file_defaults(default_env_file_candidates())
+    remember_env_defaults(loaded)
     if loaded:
         logger.debug("platform_env_files_loaded vars=%d", len(loaded))
 
@@ -611,7 +839,13 @@ def main(argv: Optional[list] = None) -> int:
         command = "run"
 
     try:
-        return _COMMANDS[command](args)
+        if command in ("spawn", "adopt", "resume"):
+            projects.migrate()
+        with project_context.bound(args.workspace_id):
+            return _COMMANDS[command](args)
+    except projects.ProjectError as exc:
+        print(f"lmer platform: {exc}", file=sys.stderr)
+        return 2
     except (ConfigError, StoreError) as exc:
         print(f"lmer platform: {exc}", file=sys.stderr)
         return 2

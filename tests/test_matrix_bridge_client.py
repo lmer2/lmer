@@ -15,6 +15,7 @@ room, and nothing sent before there is a room to send it to.
 """
 
 import io
+import threading
 
 import pytest
 
@@ -297,6 +298,48 @@ async def test_the_created_room_id_lands_in_the_platform_config(
     stored = platform_config.load().matrix
     assert stored["room_id"] == ROOM
     assert stored["allow"] == STORED["allow"], "the rest of the section survived"
+
+
+def test_room_id_write_preserves_a_concurrent_matrix_edit(platform_root, monkeypatch):
+    path = platform_config.config_path()
+    platform_config.update_stored({"matrix": dict(STORED)})
+    original_read = platform_config.read_json
+    snapshot_read = threading.Event()
+    started = threading.Event()
+    errors = []
+
+    def observe_read(target):
+        value = original_read(target)
+        if target == path:
+            snapshot_read.set()
+        return value
+
+    def record_room():
+        started.set()
+        try:
+            mxclient._record_room_id(ROOM)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(platform_config, "read_json", observe_read)
+    worker = threading.Thread(target=record_room, daemon=True)
+    try:
+        with platform_config._STORED_LOCK:
+            worker.start()
+            assert started.wait(1)
+            snapshot_read.wait(0.2)
+            current = original_read(path)
+            current["matrix"]["allow"]["@new:matrix.example.net"] = ["read"]
+            store.write_json(path, current)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert not errors
+        saved = original_read(path)["matrix"]
+        assert saved["room_id"] == ROOM
+        assert saved["allow"]["@new:matrix.example.net"] == ["read"]
+    finally:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
 
 
 async def test_a_homeserver_that_returns_no_room_id_is_a_refusal(

@@ -200,7 +200,7 @@ __all__ = [
     "DEFAULT_LOG_LIMIT", "MAX_LOG_LIMIT", "DEFAULT_TAIL_BYTES",
     "POLL_INTERVAL_SECONDS", "TICKET_TTL_SECONDS", "MAX_LIVE_TICKETS",
     "CONTROL_TIMEOUT_SECONDS", "LOG_SOURCE_CONTAINER", "LOG_SOURCE_HOST",
-    "session_log_path", "container_log_path", "canonical_log", "named_log",
+    "session_log_path", "container_log_path", "canonical_log", "named_log", "quiet_health",
     "require_session", "session_is_live", "read_log",
     "read_log_at", "follow_log", "control_endpoint", "send_input", "apply_resize",
     "probe_health", "read_control_output", "session_activity",
@@ -448,7 +448,14 @@ class _ControlReply:
     def detail(self) -> str:
         """Upstream explanation, truncated — a 422's ``detail`` is a whole list."""
         detail = self.payload.get("detail")
-        return str(detail)[:_DETAIL_LIMIT] if detail else f"HTTP {self.status}"
+        text = str(detail)[:_DETAIL_LIMIT] if detail else f"HTTP {self.status}"
+        if self.status == 401:
+            text += (
+                "; the session image may predate digest credentials. "
+                "Roll the session image first, then the platform and host CLI, "
+                "and start a new session; also check that the control credential matches"
+            )
+        return text
 
 
 def _validated(session_id: str) -> str:
@@ -459,6 +466,14 @@ def _validated(session_id: str) -> str:
     the check is borrowed from the registry rather than written again here: two
     different notions of a legal session id is how ``..`` eventually gets past
     one of them.
+
+    The same id also names a DIRECTORY in a schema-form work repo —
+    ``_runs/<slug>/<session-id>[--<name>]/`` is one launch's whole record
+    (``docs/SCHEMA.md``, "Sessions and runs") — so the borrowed rule has to
+    admit every name that tree can carry: the ``LMER_SESSION_ID`` form and the
+    kebab-case ``--<name>`` the freeze rename appends both sit inside the
+    registry's charset, and nothing here was widened to let them in
+    (``tests/test_platform_session_io.py`` pins both directions).
     """
     try:
         registry.session_path(session_id)
@@ -574,6 +589,10 @@ def require_session(session_id: str) -> Optional[dict]:
         raise SessionNotFound(str(exc)) from exc
     if entry is not None:
         return entry
+    from . import assistant_history
+
+    if assistant_history.generation(session_id):
+        return None
     if session_log_path(session_id).exists() or container_log_path(session_id).exists():
         return None
     raise SessionNotFound(
@@ -919,35 +938,18 @@ def _record_attempt(
 def send_input(
     session_id: str, data: str, *, append_newline: bool = False,
     sanitize: bool = False, preserve_slash_commands: bool = False,
+    delivery_id: Optional[str] = None,
 ) -> dict:
-    """Type *data* into a running session. Returns the control plane's answer.
+    """Send input and return its receipt; failures are surfaced without payload logs.
 
-    Loud by design: everything that can go wrong raises. This is the path an
-    operator uses to answer a session that stopped to ask a question, and an
-    answer that quietly went nowhere leaves them believing the session was
-    unblocked while it sits there waiting.
+    ``append_newline`` requests submission; otherwise input is raw terminal data.
+    Codex submits through its native adapter, with ``delivery_id`` correlating
+    retries. Legacy PTY delivery cannot confirm native submission. See
+    docs/CODEX-DELIVERY.md for receipt states and recovery.
 
-    *append_newline* defaults off, matching the control plane it forwards to — a
-    caller that means "and press Enter" says so. The payload itself is never
-    logged: an answer routinely contains whatever the operator was asked for.
-
-    *sanitize* says the payload is prose intended to steer the session, from
-    either the chat composer or ``lmer-ctl send``. That lets the supervisor
-    defuse shapes a TUI reads as a command rather than as text
-    (``lmer_cli.supervisor._sanitize_user_chat``). Off by default and only put
-    on the wire when set: raw terminal keystrokes and injected lifecycle
-    commands send exactly the body they sent before the flag existed.
-
-    *preserve_slash_commands* narrows that transformation for an orchestration
-    caller whose leading slash is intentional. It has no effect unless
-    *sanitize* is also set; the supervisor remains the owner of the harness's
-    escape set and leaves only slash commands out of the prose guard.
-
-    The reply carries ``submit_confirmed`` and a ``note`` when Enter was asked
-    for, and both are passed to the caller rather than dropped: the supervisor
-    writes the CR to the PTY and cannot see whether the TUI registered it as a
-    submit, and "loud by design" has to include the part that is uncertain. See
-    ``lmer_cli.supervisor._SUBMIT_UNCONFIRMED_NOTE``.
+    ``sanitize`` enables the supervisor's prose guard for PTY delivery;
+    ``preserve_slash_commands`` keeps intentional orchestration slash commands.
+    Neither flag transforms structured Codex prose.
     """
     if not isinstance(data, str):
         raise SessionIOError(
@@ -963,6 +965,8 @@ def send_input(
     payload_bytes = data.encode("utf-8")
     sent_sha256 = hashlib.sha256(payload_bytes).hexdigest()
     body = {"data": data, "append_newline": bool(append_newline)}
+    if delivery_id is not None:
+        body["delivery_id"] = delivery_id
     if sanitize:
         body["sanitize"] = True
         if preserve_slash_commands:
@@ -1015,6 +1019,13 @@ def send_input(
     if not reply.ok:
         raise ControlPlaneError(
             f"session {session_id} refused the input ({reply.detail})"
+        )
+    if reply.payload.get("transport") == "codex-app-server" and reply.payload.get("state") in ("rejected", "uncertain"):
+        raise ControlPlaneError(
+            f"session {session_id} Codex delivery is {reply.payload['state']}: "
+            f"{reply.payload.get('error') or reply.payload.get('note')}. "
+            "Original input is retained; do not retype an unconfirmed submission.",
+            delivered=reply.payload["state"] == "uncertain",
         )
     receipt_sha256 = reply.payload.get("payload_sha256")
     if receipt_sha256 is not None and receipt_sha256 != sent_sha256:
@@ -1167,7 +1178,7 @@ def probe_health(session_id: str) -> dict:
     offset) and the PTY's ``rows``/``cols``. Both are why a re-attach probes at
     all rather than just opening ``/output``: the cursor is where a reader must
     start to avoid re-reading output the host log already holds, and a geometry
-    of ``0x0`` — which is what a session spawned with no host terminal reports —
+    of ``0x0`` — which older sessions spawned with no host terminal may report —
     is the signal that nothing has ever told this PTY how big it is.
     """
     endpoint = control_endpoint(session_id)
@@ -1180,7 +1191,7 @@ def probe_health(session_id: str) -> dict:
     return reply.payload
 
 
-def _quiet_health(session_id: str) -> Optional[dict]:
+def quiet_health(session_id: str) -> Optional[dict]:
     """One cheap health probe, or ``None`` for every way of not getting an answer.
 
     The shared half of :func:`session_activity` and :func:`control_plane_answers`:
@@ -1239,7 +1250,7 @@ def control_plane_answers(session_id: str) -> bool:
     and a gone one look identical), so callers must treat it as "no reader can be
     proved" rather than as "the container is gone".
     """
-    return _quiet_health(session_id) is not None
+    return quiet_health(session_id) is not None
 
 
 def session_activity(session_id: str) -> Optional[dict]:
@@ -1277,7 +1288,7 @@ def session_activity(session_id: str) -> Optional[dict]:
     tooltip and the loggable form of a measurement that ``idle_seconds`` *is*: a
     record with the timestamp and no number would have nothing to render.
     """
-    return _activity_of(_quiet_health(session_id))
+    return _activity_of(quiet_health(session_id))
 
 
 def _activity_of(payload: Optional[dict]) -> Optional[dict]:
@@ -1324,7 +1335,7 @@ def session_output_state(session_id: str) -> Optional[dict]:
     Only ``False`` is a fact a caller may act on; ``None`` keeps whatever the
     caller does with "not knowable".
     """
-    payload = _quiet_health(session_id)
+    payload = quiet_health(session_id)
     if payload is None:
         return None
     cursor = payload.get("cursor")
@@ -1430,17 +1441,17 @@ class TicketStore:
         self.ttl = TICKET_TTL_SECONDS if ttl is None else ttl
         self._capacity = capacity
         self._lock = threading.Lock()
-        self._issued: dict[str, tuple[str, float]] = {}
+        self._issued: dict[str, tuple[str, float, dict]] = {}
 
     @staticmethod
     def _digest(raw: str) -> str:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _sweep(self, now: float) -> None:
-        for digest in [d for d, (_, exp) in self._issued.items() if exp <= now]:
+        for digest in [d for d, (_, exp, _) in self._issued.items() if exp <= now]:
             del self._issued[digest]
 
-    def mint(self, session_id: str) -> str:
+    def mint(self, session_id: str, *, binding: Optional[dict] = None) -> str:
         """Issue a ticket for *session_id*.
 
         Swept on the way in rather than on a timer: the only moment the store can
@@ -1458,7 +1469,7 @@ class TicketStore:
                     "platform_tty_ticket_evicted capacity=%d — a client is "
                     "minting tickets it never redeems", self._capacity,
                 )
-            self._issued[self._digest(raw)] = (session_id, now + self.ttl)
+            self._issued[self._digest(raw)] = (session_id, now + self.ttl, dict(binding or {}))
         return raw
 
     def redeem(self, raw: str, session_id: str) -> bool:
@@ -1469,13 +1480,17 @@ class TicketStore:
         those answers differ exactly by information about sessions it has not
         proved it may see.
         """
+        return self.consume(raw, session_id) is not None
+
+    def consume(self, raw: str, session_id: str) -> Optional[dict]:
+        """Consume a valid ticket and return its captured authority."""
         if not raw:
-            return False
+            return None
         now = time.monotonic()
         with self._lock:
             self._sweep(now)
             issued = self._issued.pop(self._digest(raw), None)
-        return issued is not None and issued[0] == session_id
+        return issued[2] if issued is not None and issued[0] == session_id else None
 
     def live_count(self) -> int:
         """Unredeemed, unexpired tickets — for tests and for a health readout."""

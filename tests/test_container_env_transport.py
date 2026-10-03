@@ -892,7 +892,15 @@ class TestSpawnCommandCarriesNoValues:
         assert rc == 0
         assert captured["file"] is not None, "no --env-file was passed"
         assert f"LMER_WORK_REPO={_SENTINEL_WORK_REPO}\n" in captured["file"]
-        assert f"LMER_FASTAPI_TOKEN={_SENTINEL_FASTAPI}\n" in captured["file"]
+        # The control-plane token is the one value that deliberately does NOT
+        # cross (issue #407): the container gets its digest, because anything
+        # running in there can read the container's initial environment and the
+        # credential is what says who a record came from.
+        import hashlib
+
+        digest = hashlib.sha256(_SENTINEL_FASTAPI.encode("utf-8")).hexdigest()
+        assert f"LMER_FASTAPI_TOKEN_SHA256={digest}\n" in captured["file"]
+        assert _SENTINEL_FASTAPI not in captured["file"]
 
     def test_every_transport_emitted_e_flag_carries_a_bare_name(self, tmp_path):
         """The structural invariant, scoped to what this MR controls.

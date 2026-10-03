@@ -34,6 +34,8 @@ import pytest
 
 from slack_chat.permalink import is_slack_thread_url
 
+from tests.timing_budgets import XDIST_GROUP
+
 from lmer_cli import targets as targets_mod
 from lmer_cli.targets import (
     SlackThreadTargets,
@@ -350,11 +352,15 @@ class TestTargetHandlerContract:
                 assert env[key] is None
 
     def test_special_target_env_fills_slack_context(self):
-        """An active Slack handler contributes token + parsed thread context."""
+        """An active Slack handler contributes the parsed thread context and
+        the chat-channel marker — and since #407 keeps the token out: the
+        connector on the host holds it, and a None seed is what blocks a .env
+        file from forwarding it."""
         with patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-test"}):
             _, handlers = partition_targets([SLACK_URL])
             env = special_target_env(handlers)
-        assert env["SLACK_BOT_TOKEN"] == "xoxb-test"
+        assert env["SLACK_BOT_TOKEN"] is None
+        assert env["LMER_CHAT_CHANNEL"] == "slack"
         assert env["LMER_SLACK_CHANNEL"] == "C0123ABCDEF"
         assert env["LMER_SLACK_THREAD_TS"] == "1700000000.123456"
         assert env["LMER_SLACK_PERMALINK"] == SLACK_URL
@@ -408,7 +414,9 @@ _EXPECTED_CHANNEL = "C0123ABCDEF"
 _EXPECTED_THREAD_TS = "1700000000.123456"
 
 
-def _make_main_mocks(captured_env: dict | None = None):
+def _make_main_mocks(
+    captured_env: dict | None = None, *, registry_dir=None, runtime_rc=0
+):
     """Return a context-manager stack of patches sufficient to let main() run
     without a real container runtime.  Patches are applied in the caller via
     ``unittest.mock.patch`` calls so the test controls what is returned.
@@ -428,7 +436,7 @@ def _make_main_mocks(captured_env: dict | None = None):
     # --- session registry: point it at a throwaway dir so the on_session_start
     # / on_session_end hooks (issue #74) that fire on the real claude-runner
     # launch path never write to the host's ~/.lmer/slack-sessions during tests.
-    _tmp_registry = stack.enter_context(tempfile.TemporaryDirectory())
+    _tmp_registry = registry_dir or stack.enter_context(tempfile.TemporaryDirectory())
     stack.enter_context(
         patch.object(_slack_registry, "REGISTRY_DIR", _tmp_registry)
     )
@@ -526,7 +534,7 @@ def _make_main_mocks(captured_env: dict | None = None):
 
     # --- subprocess.call: prevent actually launching a container ---
     stack.enter_context(
-        patch("lmer_cli.cli.subprocess.call", return_value=0)
+        patch("lmer_cli.cli.subprocess.call", return_value=runtime_rc)
     )
 
     return stack
@@ -611,10 +619,15 @@ class TestSlackCredentialFastFail:
 
 
 class TestSlackTokenContainerEnv:
-    """Case (b): SLACK_BOT_TOKEN flows into container env dict."""
+    """Case (b), inverted by #407: the Slack tokens stay on the host.
 
-    def test_bot_token_in_container_env(self):
-        """SLACK_BOT_TOKEN from host env must appear in the container env dict."""
+    The connector that carries the thread runs in the host ``lmer`` process
+    (:mod:`slack_chat.connector`), so the container needs no Slack credential;
+    both tokens are seeded ``None`` so a ``.env`` file cannot forward them
+    either. The thread context and the chat-channel marker still travel.
+    """
+
+    def test_bot_token_stays_out_of_the_container_env(self):
         env_in = {**_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token"}
         captured = {}
         with patch.dict(os.environ, env_in, clear=True):
@@ -623,15 +636,21 @@ class TestSlackTokenContainerEnv:
 
                 main(["--no-task", "--exec", "true", _SLACK_URL])
 
-        assert "SLACK_BOT_TOKEN" in captured, (
-            "SLACK_BOT_TOKEN must be forwarded into the container env dict "
-            f"when set; container env keys: {sorted(captured.keys())}"
+        assert captured.get("SLACK_BOT_TOKEN") is None, (
+            "the Slack bot token reached the container env — the connector on "
+            "the host is its only holder since #407"
         )
-        assert captured["SLACK_BOT_TOKEN"] == "xoxb-test-bot-token"
+        assert captured["LMER_CHAT_CHANNEL"] == "slack"
+        assert captured["LMER_SLACK_CHANNEL"]
+        # A chat-thread target implies the control plane, with a host-minted
+        # token. Only its digest crosses: the harness can read the container's
+        # initial environment, and the control credential is what stamps a
+        # record's channel (#407 §3.2).
+        assert captured["LMER_FASTAPI"] == "1"
+        assert captured.get("LMER_FASTAPI_TOKEN") is None
+        assert len(captured["LMER_FASTAPI_TOKEN_SHA256"]) == 64
 
-    def test_app_token_in_container_env_when_set(self):
-        """SLACK_APP_TOKEN from host env must appear in the container env dict
-        when it is set."""
+    def test_app_token_stays_out_of_the_container_env_too(self):
         env_in = {
             **_BASE_ENV,
             "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
@@ -644,11 +663,7 @@ class TestSlackTokenContainerEnv:
 
                 main(["--no-task", "--exec", "true", _SLACK_URL])
 
-        assert "SLACK_APP_TOKEN" in captured, (
-            "SLACK_APP_TOKEN must be forwarded into container env when set; "
-            f"container env keys: {sorted(captured.keys())}"
-        )
-        assert captured["SLACK_APP_TOKEN"] == "xapp-test-app-token"
+        assert captured.get("SLACK_APP_TOKEN") is None
 
     def test_absence_of_app_token_is_not_fatal(self, capsys):
         """main() must succeed (rc == 0) when SLACK_BOT_TOKEN is set but
@@ -824,14 +839,20 @@ class TestSlackTokenRedaction:
 # ---------------------------------------------------------------------------
 
 
-def _run_main_repoless(argv, captured_env=None, resolve_fails=True):
+def _run_main_repoless(
+    argv, captured_env=None, resolve_fails=True, runtime_rc=0, extra_env=None
+):
     """Run main() with the standard mock stack; optionally make repo
     resolution raise ResolveError (simulating a non-git cwd)."""
     from lmer_cli import resolve as resolve_mod
 
-    env_in = {**_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token"}
+    env_in = {
+        **_BASE_ENV,
+        "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
+        **(extra_env or {}),
+    }
     with patch.dict(os.environ, env_in, clear=True):
-        with _make_main_mocks(captured_env=captured_env):
+        with _make_main_mocks(captured_env=captured_env, runtime_rc=runtime_rc):
             ctx = (
                 patch(
                     "lmer_cli.cli.resolve.normalize_repo_url",
@@ -847,6 +868,43 @@ def _run_main_repoless(argv, captured_env=None, resolve_fails=True):
                 from lmer_cli.cli import main
 
                 return main(argv)
+
+
+class TestGpuLaunchWiring:
+    """The effective grant controls both the marker and runtime-failure posture."""
+
+    def test_granted_value_is_forwarded_as_the_container_marker(self):
+        from lmer_cli.runtime import GPUGrant
+
+        captured: dict = {}
+        grant = GPUGrant("0,1", "LMER_GPU", ("--device", "nvidia.com/gpu=0"))
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=grant):
+            assert _run_main_repoless(["chat", _SLACK_URL], captured_env=captured) == 0
+        assert captured["LMER_GPU_GRANTED"] == "0,1"
+
+    def test_disabled_plan_blocks_an_ambient_marker(self):
+        from lmer_cli.runtime import GPUGrant
+
+        captured: dict = {}
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=GPUGrant(None, "default")):
+            assert _run_main_repoless(
+                ["chat", _SLACK_URL],
+                captured_env=captured,
+                extra_env={"LMER_GPU_GRANTED": "all"},
+            ) == 0
+        assert captured["LMER_GPU_GRANTED"] is None
+
+    def test_runtime_start_rejection_is_not_retried_without_gpu(self, capsys):
+        from lmer_cli.runtime import GPUGrant
+
+        grant = GPUGrant("all", "LMER_GPU", ("--device", "nvidia.com/gpu=all"))
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=grant):
+            rc = _run_main_repoless(["chat", _SLACK_URL], runtime_rc=125)
+        assert rc == 125
+        out = capsys.readouterr().out
+        assert "will not retry without the requested GPU" in out
+        assert "NVIDIA driver and Container Toolkit" in out
+        assert "CDI specification" in out
 
 
 class TestSlackOnlyNoRepo:
@@ -1036,8 +1094,8 @@ class TestSlackSessionRegistration:
                     else nullcontext()
                 )
                 with resolve_ctx, mpatch(
-                    "lmer_cli.targets.register", reg
-                ), mpatch("lmer_cli.targets.deregister", dereg):
+                    "lmer_cli.targets.ConnectorProcess.start", lambda owner: reg(owner.key.conversation, owner.key.root)
+                ), mpatch("lmer_cli.targets.ConnectorProcess.stop", lambda owner: dereg(owner.key.conversation, owner.key.root)):
                     from lmer_cli.cli import main
 
                     return main(argv)
@@ -1084,3 +1142,95 @@ class TestSlackSessionRegistration:
         assert rc == 0
         reg.assert_not_called()
         dereg.assert_not_called()
+
+
+@pytest.mark.xdist_group(XDIST_GROUP)
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+@pytest.mark.parametrize("supplied_control", [False, True])
+@pytest.mark.parametrize("session_kind", ["worker", "assistant"])
+def test_chat_launch_starts_connector_with_digest_only_container(
+    tmp_path, monkeypatch, channel, supplied_control, session_kind,
+):
+    """Real CLI → target → connector → HTTP bus, starting the bus at launch."""
+    import json
+    import time
+    from types import SimpleNamespace
+    from lmer_cli import cli, supervisor, connector_process, thread_access
+    from lmer_cli.connector_ownership import ThreadKey
+    from lmer_cli.threads import parse_thread
+    from tests.connector_fakes import ChildHarness
+    from tests.timing_budgets import JOIN, LINK
+    from tests.test_connector_process import wait_for
+    from tests.test_platform_thread_connectors import FakeSlack, FakeMatrix
+    from ask_channel.bus import BusClient, Endpoint
+
+    target = SLACK_URL if channel == "slack" else "https://matrix.to/#/!room:example.org/$root_event_id"
+    ref = parse_thread(target)
+    holder = SimpleNamespace(endpoint=Endpoint("http://not-started", "placeholder"))
+    harness = ChildHarness(tmp_path / "connector-child", channel, holder)
+    harness.key = ThreadKey(channel, *ref.registry_key())
+    harness.link = target
+    original_init = connector_process.ConnectorProcess.__init__
+    owners = []
+    def construct(owner, *args, **kwargs):
+        kwargs["runner"] = harness.runner
+        original_init(owner, *args, **kwargs)
+        owners.append(owner)
+    monkeypatch.setattr(connector_process.ConnectorProcess, "__init__", construct)
+    monkeypatch.setattr(thread_access, "_slack_client", lambda *args: FakeSlack())
+    monkeypatch.setattr(thread_access, "_matrix_client", lambda *args: FakeMatrix())
+    monkeypatch.setattr(cli, "lmer_state_dir", lambda: tmp_path / "lmer-state")
+    captured = {}
+    env_in = {**_BASE_ENV, **{key: value for key, value in harness.environment().items()
+                            if key.startswith(("CONNECTOR_FIXTURE_", "LMER_MATRIX_", "LMER_CHAT_ATTACH_"))
+                            or key in {"SLACK_BOT_TOKEN", "LMER_COMMS_CONNECT_BUDGET", "LMER_SLACK_POLL_SECONDS"}},
+              "LMER_SESSION_KIND": session_kind}
+    env_in.pop("LMER_SUPERVISOR_URL", None)
+    env_in.pop("LMER_FASTAPI_TOKEN", None)
+    if supplied_control:
+        env_in["LMER_FASTAPI_TOKEN"] = "host-control-fixture"
+    log = None
+    servers = []
+    def launch(*args, **kwargs):
+        nonlocal log
+        assert captured["LMER_SESSION_KIND"] == session_kind
+        log = supervisor._open_comms_log(str(tmp_path), captured)
+        assert captured["LMER_FASTAPI_TOKEN"] is None
+        assert captured["SLACK_BOT_TOKEN"] is None
+        assert captured["LMER_MATRIX_ACCESS_TOKEN"] is None
+        app = supervisor._build_fastapi_app(
+            supervisor.OutputBuffer(), len, "", comms=log,
+            agent_token="agent-fixture", token_hash=captured["LMER_FASTAPI_TOKEN_SHA256"],
+        )
+        servers.append(supervisor._start_fastapi_server(app, "127.0.0.1", int(captured["LMER_FASTAPI_PORT"])))
+        client = BusClient(Endpoint(f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", "agent-fixture"))
+        assert client.wait_ready(budget=LINK, interval=.01)
+        outgoing = client.post("message", "outbound seam")["message"]
+        assert outgoing["source"]["channel"] == ("uber-lmer" if session_kind == "assistant" else "agent")
+        wait_for(lambda: any("outbound seam" in item["text"] for item in harness.events()), harness)
+        wait_for(lambda: any(item.text.startswith("[replay notice]") for item in log.read_since(0)[0]), harness)
+        with (harness.root / "events.jsonl").open("a") as stream:
+            stream.write(json.dumps({"ref": f"{time.time():.6f}" if channel == "slack" else "$human-live",
+                                     "sender": "U1" if channel == "slack" else "@operator:example.org",
+                                     "text": "inbound seam"}) + "\n")
+        wait_for(lambda: any(item.text == "inbound seam" for item in log.read_since(0)[0]), harness)
+        record = next(item for item in log.read_since(0)[0] if item.text == "inbound seam")
+        assert record.source.channel == channel
+        return 0
+    try:
+        with patch.dict(os.environ, env_in, clear=True), _make_main_mocks(
+            captured, registry_dir=str(tmp_path / "claims"),
+        ):
+            with patch("lmer_cli.cli.subprocess.call", side_effect=launch):
+                assert cli.main(["chat", target]) == 0
+    finally:
+        for owner in owners:
+            owner.stop()
+        harness.close()
+        for thread, shutdown in servers:
+            shutdown()
+            thread.join(timeout=JOIN)
+            assert not thread.is_alive()
+        if log is not None:
+            log.close()
+    assert all(child.returncode is not None for child in harness.children)

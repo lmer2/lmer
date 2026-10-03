@@ -142,6 +142,11 @@ path, and forcing here would turn every tick into a ``git fetch`` and make the
 ``work_repo_pull_interval`` throttle mean nothing. Detection is therefore never
 more expensive than the browser sitting on the same page.
 
+There is one exception: a signal whose content is an assertion about the mirror
+(:data:`ABSENCE_KINDS`) is re-read against a caught-up one before it is
+delivered. See :meth:`Detector._confirmed`, and docs/PLATFORM-QUICKSTART.md,
+"Confirming a crash", for what that costs.
+
 :data:`DETECT_INTERVAL_SECONDS` matches :data:`lmer_platform.config
 .DEFAULT_PULL_INTERVAL_SECONDS`, so on a default host a tick lands roughly in
 step with the fastest the mirror can move. It is a constant rather than a read of
@@ -182,10 +187,17 @@ read in two places that behave differently:
   run key to its live replacement and turns into a second row and a permanent badge
   for a session that finished normally.
 
-The sweep removes such an entry in exactly the case where the run's own record says
-the work finished, so neither of those outlives the run, and :func:`_derive`'s rule
-is not touched. An entry whose run state is *not* terminal stays exactly where it
+The sweep removes such an entry when the run's own record says the work
+finished, so neither of those outlives the run and :func:`_derive`'s rule is not
+touched. It removes one more: an entry the operator asked to wind down that no
+watcher saw fail (:func:`_ended_as_asked`), which the fleet now calls ``dormant``
+rather than ``crashed`` and which the UI's clear-crashed card therefore no longer
+offers to remove. Both conditions read the same facts as the label, so the sweep
+can never clear a row the fleet still calls crashed. Anything else stays where it
 is: that shape is a real crash and the entry is its only evidence.
+
+Only the first of the two takes the transcript scrub with it — see
+:func:`_reconcile`.
 
 It also finishes the cleanup ``_watch`` would have done on the way out, which for
 these sessions has never happened at all: the control token goes with the entry
@@ -295,6 +307,8 @@ Two consequences worth stating, because both are ways this goes wrong quietly:
 from __future__ import annotations
 
 import logging
+import hashlib
+import uuid
 import threading
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -302,12 +316,18 @@ from typing import Optional
 from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
-from . import ask, assistant, checkin, nudge, registry, transcripts
+from lmer_cli import runref
+
+from . import (
+    ask, assistant, checkin, nudge, registry, rotation, teardown, transcripts,
+)
 from .api import build_state
 from . import config as config_module
-from .config import PlatformConfig, checkin_settings, nudge_settings
-from .session_io import SessionIOError, send_input, session_output_state
-from .inventory import _TERMINAL_STATUSES
+from .config import (
+    PlatformConfig, checkin_settings, nudge_settings, rotation_settings,
+)
+from .session_io import SessionIOError, send_input, session_output_state, quiet_health
+from .inventory import _TERMINAL_STATUSES, _observed_bad_exit, _was_wound_down
 from .spawn import ports_file_for
 from .store import (
     StoreError,
@@ -322,6 +342,7 @@ from .store import (
 )
 from .transcripts import _scrub
 from .workrepo import resolve_run_dir
+from . import project_context, projects
 
 logger = logging.getLogger("lmer_platform.detect")
 
@@ -359,9 +380,13 @@ _UNIDENTIFIED = "—"
 #: every existing consumer of ``session_exited`` exactly as correct as it was: this
 #: is not one of those events, and it does not arrive as one.
 #:
-#: What its ``data`` says instead: the session, the run key, the committed status
-#: that authorised the removal, and ``exit_code: null`` — explicitly unknown, since
-#: the ending itself is evidence-based rather than observed.
+#: What its ``data`` says instead: the session, the run key, the run's committed
+#: status *at the time of the sweep*, and ``exit_code: null`` — explicitly unknown,
+#: since the ending itself is evidence-based rather than observed.
+#:
+#: ``run_status`` is a reading and not an authorisation: :func:`_ended_as_asked`
+#: fires precisely when the status is *not* terminal, and what authorised the
+#: removal is then on the entry instead.
 SESSION_ENDED_UNWATCHED = "session_ended_unwatched"
 
 #: Event type for a milestone a session signalled (T122). The platform's own
@@ -424,12 +449,35 @@ MAX_SEND_ERROR_CHARS = 500
 #: the same history that records a wind-down.
 ASSISTANT_NUDGED = "assistant_nudged"
 
+#: What the platform records when it has recommended a rotation to the
+#: assistant (issue #446). An event for :data:`ASSISTANT_NUDGED`'s reason —
+#: the platform typed into a session unasked — and the only durable trace of
+#: why an incarnation ended, since the rotation that follows is the
+#: assistant's own decision and records nothing about what prompted it.
+ASSISTANT_ROTATION_RECOMMENDED = "assistant_rotation_recommended"
+
+#: What the platform records when the threshold is set and the assistant's
+#: harness publishes no context figure to compare it against (issue #446).
+#: Once per incarnation: an operator who set a threshold and hears nothing
+#: has no other way to tell a quiet window from a reading that never arrives.
+ASSISTANT_ROTATION_UNREADABLE = "assistant_rotation_unreadable"
+
 #: Run states whose *arrival* is material even though nothing needs a human.
 #: ``complete`` only: §8.3's "a task finished", read off the state axis because a
 #: finished run deliberately carries no attention record. Names from
 #: :data:`lmer_platform.inventory.RUN_STATES`; adding ``failed`` here would
 #: duplicate the ``critical_error`` attention reason that already covers it.
 MATERIAL_STATES = ("complete",)
+
+#: Signal kinds whose claim is an **absence** in the work-repo mirror, and which
+#: are therefore re-read against a caught-up mirror before they are delivered.
+#: See :meth:`Detector._confirmed`.
+ABSENCE_KINDS = ("crashed",)
+
+#: What an absorbed failure cost, for the stages that simply do not run. Named
+#: because one stage's failure costs something else — see
+#: :meth:`Detector._absorb`.
+_TICK_SKIPPED = "this tick is skipped and detection keeps going"
 
 
 def _text(value: object) -> Optional[str]:
@@ -468,9 +516,9 @@ class Signal:
     what gets said about it once it turns out to be new.
     """
 
-    host: str
-    project: str
-    slug: str
+    host: Optional[str]
+    project: Optional[str]
+    slug: Optional[str]
     #: An attention reason from :data:`lmer_platform.inventory.ATTENTION_REASONS`,
     #: or a state from :data:`MATERIAL_STATES`. Not an enum here on purpose — the
     #: vocabulary belongs to :mod:`lmer_platform.inventory`, and a copy of it
@@ -480,11 +528,14 @@ class Signal:
     since: Optional[str] = None
     label: Optional[str] = None
     state: Optional[str] = None
+    session: Optional[str] = None
 
     @property
     def ref(self) -> str:
         """``<host>/<project>/<slug>`` — the identity every run route takes."""
-        return f"{self.host}/{self.project}/{self.slug}"
+        if self.kind == "stuck_teardown" and self.session:
+            return f"session {self.session}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @property
     def key(self) -> tuple:
@@ -500,6 +551,8 @@ class Signal:
         is what ``/api/runs/answer`` and ``/api/runs/resume`` take. The label is
         on :meth:`data` for when it wants to speak about the run instead.
         """
+        if self.kind == "stuck_teardown" and self.note:
+            return _clamp(self.note, assistant.MAX_NOTE_CHARS)
         if self.kind in MATERIAL_STATES:
             text = f"{self.ref} is now {self.kind}"
         else:
@@ -533,7 +586,7 @@ class Signal:
 
     def data(self) -> dict:
         """The structured half of the digest: enough to act without a fleet read."""
-        return {
+        data = {
             "host": self.host,
             "project": self.project,
             "slug": self.slug,
@@ -542,6 +595,9 @@ class Signal:
             "state": self.state,
             "since": self.since,
         }
+        if self.session:
+            data["session"] = self.session
+        return data
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -571,6 +627,18 @@ def _signals_of_row(row: object) -> list:
     that staying true.
     """
     identity = _identity(row)
+    if isinstance(row, dict):
+        attention = row.get("attention")
+        session = row.get("session")
+        if (isinstance(attention, dict) and attention.get("reason") == "stuck_teardown"
+                and isinstance(session, dict) and _text(session.get("id"))):
+            host, project, slug = identity or (None, None, None)
+            return [Signal(
+                host=host, project=project, slug=slug, kind="stuck_teardown",
+                note=_text(attention.get("note")), since=_text(attention.get("since")),
+                label=_text(row.get("label")), state=_text(row.get("state")),
+                session=_text(session.get("id")),
+            )]
     if identity is None:
         return []
     host, project, slug = identity
@@ -709,7 +777,9 @@ def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
     return status if isinstance(status, str) else None
 
 
-def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
+def _reconcile(
+    session_id: str, identity: tuple, status: Optional[str], *, scrub: bool
+) -> bool:
     """Remove one stale entry and record the ending. ``True`` when it went.
 
     The removal comes first and the event only follows a removal that happened:
@@ -736,6 +806,11 @@ def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
     (:func:`lmer_platform.transcripts.scrub_transcript`). The hazard it documents —
     a lingering grandchild appending into the replaced inode — is the same hazard
     in both places and no larger in this one.
+
+    Which is why *scrub* is the caller's decision: an entry admitted only by the
+    wind-down mark is the population that ground excludes — a re-attached session
+    whose registry pid died with the host PTY may still be writing its transcript,
+    and scrubbing there would truncate a live file.
     """
     if not registry.remove(session_id, force=True):
         logger.debug(
@@ -763,6 +838,15 @@ def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
         ports_file_for(session_id).unlink()
     except OSError:
         pass
+    if not scrub:
+        logger.info(
+            "platform_sweep_reconciled id=%s run=%s/%s/%s status=%s — the operator "
+            "asked this session to end and no watcher saw it fail; its entry is "
+            "cleared. The transcript is left alone: this run recorded no terminal "
+            "status, so nothing here says the harness has stopped writing",
+            session_id, host, project, slug, status,
+        )
+        return True
     try:
         transcripts.scrub_session_transcripts(session_id)
     except OSError as exc:
@@ -785,10 +869,12 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
 
     Returns the ids reconciled. The condition, all four parts of it, is the whole
     function: an entry that is **there**, a pid that is **dead**, a run identity on
-    the entry, and a **terminal committed status** for that run
-    (:data:`lmer_platform.inventory._TERMINAL_STATUSES`). Anything else is left
-    alone — most of all a dead entry whose run state is not terminal, which is a
-    crash, and whose entry is the only record that it happened.
+    the entry, and either a **terminal committed status** for that run
+    (:data:`lmer_platform.inventory._TERMINAL_STATUSES`) or an ending the operator
+    asked for and no watcher saw fail (:func:`_ended_as_asked`). Anything else is
+    left alone — most of all a dead entry whose run state is not terminal and
+    whose ending nobody asked for, which is a crash, and whose entry is the only
+    record that it happened.
 
     The terminal statuses are imported rather than restated, and that matters in
     both directions: a list here that lacked one would leave those runs reading
@@ -812,11 +898,24 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
         if identity is None:
             continue
         status = _committed_status(config, identity)
-        if status not in _TERMINAL_STATUSES:
+        finished = status in _TERMINAL_STATUSES
+        if not finished and not _ended_as_asked(entry):
             continue
-        if _reconcile(session_id, identity, status):
+        if _reconcile(session_id, identity, status, scrub=finished):
             reconciled.append(session_id)
     return reconciled
+
+
+def _ended_as_asked(entry: dict) -> bool:
+    """Did this dead entry end the way the operator asked it to?
+
+    The second reconciliation condition, and the sweep is the only clearing path
+    these entries have: the UI's "clear crashed sessions" card renders on a
+    ``crashed`` row, which they no longer are
+    (:func:`lmer_platform.inventory._derive`). Deliberately the same pair of
+    facts the label is made of, so the two can never disagree.
+    """
+    return _was_wound_down(entry) and not _observed_bad_exit(entry)
 
 
 # --- milestones a session signalled -------------------------------------------
@@ -858,7 +957,7 @@ class SessionSignal:
         """
         if not (self.host and self.project and self.slug):
             return None
-        return f"{self.host}/{self.project}/{self.slug}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @property
     def digest(self) -> str:
@@ -1000,9 +1099,15 @@ def new_signals() -> list:
     """
     marks = _signal_marks()
     found: list = []
+    hub = _comms_hub()
     for entry in registry.list_sessions(live_only=True):
         session_id = entry.get("id") if isinstance(entry, dict) else None
         if not isinstance(session_id, str) or not session_id:
+            continue
+        # A session on the bus (#407) has its milestones delivered by the
+        # comms hub; its ask directory is a projection of the same records, and
+        # reading both would spool every milestone twice.
+        if hub is not None and hub.handles(session_id):
             continue
         try:
             directory = ask.session_ask_dir(session_id)
@@ -1029,6 +1134,13 @@ def new_signals() -> list:
                 continue
             found.append(record)
     return found
+
+
+def _comms_hub():
+    """The running comms hub, if the daemon started one (issue #407)."""
+    from . import comms
+
+    return comms.get_hub()
 
 
 def record_ingested_signals(signals: list) -> None:
@@ -1075,6 +1187,29 @@ def record_ingested_signals(signals: list) -> None:
                 }
             },
         )
+
+
+def _reading_age(status, reading) -> "Optional[float]":
+    """How old the context figure is, preferring the figure's own stamp.
+
+    The document's ``updated`` is not the reading's: a codex status line carries
+    a dated ``context`` block of its own, refreshed from the rollout counter,
+    while the document around it is rewritten on every adapter poll — including
+    the polls that re-publish the last reading because the counter has stopped
+    being readable (``lmer_cli.codex_usage.CodexUsage.refresh``). Measuring the
+    wrapper there would age-check a stamp that is always fresh and let an
+    hours-old figure recommend ending a context window, which is the one thing
+    :data:`lmer_platform.rotation.MAX_READING_AGE_SECONDS` exists to refuse.
+
+    The document's age is the fallback, and it is the right one for a claude
+    status line, whose ``context`` block is ``{"percent": N}`` and is exactly as
+    old as the document that carries it.
+    """
+    if isinstance(reading, dict):
+        own = reading.get("age_seconds")
+        if isinstance(own, (int, float)) and not isinstance(own, bool):
+            return float(own)
+    return (status.statusline or {}).get("age_seconds")
 
 
 class Detector:
@@ -1126,6 +1261,14 @@ class Detector:
         #: Nudges typed into the assistant's session (issue #317). Counted
         #: apart because it is the only stage that writes *into* a session.
         self.nudged = 0
+        #: Rotations recommended to the assistant (issue #446), counted apart
+        #: from ``nudged`` because the two say opposite things about the session:
+        #: one asks it to do something, the other to finish and go.
+        self.recommended = 0
+        #: Absence claims a forced pull withdrew before anyone was told (#324).
+        #: A climbing number is a tuning fact — the mirror throttle and the rate
+        #: runs finish are out of step — rather than a fault.
+        self.unconfirmed = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
@@ -1136,17 +1279,39 @@ class Detector:
         #: The previous tick's conditions. ``None`` means no baseline has been
         #: established, which is the one state in which nothing is notified.
         self._seen: Optional[dict] = None
+        # A sweep can persist a new condition before the fleet snapshot fails.
+        self._pending_teardowns: set[str] = set()
         #: stage -> (cause, consecutive count), for the log dedupe.
         self._failed: dict = {}
         #: ``{run ref: announced_at}`` for digests spooled but not recorded on
         #: disk; cleared by the first successful write (see :meth:`_check_ins`).
         self._announced: dict = {}
+        self._project_detectors: dict = {}
         #: ``(pending_seq, stamp)`` for the nudge this process last typed —
         #: ``_announced``' shape, and the bound when the durable mark cannot be
         #: written (issue #317's review, module docstring). Keyed on the sequence
         #: rather than the accumulation's stamp, which two accumulations a second
         #: apart share. Per process: a restart re-nudges once.
         self._nudged: Optional[tuple] = None
+        #: ``(session_id, stamp)`` for the rotation reminder this process last
+        #: typed, or ``None`` while the reading is below the threshold — which is
+        #: what makes the *next* crossing announce itself immediately instead of
+        #: waiting out the window. One slot rather than a map: there is one
+        #: assistant (D11), and a new session id replaces what the last one left.
+        #:
+        #: In memory rather than in ``assistant.json``, unlike the nudge's stamp.
+        #: A spool outlives incarnations and drains rarely, so its bound has to
+        #: survive a restart; a context reading is a fact about *this* live
+        #: session, a rotation resets it to nothing, and a daemon restart while
+        #: the window is full costs one extra reminder.
+        self._rotation: Optional[tuple] = None
+        #: The session already reported as publishing no context figure, so the
+        #: notice is once per incarnation rather than once per tick.
+        self._context_unreadable: Optional[str] = None
+        #: ``(session_id, window, delivery_id, text)`` for the reminder being
+        #: attempted — held across retries so the id and its prose stay one pair
+        #: (:meth:`_rotation_text`), and dropped the moment one is marked.
+        self._rotation_attempt: Optional[tuple] = None
         self._warned_unattributed = False
 
     def stop(self) -> None:
@@ -1179,7 +1344,31 @@ class Detector:
             "lmer-signal (an MR pushed, a review finished), which reach the "
             "assistant and not your attention list.\n"
             f"   — {self._checkin_notice()}\n"
-            f"   — {self._nudge_notice()}"
+            f"   — {self._nudge_notice()}\n"
+            f"   — {self._rotation_notice()}"
+        )
+
+    def _rotation_notice(self) -> str:
+        """The rotation half of :attr:`notice`, in one sentence (issue #446).
+
+        Worth a line for :meth:`_nudge_notice`'s reason, and worth saying when it
+        is off: this one is off by *default*, so an operator who has heard nothing
+        cannot otherwise tell the feature apart from a quiet context window.
+        """
+        threshold = rotation_settings()["context_threshold"].value
+        if not threshold:
+            return (
+                "context-fullness reminders are OFF on this host "
+                "(rotation_context_threshold is 0): uber lmer is never told its "
+                "window is filling. POST /api/assistant/config to set a percent."
+            )
+        return (
+            f"context-fullness reminder ON: when uber lmer's own status line "
+            f"reports {threshold}% of its context window used, it is told once "
+            f"— and again at most every "
+            f"{rotation.REMINDER_INTERVAL_SECONDS // 60}m while it stays there — "
+            "to rotate itself at its next breakpoint. The daemon never rotates "
+            "it; a harness publishing no context figure is reported once instead."
         )
 
     def _nudge_notice(self) -> str:
@@ -1268,7 +1457,10 @@ class Detector:
         baseline-establishing one, and the absorbed-scan one — because it depends
         on none of what they have or lack: a first tick and an unreadable mirror
         are both states in which a spool can already be sitting unread, and the
-        second is the host least able to notice.
+        second is the host least able to notice. The rotation reminder
+        (:meth:`_rotation_stage`, issue #446) rides beside it on all three for the
+        same reason and is absent for the same one: what it reads is the
+        assistant's own context window, not the fleet.
 
         Signal ingestion is a third stage on the same terms, and it is *not* in the
         return value: what comes back is the diff's own fresh conditions, because
@@ -1292,12 +1484,20 @@ class Detector:
             self._clear("signals")
 
         try:
+            self._pending_teardowns.update(teardown.sweep(self.config.stuck_teardown_seconds))
+        except Exception as exc:  # noqa: BLE001 - one failed stage must not stop detection
+            self._absorb("teardown", exc)
+        else:
+            self._clear("teardown")
+
+        try:
             payload = self._read_state(self.config)
         except Exception as exc:  # noqa: BLE001 - the daemon serves regardless
             self._absorb("scan", exc)
             # The nudge stage depends on nothing this read provides, and a host
             # whose mirror will not read is where a spool sits unnoticed.
             self._nudge_stage()
+            self._rotation_stage()
             return []
         self._clear("scan")
         current = _signals(payload)
@@ -1313,22 +1513,28 @@ class Detector:
             self._clear("checkin")
 
         baseline, self._seen = self._seen, current
+        newly_stuck, self._pending_teardowns = self._pending_teardowns, set()
         if baseline is None:
-            # The silent first tick. Logged, because "the assistant was told
-            # nothing about the four runs waiting on you" needs an explanation
-            # that is not "detection is broken".
+            # Existing conditions stay silent across restart. A teardown timer
+            # that matured since startup is new, even on the first fleet read.
+            fresh = [item for item in current.values()
+                     if item.kind == "stuck_teardown" and item.session in newly_stuck]
+            for item in fresh:
+                self._deliver(item)
             logger.info(
-                "platform_detection_baseline conditions=%d — the first tick "
-                "records what is already true and notifies nothing; standing "
-                "state is what GET /api/state answers", len(current),
+                "platform_detection_baseline conditions=%d fresh_teardowns=%d — "
+                "existing conditions stay silent; standing state is what "
+                "GET /api/state answers", len(current), len(fresh),
             )
             # The nudge stage still runs: the baseline rule is about not
             # re-announcing conditions, and a spool inherited across a restart is
             # the one that has waited longest.
             self._nudge_stage()
-            return []
+            self._rotation_stage()
+            return fresh
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
+        fresh = self._confirmed(fresh)
         for signal in fresh:
             self._deliver(signal)
         # After the fresh ones, so a run whose question cleared *into* another
@@ -1343,7 +1549,54 @@ class Detector:
 
         # Last on purpose, so it counts what this tick spooled.
         self._nudge_stage()
+        self._rotation_stage()
         return fresh
+
+    def _confirmed(self, fresh: list) -> list:
+        """*fresh* minus the absence claims a caught-up mirror does not support.
+
+        A ``crashed`` row says a session died having committed nothing, and the
+        second half of that is read off a mirror this tick deliberately did not
+        pull — so a run that pushed its final state inside the throttle window is
+        indistinguishable from one that never pushed, and is announced as a death
+        with its work declared lost (#324). The claim is checked before it is
+        made, and only when such a signal is fresh in this tick's diff. What the
+        forced read costs is in docs/PLATFORM-QUICKSTART.md, "Confirming a
+        crash".
+
+        A dropped signal leaves :attr:`_seen` too, so it stays a condition nobody
+        was told about. A read that fails delivers anyway: the absence may be
+        real, and a mirror that will not answer is the worst moment to go quiet
+        about a session that died.
+        """
+        if not any(signal.kind in ABSENCE_KINDS for signal in fresh):
+            return fresh
+        try:
+            payload = self._read_state(self.config, force_pull=True)
+        except Exception as exc:  # noqa: BLE001 - the delivery below is not its dependant
+            self._absorb(
+                "confirm", exc,
+                "the crash it was checking is delivered unconfirmed, because a "
+                "mirror that will not answer is the worst moment to go quiet "
+                "about a session that died",
+            )
+            return fresh
+        self._clear("confirm")
+        confirmed = _signals(payload)
+        kept = []
+        for signal in fresh:
+            if signal.kind not in ABSENCE_KINDS or signal.key in confirmed:
+                kept.append(signal)
+                continue
+            self.unconfirmed += 1
+            if self._seen is not None:
+                self._seen.pop(signal.key, None)
+            logger.info(
+                "platform_detection_absence_withdrawn run=%s kind=%s — the mirror "
+                "was a pull behind; its run state is there and nothing was "
+                "announced", signal.ref, signal.kind,
+            )
+        return kept
 
     def _nudge_stage(self) -> None:
         """:meth:`nudge_once` with its failures absorbed, as a tick stage.
@@ -1352,24 +1605,250 @@ class Detector:
         already be waiting in each — a restart carries one in, an unreadable
         mirror hides one.
         """
+        if self._project_stage("_nudge_stage"):
+            return
+        try:
+            self.codex_wake_once()
+        except Exception as exc:
+            self._absorb("codex-wake", exc)
         try:
             self.nudge_once()
         except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
             self._absorb("nudge", exc)
 
+    def _rotation_stage(self) -> None:
+        """:meth:`rotation_once` with its failures absorbed, as a tick stage.
+
+        Its own stage beside the nudge's: the two read different things, and one
+        must not be able to cost the other. Called from all three tick exits.
+        """
+        if self._project_stage("_rotation_stage"):
+            return
+        try:
+            self.rotation_once()
+        except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
+            self._absorb("rotation", exc)
+
+    def _project_stage(self, method):
+        if not projects.enabled() or project_context.current():
+            return False
+        for project in projects.listing(archived=False):
+            identifier = project["id"]
+            if identifier not in self._project_detectors:
+                self._project_detectors[identifier] = Detector(self.config, notifier=self._notify, sender=self._send)
+            with project_context.bound(identifier):
+                getattr(self._project_detectors[identifier], method)()
+        return True
+
+    def rotation_once(self) -> Optional[rotation.Alert]:
+        """Recommend a rotation when the reading has reached the threshold.
+
+        The reading comes from :func:`lmer_platform.assistant.status`, which
+        resolves the document for the *live* session id — so a successor is never
+        alerted on the reading its predecessor left behind. Nothing here rotates
+        anything. Conditions and delivery rules:
+        ``docs/PLATFORM-QUICKSTART.md``, "Context-fullness reminders".
+        """
+        threshold = rotation_settings()["context_threshold"].value
+        if not threshold:
+            return None
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return None
+        reading = (status.statusline or {}).get("context")
+        percent = reading.get("percent") if isinstance(reading, dict) else None
+        if percent is None:
+            self._report_unreadable_context(status, threshold)
+            return None
+        # A figure arrived, so a publisher that comes back re-arms the notice.
+        if self._context_unreadable == status.session_id:
+            self._context_unreadable = None
+        alerted_at = None
+        if self._rotation and self._rotation[0] == status.session_id:
+            alerted_at = self._rotation[1]
+        reading_age = _reading_age(status, reading)
+        due = rotation.due(
+            threshold=threshold,
+            percent=percent,
+            reading_age=reading_age,
+            alerted_at=alerted_at,
+        )
+        if due is None:
+            if percent < threshold:
+                # The stay above the threshold ended, so the next crossing is
+                # announced when it happens rather than a window later — and it
+                # is a *new* reminder, which is why the attempt goes too.
+                self._rotation = None
+                self._rotation_attempt = None
+            return None
+        ident, text = self._rotation_text(status.session_id, alerted_at, due)
+        adapter = (quiet_health(status.session_id) or {}).get("codex_delivery")
+        codex = isinstance(adapter, dict) or (
+            getattr(status, "settings", None) or {}
+        ).get("harness") == "codex"
+        sent_error: Optional[str] = None
+        try:
+            if codex:
+                # Submits only what the adapter has not seen; a state short of
+                # confirmed comes back False rather than as a send to mark.
+                if not self._codex_notice(status.session_id, adapter, ident, text):
+                    return None
+            else:
+                self._send(status.session_id, text, append_newline=True)
+        except SessionIOError as exc:
+            self._absorb("rotation", exc)
+            # `send_input` reports a native `uncertain` as a *delivered* error,
+            # so codex must not read `delivered` as a send: an unknown submission
+            # is not a recommendation anyone can be shown to have received.
+            # Legacy transports keep their byte-delivery bound.
+            if codex or not getattr(exc, "delivered", False):
+                return None
+            sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
+        else:
+            self._clear("rotation")
+        self.recommended += 1
+        self._rotation = (status.session_id, utc_now_iso())
+        self._rotation_attempt = None
+        append_event(
+            ASSISTANT_ROTATION_RECOMMENDED,
+            note=status.session_id,
+            data={
+                "session": status.session_id,
+                "generation": status.generation,
+                "percent": due.percent,
+                "threshold": due.threshold,
+                "repeat": due.repeat,
+                # The age the decision was taken on, which on codex is the
+                # reading's own rather than the document's (:func:`_reading_age`).
+                "reading_age_seconds": reading_age,
+                "delivery_id": ident,
+                "send_error": sent_error,
+            },
+        )
+        logger.info(
+            "platform_assistant_rotation_recommended session=%s generation=%s "
+            "percent=%d threshold=%d repeat=%s delivery=%s — the reminder "
+            "recommends a rotation at the assistant's next breakpoint; nothing "
+            "here ends an incarnation",
+            status.session_id, status.generation, due.percent, due.threshold,
+            due.repeat, ident,
+        )
+        return due
+
+    def _rotation_text(self, session_id: str, alerted_at, due) -> tuple:
+        """The delivery id and the frozen prose of the attempt in flight.
+
+        One attempt is one id and one immutable text, because
+        :class:`lmer_cli.codex_delivery.CodexDelivery` refuses a reused id
+        carrying different text and answers a repeated one from its own receipt.
+        A fresh identity is random rather than derived: a detector that restarted
+        mid-attempt must not be able to mint the id of an attempt whose text it
+        no longer has.
+        """
+        attempt = self._rotation_attempt
+        if attempt and attempt[0] == session_id and attempt[1] == (alerted_at or ""):
+            return attempt[2], attempt[3]
+        ident = "rotation-" + uuid.uuid4().hex
+        text = rotation.prompt(due)
+        self._rotation_attempt = (session_id, alerted_at or "", ident, text)
+        return ident, text
+
+    def _report_unreadable_context(self, status, threshold: int) -> None:
+        """Say once that the threshold has nothing to be compared against.
+
+        The issue's own rule (#446): "when a harness publishes no context figure
+        the daemon says so once and does not alert". It says it in the log and in
+        ``events.jsonl`` rather than in the session, because the fact is about the
+        *host* — an operator who set a threshold and hears nothing needs to know
+        it can never fire here, while the assistant can do nothing with it.
+        Harness parity for the figure itself is issue #122.
+
+        **Young sessions are exempt.** Every incarnation has a window between its
+        container starting and its harness first rendering a status line, and the
+        tick lands in it routinely — so below
+        :data:`lmer_platform.rotation.MAX_READING_AGE_SECONDS` absence is not yet
+        evidence. "Once" means once per *stretch without a reading*: a figure
+        arriving re-arms it.
+        """
+        session_id = status.session_id
+        if self._context_unreadable == session_id:
+            return
+        age = status.age_seconds
+        if age is not None and age < rotation.MAX_READING_AGE_SECONDS:
+            return
+        self._context_unreadable = session_id
+        append_event(
+            ASSISTANT_ROTATION_UNREADABLE,
+            note=session_id,
+            data={
+                "session": session_id,
+                "threshold": threshold,
+                # Which of the two absences this was: no document at all, or a
+                # document carrying no context block. They are different faults —
+                # one is a harness that publishes nothing, the other a harness
+                # that publishes without the figure — and only the event can keep
+                # them apart afterwards.
+                "document": status.statusline is not None,
+                "session_age_seconds": age,
+            },
+        )
+        logger.warning(
+            "platform_assistant_rotation_unreadable session=%s threshold=%d "
+            "document=%s — no context figure to compare the threshold against, "
+            "so the rotation reminder cannot fire; said once until one arrives",
+            session_id, threshold, status.statusline is not None,
+        )
+
+    def codex_wake_once(self) -> None:
+        """Use the existing daemon tick to wake Codex even during conversation."""
+        state = assistant.read_state()
+        if not state.pending:
+            return
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return
+        ident = self._codex_accumulation_id(status.session_id, state.pending_seq)
+        if state.codex_wake == ident:
+            return
+        health = quiet_health(status.session_id) or {}
+        adapter = health.get('codex_delivery')
+        if not isinstance(adapter, dict) or not adapter.get('runtime'):
+            return
+        if self._codex_notice(status.session_id, adapter, ident,
+                              '[platform] Your digest spool has pending items. This is an automatic wake-up, '
+                              'not a new task. Take the spool with POST /api/assistant/pending, '
+                              'act on what you took, and continue the current conversation.'):
+            marked = assistant.mark_codex_wake(status.session_id, state.pending_seq, ident)
+            if not marked:
+                raise SessionIOError('Codex wake confirmed but acknowledgement was not persisted; idle held')
+            append_event('assistant_codex_woken', note=status.session_id, data={
+                'accumulation': state.pending_seq, 'pending': len(state.pending),
+                'delivery_id': ident, 'marked': marked,
+            })
+            self._clear('codex-wake')
+
+    @staticmethod
+    def _codex_accumulation_id(session_id, pending_seq):
+        return 'digest-' + hashlib.sha256(f'{session_id}:{pending_seq}'.encode()).hexdigest()[:32]
+
+    def _codex_notice(self, session_id, adapter, ident, text) -> bool:
+        """A stable notice is complete only when its native receipt confirms it."""
+        if not adapter or not adapter.get('runtime'):
+            return False
+        receipt = next((r for r in adapter.get('receipts', []) if r.get('delivery_id') == ident), None)
+        if receipt is None or (receipt.get('state') == 'rejected' and receipt.get('retryable')):
+            receipt = self._send(session_id, text, append_newline=True, delivery_id=ident)
+        if receipt.get('transport') != 'codex-app-server':
+            raise SessionIOError('Codex digest notice did not use structured delivery')
+        if receipt.get('state') in ('rejected', 'uncertain'):
+            raise SessionIOError(f'Codex digest notice {ident} is {receipt["state"]}; original retained')
+        return receipt.get('state') == 'confirmed' and receipt.get('submit_confirmed') is True
+
     def nudge_once(self) -> Optional[nudge.Nudge]:
-        """Type one reminder into the assistant's session if its spool is owed one.
+        """Send a due reminder, then mark its delivery; otherwise return None.
 
-        Returns the nudge that was delivered, or ``None`` for both "nothing was
-        due" and "it could not be sent" — the caller does the same with either and
-        the log says which.
-
-        Send, then mark, then record, as :func:`lmer_platform.lifecycle.wind_down`
-        does: a mark written first would silence the retry a refused send earns.
-        What decides retry-versus-bound is whether the bytes arrived, not whether
-        the call raised (see the ``except`` branch), and a durable mark that fails
-        to write costs nothing while this process lives — :attr:`_nudged` is the
-        bound — and one early repeat across a restart.
+        Codex requires a native receipt before advancing the interval. Legacy
+        PTY sends retain their byte-delivery bound. See docs/CODEX-DELIVERY.md.
         """
         settings = nudge_settings()
         after = settings["after_seconds"].value
@@ -1405,20 +1884,36 @@ class Detector:
             # that changes is the one that tells it.
             return None
         text = nudge.prompt(due)
+        adapter = (quiet_health(status.session_id) or {}).get('codex_delivery')
+        codex = isinstance(adapter, dict) or (getattr(status, 'settings', None) or {}).get('harness') == 'codex'
         sent_error: Optional[str] = None
         try:
-            # append_newline, or the reminder sits unsent in the input box.
-            self._send(status.session_id, text, append_newline=True)
+            if codex:
+                durable = assistant.read_state()
+                primary = self._codex_accumulation_id(status.session_id, state.pending_seq)
+                if primary != durable.codex_wake:
+                    return None
+                due = nudge.due(
+                    durable, running=True, idle_seconds=reading.get('idle_seconds'),
+                    produced_output=reading.get('produced'), after_seconds=after,
+                    pending_threshold=threshold,
+                )
+                if due is None:
+                    return None
+                key = f'{status.session_id}:{durable.pending_seq}:{durable.nudged_at or ""}'
+                ident = 'digest-idle-' + hashlib.sha256(key.encode()).hexdigest()[:32]
+                text = ('[platform] Your digest spool is still pending. This is an automatic idle reminder, '
+                        'not a new task. Take the spool with POST /api/assistant/pending, '
+                        'act on what you took, and continue the current conversation.')
+                if not self._codex_notice(status.session_id, adapter, ident, text):
+                    return None
+            else:
+                self._send(status.session_id, text, append_newline=True)
         except SessionIOError as exc:
-            # Absorbed: an unreachable control plane must not end the tick. Only
-            # the raiser knows whether the bytes were typed, and the two cases
-            # need opposite recoveries — retry a refusal, bound a delivered one.
-            # A transport failure cannot be told apart and counts as retryable,
-            # since a duplicate reminder beats a lost window. ``getattr`` is a
-            # positive-delivery test: a refused write is false, while a timeout
-            # after the child read the bytes is unknown and therefore false too.
+            # Codex waits for its receipt. Legacy transports keep their existing
+            # positive byte-delivery bound, including a delivered error.
             self._absorb("nudge", exc)
-            if not getattr(exc, "delivered", False):
+            if codex or not getattr(exc, "delivered", False):
                 return None
             sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
         else:
@@ -1551,11 +2046,20 @@ class Detector:
         stale = checkin.stale_runs(payload, window=window, marks=marks)
         if not stale:
             return []
-        note, data = checkin.digest(
-            stale, window=window, caveat=self._unattributed_caveat()
-        )
-        delivered, live = self._spool(note, checkin.STALE_DIGEST_KIND, data)
-        if not delivered:
+        groups = {}
+        for run in stale:
+            owner = (projects.run_home(run.ref) or {}).get("project_id") if projects.enabled() else None
+            groups.setdefault(owner, []).append(run)
+        delivered_runs, live = [], False
+        for owner, group in groups.items():
+            note, data = checkin.digest(group, window=window, caveat=self._unattributed_caveat())
+            if owner:
+                data["workspace_id"] = owner
+            delivered, live = self._spool(note, checkin.STALE_DIGEST_KIND, data)
+            if delivered:
+                delivered_runs.extend(group)
+        stale = delivered_runs
+        if not stale:
             return []
         stamped = utc_now_iso()
         try:
@@ -1690,9 +2194,12 @@ class Detector:
             append_event(
                 SESSION_SIGNALLED, note=signal.session, data=signal.event_data()
             )
-            delivered, live = self._spool(
-                signal.digest, SIGNAL_DIGEST_KIND, signal.data()
-            )
+            delivered, live = False, False
+            entry = registry.read_session(signal.session) or {}
+            if entry.get("kind") != assistant.KIND:
+                delivered, live = self._spool(
+                    signal.digest, SIGNAL_DIGEST_KIND, signal.data()
+                )
             logger.info(
                 "platform_signal_ingested session=%s signal=%s run=%s "
                 "notified=%s assistant_live=%s",
@@ -1718,12 +2225,19 @@ class Detector:
         self.notified += 1
         return True, bool(live)
 
-    def _absorb(self, stage: str, exc: BaseException) -> None:
+    def _absorb(
+        self, stage: str, exc: BaseException, outcome: str = _TICK_SKIPPED
+    ) -> None:
         """Log a failure once per cause per stage, then demote its repeats.
 
         Per *stage* rather than one shared cause, so a permanently unwritable
         spool cannot make an unrelated first mirror failure look like a repeat and
         hide it at ``DEBUG``.
+
+        *outcome* is a parameter because :meth:`_confirmed` delivers the crash it
+        could not confirm: the shared "this tick is skipped" would tell whoever is
+        reconciling a mirror outage that nothing was announced, while they are
+        looking at the digest that was.
         """
         self.failures += 1
         cause = f"{type(exc).__name__}: {exc}"
@@ -1737,9 +2251,9 @@ class Detector:
             return
         self._failed[stage] = (cause, 1)
         logger.error(
-            "platform_detection_failed stage=%s error=%s — this tick is skipped "
-            "and detection keeps going; identical repeats are logged at debug, "
-            "and the fleet view does not depend on any of it", stage, cause,
+            "platform_detection_failed stage=%s error=%s — %s; identical repeats "
+            "are logged at debug, and the fleet view does not depend on any of it",
+            stage, cause, outcome,
         )
 
     def _clear(self, stage: str) -> None:

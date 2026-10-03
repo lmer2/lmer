@@ -23,8 +23,9 @@ from tests.conftest import node_binary, require_node_toolchain
 from tests.test_platform_web_markdown import MARKDOWN, WEB, _read, _render_path
 
 
-# This image happens to carry playwright's bundled chromium (the MCP server ships
-# it). Overridable, because a path in a test is a guess about a host.
+# This image happens to carry playwright's bundled chromium (the `playwright`
+# npm package ships it). Overridable, because a path in a test is a guess about
+# a host.
 BROWSER_CANDIDATES = [
     "/home/developer/.npm-global/lib/node_modules/playwright/index.mjs",
     "/usr/lib/node_modules/playwright/index.mjs",

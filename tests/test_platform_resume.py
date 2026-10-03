@@ -11,11 +11,15 @@ a shell string, so that is what proves a target full of metacharacters (or a
 direction that looks like a flag) arrives intact rather than proving this module
 built a string it liked.
 
-Four properties get the most attention:
+Five properties get the most attention:
 
 - **continue vs sibling**: the recorded taskdef continues the run in front of the
   operator; an overridden one starts a different run against the same target, and
   the reply says which happened;
+- **which session is continued**: in schema form a slug groups several complete,
+  independent records (D22), so a resume says which one it read — by naming the
+  session dir it found, in the reply and in every refusal — and a caller that
+  means a particular launch names it with ``session_id``;
 - **the landing run is what gets checked**: a ``complete`` ``develop`` run is the
   normal starting point for a ``review``, so the status that matters is the one of
   the run the session will actually file itself under;
@@ -34,7 +38,9 @@ from pathlib import Path
 import pytest
 
 from lmer_platform import config as cfg
-from lmer_platform import registry, resume as resume_mod, runs, spawn, store
+from lmer_platform import (
+    registry, resume as resume_mod, runs, spawn, store, workrepo,
+)
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 
@@ -44,6 +50,11 @@ TASKDEF = "develop"
 TARGET = "https://gitlab.example.com/agents/global/-/work_items/141"
 REPO = "https://gitlab.example.com/agents/global"
 QUESTION = "Should the queue survive a daemon restart, or start empty?"
+#: Session ids in the schema-form grammar (``LMER_SESSION_ID``): timestamp-first,
+#: so they sort into start order and the last one is the newest launch — the rule
+#: ``workrepo._sessions_in`` holds for the picker and the resolver alike.
+SESSION_ID = "20260824-165230-2-31245"
+LATER_SESSION_ID = "20260825-090000-2-31300"
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +83,11 @@ def resume_recording_lmer(tmp_path):
     taskdef, target and direction ``lmer`` recovers are the ones the operator
     asked for. That contract spans two packages, so asserting on this module's
     intentions alone would not test it.
+
+    ``session`` is the third value of that kind and the newest (issue #353): the
+    record a continue lands in is decided by the ``LMER_SESSION_ID`` this flag
+    sets, so what matters is that ``lmer``'s parser takes the token as its own
+    rather than leaving it in ``rest``.
     """
     dump = tmp_path / "resume.json"
     script = tmp_path / "resume-lmer"
@@ -81,7 +97,10 @@ def resume_recording_lmer(tmp_path):
         "from lmer_cli.cli import parse_args\n"
         "ns, rest = parse_args(sys.argv[1:])\n"
         "payload = {'argv': sys.argv[1:], 'task': ns.task, 'target': ns.target,\n"
-        "           'prompt': ns.prompt, 'answer': ns.answer, 'rest': rest}\n"
+        "           'prompt': ns.prompt, 'answer': ns.answer, 'rest': rest,\n"
+        # getattr rather than ns.session so a suite run against a CLI without the
+        # flag reports the missing *flag* rather than dying inside the stub.
+        "           'session': getattr(ns, 'session', None)}\n"
         f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
         # Staying alive is how a test keeps the session's registry entry around; a
         # clean exit reaps it, which would race any assertion about a live one.
@@ -124,6 +143,7 @@ def plant_run(
     question=None,
     status="in-progress",
     recorded_slug=...,
+    session_id=None,
     extra="",
 ):
     """Write one run dir into the mirror the way a pushed run appears there.
@@ -133,9 +153,19 @@ def plant_run(
     way a test can be sure nothing in the resume path wrote to it. Values go
     through ``json.dumps`` (valid YAML) so a target full of metacharacters is
     planted as the string it is rather than as accidental YAML.
+
+    ``session_id`` plants the schema-form shape instead: the record is the SESSION
+    dir ``<project>/_runs/<slug>/<session-id>/`` and ``_runs/<slug>/`` is a
+    grouping level nothing is ever written at (D22). The ``{host}/{project}/``
+    project dir is the host bucket an unnamed repo keeps (D9), so these trees need
+    no registry; resolving a *registered* flat short name is
+    ``workrepo.resolve_run_dir``'s own contract and is covered where it lives.
     """
     slug = slug if slug is not None else run_state.derive_slug(taskdef, target)
-    path = config.mirror_path / host / project / "runs" / slug
+    if session_id is None:
+        path = config.mirror_path / host / project / "runs" / slug
+    else:
+        path = config.mirror_path / host / project / "_runs" / slug / session_id
     path.mkdir(parents=True, exist_ok=True)
     lines = ["schema: 1", f"status: {json.dumps(status)}"]
     recorded = slug if recorded_slug is ... else recorded_slug
@@ -985,6 +1015,77 @@ def test_the_ambient_repo_url_is_not_a_substitute(config, monkeypatch):
         resume_mod.resume_run(config, request_for())
 
 
+# --- a project reached through more than one remote (issue #353, D8) ---------
+#
+# A registered project with ``remotes:`` is ONE project at several URLs. The
+# launch records the URL it was given, while ``spawn.derive_run_identity`` folds
+# that URL to the project's PRIMARY remote so the run is tracked under the same
+# key the mirror walk lists its directory by (tests/test_platform_spawn.py). The
+# recorded URL and the tracked identity therefore differ *by design* for such a
+# run, and the check below compares what the next spawn will DERIVE rather than
+# what the URL parses to on its own — otherwise resume would refuse exactly the
+# runs the fold exists to key correctly, and refuse them with a message accusing
+# the operator of naming another project.
+
+WIDGETS_PRIMARY = "gitlab.example.com/acme/widgets"
+WIDGETS_SECONDARY = "github.com/acme/widgets"
+WIDGETS_URL = "https://github.com/acme/widgets.git"
+WIDGETS_TARGET = "https://gitlab.example.com/acme/widgets/-/work_items/42"
+
+
+def plant_widgets_manifest(config):
+    """A registry that knows ``widgets`` at both of its remotes (D8). Planted
+    before the identity is derived, because it is what the fold reads."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 1\nname: example-plexus\nprojects:\n  widgets:\n"
+        f"    repo: {WIDGETS_PRIMARY}\n    remotes: [{WIDGETS_SECONDARY}]\n",
+        encoding="utf-8",
+    )
+
+
+def plant_widgets_run(config, slug):
+    """The record a launch through the SECONDARY remote left: under the project's
+    flat short name, which is where the registry's union placed it (D7/D22)."""
+    path = config.mirror_path / "widgets" / "_runs" / slug / SESSION_ID
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.yaml").write_text(
+        "\n".join([
+            "schema: 1",
+            'status: "in-progress"',
+            f"slug: {json.dumps(slug)}",
+            f"taskdef: {json.dumps(TASKDEF)}",
+            f"target: {json.dumps(WIDGETS_TARGET)}",
+            'stop_reason: "yield"',
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_run_launched_through_a_secondary_remote_still_resumes(config):
+    """Its recorded repo names the mirror, its identity names the primary, and
+    both describe the same run — so this must start a session, not refuse."""
+    plant_widgets_manifest(config)
+    host, project, slug = spawn.derive_run_identity(
+        spawn.SpawnRequest(
+            taskdef=TASKDEF, target=WIDGETS_TARGET, repo_url=WIDGETS_URL,
+        ),
+        WIDGETS_URL, config,
+    )
+    plant_widgets_run(config, slug)
+    runs.track(host, project, slug, taskdef=TASKDEF, target=WIDGETS_TARGET,
+               repo=WIDGETS_URL)
+
+    result = resume_mod.resume_run(config, resume_mod.ResumeRequest(
+        host=host, project=project, slug=slug,
+    ))
+
+    assert result.session.session_id, (
+        "a run reachable at two remotes was refused its own repo URL"
+    )
+
+
 # --- refusals: what the spawn would derive -----------------------------------
 
 def test_a_resume_that_would_derive_another_run_is_refused(config):
@@ -1160,7 +1261,8 @@ def test_a_recorded_target_that_looks_like_a_flag_is_refused(config):
 
 @pytest.mark.parametrize("field,value", [
     ("taskdef", 5), ("taskdef", ["review"]), ("direction", 5),
-    ("direction", {"text": "hi"}), ("repo_url", 5),
+    ("direction", {"text": "hi"}), ("repo_url", 5), ("session_id", 5),
+    ("session_id", ["20260824-165230-2-31245"]),
 ])
 def test_a_non_string_option_is_refused(config, stopped_run, field, value):
     with pytest.raises(resume_mod.ResumeError, match="must be a string") as caught:
@@ -1177,6 +1279,418 @@ def test_a_blank_taskdef_means_the_recorded_one(config, stopped_run, blank):
 
 def test_a_blank_repo_url_falls_back_to_the_recorded_one(config, stopped_run):
     assert resume_mod.resume_run(config, request_for(repo_url="  ")).continued is True
+
+
+# --- the session is the unit of record (issue #353, D22) ---------------------
+#
+# In schema form a launch owns ``<project>/_runs/<slug>/<session-id>[--<name>]/``
+# and ``_runs/<slug>/`` merely groups the launches against one (taskdef, target).
+# So the slug an operator resumes can name several complete, independent records,
+# and the two questions this section answers are "which one did the platform
+# read" and "how does a caller say which one it meant".
+#
+# The resolve rule is not this module's to invent: ``workrepo._sessions_in`` is
+# the one definition of "which sessions are records, newest last", used by the
+# adoption picker and by ``resolve_run_dir`` alike. A resume that opened a
+# different session than the picker offered is exactly the failure that shared
+# rule exists to prevent, so the test below pins the two against each other
+# rather than restating the rule.
+
+
+def session_address(slug=None, session_dir=SESSION_ID):
+    """The mirror-relative address of one planted session dir."""
+    slug = slug if slug is not None else run_state.derive_slug(TASKDEF, TARGET)
+    return f"{HOST}/{PROJECT}/_runs/{slug}/{session_dir}"
+
+
+def test_a_schema_form_run_is_resumed_from_its_session_dir(
+    config, resume_recording_lmer
+):
+    """The ordinary schema-form continue: one launch, one record, one address."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    tracked = track_run()
+
+    result = resume_mod.resume_run(config, request_for())
+
+    assert result.continued is True
+    assert result.started_slug == tracked.slug
+    assert result.rel_path == session_address()
+    assert result.to_dict()["rel_path"] == session_address()
+    payload = child_payload(dump)
+    assert (payload["task"], payload["target"]) == (TASKDEF, [TARGET])
+
+
+def test_a_plain_slug_resume_reads_the_session_the_picker_offers(config):
+    """Two launches, no session id: the resolve rule picks, and it is the shared
+    one — a resume that read another session than the fleet row quotes would be
+    the divergence ``_sessions_in`` exists to stop."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for())
+
+    offered = workrepo.resolve_run_dir(config, HOST, PROJECT, result.slug)
+    assert result.rel_path == offered.rel_path
+    assert result.rel_path == session_address(session_dir=LATER_SESSION_ID)
+
+
+def test_a_session_id_continues_that_launch_and_its_state_governs(config):
+    """The point of the field: the newest launch is finished and would need a
+    direction, and the named one is not — so a resume that took the newest anyway
+    would refuse a request that is perfectly resumable."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, status="complete")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    assert result.continued is True
+    assert result.rel_path == session_address()
+
+
+def test_the_newest_session_still_governs_when_no_session_is_named(config):
+    """The other half of the same tree: without the field the finished launch is
+    the one read, and its refusal names it."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, status="complete")
+    track_run()
+
+    with pytest.raises(resume_mod.DirectionRequired) as caught:
+        resume_mod.resume_run(config, request_for())
+
+    assert session_address(session_dir=LATER_SESSION_ID) in str(caught.value)
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_a_session_id_finds_the_dir_the_naming_rename_moved_it_to(config):
+    """``work name`` renames the SESSION dir (``<sid>--<name>``) while the id it
+    was launched under is what an operator has written down."""
+    plant_run(config, session_id=f"{SESSION_ID}--nice-name", stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    assert result.rel_path == session_address(
+        session_dir=f"{SESSION_ID}--nice-name"
+    )
+    assert result.continued is True
+
+
+def test_the_full_session_dir_name_addresses_it_too(config):
+    """It is what the fleet row shows, so it has to be a thing you can paste back."""
+    plant_run(config, session_id=f"{SESSION_ID}--nice-name", stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(
+        config, request_for(session_id=f"{SESSION_ID}--nice-name")
+    )
+    assert result.rel_path == session_address(
+        session_dir=f"{SESSION_ID}--nice-name"
+    )
+
+
+def test_an_unknown_session_id_is_refused_and_says_what_is_there(config):
+    """The remedy is a different session id, so the refusal has to carry the list —
+    and a code, because a UI turns this one into a picker."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, stop_reason="yield")
+    track_run()
+
+    with pytest.raises(resume_mod.SessionNotFound) as caught:
+        resume_mod.resume_run(
+            config, request_for(session_id="20260101-000000-2-1")
+        )
+
+    message = str(caught.value)
+    assert (caught.value.status, caught.value.code) == (409, "session_not_found")
+    assert SESSION_ID in message and LATER_SESSION_ID in message
+    assert f"{HOST}/{PROJECT}/_runs/{request_for().slug}" in message
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_a_session_id_naming_two_dirs_is_refused_rather_than_guessed(config):
+    """The name half of a session dir is unconstrained, so one id can end up on
+    two directories — and a whole record is not worth a coin toss."""
+    plant_run(config, session_id=f"{SESSION_ID}--one", stop_reason="yield")
+    plant_run(config, session_id=f"{SESSION_ID}--two", stop_reason="yield")
+    track_run()
+
+    with pytest.raises(resume_mod.SessionNotFound, match="more than one") as caught:
+        resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    assert f"{SESSION_ID}--one" in str(caught.value)
+    assert f"{SESSION_ID}--two" in str(caught.value)
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_a_session_id_against_a_legacy_run_is_refused(config):
+    """A legacy tree keeps one shared dir per target and is read in place (D22),
+    so there is no launch to address there — and the refusal names the dir that
+    actually holds the record rather than the one the request implies."""
+    plant_run(config, stop_reason="yield")
+    track_run()
+
+    with pytest.raises(resume_mod.SessionNotFound, match="legacy") as caught:
+        resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    assert f"{HOST}/{PROJECT}/runs/{request_for().slug}" in str(caught.value)
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_a_session_dir_with_no_state_file_is_not_a_session(config):
+    """The one rule for "this is a record" is unchanged: it holds a state file."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+    (config.mirror_path / HOST / PROJECT / "_runs" / request_for().slug
+     / LATER_SESSION_ID).mkdir(parents=True)
+
+    with pytest.raises(resume_mod.SessionNotFound):
+        resume_mod.resume_run(config, request_for(session_id=LATER_SESSION_ID))
+
+
+@pytest.mark.parametrize("session_id", [
+    "../../../etc", "..", ".", "a/b", "..\\..\\windows", f"{SESSION_ID}/..",
+])
+def test_a_session_id_that_would_escape_the_mirror_is_refused(config, session_id):
+    """It becomes a path segment under the run's grouping dir like any other."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+
+    with pytest.raises(resume_mod.ResumeError, match="path") as caught:
+        resume_mod.resume_run(config, request_for(session_id=session_id))
+    assert caught.value.status == 400
+    assert registry.list_sessions(live_only=False) == []
+
+
+@pytest.mark.parametrize("blank", [None, "", "   ", "\n\t "])
+def test_a_blank_session_id_means_the_resolve_rule(config, blank):
+    """The field is a text box the ordinary continue submits empty."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for(session_id=blank))
+    assert result.rel_path == session_address(session_dir=LATER_SESSION_ID)
+
+
+def test_a_question_open_in_a_session_names_that_session_dir(config):
+    """Every refusal quotes the address that was found, never a composed
+    ``runs/<slug>`` — which in schema form is a directory that does not exist."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="question",
+              question=QUESTION)
+    track_run()
+
+    with pytest.raises(resume_mod.QuestionOpen) as caught:
+        resume_mod.resume_run(config, request_for())
+
+    message = str(caught.value)
+    assert message.startswith(f"{session_address()} is stopped on a question")
+    assert f"{HOST}/{PROJECT}/runs/" not in message
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_an_unreadable_session_record_is_refused_by_its_address(config):
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+    (config.mirror_path / HOST / PROJECT / "_runs" / request_for().slug
+     / SESSION_ID / "state.yaml").write_text("not: [a, mapping\n", encoding="utf-8")
+
+    with pytest.raises(resume_mod.NotResumable, match="could not be read") as caught:
+        resume_mod.resume_run(config, request_for())
+    assert str(caught.value).startswith(session_address())
+
+
+def test_a_session_resume_writes_nothing_into_the_mirror(config):
+    """Spec D3, in the shape where the platform now has one level more to walk."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, stop_reason="yield")
+    track_run()
+    before = snapshot_tree(config.mirror_path)
+    assert before
+
+    resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    assert snapshot_tree(config.mirror_path) == before
+
+
+def test_the_started_session_is_still_what_the_index_records(config, monkeypatch):
+    """Two things are called a session here and only one of them is an index
+    entry: ``last_session_id`` is the container session the spawn started
+    (``s-…``), never the record dir a resume continued (``20260824-…``)."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    tracked = track_run()
+
+    result = resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+    try:
+        entry = runs.get_tracked(HOST, PROJECT, tracked.slug)
+        assert entry.last_session_id == result.session.session_id
+        assert entry.last_session_id != SESSION_ID
+        assert registry.read_session(result.session.session_id)["run"] == {
+            "host": HOST, "project": PROJECT, "slug": tracked.slug,
+        }
+    finally:
+        os.kill(result.session.pid, 9)
+
+
+def test_a_sibling_that_does_not_exist_yet_has_no_address(config):
+    """``rel_path`` is the record the checks were made against; an override that
+    founds a run has none until the session it starts pushes one."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for(taskdef="review"))
+
+    assert result.continued is False
+    assert result.rel_path is None
+    assert result.to_dict()["rel_path"] is None
+
+
+def test_an_existing_sibling_in_schema_form_is_addressed_by_its_session(config):
+    """And when it does exist, the address is the sibling's session dir — the
+    record whose state governed the checks."""
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+    plant_run(config, taskdef="review", session_id=LATER_SESSION_ID)
+
+    result = resume_mod.resume_run(config, request_for(taskdef="review"))
+
+    assert result.rel_path == session_address(
+        slug=run_state.derive_slug("review", TARGET),
+        session_dir=LATER_SESSION_ID,
+    )
+
+
+# --- the record the session lands in (issue #353, D22) -----------------------
+#
+# Reading the right record is half of a resume; landing in it is the other half.
+# The container mints ``LMER_SESSION_ID`` at startup only when the host injected
+# none (``clone_and_exec.main`` -> ``mint_session_id``, ``os.environ.setdefault``),
+# so a resume that names no record starts a BRAND NEW one beside the launch the
+# operator asked to continue — the checks made against one record and the session
+# written into another. What is pinned below is that the id the spawn carries is
+# the id of the record every refusal above was measured against, and that it is
+# carried only where that record is in the run the session will file itself under.
+
+
+def session_flag_for(session_dir=SESSION_ID):
+    """The one argv token that says which launch the session writes in."""
+    return f"{spawn.SESSION_FLAG}={session_dir}"
+
+
+def test_a_continue_lands_in_the_record_it_checked(config, resume_recording_lmer):
+    """The defect this closes: same slug, same group, a second record."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for())
+
+    payload = child_payload(dump)
+    assert session_flag_for() in payload["argv"], (
+        "without the id the container mints a fresh one and the resume opens a "
+        "new record beside the launch it just read"
+    )
+    assert spawn.SESSION_FLAG not in payload["argv"], (
+        "a bare --session token means the id was passed as a separate argument"
+    )
+    assert payload["session"] == SESSION_ID, (
+        "the id has to be one lmer's own parser recovers — the contract spans "
+        "two packages, and this module's intentions are not the test"
+    )
+    assert payload["rest"] == [], (
+        "an unrecognised flag lands in rest and reaches nothing but the "
+        "container's own command line"
+    )
+    assert result.rel_path == session_address(), (
+        "the id carried must be the record the checks were made against"
+    )
+
+
+def test_a_named_session_is_the_one_continued_not_the_newest(config,
+                                                             resume_recording_lmer):
+    """The whole purpose of ``session_id``: it picked which record was read, and
+    it has to pick which record is written in too — otherwise a resume of the
+    older launch checks it and then lands somewhere it never looked."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    plant_run(config, session_id=LATER_SESSION_ID, stop_reason="yield")
+    track_run()
+
+    resume_mod.resume_run(config, request_for(session_id=SESSION_ID))
+
+    argv = child_payload(dump)["argv"]
+    assert session_flag_for() in argv
+    assert session_flag_for(LATER_SESSION_ID) not in argv
+
+
+def test_the_id_carried_is_the_launch_and_not_the_named_dir(config,
+                                                            resume_recording_lmer):
+    """``<sid>`` and ``<sid>--<name>`` are the same session and the id is
+    ``<sid>``: carrying the dir name would have the container compose
+    ``<sid>--<name>--<name>`` the next time anything built the address from it."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=f"{SESSION_ID}--nice-name", stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for())
+
+    assert result.rel_path == session_address(session_dir=f"{SESSION_ID}--nice-name")
+    argv = child_payload(dump)["argv"]
+    assert session_flag_for() in argv
+    assert session_flag_for(f"{SESSION_ID}--nice-name") not in argv
+
+
+def test_an_override_carries_no_session_id(config, resume_recording_lmer):
+    """The sibling case, and the reason the injection is conditional: the session
+    lands under a DIFFERENT slug, where the source record's id names nothing — so
+    injecting it would create a record in one group named for a launch of another.
+    The container mints its own, exactly as it did before this existed."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+
+    result = resume_mod.resume_run(config, request_for(taskdef="review"))
+
+    assert result.continued is False
+    assert not any(
+        arg.startswith(spawn.SESSION_FLAG) for arg in child_payload(dump)["argv"]
+    )
+
+
+def test_an_override_onto_an_existing_sibling_carries_no_session_id(
+    config, resume_recording_lmer
+):
+    """Even when the sibling has records of its own. The checks were made against
+    the sibling's newest launch, but the operator asked to start work rather than
+    to continue that launch — and ``_landing_slug`` says this is not a continue."""
+    _script, dump = resume_recording_lmer
+    plant_run(config, session_id=SESSION_ID, stop_reason="yield")
+    track_run()
+    plant_run(config, taskdef="review", session_id=LATER_SESSION_ID)
+
+    result = resume_mod.resume_run(config, request_for(taskdef="review"))
+
+    assert result.continued is False
+    assert not any(
+        arg.startswith(spawn.SESSION_FLAG) for arg in child_payload(dump)["argv"]
+    )
+
+
+def test_a_legacy_tree_resume_is_byte_identical_to_what_it_was(
+    config, stopped_run, resume_recording_lmer
+):
+    """A legacy run dir is one shared record per target, read in place: nothing
+    there is addressed by a launch, so there is no id to carry and the argv must
+    not gain one."""
+    _script, dump = resume_recording_lmer
+    resume_mod.resume_run(config, request_for())
+
+    assert not any(
+        arg.startswith(spawn.SESSION_FLAG) for arg in child_payload(dump)["argv"]
+    )
 
 
 # --- the spawn path's own rules still apply ----------------------------------
@@ -1244,6 +1758,7 @@ def test_the_reply_carries_the_spawns_warning_key(config, stopped_run):
     (resume_mod.NotResumable, 409, "not_resumable"),
     (resume_mod.RunIsLive, 409, "live_session"),
     (resume_mod.QuestionOpen, 409, "question_open"),
+    (resume_mod.SessionNotFound, 409, "session_not_found"),
 ])
 def test_every_refusal_carries_a_status_and_a_stable_code(error, status, code):
     """The route maps the status; the UI branches on the code. Both are contract."""
@@ -1260,6 +1775,56 @@ def test_the_codes_are_unique():
             resume_mod.ResumeError, resume_mod.RunNotTracked,
             resume_mod.RepoUrlRequired, resume_mod.DirectionRequired,
             resume_mod.NotResumable, resume_mod.RunIsLive, resume_mod.QuestionOpen,
+            resume_mod.SessionNotFound,
         )
     ]
     assert len(set(codes)) == len(codes)
+
+
+def test_a_row_keyed_on_the_secondary_is_not_a_dead_end(config):
+    """The row the fold cannot reach, and used to refuse forever (!269 review).
+
+    A row keyed on the SECONDARY needs no old build to exist: `POST
+    /api/runs/adopt` takes host and project verbatim with no registry
+    validation, and the secondary is the URL an operator actually cloned from,
+    so it is the spelling they would type. A spawn whose fold no-opped on a
+    momentarily unreadable mirror leaves one too — the fold is best-effort by
+    design, and this is what that costs.
+
+    Folding only the URL made such a row unresumable *permanently*, and the
+    refusal named a remedy that does not exist: every spelling of the project
+    folds to the same primary, so no `repo_url` the operator could supply would
+    ever satisfy "supply a repo_url for <secondary>".
+    """
+    plant_widgets_manifest(config)
+    slug = run_state.derive_slug(TASKDEF, WIDGETS_TARGET)
+    plant_widgets_run(config, slug)
+    secondary_host, secondary_project = WIDGETS_SECONDARY.split("/", 1)
+    runs.track(secondary_host, secondary_project, slug, source="adopted",
+               taskdef=TASKDEF, target=WIDGETS_TARGET, repo=WIDGETS_URL)
+
+    result = resume_mod.resume_run(config, resume_mod.ResumeRequest(
+        host=secondary_host, project=secondary_project, slug=slug,
+    ))
+
+    assert result.session.session_id, (
+        "a run tracked under one of its own remotes was refused a resume, with "
+        "advice no URL could satisfy"
+    )
+
+
+def test_a_repo_url_naming_another_project_is_still_refused(config):
+    """The converse, so folding both sides is not a widening: the check still
+    refuses a URL that names a genuinely different project."""
+    plant_widgets_manifest(config)
+    slug = run_state.derive_slug(TASKDEF, WIDGETS_TARGET)
+    plant_widgets_run(config, slug)
+    secondary_host, secondary_project = WIDGETS_SECONDARY.split("/", 1)
+    runs.track(secondary_host, secondary_project, slug, source="adopted",
+               taskdef=TASKDEF, target=WIDGETS_TARGET, repo=WIDGETS_URL)
+
+    with pytest.raises(resume_mod.RepoUrlRequired, match="names"):
+        resume_mod.resume_run(config, resume_mod.ResumeRequest(
+            host=secondary_host, project=secondary_project, slug=slug,
+            repo_url="https://gitlab.example.com/acme/gadgets",
+        ))

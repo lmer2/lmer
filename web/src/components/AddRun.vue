@@ -2,8 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { mdiFormatListBulleted, mdiMagnify, mdiPencil } from '@mdi/js'
 import { adoptRun, fetchCandidates, fetchSpawnOptions, spawnSession } from '../api.js'
+import { eligibleSlots } from '../projects.js'
 
 const props = defineProps({
+  workspaceId: { type: String, default: null },
+  projects: { type: Array, default: () => [] },
   // Convenience only: the daemon re-checks and refuses an occupied slot whoever
   // is asking, so a list that went stale between polls costs a refusal rather
   // than a session in a slot somebody else has (#245).
@@ -17,6 +20,10 @@ const props = defineProps({
 const emit = defineEmits(['changed'])
 
 const mode = ref('spawn')
+const destination = ref(props.workspaceId)
+const repositories = computed(() => props.projects.find(project => project.id === destination.value)?.repositories || [])
+const availableSlots = computed(() => eligibleSlots(props.freeSlots, destination.value))
+watch(destination, () => { spawn.value.slot = null })
 
 // `taskdef` keeps its default rather than waiting for discovery: the form is
 // usable on the first frame, and the default survives a host whose taskdef list
@@ -28,7 +35,7 @@ const mode = ref('spawn')
 // only the harness can, and it does so by rejecting what it does not know.
 const spawn = ref({
   taskdef: 'develop', target: '', repo_url: '', preset: '', agents: [],
-  model: '', ports: 0, slot: null,
+  model: '', ports: 0, slot: null, references: [],
 })
 const busy = ref(false)
 const error = ref(null)
@@ -223,14 +230,14 @@ const agentsSelection = computed(() =>
 // The service rides in the label: two slots on one host are told apart by what
 // they are bound to, not by whatever they were named.
 const slotItems = computed(() =>
-  props.freeSlots.map((slot) => ({
+  availableSlots.value.map((slot) => ({
     value: slot.name,
     title: slot.service ? `${slot.name} — ${slot.service}` : slot.name,
   })),
 )
 
 const canSpawn = computed(() =>
-  Boolean(typed(spawn.value.taskdef) && typed(spawn.value.target)),
+  Boolean(destination.value && typed(spawn.value.taskdef) && typed(spawn.value.target)),
 )
 
 async function doSpawn() {
@@ -240,6 +247,7 @@ async function doSpawn() {
   warning.value = null
   try {
     const payload = {
+      workspace_id: destination.value,
       taskdef: typed(spawn.value.taskdef),
       target: typed(spawn.value.target),
       ports: Number(spawn.value.ports) || 0,
@@ -257,6 +265,14 @@ async function doSpawn() {
     // with a guess: unset means "whatever this session's environment, preset or
     // harness settles on", which the session itself reports back once it knows.
     if (typed(spawn.value.model)) payload.model = typed(spawn.value.model)
+    // Threads the run should know about, not be connected to (#414). Sent as
+    // objects because a title rides with each; the chip's text is the permalink,
+    // and a title is added later from the run's own thread menu.
+    const references = (spawn.value.references || [])
+      .map((permalink) => typed(permalink))
+      .filter(Boolean)
+      .map((permalink) => ({ permalink }))
+    if (references.length) payload.references = references
     const result = await spawnSession(payload)
     notice.value = `spawned ${result.session_id}`
     // The daemon says so when a session it just started belongs to no run it can
@@ -277,7 +293,7 @@ async function doAdopt(candidate) {
   busy.value = true
   error.value = null
   try {
-    await adoptRun(candidate)
+    await adoptRun({ ...candidate, workspace_id: destination.value })
     candidate.tracked = true
     emit('changed')
   } catch (exc) {
@@ -290,6 +306,8 @@ async function doAdopt(candidate) {
 
 <template>
   <div>
+    <v-select v-model="destination" :items="projects.filter(project => !project.archived)" item-title="name"
+      item-value="id" label="Destination project" :disabled="busy" persistent-hint hint="Choose the home for this run." />
     <v-tabs :model-value="mode" grow class="mb-3" @update:model-value="switchTo">
       <v-tab value="spawn">spawn</v-tab>
       <v-tab value="adopt">adopt</v-tab>
@@ -342,8 +360,9 @@ async function doAdopt(candidate) {
                (GET /api/spawn-options): an empty box beside a daemon that has a
                URL misrepresents what leaving it blank does. What it does when
                there is nothing to fall back on is REPO_URL_HINT's subject. -->
-          <v-text-field
+          <v-combobox
             v-model="spawn.repo_url"
+            :items="repositories"
             label="repository URL"
             :hint="REPO_URL_HINT"
             persistent-hint
@@ -356,7 +375,7 @@ async function doAdopt(candidate) {
                otherwise — a note rather than disabled items, because there is
                nothing to choose (#245). -->
           <v-alert
-            v-if="slots.length && !freeSlots.length"
+            v-if="slots.length && !availableSlots.length"
             type="info"
             variant="tonal"
             density="compact"
@@ -367,7 +386,7 @@ async function doAdopt(candidate) {
             one, or wait for a slot to free.
           </v-alert>
           <v-select
-            v-if="freeSlots.length"
+            v-if="availableSlots.length"
             v-model="spawn.slot"
             :items="slotItems"
             label="service slot"
@@ -410,6 +429,20 @@ async function doAdopt(candidate) {
             hint="the session's LMER_LLM_NAME (--model); blank runs the harness default"
             persistent-hint
             placeholder="opus"
+            class="mb-3"
+          />
+          <!-- Context threads, not connections: nothing is mirrored, nothing
+               starts listening, and a thread another run holds can be listed
+               here. The run is told about each one once (#414). -->
+          <v-combobox
+            v-model="spawn.references"
+            label="reference threads"
+            hint="Slack or matrix permalinks the run should read; it is told about each once, and connects to none"
+            persistent-hint
+            multiple
+            chips
+            closable-chips
+            clearable
             class="mb-3"
           />
           <v-text-field
@@ -471,7 +504,7 @@ async function doAdopt(candidate) {
       <v-card v-for="candidate in untracked" :key="candidate.rel_path" class="mb-3">
         <v-card-text class="d-flex flex-wrap align-center ga-3">
           <div class="scroll-x flex-1-1"><code>{{ candidate.rel_path }}</code></div>
-          <v-btn variant="tonal" :disabled="busy" @click="doAdopt(candidate)">
+          <v-btn variant="tonal" :disabled="busy || !destination" @click="doAdopt(candidate)">
             adopt
           </v-btn>
         </v-card-text>

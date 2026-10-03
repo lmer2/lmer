@@ -237,7 +237,8 @@ _SCHEME_PORTS = {"http": "80", "https": "443", "ssh": "22"}
 _DEFAULT_PORTS = ("443", "22")
 
 # scheme:// detector (RFC 3986 scheme charset); anything else is treated as
-# scp-form (`user@host:path`) or an opaque path-like string.
+# scp-form (`[user@]host:path`, see _parse_repo_url) or an opaque path-like
+# string.
 _SCHEME_RE = re.compile(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://")
 
 # Redaction (see scrub_credentials): the first pattern is the
@@ -343,10 +344,38 @@ def _parse_repo_url(url) -> Tuple[str, str, str, str, str]:
     and derivation — no I/O, no env reads, never raises. Handles both
     scheme URLs (``https://user:tok@host:port/path``,
     ``ssh://git@host/path``) and scp-form (``git@host:path``,
-    ``user:secret@host:path``). ``scheme`` is lowercased and empty for
-    scp-form; ``path`` carries no leading separator for scheme URLs and is
-    otherwise verbatim (case preserved, ``.git`` kept). A string with
-    neither scheme nor userinfo comes back entirely in ``path``.
+    ``user:secret@host:path`` and the userless ``host:path``). ``scheme``
+    is lowercased and empty for scp-form; ``path`` carries no leading
+    separator for scheme URLs and is otherwise verbatim (case preserved,
+    ``.git`` kept). A scheme-less string that is not scp-form (a bare
+    ``host/path``, an absolute path) comes back entirely in ``path``.
+
+    scp-form is recognized on git's own rule — no scheme, and a ``:``
+    before any ``/`` — with the user optional (``[user@]host:path``), so a
+    checkout cloned through an ssh_config ``Host`` alias, whose ``remote
+    get-url`` is the userless ``host:org/repo.git`` for the rest of its
+    life, names the same repo as ``git@host:org/repo.git`` (review
+    finding). Two scheme-less shapes deliberately stay OUT of the scp
+    branch, and the choice is made here rather than by every caller:
+
+    - ``host:2222/path`` — when the text after the first ``:`` is bare
+      digits up to the next ``/`` (or the end), the ``:`` is read as a PORT
+      and the string is left opaque (all ``path``), exactly like a bare
+      ``host/path``. That is the normalizer's own canonical spelling of a
+      ported repo (``normalize_repo_url`` keeps non-default ports as
+      ``host:port/path``), so the canonical form re-normalizes to itself
+      and a manifest may carry it verbatim; it is also the reading
+      ``_userinfo_boundary``'s digit guard already gives ``host:8080/…@…``.
+      Git itself would read host ``host`` and path ``2222/path``; a repo
+      whose top-level path segment really is all digits must be spelled
+      with a user (``git@host:2222/path``) or a scheme to be read as one.
+    - ``a:b/c@d`` — the ambiguous shape (``_url_shape_is_ambiguous``): the
+      ungated boundary reads a credential in it, so it is not taken as
+      userless scp either. Neither reading is reported as a host, the
+      trust rule cannot pass on a guess, and callers refuse it outright.
+
+    A Windows drive path (``c:/x``) is not distinguished — git only does
+    so on Windows — and reads as scp-form.
     """
     url = (url or "").strip()
     m = _SCHEME_RE.match(url)
@@ -367,6 +396,18 @@ def _parse_repo_url(url) -> Tuple[str, str, str, str, str]:
     if at != -1:
         host, _, path = url[at + 1:].partition(":")
         return "", url[:at], host, "", path
+    # Userless scp-form, host:path — git's rule (a `:` before any `/`) minus
+    # the two carve-outs above: a bare-digit right-hand side is a port, and
+    # the ungated boundary reading a credential is the ambiguous shape.
+    host, colon, path = url.partition(":")
+    if (
+        colon
+        and host
+        and "/" not in host
+        and not path.partition("/")[0].isdigit()
+        and _userinfo_boundary(url) == -1
+    ):
+        return "", "", host, "", path
     return "", "", "", "", url
 
 

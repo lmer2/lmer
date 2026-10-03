@@ -25,19 +25,22 @@ The gate checks warn when a staged file that names a spec-class deliverable (any
 - **ALWAYS** run all tests before commit
 - **ALWAYS** run precommit before commit
 - **NEVER** push to any repository without explicit permission (except allow list)
-- **NEVER** commit without explicit user approval or request
+- **ALWAYS** use required gates for routine commits within authorized work; respect explicit user holds
 - **NEVER** add Claude attributions or signatures
 
 ## 🚨 Commit Rules - STOP AND CHECK
 - **MUST** use `gate-commit -m "message"` for all commits
 - **NEVER** use `git commit` directly
-- **NEVER** commit without explicit user approval (user must say "commit", "please commit", "pc", "rgrpc")
+- Routine commits within authorized work need no separate generic commit confirmation
+- An explicit user hold, such as "do not commit yet", remains binding
 - **BEFORE committing:**
   1. ✅ Run `gate-check` to verify all checks pass
   2. ✅ Show user the gate check results
   3. ✅ Summarize what changed
-  4. ✅ Get explicit user approval
-- **STOP**: Wait for user to review changes before committing
+  4. ✅ Confirm the changes stay within authorized work and no explicit user hold applies
+- Proceed through `gate-commit` when required checks pass; failing checks block
+- A commit does not authorize new scope, push, history rewrite, merge, deploy,
+  destructive operations, or another worker's lifecycle
 - Only add and commit files you created or modified
 - Never include Claude code attributions in commit messages
 - Never add or commit any Claude-specific files to git
@@ -106,6 +109,46 @@ entry — a bare entry does not authorize it.
 gate-push --tag v1.2.3                  # refs/tags/v1.2.3 -> origin
 gate-push --tag v1.2.3 --remote github  # same tag -> the GitHub mirror remote
 ```
+
+**Publishing an authorized rebased branch**:
+First obtain explicit human operator permission for the specific history
+rewrite. Only then set the approval variable for that command and use an
+explicit lease through the gate:
+```bash
+LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER=1 gate-push --force-with-lease refs/heads/feature/example OLD_OID --remote origin
+```
+Before rebasing, use `gate-push --inspect-lease refs/heads/feature/example
+--remote origin` to inspect the push transport/host/port and its current commit.
+Keep that full, nonzero lowercase commit ID as `OLD_OID`; do not print raw
+remote URLs, which may contain credentials. Inspection omits URL userinfo,
+path, query and fragment, withholds captured Git failure output, and disables
+Git's inherited trace/diagnostic sinks throughout inspection, including
+configuration-backed Trace2 targets. It does not grant push authorization.
+The source is the clean, checked-out
+branch's committed HEAD; the destination must be covered by the normal
+allowlist. Generic task/development authorization and repository/ref allowlisting
+alone are insufficient. Existing explicit human approval for the same scoped
+rewrite need not be requested again; no direct `git push` exception is needed.
+
+`LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER` must be exactly `1`: unset, empty,
+whitespace and all other values refuse before gates, source pinning or transport.
+This is a workflow checkpoint, not independent authentication of human consent.
+Keep it command-scoped; never export it for the session, add it to defaults,
+presets, taskdefs or persistent `.env` files, or automatically enable it after
+refusal. Obtain explicit operator permission first, then set it only for the
+approved command. Ordinary pushes and read-only inspection do not require it.
+
+Git receives that exact lease with the real push. A stale expectation refuses
+the update without an automatic refresh, retry, or unconditional force.
+Leased mode supports one fully qualified branch on one push URL, and refuses
+tags, deletions, wildcard/compound refspecs, mirror remotes and advertised
+symbolic destination branches. It cannot be combined with `--tag` or `--ref`.
+The selected remote's custom service selectors (`receivepack`, `uploadpack`,
+`vcs`, `serverOption`), custom URL helpers, `GIT_OVERRIDE_VIRTUAL_HOST` and
+`GIT_NAMESPACE` are unsupported for leased pushes and inspection. Required credential helpers,
+hooks, proxies and SSH programs retain their existing trust boundary.
+See [gate-push usage and guarantees](../docs/GATE-PUSH.md) for source locking,
+Git compatibility, credential routing and receipt semantics.
 
 **Pre-push Checklist**:
 1. Use `gate-push` command

@@ -8,7 +8,7 @@
 - **ALWAYS** check that ALL tests pass before declaring anything complete
 - **ALWAYS** check git rules before commit
 - **NEVER** push to any repository without explicit permission (except allow list)
-- **NEVER** commit without explicit user approval or request
+- **ALWAYS** use required gates for routine commits within authorized work; respect explicit user holds
 - **NEVER** expose API keys, tokens, or secrets in code or logs
 
 ## 🤖 NON-INTERACTIVE SESSIONS - when there is nobody to ask
@@ -39,8 +39,9 @@ When a gate would stop you for approval you do not already have:
   report, not a prompt.
 
 Per-gate, in a non-interactive session:
-- **COMMIT GATE** — run `gate-check`, show its output, and commit under the approval
-  the launch already carries. Without such approval, stop at the checks and report.
+- **COMMIT GATE** — run `gate-check`, show its output, and use `gate-commit` for
+  routine commits within authorized work. No separate generic commit confirmation
+  is required. An explicit user hold or restriction still blocks the commit.
 - **CONTEXT SWITCH GATE** — state the switch (completed / new objective / files) in
   your output and proceed; do not stop for the confirmation step.
 - **ERROR GATE** — for the STOP cases, use the report format below with its
@@ -50,8 +51,13 @@ Per-gate, in a non-interactive session:
 Before EVERY commit, you MUST:
 1. Run gate check: `gate-check`
 2. Show gate check results to user
-3. Get explicit approval: "commit" / "please commit" / `/gate-commit` command
+3. Confirm the changes stay within authorized work and no explicit user hold applies
 4. Use gate commit: `gate-commit -m "message"`
+
+Routine commits within authorized work need no separate commit-confirmation stop.
+A user instruction such as "do not commit yet" remains binding. A local commit
+does not authorize new scope, push, history rewrite, merge, deploy, destructive
+operations, or another worker's lifecycle. Those boundaries remain separate.
 
 **IMPORTANT**: The `/gate-commit` command IS explicit approval to commit:
 - When user runs `/gate-commit`, generate appropriate message if none provided
@@ -83,13 +89,15 @@ This configuration is organized into focused modules. Each module contains speci
 - [`rules/ci-cd.md`](rules/ci-cd.md) - GitHub Actions, monitoring, verification
 - [`rules/dependencies.md`](rules/dependencies.md) - Lock files, package management
 
-### 🎯 Quick Access Commands
-Use these focused commands:
-- `rgr` - Read all global rules
-- `rgr-git` - Read only git rules
-- `rgr-test` - Read only testing rules
-- `rgr-security` - Read only security rules
-- `rgr-code` - Read only code quality rules
+### 🎯 Reading Rules
+Read the installed rule files with your file-reading tool or these commands:
+
+- `cat /Agents/global/rules/git.md` - Git rules
+- `cat /Agents/global/rules/testing.md` - Testing rules
+- `cat /Agents/global/rules/security.md` - Security rules
+- `cat /Agents/global/rules/code-quality.md` - Code quality rules
+
+To read all global rules, run `cat /Agents/global/AGENTS.md /Agents/global/rules/*.md`.
 
 ### 🔒 Gate Commands (MANDATORY)
 - `gate-check` - Run all checks without committing
@@ -123,7 +131,7 @@ Use these focused commands:
 ## 🛑 CONTEXT SWITCH GATE
 **When switching between tasks, STOP and:**
 - [ ] Summarize what was just completed
-- [ ] Run rgr-[relevant module] for new task (e.g., rgr-git, rgr-test)
+- [ ] Read the relevant file under `/Agents/global/rules/` for the new task
 - [ ] State the new objective clearly
 - [ ] List specific files/areas you'll be working with
 - [ ] STOP: Confirm understanding with user
@@ -132,7 +140,7 @@ Use these focused commands:
 ```
 Completed: Added test coverage for user authentication
 Switching to: Bug fix for login timeout
-Reading: rgr-git (for commit rules)
+Reading: /Agents/global/rules/git.md (for commit rules)
 Objective: Fix timeout issue in auth.py line 45
 Will modify: src/auth.py, tests/test_auth.py
 Is this correct?
@@ -287,15 +295,24 @@ The goal is stored temporarily and persists across CLI invocations but is not pe
 #### Persist Agent Memory
 
 When `LMER_PERSIST_AGENT_MEMORY` is enabled, your agent memory is persisted to
-the work repo on a **per-project** basis (stored under
-`{host}/{project}/memory/`) so it survives across sessions.
+the work repo so it survives across sessions. **Where it lands depends on the
+memory's own `metadata.type`** (schema form, spec D17): a `project` memory goes
+to that project's own scope, and `user`, `feedback` and `reference` memories go
+to the instance-wide scope shared by every project in the work repo — so a fact
+about you, or about how you should work, is recalled in every project rather
+than only the one you happened to learn it in. Recall reads both scopes, with
+the project scope taking precedence on a name collision. In a legacy work repo
+(no `_plexus.yaml`) there is only one scope and everything lands in
+`{host}/{project}/memory/` as before.
 
 - **Restore is automatic.** At session start, any previously-saved memory for
   this project is copied back into your memory directory before you begin — you
   do not need to do anything to load it.
 - **Persisting is your responsibility.** Memory you write during a session lives
-  only in the ephemeral container until you save it. Before you finish a task,
-  run:
+  only in the ephemeral container until you save it. Persist **merges** into the
+  work repo — it deletes only memories that were restored to you and that you
+  then removed, so a memory another session wrote is never lost because you did
+  not have it. Before you finish a task, run:
 
   ```bash
   work memory persist

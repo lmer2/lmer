@@ -30,7 +30,7 @@ from lmer_cli import gate_lock
 
 from .run_state import append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
-from .utils import sanitize_task_target
+from .utils import no_run_context_error, task_target_dir, work_repo_layout
 
 PUSH_RETRIES = 3
 
@@ -471,7 +471,10 @@ def _report_deferral(marker: dict, paths: list[str]) -> None:
         "   Committing now would move tracked files under the running gate and "
         "fail its /work isolation guard (issue #201)."
     )
-    print(f"   Left on disk, uncommitted: {', '.join(paths)}")
+    if paths:
+        print(f"   Left on disk, uncommitted: {', '.join(paths)}")
+    else:
+        print("   Existing local commits are awaiting publication.")
     print(
         "   Run `work commit` once the gate finishes — the stop hook will not "
         "let the session end until it lands."
@@ -483,6 +486,174 @@ def _report_deferral(marker: dict, paths: list[str]) -> None:
     )
 
 
+def _git_failure(operation: str, label: str, rc: int, output: str) -> int:
+    print(f"❌ {operation} failed ({label}): {_scrub_credentials(output)}", file=sys.stderr)
+    return rc or 1
+
+
+def _git_directory(repo_path: Path, label: str) -> Optional[Path]:
+    rc, output = run_git_command(["rev-parse", "--absolute-git-dir"], repo_path, check=False)
+    if rc != 0 or not output.strip():
+        _git_failure("git rev-parse --absolute-git-dir", label, rc, output)
+        return None
+    return Path(output.strip())
+
+
+def check_commit_ready(repo_path: Path, label: str = "work repo") -> int:
+    """Refuse interrupted operations before copying files or staging resolutions."""
+    git_dir = _git_directory(repo_path, label)
+    if git_dir is None:
+        return 1
+    for state in (
+        "rebase-merge", "rebase-apply", "MERGE_HEAD",
+        "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer",
+    ):
+        if (git_dir / state).exists():
+            return _git_failure(
+                "repository state check", label, 1,
+                f"{state} is in progress at {repo_path}; "
+                "resolve or abort it manually before retrying.",
+            )
+    rc, output = run_git_command(["symbolic-ref", "--quiet", "HEAD"], repo_path, check=False)
+    if rc != 0:
+        return _git_failure(
+            "repository state check", label, rc,
+            f"detached HEAD or unreadable branch at {repo_path}; "
+            f"check out the intended branch.\n{output}",
+        )
+    rc, output = run_git_command(["ls-files", "--unmerged"], repo_path, check=False)
+    if rc != 0 or output.strip():
+        return _git_failure("unmerged index check", label, rc, output)
+    return 0
+
+
+def _check_staged_conflicts(repo_path: Path, label: str) -> int:
+    # Check the whole index: git commit also includes previously staged paths.
+    rc, output = run_git_command(
+        [
+            "-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab",
+            "diff", "--cached", "--check", "--text", "--no-ext-diff", "--no-textconv",
+        ],
+        repo_path, check=False,
+    )
+    if rc != 0:
+        return _git_failure(
+            "staged conflict marker check", label, rc,
+            output + "\nResolve leftover markers. For legitimate prose, indent or "
+            "lengthen seven-character marker lines (<, =, >, or |).",
+        )
+    return 0
+
+
+def _index_snapshot(repo_path: Path) -> tuple[Path, Optional[bytes]]:
+    rc, output = run_git_command(["rev-parse", "--git-path", "index"], repo_path, check=False)
+    if rc != 0 or not output.strip():
+        raise OSError(output or "Cannot locate the Git index")
+    index = repo_path / output.strip()
+    return index, index.read_bytes() if index.exists() else None
+
+
+def _restore_index(index: Path, saved: Optional[bytes], label: str) -> None:
+    lock = index.with_name(index.name + ".lock")
+    try:
+        with lock.open("xb") as stream:
+            try:
+                if saved is None:
+                    index.unlink(missing_ok=True)
+                else:
+                    stream.write(saved)
+                    stream.flush()
+                    os.replace(lock, index)
+            finally:
+                lock.unlink(missing_ok=True)
+    except OSError as exc:
+        _git_failure("index restoration", label, 1, str(exc))
+
+
+def _stage_and_check(repo_path: Path, paths: list[str], label: str) -> tuple[int, str]:
+    """Restore the exact previous staging state if preparation is refused."""
+    try:
+        index, saved = _index_snapshot(repo_path)
+    except OSError as exc:
+        return _git_failure("index snapshot", label, 1, str(exc)), ""
+    rc, output = run_git_command(["add", "-A", "--", *paths], repo_path, check=False)
+    if rc != 0:
+        return _git_failure("git add", label, rc, output), output
+    rc, output = run_git_command(
+        ["status", "--porcelain", "--", *paths], repo_path, check=False
+    )
+    if rc != 0:
+        _git_failure("git status", label, rc, output)
+    else:
+        rc = _check_staged_conflicts(repo_path, label)
+    if rc != 0:
+        _restore_index(index, saved, label)
+    return rc, output
+
+
+def _push_pending_commits(repo_path: Path, label: str) -> int:
+    rc, output = run_git_command(
+        ["rev-list", "--max-count=1", "@{upstream}..HEAD"], repo_path, check=False
+    )
+    if rc != 0:
+        return _git_failure("pending commit check", label, rc, output)
+    if not output.strip():
+        return _verify_published(repo_path, label, "HEAD")
+    print(f"📤 Publishing existing local commits ({label})...")
+    rc = _push_with_rebase_retries(repo_path, label)
+    if rc == 0:
+        print(f"✅ Published pending commits ({label})")
+    return rc
+
+
+def _publication_destination(repo_path: Path, label: str) -> Optional[tuple[str, str]]:
+    rc, branch = run_git_command(["symbolic-ref", "--quiet", "HEAD"], repo_path, check=False)
+    if rc != 0:
+        _git_failure("publication branch check", label, rc, branch)
+        return None
+    rc, output = run_git_command(
+        [
+            "for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            branch.strip(),
+        ],
+        repo_path, check=False,
+    )
+    if rc != 0:
+        _git_failure("upstream destination check", label, rc, output)
+        return None
+    remote, _, ref = output.strip().partition("\0")
+    if not remote or remote == "." or not ref.startswith("refs/heads/"):
+        _git_failure(
+            "upstream destination check", label, 1,
+            "the current branch has no remote branch upstream configured",
+        )
+        return None
+    return remote, ref
+
+
+def _verify_published(
+    repo_path: Path, label: str, commit: str,
+    destination: Optional[tuple[str, str]] = None,
+) -> int:
+    destination = destination or _publication_destination(repo_path, label)
+    if destination is None:
+        return 1
+    remote, ref = destination
+    # Fetch the actual remote branch, including when a tracking ref is stale or deleted.
+    rc, output = run_git_command(["fetch", "--no-tags", remote, ref], repo_path, check=False)
+    if rc != 0:
+        return _git_failure("post-push git fetch", label, rc, output)
+    rc, output = run_git_command(
+        ["merge-base", "--is-ancestor", commit, "FETCH_HEAD"], repo_path, check=False,
+    )
+    if rc != 0:
+        return _git_failure(
+            "remote reachability check", label, rc,
+            f"commit {commit} was not confirmed on the fetched upstream.\n{output}",
+        )
+    return 0
+
+
 def commit_work_path(
     target_path,
     commit_message: Optional[str] = None,
@@ -491,19 +662,17 @@ def commit_work_path(
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
 
-    Stages only the given path(s) (relative to the work repo root) with ``git
-    add -A`` so additions, modifications, *and* deletions under them are
-    captured, leaving unrelated pending changes elsewhere in the work repo
-    untouched. If staging produces no changes, returns 0 without committing —
+    Stages additions, modifications, and deletions under the given paths
+    relative to the work repo root. Git commit also includes previously
+    staged paths; unrelated unstaged edits remain local.
+    If staging produces no changes, retries any unpushed commits —
     the no-change check is scoped to the given paths too, so an unrelated
     dirty file (e.g. a per-session ``log.yaml``) does not trigger a spurious
     empty commit.
 
-    Ordering matters: the local commit happens FIRST, then the remote is
-    integrated with ``pull --rebase``, then push retries with a rebase
-    between attempts. The previous fetch/pull-first sequence failed whenever
-    the tree was dirty (``git pull`` refuses) and then lost the race to a
-    busy remote — the work repo has many concurrent writers by design.
+    Commit the selected changes before rebasing so conflicts retain a local
+    commit. Rebase autostashes unrelated tracked edits; push races trigger
+    another rebase before retrying.
 
     Args:
         target_path: Path (or list of paths) within the work repo to stage,
@@ -532,12 +701,12 @@ def commit_work_path(
         print(f"❌ Work repository not found at {work_repo_path}", file=sys.stderr)
         return 1
 
+    rc = check_commit_ready(work_repo_path)
+    if rc != 0:
+        return rc
+
     all_paths = [target_path] if isinstance(target_path, str) else list(target_path)
     paths = stageable_paths(work_repo_path, all_paths)
-    if not paths:
-        print("✅ No existing paths to commit in work repository")
-        return 0
-
     # 0. Gate-in-flight check (issue #201), BEFORE any git write. A gate leaves
     # the run dir dirty via its own receipt, which arms the stop hook, whose
     # mandated commit then sweeps tracked files out from under the running
@@ -547,16 +716,30 @@ def commit_work_path(
     # happened to bite first.
     marker = None if allow_during_gate else gate_lock.active_gate()
     if marker is not None:
-        # Read-only: a run whose paths are already clean has nothing to defer,
-        # so it must not print a deferral for a no-op commit.
-        rc, pending = run_git_command(
-            ["status", "--porcelain", "--", *paths], work_repo_path, check=False
-        )
-        if rc != 0 or not pending.strip():
-            return 0
+        # A clean index may still hide commits left by a failed push.
+        pending = ""
+        if paths:
+            rc, pending = run_git_command(
+                ["status", "--porcelain", "--", *paths], work_repo_path, check=False
+            )
+            if rc != 0:
+                return _git_failure("git status", "work repo", rc, pending)
+        if not pending.strip():
+            rc, pending = run_git_command(
+                ["rev-list", "--max-count=1", "@{upstream}..HEAD"],
+                work_repo_path, check=False,
+            )
+            if rc != 0:
+                return _git_failure("pending commit check", "work repo", rc, pending)
+            if not pending.strip():
+                return 0
         _report_deferral(marker, paths)
         _queue_deferral(_current_run_dir(), marker, paths)
         return 0
+
+    if not paths:
+        print("No existing paths to commit in work repository")
+        return _push_pending_commits(work_repo_path, "work repo")
 
     # Parked deferrals land as events now, so this commit carries the trace of
     # the commits it is standing in for.
@@ -567,20 +750,13 @@ def commit_work_path(
             "(issue #201); this commit carries the trace."
         )
 
-    # 1. Stage first — committing before any pull keeps the tree clean for
-    # the rebase below (a dirty tree makes `git pull` refuse outright).
     print(f"➕ Staging {', '.join(paths)} in work repository...")
-    rc, output = run_git_command(["add", "-A", "--", *paths], work_repo_path, check=False)
+    rc, status_output = _stage_and_check(work_repo_path, paths, "work repo")
     if rc != 0:
-        print(f"❌ git add failed (work repo): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
-
-    rc, status_output = run_git_command(
-        ["status", "--porcelain", "--", *paths], work_repo_path, check=False
-    )
     if not status_output.strip():
-        print("✅ No changes to commit in work repository")
-        return 0
+        print("No new file changes to commit in work repository")
+        return _push_pending_commits(work_repo_path, "work repo")
 
     # 2. Commit
     if commit_message is None:
@@ -600,41 +776,78 @@ def commit_work_path(
     return rc
 
 
-def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
-    """Integrate the remote and push, rebasing between attempts.
-
-    The commit must already exist locally (commit-FIRST ordering — a dirty
-    tree makes ``git pull`` refuse outright). Shared by the work-repo and
-    separate-napkin push paths; both repos have concurrent writers by design,
-    so a rejected push is retried up to :data:`PUSH_RETRIES` times with a
-    ``pull --rebase`` between attempts.
-
-    Returns 0 on success, the failing git exit code otherwise.
-    """
-    run_git_command(["fetch"], repo_path, check=False)
-    rc, output = run_git_command(["pull", "--rebase"], repo_path, check=False)
+def _stash_head(repo_path: Path, label: str) -> tuple[int, str]:
+    rc, output = run_git_command(
+        ["rev-parse", "--verify", "--quiet", "refs/stash"], repo_path, check=False
+    )
+    if rc == 1:
+        return 0, ""
     if rc != 0:
-        print(
-            f"⚠️  git pull --rebase warning ({label}): {_scrub_credentials(output)}",
-            file=sys.stderr,
-        )
+        return _git_failure("stash inspection", label, rc, output), ""
+    return 0, output.strip()
 
+
+def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
+    """Publish existing commits for work, napkin, and pending-commit retries.
+
+    Retain local commits on rebase failure. Return 0 only after fresh remote
+    ancestry verification; otherwise return a nonzero Git or validation code.
+    """
+    destination = _publication_destination(repo_path, label)
+    if destination is None:
+        return 1
+    remote, ref = destination
     for attempt in range(1, PUSH_RETRIES + 1):
-        rc, output = run_git_command(["push"], repo_path, check=False)
+        rc = check_commit_ready(repo_path, label)
+        if rc != 0:
+            return rc
+        rc, stash_before = _stash_head(repo_path, label)
+        if rc != 0:
+            return rc
+        rc, output = run_git_command(
+            ["pull", "--rebase", "--autostash", remote, ref], repo_path, check=False
+        )
+        if rc != 0:
+            _git_failure("git pull --rebase", label, rc, output)
+            git_dir = _git_directory(repo_path, label)
+            if git_dir and any(
+                (git_dir / p).exists() for p in ("rebase-merge", "rebase-apply")
+            ):
+                arc, detail = run_git_command(["rebase", "--abort"], repo_path, check=False)
+                if arc != 0:
+                    _git_failure("git rebase --abort", label, arc, detail)
+                else:
+                    print(
+                        "Rebase aborted; local commits retained. "
+                        "Resolve the conflict before retrying.", file=sys.stderr,
+                    )
+            return rc
+        # Git can return zero even when applying the autostash failed.
+        rc, stash_after = _stash_head(repo_path, label)
+        if rc != 0:
+            return rc
+        if stash_after and stash_after != stash_before:
+            return _git_failure(
+                "autostash restoration", label, 1,
+                "refs/stash changed during pull; automatic restoration was not confirmed. "
+                f"Saved edits are available at {stash_after} (refs/stash). "
+                f"Inspect git status and git stash show -p {stash_after} before restoring. "
+                "Resolve any unmerged paths before retrying publication.",
+            )
+        rc = check_commit_ready(repo_path, label)
+        if rc != 0:
+            return rc
+        rc, commit = run_git_command(["rev-parse", "HEAD"], repo_path, check=False)
+        if rc != 0:
+            return _git_failure("git rev-parse HEAD", label, rc, commit)
+        rc, output = run_git_command(["push", remote, f"HEAD:{ref}"], repo_path, check=False)
         if rc == 0:
-            return 0
+            return _verify_published(repo_path, label, commit.strip(), destination)
         print(
             f"⚠️  git push rejected (attempt {attempt}/{PUSH_RETRIES}): "
             f"{_scrub_credentials(output)}",
             file=sys.stderr,
         )
-        if attempt < PUSH_RETRIES:
-            rrc, routput = run_git_command(["pull", "--rebase"], repo_path, check=False)
-            if rrc != 0:
-                print(
-                    f"⚠️  git pull --rebase warning ({label}): {_scrub_credentials(routput)}",
-                    file=sys.stderr,
-                )
 
     print(
         f"❌ git push failed after {PUSH_RETRIES} attempts ({label}): "
@@ -688,12 +901,68 @@ def claim_push_once(repo_path: Path, label: str = "work repo") -> tuple[str, str
     return CLAIM_PUSH_ERROR, output
 
 
+def _rel_to_root(path: Optional[Path], root: Path) -> Optional[str]:
+    """*path* spelled relative to the work-repo root, or None.
+
+    None for a path outside the root (and for no path at all), which stages
+    nothing rather than a string a commit would take literally — the rule
+    :func:`run_state.run_rel_for_dir_name` and :func:`specs_index.specs_rel_path`
+    already follow for the areas they own.
+    """
+    if path is None:
+        return None
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def _memory_rel_paths() -> list[str]:
+    """Both memory scopes, from the module that owns them.
+
+    Imported at call time, not at module import: ``work_repo.memory`` imports
+    this module, so a top-level import here would close the cycle (the same
+    local-import convention ``specs_index`` uses for ``run_state``).
+    """
+    from .memory import memory_write_rel_paths  # local: memory imports this module
+
+    return memory_write_rel_paths()
+
+
 def commit_work_changes(commit_message: Optional[str] = None) -> int:
     """
-    Commit and push the current task-target directory in the work repo.
+    Commit and push everything this session writes into the work repo.
 
-    Builds the path ``{host}/{project}/{task_type}/{task_target}`` from the
-    environment and delegates to :func:`commit_work_path`.
+    The batching commit behind ``work commit``. Every path is asked of the
+    helper that OWNS it rather than composed from the ``{host}/{project}``
+    env trio, so the list follows the FORM of the tree (issue #353 D20) and
+    can never name a directory the writers do not use.
+
+    Both forms stage the run record (:func:`run_state.run_rel_path_candidates`
+    — the resolved dir plus the address a rename vacated) and the specs index
+    (:func:`specs_index.specs_rel_path`). The two ends differ:
+
+    * a LEGACY tree also stages ``{host}/{project}/{task}/{target}``, where
+      log and report output predating the run-dir unification (issue #87 D4)
+      may still sit. Schema form has no such directory — the record is a
+      session dir under ``_runs/<slug>/`` (D22) and nothing writes a
+      task-target path — so staging one there would name a directory that
+      does not exist.
+    * a SCHEMA tree also stages both memory scopes
+      (:func:`memory.memory_write_rel_paths`). D17 splits memory in two and
+      the instance scope lives at the plexus ROOT, outside every project
+      dir, so no other path in this list can reach it. That scope is shared,
+      so this can carry another launch's freshly persisted memory along —
+      the same many-concurrent-writers property the run area already has,
+      and pushing it beats losing it when an ephemeral container exits. A
+      legacy tree has ONE scope and keeps staging exactly what it staged
+      before: memory there is ``work memory persist``'s own push.
+
+    Refuses (1) when nothing resolves a project dir — an unset launch context
+    in a legacy tree, an unreadable manifest in a schema one — naming the
+    reason it actually has (:func:`~work_repo.utils.no_run_context_error`). A broken registry
+    is NOT that case: it resolves the host bucket (D9) and the commit
+    proceeds there.
 
     Args:
         commit_message: Optional commit message (defaults to auto-generated)
@@ -701,26 +970,28 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
-    repo_host = os.environ.get("LMER_REPO_HOST")
-    repo_project = os.environ.get("LMER_REPO_PROJECT")
-    task_type = os.environ.get("LMER_TASK", "default")
-    task_target = os.environ.get("LMER_TASK_TARGET", "default")
-
-    if not repo_host or not repo_project:
-        print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+    layout = work_repo_layout()
+    if layout.base is None:
+        print(no_run_context_error(), file=sys.stderr)
         return 1
 
-    # Sanitize task_target to match directory structure
-    safe_task_target = sanitize_task_target(task_target) if task_target else "default"
+    paths: list[str] = []
 
     # Legacy task-target dir: log/report output predating the run-dir
-    # unification (issue #87 D4) may still sit here — keep staging it.
-    target_path = f"{repo_host}/{repo_project}/{task_type}/{safe_task_target}"
+    # unification (issue #87 D4) may still sit here — keep staging it, in the
+    # form that has it. `task_target_dir` applies the same LMER_TASK /
+    # LMER_TASK_TARGET defaults and the same `sanitize_task_target` this used
+    # to apply inline, so the legacy string is unchanged.
+    if not layout.is_schema:
+        legacy_target = _rel_to_root(task_target_dir(), layout.root)
+        if legacy_target is not None:
+            paths.append(legacy_target)
 
     # The run dir itself: the resolved (possibly renamed) dir plus the
     # bare-slug dir, so a rename whose own push failed still gets its old
-    # path's deletions staged (commit_work_path skips clean paths).
-    paths = [target_path]
+    # path's deletions staged (commit_work_path skips clean paths). In schema
+    # form the bare address is the `_runs/<slug>/` group, which holds every
+    # session of the run.
     for rel in run_rel_path_candidates():
         if rel not in paths:
             paths.append(rel)
@@ -732,6 +1003,12 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     if specs_rel and specs_rel not in paths:
         paths.append(specs_rel)
 
+    # Both memory scopes (D17), schema form only — see the docstring.
+    if layout.is_schema:
+        for rel in _memory_rel_paths():
+            if rel not in paths:
+                paths.append(rel)
+
     return commit_work_path(paths, commit_message)
 
 
@@ -741,15 +1018,16 @@ def commit_napkin_if_subdir(commit_message: Optional[str] = None) -> int:
 
     The inverse of :func:`push_napkin_if_separate`: in subdir mode
     ``LMER_NAPKIN_PATH`` resolves under ``LMER_WORK_REPO_PATH``, but the
-    work-repo commit (:func:`commit_work_changes`) stages only the task-target
-    and run-dir paths — napkin sits at the work-repo root, so without this
+    work-repo commit stages only the paths this session's own work lands in
+    (:func:`commit_work_changes`) — napkin is not one of them in either form,
+    and it sits at the work-repo root, so without this
     step notes written there are never committed and are silently lost when
     an ephemeral container exits. Stages and pushes just the napkin subdir
     via :func:`commit_work_path`.
 
-    Returns 0 when there is nothing to do or the commit succeeds; the failing
-    git exit code otherwise. Callers treat any failure as a warning — napkin
-    capture must never block the worklog commit.
+    Returns 0 when inapplicable or publication is verified; otherwise nonzero.
+    A clean applicable path still checks the remote. Callers warn on failure;
+    napkin capture must never block the worklog commit.
     """
     napkin_path_str = os.environ.get("LMER_NAPKIN_PATH")
     if not napkin_path_str:
@@ -773,8 +1051,8 @@ def commit_napkin_if_subdir(commit_message: Optional[str] = None) -> int:
 def report_uncommitted_work_items() -> int:
     """Flag items left uncommitted in the work repo after a ``work commit``.
 
-    ``work commit`` stages only the run dir and legacy task-target dir (see
-    :func:`commit_work_changes`), so a file added elsewhere — e.g. a new
+    ``work commit`` stages only the paths :func:`commit_work_changes` composes
+    for this session's form, so a file added elsewhere — e.g. a new
     ``{host}/{project}/info/*.md`` — is silently left behind (issue #85). This
     runs a repo-wide ``git status --porcelain --untracked-files=all`` and prints
     one ⚠️ block naming the untracked/unstaged entries so the user notices them.
@@ -833,12 +1111,10 @@ def push_napkin_if_separate(commit_message: Optional[str] = None) -> int:
     lives *outside* ``LMER_WORK_REPO_PATH``. In subdir mode (napkin under the
     work repo) the work-repo commit already captures it, so this is a no-op.
 
-    Uses the same commit-FIRST ordering as :func:`commit_work_path` — stage
-    and commit locally, then integrate the remote with ``pull --rebase`` and
-    push with rebase-between-attempt retries (a shared team napkin repo has
-    concurrent writers by design; a plain ``git pull`` refuses on a dirty
-    tree and a single unretried push loses races). Returns 0 when there is
-    nothing to do or the push succeeds; the failing git exit code otherwise.
+    Uses the same commit-first ordering and verified publication as
+    :func:`commit_work_path`. Returns 0 when inapplicable or publication is
+    verified, including clean retries; missing upstream and network errors
+    return nonzero.
     Callers treat any failure as a warning — napkin push must never block
     the worklog commit.
     """
@@ -854,18 +1130,17 @@ def push_napkin_if_separate(commit_message: Optional[str] = None) -> int:
     if napkin_path == work_repo_path or work_repo_path in napkin_path.parents:
         return 0
 
-    # 1. Stage first — committing before any pull keeps the tree clean for
-    # the rebase below (a dirty tree makes `git pull` refuse outright).
-    print("➕ Staging all changes in napkin repository...")
-    rc, output = run_git_command(["add", "-A"], napkin_path, check=False)
+    rc = check_commit_ready(napkin_path, "napkin")
     if rc != 0:
-        print(f"⚠️  git add failed (napkin): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
 
-    rc, status_output = run_git_command(["status", "--porcelain"], napkin_path, check=False)
+    print("➕ Staging all changes in napkin repository...")
+    rc, status_output = _stage_and_check(napkin_path, [], "napkin")
+    if rc != 0:
+        return rc
     if not status_output.strip():
-        print("✅ No changes to commit in napkin repository")
-        return 0
+        print("No new file changes to commit in napkin repository")
+        return _push_pending_commits(napkin_path, "napkin")
 
     # 2. Commit
     if commit_message is None:

@@ -1,5 +1,8 @@
 # Platform quickstart
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 Get the lmer platform — the web control plane for a fleet of lmer sessions,
 with its supervising assistant ("uber lmer") — running on a host in a few
 minutes. The full reference for a container deploy is
@@ -107,8 +110,9 @@ curl -X POST -H "Authorization: Bearer $(lmer platform secret)" \
     http://127.0.0.1:7180/api/assistant/rotate
 ```
 
-Standing orders and the handover note survive a restart; only the
-conversation window is lost.
+Standing orders, the handover note, and the visible conversation survive a
+restart. The replacement assistant starts with a fresh model context and can
+consult relevant prior exchanges when context is missing.
 
 ## Using it
 
@@ -127,11 +131,27 @@ conversation window is lost.
   replying to a *live* one is delivered into the waiting session.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
+- **Wound down, not crashed** — a dead session's leftover registry entry is
+  normally the only evidence that something died, so the fleet reads it as a
+  crash. The exception is an ending the operator asked for: a wind-down leaves a
+  record on the entry and then ends exactly as asked, with no reaper to clear it,
+  and such a row reads `dormant` with no attention badge (#324). Two facts decide
+  it, not one — the recorded request, *and* the absence of a bad exit a watcher
+  saw. A session wound down at 09:00 and OOM-killed at 09:04 is still a crash,
+  and the detail view names the status that watcher saw. Where nobody watched (a
+  re-attached session, or one `lmer platform spawn` started) there is no such
+  record either way, which is the case the wind-down mark is allowed to speak
+  for. A corrupt or truncated `exited` record counts as a bad exit rather than as
+  none: mislabelling a wound-down run costs a badge an operator can dismiss,
+  while the other direction retires a death nobody is ever told about. The
+  daemon's sweep clears these entries, since the UI's "clear crashed sessions"
+  card only renders on a crashed row.
 - **uber lmer** — the supervising assistant. It hears attention changes and
   session milestones (`lmer-signal`), can spawn/answer/wind-down runs on
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
-  drawer when needed.
+  drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
+  remains available across rotations, reloads, and daemon restarts.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
   view. Details worth knowing:
@@ -153,6 +173,12 @@ conversation window is lost.
     substitution, not a markdown parse: it does not know what a code span is, so
     a reference written *as an example* is reduced too. An escaped `\[` is left
     alone, as is a label containing brackets.
+  - **One grammar, two languages.** The key and the reference are spelled by
+    `src/lmer_cli/runref.py` and `web/src/runref.js`, with one corpus run
+    through both by `tests/test_runref_grammar.py`. Splitting a key is
+    deliberately permissive (an argument the daemon should refuse by name),
+    matching a reference deliberately anchored (it decides whether a link is
+    live).
   - Web-only: it reaches you after a bundle build and a UI image roll.
 - **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
   run list, the content and uber lmer's drawer — in a 1620px band in the middle of
@@ -172,13 +198,33 @@ conversation window is lost.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
 - **uber lmer settings** — how its session is *run* (model, harness, preset,
-  agents fan-out), per platform instance: the settings entry in the drawer's
+  agents fan-out, Slack/matrix threads), per platform instance: the settings entry in the drawer's
   overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
   layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
   dialog persists to `config.json`, and the dialog says so). Changes apply to
   the **next** incarnation — the running one keeps its context window until
   you restart it, and the dialog offers the restart. Standing orders are the
-  chat's to edit and are deliberately not in this dialog.
+  chat's to edit and are deliberately not in this dialog. Thread permalinks go
+  one per line; save and rotate to connect. The saved list survives rotations.
+  The dialog also holds the chat pane's **Show uber lmer's working transcript**
+  switch: off (the default) the pane draws the conversation only — your
+  messages, and what uber lmer posted, asked and answered; on, its tool calls,
+  watch events, hook re-prompts and unposted working notes appear muted beside
+  them. Platform state (`chat_show_transcript` in `config.json`): the browser
+  that saved it switches at once, and every other open drawer follows on its
+  next status poll. `docs/COMMS.md` §4 has the table of what each view draws.
+  Workers accept the same links through `POST /api/sessions` (`targets`) or
+  repeatable `lmer-ctl spawn --target-thread` flags. See
+  [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
+- **Thread icons** — every run row, the run view header and the uber lmer chat
+  pane header carry two small icons, Slack and matrix. A dim one opens a
+  one-field prompt for a thread permalink; a coloured one names the threads on
+  hover, carries a count when there is more than one, and offers a link and a
+  disconnect for each. Connecting and disconnecting happen **while the session
+  runs** — nothing restarts — and doing it on uber lmer also moves its standing
+  `threads` setting, so the connection survives a rotation. A run with no live
+  session shows what it was connected to and offers no new connection. The same
+  three calls are `lmer-ctl threads list|connect|disconnect`.
 - **A message that never settles** — a message you sent is shown as a bubble until
   the harness writes that turn into its transcript, which is how a queued message
   stays visible. When one gets stuck there — a transcript gap, which is a bug rather
@@ -190,10 +236,12 @@ conversation window is lost.
   be forgotten from their card (undo window; nothing on disk is touched).
 - **Service slots** — named single-occupancy bindings from a runner to a dev
   service on this host, declared under `slots` in `config.json` and shown as a
-  row each under the runs list. The spawn dialog's picker offers the free ones;
-  `lmer-ctl spawn … --slot <name>` takes one from a shell. Occupancy is derived
-  from live sessions, so a slot frees when its session's process ends and a
-  crash cannot strand one. Full reference:
+  row each under the runs list. Declare, edit and remove them from that section;
+  the spawn dialog's picker offers the free ones, and
+  `lmer-ctl spawn … --slot <name>` takes one from a shell. Changes apply on the
+  next poll — nothing is restarted. Occupancy is derived from live sessions, so
+  a slot frees when its session's process ends and a crash cannot strand one.
+  Full reference:
   [SERVICE-MODE.md](SERVICE-MODE.md#service-slots-several-agents-one-dev-stack).
 - **"stopped responding"** — a run whose session is up but whose agent stopped
   producing anything, with no stop recorded by the run itself. That is what a
@@ -236,10 +284,137 @@ conversation window is lost.
   config fields take effect; there is no migration, and an existing
   `config.json` without them takes the defaults.
 
+- **Stuck teardown** — after the supervisor acknowledges an end request, a
+  launcher that stays alive while its control plane continuously fails to
+  respond is shown as **stuck teardown**. The assistant gets one digest naming
+  the session, including its id in the digest's structured data. The daemon
+  does not terminate it automatically; the operator or orchestrator decides
+  whether to use exit. Wind down alone does not start this timer.
+
+  Before typing quit, the supervisor allows up to six seconds for the daemon
+  to confirm the acknowledgment over the authenticated bus. The API stays up
+  through this bounded handoff even if the harness exits naturally first. This
+  covers the daemon's five-second subscription reconciliation cycle. Without
+  authenticated delivery to the daemon, shutdown proceeds and the detector
+  remains unarmed.
+  Container-written files cannot arm it. The subscriber identifies the platform
+  session; the work-session id in the record stays intact.
+
+  `LMER_PLATFORM_STUCK_TEARDOWN_SECONDS` overrides `stuck_teardown_seconds` in
+  `~/.lmer/platform/config.json`; the default is **60** seconds. Accepts positive
+  integers; zero, negative values and malformed values are refused. A blank
+  environment value falls through to the config file. Restart the daemon after
+  changing it, as with the halt-detection thresholds above.
+
+  Timing starts at the first failed control-plane sample after acknowledgment.
+  The detector samples every 30 seconds, so the warning appears on the first
+  tick at or beyond the configured grace. An HTTP response, including an HTTP
+  error, clears the loss interval. Missing local probe credentials cannot prove
+  connection failure and also clear the interval.
+
+  This is the safety net for shutdown. The supervisor first asks the harness to
+  quit, allows 10 seconds, sends SIGTERM, allows another 10 seconds, then sends
+  SIGKILL. A blocked PTY writer cannot delay this ladder. It reaps the harness
+  before stopping the control plane, including when the PTY closes early or a
+  descendant retains it. Transient tiny host dimensions preserve the previous
+  terminal size; a headless session starts at 80 columns by 24 rows.
+
+  Upgrade the session image, daemon, and UI bundle together. Existing sessions
+  from older images do not publish the acknowledgment needed by this detector.
+
 - **Digest nudges** — the daemon spools digests for uber lmer, and nothing reads
   that spool until uber lmer takes it. When digests sit there while the session
   is quiet, the daemon types one reminder into it. Defaults: one digest, three
   minutes. Full behaviour in the section below.
+
+- **Context-fullness reminders** — when uber lmer's own status line reports that
+  its context window has reached a threshold the operator set, the daemon
+  recommends a rotation at its next breakpoint. Off by default; it never rotates
+  anything itself. Full behaviour in the section below.
+
+## Assistant mentions and DM replies
+
+The daemon owns Slack and Matrix ingress for the assistant. Enable
+`LMER_ASSISTANT_MENTION_ROUTING=true` in its environment or `~/.lmer/.env`, set
+the transport credentials and sender allow-lists below, and restart the daemon
+once. Stop any standalone `lmer-slack-listener` or `lmer-matrix-listener`: they
+are legacy entry points and are not needed here. Running a second Socket Mode
+consumer can split Slack delivery between processes.
+
+Ingress adds requests to the assistant's private inbox. It never starts an
+`lmer chat` session. The assistant answers or starts a worker under the
+operator's run-start policy. A mention does not automatically start an offline
+assistant. See [admission and reply rules](./ASSISTANT-MENTIONS.md), including
+connected-run ownership and the exact assistant-parent requirement for DMs.
+
+### Slack app requirements
+
+Slack uses [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
+the same transport as the legacy listener. This avoids enumerating and polling
+every channel for mentions and needs no public HTTP endpoint.
+
+- Set `SLACK_BOT_TOKEN` to the installed bot token and `SLACK_APP_TOKEN` to the
+  app-level token with `connections:write`, for the same app/workspace.
+- Enable Socket Mode and subscribe to bot events `app_mention` and `message.im`.
+- Grant `app_mentions:read` and `im:history`, plus the existing history scopes
+  for context reads (`channels:history` for public channels and `groups:history`
+  for private channels). Keep `chat:write` for replies and `im:write` to start
+  assistant DMs. Reinstall the app after changing its granted scopes.
+- Invite the bot to the channels where it should receive mentions. Membership
+  still controls access to history; `not_in_channel` in the daemon log identifies
+  a refused context read.
+- Set `LMER_SLACK_DM_ALLOWED_USERS` to permitted Slack IDs or confirmed handles.
+  Unset or empty admits nobody, including channel mentions. Handle entries need
+  `users:read`; exact IDs avoid that lookup.
+
+### Matrix account requirements
+
+Set `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID` and
+`LMER_MATRIX_ACCESS_TOKEN` for the existing bot account. Set
+`LMER_MATRIX_ALLOWED_USERS` to permitted exact MXIDs; unset or empty admits
+nobody. `LMER_MATRIX_ROOMS` optionally selects rooms to join and sync; otherwise
+the daemon syncs all rooms the bot has joined. Room aliases are resolved by the
+join response before they enter the sync filter. The first sync establishes a
+cursor and ignores historical events; reconnects retain that cursor until the
+daemon restarts. Encrypted rooms retain the existing transport limitations.
+
+A failed selected-room join logs the room and error code and retries after
+30 seconds. Successfully selected rooms continue to sync. If none of the
+selected rooms can be joined, ingress reports `retrying` and waits for a join
+to succeed; it never falls back to syncing all joined rooms.
+The first sync after a selected room joins excludes that room's initial history.
+Other selected rooms keep receiving fresh events, and reconnects retain this
+per-room initialization state along with the cursor.
+
+### Ingress health and failures
+
+`GET /api/health` includes `ingress.slack` and `ingress.matrix`. Each contains
+`up`, `state`, `last_event_at`, and `last_error`. These are local snapshots;
+reading health never calls Slack or Matrix. The fleet UI's **Assistant message
+ingress** panel shows the same state, last event time and last error.
+
+`up` means the Socket Mode connection is live or Matrix sync succeeded.
+`last_event_at` records receipt of an event, including refused events, rather
+than the last empty poll. `last_error` retains the most recent error after
+recovery, and is empty until a failure occurs. Times/errors reset at daemon
+startup; inbox replay receipts remain durable.
+
+Disabled routing reports `disabled`. No credentials reports `unconfigured`;
+partial credentials reports `misconfigured` and names the missing variables.
+One transport failing does not stop the other or the API. Initial failures retry
+with bounded backoff; Socket Mode also reconnects through its SDK. Check the
+app's subscriptions and channel membership when ingress is up but no event
+arrives: connection health cannot verify an event the app never sends.
+
+Every received event that is not admitted produces an `assistant_ingress_dropped`
+daemon log record with its transport, identifiers and reason, such as `denied`,
+`connected`, `unmatched_dm_parent`, `duplicate`, or `not_in_channel`. Message
+bodies are not logged. Disabled submissions through the external API log
+`disabled`. Transport failures also update health; limited Matrix sync timelines
+log `limited_sync` because events may have been omitted by the homeserver.
+There is no durable ingress outbox: after a failed admission, mention again
+once the cause is fixed. External host listeners may still submit authenticated
+`POST /api/assistant/requests` events through the same admission rules.
 
 ## Digest nudges
 
@@ -329,6 +504,32 @@ outage that stops it recording a nudge also stops uber lmer draining the spool �
 without that memory, an unwritable `assistant.json` turned the interval into the
 30-second tick.
 
+### Confirming a crash
+
+A `crashed` digest claims two things: that a session died, and that its run
+committed nothing. The second half is read off the work-repo mirror, and a
+detection tick deliberately does *not* pull it — so a run that pushed its final
+state and exited inside the throttle window looks exactly like one that never
+pushed at all, and was announced as a death with its work declared lost (#324).
+
+The claim is therefore re-read against a mirror forced to catch up, and only
+when such a signal is fresh in that tick's diff — never on a tick that found a
+crash standing, and never on one that found none. `work_repo_pull_interval`
+keeps its meaning for all the traffic the confirmation is not for.
+
+What the forced read costs, because it is what the next reader will budget
+against: a second whole `build_state`. That is the fetch in `list_tracked()`, a
+`resolve_run_dir` per tracked run, the titles, the ask channel and the check-in
+fold — plus, since no `activity` mapping is handed in, one control-plane HTTP
+read per *live* session at `ACTIVITY_TIMEOUT_SECONDS` each. On a busy fleet with
+a few unreachable containers that roughly doubles the tick and can push it past
+the detection interval. It is the right trade on an event this rare, and worth
+knowing before a second such read is added.
+
+A confirmation that fails delivers the crash anyway: the absence may be real,
+and a mirror that will not answer is the worst moment to go quiet about a
+session that died.
+
 ### Configuration
 
 | variable | default | what it sets |
@@ -355,6 +556,209 @@ no migration — the three state fields are additive and tolerate absence — an
 image rebuild or container passthrough, since the daemon reads both settings
 itself. A host that does not want the feature sets the interval to `0`.
 
+## Context-fullness reminders
+
+uber lmer fills its context window over a working day, and it cannot see its own
+fullness as a threshold — the figure exists, but reading it means asking the
+platform about itself on a schedule, which is the polling the whole design keeps
+out of the assistant's turns. So the daemon holds the number.
+
+Set `rotation.context_threshold` (a percentage, `0` is off and is the default)
+and on each detection tick the daemon compares it against what uber lmer's own
+harness publishes on its status line. When the reading reaches the threshold it
+types **one sentence** into that session, over the same input path the digest
+nudge uses — including that path's harness-specific delivery: on a codex
+assistant a reminder the native adapter refuses is not marked as sent, and the
+next tick asks again under the same delivery id, which the adapter replays only
+if it never submitted the first one:
+
+```
+[lmer platform] Your context window is at 71 percent and this host's rotation
+threshold is 70 percent. This is an automatic reminder from the daemon, not the
+operator, and it is not a new task: nothing has been rotated and nothing will be
+without you. Finish what is in front of you, then rotate yourself at the next
+clean breakpoint ...
+```
+
+**Nothing here rotates anything.** The daemon recommends; uber lmer decides, and
+what a good breakpoint is lives in the `orchestrate` taskdef — no open question of
+its own, no digest taken and not yet acted on, no half-finished brief, and never
+mid-decision. A daemon that rotated on a number would end a context window in the
+middle of the operator's sentence.
+
+### When a reminder fires
+
+All six, or nothing is typed:
+
+| condition | why it is there |
+|---|---|
+| the threshold is non-zero | `0` is the off-switch, and the only one |
+| an assistant is running | there is otherwise no session to type into |
+| its harness published a `context.percent` | the reading is the harness's, and not every harness has one |
+| the reading is not older than 10 minutes | a reading is a fact about a moment, and a publisher that has stopped must not keep recommending on an hour-old figure |
+| the reading is **at or above** the threshold | 70 is the number the operator asked to hear about, so reaching it is reaching it |
+| no reminder went to this session in the last 15 minutes | the repeat window |
+
+The reading is `context.percent` from [SESSION-STATUS.md](./SESSION-STATUS.md):
+the percentage of the window **used**, `0`–`100`. Its age is the reading's own
+where the harness dates it and the document's otherwise — a status line that
+re-publishes a figure it can no longer refresh would otherwise look permanently
+fresh.
+
+**The age bound is also why a reminder lands while uber lmer is working.** A
+status line is published when the harness renders one, which does not happen
+while a session sits idle at its prompt — so an assistant that has been idle for
+longer than the bound has no usable reading and is told nothing until it is
+active again, and then within a tick. That is the opposite of the digest nudge,
+which exists to reach an idle session, and it is the right way round for this
+one: what the reminder asks for is a decision at a breakpoint, and a session with
+no turn in progress has no breakpoint to take it at. Where a harness publishes none
+the daemon says so **once per incarnation** — one
+`platform_assistant_rotation_unreadable` log line and one
+`assistant_rotation_unreadable` record in `events.jsonl` — and then stays quiet,
+rather than alerting on a figure it does not have. Codex and pi status-line parity
+is tracked separately.
+
+### Delivery, and why a reminder can be attempted more than once
+
+The line travels the same input path as the digest nudge, which means it inherits
+that path's harness-specific delivery. On a **codex** assistant the native
+adapter is the transport, and three of its properties decide what the daemon may
+record:
+
+- A refusal is not an exception. The adapter answers 200 carrying
+  `state: rejected` or `uncertain` and there is no fallback to terminal
+  submission, so a reminder is only ever marked once the adapter reports the
+  model actually took it.
+- `uncertain` means the submission may have landed. It is never replayed and
+  never recorded as a recommendation — an unknown outcome is not evidence that
+  anyone was told.
+- Receipts are keyed on a delivery id, and **reusing an id with different text is
+  refused outright**. So one reminder attempt is one id and one frozen sentence:
+  a retry after a refusal re-offers byte-identical prose under the same id, and a
+  new crossing or a new repeat window gets an id of its own.
+
+A consequence worth knowing when reading a reminder that arrives late: it reports
+the percentage that *triggered* it, which may be a point or two below the reading
+by the time it lands.
+
+### One reminder per crossing, and the window
+
+The reminder repeats at most every 15 minutes while the reading stays at or above
+the threshold, for the digest nudge's reason: the input path proves the bytes
+reached the control plane and cannot prove the harness registered the Enter that
+submits them, so the remedy for a lost reminder is the repeat rather than a claim
+that it landed.
+
+The 15 minutes is **not** configurable. The group has one knob deliberately: what
+an operator tunes is the percentage they want to hear about, and the interval is a
+property of what the reminder is — a recommendation about a decision taken at a
+breakpoint, not a wake-up about work waiting.
+
+If the reading falls back below the threshold — a compaction, a fresh
+incarnation — the window ends with it, so the *next* crossing is announced
+immediately instead of a quarter of an hour later. The bookkeeping is the daemon's
+own memory, keyed on the session it typed into, so a rotation never inherits a
+window and a successor is never held quiet by a reminder its predecessor received.
+A daemon restart while a reading sits above the threshold costs one extra
+reminder, which is the whole price of not storing it.
+
+### Reserved assistant capacity
+
+`max_concurrent_sessions` limits **workers**. uber lmer has one additional,
+reserved place: with a limit of eight, eight workers and one assistant may run
+at the same time. A full worker pool does not prevent assistant startup or
+replacement, and starting or rotating the assistant does not free a place for
+a ninth worker. The worker occupancy remains 8/8 during that rotation.
+
+This applies to `POST /api/assistant/start`, operator-initiated
+`POST /api/assistant/rotate`, self-rotation through `lmer-ctl rotate`, and the
+supervisor's startup and recovery paths. They share the same launcher, which
+applies the worker limit only to worker launches. Worker launches through
+spawn, answer, and resume remain subject to that limit, including workers
+requested by the assistant. The reservation follows the server-selected session
+kind; naming the `orchestrate` task does not grant it.
+
+The existing assistant lifecycle lock and live registry check still prevent
+duplicate assistants: a second start returns HTTP 409. Rotation stops the old
+assistant before publishing its successor, without stopping any worker. The
+successor inherits the handoff and pending updates; retained
+[conversation history](./ASSISTANT-HISTORY.md) links the generations. Old
+conversation text is not automatically inserted into the successor's context.
+
+Capacity admission still runs inside the shared launch lock, alongside request
+validation and publication safeguards. Reserved assistant capacity does not
+guarantee that a process can start when host resources or other launch
+requirements are unavailable. Configured **service slots** are a separate
+ownership mechanism and are unaffected.
+
+### Rotating uber lmer, and who may
+
+uber lmer can rotate **itself**:
+
+```sh
+lmer-ctl rotate --handoff -     # or --handoff-file PATH
+```
+
+That writes the handover through `POST /api/assistant/handoff` and then calls
+`POST /api/assistant/rotate`. The handover goes first on purpose: a rotation the
+daemon declines still leaves the note stored, so the operator's own rotate — or
+the supervisor's respawn after a crash — is as briefed as the planned rotation
+would have been.
+
+**The rotate call does not return.** The daemon ends that container to start the
+successor, so from inside it a dropped connection is what success looks like; the
+CLI reports it as a transport error and claims nothing, because a dropped
+connection is equally consistent with a daemon that died. The receipt is the
+successor: a fresh `generation` on `GET /api/assistant`, with `handoff` the note
+its predecessor wrote and the digest spool preserved for it.
+
+**Who may rotate is unchanged.** This adds a caller to an existing route, not a
+route and not a caller class: uber lmer's minted credential (#244) already opens
+what the operator's shared secret opens, and an unauthenticated rotate is still a
+401. The operator-initiated rotate — the chat drawer's restart, or the route by
+hand — is untouched.
+
+### Configuration
+
+| variable | default | what it sets |
+|---|---|---|
+| `LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD` | `0` (off) | the percentage of the context window at which a rotation is recommended |
+
+It also lives in `config.json` as `rotation_context_threshold` and on
+`GET`/`POST /api/assistant/config` under `rotation`, beside `checkin` and
+`nudge` — all three are re-read on every tick, so a change applies without a
+daemon restart and without a rotation. Precedence is the platform's usual chain:
+the export beats the file beats the default, and the value reports which layer
+decided it. The settings screen in the chat drawer edits all four numbers.
+
+`0` disables the reminder and is the only off-switch. The ceiling is `100`,
+because the figure it is compared against is itself a percentage clamped to 100 —
+a higher threshold could never be met and would be a second off-switch nobody
+documented. An unusable value costs its own layer with a warning and falls through
+to the next, rather than stopping the daemon over a reminder; an explicit write
+through the API is refused with a 400 naming the field.
+
+**On upgrade**, in this order, because three of the four moving parts live in
+different places:
+
+1. **Build or pull the matching session image.** `lmer-ctl` and the `orchestrate`
+   taskdef are baked into it (the repo is copied in at image build). The source
+   and taskdef mounts that make edits live are *developer mode only*, so on an
+   installed host an assistant from the old image has neither the `rotate` verb
+   nor the breakpoint instructions — however new the daemon is.
+2. **Restart the platform daemon** to run the new tick stage.
+3. **Rebuild the UI bundle** for the settings screen.
+4. **Replace the incumbent assistant.** A new image does not touch a running
+   session, and `ensure_running` deliberately keeps a live one — so rotate or
+   restart it through the usual operator path (the chat drawer's restart, or
+   `POST /api/assistant/rotate`) before relying on the reminder. Until then the
+   daemon can recommend a rotation to a session that cannot perform one.
+
+Then set a threshold: the feature is off until an operator does. There is no
+migration — nothing new is stored — and no container passthrough, since the
+daemon reads the setting itself.
+
 ## uber lmer's memory
 
 The assistant's harness keeps an agent-memory directory — small fact files and an
@@ -380,9 +784,25 @@ every incarnation instead.
   across many incarnations is worth investigating. It is *not* a liveness check —
   a store that already holds files keeps reporting them even if the harness stops
   reading the path (that path is the harness's own encoding of its working
-  directory, which nothing promises). The authoritative answer is in the session's
-  own log, where the container entrypoint prints either `🔗 Linked <path> → …` or a
-  `⚠️` line naming why it could not.
+  directory, which nothing promises).
+- **Liveness is a separate field, and it comes from the container.** The entrypoint
+  linker leaves a `.lmer-mount-link` record in the staged store saying whether it
+  made the symlink and, if not, why; `GET /api/assistant` serves it as the `link`
+  block beside the counts. That is what makes `files: 0` diagnosable: with
+  `link.linked` true it means "linked, nothing saved yet", with it false the
+  `detail` names the obstruction, and `link: null` means no incarnation has left
+  the fact — a session image older than the marker, or a store nothing has used.
+  The session's own log still prints `🔗 Linked <path> → …` or a `⚠️` line, and the
+  record is that line made durable and machine-readable. The marker is not counted
+  among the store's files.
+- **`link.stale` says whether the record is *this* incarnation's.** Only a session
+  that ran the linker rewrites it, so one whose image predates the marker — or
+  whose memory directory could not be prepared — leaves the previous
+  incarnation's answer in place. `true` means the record predates the running
+  session and describes a link it did not make; `null` means the question cannot
+  be asked (no record, or nothing running). Several harnesses can declare a
+  memory path and share one store, and a success is never downgraded by a later
+  pair, so `linked: true` means *something* linked it, not that everything did.
 - **How it gets in, and why not more simply.** The host directory is bound at a
   staging path (`~/.lmer-mounts/assistant/memory`) and the container entrypoint
   symlinks the harness's own memory path to it. It is not bound at that path

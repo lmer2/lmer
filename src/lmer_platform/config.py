@@ -70,23 +70,32 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import stat
 import subprocess
 import threading
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 # One definition of the credential scrub, imported rather than reimplemented —
 # the same trade :mod:`lmer_platform.workrepo` makes, and it says why there.
 from lmer_cli.container.clone_and_exec import _scrub_credentials
-from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
+from lmer_cli.runtime import (
+    CPUS_HINT,
+    MEMORY_HINT,
+    RuntimeErrorDetect,
+    detect_runtime,
+    _valid_cpus,
+    _valid_memory,
+)
 # The token lookup's own host parser: the issuing-host default seeded below has
 # to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
 from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
+from lmer_cli.comms import DEFAULT_TERMINAL_CONFIRM_SECONDS, TERMINAL_CONFIRM_ENV
 
 # Module level, deliberately: this used to be a function-local import explained as
 # laziness for importability, which defended a cycle that does not exist —
@@ -94,6 +103,7 @@ from lmer_cli.util import get_bool_env
 # here (!272 review). The type table lives with the code that sniffs bytes; this
 # module only needs to know which names are checkable.
 from .uploads import KNOWN_TYPES
+from .thread_targets import validate_thread_targets
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
 # :func:`work_repo.git_ops.forge_web_url` knows how to build paths for, and a
@@ -104,10 +114,18 @@ from .store import (
     StoreError, ensure_state_dir, read_json, platform_dir, snapshot_path,
     write_json,
 )
+from .project_context import assistant_dir
+from . import project_context
 
 logger = logging.getLogger("lmer_platform.config")
 
+CONNECTORS_DIRNAME = "connectors"
+_CONNECTORS_MEMO: tuple = (None, {})
+_CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
 __all__ = [
+    "TERMINAL_SETTING_KEYS", "terminal_settings",
     "ConfigError", "PlatformConfig", "CONFIG_FILENAME", "SECRET_FILENAME",
     "DEFAULT_BIND_ADDRESS", "DEFAULT_BIND_PORT", "ENV_REPO_URL",
     "ENV_WORK_REPO_FORGE", "WORK_REPO_FORGE_NONE", "WORK_REPO_FORGE_VALUES",
@@ -115,19 +133,27 @@ __all__ = [
     "DOCKER_BRIDGE_INTERFACE", "ContainerReach", "config_path",
     "load", "save", "read_secret", "ensure_secret", "active_secret",
     "ASSISTANT_CREDENTIAL_FILENAME", "assistant_credential_path",
+    "CONNECTORS_DIRNAME", "connectors_dir", "connector_path",
+    "mint_connector_credential", "revoke_connector_credential",
+    "list_connectors", "active_connectors",
     "mint_assistant_credential", "active_assistant_credential",
     "revoke_assistant_credential",
-    "binding_notice", "configured_repo_url", "container_base_url",
+    "binding_notice", "configured_repo_url", "container_base_url", "control_ui_url",
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
+    "ASSISTANT_RESOURCE_KEYS", "assistant_resource_settings",
+    "ENV_ASSISTANT_MEMORY", "ENV_ASSISTANT_CPUS",
     "update_stored", "validate_assistant_override",
     "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
     "ENV_CHECKIN_WINDOW", "checkin_settings", "validate_checkin_window",
     "INT_SETTINGS", "NUDGE_SETTING_KEYS", "DEFAULT_NUDGE_AFTER_SECONDS",
     "DEFAULT_NUDGE_PENDING_THRESHOLD", "ENV_NUDGE_AFTER_SECONDS",
     "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
+    "BOOL_SETTINGS", "validate_bool_setting",
+    "ROTATION_SETTING_KEYS", "DEFAULT_ROTATION_CONTEXT_THRESHOLD",
+    "ENV_ROTATION_CONTEXT_THRESHOLD", "rotation_settings",
     "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
     "DEFAULT_UPLOAD_TYPES", "DEFAULT_UPLOAD_MAX_BYTES", "MAX_UPLOAD_MAX_BYTES",
-    "upload_settings", "upload_types",
+    "upload_settings", "upload_types", "chat_settings",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
@@ -173,6 +199,13 @@ DEFAULT_NUDGE_AFTER_SECONDS = 180
 #: How many digests have to be waiting. 1 because everything in the spool is
 #: material by construction, so "there is one" is already the condition.
 DEFAULT_NUDGE_PENDING_THRESHOLD = 1
+
+#: How full uber lmer's context window may get before the daemon recommends a
+#: rotation (issue #446), as a percentage of the window. ``0`` turns the reminder
+#: off and is the only off-switch; the default is off, because the reading it
+#: needs is published by the harness and not every harness publishes one.
+#: Full mechanics: ``docs/PLATFORM-QUICKSTART.md``, "Context-fullness reminders".
+DEFAULT_ROTATION_CONTEXT_THRESHOLD = 0
 #: Ceiling on ``nudge_pending_threshold``: the spool it counts is bounded, so a
 #: higher threshold could never be met and would be an undocumented off-switch.
 #: :data:`lmer_platform.assistant.MAX_PENDING`, copied because that module imports
@@ -201,6 +234,7 @@ DEFAULT_STALL_IDLE_SECONDS = 600
 #: Silence past this raises the flag whatever the transcript says, so a halt the
 #: precise paths cannot recognise is found an hour late rather than never.
 DEFAULT_STALL_BACKSTOP_SECONDS = 3600
+DEFAULT_STUCK_TEARDOWN_SECONDS = 60
 
 ENV_BIND_ADDRESS = "LMER_PLATFORM_BIND_ADDRESS"
 ENV_BIND_PORT = "LMER_PLATFORM_BIND_PORT"
@@ -233,6 +267,7 @@ ENV_CONTAINER_URL = "LMER_PLATFORM_CONTAINER_URL"
 #: neighbours.
 ENV_STALL_IDLE_SECONDS = "LMER_PLATFORM_STALL_IDLE_SECONDS"
 ENV_STALL_BACKSTOP_SECONDS = "LMER_PLATFORM_STALL_BACKSTOP_SECONDS"
+ENV_STUCK_TEARDOWN_SECONDS = "LMER_PLATFORM_STUCK_TEARDOWN_SECONDS"
 
 #: How the orchestrating assistant's session is *run*, per platform instance
 #: (issue #234): the model, harness, preset and agents fan-out its ``lmer``
@@ -254,6 +289,29 @@ ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
 ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
+
+#: The supervising assistant's own container allocation (issue #453). It
+#: coordinates workers rather than running their test suites, so it has no use
+#: for whatever the worker defaults happen to be — and worker defaults move.
+#:
+#: Deliberately NOT in :data:`ASSISTANT_SETTING_KEYS`: those four are persisted
+#: in ``config.json`` and writable through ``POST /api/assistant/config``, while
+#: these resolve from the daemon's environment only and are reported read-only
+#: (the operator's call on this issue). They still travel as flags —
+#: ``--memory``/``--cpus`` on the assistant's own ``lmer`` invocation — for that
+#: table's reason: a flag beats the container's environment and a preset's env,
+#: so model or preset selection cannot discard the allocation.
+ENV_ASSISTANT_MEMORY = "LMER_PLATFORM_ASSISTANT_MEMORY"
+ENV_ASSISTANT_CPUS = "LMER_PLATFORM_ASSISTANT_CPUS"
+
+#: setting key -> (env var, validator, grammar). The validators are the CLI's
+#: own, so a value this accepts is one the spawned ``lmer`` accepts: the flag
+#: posture there is refuse-not-default, and an assistant that will not start
+#: because of a typo in an export is the failure this group must not have.
+ASSISTANT_RESOURCE_KEYS = {
+    "memory": (ENV_ASSISTANT_MEMORY, _valid_memory, MEMORY_HINT),
+    "cpus": (ENV_ASSISTANT_CPUS, _valid_cpus, CPUS_HINT),
+}
 
 #: The check-in window, per platform instance (issue #244) — how often to sweep
 #: what has gone quiet is a property of a host's fleet, not of a build.
@@ -301,6 +359,22 @@ NUDGE_SETTING_KEYS = {
     ),
 }
 
+#: The context-fullness reminder's one knob, per platform instance (issue #446).
+#: :data:`NUDGE_SETTING_KEYS`' group on the same terms: an integer the daemon
+#: reads on its own tick, never an argv token.
+ENV_ROTATION_CONTEXT_THRESHOLD = "LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD"
+
+#: setting key -> (PlatformConfig field, env var), as above.
+ROTATION_SETTING_KEYS = {
+    "context_threshold": (
+        "rotation_context_threshold", ENV_ROTATION_CONTEXT_THRESHOLD
+    ),
+}
+
+TERMINAL_SETTING_KEYS = {
+    "confirm_seconds": ("terminal_confirm_seconds", TERMINAL_CONFIRM_ENV),
+}
+
 
 @dataclass(frozen=True)
 class _IntSettingRule:
@@ -342,6 +416,30 @@ class _IntSettingRule:
 #: which raises: a daemon bound where nobody expects it beats one that will not
 #: start.
 INT_SETTINGS = {
+    "max_concurrent_sessions": _IntSettingRule(
+        default=DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1, floor_reason="at least one worker must be allowed",
+        log_key="platform_worker_cap_invalid", unit="workers", singular_unit="worker",
+    ),
+    "max_live_assistants": _IntSettingRule(
+        default=4, minimum=1, floor_reason="at least one assistant must be allowed",
+        log_key="platform_assistant_cap_invalid", unit="assistants", singular_unit="assistant",
+    ),
+    "terminal_confirm_seconds": _IntSettingRule(
+        default=DEFAULT_TERMINAL_CONFIRM_SECONDS,
+        minimum=1,
+        floor_reason="confirmation needs a positive window — disable the terminal tracker separately",
+        log_key="platform_terminal_confirm_invalid",
+        unit="seconds",
+        singular_unit="second",
+    ),
+    "chat_keep_last": _IntSettingRule(
+        default=0,
+        minimum=0,
+        floor_reason="the count cannot be negative — 0 disables chat auto-clear",
+        log_key="platform_chat_keep_last_invalid",
+        unit="entries",
+        singular_unit="entry",
+    ),
     "checkin_window_seconds": _IntSettingRule(
         default=DEFAULT_CHECKIN_WINDOW_SECONDS,
         minimum=0,
@@ -379,6 +477,23 @@ INT_SETTINGS = {
             "nudge_after_seconds=0 instead"
         ),
     ),
+    "rotation_context_threshold": _IntSettingRule(
+        default=DEFAULT_ROTATION_CONTEXT_THRESHOLD,
+        minimum=0,
+        floor_reason=(
+            "a percentage of the context window cannot be negative — 0 disables "
+            "the rotation reminder"
+        ),
+        log_key="platform_rotation_threshold_invalid",
+        unit="percent",
+        singular_unit="percent",
+        maximum=100,
+        ceiling_reason=(
+            "the reading it is compared against is a percentage clamped to 100, "
+            "so a higher threshold could never be met — disable the reminder "
+            "with rotation_context_threshold=0 instead"
+        ),
+    ),
     "upload_max_bytes": _IntSettingRule(
         default=DEFAULT_UPLOAD_MAX_BYTES,
         minimum=1,
@@ -400,14 +515,23 @@ INT_SETTINGS = {
     ),
 }
 
-#: setting key -> (PlatformConfig field, env var). The one table the loader,
+#: PlatformConfig field -> default, for the boolean settings. :data:`INT_SETTINGS`'
+#: three postures apply unchanged — warn-and-default inside ``load()``,
+#: warn-and-fall-through per layer, refuse an explicit write — and the API
+#: derives its accepted keys from this table as it does from that one.
+BOOL_SETTINGS = {
+    "chat_show_transcript": False,
+}
+
+#: setting key -> (PlatformConfig field, optional env var). The one table the loader,
 #: the resolver and the API routes all read, so a fifth setting is added in
-#: exactly one place.
+#: exactly one place. Threads have no environment layer.
 ASSISTANT_SETTING_KEYS = {
     "model": ("assistant_model", ENV_ASSISTANT_MODEL),
     "harness": ("assistant_harness", ENV_ASSISTANT_HARNESS),
     "preset": ("assistant_preset", ENV_ASSISTANT_PRESET),
     "agents": ("assistant_agents", ENV_ASSISTANT_AGENTS),
+    "threads": ("assistant_threads", None),
 }
 
 #: ``work_repo_forge``'s third value, which is not a forge: the operator saying
@@ -478,6 +602,7 @@ class PlatformConfig:
     #: assistant is not one of them — see
     #: :func:`lmer_platform.spawn._live_worker_count`.
     max_concurrent_sessions: int = DEFAULT_MAX_CONCURRENT_SESSIONS
+    max_live_assistants: int = 4
     # ``max_concurrent_assistant_spawns`` lived here, between the two caps it is
     # not. Retired by T75 rather than left standing: see the module docstring for
     # why an unattributable cap cannot be enforced, and what would have to become
@@ -487,6 +612,7 @@ class PlatformConfig:
     #: fire, and when silence alone is enough. ``0`` disables each.
     stall_idle_seconds: int = DEFAULT_STALL_IDLE_SECONDS
     stall_backstop_seconds: int = DEFAULT_STALL_BACKSTOP_SECONDS
+    stuck_teardown_seconds: int = DEFAULT_STUCK_TEARDOWN_SECONDS
     autonomous_default: bool = False
     park_idle_side: bool = False
     #: How the orchestrating assistant's session is run (issue #234) — see
@@ -501,6 +627,15 @@ class PlatformConfig:
     assistant_harness: Optional[str] = None
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
+    assistant_threads: Optional[list[str]] = None
+    chat_keep_last: int = 0
+    #: Whether the uber lmer chat pane draws the harness transcript — tool
+    #: calls, watch events, hook re-prompts, unposted prose — beside the
+    #: conversation (issue #488). Off, the pane draws bus records only. A pane
+    #: display setting like ``chat_keep_last``: no env var, read on config refresh.
+    chat_show_transcript: bool = False
+    #: Visual graph groups; read fresh for UI requests, independent of run ownership.
+    fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
     #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
     #: them into definitions and skips a malformed one with a warning; parsing
@@ -510,6 +645,13 @@ class PlatformConfig:
     #:
     #: No environment override, unlike every scalar above it: a JSON list in an
     #: env var is a footgun, and declaring slots is once-per-host file work.
+    #:
+    #: **This is the boot-time snapshot and decides nothing** (issue #256). The
+    #: daemon writes this field itself now, so every reader that must see the
+    #: current list goes through :func:`with_stored_slots` — which is also what
+    #: lets the editor resolve a *candidate* list through the same resolver. A
+    #: new ``slot_rows(config)`` on a long-lived config gets a stale answer with
+    #: nothing to warn it.
     slots: tuple = ()
     #: How long a run may go unchecked before the daemon spools a digest naming
     #: it (issue #244), in seconds. ``0`` disables check-in digests; see
@@ -519,6 +661,11 @@ class PlatformConfig:
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
     nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
     nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
+    #: How full the assistant's context window may get before the daemon types a
+    #: rotation recommendation into its session (issue #446), in percent. ``0``
+    #: disables it. See :data:`ROTATION_SETTING_KEYS` and :data:`INT_SETTINGS`.
+    rotation_context_threshold: int = DEFAULT_ROTATION_CONTEXT_THRESHOLD
+    terminal_confirm_seconds: int = DEFAULT_TERMINAL_CONFIRM_SECONDS
     #: What a file attached to a chat may weigh, and which types are accepted
     #: (issue #246). The type list is names, normalised and filtered against
     #: :data:`lmer_platform.uploads.KNOWN_TYPES` by :func:`_upload_types_value`;
@@ -607,7 +754,9 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     for name in (
         "work_repo_pull_interval",
         "max_concurrent_sessions",
+        "max_live_assistants",
         "max_followup_rounds",
+        "stuck_teardown_seconds",
     ):
         value = getattr(config, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -663,7 +812,16 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         usable = _int_setting_value(getattr(config, field_name), field=field_name)
         if usable != getattr(config, field_name):
             config = replace(config, **{field_name: usable})
-    return config
+    for field_name in BOOL_SETTINGS:
+        usable = _bool_setting_value(getattr(config, field_name), field=field_name)
+        if usable is not getattr(config, field_name):
+            config = replace(config, **{field_name: usable})
+    try:
+        groups = validate_fleet_groups(config.fleet_groups)
+    except ConfigError as exc:
+        logger.warning("platform_config_unusable field=fleet_groups error=%s", exc)
+        groups = []
+    return replace(config, fleet_groups=groups)
 
 
 def _slots_value(value: object) -> tuple:
@@ -830,7 +988,61 @@ def validate_checkin_window(value: object) -> int:
     return validate_int_setting("checkin_window_seconds", value)
 
 
-def _assistant_value(value: object, *, field: str) -> Optional[str]:
+def _coerced_bool(value: object) -> object:
+    """*value* as a bool when it is one written down, else unchanged.
+
+    ``"true"``/``"false"`` (any case) are what a hand-edited file or an export
+    would carry; a JSON body carries the bool itself. Nothing looser: ``1``,
+    ``"yes"`` and ``"on"`` keep their own refusal below, because a toggle that
+    reads ``"no"`` as on is the failure the strict check exists to prevent.
+    """
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+    return value
+
+
+def _bool_setting_reason(value: object) -> Optional[str]:
+    """Why *value* cannot be a boolean setting — ``None`` when it can."""
+    if isinstance(value, bool):
+        return None
+    return f"it is not true or false ({type(value).__name__})"
+
+
+def _bool_setting_value(value: object, *, field: str) -> bool:
+    """A usable value for one boolean setting, or its default with a warning.
+
+    :func:`_int_setting_value`'s posture, for the same reason: this resolves
+    inside ``load()``, where refusing would be a host that will not boot over a
+    display toggle.
+    """
+    coerced = _coerced_bool(value)
+    reason = _bool_setting_reason(coerced)
+    if reason is None:
+        return bool(coerced)
+    default = BOOL_SETTINGS[field]
+    logger.warning(
+        "platform_%s_invalid value=%r — %s; using the default of %s instead",
+        field, value, reason, default,
+    )
+    return default
+
+
+def validate_bool_setting(field: str, value: object) -> bool:
+    """A usable value for *field* from an explicit ask, or a refusal.
+
+    :func:`validate_int_setting`'s posture: the caller is attached and asking
+    for exactly this value, so an unusable one is refused rather than defaulted.
+    """
+    coerced = _coerced_bool(value)
+    reason = _bool_setting_reason(coerced)
+    if reason is not None:
+        raise ConfigError(f"{field} is unusable ({value!r}): {reason}")
+    return bool(coerced)
+
+
+def _assistant_value(value: object, *, field: str) -> Optional[object]:
     """A usable assistant launch setting, or ``None`` with a warning.
 
     The ``_resolve_pids_limit`` house rule rather than :func:`_validate`'s
@@ -863,10 +1075,10 @@ def _assistant_value(value: object, *, field: str) -> Optional[str]:
         logger.warning(
             "platform_assistant_setting_invalid field=%s value=%r — %s; "
             "ignoring it and resolving as if this layer were unset",
-            field, value, reason,
+            field, "<thread list>" if field == "assistant_threads" else value, reason,
         )
         return None
-    return str(value).strip()
+    return list(value) if field == "assistant_threads" else str(value).strip()
 
 
 #: Ceiling on one launch-setting value. Names are a few dozen characters; the
@@ -1048,6 +1260,12 @@ def _unusable_reason(field: str, value: object) -> Optional[str]:
     *field* accepts both spellings — the setting key (``agents``) and the
     config field (``assistant_agents``) — so the callers do not translate.
     """
+    if field in ("threads", "assistant_threads"):
+        try:
+            validate_thread_targets(value)
+        except ValueError as exc:
+            return str(exc)
+        return None
     if not isinstance(value, str) or not value.strip():
         return "not non-empty text"
     text = value.strip()
@@ -1081,7 +1299,7 @@ def _unusable_reason(field: str, value: object) -> Optional[str]:
     return None
 
 
-def validate_assistant_override(key: str, value: object) -> str:
+def validate_assistant_override(key: str, value: object) -> object:
     """A usable *explicit* launch-setting value, or a refusal naming *key*.
 
     The other posture over :func:`_unusable_reason`'s one rule set: the caller
@@ -1094,8 +1312,10 @@ def validate_assistant_override(key: str, value: object) -> str:
     """
     reason = _unusable_reason(key, value)
     if reason is not None:
+        if key == "threads":
+            raise ConfigError(f"threads is unusable: {reason}")
         raise ConfigError(f"{key} is unusable ({value!r}): {reason}")
-    return str(value).strip()
+    return list(value) if key == "threads" else str(value).strip()
 
 
 def load(overrides: Optional[dict] = None) -> PlatformConfig:
@@ -1129,6 +1349,7 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "work_repo_forge": _env_str(ENV_WORK_REPO_FORGE),
         "stall_idle_seconds": _env_int(ENV_STALL_IDLE_SECONDS),
         "stall_backstop_seconds": _env_int(ENV_STALL_BACKSTOP_SECONDS),
+        "stuck_teardown_seconds": _env_int(ENV_STUCK_TEARDOWN_SECONDS),
         # Not `_env_int`: it raises, which is right for a bind port and wrong
         # for a reminder interval. Cleaned here rather than in ``_validate`` so
         # an unusable export costs its own layer and lets ``config.json`` show
@@ -1138,11 +1359,12 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             field: _layer_int(_env_str(env_var), layer="env", field=field)
             for field, env_var in (
                 *CHECKIN_SETTING_KEYS.values(), *NUDGE_SETTING_KEYS.values(),
+                *TERMINAL_SETTING_KEYS.values(),
             )
         },
         **{
             field: _env_str(env_var)
-            for field, env_var in ASSISTANT_SETTING_KEYS.values()
+            for field, env_var in ASSISTANT_SETTING_KEYS.values() if env_var
         },
         # Same warn-don't-refuse posture as the two above: an unusable export
         # costs its own layer and lets ``config.json`` show through.
@@ -1293,14 +1515,16 @@ def assistant_settings() -> dict:
         # serialized rather than dropped: served as null it would prefill the
         # field empty, make clearing a no-op diff, and warn on every resolve
         # with nothing on any screen to remove.
-        if isinstance(raw, str):
+        if key == "threads" and isinstance(raw, list):
+            stored_text = raw
+        elif isinstance(raw, str):
             stored_text = raw.strip() or None
         elif raw is None:
             stored_text = None
         else:
             stored_text = json.dumps(raw)
         file_value = _assistant_value(raw, field=field)
-        env_value = _assistant_value(_env_str(env_var), field=field)
+        env_value = _assistant_value(_env_str(env_var), field=field) if env_var else None
         if env_value is not None:
             resolved[key] = AssistantSetting(
                 value=env_value, source="env", stored=stored_text
@@ -1312,6 +1536,66 @@ def assistant_settings() -> dict:
             )
             continue
         resolved[key] = AssistantSetting(stored=stored_text)
+    return resolved
+
+
+FLEET_GROUP_LIMITS = {"groups": 32, "name": 64, "patterns": 16, "pattern": 256}
+
+
+def validate_fleet_groups(value: Any) -> list[dict]:
+    """Validate and normalize an ordered list of literal repository-path matches."""
+    if not isinstance(value, list) or len(value) > FLEET_GROUP_LIMITS["groups"]:
+        raise ConfigError("fleet_groups must be a list of at most 32 groups.")
+
+    def text(raw: Any, limit: int, where: str) -> str:
+        if (not isinstance(raw, str) or len(raw) > limit or not raw.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
+            raise ConfigError(f"{where} must contain 1–{limit} characters without control characters.")
+        return raw.strip()
+
+    result, names = [], set()
+    for index, row in enumerate(value, 1):
+        where = f"Group {index}"
+        if not isinstance(row, dict) or set(row) != {"name", "patterns"}:
+            raise ConfigError(f"{where} must contain only name and patterns.")
+        name = text(row["name"], FLEET_GROUP_LIMITS["name"], f"{where} name")
+        if name.casefold() in names:
+            raise ConfigError(f"{where} name must be unique (case-insensitive).")
+        names.add(name.casefold())
+        patterns = row["patterns"]
+        if not isinstance(patterns, list) or not 1 <= len(patterns) <= FLEET_GROUP_LIMITS["patterns"]:
+            raise ConfigError(f"{where} must have 1–16 text entries.")
+        result.append({"name": name, "patterns": [
+            text(pattern, FLEET_GROUP_LIMITS["pattern"], f"{where}, entry {number}")
+            for number, pattern in enumerate(patterns, 1)
+        ]})
+    return result
+
+
+def fleet_group_settings() -> dict:
+    """Read current visual groups; report unusable stored input without blocking the UI."""
+    try:
+        stored = read_json(config_path()) or {}
+        groups = validate_fleet_groups(stored.get("fleet_groups", []))
+    except (ConfigError, StoreError) as exc:
+        return {"fleet_groups": [], "fleet_groups_problem": str(exc)}
+    return {"fleet_groups": groups, "fleet_groups_problem": None}
+
+
+def chat_settings() -> dict:
+    """The chat panes' display settings, read fresh from stored configuration.
+
+    ``keep_last`` is the operator chat's retention; ``show_transcript`` is
+    whether the uber lmer pane draws the harness transcript beside the
+    conversation (issue #488). Neither has an environment variable: they are
+    browser display settings, and the pane re-reads them on config refresh.
+    """
+    resolved = _int_group_settings(
+        {"keep_last": ("chat_keep_last", None)}, group="chat",
+    )
+    resolved.update(_bool_group_settings(
+        {"show_transcript": ("chat_show_transcript", None)}, group="chat",
+    ))
     return resolved
 
 
@@ -1335,6 +1619,50 @@ def nudge_settings() -> dict:
     return _int_group_settings(NUDGE_SETTING_KEYS, group="nudge")
 
 
+def rotation_settings() -> dict:
+    """The rotation group's effective settings, one per :data:`ROTATION_SETTING_KEYS`.
+
+    :func:`nudge_settings`' sibling on the same terms: the detector reads it every
+    tick, so a threshold the operator moves applies to the next tick rather than
+    to the next incarnation — which matters more here than anywhere else in this
+    group, since the thing it governs is what ends an incarnation.
+    """
+    return _int_group_settings(ROTATION_SETTING_KEYS, group="rotation")
+
+
+def assistant_resource_settings() -> dict:
+    """The assistant's effective container allocation, value and source.
+
+    :func:`assistant_settings`' sibling with one layer instead of three: the
+    environment, then unset. Unset is not a gap to fill here — it means the
+    assistant launches with no resource flags of its own and the worker
+    ladder answers, which is the documented fallback and today's behaviour.
+
+    An unusable value warns and resolves as unset rather than refusing, the
+    posture every standing layer in this module takes: a typo in an export must
+    cost the assistant its allocation, never its ability to start. The flags the
+    CLI grows for these refuse instead — see
+    :data:`ASSISTANT_RESOURCE_KEYS`.
+    """
+    resolved = {}
+    for key, (env_var, validator, hint) in ASSISTANT_RESOURCE_KEYS.items():
+        raw = _env_str(env_var)
+        if raw is None:
+            resolved[key] = AssistantSetting()
+            continue
+        accepted = validator(raw)
+        if accepted is None:
+            logger.warning(
+                "platform_assistant_resource_invalid key=%s value=%r (%s) — "
+                "ignored; the assistant launches on the worker default",
+                key, raw, hint,
+            )
+            resolved[key] = AssistantSetting()
+            continue
+        resolved[key] = AssistantSetting(value=accepted, source="env")
+    return resolved
+
+
 def upload_settings() -> dict:
     """The upload group's effective settings, one per :data:`UPLOAD_SETTING_KEYS`.
 
@@ -1344,6 +1672,11 @@ def upload_settings() -> dict:
     upload to be measured against it rather than the next daemon start.
     """
     return _int_group_settings(UPLOAD_SETTING_KEYS, group="upload")
+
+
+def terminal_settings() -> dict:
+    """The terminal confirmation window, resolved fresh for live supervisors."""
+    return _int_group_settings(TERMINAL_SETTING_KEYS, group="terminal")
 
 
 def upload_types() -> tuple:
@@ -1375,12 +1708,69 @@ def upload_types() -> tuple:
     return DEFAULT_UPLOAD_TYPES
 
 
-def _int_group_settings(keys: dict, *, group: str) -> dict:
-    """One integer setting group, resolved layer by layer.
+def stored_slots() -> tuple:
+    """The service-slot entries ``config.json`` holds **now** (issue #256).
+
+    :attr:`PlatformConfig.slots` is the value read at *load* time, and the
+    daemon holds one resolved config for its whole life — so a slot written to
+    the file under a running platform stayed invisible until it restarted. This
+    is the whole resolution chain for the field rather than a shortcut through
+    it: ``slots`` deliberately has no environment layer, so the file is the only
+    layer there is, and reading it fresh cannot bake an export into anything.
+
+    :func:`upload_types`' posture, and the same house rules as at load time —
+    an unreadable file resolves to no slots with a log line, never an exception,
+    because this is called from the fleet payload and from the spawn gate. Use
+    :func:`stored_slots_or_problem` where the caller can *report* the failure:
+    ``()`` is a claim about the host, and a read that did not happen must not
+    be shown as a host that declares nothing.
+    """
+    entries, _problem = stored_slots_or_problem()
+    return entries
+
+
+def stored_slots_or_problem() -> tuple:
+    """:func:`stored_slots`, plus why it is empty when a read failed.
+
+    ``(entries, problem)``, where *problem* is ``None`` unless ``config.json``
+    exists and could not be read. Before #256 the boot-time value carried the
+    rows across a transient read failure; re-reading per request moves that
+    failure onto every poll, which is the trade hot slots buy — but it must not
+    be silent, or a file saved mid-edit renders as a host with no slots at all
+    while the spawn gate refuses by the wrong name.
+    """
+    try:
+        stored = read_json(config_path())
+    except StoreError as exc:
+        logger.error(
+            "platform_config_unreadable error=%s — no service slots are "
+            "declared", exc,
+        )
+        return (), str(exc)
+    if not isinstance(stored, dict):
+        return (), None
+    return _slots_value(stored.get("slots")), None
+
+
+def with_stored_slots(config: PlatformConfig) -> PlatformConfig:
+    """*config* with its slots re-read from the file (issue #256).
+
+    The seam between "resolved once at boot" and "resolved now", and it is a
+    call the reader has to make deliberately: :mod:`lmer_platform.slots` keeps
+    answering for the config it is handed, so the editor can resolve a
+    *candidate* list through the identical code by passing a config carrying it.
+    """
+    return replace(config, slots=stored_slots())
+
+
+def _group_settings(keys: dict, *, group: str, layer: Callable, default: Callable) -> dict:
+    """One setting group, resolved layer by layer.
 
     An unusable layer falls through with a warning, so the effective answer is
     the one the tick will read — a screen reporting a value the daemon would have
-    discarded is the screen lying.
+    discarded is the screen lying. *layer* reads one layer's raw value into a
+    usable one or ``None`` (:func:`_layer_int`, :func:`_layer_bool`); *default*
+    names a field's default.
     """
     try:
         stored = read_json(config_path())
@@ -1395,8 +1785,10 @@ def _int_group_settings(keys: dict, *, group: str) -> dict:
     resolved = {}
     for key, (field, env_var) in keys.items():
         raw = stored.get(field)
-        env_value = _layer_int(_env_str(env_var), layer="env", field=field)
-        file_value = _layer_int(raw, layer="config.json", field=field)
+        env_value = layer(
+            _env_str(env_var) if env_var else None, layer="env", field=field,
+        )
+        file_value = layer(raw, layer="config.json", field=field)
         if env_value is not None:
             resolved[key] = AssistantSetting(
                 value=env_value, source="env", stored=raw
@@ -1408,16 +1800,29 @@ def _int_group_settings(keys: dict, *, group: str) -> dict:
             )
             continue
         resolved[key] = AssistantSetting(
-            value=INT_SETTINGS[field].default, source="default", stored=raw
+            value=default(field), source="default", stored=raw
         )
     return resolved
+
+
+def _int_group_settings(keys: dict, *, group: str) -> dict:
+    return _group_settings(
+        keys, group=group, layer=_layer_int,
+        default=lambda field: INT_SETTINGS[field].default,
+    )
+
+
+def _bool_group_settings(keys: dict, *, group: str) -> dict:
+    return _group_settings(
+        keys, group=group, layer=_layer_bool, default=BOOL_SETTINGS.__getitem__,
+    )
 
 
 #: Bad ``(field, layer, value)`` triples already warned about. This resolution
 #: runs on every fleet read, so one typo in an export would otherwise warn every
 #: few seconds for the life of the daemon. Keyed on the value too, so a
 #: corrected-then-broken-again one is announced again.
-_WARNED_INT_SETTINGS: set = set()
+_WARNED_LAYER_SETTINGS: set = set()
 
 
 def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
@@ -1433,15 +1838,31 @@ def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
     reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
-    seen = (field, layer, repr(raw))
-    if seen not in _WARNED_INT_SETTINGS:
-        _WARNED_INT_SETTINGS.add(seen)
-        logger.warning(
-            "%s layer=%s value=%r — %s; resolving as if this layer were unset "
-            "(said once per value)",
-            INT_SETTINGS[field].log_key, layer, raw, reason,
-        )
+    _warn_layer_once(INT_SETTINGS[field].log_key, field=field, layer=layer, raw=raw, reason=reason)
     return None
+
+
+def _layer_bool(raw: object, *, layer: str, field: str) -> Optional[bool]:
+    """:func:`_layer_int` for a boolean setting: a bad layer says nothing usable."""
+    if raw is None:
+        return None
+    coerced = _coerced_bool(raw)
+    reason = _bool_setting_reason(coerced)
+    if reason is None:
+        return bool(coerced)
+    _warn_layer_once(f"platform_{field}_invalid", field=field, layer=layer, raw=raw, reason=reason)
+    return None
+
+
+def _warn_layer_once(log_key: str, *, field: str, layer: str, raw: object, reason: str) -> None:
+    seen = (field, layer, repr(raw))
+    if seen in _WARNED_LAYER_SETTINGS:
+        return
+    _WARNED_LAYER_SETTINGS.add(seen)
+    logger.warning(
+        "%s layer=%s value=%r — %s; resolving as if this layer were unset "
+        "(said once per value)", log_key, layer, raw, reason,
+    )
 
 
 #: Serializes :func:`update_stored`'s read-modify-write: the API handlers run in
@@ -1451,47 +1872,56 @@ def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
 _STORED_LOCK = threading.Lock()
 
 
-def update_stored(changes: dict) -> dict:
-    """Persist *changes* into ``config.json`` — the stored layer and only it.
+def mutate_stored(compute: Callable[[dict], dict]) -> dict:
+    """Edit ``config.json``'s stored layer — the stored layer and only it.
 
-    Not :func:`save`, deliberately: ``save`` writes a whole resolved
-    :class:`PlatformConfig`, and a resolved config has the environment baked
-    into it — persisting one from a daemon whose operator has
-    ``LMER_PLATFORM_ASSISTANT_MODEL`` exported would copy the export into the
-    file, where it would outlive the export and read as a choice nobody made.
-    This edits the stored mapping itself: unknown keys in the file survive
-    untouched (the same tolerance :func:`load` has for a file written by a
-    newer build), a value of ``None`` removes the key so the layer below shows
-    through, and everything else is stored as given.
+    *compute* is handed the stored mapping as it is on disk **now** and answers
+    the changes to apply to it, all inside the write lock. An edit that has to
+    read the current value to decide the next one — every service-slot edit does
+    (issue #256) — cannot read outside the lock and write inside it: two such
+    writes interleaving drop one of them silently.
 
-    The merged file is validated as a whole before it is written — built into a
+    The stored mapping itself is edited, never a resolved config: unknown keys
+    in the file survive untouched (the same tolerance :func:`load` has for a
+    file written by a newer build), a value of ``None`` removes its key so the
+    layer below shows through, and everything else is stored as given. The
+    merged file is validated as a whole before it is written — built into a
     :class:`PlatformConfig` exactly as :func:`load` would build it — so a write
     that would make the next boot refuse the file is refused here instead, with
     the caller still attached to hear it.
 
-    Returns the stored mapping as written.
+    *compute* may raise to abandon the write; nothing is written and the
+    exception reaches the caller unchanged, which is how a precondition that can
+    only be checked against the current file (a slot changed under an edit)
+    refuses without a second read.
+
+    Raises :class:`lmer_platform.store.StoreError` when ``config.json`` exists
+    and cannot be read. A caller with a human attached should say so rather than
+    write: see the comment on the read below.
     """
-    known = _known_fields()
-    unknown = set(changes) - known
-    if unknown:
-        raise ConfigError(
-            f"unknown config field(s): {', '.join(sorted(unknown))}"
-        )
     with _STORED_LOCK:
-        try:
-            stored = read_json(config_path())
-        except StoreError as exc:
-            logger.error(
-                "platform_config_unreadable error=%s — the update starts from "
-                "an empty stored config", exc,
-            )
-            stored = None
+        # Deliberately NOT :func:`load`'s warn-and-continue: starting from an
+        # empty mapping is right at boot — a daemon that will not start cannot be
+        # fixed through its own UI — and wrong for a write, where it would
+        # *publish* that empty mapping over a file it could not read. The
+        # newer-schema refusal is the case that makes it destructive rather than
+        # merely lossy: ``read_json`` leaves those bytes deliberately untouched
+        # (nothing is moved aside), so overwriting them destroys the only copy.
+        # ``None`` — no file yet — is the one absence that really is empty.
+        stored = read_json(config_path())
         current = dict(stored) if isinstance(stored, dict) else {}
         # The store's own bookkeeping, not configuration: ``write_json`` stamps
         # both on every write, so carrying the old pair forward would only
         # persist a stale ``updated``.
         current.pop("schema", None)
         current.pop("updated", None)
+        changes = compute(dict(current))
+        known = _known_fields()
+        unknown = set(changes) - known
+        if unknown:
+            raise ConfigError(
+                f"unknown config field(s): {', '.join(sorted(unknown))}"
+            )
         for field, value in changes.items():
             if value is None:
                 current.pop(field, None)
@@ -1502,6 +1932,22 @@ def update_stored(changes: dict) -> dict:
         }))
         write_json(config_path(), current)
     return current
+
+
+def update_stored(changes: dict) -> dict:
+    """Persist a fixed set of *changes* — :func:`mutate_stored` with no reading.
+
+    Not :func:`save`, deliberately: ``save`` writes a whole resolved
+    :class:`PlatformConfig`, and a resolved config has the environment baked
+    into it — persisting one from a daemon whose operator has
+    ``LMER_PLATFORM_ASSISTANT_MODEL`` exported would copy the export into the
+    file, where it would outlive the export and read as a choice nobody made.
+
+    Use this when the values to store are already decided. When they depend on
+    what the file currently holds, use :func:`mutate_stored` directly — the
+    reading has to happen under the same lock as the write.
+    """
+    return mutate_stored(lambda _current: changes)
 
 
 def configured_repo_url() -> Optional[str]:
@@ -1685,7 +2131,7 @@ _ASSISTANT_CREDENTIAL_MEMO: tuple = (None, None)
 
 def assistant_credential_path() -> Path:
     """Where the running assistant's minted credential lives."""
-    return platform_dir() / ASSISTANT_CREDENTIAL_FILENAME
+    return assistant_dir() / ASSISTANT_CREDENTIAL_FILENAME
 
 
 def mint_assistant_credential() -> str:
@@ -1755,6 +2201,21 @@ def active_assistant_credential() -> Optional[str]:
     return credential
 
 
+def active_assistant_credentials() -> set[str]:
+    credentials = set()
+    with project_context.bound(None):
+        credential = active_assistant_credential()
+        if credential:
+            credentials.add(credential)
+    root = platform_dir() / "projects"
+    for path in root.glob(f"*/{ASSISTANT_CREDENTIAL_FILENAME}"):
+        with project_context.bound(path.parent.name):
+            credential = active_assistant_credential()
+            if credential:
+                credentials.add(credential)
+    return credentials
+
+
 def revoke_assistant_credential() -> bool:
     """Remove the current assistant credential. Returns whether one was there.
 
@@ -1777,6 +2238,120 @@ def revoke_assistant_credential() -> bool:
         return False
     logger.info("platform_assistant_credential_revoked path=%s", path)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Connector credentials (issue #407, spec decision 6)
+# ---------------------------------------------------------------------------
+
+def connectors_dir() -> Path:
+    return platform_dir() / CONNECTORS_DIRNAME
+
+
+def connector_path(name: str) -> Path:
+    if not _CHANNEL_RE.match(name or ""):
+        raise ConfigError(
+            f"invalid connector name {name!r}: lowercase letters, digits and dashes"
+        )
+    return connectors_dir() / f"{name}.json"
+
+
+def mint_connector_credential(name: str, channel: str) -> str:
+    """Mint (or replace) the credential for connector *name* bound to *channel*.
+
+    The assistant's shape (:func:`mint_assistant_credential`): a random value,
+    owner-only from creation, revocable by deleting the file. Unlike the
+    assistant's it is not per incarnation — a connector is a long-lived host
+    process and its operator rotates it by re-running this.
+    """
+    if not _CHANNEL_RE.match(channel or ""):
+        raise ConfigError(
+            f"invalid channel {channel!r}: lowercase letters, digits and dashes"
+        )
+    path = connector_path(name)
+    credential = secrets.token_urlsafe(32)
+    payload = json.dumps(
+        {"schema": 1, "name": name, "channel": channel, "credential": credential},
+        indent=2,
+    ) + "\n"
+    try:
+        ensure_state_dir(path.parent)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"cannot write connector credential {path} ({exc})")
+    logger.info("platform_connector_credential_minted name=%s channel=%s", name, channel)
+    return credential
+
+
+def revoke_connector_credential(name: str) -> bool:
+    path = connector_path(name)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ConfigError(f"cannot remove connector credential {path} ({exc})")
+    logger.info("platform_connector_credential_revoked name=%s", name)
+    return True
+
+
+def list_connectors() -> list:
+    """``[{"name", "channel"}]`` for every minted connector, never the values."""
+    return [
+        {"name": item["name"], "channel": item["channel"]}
+        for item in active_connectors().values()
+    ]
+
+
+def active_connectors() -> dict:
+    """``{credential: {"name", "channel"}}`` for every connector file.
+
+    Memoized on the directory's stat so the per-request lookup in
+    ``require_secret`` costs a stat, not a directory read — and re-read when
+    the operator mints or revokes one. Unreadable or malformed files are
+    skipped, loudly, so one bad file cannot lock every connector out.
+    """
+    global _CONNECTORS_MEMO
+    directory = connectors_dir()
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
+        paths = []
+    # Fingerprint the files, not the directory: a mint followed by a revoke
+    # inside one clock tick leaves the directory's own stat unchanged, and a
+    # stale memo then keeps a revoked credential valid.
+    key = tuple(item for path in paths for item in (_stat_key(path),) if item is not None)
+    if not key:
+        _CONNECTORS_MEMO = ((), {})
+        return {}
+    cached_key, cached = _CONNECTORS_MEMO
+    if cached_key == key:
+        return cached
+    found: dict = {}
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("platform_connector_unreadable path=%s error=%s", path, exc)
+            continue
+        if not isinstance(data, dict):
+            continue
+        credential = data.get("credential")
+        name = data.get("name")
+        channel = data.get("channel")
+        if not (isinstance(credential, str) and credential and isinstance(name, str)
+                and isinstance(channel, str) and _CHANNEL_RE.match(channel)):
+            logger.warning("platform_connector_malformed path=%s", path)
+            continue
+        _warn_if_permissive(path)
+        found[credential] = {"name": name, "channel": channel}
+    _CONNECTORS_MEMO = (key, found)
+    return found
 
 
 def binding_notice(config: PlatformConfig) -> str:
@@ -2143,6 +2718,35 @@ def container_base_url(
             source="host-alias",
         )
     return ContainerReach(reason=_unreachable_reason(config, kind, detected))
+
+
+def control_ui_url(config: PlatformConfig) -> Optional[str]:
+    """The URL a **person in a chat thread** can open to reach this fleet.
+
+    ``matrix.control_url`` when the operator set one — the same key the fleet
+    bridge asks for, for the same reason it is asked rather than derived
+    (docs/MATRIX-CHAT.md): what the daemon knows is a bind pair, and a
+    reverse proxy or a tunnel is not derivable from one. A routable bind is used
+    as it stands, since that address is one somebody else can dial.
+
+    ``None`` for a loopback or wildcard bind with no configured URL, because
+    ``http://127.0.0.1:8600`` posted into somebody's Slack channel is not a link
+    — the same judgement, and the same wording, as the bridge's.
+    """
+    configured = (config.matrix or {}).get("control_url")
+    if isinstance(configured, str) and configured.strip():
+        parts = urlsplit(configured.strip())
+        if parts.scheme in ("http", "https") and parts.netloc:
+            return configured.strip().rstrip("/")
+        # Said rather than dropped: the bridge refuses a malformed one outright,
+        # and falling through in silence is how a typo becomes a wrong link.
+        logger.warning(
+            "platform_control_url_unusable value=%r — matrix.control_url needs a "
+            "scheme and a host; falling back to the bind address", configured,
+        )
+    if _address_kind(config.bind_address) == "routable":
+        return config.base_url
+    return None
 
 
 def with_overrides(config: PlatformConfig, **changes) -> PlatformConfig:

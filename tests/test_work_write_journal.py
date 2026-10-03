@@ -588,6 +588,10 @@ class TestWriteIntentMapCoversTheParser:
         ("event", ["event", "note"], True),
         ("ledger", ["ledger"], False),
         ("ledger", ["ledger", "set", "T1", "--status", "done"], True),
+        # `sessions` only READS the run area (run_state.list_sessions);
+        # both modes are listings, so neither writes the work repo.
+        ("sessions", ["sessions"], False),
+        ("sessions", ["sessions", "--running"], False),
         ("plan", ["plan", "check"], False),
         ("goals", ["goals"], False),
         ("goals", ["goals", "check"], False),

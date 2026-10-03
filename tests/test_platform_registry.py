@@ -9,6 +9,8 @@ it belonged to rather than outliving it as an unexplained credential.
 
 import json
 import os
+import threading
+from unittest.mock import patch
 
 import pytest
 
@@ -453,3 +455,50 @@ def test_zombie_check_tolerates_a_comm_containing_parens(monkeypatch, tmp_path):
 
     monkeypatch.setattr("builtins.open", fake_open)
     assert registry._is_zombie(4242) is True
+
+
+# ── A removal and an in-flight update are ordered (!284 review fallout) ───────
+
+
+def test_a_removal_is_not_undone_by_an_update_already_in_flight(platform_root):
+    """`update` reads, gets overtaken by an unlink, and writes the entry back.
+
+    A resurrected entry is a session the fleet view calls crashed forever, and
+    the racers are real: `assistant.stop` removes the entry of a session it
+    signalled while `spawn._watch` records that unclean exit onto it.
+    """
+    registry.register("s-race", pid=os.getpid())
+    reading = threading.Event()
+    finish = threading.Event()
+    real_write = registry.write_json
+
+    def slow_write(path, blob):
+        # Inside `update`'s lock, with the read already done.
+        reading.set()
+        assert finish.wait(10)
+        return real_write(path, blob)
+
+    with patch.object(registry, "write_json", slow_write):
+        updater = threading.Thread(
+            target=registry.update, args=("s-race",),
+            kwargs={"exited": {"code": 137, "clean": False}},
+        )
+        updater.start()
+        assert reading.wait(10), "the update never reached its write"
+
+        remover = threading.Thread(
+            target=registry.remove, args=("s-race",), kwargs={"force": True},
+        )
+        remover.start()
+        remover.join(0.5)
+        assert remover.is_alive(), (
+            "the removal walked straight past an update holding the entry's lock"
+        )
+
+        finish.set()
+        updater.join(10)
+        remover.join(10)
+
+    assert registry.read_session("s-race") is None, (
+        "the update resurrected an entry that had been removed"
+    )

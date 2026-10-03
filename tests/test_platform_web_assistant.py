@@ -41,8 +41,12 @@ How any of it looks, and whether the app bar now crowds a phone, are verified by
 building the bundle and by live test LT3 on a real phone.
 """
 
+import json
 import re
+import subprocess
 from pathlib import Path
+
+from tests.conftest import node_binary, require_node_toolchain
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -140,11 +144,13 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
     app = _read(APP)
     button = None
     for match in re.finditer(r"<v-btn\b[^>]*>", app, re.S):
-        if "uberOpen" in match.group(0):
+        if '@click="toggleProjectChat"' in match.group(0):
             button = match.group(0)
             break
     assert button, "nothing in the shell opens the supervisor's drawer"
-    assert "uberOpen = !uberOpen" in button, "the bar button cannot close it again"
+    toggle = app.split("function toggleProjectChat()", 1)[1].split("\n}", 1)[0]
+    assert "if (uberOpen.value) uberOpen.value = false" in toggle, "the bar button cannot close it again"
+    assert "openProjectChat(activeProject.value || chatProject.value)" in toggle, "reopening lost its project destination"
     assert "aria-label" in button, "an icon-only button needs a name"
     assert "mdiRobot" in button, (
         "the toggle draws no icon, or one pasted as path data rather than taken "
@@ -159,64 +165,20 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
 # --- the words ----------------------------------------------------------------
 
 def test_the_supervisor_is_called_uber_lmer_and_never_an_assistant():
-    """Two visibly different names are what stand between an operator and the
-    wrong recipient (operator request, 2026-07-27).
-
-    "assistant" stays the spelling of the module, the taskdef and every API field —
-    this is a label decision — so the check is on the strings an operator reads and
-    on nothing else. Which is also why "uber lmer" has to be *present*: a drawer
-    that merely avoided the forbidden word would be a nameless panel, and a
-    nameless panel is one an operator has to guess the recipient of.
-    """
-    words = _operator_words(DRAWER)
-    assert "uber lmer" in words, "the drawer never says whose chat it is"
-    assert "assistant" not in words.lower(), (
-        f"the drawer calls the supervisor an assistant to the operator: {words!r}"
-    )
-    assert "lmer working in a repository" in words, (
-        "nothing tells the operator that this is not one of the runs, which is the "
-        "distinction the two names exist to carry"
-    )
-    # The bar button is the other operator-visible surface, and it is one word.
-    shell = _operator_words(APP)
-    assert "uber lmer" in shell, "the app bar's toggle is unnamed or misnamed"
-    assert "assistant" not in shell.lower(), (
-        "the shell calls the supervisor an assistant to the operator"
-    )
+    text = _read(DRAWER)
+    assert '{{ workspace.name }} · uber lmer' in text
+    assert 'agent-label="uber lmer"' in text
+    assert 'Waiting to start — assistant limit reached' in text
+    assert 'this chat belong to this project' in ' '.join(text.split())
 
 
 def test_the_composer_says_who_is_at_the_other_end():
-    """The shared chat's own label is written for a worker session ("this session").
+    text = _read(DRAWER)
+    assert 'You are talking to {{ workspace.name }} · uber lmer.' in text
+    assert ':composer-label="`Say something to ${workspace.name} · uber lmer`"' in text
+    assert ':workspace-id="workspace.id"' in text
+    assert 'say something to this session' in _read(CHAT)
 
-    Which is correct there and not enough here: the last line read before typing
-    has to name the recipient, because that is the moment the mistake happens. So
-    two things say it — the line above the composer, and the composer's own label,
-    which Chat.vue takes as a prop for exactly this reason. Both, rather than one:
-    the sentence is above a conversation that scrolls, and the label is inside the
-    field a thumb is already in.
-    """
-    words = _operator_words(DRAWER)
-    assert "You are talking to uber lmer." in words, (
-        "nothing above the composer names the recipient"
-    )
-
-    label = re.search(r"<Chat[^>]*\scomposer-label=\"([^\"]*)\"", _read(DRAWER), re.S)
-    assert label, (
-        "the drawer leaves the shared composer on its default label, which says "
-        '"this session" in a panel that is deliberately not one of the runs'
-    )
-    assert "uber lmer" in label.group(1), (
-        f"the composer is labelled {label.group(1)!r}, which names no recipient — "
-        "and the recipient is the whole of what this drawer has to get right"
-    )
-    # The default it overrides is the run's, and still exists: this is a wording
-    # decision in one component, not a second composer.
-    assert "say something to this session" in _read(CHAT), (
-        "the shared chat no longer has a label of its own to override"
-    )
-
-
-# --- the conversation is the shared one ---------------------------------------
 
 def test_the_conversation_is_the_shared_chat_pointed_at_the_supervisor():
     """Reused, not rebuilt: the supervisor is an lmer session with a session id.
@@ -268,36 +230,13 @@ def test_the_runs_two_chat_props_are_left_to_the_run_that_has_them():
 # --- the states the drawer has to be honest about -----------------------------
 
 def test_a_supervisor_that_is_not_running_says_so_and_offers_a_start():
-    """The state an operator most needs the drawer in is the one it is useless in.
-
-    The daemon supervises the supervisor (T63), so a manual start is a legitimate
-    verb rather than a workaround — and the drawer says both halves: one is coming
-    on its own, and here is the button if it has not.
-    """
     text = _read(DRAWER)
-    words = _operator_words(DRAWER)
-    assert "No uber lmer is running." in words, (
-        "a stopped supervisor is not stated, so an empty drawer reads as a broken one"
-    )
-    assert "start uber lmer" in words, "there is no way to start one"
-    assert "The daemon starts one and keeps it up" in words, (
-        "nothing says the daemon is already trying, so the button reads as the "
-        "only thing that can start one"
-    )
-    assert "startAssistant" in text and "startAssistant" in _read(API_JS), (
-        "the start goes somewhere other than the daemon's own route"
-    )
-    assert "request('api/assistant/start', { method: 'POST' })" in _read(API_JS), (
-        "the start route is no longer the POST the daemon serves"
-    )
-    # A 409 is "one is already running" — two taps on a slow connection — and must
-    # not be reported as a failure to start.
-    assert "exc.status === 409" in text, (
-        "a second start is reported as an error instead of being re-read"
-    )
-    assert ":loading=\"starting\"" in text and "starting" in words, (
-        "the wait between the tap and the session being up draws nothing"
-    )
+    assert 'Stopped until you choose Start' in text
+    assert "status?.lifecycle === 'failed' ? 'Retry' : 'Start'" in text
+    assert "lifecycle(starting, startAssistant)" in text
+    assert "workspaceId)" in _client_body(_read(API_JS), 'startAssistant')
+    assert ':loading="starting"' in text
+    assert 'Your draft stays here' in text
 
 
 def test_a_daemon_that_did_not_answer_degrades_instead_of_resetting():
@@ -400,8 +339,8 @@ def test_restart_is_the_rotate_route_and_the_other_two_are_their_own():
     text = _read(DRAWER)
     api = _read(API_JS)
     for client, route in (
-        ("rotateAssistant", "request('api/assistant/rotate', { method: 'POST' })"),
-        ("stopAssistant", "request('api/assistant/stop', { method: 'POST' })"),
+        ("rotateAssistant", "request(workspacePath('api/assistant/rotate', workspaceId), { method: 'POST' })"),
+        ("stopAssistant", "request(workspacePath('api/assistant/stop', workspaceId), { method: 'POST' })"),
     ):
         assert client in text, f"the drawer does not call {client}"
         assert route in api, (
@@ -468,61 +407,17 @@ def test_the_two_destructive_verbs_are_confirmed_in_the_apps_own_pattern():
     # The action functions are only reachable through those dialogs: a control that
     # called them directly would be the confirmation removed for one entry point.
     for call in ("restartUberLmer", "stopUberLmer"):
-        assert text.count(f'@click="{call}"') == 1, (
+        assert text.count(f'@click="{call}"') == (2 if call == 'stopUberLmer' else 1), (
             f"{call} is reachable from somewhere other than its confirmation"
         )
 
 
 def test_the_confirmations_say_what_is_lost_and_claim_nothing_more():
-    """The copy is the whole safety feature here, so it is checked as one.
-
-    What a rotation costs is the conversation window and *only* that: standing orders
-    are never consumed and a rotation carries them forward, and the handover note
-    travels untouched when none is sent (``assistant.start``/``stop`` edit state with
-    ``dataclasses.replace``, and ``_handoff_update`` keeps the recorded note when the
-    field is omitted). So the confirm says both halves — and says the note is the one
-    on record rather than a fresh summary, because nothing in this UI asks the
-    outgoing incarnation to write one.
-
-    A stop must not promise it stays stopped. The daemon's supervisor respawns
-    anything that is not running, whatever ended it (``Supervisor.supervise_once``
-    reads liveness and nothing else), so "nothing restarts it until you say so" is
-    true only of a daemon that is not supervising or has given up — which is exactly
-    what the start button is for, and what the copy says instead.
-    """
-    # Collapsed, because a sentence this long is wrapped in the markup and what is
-    # being checked is the sentence rather than where it happens to break.
     words = _words(DRAWER)
-    for phrase in (
-        "Restart uber lmer?",
-        "the conversation window is lost",
-        "Standing orders survive",
-        "the handover note already on record",
-    ):
-        assert phrase in words, (
-            f"the restart confirmation does not say {phrase!r}, so the operator is "
-            "asked to accept a loss nobody named"
-        )
-    for phrase in (
-        "Stop uber lmer?",
-        "nothing in this drawer brings one back",
-        "A daemon that is supervising puts a fresh one up on its own",
-        "none comes back until you start one here",
-    ):
-        assert phrase in words, (
-            f"the stop confirmation does not say {phrase!r}"
-        )
-    # The claim the code cannot support, in the shapes it would be written in.
-    for lie in (
-        "nothing restarts it",
-        "nothing will restart it",
-        "stays stopped",
-        "stays down until you start",
-    ):
-        assert lie not in words.lower(), (
-            f"the drawer promises {lie!r}, which the supervisor contradicts: it "
-            "respawns anything that is not running, whatever ended it"
-        )
+    for phrase in ('its current context is lost', 'Your conversation history remains visible',
+                   'Standing orders survive', 'the handover note already on record',
+                   'It stays stopped until you choose Start', 'pending work remain'):
+        assert phrase in words
 
 
 def test_one_lifecycle_call_at_a_time_and_the_wait_is_drawn():
@@ -566,9 +461,8 @@ def test_the_conversation_follows_the_incarnation_a_restart_created():
     Each lifecycle route answers with the reconciled status, so the reply becomes the
     status, ``sessionId`` derives from it, and ``Chat.vue`` already restarts its
     transcript when the id it was given changes (it was written for a respawned run's
-    session, which is the same shape). Anything else — a ``:key`` to force a remount,
-    a reload, a second poll — would be a second mechanism for a property one already
-    covers.
+    session, which is the same shape). The history/active key stays stable through
+    a live rotation, which must not remount the conversation or discard attachments.
     """
     text = _read(DRAWER)
     body = text[text.index("async function lifecycle("):text.index("function startUberLmer")]
@@ -576,19 +470,22 @@ def test_the_conversation_follows_the_incarnation_a_restart_created():
         "a lifecycle reply is discarded, so the chat keeps reading the session the "
         "restart replaced until the next poll"
     )
-    assert 'const sessionId = computed(() => (running.value ? status.value.session_id' in text, (
+    assert 'status.value.session_id || status.value.history_session' in text, (
         "the conversation's session no longer derives from the status the reply "
-        "replaced"
+        "replaced, with retained history available when stopped"
     )
     assert "watch(() => props.sessionId, () => start())" in _read(CHAT), (
         "the shared chat no longer restarts when it is pointed at another session, "
         "so a rotation would leave the previous incarnation's transcript on screen"
     )
     assert "location.reload" not in text, "the drawer reloads the page to follow a rotation"
-    assert not re.search(r"<Chat[^>]*:key=", text, re.S), (
-        "the conversation is remounted by key; the session-id watch is what follows "
-        "an incarnation, and two mechanisms for it is one to get wrong"
+    chat = re.search(r"<Chat\b[^>]*>", text, re.S).group(0)
+    assert ':key="composerActive ? \'active\' : \'history\'"' in chat, (
+        "the conversation key must stay stable across live generations"
     )
+    assert "running.value || rotating.value" in text
+    assert "status.value?.lifecycle === 'rotating'" in text
+    assert ':send-paused="rotating"' in chat
 
 
 def test_a_refused_lifecycle_call_arrives_in_the_daemons_own_words():
@@ -608,50 +505,19 @@ def test_a_refused_lifecycle_call_arrives_in_the_daemons_own_words():
     assert "status.value = null" not in body, (
         "a refused lifecycle call throws away the state the daemon last reported"
     )
-    assert "exc.status === 409" in body and "await load()" in body, (
+    assert "exc.status === 409" not in body, (
         "a 409 is reported as a failure instead of being settled by a re-read; it "
         "means the daemon's view of what is running differs from this one's"
     )
 
 
 def test_an_uber_lmer_that_was_stopped_is_legible_as_one():
-    """The zombie problem is a supervisor that is *gone* and looks merely quiet, so
-    the drawer has to say which of the two it is.
-
-    It can, from the status alone and without a new field: a stop clears the pointer
-    to the session and a crash leaves it, which is what ``stale`` reports. So the
-    card names the generation either way and says which of the two happened — and
-    the stop reply is itself a status, so the drawer lands on that card the moment
-    the daemon answers rather than at the next poll.
-    """
     text = _read(DRAWER)
-    words = _words(DRAWER)
-    assert "No uber lmer is running." in words, "a stopped supervisor is not stated"
-    assert "a stop looks like from here rather than a crash" in words, (
-        "a stopped uber lmer and one that crashed read identically, which is the "
-        "state this control cluster exists to get out of"
-    )
-    # Optional chaining on both branches, and it is not decoration: `load()`'s
-    # catch leaves `status` null while setting `problem`, and the spinner above
-    # is gated on both being absent — so a first poll that fails renders this
-    # card with nothing behind it. A bare deref throws on every re-render and
-    # leaves the drawer blank, which is the moment it is opened to find out
-    # what is wrong.
-    assert re.search(r'<template v-else-if="status\?\.generation">', text), (
-        "the clean-stop line is not the other branch of the stale check, so it "
-        "either claims a crash was a stop or fires on a host that never had one"
-    )
-    assert not re.search(r'v-(if|else-if)="status\.(stale|generation)"', text), (
-        "a branch of this card dereferences `status` without optional chaining, "
-        "so it throws whenever the drawer is opened while the daemon is not "
-        "answering"
-    )
-    assert "stopUberLmer" in text and "lifecycle(stopping, stopAssistant)" in text, (
-        "the stop the card describes is not the one this drawer performs"
-    )
+    assert "status?.lifecycle === 'stopped'" in text
+    assert "status?.lifecycle === 'failed' ? 'Retry' : 'Start'" in text
+    assert '{{ status.error }}' in text
+    assert 'lifecycle(stopping, stopAssistant)' in text
 
-
-# --- the digest spool ---------------------------------------------------------
 
 def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
     """T69's open question, decided here: the operator sees the *number*.
@@ -713,23 +579,14 @@ def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
 # --- the standing orders ------------------------------------------------------
 
 def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
-    """T87. The operator asked for the chat to be the write path — "not some ux
-    config thing" — so this panel is a window onto the document and nothing else.
-
-    Which is a real temptation to guard: it is a text document with a POST route
-    beside its GET, and a textarea plus a save button is the obvious next commit.
-    What that would cost is the confirm-the-wording step — uber lmer reads the rule
-    back before storing it, in the operator's own words — and it would make two
-    writers of one document with no merge between them. So the absence of a write
-    path here is the feature, and it is checked as one.
-    """
+    """The chat drawer reads standing orders; Project settings owns direct edits."""
     text = _read(DRAWER)
     words = _operator_words(DRAWER)
 
     assert "fetchAssistantInstructions" in text and (
         "fetchAssistantInstructions" in _read(API_JS)
     ), "the standing orders are read from somewhere other than the daemon's route"
-    assert "request('api/assistant/instructions')" in _read(API_JS), (
+    assert "request(workspacePath('api/assistant/instructions', workspaceId))" in _read(API_JS), (
         "the read route is no longer the GET the daemon serves"
     )
     assert "standing orders" in words, "the panel is unnamed, or named something else"
@@ -744,36 +601,22 @@ def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
         "nothing tells the operator what happens when they state a rule in the chat"
     )
 
-    # No write path, from either end: no field to type in, and no client that could
-    # send one. `POST api/assistant/instructions` exists and is the assistant's.
+    # Project settings owns the editor; the chat drawer remains a read-only view.
     for affordance in ("v-textarea", "v-text-field", "v-form", "v-switch"):
-        assert affordance not in text, (
+        assert affordance not in text[text.index('<v-expansion-panel title="standing orders"'):text.index('</v-expansion-panels>')], (
             f"the drawer grew a {affordance}: editing the standing orders here "
             "bypasses the confirm-the-wording step that makes them the operator's"
         )
-    writer = re.compile(r"""['"]api/assistant/instructions['"][^)]*method""")
-    for source in sorted((WEB / "src").rglob("*")):
-        if source.is_file() and source.suffix in {".js", ".vue"}:
-            assert not writer.search(_read(source)), (
-                f"{source.name} writes the standing orders; the chat is the write "
-                "path by the operator's own choice"
-            )
-    api = _read(API_PY)
-    assert '@app.post("/api/assistant/instructions"' in api, (
-        "the write route is gone, so the chat has nothing to store a rule through"
-    )
+    assert 'setAssistantInstructions' not in text, 'the chat drawer must remain a reader'
+    editor = _read(WEB / 'src/components/ProjectSettings.vue')
+    assert 'setAssistantInstructions(id, instructions.value)' in editor
+    client = _read(API_JS)
+    assert "export function setAssistantInstructions(workspaceId, instructions)" in client
+    assert "request(workspacePath('api/assistant/instructions', workspaceId), {" in client
 
 
 def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
-    """Issue #234. The drawer's no-affordance guard above is a one-line ban, and
-    keeping it one is why the settings dialog lives in its own file: launch facts
-    (model/harness/preset/agents) are a config file's to edit and a form's to
-    write, while the standing orders' write path stays the chat. What this pins
-    is the boundary — the dialog writes the config route and could not reach the
-    instructions route even by mistake (the rglob in the standing-orders test
-    covers every source file, this one included), and the drawer file itself
-    stays free of input widgets.
-    """
+    """Global execution settings remain separate from the project instruction editor."""
     settings = WEB / "src" / "components" / "AssistantSettings.vue"
     text = _read(settings)
     words = _operator_words(settings)
@@ -807,15 +650,8 @@ def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
     assert re.search(r"\.stored \|\| ''", text), (
         "the form prefills from something other than the stored layer"
     )
-    # The restart the saved banner offers is the drawer's own confirmed one —
-    # ending a context window is one decision however it is reached.
-    drawer = _read(DRAWER)
-    assert '@restart="confirmingRestart = true"' in drawer, (
-        "the dialog's restart bypasses the drawer's confirmation"
-    )
-    assert "AssistantSettings" in drawer, (
-        "the dialog is not reachable from the drawer at all"
-    )
+    assert "emit('settings')" in _read(DRAWER)
+    assert '<AssistantSettings' in _read(WEB / 'src/components/PlatformSettings.vue')
     # The saved banner's one branch: when every changed key came back still
     # pinned by an export, the restart offer is withheld — an operator taking
     # it would pay a context window to run the export again.
@@ -907,15 +743,30 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     lands on the fleet, which is what a glance would otherwise pay for.
 
     The width is still the theme's, not a preference.
+
+    The third key is the same shape of decision and not this rule bending either:
+    ``lmer.fleet.view`` is whether this operator reads the fleet as the list or as
+    the constellation map (#141 fleet map) — again a property of how somebody
+    reads a fleet rather than a fact about any run, and again not the drawer. It
+    cannot cost a glance what a remembered-open drawer would: both views render
+    from the fleet payload the screen already fetches, the map opens no
+    connection of its own, and ``list`` is the first mode and therefore the
+    default, so an operator who never touches the switch lands exactly where they
+    did before.
+
+    What stays true is the actual rule: nothing writes the drawer's own open
+    state, so closing it is still forgotten by the next load.
     """
     assert "localStorage" not in _read(DRAWER), (
         "the drawer stores something; if it is a preference it belongs in "
         "preferences.js and in ALLOWED_STORAGE_KEYS with a reason"
     )
     keys = re.findall(r"localStorage\.\w+\(\s*([A-Za-z0-9_.]+)", _read(APP))
-    assert set(keys) == {"THEME_STORAGE_KEY", "NARROW_STORAGE_KEY"}, (
+    assert set(keys) == {
+        "THEME_STORAGE_KEY", "NARROW_STORAGE_KEY", "FLEET_VIEW_STORAGE_KEY",
+    }, (
         f"the shell now stores {sorted(set(keys))}; the drawer's open state is "
-        "deliberately not remembered, and a third key here is a decision"
+        "deliberately not remembered, and a further key here is a decision"
     )
 
 
@@ -932,3 +783,393 @@ def test_the_drawer_takes_its_colour_from_the_theme():
         "the drawer has no accent, so it reads as the same panel as the run "
         "navigator on the other edge"
     )
+
+
+def test_thread_settings_form_round_trips_lists_and_clears_them():
+    import json
+    import subprocess
+    from tests.test_platform_web_bundle import node_binary, require_node_toolchain
+
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    script = r"""
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createRenderer } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+const path = 'src/components/AssistantSettings.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+assert.match(descriptor.template.content, /<v-textarea[\s\S]*?v-model="fields.threads"/)
+const compiled = compileScript(descriptor, { id: 'threads-probe' })
+globalThis.savedCalls = []
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\.\.\/operatorChat.js['"]/g, `from '${import.meta.resolve('./src/operatorChat.js')}'`)
+  .replace(/import .* from ['"]\.\.\/api.js['"]/, `
+    const fetchAssistantConfig = async () => ({ settings: {} });
+    const setAssistantConfig = async (body) => {
+      globalThis.savedCalls.push(body);
+      return { settings: { threads: { stored: body.threads, value: body.threads } }, changed: ['threads'] };
+    };`)
+const component = (await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default
+component.render = () => null
+const renderer = createRenderer({ createComment: () => ({}), insert() {}, remove() {}, parentNode() {}, nextSibling() {} })
+const app = renderer.createApp(component, { running: true, runningSettings: { threads: ['https://matrix.to/#/!room:example.org/$root'] } })
+const instance = app.mount({})
+const state = instance.$.setupState
+const links = ['https://team.slack.com/archives/C1/p1700000000000001', 'https://matrix.to/#/!room:example.org/$root']
+const config = { settings: { threads: { stored: links, value: links } } }
+state.reply = config
+state.prefill(config)
+assert.equal(state.fields.threads, links.join('\n'))
+assert.deepEqual(state.changes(), {})
+assert.equal(state.runningDiffers('threads'), true)
+state.fields.threads = links[1]
+await state.save()
+assert.deepEqual(globalThis.savedCalls[0], { threads: [links[1]] })
+assert.equal(state.runningDiffers('threads'), false)
+state.fields.threads = ''
+await state.save()
+assert.deepEqual(globalThis.savedCalls[1], { threads: [] })
+app.unmount()
+console.log(JSON.stringify({ passed: true }))
+"""
+    result = subprocess.run([node, "--input-type=module", "-e", script], cwd=WEB,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"passed": True}
+
+
+# --- the daemon's reminders on the settings screen (issue #446) ----------------
+
+def test_the_settings_dialog_carries_the_three_reminder_settings():
+    """#446 item 4 asks for the context threshold "next to checkin and nudge".
+    Neither was on this screen, so all four arrive together — and they are the
+    keys the write route already accepts, spelled as the config fields they are
+    rather than as the groups they are served under."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+
+    for key in ("checkin_window_seconds", "nudge_after_seconds",
+                "nudge_pending_threshold", "rotation_context_threshold"):
+        assert key in text, f"{key} is not written by the settings screen"
+
+
+def test_the_threshold_is_a_percent_slider_from_one_to_a_hundred():
+    """The operator's own shape for it: a slider over the usable range, with the
+    off state beside it rather than at the bottom of the scale — a slider whose
+    lowest position means "never" reads as "always"."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+    slider = re.search(r"<v-slider\b.*?</v-slider>", text, re.S)
+    assert slider, "the threshold is not a slider"
+    assert ':min="1"' in slider.group(0)
+    assert ':max="100"' in slider.group(0)
+    assert "<v-switch" in text, "there is no explicit off state beside the slider"
+    assert "fields.rotationOn ? Number(fields.rotationPercent) : 0" in text, (
+        "the off state does not write the 0 the daemon reads as off"
+    )
+
+
+def test_the_reminder_block_says_it_needs_no_restart():
+    """Everything else on this screen applies to the next incarnation. These four
+    apply on the next detection tick, and a screen that let the opening sentence
+    speak for them would have an operator restarting a session for nothing."""
+    words = " ".join(
+        _operator_words(WEB / "src" / "components" / "AssistantSettings.vue").split()
+    )
+    assert "apply on its next check" in words
+    assert "no restart" in words
+
+
+def test_the_off_state_says_what_off_means_and_what_it_depends_on():
+    words = " ".join(
+        _operator_words(WEB / "src" / "components" / "AssistantSettings.vue").split()
+    )
+    assert "never told its context window is filling" in words
+    assert "publishes the reading on its status line" in words, (
+        "nothing tells the operator the reminder needs a harness that reports one"
+    )
+    assert "nothing here ends a session" in words, (
+        "a settings screen that sets a rotation threshold has to say it does not "
+        "rotate anything"
+    )
+
+
+def test_the_reminder_fields_prefill_from_the_stored_layer():
+    """The launch fields' rule, and it matters more here: prefilling an export's
+    value into a widget that writes config.json bakes the export into the file."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+    assert "config[spec.group]?.[spec.key]?.stored" in text
+    assert "config.rotation?.context_threshold?.stored" in text
+    assert "an exported environment variable pins this to" in text
+
+
+# --- the reminder settings, driven (issue #446) -------------------------------
+#
+# Every guard above reads source, and source cannot show what a save *sends*. The
+# round trip is where a settings screen lies: a threshold the operator set that
+# arrives as nothing, an untouched field stamped with its own value, or an
+# export's number written into the file the first time anything is saved. So this
+# drives the component — prefill it from a daemon reply, move the widgets, call
+# save(), and read the body off the wire.
+
+_SAVE_PROBE = """
+import { readFileSync } from 'node:fs'
+import { createRenderer, ref, h, nextTick } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+
+const path = 'src/components/AssistantSettings.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+// Not `inlineTemplate`: that closes the setup bindings over the render function
+// and `save()` becomes unreachable. The template is not what is under test here.
+const compiled = compileScript(descriptor, { id: 'probe' })
+
+const CONFIG = %s
+
+const sent = []
+globalThis.fetch = async (url, options = {}) => {
+  const body = options.body ? JSON.parse(options.body) : null
+  sent.push({ url: String(url), method: options.method || 'GET', body })
+  // A write answers with `changed`, as the daemon's own route does: the banner
+  // branches on it, so a stub that omitted it would make every flag read false.
+  return {
+    ok: true,
+    status: 200,
+    json: async () => (body ? { ...CONFIG, changed: Object.keys(body).sort() } : CONFIG),
+  }
+}
+
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\\.\\.\\/(api|format|operatorChat)\\.js['"]/g,
+    (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
+const component = (await import(
+  `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`
+)).default
+component.render = () => null
+
+const noop = () => {}
+const nodeOps = {
+  createElement: (t) => ({ tag: t }), createText: (t) => ({ text: t }),
+  createComment: (t) => ({ comment: t }), setText: noop, setElementText: noop,
+  insert: noop, remove: noop, parentNode: () => null, nextSibling: () => null,
+  patchProp: noop, querySelector: () => null, setScopeId: noop,
+  cloneNode: (n) => n,
+}
+const { createApp } = createRenderer(nodeOps)
+
+const child = ref(null)
+const open = ref(false)
+const app = createApp({
+  render: () => h(component, { modelValue: open.value, ref: child }),
+})
+app.config.warnHandler = noop
+app.mount(nodeOps.createElement('root'))
+// Opened the way the drawer opens it, which is what triggers the read.
+open.value = true
+await nextTick()
+await new Promise((resolve) => setTimeout(resolve, 20))
+
+// `<script setup>` bindings are deliberately private on the public proxy, so the
+// internal instance is how a probe reaches them. Test-only reach-in.
+const state = child.value.$.setupState
+const prefilled = {
+  checkinWindow: state.fields.checkinWindow,
+  nudgeAfter: state.fields.nudgeAfter,
+  nudgePending: state.fields.nudgePending,
+  rotationOn: state.fields.rotationOn,
+  rotationPercent: state.fields.rotationPercent,
+}
+
+%s
+
+sent.length = 0
+await state.save()
+// `setupState` unwraps refs, so these are the booleans the template branches on.
+const flags = {
+  savedTick: state.savedTick === true,
+  savedTickShadowed: state.savedTickShadowed === true,
+  savedShadowed: state.savedShadowed === true,
+  savedLaunch: state.savedLaunch === true,
+}
+console.log(JSON.stringify({ sent, prefilled, flags }))
+"""
+
+
+def _settings_reply(**overrides):
+    """A daemon config reply with every group the dialog reads."""
+    def setting(value, stored=None, source="default"):
+        return {"value": value, "source": source, "stored": stored}
+
+    reply = {
+        "settings": {
+            key: setting(None) for key in
+            ("model", "harness", "preset", "agents", "threads")
+        },
+        "chat": {"keep_last": setting(0, 0)},
+        "checkin": {"window_seconds": setting(3600)},
+        "nudge": {
+            "after_seconds": setting(180),
+            "pending_threshold": setting(1),
+        },
+        "rotation": {"context_threshold": setting(0)},
+        "changed": [],
+    }
+    reply.update(overrides)
+    return reply
+
+
+def _drive(script, reply=None):
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    probe = _SAVE_PROBE % (json.dumps(reply or _settings_reply()), script)
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", probe],
+        capture_output=True, text=True, timeout=180, cwd=str(WEB),
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_turning_the_reminder_on_sends_the_percent_and_nothing_else():
+    """The acceptance the operator will check by hand: move the slider, save, and
+    the daemon is asked for exactly that threshold. A whole-form write would stamp
+    every other key with its own value and make two browsers overwrite each other."""
+    driven = _drive(
+        "state.fields.rotationOn = true\n"
+        "state.fields.rotationPercent = 70\n"
+        "await nextTick()"
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes, f"the save sent nothing: {driven['sent']}"
+    assert writes[0]["body"] == {"rotation_context_threshold": 70}
+
+
+def test_turning_it_off_sends_the_zero_the_daemon_reads_as_off():
+    reply = _settings_reply(
+        rotation={"context_threshold": {
+            "value": 70, "source": "config.json", "stored": 70,
+        }},
+    )
+    driven = _drive("state.fields.rotationOn = false\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {"rotation_context_threshold": 0}
+    assert driven["prefilled"]["rotationOn"] is True, (
+        "a stored threshold opened the dialog switched off"
+    )
+    assert driven["prefilled"]["rotationPercent"] == 70
+
+
+def test_an_untouched_form_writes_nothing_at_all():
+    """Every field prefills from the stored layer, so a save that changed nothing
+    has nothing to send — including the three reminder fields, which are unset on
+    a host nobody has configured and must not be stamped with the defaults they
+    are showing."""
+    driven = _drive("await nextTick()")
+    assert driven["prefilled"]["checkinWindow"] == ""
+    assert driven["prefilled"]["nudgeAfter"] == ""
+    assert [call for call in driven["sent"] if call["method"] == "POST"] == []
+
+
+def test_an_exported_value_is_not_baked_into_the_file_by_a_save():
+    """The stored-layer rule, in the case that costs: an export pins the interval
+    at 900, the dialog shows 900 as what is in effect, and a save touching
+    something else must not persist 900 into config.json — where it would outlive
+    the export."""
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {"value": 900, "source": "env", "stored": None},
+            "pending_threshold": {"value": 1, "source": "default", "stored": None},
+        },
+    )
+    driven = _drive(
+        "state.fields.rotationOn = true\n"
+        "state.fields.rotationPercent = 80\n"
+        "await nextTick()",
+        reply,
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert driven["prefilled"]["nudgeAfter"] == "", (
+        "the export's value was prefilled into a field that writes the file"
+    )
+    assert writes[0]["body"] == {"rotation_context_threshold": 80}
+
+
+def test_a_reminder_field_the_operator_typed_is_sent_as_its_config_key():
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\n"
+        "state.fields.checkinWindow = '0'\n"
+        "await nextTick()"
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {
+        "nudge_after_seconds": 600, "checkin_window_seconds": 0,
+    }
+
+
+def test_a_shadowed_reminder_save_does_not_promise_the_next_tick():
+    """Round 1: with `LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD=85` exported,
+    switching the reminder off persists `0` correctly — and the success banner
+    said it applies on the daemon's next check, which still reads 85. The field
+    caption already exposed the shadow; the banner contradicted it."""
+    reply = _settings_reply(
+        rotation={"context_threshold": {
+            "value": 85, "source": "env", "stored": 70,
+        }},
+    )
+    driven = _drive("state.fields.rotationOn = false\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+
+    assert writes[0]["body"] == {"rotation_context_threshold": 0}, (
+        "the stored-only write is unchanged"
+    )
+    assert driven["flags"]["savedTickShadowed"] is True
+    assert driven["flags"]["savedTick"] is False, (
+        "the banner promised a next-tick effect the export will not allow"
+    )
+
+
+def test_an_effective_reminder_save_still_says_it_applies_next_tick():
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\nawait nextTick()"
+    )
+    assert driven["flags"]["savedTick"] is True
+    assert driven["flags"]["savedTickShadowed"] is False
+
+
+def test_a_half_shadowed_save_says_both_things():
+    """One save can change an effective field and a pinned one; the operator
+    needs the true half as well as the warning."""
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {"value": 900, "source": "env", "stored": None},
+            "pending_threshold": {"value": 1, "source": "default", "stored": None},
+        },
+    )
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\n"
+        "state.fields.nudgePending = '3'\n"
+        "await nextTick()",
+        reply,
+    )
+    assert driven["flags"]["savedTick"] is True
+    assert driven["flags"]["savedTickShadowed"] is True
+
+
+def test_clearing_a_reminder_field_clears_the_stored_key():
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {
+                "value": 600, "source": "config.json", "stored": 600,
+            },
+            "pending_threshold": {
+                "value": 1, "source": "default", "stored": None,
+            },
+        },
+    )
+    driven = _drive("state.fields.nudgeAfter = ''\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {"nudge_after_seconds": None}

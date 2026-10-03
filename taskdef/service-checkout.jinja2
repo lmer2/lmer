@@ -1,0 +1,36 @@
+{% if LMER_SERVICE_MODE is defined and LMER_SERVICE_MODE == '1' %}
+{% if LMER_SERVICE_GROUP is defined and LMER_SERVICE_GROUP %}
+Supplied service group: `{{ LMER_SERVICE_GROUP }}`.
+{% else %}
+Supplied service: `{{ LMER_SERVICE_NAME }}`.
+{% endif %}
+
+### Before using the supplied checkout
+
+Before changing branches or files, or starting validation, inspect the branch
+and existing changes in `/workspace` and compare them with this task and the
+current run's recorded work:
+
+```bash
+git branch --show-current
+git status --short
+```
+
+If there are unexpected pre-existing changes, or the branch appears to belong
+to another issue, **STOP and flag the service environment to the operator or
+orchestrator**. Report the service or group, the branch, and the unexpected
+state through `lmer-signal ask`. Preserve the environment and wait for the
+operator to resolve it or explicitly authorize a specific remedy. The service
+environment may simply not have been reset after the previous task.
+
+Do not work around this condition by creating or switching worktrees, switching
+branches, stashing, resetting, discarding, cleaning up, or repairing the
+environment yourself. This check takes precedence over later branch-setup
+instructions. Test runners stay unchanged.
+
+A dirty status alone does not establish a blocker: this run's own later task
+changes, known provisioned local instructions, and ignored files are normal.
+Use the run context to distinguish them from unexpected existing work; do not
+turn normal task progress into repeated stops. A clean, appropriate checkout
+can be used normally.
+{% endif %}

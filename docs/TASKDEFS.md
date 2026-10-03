@@ -312,6 +312,18 @@ taskdefs include it.
 {% raw %}{% include 'service-mode.jinja2' %}{% endraw %}
 ```
 
+`thread-updates.jinja2` supplies the common human-facing posting policy for
+chat, develop, and review: acknowledge substantive work, then post at actual
+phase changes, for decisions, and for results. Diagnostics stay in the run
+record. Connector receipt reactions and quiet keepalive notes are documented
+in [COMMS.md](COMMS.md).
+
+Chat includes the partial from this repository. The develop/review taskdefs
+in the work repository include the same partial with `ignore missing` so an
+older runtime can still render them. Deploy the runtime containing the
+partial and quiet-note handling before relying on the updated work-repo
+taskdefs; both changes are needed for the shared policy to take effect.
+
 ## Patterns
 
 When writing a new taskdef, the templates shipped under `taskdef/` and any

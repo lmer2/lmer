@@ -134,6 +134,64 @@ if [ -n "$LMER_GIT_USER_EMAIL" ]; then
     echo "✅ Git author/committer email overridden via LMER_GIT_USER_EMAIL"
 fi
 
+# ── GPG agent forwarding ──
+# Provision a GNUPGHOME pointing gpg at the forwarded host agent socket
+# (#355). Modern gpg takes the agent socket from its home directory and
+# ignores the environment for it, so this redirect file IS the mechanism.
+#
+# Where the redirect has to live is gnupg's choice, not ours: gpg opens
+# S.gpg-agent inside its *socket directory*, which is a subdirectory of
+# /run/user/<uid>/gnupg when that runtime dir exists and the home directory
+# only as a fallback when it does not (gpgconf says so itself: "no /run/user
+# dir / using homedir as fallback"). So ask gpgconf where it will look
+# rather than assuming — a container that ever gains /run/user/<uid> would
+# otherwise get a redirect gpg never reads, and would report success while
+# every decrypt failed. The separate home is for isolation from any real
+# ~/.gnupg in the session; it has no bearing on the socket directory.
+#
+# Inert unless the socket mount is actually present, so every other taskdef
+# sees nothing and pays nothing — and non-fatal throughout: a broken gpg
+# setup may cost the session gpg, never the launch.
+if [ -n "$LMER_ANSIBLE_GPG_AGENT" ] && [ -S "$LMER_ANSIBLE_GPG_AGENT" ]; then
+    lmer_gnupg_home="${HOME:-/home/developer}/.lmer-gnupg"
+    lmer_gnupg_sockdir=""
+    if mkdir -p "$lmer_gnupg_home" && chmod 700 "$lmer_gnupg_home"; then
+        lmer_gnupg_sockdir="$(GNUPGHOME="$lmer_gnupg_home" \
+            gpgconf --list-dirs socketdir 2>/dev/null)" || lmer_gnupg_sockdir=""
+        # No gpgconf, or nothing printed: fall back to the home directory,
+        # which is where gpg looks whenever there is no /run/user dir.
+        [ -n "$lmer_gnupg_sockdir" ] || lmer_gnupg_sockdir="$lmer_gnupg_home"
+    fi
+    if [ -n "$lmer_gnupg_sockdir" ] \
+        && mkdir -p "$lmer_gnupg_sockdir" \
+        && chmod 700 "$lmer_gnupg_sockdir" \
+        && printf '%%Assuan%%\nsocket=%s\n' "$LMER_ANSIBLE_GPG_AGENT" \
+            > "$lmer_gnupg_sockdir/S.gpg-agent"; then
+        export GNUPGHOME="$lmer_gnupg_home"
+        echo "✅ gpg-agent forwarded via $LMER_ANSIBLE_GPG_AGENT (GNUPGHOME=$GNUPGHOME, socketdir=$lmer_gnupg_sockdir)"
+        # The keyring is copied rather than read in place: gpg wants its
+        # lockfiles and trustdb beside the keyring, and the mount is ro. The
+        # destination name carries the format — gpg picks its parser from it
+        # — so it mirrors the mounted suffix.
+        if [ -n "$LMER_ANSIBLE_GPG_PUBRING" ] && [ -f "$LMER_ANSIBLE_GPG_PUBRING" ]; then
+            case "$LMER_ANSIBLE_GPG_PUBRING" in
+                *.kbx) lmer_pubring_name="pubring.kbx" ;;
+                *)     lmer_pubring_name="pubring.gpg" ;;
+            esac
+            if cp "$LMER_ANSIBLE_GPG_PUBRING" "$lmer_gnupg_home/$lmer_pubring_name" \
+                && chmod 600 "$lmer_gnupg_home/$lmer_pubring_name"; then
+                echo "✅ gpg public keyring installed as $lmer_pubring_name"
+            else
+                echo "⚠️  Could not install the gpg public keyring — recipient lookups will fail"
+            fi
+        else
+            echo "⚠️  No gpg public keyring mounted — recipient lookups will fail"
+        fi
+    else
+        echo "⚠️  Could not provision $lmer_gnupg_home — gpg-agent forwarding is off this session"
+    fi
+fi
+
 # Check if we're in a git repository
 if [ -d .git ]; then
     echo ""

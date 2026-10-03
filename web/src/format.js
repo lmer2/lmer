@@ -5,6 +5,7 @@
 // lmer_platform.inventory.RUN_STATES.
 const STATE_META = {
   running: { label: 'running', tone: 'live' },
+  stuck_teardown: { label: 'stuck teardown', tone: 'attention' },
   // Not 'live' and not 'bad': the process is up but the platform lost its only
   // view of it (the host terminal died with a daemon restart and the container
   // did not answer), so nothing is being recorded. Rendering that as a healthy
@@ -42,6 +43,7 @@ const ATTENTION_LABELS = {
   // something else that ended a turn it never came back from (#243). The note
   // beside it says how long, and how confidently that was decided.
   stalled: 'stopped responding',
+  stuck_teardown: 'is stuck ending its session',
 }
 
 // Tones are this domain's urgency vocabulary; Vuetify colours are how a chip or
@@ -314,19 +316,142 @@ export function targetRef(target) {
   return { kind: kind.kind, number: rest[1], label: `${kind.word} #${rest[1]}` }
 }
 
-// What is driving a session, as far as the *platform* can know it. Two optional
-// and independent facts, both recorded on the spawn entry
-// (lmer_platform.inventory):
-//
-//   - `harness` is recorded only when the spawn request named one. Left unset,
-//     `lmer` resolves it inside the session and the host never learns which.
-//   - `model` is the resolved LMER_LLM_NAME, and nothing writes it yet (T51
-//     adds the flag). The daemon's own environment is not evidence about a run:
-//     an exported LMER_LLM_NAME beats a preset's value host-side, so guessing
-//     from it would be wrong for exactly the runs that name a preset.
-//
-// Null when neither is known, because a chip reading "unknown" where a model
-// belongs is worse than a row that never raises the question.
+// Missing launch facts stay silent; the harness's own defaults are not known here.
 export function driverLabel(run) {
-  return [run.harness, run.model].filter(Boolean).join(' · ') || null
+  return [run.harness, run.model, run.effort].filter(Boolean).join(' · ') || null
+}
+
+// The harness's own status line, as segments to draw (issue 248). One
+// vocabulary for all three surfaces, because a `ctx 9%` that reads differently
+// in the list and in the detail beside it is two facts to an operator.
+//
+// Order is the document's, and the document's order is the harness's: only it
+// knows which of its usage windows matters most. `percent` is present only on
+// the segments that are a proportion, and its absence is how a caller knows
+// there is no meter to draw.
+export function statusSegments(status, { details = false } = {}) {
+  if (!status) return []
+  if (status.harness === 'codex') return codexSegments(status).filter((each) => details || !each.detailOnly)
+  const segments = []
+  const context = proportion(status.context?.percent)
+  if (context !== null) segments.push(segment('ctx', 'ctx', context))
+  for (const window of status.limits || []) {
+    const percent = proportion(window?.percent)
+    if (percent === null) continue
+    segments.push({
+      ...segment(`limit:${window.key}`, window.label || window.key, percent),
+      resets_at: window.resets_at || null,
+    })
+  }
+  // Not a proportion and deliberately last: it is what the session is *set* to,
+  // where everything before it is being spent.
+  const level = status.effort?.level
+  if (level) {
+    segments.push({ key: 'effort', label: 'eff', value: level,
+      text: `eff ${level}` })
+  }
+  return segments
+}
+
+function segment(key, label, percent) {
+  return { key, label, percent, value: `${percent}%`,
+    text: `${label} ${percent}%` }
+}
+
+// A percentage, or null for anything that is not one. Typed rather than
+// coerced: `Number(null)` and `Number(false)` are both 0, and absence means
+// "not reported" everywhere in this document — a fabricated `ctx 0%` is the one
+// answer its shape exists to avoid.
+function proportion(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+// Under a minute is "now" for a status line: claude re-renders on every change,
+// so a fresher reading is one keystroke away and dating it would be noise.
+const STATUS_FRESH_SECONDS = 60
+
+// How long ago the reading was taken, and only once that is worth saying; null
+// while fresh, so a caller renders nothing. The age is the daemon's
+// `age_seconds` and not this browser's clock — see docs/SESSION-STATUS.md ("How
+// the UI renders it") for that trade and for why a missing age still captions.
+// On a failed poll App.vue keeps the last payload, so this caption freezes with
+// the rest of it and the error banner is what says so.
+export function statusAge(status, segments = statusSegments(status)) {
+  if (!status) return null
+  if (status.harness === 'codex') {
+    if (!segments.length) return null
+    const ages = segments.map((each) => each.age_seconds)
+    if (ages.some((age) => typeof age !== 'number' || !Number.isFinite(age))) return 'age unknown'
+    if (ages.some((age) => age < 0)) return 'clock ahead'
+    const oldest = Math.max(...ages)
+    return oldest < STATUS_FRESH_SECONDS ? null : `as of ${duration(oldest)} ago`
+  }
+  const seconds = status.age_seconds
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) {
+    return 'age unknown'
+  }
+  if (seconds < STATUS_FRESH_SECONDS) return null
+  return `as of ${duration(seconds)} ago`
+}
+
+function codexSegments(status) {
+  const usage = status.codex
+  if (!usage) return []
+  const segments = []
+  function add(key, label, value, reading, extra = {}) {
+    const seconds = reading.age_seconds
+    const sourceAge = typeof seconds !== 'number' || !Number.isFinite(seconds)
+      ? 'age unknown' : seconds < 0 ? 'clock ahead'
+        : seconds >= STATUS_FRESH_SECONDS ? `as of ${duration(seconds)} ago` : null
+    const text = `${label} ${value}`
+    segments.push({ key, label, value, text, sourceAge, age_seconds: seconds, updated: reading.updated,
+      provenance: `${reading.scope || 'session metadata'}; ${reading.source}; thread ${usage.thread_id}; thread CLI ${usage.version || 'version unknown'}; model ${usage.runtime?.model || 'unknown'}`,
+      ...extra })
+  }
+  const context = proportion(status.context?.percent)
+  if (context !== null) add('ctx', 'ctx', `${context}%`, status.context, { percent: context })
+  const tokens = usage.tokens
+  if (tokens) {
+    const breakdown = (value) => Object.entries(value || {}).map(([key, count]) => `${key}: ${count}`).join('; ')
+    const count = (value) => Number.isSafeInteger(value) && value >= 0
+    if (count(tokens.last?.total_tokens)) add('last-tokens', 'last response', `${tokens.last.total_tokens.toLocaleString('en-US')} tokens`, tokens,
+      { detail: breakdown(tokens.last), detailOnly: true })
+    if (count(tokens.total?.total_tokens)) add('total-tokens', 'thread total', `${tokens.total.total_tokens.toLocaleString('en-US')} tokens`, tokens,
+      { detail: breakdown(tokens.total), detailOnly: true })
+    if (count(tokens.context_window)) add('capacity', 'context capacity', `${tokens.context_window.toLocaleString('en-US')} tokens`, tokens, { detailOnly: true })
+  }
+  const account = usage.account
+  if (account) {
+    const buckets = [...new Set((account.limits || []).map((window) => window.bucket))]
+    const main = 'main_bucket' in account ? account.main_bucket
+      : buckets.includes('codex') ? 'codex' : buckets.length === 1 ? buckets[0] : null
+    for (const window of account.limits || []) {
+      const reported = proportion(window.percent)
+      if (reported === null) continue
+      const percent = Math.min(100, Math.max(0, reported))
+      const minutes = window.minutes
+      const period = window.period_label || (!Number.isSafeInteger(minutes) || minutes <= 0 ? 'window unknown'
+        : minutes % 1440 === 0 ? `${minutes / 1440}d` : minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`)
+      add(`account:${window.key}`, period, `${percent}%`, account,
+        { percent, detailOnly: window.bucket !== main, detail: `account bucket ${window.bucket}: ${window.label}`, resets_at: window.resets_at, note: window.reset_passed ? 'reset passed; awaiting new snapshot' : null })
+    }
+  }
+  const runtime = usage.runtime
+  if (runtime?.model) add('model', 'model', runtime.model, runtime, { detailOnly: true })
+  if (runtime?.effort) add('effort', 'eff', runtime.effort, runtime)
+  return segments
+}
+
+// When a usage window comes back, phrased forwards. `duration()`'s thresholds,
+// so this and every age beside it agree about when minutes become hours. Null
+// for an absent, unparseable or already-passed reset: "resets in 0s" would be a
+// countdown to something that already happened.
+export function resetsLabel(iso, now = Date.now()) {
+  if (!iso) return null
+  const when = Date.parse(iso)
+  if (Number.isNaN(when)) return null
+  const seconds = (when - now) / 1000
+  if (seconds <= 0) return null
+  const span = duration(seconds)
+  return span ? `resets in ${span}` : null
 }

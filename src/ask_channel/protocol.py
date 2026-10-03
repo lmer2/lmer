@@ -175,7 +175,7 @@ __all__ = [
     "load_closure", "closure_for", "close_question", "is_answerable",
     "load_receipt", "receipt_for", "mark_answer_read", "is_answer_unread",
     "unread_answers",
-    "open_questions", "write_answer", "wait_for_answer",
+    "open_questions", "write_answer", "wait_for_answer", "write_record",
 ]
 
 #: Bumped when a field changes meaning. Both ends read tolerantly, so a record
@@ -217,6 +217,15 @@ CLOSED_SUFFIX = ".closed.json"
 #: field on the answer record because the answer is the platform's file and
 #: nothing here rewrites another writer's file (module docstring).
 READ_SUFFIX = ".read.json"
+
+#: Stamped on every record the supervisor's bus projection files and on nothing
+#: else: which of the directory's two writers filed one (docs/COMMS.md §10,
+#: issue #421). Every reader here ignores unknown keys, so it costs an older CLI
+#: nothing.
+WRITER_KEY = "writer"
+
+#: :data:`WRITER_KEY`'s value on a record the projection filed.
+BUS_WRITER = "bus"
 
 #: The files filed *under* a question rather than being entries of their own.
 #: Listed once so a reader cannot learn about one and miss the other — the whole
@@ -340,14 +349,21 @@ class Answer:
     answered_at: str
     source: str = "operator"
     nonce: str = ""
+    #: 1-based index into the question's options when the operator named one by
+    #: number. Absent from the file unless it was, so a reader that predates it
+    #: sees the shape it always saw.
+    option: Optional[int] = None
 
     def to_dict(self) -> dict:
-        return {
+        record = {
             "question_id": self.question_id,
             "text": self.text,
             "answered_at": self.answered_at,
             "source": self.source,
         }
+        if self.option is not None:
+            record["option"] = self.option
+        return record
 
 
 @dataclass(frozen=True)
@@ -579,6 +595,14 @@ def _write_new(directory: Path, name: str, payload: dict) -> Path:
         raise AskError(f"cannot write {name} in {directory} ({exc})")
     _unlink_quietly(tmp)
     return target
+
+
+def write_record(directory: Path, name: str, payload: dict) -> Path:
+    """Create *name* exclusively with *payload* — the write every shape here
+    uses, for a writer outside this module that must match them byte for
+    byte (the supervisor's ask-dir projection, issue #407). Raises
+    :class:`FileExistsError` when the name is taken."""
+    return _write_new(directory, name, payload)
 
 
 def _unlink_quietly(path: Path) -> None:
@@ -814,12 +838,14 @@ def load_answer(directory: Path, entry_id: str) -> Optional[Answer]:
     answered_at = record.get("answered_at")
     source = record.get("source")
     question_id = record.get("question_id")
+    option = record.get("option")
     return Answer(
         question_id=question_id if isinstance(question_id, str) else "",
         text=text,
         answered_at=answered_at if isinstance(answered_at, str) else "",
         source=source if isinstance(source, str) else "operator",
         nonce=record.get("nonce") if isinstance(record.get("nonce"), str) else "",
+        option=option if isinstance(option, int) and not isinstance(option, bool) else None,
     )
 
 
@@ -1196,6 +1222,7 @@ def write_answer(
     text: str,
     *,
     source: str = "operator",
+    option: Optional[int] = None,
 ) -> Answer:
     """Record the operator's reply to *question*.
 
@@ -1205,6 +1232,11 @@ def write_answer(
     that into whatever "already answered" means at its layer.
     """
     body = _clean_text(text, MAX_ANSWER_CHARS, "the answer")
+    if option is not None and not 1 <= option <= len(question.options):
+        raise AskError(
+            f"option {option} is not one of the {len(question.options)} "
+            f"question {question.id} offers"
+        )
     record = {
         "schema": SCHEMA_VERSION,
         "kind": "answer",
@@ -1214,6 +1246,8 @@ def write_answer(
         "answered_at": utc_now_iso(),
         "source": source,
     }
+    if option is not None:
+        record["option"] = option
     _write_new(directory, f"{question.id}{ANSWER_SUFFIX}", record)
     return Answer(
         question_id=question.id,
@@ -1221,6 +1255,7 @@ def write_answer(
         answered_at=record["answered_at"],
         source=source,
         nonce=question.nonce,
+        option=option,
     )
 
 

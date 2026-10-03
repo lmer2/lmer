@@ -35,8 +35,16 @@ from .git_ops import (
     web_url_for,
 )
 from . import goals, plan_index, release_run, run_state, specs_index, write_journal
-from .memory import persist_memory, restore_memory
-from .utils import redact_secrets, task_target_dir
+from .memory import memory_write_rel_paths, persist_memory, restore_memory
+from .utils import (
+    MANIFEST_PROBLEM,
+    redact_secrets,
+    task_target_dir,
+    work_repo_form,
+    work_repo_layout,
+    no_run_context_error,
+    no_run_context_reason,
+)
 
 # `work verify` keeps only this much of the tail of the verified command's
 # combined output in memory — enough to cover any runner's summary, bounded
@@ -102,6 +110,9 @@ Examples:
 
   # Seed a run for another slug (out-of-session run creation)
   work seed develop gate-receipts --goal "..." --name gate-receipts
+
+  # What is running in this project (one row per launch; --running filters)
+  work sessions --running
 
   # Record a plan task's completion in the execution ledger
   work ledger set T2 --status done --commit 4a1f9c2 --receipt t2-tests
@@ -400,6 +411,25 @@ Examples:
     )
     resume_parser.add_argument("--json", action="store_true", dest="as_json",
                                help="Emit the decision as JSON")
+    resume_parser.add_argument(
+        "--session", metavar="<id>",
+        help="Brief this session's record instead of the launch's own "
+             "(schema form: one launch = one record — see `work sessions`)",
+    )
+
+    # sessions command (D22 — the session is the unit of record, issue #353)
+    sessions_parser = subparsers.add_parser(
+        "sessions",
+        help="List this project's run records — one row per launch (read-only)",
+    )
+    sessions_parser.add_argument(
+        "--running", action="store_true",
+        help="Only records something is live in (in-progress with a fresh owner claim)",
+    )
+    sessions_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the rows as JSON",
+    )
 
     # artifact command
     artifact_parser = subparsers.add_parser(
@@ -559,9 +589,15 @@ Examples:
     )
 
     # session-start / session-end (hook plumbing — spec §4.4)
-    subparsers.add_parser(
+    session_start_parser = subparsers.add_parser(
         "session-start",
         help="Seed/claim the run for this session and print the resume brief (hook-facing)",
+    )
+    session_start_parser.add_argument(
+        "--session", metavar="<id>",
+        help="Continue this session's record — the D22 resume handshake: this "
+             "harness id chains into its lineage and every later `work` "
+             "invocation of the launch finds it there",
     )
     subparsers.add_parser(
         "session-end",
@@ -764,7 +800,7 @@ def cmd_report(file_path: str) -> int:
     try:
         rdir = run_state.run_dir()
         if rdir is None:
-            print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+            print(no_run_context_error(), file=sys.stderr)
             return 1
 
         work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
@@ -1065,7 +1101,7 @@ def _require_run() -> tuple[Path, dict] | tuple[None, None]:
     no run context or the state layer refuses.
     """
     if run_state.run_dir() is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return None, None
     try:
         return run_state.ensure_run()
@@ -1318,7 +1354,7 @@ def cmd_answer(text: str) -> int:
         return 1
     rdir = run_state.run_dir()
     if rdir is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
     try:
         state = run_state.load_state(rdir)
@@ -1519,37 +1555,78 @@ def _validate_name(value: str) -> str | None:
     return name
 
 
-def _name_conflict(rdir: Path, name: str) -> str | None:
-    """Slug of another run in this project already holding `name`, or None.
+def _name_conflict(rdir: Path, name: str, slug: str | None = None) -> str | None:
+    """Address of another run in this project already holding `name`, or None.
 
-    Scans sibling run dirs for state.yaml (plus legacy state.yml).
-    Corrupt/unreadable siblings are skipped — a broken run must not block
-    naming — and the archive/ subtree is ignored (archived runs no longer
-    hold their names). A sibling's slug also holds its name: a name equal
-    to another run's slug would let the name shadow that run's address.
-    The slug is checked from the sibling's recorded state (dirs get
-    renamed to `<slug>--<name>` at the freeze, so the dir name alone no
-    longer carries the slug), with the dir-name check kept as a fallback
-    for stateless dirs.
+    Names are unique per PROJECT (RUN-STATE.md §4), so the scan is every
+    RECORD in the run area — `run_state.iter_record_dirs`, the one walk that
+    knows which directories are records in either form. It used to be
+    `rdir`'s siblings, which was the same set while a run dir sat directly
+    in `runs/`; in schema form a record's siblings are the OTHER LAUNCHES OF
+    ITS OWN GROUP (D22), so a sibling scan quietly asked "is this name free
+    in this run's group" and let two runs of the project hold one name — the
+    ambiguity the rule exists to prevent, since `find_run_dir(match_names=)`
+    then answers with whichever the walk reaches first.
+
+    Corrupt/unreadable records are skipped (a broken run must not block
+    naming) and the archive/ subtree is skipped by the walk itself (archived
+    runs no longer hold their names). A record's slug also holds its name: a
+    name equal to another run's slug would let the name shadow that run's
+    address. The slug is read from recorded state — dirs get renamed at the
+    freeze, so a directory name is never an identity — with a name-shaped
+    directory kept as the fallback for stateless dirs.
+
+    The holder is quoted run-area-relative (`<slug>/<sid>` for a session
+    dir, the bare dir name in a legacy tree): a bare session id would name a
+    launch without saying which run it belongs to, and it is the spelling
+    the movers report (`run_state.run_area_rel_name`).
+
+    `slug` is the identity of the run being named — passed in because the
+    naming run may not exist on disk yet (`work seed --name`). Every launch
+    of one run records that slug, so without it a schema-form run could no
+    longer take its own slug as its name: its own sibling would be read as
+    another run holding the address.
     """
-    base = rdir.parent
-    if not base.is_dir():
+    base = run_state.runs_base()
+    if base is None or not base.is_dir():
         return None
-    for sibling in sorted(base.iterdir()):
-        if not sibling.is_dir() or sibling.name in (rdir.name, "archive"):
+    for record in run_state.iter_record_dirs(base):
+        if record == rdir:
             continue
-        if sibling.name == name:
-            return sibling.name
-        sib_state = run_state._read_sibling_state(sibling)
-        if sib_state is not None and name in (
-            sib_state.get("name"), sib_state.get("slug")
-        ):
-            return sibling.name
+        rec_state = run_state._read_sibling_state(record)
+        if rec_state is None:
+            held = record.name == name
+        else:
+            # A record of the run being named (in schema form, another launch
+            # of it) holds our OWN slug — that is not a foreign address the
+            # name could shadow, and a run has always been allowed to take
+            # its own slug as its name.
+            held = rec_state.get("name") == name or (
+                rec_state.get("slug") == name and name != slug
+            )
+        if held:
+            return run_state.run_area_rel_name(record) or record.name
+    # The ADDRESS the name would shadow, whether or not anything records it:
+    # `runs/<name>/` in a legacy tree, the `_runs/<name>/` group in schema
+    # form. A stateless leftover occupies an address exactly as a run does
+    # (run_state.slug_available gives the same conservative answer), and the
+    # run being named never counts as its own conflict.
+    address = base / name
+    if address.is_dir() and address not in (rdir, rdir.parent):
+        return name
     return None
 
 
 def cmd_name(value: str | None) -> int:
-    """Execute name command (spec §1 `work name`)."""
+    """Execute name command (spec §1 `work name`).
+
+    The name lands on the record this launch writes in, which in schema form
+    is its SESSION dir (issue #353 D22): two launches against one target are
+    two records, and a name is exactly how an operator tells them apart, so
+    naming the group would name both. Nothing renames here either way — the
+    pre-execution freeze gate takes the single directory rename, on the
+    session dir (`<sid>` → `<sid>--<name>`) or on the legacy run dir.
+    """
     if value is None:
         # Display path — read-only; never breaks a session (always 0).
         rdir = run_state.run_dir()
@@ -1577,7 +1654,7 @@ def cmd_name(value: str | None) -> int:
     if state.get("name") == name:
         print(f"✅ Name unchanged: {name}")
         return 0
-    holder = _name_conflict(rdir, name)
+    holder = _name_conflict(rdir, name, state.get("slug"))
     if holder is not None:
         print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
         return 1
@@ -2057,6 +2134,224 @@ def cmd_goals(args) -> int:
     return _cmd_goals_status()
 
 
+def _record_is_asking(rdir: Path) -> bool:
+    """Whether the record at *rdir* is stopped on a question right now.
+
+    Exactly the predicate :func:`_apply_pushed_answer` applies an answer on,
+    read once more here so the routing below can never send a launch at a
+    record the apply would then decline (`work answer` and the pushed
+    `LMER_ANSWER` are documented as equivalent — RUN-STATE.md §4). Read
+    through the resolver's tolerant reader: a sibling record whose state is
+    corrupt is not asking anything, and must not raise out of a hook.
+    """
+    state = run_state._read_sibling_state(rdir)
+    return isinstance(state, dict) and state.get("stop_reason") == "question"
+
+
+def _session_that_asked() -> str | None:
+    """The session id a pushed `LMER_ANSWER` belongs to, or None (D22).
+
+    An answer belongs to the QUESTION it was given for, and in schema form
+    the question was asked by one launch, in its own record. The relaunch
+    that carries the answer is a new container with a new `LMER_SESSION_ID`,
+    so the kernel's own routing would open a fresh session dir beside the
+    one that asked: the answer would land in an empty record, the question
+    would stand forever in the real one, and `work sessions` would show the
+    stopped run nobody answered. Naming the session explicitly
+    (`work session-start --session <id>`) is the direct route; this is the
+    fallback for a launcher that carries only the answer.
+
+    Deliberately narrow, because rerouting a launch is not a small act:
+
+    - nothing to apply (no `LMER_ANSWER`, or one this container already
+      consumed — :func:`_answer_marker_path`) routes nothing at all;
+    - a launch that ALREADY has a record of its own — its own session dir
+      holding a state file, or one whose lineage records this harness id —
+      is left where it is. The test is the state FILE and not the directory
+      because container start creates this launch's session dir EMPTY,
+      before the harness and so before any `work` verb runs
+      (`clone_and_exec._ensure_session_dir`, D22): an existence test is
+      true on every real container, and this reroute would never fire in
+      the one shape it ships in. `run_state._state_path` is the same "is
+      this a record" question `_session_dirs` asks of a grouping dir's
+      children, rather than a second rule that can drift from it. This
+      still only ever redirects a dir nothing has been written in;
+    - only records of THIS run (the slug this session derives) and only ones
+      that are stopped on a question are candidates, and only in schema form
+      — a legacy tree has one shared run dir per target, which is already
+      the dir that asked (rows there carry no session id, and this returns
+      None, so the legacy route is byte-identical);
+    - the newest asker wins when several launches of one run are stopped on
+      a question, the same "newest session" rule the kernel and the fleet
+      view resolve a group by (`run_state.list_sessions` lists in start
+      order, so that is its last row).
+    """
+    answer = (os.environ.get("LMER_ANSWER") or "").strip()
+    if not answer:
+        return None
+    try:
+        if _answer_marker_path(answer).exists():
+            return None
+        own = run_state.run_dir()
+        if own is None or run_state._state_path(own) is not None:
+            return None
+        slug = run_state.derive_slug()
+        asking = [
+            row["id"]
+            for row in run_state.list_sessions()
+            if row["id"] and row["slug"] == slug and _record_is_asking(row["path"])
+        ]
+    except (run_state.RunStateError, OSError):
+        return None
+    return asking[-1] if asking else None
+
+
+def _launch_session(session: str | None) -> str | None:
+    """The session id this invocation addresses, or None for the launch's own.
+
+    One rule for both verbs that take `--session`: an explicit id is the
+    resume handshake and wins outright, and an answer with no explicit id
+    addresses the session that asked (:func:`_session_that_asked`). None
+    hands the question back to the kernel, which routes by
+    `LMER_SESSION_ID` and the recorded lineage — the whole point of the
+    lineage being that ONE call per launch is enough, so nothing here has to
+    be forwarded into the container a second time.
+
+    The id itself is never inspected here. `run_state` validates it where
+    the consequence is (a value that is not a usable directory name would
+    address the grouping level D22 keeps empty, or a launch nobody named)
+    and raises `RunStateError`; a second copy of that rule in the CLI is a
+    copy that drifts.
+    """
+    if session is not None:
+        # Given, and given EMPTY, are different requests: `--session ""` asks
+        # for a session that cannot be one, and the kernel refuses it rather
+        # than reading it as absent (its decided letter). Folding it back to
+        # "the launch's own" here would answer a request nobody made.
+        return session
+    return _session_that_asked()
+
+
+def _format_sessions(rows: list[dict], running_only: bool) -> str:
+    """The `work sessions` table: one line per record, in start order.
+
+    Reads as the answer to "what is running": the run's slug, the launch's
+    session id, its status, and the fields an operator decides on (name,
+    phase, timestamps) as `key=value` tails, the way `work ledger` prints a
+    row. A legacy run dir has no session id — several sessions interleave in
+    one dir, so none of them names it — and prints `-` in that column rather
+    than a directory name pretending to be a launch.
+    """
+    if not rows:
+        return "No sessions running" if running_only else "No sessions recorded"
+    id_width = max(len(row["id"] or "-") for row in rows)
+    slug_width = max(len(str(row["slug"] or "?")) for row in rows)
+    orphaned = sum(1 for row in rows if row["orphaned"] is True)
+    running = sum(
+        1 for row in rows if row["status"] == "in-progress" and row["orphaned"] is False
+    )
+    head = f"Running sessions: {len(rows)}" if running_only else (
+        f"Sessions: {len(rows)} ({running} running, {orphaned} orphaned)"
+    )
+    lines = [head]
+    for row in rows:
+        parts = [
+            f"  {str(row['slug'] or '?'):<{slug_width}}  "
+            f"{(row['id'] or '-'):<{id_width}}  {str(row['status'] or '?'):<11}"
+        ]
+        for key in ("name", "phase", "created", "updated"):
+            if row.get(key):
+                parts.append(f"{key}={row[key]}")
+        if row["orphaned"] is True:
+            parts.append("⚠️  orphaned (no live owner)")
+        if row["orphaned"] is None:
+            parts.append("⚠️  state unreadable")
+        lines.append(" ".join(parts).rstrip())
+    return "\n".join(lines)
+
+
+def _session_json_entry(row: dict) -> dict:
+    """One `work sessions --json` entry: the row, or the unreadable shape.
+
+    `run_state.list_sessions` hands back what `yaml.safe_load` produced, and
+    YAML has types JSON does not: an unquoted ISO date resolves to a
+    `datetime` (`created`, `updated`, `frozen`, `owner.claimed_at` all
+    qualify), which `json.dumps` refuses. One hand-edited record must not
+    take down the machine-readable listing the fleet view reads — this verb
+    is read-only and always exits 0.
+
+    A record whose state cannot be REPRESENTED is an unreadable record, and
+    the verb already publishes what happens to one: it is listed with None
+    fields and no verdict, never dropped. So only the state-derived fields
+    are cleared, per record, leaving the readable rows byte-identical — a
+    blanket coercion over the whole document (`default=str`) would instead
+    reshape good rows to rescue a bad one, and the reader could no longer
+    tell a recorded timestamp from a repr of something else.
+    """
+    entry = dict(row)
+    entry["path"] = str(row["path"])
+    entry["address"] = run_state.run_area_rel_name(row["path"])
+    try:
+        json.dumps(entry)
+    except (TypeError, ValueError):
+        # Kept: the record's ADDRESS, read off the directory name and a
+        # string by construction. Cleared: everything list_sessions read out
+        # of the state file, whatever a hand edit made of it — including a
+        # field added there later, which this way needs no second list.
+        address = ("id", "dir_name", "path", "address")
+        entry = {
+            key: (value if key in address else None)
+            for key, value in entry.items()
+        }
+    return entry
+
+
+def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
+    """Execute `work sessions` — what is running in this project (D22).
+
+    One verb for both forms, because "what is running" is one question: in
+    schema form a row is one LAUNCH (`_runs/<slug>/<session-id>/`, the unit
+    of record — two people on one issue are two rows that share a slug), in
+    a legacy tree it is a run dir, listed with no session id. The rows come
+    from `run_state.list_sessions`, which owns the walk and the `orphaned`
+    verdict; nothing is re-derived here.
+
+    `--running` is `in-progress` AND not orphaned — something is live in it.
+    An orphaned record (in-progress, no owner claim or a stale one) is
+    deliberately NOT running and just as deliberately still listed without
+    the flag: it is the resumable one, and hiding it is how a crashed
+    session is mistaken for a finished one. A record whose state cannot be
+    read has no verdict at all, so it is never `--running` and always listed.
+
+    Read-only, and always exits 0 — the `work ledger` convention. No run
+    context is a normal state (a `chat` session without a repo), not a
+    failure, and it is reported with the cause it actually has; so is a
+    record JSON cannot represent (:func:`_session_json_entry`).
+    """
+    base = run_state.runs_base()
+    if base is None:
+        detail = no_run_context_reason()
+        if as_json:
+            print(json.dumps({"form": work_repo_form(), "count": 0,
+                              "sessions": [], "detail": detail}))
+        else:
+            print(f"No run context: {detail}")
+        return 0
+    rows = run_state.list_sessions(base=base)
+    if running_only:
+        rows = [
+            row for row in rows
+            if row["status"] == "in-progress" and row["orphaned"] is False
+        ]
+    if as_json:
+        payload = [_session_json_entry(row) for row in rows]
+        print(json.dumps({"form": work_repo_form(), "count": len(payload),
+                          "sessions": payload}, ensure_ascii=False))
+        return 0
+    print(_format_sessions(rows, running_only))
+    return 0
+
+
 def _release_record_for_brief(rdir: Path, state) -> dict | None:
     """Release record for the resume brief (release-flow §3), or None.
 
@@ -2074,9 +2369,26 @@ def _release_record_for_brief(rdir: Path, state) -> dict | None:
         return None
 
 
-def cmd_resume(as_json: bool = False) -> int:
-    """Execute resume command. Read-only; never breaks a session (always 0)."""
-    rdir = run_state.run_dir()
+def cmd_resume(as_json: bool = False, session: str | None = None) -> int:
+    """Execute resume command. Read-only; never breaks a session (always 0).
+
+    `--session` briefs ONE launch's record (D22): in schema form a slug
+    groups every launch against a target, so "the run's brief" is a
+    question about a specific record once two people are on one issue. With
+    no flag the kernel routes as it always has — this launch's own dir,
+    the dir whose lineage records this harness id, or the legacy run dir —
+    except that a relaunch carrying an answer briefs the session that asked
+    (:func:`_session_that_asked`), which is the record the answer is about
+    to be applied to.
+    """
+    try:
+        rdir = run_state.run_dir(session=_launch_session(session))
+    except run_state.RunStateError as exc:
+        # An unusable session id. Read-only verbs never exit non-zero
+        # (RUN-STATE.md §4), and the refusal is the kernel's — spelled
+        # there, printed here, never a traceback out of a hook.
+        print(f"⚠️  {exc}")
+        return 0
     if rdir is None:
         print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
         return 0
@@ -2291,7 +2603,7 @@ def cmd_specs_index(rebuild: bool) -> int:
     `work seed`).
     """
     if specs_index.specs_dir() is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
     if rebuild:
         created = specs_index.rebuild()
@@ -2323,7 +2635,7 @@ def cmd_seed(args) -> int:
     """
     base = run_state.runs_base()
     if base is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
 
     slug = run_state.derive_slug(args.taskdef, args.target)
@@ -2342,7 +2654,7 @@ def cmd_seed(args) -> int:
         name = _validate_name(args.name)
         if name is None:
             return 1
-        holder = _name_conflict(base / slug, name)
+        holder = _name_conflict(base / slug, name, slug)
         if holder is not None:
             print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
             return 1
@@ -2610,7 +2922,14 @@ def _roll_over_terminal_release(
     # already taken. Computing an address that is free by construction is
     # what keeps this roll-over from dead-ending in the refusal below.
     try:
-        aside = release_run.unique_release_slug(base, version, rdir.parent, rdir)
+        # The RUN AREA, never `rdir.parent`: in schema form the parent is the
+        # `_runs/<slug>/` group, and occupancy asked there tests
+        # `_runs/<old-slug>/<candidate>` instead of `_runs/<candidate>` — so
+        # the answer can be an address `slug_available` (and therefore
+        # reslug_run) refuses, which is exactly what this function's total
+        # guarantee exists to prevent.
+        aside = release_run.unique_release_slug(
+            base, version, run_state.runs_base(), rdir)
     except release_run.ReleaseRunError as exc:
         # No free address exists (pathological runs/ tree). Fail closed: the
         # caller refuses rather than claiming a terminal run.
@@ -2633,7 +2952,13 @@ def _roll_over_terminal_release(
     # rename actually happened: a re-slug interrupted between its rename and
     # its slug write is completed here from the dir it already sits in, which
     # vacates nothing but still writes state the resolver cannot name.
-    moved_names = tuple(n for n in (old_dir_name, moved.name) if n)
+    # Both ends named the same way — run-area-relative, which `reslug_run`
+    # already returns for the vacated half. `moved.name` is the bare session
+    # id in schema form, and a staging path built from it addresses
+    # `_runs/<sid>`, a directory nothing ever wrote.
+    moved_names = tuple(
+        n for n in (old_dir_name, run_state.run_area_rel_name(moved)) if n
+    )
     return fresh_rdir, fresh_state, moved_names
 
 
@@ -2662,7 +2987,7 @@ def cmd_release_claim(as_json: bool = False) -> int:
     attempts exhausted): fail closed, never proceed unlocked.
     """
     if run_state.run_dir() is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
     session = run_state.current_session_id()
     last_detail = "no push attempted"
@@ -2854,7 +3179,7 @@ def cmd_release_unclaim(force: bool = False) -> int:
     success. Mutating-verb rules: no run context is an error (exit 1).
     """
     if run_state.run_dir() is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
     session = run_state.current_session_id()
     last_detail = "no push attempted"
@@ -2931,7 +3256,7 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
     never reverts anything.
     """
     if run_state.run_dir() is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        print(no_run_context_error(), file=sys.stderr)
         return 1
     last_detail = "no push attempted"
     for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
@@ -3035,7 +3360,10 @@ def _ensure_release_slug(
     if release_run.names_version(state.get("slug"), base, version):
         return rdir, state, None
     try:
-        target = release_run.unique_release_slug(base, version, rdir.parent, rdir)
+        # The run area, for the reason given at the claim's roll-over: the
+        # group is one level too deep to answer "is this address free?".
+        target = release_run.unique_release_slug(
+            base, version, run_state.runs_base(), rdir)
     except release_run.ReleaseRunError as exc:
         # No address is free (pathological runs/ tree). Same fallback a failed
         # rename takes: the record itself already landed, so warn and leave the
@@ -3107,7 +3435,7 @@ def cmd_release_record(args) -> int:
               f"new path — the old one is free for the next release)")
     # Durability: the record is the crash-recovery contract (spec §3 —
     # resume is the contract) — push now, not at session end. An idempotent
-    # no-op stages nothing and commit_work_path skips the empty commit. The
+    # no-op creates no commit but still verifies remote publication. The
     # pre-rename path rides along so a re-slug's deletion lands too.
     _push_run_dir(state, f"release record {noun}", old_dir_name,
                   saved="release record")
@@ -3197,12 +3525,37 @@ def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
     return state, answered
 
 
-def cmd_session_start() -> int:
+def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
-    ALWAYS exits 0 — a broken state layer must never break session start."""
-    rdir = run_state.run_dir()
+    ALWAYS exits 0 — a broken state layer must never break session start.
+
+    `--session` is the D22 resume handshake, and it happens exactly once per
+    launch: the named record is the one this session continues, and
+    `attach_session` chains this harness id into its `sessions:` lineage so
+    every LATER `work` invocation of the launch — a different process that
+    knows only its own `LMER_SESSION_ID` — finds the same dir through the
+    record itself. That is why no second environment variable is minted,
+    forwarded into the container and kept in step with the directory. A
+    legacy tree keeps one shared run dir per target and chains nothing.
+    """
+    try:
+        session = _launch_session(session)
+        rdir = run_state.run_dir(session=session)
+    except run_state.RunStateError as exc:
+        # An unusable session id, refused by the kernel where the
+        # consequence is. Hook-facing: reported, never raised, still 0.
+        print(f"⚠️  run-state session-start skipped: {exc}")
+        return 0
     if rdir is None:
-        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset) — run state skipped")
+        # The cause, not a guess at it. `hooks/start.py` runs this verb with
+        # `capture_output=True` and injects its STDOUT into the agent's
+        # context while dropping stderr, so on a schema-form tree with an
+        # unusable manifest this line is the reader's ONLY channel — the
+        # announcement naming the manifest goes to a stderr nobody reads,
+        # and "env vars unset" would send the agent at the environment
+        # instead (the misdiagnosis `_no_run_context_reason` exists to
+        # prevent). Still hook-facing: a note on stdout, never a refusal.
+        print(f"No run context: {no_run_context_reason()} — run state skipped")
         return 0
     try:
         recovered = False
@@ -3237,7 +3590,14 @@ def cmd_session_start() -> int:
                     run_state.derive_slug(),
                     os.environ.get("LMER_TASK", "default"),
                     os.environ.get("LMER_TASK_TARGET", ""),
+                    session=session,
                 )
+
+        # The handshake itself (D22): this harness id joins the record's
+        # lineage, which is what routes the rest of the launch back here. A
+        # no-op for a legacy run dir and for a record this id already writes
+        # in, so a plain session start costs no extra write.
+        run_state.attach_session(rdir, state)
 
         state, answered = _apply_pushed_answer(rdir, state)
 
@@ -3443,9 +3803,10 @@ def _write_intent_rel_paths(args) -> list[str] | None:
     if command == "memory":
         if getattr(args, "memory_action", None) != "persist":
             return None
-        host = os.environ.get("LMER_REPO_HOST")
-        project = os.environ.get("LMER_REPO_PROJECT")
-        return [f"{host}/{project}/memory"] if host and project else []
+        # The writer owns the shape: memory has one scope in a legacy tree and
+        # two in a schema-form one (issue #353 D17), and a hand-built
+        # {host}/{project}/memory would journal a path persist never touches.
+        return memory_write_rel_paths()
     return None
 
 
@@ -3550,7 +3911,9 @@ def _dispatch(args, parser) -> int:
         parser.print_help()
         return 1
     elif args.command == "resume":
-        return cmd_resume(args.as_json)
+        return cmd_resume(args.as_json, args.session)
+    elif args.command == "sessions":
+        return cmd_sessions(args.running, args.as_json)
     elif args.command == "artifact":
         return cmd_artifact(args.name, args.file, args.sync)
     elif args.command == "specs-index":
@@ -3573,7 +3936,7 @@ def _dispatch(args, parser) -> int:
         parser.print_help()
         return 1
     elif args.command == "session-start":
-        return cmd_session_start()
+        return cmd_session_start(args.session)
     elif args.command == "session-end":
         return cmd_session_end()
     else:

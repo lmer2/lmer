@@ -692,3 +692,737 @@ def test_the_server_and_the_view_agree_on_the_marker():
     """One spelling of the marker, checked across the seam rather than assumed."""
     assert transcripts.ASK_CHANNEL_VIA == "ask"
     assert f"message.via === '{transcripts.ASK_CHANNEL_VIA}'" in _chat()
+
+
+# --- the bus (issue #407): the conversation, every channel included ------------
+#
+# The ask channel is a projection of the bus for one release; when the daemon's
+# journal holds a session's records, they are the conversation and the projection
+# is not read. Records are planted straight into the journal the way the hub's
+# subscriber lands them.
+
+from lmer_platform import comms as platform_comms  # noqa: E402
+
+
+def plant_record(session_id, seq, kind, text, *, channel="agent", author=None, ref=None,
+                 in_reply_to=None, at=AFTER_THE_EDIT, meta=None, options=()):
+    record = {
+        "schema": 1, "id": f"{session_id}/{seq:06d}", "seq": seq, "session": session_id,
+        "at": at, "source": {"channel": channel}, "kind": kind, "text": text,
+        "in_reply_to": in_reply_to, "options": list(options), "attachments": [],
+        "meta": dict(meta or {}),
+    }
+    if author:
+        record["source"]["author"] = author
+    if ref:
+        record["source"]["ref"] = ref
+    platform_comms.ensure_hub().journal.append(session_id, record)
+    return record
+
+
+def plant_rows(session_id, rows):
+    """A session whose transcript is exactly *rows* (harness-shaped records)."""
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir(session_id) / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "rows.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+
+def user_row(text, at="2026-07-20T09:00:02.000Z"):
+    return {"type": "user", "timestamp": at, "message": {"role": "user", "content": text}}
+
+
+def assistant_row(text, at="2026-07-20T09:00:03.000Z"):
+    return {"type": "assistant", "timestamp": at,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+
+def bus_turns(page):
+    return [
+        (m.role, m.text, m.comms_kind, (m.source or {}).get("channel"))
+        for m in page.messages if m.via == transcripts.COMMS_VIA
+    ]
+
+
+def test_bus_records_are_the_conversation_with_their_sources(platform_root):
+    session_id = "s-bus-merge"
+    plant_rows(session_id, [assistant_row("looking at the branch")])
+    plant_record(session_id, 1, "note", "running the suite")
+    plant_record(session_id, 2, "question", "which branch?", options=["main", "prep"])
+    plant_record(session_id, 3, "answer", "prep", channel="slack", author="tester", ref="t1",
+                 in_reply_to=f"{session_id}/000002", meta={"delivered": "pty"})
+    plant_record(session_id, 4, "message", "thanks — go ahead", channel="matrix", author="@alice:x", ref="e1")
+    plant_record(session_id, 5, "milestone", "pushed MR !300")
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert said(page)[0] == ("assistant", "looking at the branch")
+    assert bus_turns(page) == [
+        ("assistant", "running the suite", "note", "agent"),
+        ("assistant", "which branch?", "question", "agent"),
+        ("user", "prep", "answer", "slack"),
+        ("user", "thanks — go ahead", None, "matrix"),
+        ("assistant", "pushed MR !300", "milestone", "agent"),
+    ]
+    answer = [m for m in page.messages if m.text == "prep"][0]
+    assert answer.source == {"channel": "slack", "author": "tester", "ref": "t1"}
+    assert answer.to_dict()["source"]["author"] == "tester"
+    assert answer.origin is None
+
+
+def test_the_harness_copy_of_a_relayed_record_is_hidden(platform_root):
+    """The supervisor typed ``[slack · tester] hello there`` into the harness, which
+    wrote it down as a user turn. The bus record already says who said hello."""
+    session_id = "s-bus-relay"
+    plant_rows(session_id, [
+        user_row("[slack · tester] hello there", at="2026-07-20T09:00:02.000Z"),
+        assistant_row("hi tester", at="2026-07-20T09:00:03.000Z"),
+        user_row("[slack · tester] hello   there", at="2026-07-20T09:00:04.000Z"),
+        user_row("an unrelated turn typed at the terminal", at="2026-07-20T09:00:05.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "hello there", channel="slack", author="tester", ref="t1",
+                 at="2026-07-20T09:00:01Z")
+    plant_record(session_id, 2, "message", "hello there", channel="slack", author="tester", ref="t2",
+                 at="2026-07-20T09:00:04Z")
+    page = transcripts.read_messages(session_id, limit=100)
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[slack")]
+    assert harness_copies == [], "the harness's copy of a relayed record is still shown"
+    assert [(m.role, m.text) for m in page.messages if m.via is None] == [
+        ("assistant", "hi tester"),
+        ("user", "an unrelated turn typed at the terminal"),
+    ]
+    assert said(page).count(("user", "hello there")) == 2
+
+
+def test_a_late_answer_is_labelled_and_a_command_is_the_platforms(platform_root):
+    session_id = "s-bus-late"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    plant_record(session_id, 1, "question", "branch?")
+    plant_record(session_id, 2, "answer", "prep", channel="slack", author="tester", in_reply_to=f"{session_id}/000001")
+    plant_record(session_id, 3, "answer", "main", channel="matrix", author="@a:x",
+                 in_reply_to=f"{session_id}/000001", meta={"late": True, "answered_by": f"{session_id}/000002"})
+    plant_record(session_id, 4, "command", "/followup", channel="uber-lmer")
+    plant_record(session_id, 5, "close", "", in_reply_to=f"{session_id}/000001")
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [(m.role, m.comms_kind, m.text) for m in page.messages] == [
+        ("assistant", "question", "branch?"),
+        ("user", "answer", "prep"),
+        ("user", "late answer", "main"),
+        (transcripts.PLATFORM_ROLE, "command", "/followup"),
+        ("assistant", "close", "stopped waiting for an answer"),
+    ]
+
+
+def test_the_ask_channel_is_read_only_when_the_bus_has_nothing(platform_root):
+    """An older image writes the ask channel and nothing else; a current one
+    projects the bus into it, and reading both would double every question."""
+    session_id = "s-bus-fallback"
+    plant_session(session_id)
+    plant_question(session_id, "old-image question?", answer="yes")
+    page = transcripts.read_messages(session_id, limit=100)
+    assert ("assistant", "old-image question?") in said(page)
+    assert all(m.via in (None, transcripts.ASK_CHANNEL_VIA) for m in page.messages)
+
+    plant_record(session_id, 1, "question", "old-image question?")
+    page = transcripts.read_messages(session_id, limit=100)
+    assert said(page).count(("assistant", "old-image question?")) == 1
+    assert [m.via for m in page.messages if m.text == "old-image question?"] == [transcripts.COMMS_VIA]
+
+
+def test_the_messages_route_carries_the_source(platform_root):
+    session_id = "s-20260720T090000-dddd"
+    plant_session(session_id)
+    plant_log(session_id)
+    plant_record(session_id, 1, "message", "from the room", channel="matrix", author="@a:x", ref="e1")
+    client = TestClient(
+        api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})
+    )
+    body = client.get(
+        f"/api/sessions/{session_id}/messages?limit=100",
+        headers={"Authorization": f"Bearer {SECRET}"},
+    ).json()
+    (turn,) = [m for m in body["messages"] if m["via"] == transcripts.COMMS_VIA]
+    assert turn["source"] == {"channel": "matrix", "author": "@a:x", "ref": "e1"}
+    assert turn["comms_kind"] is None and turn["role"] == "user"
+
+
+def test_a_reconstructed_terminal_line_is_marked_all_the_way_to_the_view(platform_root):
+    """§3.4 accepts keystroke reconstruction as a prediction on one condition:
+    that the humans reading the mirror can see which lines are one. The marker
+    stops being a marker if it ends at the daemon."""
+    session_id = "s-20260720T090000-eeee"
+    plant_session(session_id)
+    plant_log(session_id)
+    plant_record(session_id, 1, "message", "deploy it", channel="terminal",
+                 meta={"fidelity": "reconstructed"})
+    client = TestClient(
+        api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})
+    )
+    body = client.get(
+        f"/api/sessions/{session_id}/messages?limit=100",
+        headers={"Authorization": f"Bearer {SECRET}"},
+    ).json()
+    (turn,) = [m for m in body["messages"] if m["via"] == transcripts.COMMS_VIA]
+    assert turn["fidelity"] == "reconstructed"
+    text = _chat()
+    assert "message.fidelity === 'reconstructed'" in text, "the view must show it"
+    assert "· typed" in text
+
+
+def test_a_post_into_another_thread_says_so_all_the_way_to_the_view(platform_root):
+    """The words are on this session's conversation because the run said them,
+    but they were addressed to a thread it is not connected to (#414). Without
+    the marker the operator reading the pane is being addressed by a message that
+    was never for them."""
+    session_id = "s-20260720T090000-ffff"
+    plant_session(session_id)
+    plant_log(session_id)
+    plant_record(
+        session_id, 1, "message", "the review is posted", channel="agent",
+        meta={"thread": "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"},
+    )
+    client = TestClient(
+        api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})
+    )
+    body = client.get(
+        f"/api/sessions/{session_id}/messages?limit=100",
+        headers={"Authorization": f"Bearer {SECRET}"},
+    ).json()
+    (turn,) = [m for m in body["messages"] if m["via"] == transcripts.COMMS_VIA]
+    assert turn["thread"].endswith("p1712345678000900")
+    text = _chat()
+    assert 'v-if="threadLink(message)"' in text, "the view must show it"
+    assert "posted into a thread" in text
+
+
+def test_a_thread_link_the_container_chose_never_becomes_an_href(platform_root):
+    """`meta.thread` is the one field on a record that becomes an `href`, and the
+    path to it takes an unschema'd `meta` on the session's own token. So a session
+    that never posts into a thread could otherwise choose where a link in the
+    operator's browser points, under a caption saying the platform put it there.
+
+    Dropped where the turn is built, so no consumer inherits the problem, and the
+    marker still renders — as text — for a record that carries one."""
+    session_id = "s-20260720T090000-aaab"
+    plant_session(session_id)
+    plant_log(session_id)
+    for seq, hostile in enumerate(
+        ["javascript:alert(1)", "https://evil.example/phish", "data:text/html,x"], start=1
+    ):
+        plant_record(
+            session_id, seq, "message", f"claim {seq}", channel="agent",
+            meta={"thread": hostile},
+        )
+    client = TestClient(
+        api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})
+    )
+    body = client.get(
+        f"/api/sessions/{session_id}/messages?limit=100",
+        headers={"Authorization": f"Bearer {SECRET}"},
+    ).json()
+    threads = [
+        m["thread"] for m in body["messages"] if m["via"] == transcripts.COMMS_VIA
+    ]
+    assert threads == [None, None, None]
+    # And the last hop says so too: the anchor is bound to the checked value, not
+    # to the record's own field, with a plain-text fallback beside it.
+    text = _chat()
+    assert ':href="threadLink(message)"' in text
+    assert ":href=\"message.thread\"" not in text
+    assert "protocol === 'https:'" in text
+
+
+def test_the_view_names_the_source_and_the_kind():
+    text = _chat()
+    assert "sourceLabel(source)" in text and "message.comms_kind" in text
+    assert "'uber-lmer': 'uber lmer'" in text
+    api_js = (CHAT.parent.parent / "api.js").read_text(encoding="utf-8")
+    send = api_js[api_js.index("export function sendSessionInput"):]
+    send = send[:send.index("\n}\n")]
+    assert "/comms" in send and "kind: 'message'" in send
+    assert send.index("append_newline: false") < send.index("/comms"), (
+        "the keystroke form must keep the raw input route"
+    )
+
+
+# --- the agent's own post is one message, not two ------------------------------
+#
+# Found by hands-on test on 2026-09-05: every uber lmer post was drawn twice in
+# the chat pane. The agent writes its reply as prose — which the harness records
+# — and then posts the same words with `lmer-signal post`, which the bus records.
+# Both reached the page, so the pane drew the same sentence twice with the same
+# timestamp. The suppression that already hid the harness's copy of an *inbound*
+# record only looked at `user` turns, so nothing covered the outbound direction.
+#
+# The bus record is the one kept, for the reason `_merged_channel` keeps it over
+# the ask projection: it is what every other channel saw, and it alone carries
+# the source and kind the pane labels the turn with.
+
+
+def _messages_route(session_id):
+    """The page as the pane actually receives it, over the route it polls."""
+    client = TestClient(
+        api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})
+    )
+    return client.get(
+        f"/api/sessions/{session_id}/messages?limit=100",
+        headers={"Authorization": f"Bearer {SECRET}"},
+    ).json()["messages"]
+
+
+def test_a_worker_post_the_harness_also_wrote_is_one_turn(platform_root):
+    session_id = "s-echo-worker"
+    plant_rows(session_id, [assistant_row("the suite is green, pushing now")])
+    plant_record(session_id, 1, "message", "the suite is green, pushing now",
+                 channel="agent", at="2026-07-20T09:00:03Z")
+
+    turns = [(m["role"], m["text"], m["comms_kind"]) for m in _messages_route(session_id)]
+    assert turns == [("assistant", "the suite is green, pushing now", "message")], (
+        "the agent's post and its own prose copy are one message"
+    )
+
+
+def test_the_assistants_own_post_is_one_turn(platform_root):
+    """uber lmer's records carry `session_origin` and the channel it was launched
+    with, so they never took the inbound path the old suppression looked at."""
+    session_id = "s-echo-assistant"
+    plant_rows(session_id, [assistant_row("three running, one waiting on you")])
+    plant_record(session_id, 1, "message", "three running, one waiting on you",
+                 channel="uber-lmer", at="2026-07-20T09:00:03Z",
+                 meta={"session_origin": True})
+
+    turns = [(m["role"], m["text"], m["source"]) for m in _messages_route(session_id)]
+    assert turns == [
+        ("assistant", "three running, one waiting on you", {"channel": "uber-lmer"}),
+    ]
+
+
+def test_every_outbound_kind_is_hidden_once_and_only_where_it_matches(platform_root):
+    """Each record consumes one copy: prose the bus never carried stays, and the
+    second of two identical replies is still a second reply."""
+    session_id = "s-echo-kinds"
+    plant_rows(session_id, [
+        assistant_row("looking at the branch", at="2026-07-20T09:00:02.000Z"),
+        assistant_row("which target branch?", at="2026-07-20T09:00:03.000Z"),
+        assistant_row("on it", at="2026-07-20T09:00:04.000Z"),
+        assistant_row("on it", at="2026-07-20T09:00:05.000Z"),
+        assistant_row("pushed MR !300", at="2026-07-20T09:00:06.000Z"),
+    ])
+    plant_record(session_id, 1, "question", "which target branch?", at="2026-07-20T09:00:03Z")
+    plant_record(session_id, 2, "message", "on it", at="2026-07-20T09:00:04Z")
+    plant_record(session_id, 3, "milestone", "pushed MR !300", at="2026-07-20T09:00:06Z")
+
+    assert said(transcripts.read_messages(session_id, limit=100)) == [
+        ("assistant", "looking at the branch"),
+        ("assistant", "which target branch?"),
+        ("assistant", "on it"),
+        ("assistant", "on it"),
+        ("assistant", "pushed MR !300"),
+    ]
+    kinds = [m.comms_kind for m in transcripts.read_messages(session_id, limit=100).messages]
+    assert kinds == [None, "question", "message", None, "milestone"], (
+        "one prose copy per record, and the unmatched turn keeps its own place"
+    )
+
+
+def test_a_close_the_harness_never_wrote_consumes_nothing(platform_root):
+    """`close` renders words the record does not carry, so it must not be able to
+    swallow an assistant turn that happens to say them."""
+    session_id = "s-echo-close"
+    plant_rows(session_id, [assistant_row("stopped waiting for an answer")])
+    plant_record(session_id, 1, "question", "branch?", at="2026-07-20T09:00:02Z")
+    plant_record(session_id, 2, "close", "", in_reply_to=f"{session_id}/000001",
+                 at="2026-07-20T09:00:04Z")
+
+    assert said(transcripts.read_messages(session_id, limit=100)).count(
+        ("assistant", "stopped waiting for an answer")
+    ) == 2
+
+
+def test_a_turn_that_also_called_a_tool_keeps_the_call_and_loses_the_words(platform_root):
+    """The commonest shape of the bug: the harness records the reply and the
+    `lmer-signal post` that sends it as one turn. Dropping it would lose the only
+    record of the call, so the turn stays and only the duplicated words go."""
+    session_id = "s-echo-tools"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir(session_id) / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "rows.jsonl").write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-07-20T09:00:03.000Z",
+        "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "running the suite"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest"}},
+        ]},
+    }) + "\n", encoding="utf-8")
+    plant_record(session_id, 1, "note", "running the suite", at="2026-07-20T09:00:03Z")
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.name for m in page.messages[0].tools] == ["Bash"]
+    assert page.messages[0].text == ""
+    assert said(page).count(("assistant", "running the suite")) == 1
+
+
+# --- what a turn is, and nothing of it is lost (issue #481) --------------------
+#
+# Shaped after a recorded uber lmer session (1,816 records, 2026-09-18): the
+# harness writes prose, tool calls and thinking as separate records, and the
+# read path served every one of its 132 assistant text blocks. These pin the
+# rules that made that so, for both record shapes the harness has been seen to
+# write, so a regression shows up as a test rather than as a screenshot.
+
+
+def tool_row(command, at, text=None):
+    """An assistant record with a tool call — and, optionally, prose in the
+    same record, the combined shape a harness may write."""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    content.append({
+        "type": "tool_use", "id": f"t-{at}", "name": "Bash",
+        "input": {"command": command},
+    })
+    return {"type": "assistant", "timestamp": at,
+            "message": {"role": "assistant", "content": content}}
+
+
+def test_prose_a_tool_call_more_prose_and_a_post_are_served_once_each(platform_root):
+    session_id = "s-481-turn"
+    plant_rows(session_id, [
+        assistant_row("Saved the note to memory.", at="2026-07-20T09:00:02.000Z"),
+        tool_row("sed -i s/a/b/ memory.md", "2026-07-20T09:00:03.000Z"),
+        assistant_row("The 657 developer pushed round 2; I turn the reviewer now.",
+                      at="2026-07-20T09:00:04.000Z"),
+        tool_row('lmer-signal post "Round 2 is up; reviewer turned."', "2026-07-20T09:00:05.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "Round 2 is up; reviewer turned.",
+                 channel="uber-lmer", at="2026-07-20T09:00:05Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.text for m in page.messages if m.text] == [
+        "Saved the note to memory.",
+        "The 657 developer pushed round 2; I turn the reviewer now.",
+        "Round 2 is up; reviewer turned.",
+    ]
+    assert [m.via for m in page.messages if m.text] == [None, None, transcripts.COMMS_VIA]
+    # Both calls are kept: the post's own tool row is the pane's to hide.
+    assert [[t.name for t in m.tools] for m in page.messages if m.tools] == [["Bash"], ["Bash"]]
+
+
+def test_a_post_whose_words_differ_from_the_prose_keeps_both(platform_root):
+    session_id = "s-481-differs"
+    plant_rows(session_id, [assistant_row("I will post the sitrep now.", at="2026-07-20T09:00:02.000Z")])
+    plant_record(session_id, 1, "message", "Three runs up, one waiting on you.",
+                 channel="uber-lmer", at="2026-07-20T09:00:03Z", meta={"session_origin": True})
+
+    assert said(transcripts.read_messages(session_id, limit=100)) == [
+        ("assistant", "I will post the sitrep now."),
+        ("assistant", "Three runs up, one waiting on you."),
+    ]
+
+
+def test_prose_and_a_tool_call_in_one_record_keep_the_prose_nothing_posted(platform_root):
+    """The combined record shape, beside a post of *different* words: the join
+    may only blank a record whose words the bus carries."""
+    session_id = "s-481-combined"
+    plant_rows(session_id, [
+        tool_row("sed -i s/a/b/ memory.md", "2026-07-20T09:00:03.000Z",
+                 text="Noted — saved to persistent memory."),
+    ])
+    plant_record(session_id, 1, "message", "Three runs up, one waiting on you.",
+                 channel="uber-lmer", at="2026-07-20T09:00:04Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert page.messages[0].text == "Noted — saved to persistent memory."
+    assert [t.name for t in page.messages[0].tools] == ["Bash"]
+    assert page.messages[1].text == "Three runs up, one waiting on you."
+
+
+def test_a_record_is_spent_on_a_turn_saying_its_own_words_and_never_a_neighbour(platform_root):
+    session_id = "s-481-neighbour"
+    plant_rows(session_id, [
+        assistant_row("Noted — saved.", at="2026-07-20T09:00:02.000Z"),
+        assistant_row("on it", at="2026-07-20T09:00:03.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "on it", channel="uber-lmer",
+                 at="2026-07-20T09:00:03Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert said(page) == [("assistant", "Noted — saved."), ("assistant", "on it")]
+    assert [m.comms_kind for m in page.messages] == [None, "message"], (
+        "the record replaced its own copy; the neighbouring prose is untouched"
+    )
+
+
+def test_the_pane_reads_the_conversation_from_one_route(platform_root):
+    """`/messages` is the pane's only source for the conversation, so a record
+    that reaches it twice is drawn twice unless the page itself dedupes."""
+    text = _chat()
+    assert "fetchSessionMessages" in text
+    # Anchored on the fetch identifiers rather than on the substring "/comms",
+    # which appears in prose about the write path and would fail a comment edit.
+    others = [name for name in ("fetchSessionComms", "fetchCommsFeed") if name in text]
+    assert others == [], f"the conversation grew a second source: {others}"
+
+
+def test_the_pane_names_a_turn_by_the_id_that_survives_a_renumber(platform_root):
+    """Source-level because the render key is in the template, where the node
+    harness in `test_web_chat_merge.py` cannot reach it. Two keys for one turn is
+    the duplicate this change removes, drawn by Vue rather than by `absorb`."""
+    text = _chat()
+    assert ''':key="message.id ?? message.seq"''' in text, (
+        "a redelivered turn is recognised by its id, so the row must be keyed on "
+        "the same thing the dedupe is"
+    )
+    # Both reads, or the row's key is not unique: a page the backward read matched
+    # by position while the row is named by id renders one turn twice under one key.
+    assert text.count("!known.has(message.id)") == 2, (
+        "the forward and backward reads must both dedupe by id"
+    )
+    assert "message.seq)" not in text.split("function absorb")[1].split("\n}\n")[0], (
+        "no branch of absorb may key a turn by its position"
+    )
+
+
+# --- a turn keeps its name when history renumbers underneath it ----------------
+#
+# The operator's screenshot, 2026-09-05: two bubbles for one uber lmer post, both
+# carrying the `· message` chip, both labelled uber lmer, same timestamp, on a
+# pane that was open and polling. The post came from a Bash heredoc, so no prose
+# turn with those words existed — the harness-copy join above cannot explain it
+# and does not fix it.
+#
+# `read_messages` numbers by position and renumbers on every read. A transcript
+# row written after the record it precedes in time lands *below* the served
+# cursor, everything after it shifts up one, and the client's next forward read
+# hands back the record it already drew. `seq` is that position; `id` is what
+# survives it.
+
+
+def _rows_path(session_id):
+    return transcripts.session_transcript_dir(session_id) / "-workspace" / "rows.jsonl"
+
+
+def _append_row(session_id, row):
+    with _rows_path(session_id).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def test_a_late_transcript_row_does_not_redeliver_the_record_above_it(platform_root):
+    session_id = "s-renumber"
+    plant_rows(session_id, [assistant_row("looking at the branch", at="2026-07-20T09:00:01.000Z")])
+    plant_record(session_id, 1, "message", "three running", channel="uber-lmer",
+                 at="2026-07-20T09:00:05Z", meta={"session_origin": True})
+
+    first = transcripts.read_messages(session_id, since=0, limit=100)
+    record = [m for m in first.messages if m.via == transcripts.COMMS_VIA][0]
+    assert record.id == f"{session_id}/000001", "a bus turn is named by its record"
+
+    # The harness flushes the turn that ran `lmer-signal`, stamped before the post.
+    _append_row(session_id, assistant_row("running the suite", at="2026-07-20T09:00:03.000Z"))
+
+    second = transcripts.read_messages(session_id, since=first.cursor, limit=100)
+    assert [m.text for m in second.messages] == ["three running"], (
+        "the positional cursor still hands the record back — that is the bug"
+    )
+    assert [m.id for m in second.messages] == [record.id], (
+        "and the id is what lets the pane recognise it as one it already holds"
+    )
+    assert record.seq != second.messages[0].seq, "the position moved; the name did not"
+
+
+def test_a_transcript_turn_keeps_its_id_when_a_row_lands_before_it(platform_root):
+    """Numbered within its own file, which is append-only — so an id is not
+    disturbed by a row arriving in another source or by the bus merge."""
+    session_id = "s-stable-ids"
+    plant_rows(session_id, [
+        assistant_row("first", at="2026-07-20T09:00:01.000Z"),
+        assistant_row("second", at="2026-07-20T09:00:09.000Z"),
+    ])
+    before = {m.text: m.id for m in transcripts.read_messages(session_id, limit=100).messages}
+
+    plant_record(session_id, 1, "note", "running the suite", at="2026-07-20T09:00:04Z")
+    after = {m.text: m.id for m in transcripts.read_messages(session_id, limit=100).messages}
+
+    assert before["second"] == after["second"]
+    assert all(value is not None for value in after.values()), "every turn is named"
+    assert len(set(after.values())) == len(after), "and no two turns share a name"
+
+
+def test_every_turn_the_route_serves_carries_an_id(platform_root):
+    session_id = "s-ids-wire"
+    plant_rows(session_id, [assistant_row("looking at the branch")])
+    plant_question(session_id, "which branch?", answer="prep-release")
+
+    served = _messages_route(session_id)
+    assert served, "fixture produced no turns"
+    assert all(m["id"] for m in served), [m for m in served if not m["id"]]
+    assert len({m["id"] for m in served}) == len(served)
+
+
+def test_a_copy_is_spent_on_the_turn_that_produced_the_record(platform_root):
+    """Bare agent prose repeats — "on it" is ordinary `note` text — so matching
+    oldest-first deleted an earlier, separate statement and left the turn that
+    actually posted beside its own bus turn."""
+    session_id = "s-echo-repeat"
+    plant_rows(session_id, [
+        assistant_row("on it", at="2026-07-20T09:00:01.000Z"),
+        assistant_row("on it", at="2026-07-20T09:00:10.000Z"),
+    ])
+    plant_record(session_id, 1, "note", "on it", at="2026-07-20T09:00:11Z")
+
+    kept = [(m.at, m.comms_kind) for m in transcripts.read_messages(session_id, limit=100).messages]
+    assert kept == [
+        ("2026-07-20T09:00:01.000Z", None),
+        ("2026-07-20T09:00:11Z", "note"),
+    ], "the earlier statement survives; the turn that posted is the one consumed"
+
+
+def test_two_transcript_files_sharing_a_stem_get_different_names(platform_root):
+    """Discovery is recursive and normatively so — a harness keeps one subdirectory
+    per workspace — so `a/session-7.jsonl` and `b/session-7.jsonl` are ordinary.
+    Naming a turn by the stem gave both one name, and the pane kept one of them."""
+    session_id = "s-stem"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    root = transcripts.session_transcript_dir(session_id)
+    for folder, text in (("a", "from workspace a"), ("b", "from workspace b")):
+        directory = root / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "session-7.jsonl").write_text(
+            json.dumps(assistant_row(text)) + "\n", encoding="utf-8"
+        )
+
+    served = transcripts.read_messages(session_id, limit=100).messages
+    assert sorted(m.text for m in served) == ["from workspace a", "from workspace b"]
+    assert len({m.id for m in served}) == 2, [m.id for m in served]
+
+
+# --- the parts of the join a review found untested (!288 round 8) --------------
+
+
+def test_a_bus_record_with_no_usable_id_is_still_named(platform_root):
+    """The pane recognises a turn it already holds by `id` and by nothing else, so
+    a turn the route cannot name is a turn it cannot recognise — it is kept rather
+    than guessed at, and a redelivered one is then drawn twice
+    (`test_web_chat_merge.py::test_a_turn_the_route_could_not_name_is_kept_...`).
+    The journal's own cursor is stable across reads, so there is always a name."""
+    session_id = "s-unnamed"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    record = plant_record(session_id, 1, "message", "posted with no id", channel="agent")
+    platform_comms.ensure_hub().journal.append(session_id, dict(record, id=None))
+
+    served = transcripts.read_messages(session_id, limit=100).messages
+    assert served, "fixture produced no turns"
+    assert all(m.id for m in served), [m.to_dict() for m in served if not m.id]
+    assert any(m.id.startswith(f"{session_id}:comms#") for m in served)
+
+
+def test_an_undated_copy_prefers_a_dated_turn(platform_root):
+    """Every inbound copy is undated by design, so this branch governs the whole
+    inbound half. `_UNDATED` orders an undated turn last on both branches."""
+    session_id = "s-undated"
+    plant_rows(session_id, [
+        dict(assistant_row("on it"), timestamp=None),
+        assistant_row("on it", at="2026-07-20T09:00:05.000Z"),
+    ])
+    plant_record(session_id, 1, "note", "on it", at="not-a-timestamp")
+
+    turns = transcripts.read_messages(session_id, limit=100).messages
+    kept = [m.at for m in turns if m.text == "on it" and m.via is None]
+    assert kept == [None], "the dated turn is taken; the undated one is left standing"
+    assert [m.comms_kind for m in turns if m.via == transcripts.COMMS_VIA] == ["note"]
+
+
+def test_the_tail_fallback_is_the_inbound_half_only(platform_root):
+    """A dated copy must not reach the tail path: it is the one path that does not
+    bound a claim by the record's time, and confining it is what makes the
+    docstring's "never one after it" true by construction rather than by odds.
+
+    Both truncation ends matter — the bus refuses over-limit text rather than
+    cutting it, and both sides cut with the same `keep="tail"` — so a change at
+    either end would restore the duplicate silently. This states it."""
+    long = "z" * (transcripts.TEXT_LIMIT + 400)
+    session_id = "s-tail-dated"
+    plant_rows(session_id, [assistant_row(long, at="2026-07-20T09:00:09.000Z")])
+    # A dated record whose text differs at the head but shares the kept tail.
+    plant_record(session_id, 1, "note", "different start " + long,
+                 at="2026-07-20T09:00:02Z")
+
+    turns = transcripts.read_messages(session_id, limit=100).messages
+    assert sum(1 for m in turns if m.via is None) == 1, (
+        "a dated copy claimed a turn later than its own record through the tail path"
+    )
+    assert [m.comms_kind for m in turns if m.via == transcripts.COMMS_VIA] == ["note"], (
+        "and the record itself is on the page, so the count above means what it says"
+    )
+
+
+def test_a_recorded_pointer_is_named_by_its_path_under_the_transcript_root():
+    """`locate_sources` prefers a recorded pointer, which lies outside the derived
+    session directory — so resolving against that directory alone named every turn
+    of the *preferred* resolution by a digest."""
+    root = Path(transcripts.transcript_root())
+    assert transcripts._source_name("s-x", root / "-workspace" / "abc.jsonl") == (
+        "-workspace/abc.jsonl"
+    )
+    outside = transcripts._source_name("s-x", Path("/elsewhere/abc.jsonl"))
+    assert re.fullmatch(r"[0-9a-f]{16}", outside), outside
+
+
+@pytest.mark.parametrize('combined', [False, True])
+def test_late_post_reconciles_through_the_real_reader_and_pane(platform_root, combined):
+    from tests.conftest import node_binary, require_node_toolchain
+    node = node_binary()
+    if node is None:
+        require_node_toolchain("Node is required for the pane reconciliation regression")
+    import subprocess
+
+    session = 'late-post-pane'
+    text = 'The requested review is ready for you.'
+    prose = assistant_row(text)
+    call = {'type': 'tool_use', 'id': 'post', 'name': 'Bash',
+            'input': {'command': 'lmer-signal post --stdin'}}
+    if combined:
+        prose['message']['content'].append(call)
+        rows = [prose]
+    else:
+        command = assistant_row('', at='2026-07-20T09:00:04Z')
+        command['message']['content'] = [call]
+        rows = [prose, command]
+    plant_rows(session, rows)
+    before = transcripts.read_messages(session).to_dict()
+    plant_record(session, 1, 'message', text, at='2026-07-20T09:00:05Z')
+    after = transcripts.read_messages(session).to_dict()
+    script = r'''
+      const fs = require('fs');
+      const { before, after, text } = JSON.parse(fs.readFileSync(0, 'utf8'));
+      const source = fs.readFileSync('web/src/components/Chat.vue', 'utf8');
+      const code = source.slice(source.indexOf('function absorb('), source.indexOf('\nasync function start()'));
+      const factory = new Function('fetchSessionMessages', `
+        const props = { sessionId: 'late-post-pane', view: 'conversation' };
+        const messages = { value: [] }, following = { value: false }, total = {}, sessions = {}, note = {}, live = {}, problem = {};
+        let cursor = 0, generation = 0, polling = false;
+        const PAGE = 40, stale = () => false, settlePending = () => {}, nextTick = () => {}, stickToBottom = () => {};
+        ${code}
+        return { absorb, poll, messages };
+      `);
+      const pane = factory(async (_id, { since, limit }) => {
+        const start = since < 0 ? Math.max(0, after.total + since) : Math.min(since, after.total);
+        const messages = after.messages.slice(start, start + limit);
+        return { ...after, messages, from: start, cursor: start + messages.length };
+      });
+      pane.absorb(before, 'replace');
+      (async () => {
+        await pane.poll();
+        const rows = pane.messages.value;
+        const speech = rows.filter(m => m.via === 'comms');
+        if (speech.length !== 1 || speech[0].text !== text) throw Error('late post missing');
+        if (rows.filter(m => m.text === text).length !== 1) throw Error('prose duplicated');
+        await pane.poll();
+        if (JSON.stringify(rows) !== JSON.stringify(pane.messages.value)) throw Error('repeated poll changed membership');
+      })().catch(error => { console.error(error); process.exitCode = 1; });
+    '''
+    result = subprocess.run([node, '-e', script],
+                            input=json.dumps({'before': before, 'after': after, 'text': text}),
+                            text=True, capture_output=True, timeout=30, cwd=WEB.parent)
+    assert result.returncode == 0, result.stdout + result.stderr

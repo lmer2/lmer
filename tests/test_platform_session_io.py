@@ -37,6 +37,7 @@ from starlette.websockets import WebSocketDisconnect
 from lmer_platform import api, registry, session_io, spawn
 from lmer_platform import config as cfg
 from lmer_platform import store
+from tests import plexus_fixtures as pf
 from tests.conftest import strip_lmer_env
 
 SECRET = "test-secret-value"
@@ -1430,10 +1431,14 @@ def test_the_route_forwards_the_steering_flags_and_invents_them_for_nobody(
         json={"data": "!206 was merged", "append_newline": True},
     )
 
-    assert control_plane.calls[0]["body"]["sanitize"] is True
-    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
-    assert "sanitize" not in control_plane.calls[1]["body"]
-    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
+    # A steering send first asks the supervisor's /healthz whether it keeps a
+    # bus (issue #407); this fake plane has none, so the send falls through to
+    # /input. Only the /input calls are the subject here.
+    inputs = [call for call in control_plane.calls if call["path"] == "/input"]
+    assert inputs[0]["body"]["sanitize"] is True
+    assert inputs[0]["body"]["preserve_slash_commands"] is True
+    assert "sanitize" not in inputs[1]["body"]
+    assert "preserve_slash_commands" not in inputs[1]["body"]
 
 
 def test_an_unconfirmed_submit_reaches_the_caller(
@@ -2062,3 +2067,151 @@ def test_the_idle_read_gives_up_long_before_a_write_would(
     assert session_io.ACTIVITY_TIMEOUT_SECONDS < session_io.CONTROL_TIMEOUT_SECONDS, (
         "the fleet view's read is on the same budget as an operator's keystroke"
     )
+
+
+# --- the ids a schema-form session directory can be named (#353 D22) ---------
+#
+# A session id is now two things at once: the name of a registry file here, and
+# the name of a DIRECTORY in the work repo — `_runs/<slug>/<session-id>[--<name>]/`
+# is one launch's whole record (docs/SCHEMA.md, "Sessions and runs"). The two
+# grammars have to agree, and they agree in one direction only: an id the work
+# repo puts on a directory must still resolve to a log path here, while nothing
+# this module refuses today may start being accepted because of it.
+#
+# `_validated` borrows the registry's rule rather than restating it for exactly
+# that reason, so these tests pin the borrowed rule against real schema-form ids
+# — the shared fixture's, the one a contextless `work` invocation mints, and one
+# carrying a name the work CLI normalized — and re-pin the refusals on both log
+# paths, not just the host tee.
+
+def test_a_schema_form_session_id_serves_the_host_tee(platform_root):
+    """The plain `<timestamp>-<seq>-<pid>` form, unchanged in and unchanged out."""
+    session_id = pf.SESSION_IDS[0]
+
+    assert session_io._validated(session_id) == session_id
+    assert session_io.session_log_path(session_id) == spawn.log_path_for(session_id)
+    assert session_io.session_log_path(session_id).name == f"{session_id}.log"
+
+
+@pytest.mark.parametrize("session_id", pf.SESSION_DIR_NAMES)
+def test_a_session_directory_name_resolves_to_both_of_its_logs(
+    platform_root, session_id
+):
+    """Both spellings a session dir carries — bare, and `--<name>` after the
+    freeze rename — are legal ids, and each resolves to the plain
+    interpolation the two log paths have always been."""
+    assert session_io.session_log_path(session_id) == spawn.log_path_for(session_id)
+    assert session_io.container_log_path(session_id) == (
+        spawn.container_log_path_for(session_id)
+    )
+
+
+def test_the_id_a_contextless_work_invocation_mints_is_legal(
+    platform_root, monkeypatch
+):
+    """The other producer of session-dir names: `work` run with no
+    `LMER_SESSION_ID` synthesizes one in the launcher's own form
+    (`run_state._session_dir_id`), and that dir's launch must still be servable.
+    """
+    from work_repo import run_state
+
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    run_state._reset_synthesized_session_id()
+    session_id = run_state._session_dir_id()
+
+    assert run_state.SESSION_DIR_RE.fullmatch(session_id)
+    assert session_io._validated(session_id) == session_id
+
+
+@pytest.mark.parametrize(
+    "name", ["second look", "issue #353 — pass 2", "a_b", "RELEASE/0.8.0"]
+)
+def test_a_named_session_stays_inside_the_charset_a_log_path_allows(
+    platform_root, name
+):
+    """The `--<name>` half against its actual producer.
+
+    `work name` kebab-cases what it is handed (`[a-z0-9-]`, the CLI's
+    `_normalize_name`) before it reaches a directory name, so the suffix can
+    never carry a character the registry's rule refuses. Pinned against that
+    function rather than against a hand-written list of nice names, because the
+    interesting inputs are the ones a person actually types.
+    """
+    from work_repo.cli import _normalize_name
+
+    session_id = f"{pf.SESSION_IDS[0]}--{_normalize_name(name)}"
+
+    assert session_io._validated(session_id) == session_id
+    assert session_io.session_log_path(session_id) == spawn.log_path_for(session_id)
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        "..",
+        "../20260824-101500-1-11111",
+        "20260824-101500-1-11111/..",
+        "20260824-101500-1-11111/spec.md",
+        "20260824-101500-1-11111\\..",
+        "_runs/develop/20260824-101500-1-11111",
+        "20260824-101500-1-11111--a b",
+    ],
+)
+def test_an_id_that_could_name_more_than_a_directory_is_still_refused(
+    platform_root, session_id
+):
+    """The widening this task must not do. A session id names ONE directory in
+    the work repo and ONE file here; anything carrying a separator, a traversal
+    or a space is neither, and both log paths refuse it."""
+    for resolve in (session_io.session_log_path, session_io.container_log_path):
+        with pytest.raises(session_io.SessionNotFound):
+            resolve(session_id)
+
+
+def test_both_log_paths_ask_the_registry_what_a_legal_id_is(
+    platform_root, monkeypatch
+):
+    """One notion of a legal id, asserted as delegation rather than as
+    agreement: a second copy of the rule here would pass every test above and
+    then drift, which is how `..` eventually gets past one of them."""
+    asked = []
+
+    def refusing(session_id):
+        asked.append(session_id)
+        raise registry.RegistryError("no")
+
+    monkeypatch.setattr(registry, "session_path", refusing)
+
+    for resolve in (session_io.session_log_path, session_io.container_log_path):
+        with pytest.raises(session_io.SessionNotFound):
+            resolve(pf.SESSION_IDS[0])
+
+    assert asked == [pf.SESSION_IDS[0], pf.SESSION_IDS[0]]
+
+
+@pytest.mark.parametrize("operation, path", [
+    (lambda: session_io.send_input("s-1", "hello"), "/input"),
+    (lambda: session_io.probe_health("s-1"), "/healthz"),
+    (lambda: session_io.read_control_output("s-1", cursor=0), "/output?cursor=0&timeout=0.0"),
+])
+def test_control_401_explains_possible_image_skew(platform_root, control_plane, operation, path):
+    control_plane.answer(path, 401, {"detail": "invalid bearer token"})
+    plant_session("s-1", port=control_plane.port)
+    with pytest.raises(session_io.ControlPlaneError) as caught:
+        operation()
+    detail = str(caught.value)
+    assert "invalid bearer token" in detail
+    assert "may predate" in detail and "session image" in detail
+    assert "credential" in detail and "first" in detail
+
+
+@pytest.mark.parametrize('state, ambiguous', [('rejected', False), ('uncertain', True)])
+def test_codex_delivery_failures_are_visible_without_legacy_semantic_changes(platform_root, control_plane, state, ambiguous):
+    plant_session('s-1', port=control_plane.port)
+    control_plane.answer('/input', 200, {
+        'transport': 'codex-app-server', 'state': state, 'error': 'native response unavailable',
+    })
+    with pytest.raises(session_io.ControlPlaneError, match='Original input is retained') as exc:
+        session_io.send_input('s-1', 'original', append_newline=True, delivery_id='stable-1')
+    assert exc.value.delivered == ambiguous
+    assert control_plane.calls[0]['body']['delivery_id'] == 'stable-1'

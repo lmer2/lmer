@@ -33,6 +33,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { mdiLinkVariantPlus, mdiSwapHorizontal } from '@mdi/js'
 import { fetchRunRelations, fetchState, relateRun, unrelateRun } from '../api.js'
+import { runKey } from '../runref.js'
 
 const props = defineProps({
   run: { type: Object, required: true },
@@ -72,9 +73,7 @@ const ADD_HINT = 'only runs this orchestrator already tracks, and relating is '
 
 const full = computed(() => !!limit.value && entries.value.length >= limit.value)
 
-function keyOf(run) {
-  return `${run.host}/${run.project}/${run.slug}`
-}
+const keyOf = runKey
 
 // What the picker offers: the fleet, minus this run and minus everything already
 // related. A menu whose items are all refusals is a menu that reads as broken.

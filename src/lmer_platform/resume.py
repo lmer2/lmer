@@ -41,6 +41,42 @@ lost; here it is the point of the override — but only when the caller *asked* 
 it. A mismatch with no override means the index and the run's own state disagree,
 which is the hand-edited case ``answer`` refuses, and it is refused here too.
 
+Which record a resume reads, now that a slug groups several
+------------------------------------------------------------
+In schema form the unit of record is the SESSION (spec D22): every launch owns a
+complete, independent ``<project>/_runs/<slug>/<session-id>[--<name>]/``, and
+``_runs/<slug>/`` is a grouping level nothing is written at. So the identity a
+resume arrives with — ``host/project/slug``, unchanged, because the session id is
+part of the address and never the key — can name several records, and "read the
+run's state file" stops being one directory by itself.
+
+The rule for picking one is deliberately **not** this module's.
+:func:`lmer_platform.workrepo._sessions_in` is the single definition of which
+children of a grouping dir are records and in what order (newest last), and both
+the adoption picker and :func:`~lmer_platform.workrepo.resolve_run_dir` use it. A
+resume that opened a different session than the picker offered — refusing on the
+newest launch's finished status while the fleet row quoted an older one, or the
+reverse — is exactly the divergence that shared rule exists to prevent, so a
+plain slug resume takes what ``resolve_run_dir`` hands it and *names* it:
+:attr:`ResumeResult.rel_path` is the address the checks were made against, and
+every refusal has quoted :attr:`~lmer_platform.workrepo.RunDirRef.rel_path` since
+a named run made the composed ``runs/<slug>`` a lie.
+
+:attr:`ResumeRequest.session_id` is how a caller means a particular launch
+instead. It is resolved against the sessions of the group the run resolved into,
+by the session dir's own name or by the id the container's one name-bearing
+rename appended to (``<session-id>--<name>``) — and an id that names none of
+them, or two of them, is refused with the list rather than resolved to a
+neighbour. A whole record read off the wrong launch is the failure this field
+exists to make impossible, so guessing here would defeat it.
+
+Two different things are called a session in this file, and only one of them is
+an index entry: :attr:`ResumeResult.session` is the *container* session the spawn
+started (``s-…``, registered by :mod:`lmer_platform.registry`, recorded by
+``runs.note_session``), while ``session_id`` here is the work repo's record dir
+(``20260824-165230-2-31245``). They are different namespaces and neither is
+derived from the other.
+
 Every state check is about the run the session will land in
 -----------------------------------------------------------
 Not about the run the operator pointed at, and the difference is not academic: a
@@ -124,12 +160,13 @@ argv in :mod:`lmer_platform.spawn`.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Optional
 
-from lmer_cli.cli import _parse_repo_url
 from work_repo import run_state
 
 from . import runs
@@ -156,17 +193,35 @@ from .config import PlatformConfig
 from .spawn import (
     SpawnRequest,
     SpawnResult,
+    derive_repo_identity,
     live_session_for_run,
     spawn_session,
 )
 from .store import StoreError, append_event
-from .workrepo import RunDirRef, resolve_run_dir
+# The same trade as the `answer` imports above, for the same reason: `_sessions_in`
+# is THE definition of which children of a `_runs/<slug>/` group are records and
+# in what order, shared with the adoption picker and with `resolve_run_dir` on
+# purpose (module header) — a second copy here is precisely how a resume would
+# come to open a session the picker never offered. `_ref_for` and `_address` are
+# the two ways that module turns a found directory into an honest address, and
+# `_SCHEMA_RUNS_DIR` is one fact about the layout. All four want to be public;
+# this import is the honest interim rather than a reimplementation.
+from .workrepo import (
+    _SCHEMA_RUNS_DIR,
+    RunDirRef,
+    _address,
+    _ref_for,
+    _sessions_in,
+    folded_identity,
+    record_session_id,
+    resolve_run_dir,
+)
 
 logger = logging.getLogger("lmer_platform.resume")
 
 __all__ = [
     "ResumeError", "RunNotTracked", "NotResumable", "RunIsLive", "QuestionOpen",
-    "RepoUrlRequired", "DirectionRequired", "DIRECTION_FLAG",
+    "SessionNotFound", "RepoUrlRequired", "DirectionRequired", "DIRECTION_FLAG",
     "MAX_DIRECTION_CHARS", "ResumeRequest", "ResumeResult", "resume_run",
 ]
 
@@ -267,9 +322,25 @@ class QuestionOpen(NotResumable):
     code = "question_open"
 
 
+class SessionNotFound(NotResumable):
+    """The named session id is not one record of this run — see the docstring.
+
+    409 and a :class:`NotResumable` because the run itself is fine and the request
+    is well-formed: what conflicts is the record this identity actually has. The
+    commonest arm — an id whose launch is not in the mirror yet — is one a repeat
+    resolves once the push lands. The other two (a legacy tree, which addresses
+    nothing by launch, and an id that names two directories) need the request
+    changed, and share the code because the answer has the same shape: here is
+    what this run's record does hold. That is why the code is its own rather than
+    a bare ``not_resumable`` — a UI turns it into a picker, not into "cannot".
+    """
+
+    code = "session_not_found"
+
+
 @dataclass(frozen=True)
 class ResumeRequest:
-    """Which run to continue, and the three things a caller may say about it.
+    """Which run to continue, and the four things a caller may say about it.
 
     ``taskdef`` is the override: ``None`` (or blank) means the run's recorded one,
     which is the one-tap continue. Anything else starts the sibling run described
@@ -278,6 +349,14 @@ class ResumeRequest:
     ``repo_url`` and ``direction`` exist to satisfy :class:`RepoUrlRequired` and
     :class:`DirectionRequired` — the two refusals whose remedy is a second request
     with one more field, which is why they are fields rather than flags.
+
+    ``session_id`` is the work repo's record dir (``20260824-165230-2-31245``,
+    optionally with the ``--<name>`` suffix the naming rename appends), not the
+    container session the spawn starts — see the module docstring on the two
+    namespaces. ``None`` means "the record ``resolve_run_dir`` hands back", which
+    is the newest launch of the group; it is optional because in a legacy tree
+    there is nothing to choose between, and because the ordinary continue is one
+    tap on a row that has already named its address.
     """
 
     host: str
@@ -286,6 +365,11 @@ class ResumeRequest:
     taskdef: Optional[str] = None
     repo_url: Optional[str] = None
     direction: Optional[str] = None
+    session_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "ResumeRequest":
         """Return a normalised copy, or raise :class:`ResumeError`.
@@ -312,6 +396,7 @@ class ResumeRequest:
             taskdef=_clean_taskdef(self.taskdef),
             repo_url=_clean_text("repo_url", self.repo_url),
             direction=_clean_direction(self.direction),
+            session_id=_clean_session_id(self.session_id),
             **fields,
         )
 
@@ -347,6 +432,20 @@ class ResumeResult:
     continued: bool
     started_slug: str
     session: SpawnResult
+    #: The mirror-relative address of the record every check above was made
+    #: against — in schema form the session dir, which is what says WHICH of a
+    #: slug's launches was read (module docstring). ``None`` when there is no such
+    #: record: an override that founds a run has nothing to address until the
+    #: session it starts pushes something, the same absence
+    #: :mod:`lmer_platform.inventory` renders as a row with no path.
+    #:
+    #: For a continue it is also the record the new session will WRITE in: that
+    #: record's id is what the spawn carries (:func:`_landing_session_id`), which
+    #: is what makes "the record that was checked" and "the record that was
+    #: continued" one directory rather than two. The reply names no session id of
+    #: its own — ``session`` here is the container session, a different namespace
+    #: (module docstring), and an override injects nothing to name anyway.
+    rel_path: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Wire form, deliberately **without** the spawn's ``command``.
@@ -361,9 +460,11 @@ class ResumeResult:
         ``warning`` is carried through from the spawn, the same key ``POST
         /api/sessions`` publishes, so a client can render it unconditionally on
         either reply. It is ``None`` on every path a resume can reach today and
-        that is not an accident: :func:`_repo_url_for` refuses unless the URL parses
-        back to *this* run's host and project, which is precisely the derivation
-        :func:`lmer_platform.spawn._untracked_run_warning` fires on failing. Present
+        that is not an accident: :func:`_repo_url_for` refuses unless the URL
+        derives back to *this* run's host and project — through the spawn's own
+        :func:`lmer_platform.spawn.derive_repo_identity`, which is precisely the
+        derivation :func:`lmer_platform.spawn._untracked_run_warning` fires on
+        failing. Present
         anyway, because the alternative is a field that silently stops existing on
         one of two sibling routes the day that guarantee is loosened.
         """
@@ -377,9 +478,14 @@ class ResumeResult:
             "continued": self.continued,
             "taskdef": self.taskdef,
             "target": self.target,
+            # Top-level rather than inside ``run``: it is the address of the
+            # record the checks were made against, which for an override is the
+            # SIBLING's — and ``run`` is the identity the operator pointed at.
+            "rel_path": self.rel_path,
             "session": {
                 "session_id": self.session.session_id,
                 "pid": self.session.pid,
+                **self.session.launch_settings(),
                 "control": {
                     "host": self.session.control_host,
                     "port": self.session.control_port,
@@ -460,6 +566,23 @@ def _clean_taskdef(value: Optional[str]) -> Optional[str]:
     return taskdef
 
 
+def _clean_session_id(value: Optional[str]) -> Optional[str]:
+    """The session dir to continue, validated as a path segment.
+
+    It is joined under the run's grouping dir exactly as the identity fields are
+    joined under the mirror, so it gets the identity fields' check —
+    :func:`lmer_platform.answer._reject_traversal`, once more at the point where
+    the consequence appears. No grammar is imposed beyond that: the ``--<name>``
+    half of a session dir is deliberately unconstrained (``docs/SCHEMA.md``), and
+    an id that matches nothing is a :class:`SessionNotFound` that lists what is
+    there, which is a better answer than a regex refusal.
+    """
+    session_id = _clean_text("session_id", value)
+    if session_id is not None:
+        _reject_traversal_or_refuse({"session_id": session_id}, ResumeError)
+    return session_id
+
+
 def _clean_direction(value: Optional[str]) -> Optional[str]:
     """The seed direction, stripped and bounded.
 
@@ -496,11 +619,19 @@ def _require_tracked(request: ResumeRequest) -> runs.TrackedRun:
 
 
 def _require_run_dir(config: PlatformConfig, request: ResumeRequest) -> RunDirRef:
-    """The run's directory in the host mirror, or refuse.
+    """The record this resume reads, in the host mirror, or refuse.
 
     A resume is defined by what the run already recorded — its taskdef and target
     — so without the dir there is nothing to continue *from*, and a spawn made on
     assumptions is how one lands on a different run.
+
+    ``resolve_run_dir`` answers with one record per identity in either shape, and
+    in schema form that is the newest session of ``_runs/<slug>/`` — the launch
+    the adoption picker offers, by the same rule (module docstring). A caller that
+    means another one says so, and then the group that resolved is where it is
+    looked for: the resolve is what proves this identity lives in this project dir
+    at all, and re-deriving the project dir from the request would be a second
+    answer to a question :mod:`~lmer_platform.workrepo` already owns.
     """
     ref = resolve_run_dir(config, request.host, request.project, request.slug)
     if ref is None:
@@ -510,7 +641,82 @@ def _require_run_dir(config: PlatformConfig, request: ResumeRequest) -> RunDirRe
             "yet, the mirror may be stale (rescan to refresh), or the run dir may "
             "have been renamed since it was tracked"
         )
-    return ref
+    if request.session_id is None:
+        return ref
+    return _require_session(config, request, ref)
+
+
+def _session_group(ref: RunDirRef) -> Optional[Path]:
+    """The ``_runs/<slug>/`` group *ref* is one session of, or ``None``.
+
+    Read off the resolved path rather than composed, so it names the group the
+    record was actually found in — which for a registered project is a flat short
+    name the identity could not have produced (D7). The test is the layout's own:
+    a session dir's grandparent is the schema record area, while a legacy run dir
+    is a direct child of ``runs/`` and has no launches under it at all.
+    """
+    group = ref.path.parent
+    if group.parent.name != _SCHEMA_RUNS_DIR:
+        return None
+    return group
+
+
+def _require_session(
+    config: PlatformConfig, request: ResumeRequest, ref: RunDirRef
+) -> RunDirRef:
+    """The named launch's record, or refuse — never a neighbouring one.
+
+    Matched on the session dir's own name first and on the id the naming rename
+    suffixed second (``<session-id>--<name>``), because the id is what an operator
+    wrote down and the suffix arrives later, mid-life. Both spellings resolve, so
+    the address a fleet row shows can be pasted back verbatim.
+
+    Two matches are a refusal rather than a choice: the name half of a session dir
+    has no charset in any document, so one id really can end up on two directories,
+    and reading a whole record off the wrong launch is what the field was added to
+    prevent. No match is the same refusal carrying the list, because the remedy is
+    a different id and the operator cannot see this tree.
+    """
+    root = config.mirror_path.resolve()
+    wanted = request.session_id
+    group = _session_group(ref)
+    if group is None:
+        raise SessionNotFound(
+            f"{ref.rel_path} is a legacy run dir — one shared record per target, "
+            f"read in place and never restructured — so it has no launch "
+            f"{wanted!r} to continue: the session is the unit of record only in a "
+            "tree that has moved to the new layout. Resume it without a session id"
+        )
+    sessions = _sessions_in(group)
+    found = [
+        session for session in sessions if session.name == wanted
+    ] or [
+        session for session in sessions if session.name.startswith(f"{wanted}--")
+    ]
+    if len(found) > 1:
+        raise SessionNotFound(
+            f"{_address(root, group)}: the session id {wanted!r} names more than "
+            f"one record here ({', '.join(session.name for session in found)}) "
+            "and a whole run record is not worth guessing at — name the directory "
+            "in full"
+        )
+    if not found:
+        launches = ", ".join(session.name for session in sessions) or "none"
+        raise SessionNotFound(
+            f"{_address(root, group)} holds no session {wanted!r} — this run's "
+            f"launches are: {launches}. Name one of those, or resume with no "
+            "session id to continue the newest (which is the one the fleet view "
+            "offers)"
+        )
+    session = _ref_for(root, request.host, request.project, ref.slug, found[0])
+    if session is None:
+        # The mirror is force-reset under this path (see :func:`_load_state`), so
+        # a record listed a moment ago can stop being one before it is addressed.
+        raise NotResumable(
+            f"{_address(root, found[0])} stopped being a run record while it was "
+            "being resolved — the mirror is re-pulled under this request; try again"
+        )
+    return session
 
 
 def _load_state(ref: RunDirRef) -> dict:
@@ -745,7 +951,9 @@ def _require_direction_if_finished(
     )
 
 
-def _repo_url_for(tracked: runs.TrackedRun, request: ResumeRequest) -> str:
+def _repo_url_for(
+    config: PlatformConfig, tracked: runs.TrackedRun, request: ResumeRequest
+) -> str:
     """The repo URL the spawn derives its run identity from, or refuse.
 
     Supplied beats recorded, which is the opposite of
@@ -753,13 +961,34 @@ def _repo_url_for(tracked: runs.TrackedRun, request: ResumeRequest) -> str:
     path by which a wrong recorded URL can be corrected, since the spawn records
     what it was given and the corrected value then sticks.
 
-    Whichever it is, it has to parse back to the run's own host and project.
+    Whichever it is, it has to name the run's own host and project.
     ``derive_run_identity`` predicts the session's run from this URL, so one
     naming a different project files the session under a different run — a second
     row in the fleet view, the operator's row still pointing at the session that
     stopped, and (for an override) a sibling founded in the wrong project. The
     comparison is exact: this is not the place to guess that two spellings of a
     host are the same host.
+
+    It is made through :func:`lmer_platform.spawn.derive_repo_identity` — the
+    same function the spawn below will use, and *config* is here to carry the
+    work repo's registry to it. For a project registered with ``remotes:`` the
+    recorded URL and the tracked identity differ by design: one project is
+    reachable at several URLs, its record is placed and listed under the primary
+    (D8), so a run launched through a secondary is tracked under the primary
+    while its ``repo`` stays the URL that was actually cloned
+    (:func:`lmer_platform.workrepo.primary_remote_identity`). Comparing the URL's
+    bare parse refused exactly those runs, and refused them by telling the
+    operator their own repo named a different project. That is believing the
+    registry where it SAYS two URLs are one project, not guessing that they are:
+    a URL no entry claims, or any URL at all when the mirror cannot be read, is
+    still held to naming the run's host and project exactly.
+
+    Both sides go through the fold, not just the URL
+    (:func:`lmer_platform.workrepo.folded_identity`). A row keyed on a SECONDARY
+    — adopted by hand under the spelling the operator cloned from, or written by
+    a spawn whose fold no-opped on a cold mirror — otherwise lost this comparison
+    permanently, and lost it with a message telling the operator to supply a repo
+    URL that does not exist.
     """
     url = request.repo_url or tracked.repo
     if not url:
@@ -770,8 +999,14 @@ def _repo_url_for(tracked: runs.TrackedRun, request: ResumeRequest) -> str:
             "tracked index as this run's repo and every later verb believes it. "
             "Supply repo_url with the resume"
         )
-    host, project = _parse_repo_url(url)
-    if (host, project) != (request.host, request.project):
+    # BOTH sides folded, or the comparison is one a secondary-keyed row can
+    # never win: the URL side moves to the primary and the tracked side does
+    # not, so the resume is refused with advice — "supply a repo_url for
+    # <secondary>" — that no URL can satisfy, because every spelling of that
+    # project folds to the same primary. A no-op for a row already keyed on
+    # the primary, which is every row a post-fold spawn writes.
+    host, project = derive_repo_identity(url, config)
+    if (host, project) != folded_identity(config, request.host, request.project):
         source = "supplied" if request.repo_url else "recorded for this run"
         raise RepoUrlRequired(
             f"the {source} repo URL {url!r} names {host}/{project}, but the run is "
@@ -793,6 +1028,39 @@ def _direction_args(direction: Optional[str]) -> tuple:
     return (f"{DIRECTION_FLAG}={direction}",)
 
 
+def _landing_session_id(
+    landing_ref: Optional[RunDirRef], continued: bool
+) -> Optional[str]:
+    """The record the session must write in, or ``None`` to let it mint one.
+
+    ``LMER_SESSION_ID`` decides which ``_runs/<slug>/<session-id>/`` a launch
+    writes its record in (spec D22), and the container mints one at startup only
+    when the host injected none. So without this a resume READS one record and
+    LANDS in a brand-new one beside it: every refusal above measured against a
+    launch the session then never touched, and a second record in the group with
+    nothing in it but a fresh brief. The id passed is therefore the id of the ref
+    the checks were made against — ``landing_ref``, which for a continue is the
+    source ``ref`` — and not, say, the newest launch re-resolved here, which is
+    the very divergence :attr:`ResumeRequest.session_id` exists to close.
+
+    **Only for a continue.** With an overridden taskdef the session files itself
+    under a different slug (the module docstring's "continue vs sibling"), and the
+    source record's id names nothing in that other group: injecting it would open
+    a record in group B addressed by a launch of group A — a worse lie than the
+    one this fixes, and one no later reader could untangle. There the container
+    mints its own id, exactly as it did before this existed.
+
+    ``None`` also for a landing ref that is not a session record at all — a legacy
+    run dir, or an unmigrated record at the grouping level. Both are addressed by
+    their slug rather than by a launch (:func:`lmer_platform.workrepo.
+    record_session_id`), and a legacy resume is byte-identical to what it was.
+    """
+    if not continued or landing_ref is None:
+        return None
+    return record_session_id(landing_ref)
+
+
+@run_operation
 def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     """Continue a tracked run by starting its next session.
 
@@ -828,14 +1096,20 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
         _refuse_if_question(landing_state, landing_ref)
         _require_direction_if_finished(landing_state, landing_ref, request)
 
-    repo_url = _repo_url_for(tracked, request)
+    repo_url = _repo_url_for(config, tracked, request)
 
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             repo_url=repo_url,
+            # The record every refusal above was measured against, so a continue
+            # lands in the launch the operator asked to continue rather than in a
+            # fresh one beside it — and nothing for an override, which lands in
+            # another group entirely. See :func:`_landing_session_id`.
+            session_id=_landing_session_id(landing_ref, continued),
             extra_args=_direction_args(request.direction),
         ),
     )
@@ -900,4 +1174,8 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
         continued=continued,
         started_slug=started_slug,
         session=result,
+        # The landing run's record, which is the one every check above was made
+        # against: the source run for a continue, the sibling for an override, and
+        # nothing at all for an override that founds a run.
+        rel_path=landing_ref.rel_path if landing_ref is not None else None,
     )

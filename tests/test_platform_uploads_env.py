@@ -24,9 +24,13 @@ def test_cli_env_dict_declares_the_upload_dir():
     on the host `lmer` process, so nothing looks broken — but no agent is ever
     told the store is there, because the fragment inside the container is gated
     on a variable that never crossed.
+
+    A session-owned store may take precedence in the same entry (#407 gives a
+    chat session its own store), so what the guard pins is the host fallback,
+    not the whole expression.
     """
     pattern = re.compile(
-        r"""["']LMER_UPLOADS_DIR["']\s*:\s*os\.environ\.get\(\s*"""
+        r"""["']LMER_UPLOADS_DIR["']\s*:\s*[^\n]*os\.environ\.get\(\s*"""
         r"""["']LMER_UPLOADS_DIR["']\s*\)"""
     )
     assert pattern.search(CLI_PY.read_text(encoding="utf-8")), (
@@ -44,3 +48,21 @@ def test_the_variable_carries_a_container_path():
     it down would name a directory that is not there — the same mistake the ask
     channel's own test guards against."""
     assert uploads.CONTAINER_UPLOADS_DIR.startswith("/home/developer/")
+
+
+#: The two #407 variables the *supervisor* reads inside the container. Same
+#: convention, same reason as the upload dir above: a variable missing from
+#: `lmer`'s env dict is set on the host and simply never arrives.
+COMMS_CONTAINER_VARS = ("LMER_COMMS_DRAIN_GRACE", "LMER_COMMS_TERMINAL_MIRROR")
+
+
+def test_the_comms_variables_the_supervisor_reads_cross_into_the_container():
+    source = CLI_PY.read_text(encoding="utf-8")
+    for name in COMMS_CONTAINER_VARS:
+        pattern = re.compile(
+            rf"""["']{name}["']\s*:\s*[^\n]*os\.environ\.get\(\s*["']{name}["']\s*\)"""
+        )
+        assert pattern.search(source), (
+            f"{name} is read by the supervisor inside the container but is not in "
+            "cli.py's container env dict, so setting it on the host does nothing"
+        )

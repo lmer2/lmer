@@ -1,19 +1,26 @@
 ## Asking your operator
 
-This session was started by the lmer orchestrator (`LMER_ASK_DIR` is set), so nobody is watching this terminal — your operator is looking at the orchestrator's web view. A question you only write into your normal output reaches no one, and an interactive prompt blocks until the session is reaped.
+This session was started by the lmer orchestrator (`LMER_ASK_DIR` is set), so nobody is watching this terminal — your operator is looking at the orchestrator's web view, a Slack thread, or a matrix thread. A question you only write into your normal output reaches no one, and an interactive prompt blocks until the session is reaped.
 
-`lmer-ask` is the only way to reach your operator. Never put a question to them through this harness's own question or permission dialog — an interactive prompt, or a built-in question tool if this session has one: the operator is not watching this terminal, the dialog blocks the session where nobody can see it, and the orchestrator can neither show it nor answer it. That has happened, and the question was never seen. If such a tool exists in this session, its existence is not an invitation; `lmer-ask` is.
+`lmer-signal` is the only way to reach your operator, and it is one command for every direction: conversational posts reach **every** connected channel — the platform, Slack, matrix, a terminal — while quiet `note` records stay on the bus and platform. Whatever anyone types in any of those channels arrives here as an ordinary message tagged with where it came from (`[slack · tester] …`, `[uber lmer] …`, `[platform · tester] …`, `[terminal] …`). You never pick a channel and you never watch one.
 
-Use the `lmer-ask` command instead:
+Never put a question to them through this harness's own question or permission dialog — an interactive prompt, or a built-in question tool if this session has one: the operator is not watching this terminal, the dialog blocks the session where nobody can see it, and the orchestrator can neither show it nor answer it. That has happened, and the question was never seen. If such a tool exists in this session, its existence is not an invitation; `lmer-signal ask` is.
 
-- `lmer-ask ask "<question>"` posts the question and waits; the operator's reply is printed on stdout. Add `--option "<choice>"` (repeatable) to suggest answers — they are a hint, not a menu, so handle a reply that matches none of them.
-- One question per `lmer-ask ask`. A multi-part decision is that many asks: the channel holds several open questions at once, and each one gets its own card, its own options and its own answer in the operator's view. Options belong to exactly one question, and tapping one sends it, so parts packed into a single entry give the operator options that claim to answer all of them at once.
-- Exit code 2 means nobody has answered yet. That is not an error and the question is still open: report where you are, then resume with `lmer-ask wait <id>`. If you have since decided without the operator, withdraw it with `lmer-ask close <id>` so nobody answers a question you no longer hold open.
-- Answers arrive while you work. If a wait times out and you go on to other tasks, re-run that wait between them rather than at the end of the session.
-- Before you conclude the operator has not answered — and before you record any stop reason or end this session — run `lmer-ask wait <id>` (or `lmer-ask list`) one final time. `lmer-ask list` marks an answer you have never read as `answered (unread)`, and `lmer-end-session` refuses once to end a session that has one.
+The verbs:
+
+- `lmer-signal "<what happened>"` reports a milestone — you pushed an MR, you finished the review, you are done with the current task. One-way and terminal: nothing answers it, and there is nothing to wait for. The supervising assistant routes the next step from it.
+- `lmer-signal note "<text>"` records quiet progress on the bus and platform, without posting to Slack or Matrix. It expects no reply and refreshes a listener-owned session's inactivity timer.
+- `lmer-signal post "<text>"` posts a message to the humans in the conversation — an answer to something they said, a result they asked for.
+- `lmer-signal dm <recipient> "<text>"` sends one **private** message to a named person — a Slack user id or username, or a matrix user id — when what you have to say should not be in the conversation everyone can read. The operator decides who is reachable this way, so a recipient they have not listed is refused by name; do not fall back to posting it publicly. The body is deliberately not recorded on this session's journal, only the fact that a message of that length went to that person.
+- `lmer-signal ask "<question>"` posts a question and waits; the first answer from any channel is printed on stdout. Add `--option "<choice>"` (repeatable) to suggest answers — they are a hint, not a menu, so handle a reply that matches none of them.
+- One question per `lmer-signal ask`. A multi-part decision is that many asks: the channel holds several open questions at once, and each one gets its own card, its own options and its own answer in every channel. Options belong to exactly one question, and tapping one sends it, so parts packed into a single entry give the operator options that claim to answer all of them at once.
+- Exit code 2 means nobody has answered yet. That is not an error and the question is still open: report where you are, then resume with `lmer-signal wait <id>`. If you have since decided without an answer, withdraw it with `lmer-signal close <id>` so nobody answers a question you no longer hold open.
+- Answers arrive while you work. If a wait times out and you go on to other tasks, re-run that wait between them rather than at the end of the session. A late answer that reaches you after you moved on arrives as a tagged message, so you will see it either way.
+- Before you conclude the operator has not answered — and before you record any stop reason or end this session — run `lmer-signal wait <id>` (or `lmer-signal list --open`) one final time.
 - If you have a monitor or watch tool, arm it to re-run the wait so an idle session still hears the answer.
-- `lmer-ask note "<text>"` posts a progress note that expects no reply. Use it before long stretches of silent work.
-- `lmer-signal "<what happened>"` signals the orchestrator on a milestone — you pushed an MR, you finished the review, you are done with the current task. One-way and terminal: it goes to the supervising assistant rather than to your operator (`lmer-ask` is their channel), nothing answers it, and there is nothing to wait for.
-- Exit code 3 means there is no channel (you are not orchestrated after all) — then say what you need in your ordinary output and stop.
+- `lmer-signal list` prints the whole conversation so far, every channel included; `--json` gives one record per line.
+- Exit code 3 means there is no channel (this session has no supervisor control plane) — then say what you need in your ordinary output and stop.
+
+`lmer-ask` and `lmer-slack post` still work for this release and forward to `lmer-signal`; prefer `lmer-signal`.
 
 Ask when a decision is genuinely yours to hand over — an ambiguous requirement, a destructive step, a fork in the approach — not for routine confirmations. Prefer `--message-file` or `--stdin` for text containing backticks, `$` or quotes, exactly as with any other command.

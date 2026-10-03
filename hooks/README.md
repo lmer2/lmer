@@ -15,6 +15,11 @@ This will:
 
 ## Commands
 
+These optional host shortcuts are created by `hooks/install.sh`; container
+sessions do not install them. In a container, read the installed rule directly,
+for example `cat /Agents/global/rules/git.md`, or run
+`cat /Agents/global/AGENTS.md /Agents/global/rules/*.md` for all rules.
+
 ### Basic Commands
 
 - `rgr` - Read Global Rules with tracking
@@ -76,6 +81,46 @@ Located in `~/.claude/`:
 - `commits.log` - Commits made via pc
 - `violations.log` - Rule violations (if any)
 
+## SessionEnd Hooks
+
+### chrome_agent_sweep.sh
+
+Stops the captivus `chrome-agent` browsers **this session launched** — and
+nothing else. Wired from `agent-files/claude/settings.json`'s `SessionEnd`
+array as `bash ... || true`, matched to the terminal reasons
+(`logout|prompt_input_exit|other`) because `clear` and `resume` fire while the
+session carries on.
+
+**Scope is the whole design.** captivus's registry is container-global
+(`/tmp/chrome-agent/registry.json`) and its instance names come from the
+working-directory basename, so every session in `/workspace` produces
+`workspace-NN` and the registry cannot say who owns what. Sweeping it stopped
+every browser in the container. Attributing by process tree does not help
+either: Chrome is reparented to init the moment the launcher exits. So the
+sweep reads a ledger written by `bin/chrome-agent-launch`, keyed by the
+session's own harness process via `libexec/chrome-agent-session.sh` — ancestry
+over *our* processes, which are still children.
+
+Scoping alone is not enough, because captivus **reuses** instance names: it
+hands out the lowest free `<dir>-NN` and `stop` frees it again, so a session
+that stops its browser promptly (what the skill instructs) leaves a name a
+later session then holds. The ledger therefore records `name pid starttime`,
+and the sweep re-confirms that captivus still has that pid under that name and
+that the pid still has that start time. A browser started with a bare
+`chrome-agent launch`, or one whose identity cannot be confirmed, is
+deliberately **not** swept: a leaked browser is bounded and visible, one
+stopped out from under another session is neither.
+
+Best-effort in every other direction too: exits 0 when `chrome-agent`, the
+helper or the ledger are missing, re-validates every name before it reaches a
+command line, and bounds each CLI call with `timeout` so a browser that never
+answers `Browser.close` cannot hang session end. It is housekeeping for a
+container reused across sessions — Claude does not block its exit on SessionEnd
+hooks, and by the time it fires a run that leaked has already paid. Teardown
+during a session belongs to the `chrome-agent` skill.
+
+Tests: `tests/test_chrome_agent_sweep.py`.
+
 ## Lifecycle Stop Hooks
 
 ### codex_ask_guard.py
@@ -123,10 +168,12 @@ in the transcript (the `_MILESTONE_PATTERNS` list — `gate-push`,
 `gitlab-review --create-mr`/`--review-file`/`--reply-thread`,
 `github-review --review-file`, `work state set --status=complete`)
 or a run record reporting itself complete, with no signal-equivalent act after
-it (a successful `lmer-signal`; a newer signal file in the channel dir, but
-only when the transcript holds no signal of its own — ordered evidence wins
-over a file with no position in the turn; or a newly opened `lmer-ask`
-question). The reminder asks the agent to run `lmer-signal`; the hook **never
+it (a successful `lmer-signal` in one of its **milestone** forms — bare text or
+`lmer-signal milestone`; its `note`/`post`/`ask` verbs are not signals; a newer
+milestone on the session bus log (`LMER_COMMS_LOG`, falling back to a signal
+file in the ask dir), but only when the transcript holds no signal of its own —
+ordered evidence wins over a record with no position in the turn; or a newly
+opened `lmer-signal ask` question). The reminder asks the agent to run `lmer-signal`; the hook **never
 signals on the agent's behalf** — a signal must keep meaning a milestone. The
 GitLab and GitHub post-review wrappers own their milestone instead: after the
 review command succeeds they call `lmer-signal` directly. Signalling is

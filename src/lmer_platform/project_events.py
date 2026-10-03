@@ -1,0 +1,56 @@
+"""Durable delivery of worker and human events to the current run owner."""
+from collections import defaultdict
+from dataclasses import replace
+import hashlib
+import json
+
+from . import assistant, projects, runs, store
+
+
+def enqueue(session, message, run=None, session_kind=None):
+    if not projects.enabled():
+        return
+    meta = message.get("meta") or {}
+    if ((message.get("source") or {}).get("channel") == "uber-lmer" or meta.get("session_origin") is True
+            or meta.get("notification_class") == "connector_health" or session_kind == "assistant"):
+        return
+    data = {"session": session, **{key: (run or {}).get(key) for key in ("host", "project", "slug")}}
+    if all(data.get(key) for key in ("host", "project", "slug")):
+        data["run_key"] = runs.run_key(data["host"], data["project"], data["slug"])
+    owner = projects.destination(data)
+    if not owner:
+        return
+    identity = hashlib.sha256(json.dumps([session, message.get("id") or message], sort_keys=True).encode()).hexdigest()
+    payload = assistant._scrubbed_data({"message": message, "data": data})
+    with projects.database() as db:
+        db.execute("INSERT OR IGNORE INTO event_queue (id,session,project_id,payload) VALUES (?,?,?,?)",
+                   (identity, session, owner, json.dumps(payload)))
+
+
+def flush():
+    with projects.operation(), assistant._LOCK:
+        with projects.database() as db:
+            queued = [dict(row) for row in db.execute("SELECT * FROM event_queue WHERE done=0 ORDER BY rowid")]
+        groups = defaultdict(list)
+        for row in queued:
+            payload = json.loads(row["payload"])
+            owner = projects.destination(payload["data"]) or row["project_id"]
+            groups[(owner, row["session"])].append((row["id"], payload))
+        with projects.database() as db:
+            for (owner, session), records in groups.items():
+                row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (owner,)).fetchone()
+                state = assistant.AssistantState.from_dict(json.loads(row[0]))
+                data = {**records[-1][1]["data"], "workspace_id": owner, "count": len(records)}
+                lines = []
+                for _identity, payload in records[-8:]:
+                    message = payload["message"]
+                    who = (message.get("source") or {}).get("channel", "?")
+                    lines.append(f"[{who}] {message.get('kind')}: {str(message.get('text') or '')[:300]}")
+                entry = assistant.PendingNote(at=store.utc_now_iso(), kind="session_comms",
+                                              note=(f"Session {session}: " + " | ".join(lines))[:assistant.MAX_NOTE_CHARS], data=data)
+                updated = replace(state, pending=(*state.pending, entry),
+                                  pending_since=state.pending_since or entry.at,
+                                  pending_seq=state.pending_seq + (not state.pending))
+                db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(updated.to_dict()), owner))
+                db.executemany("UPDATE event_queue SET done=1 WHERE id=?", [(identity,) for identity, _ in records])
+        return len(groups)

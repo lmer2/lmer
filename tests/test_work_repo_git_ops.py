@@ -24,6 +24,38 @@ from work_repo.git_ops import (
 # so the drift-guard tests can hold both copies to the same fixtures.
 from hooks.run_state_guard import gather_run_dir_status
 
+# The form-routing section at the bottom of this file: the shared plexus
+# fixture trees (§2 and §9 twins), the helpers whose answers `work commit`
+# now stages, and the verbatim pre-routing oracle's own dependencies.
+from tests.conftest import strip_lmer_env
+from tests.plexus_fixtures import (
+    BUCKET_HOST,
+    BUCKET_PROJECT,
+    PRIMARY_REPO,
+    PROJECT,
+    SESSION_DIR_NAMES,
+    SLUG,
+    TARGET,
+    build_legacy_plexus,
+    build_schema_plexus,
+)
+from work_repo import git_ops, memory, run_state, specs_index, utils
+from work_repo.run_state import run_rel_path_candidates
+from work_repo.specs_index import specs_rel_path
+from work_repo.utils import sanitize_task_target
+
+PUSH_UPSTREAM = ["push", "origin", "HEAD:refs/heads/main"]
+REBASE_UPSTREAM = ["pull", "--rebase", "--autostash", "origin", "refs/heads/main"]
+
+
+@pytest.fixture(autouse=True)
+def publication_checks(monkeypatch):
+    """Isolate these staging/routing tests; real Git safety lives in push_safety."""
+    monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+    monkeypatch.setattr(git_ops, "_verify_published", lambda *args: 0)
+    monkeypatch.setattr(git_ops, "_publication_destination", lambda *args: ("origin", "refs/heads/main"))
+    monkeypatch.setattr(git_ops, "_index_snapshot", lambda repo: (repo / ".test-index", None))
+
 
 class TestRunGitCommand:
     """Test run_git_command function"""
@@ -65,8 +97,8 @@ class TestCommitWorkChanges:
             result = commit_work_changes()
             assert result == 1
 
-    def test_commit_work_changes_no_changes(self):
-        """Test commit when there are no changes"""
+    def test_commit_work_changes_unborn_repository_cannot_confirm_publication(self):
+        """An empty repository has no commit or upstream to verify."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Initialize git repo
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
@@ -87,8 +119,7 @@ class TestCommitWorkChanges:
 
             with patch.dict(os.environ, env_vars):
                 result = commit_work_changes()
-                # Should return 0 (no changes to commit)
-                assert result == 0
+                assert result != 0
 
     def test_commit_work_changes_with_changes(self):
         """Test commit when there are changes"""
@@ -130,7 +161,7 @@ class TestCommitWorkChanges:
                             return (0, "M  github.com/owner/repo/review/pr-123/log.yaml\n")
                         elif cmd == ["commit", "-m", "Update work repo: github.com/owner/repo/review/pr-123"]:
                             return (0, "")
-                        elif cmd == ["push"]:
+                        elif cmd == PUSH_UPSTREAM:
                             return (0, "")
                         return (0, "")
 
@@ -164,13 +195,8 @@ class TestCommitWorkChanges:
                     ]
                     assert len(add_calls) == 1
 
-    def test_commit_work_path_no_change_in_target_ignores_other_dirty_files(self):
-        """Unchanged target + an unrelated dirty file → return 0, no commit.
-
-        Regression test: the no-change check must be scoped to target_path so a
-        dirty per-session log.yaml elsewhere can't trigger a spurious empty
-        commit (which would fail and return non-zero).
-        """
+    def test_commit_work_path_no_upstream_does_not_commit_other_dirty_files(self):
+        """Missing upstream fails without turning unrelated dirt into a commit."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
@@ -191,7 +217,7 @@ class TestCommitWorkChanges:
 
             with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": tmpdir}):
                 result = commit_work_path("git.example.com/grp/proj/memory")
-            assert result == 0
+            assert result != 0  # no upstream can confirm publication
             # No new commit should have been created.
             rc, out = run_git_command(["log", "--oneline"], tmp, check=False)
             assert out.strip().count("\n") == 0  # exactly one commit (init)
@@ -252,9 +278,9 @@ class TestCommitWorkPathResilience:
             calls.append(cmd)
             if cmd[0] == "status":
                 return (0, f"M  {rel}/state.yaml\n")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 # First push rejected (non-FF), second succeeds.
-                pushes = [c for c in calls if c == ["push"]]
+                pushes = [c for c in calls if c == PUSH_UPSTREAM]
                 if len(pushes) == 1:
                     return (1, "! [rejected] main -> main (fetch first)")
                 return (0, "")
@@ -265,14 +291,14 @@ class TestCommitWorkPathResilience:
                 assert commit_work_path(rel) == 0
 
         commit_i = calls.index(["commit", "-m", f"Update work repo: {rel}"])
-        first_pull_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
-        first_push_i = calls.index(["push"])
+        first_pull_i = next(i for i, c in enumerate(calls) if c == REBASE_UPSTREAM)
+        first_push_i = calls.index(PUSH_UPSTREAM)
         assert commit_i < first_pull_i < first_push_i, calls
         # A rebase happens between the rejected and the retried push.
-        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        push_indices = [i for i, c in enumerate(calls) if c == PUSH_UPSTREAM]
         assert len(push_indices) == 2
         rebases_between = [
-            c for c in calls[push_indices[0] + 1:push_indices[1]] if c == ["pull", "--rebase"]
+            c for c in calls[push_indices[0] + 1:push_indices[1]] if c == REBASE_UPSTREAM
         ]
         assert rebases_between, "must rebase between push attempts"
 
@@ -283,7 +309,7 @@ class TestCommitWorkPathResilience:
         def side_effect(cmd, cwd, check=False):
             if cmd[0] == "status":
                 return (0, f"M  {rel}/fact.md\n")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 return (1, "! [rejected]")
             return (0, "")
 
@@ -291,7 +317,7 @@ class TestCommitWorkPathResilience:
             with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
                 assert commit_work_path(rel) == 1
                 assert [c for c in (call[0][0] for call in mock_git.call_args_list)
-                        if c == ["push"]].count(["push"]) == 3
+                        if c == PUSH_UPSTREAM].count(PUSH_UPSTREAM) == 3
 
     def test_multi_path_staging_skips_missing(self, tmp_path):
         existing = "git.example.com/grp/proj/develop/issue-1"
@@ -362,7 +388,7 @@ class TestCommitWorkPathResilience:
                 # Missing paths get a read-only tracked-files probe (they may
                 # hold pending deletions) — but nothing is staged or committed.
                 assert all(
-                    call.args[0][0] == "ls-files"
+                    call.args[0][0] in {"ls-files", "rev-list"}
                     for call in mock_git.call_args_list
                 )
 
@@ -777,7 +803,7 @@ class TestCommitNapkinIfSubdir:
         calls = [c.args[0] for c in mock_git.call_args_list]
         assert ["add", "-A", "--", "napkin"] in calls
         assert ["commit", "-m", "msg"] in calls
-        assert ["push"] in calls
+        assert PUSH_UPSTREAM in calls
         # Everything runs against the work repo, not the napkin path.
         assert all(c.args[1] == Path(str(work)) for c in mock_git.call_args_list)
 
@@ -890,9 +916,9 @@ class TestPushNapkinIfSeparate:
             calls.append(cmd)
             if cmd[0] == "status":
                 return (0, " M note.md")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 # First push rejected (non-FF), second succeeds.
-                if [c for c in calls if c == ["push"]] == [["push"]]:
+                if [c for c in calls if c == PUSH_UPSTREAM] == [PUSH_UPSTREAM]:
                     return (1, "! [rejected] main -> main (fetch first)")
                 return (0, "")
             return (0, "")
@@ -902,14 +928,336 @@ class TestPushNapkinIfSeparate:
                 assert push_napkin_if_separate("msg") == 0
 
         commit_i = calls.index(["commit", "-m", "msg"])
-        first_rebase_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
+        first_rebase_i = next(i for i, c in enumerate(calls) if c == REBASE_UPSTREAM)
         assert commit_i < first_rebase_i, calls
         # No plain (non-rebase) pull anywhere — it would refuse on dirty trees.
         assert ["pull"] not in calls
-        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        push_indices = [i for i, c in enumerate(calls) if c == PUSH_UPSTREAM]
         assert len(push_indices) == 2
         rebases_between = [
             c for c in calls[push_indices[0] + 1:push_indices[1]]
-            if c == ["pull", "--rebase"]
+            if c == REBASE_UPSTREAM
         ]
         assert rebases_between, "must rebase between push attempts"
+
+
+# ===========================================================================
+# Issue #353: what `work commit` stages follows the FORM of the tree
+# ===========================================================================
+#
+# `commit_work_changes` hand-built `{host}/{project}/{task}/{target}` from the
+# env trio and appended the routed run-dir and specs paths to it. In schema
+# form that f-string names a directory nothing writes (the record is a session
+# dir under `_runs/<slug>/`, D22), and the instance memory scope — which lives
+# at the plexus ROOT, outside every project dir (D17) — was reachable from no
+# path in the list at all. Every path now comes from the helper that OWNS it,
+# and the two ends differ by form: the legacy task-target dir is staged only in
+# a legacy tree, both memory scopes only in a schema one.
+#
+# The composed list is observed where it is composed — the argument handed to
+# `commit_work_path` — because that is what this task changes; the staging
+# filter, the clean-path skip and the push semantics below it are untouched
+# and keep their own tests above.
+
+
+def _reference_commit_work_changes():
+    """The path list `commit_work_changes` composed BEFORE form routing
+    (git_ops.py:704-735 at the time), `None` for its refusal.
+
+    The run-dir and specs helpers are the SHIPPED ones: this task does not
+    touch them (T20/T22 routed them already), and an oracle that copied them
+    would drift from the suite instead of pinning it."""
+    repo_host = os.environ.get("LMER_REPO_HOST")
+    repo_project = os.environ.get("LMER_REPO_PROJECT")
+    task_type = os.environ.get("LMER_TASK", "default")
+    task_target = os.environ.get("LMER_TASK_TARGET", "default")
+
+    if not repo_host or not repo_project:
+        return None
+
+    safe_task_target = sanitize_task_target(task_target) if task_target else "default"
+    target_path = f"{repo_host}/{repo_project}/{task_type}/{safe_task_target}"
+
+    paths = [target_path]
+    for rel in run_rel_path_candidates():
+        if rel not in paths:
+            paths.append(rel)
+
+    specs_rel = specs_rel_path()
+    if specs_rel and specs_rel not in paths:
+        paths.append(specs_rel)
+    return paths
+
+
+#: The launch contexts the legacy composition has to keep answering
+#: identically — the "no run context" pairs and the awkward spellings a launch
+#: produces (the matrix tests/test_work_repo_specs_index.py uses, plus the
+#: task/target defaults and a URL target only sanitizing can name).
+_LEGACY_CONTEXTS = [
+    (None, None, None, None),
+    ("git.example.com", None, "develop", "issue-9"),
+    (None, "group/proj", "develop", "issue-9"),
+    ("", "group/proj", "develop", "issue-9"),
+    ("git.example.com", "", "develop", "issue-9"),
+    ("git.example.com", "group/proj", None, None),
+    ("git.example.com", "group/proj", "develop", "issue-9"),
+    ("git.example.com", "group/proj", "review",
+     "https://git.example.com/group/proj/-/merge_requests/4"),
+    ("git.example.com", "group/sub/proj", "develop", "issue-9"),
+    ("git.example.com:8443", "group/proj", "develop", "issue-9"),
+    ("localhost", "proj", "develop", ""),
+]
+
+
+def _set_context(monkeypatch, root, *, host=None, project=None, task="develop",
+                 target="issue-12", session=None):
+    """Point the resolvers at *root* with the launch context a session has.
+
+    Every other LMER_* variable is stripped first — LMER_REPO_URL is what the
+    registry actually resolves on, so an ambient one would decide which
+    project dir these tests stage — and the announce-once set is cleared so a
+    manifest problem from a previous test cannot swallow this one's line. Done
+    here rather than in a module-scope autouse fixture: the older classes
+    above manage their own environment and this task does not touch them.
+    """
+    strip_lmer_env(monkeypatch)
+    utils._ANNOUNCED_MANIFEST_PROBLEMS.clear()
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
+    for name, value in (
+        ("LMER_REPO_HOST", host),
+        ("LMER_REPO_PROJECT", project),
+        ("LMER_TASK", task),
+        ("LMER_TASK_TARGET", target),
+        ("LMER_SESSION_ID", session),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def _launch(monkeypatch, tree, session=None):
+    """The launch context of a fixture tree's registered project."""
+    host, path = PRIMARY_REPO.split("/", 1)
+    _set_context(
+        monkeypatch, tree.root, host=host, project=path, session=session,
+        task="develop", target=TARGET,
+    )
+
+
+def _composed(commit_message=None):
+    """`(exit code, the path list handed to commit_work_path)` for one
+    `commit_work_changes` — `None` for the list when it refused and never got
+    that far. Nothing under it runs, so no tree is written or read by git."""
+    with patch(
+        "work_repo.git_ops.commit_work_path", return_value=0
+    ) as mock_commit:
+        rc = commit_work_changes(commit_message)
+    if not mock_commit.call_args_list:
+        return rc, None
+    return rc, list(mock_commit.call_args[0][0])
+
+
+class TestALegacyTreeStagesWhatItAlwaysDid:
+    """The path list a manifest-less tree composes is byte-identical to the
+    pre-routing implementation's — compared against that implementation
+    (`_reference_commit_work_changes`), not against a hand-written list."""
+
+    @pytest.mark.parametrize("host,project,task,target", _LEGACY_CONTEXTS)
+    def test_the_composed_list_matches_the_pre_routing_implementation(
+        self, monkeypatch, tmp_path, host, project, task, target
+    ):
+        _set_context(
+            monkeypatch, tmp_path, host=host, project=project,
+            task=task, target=target,
+        )
+        expected = _reference_commit_work_changes()
+        assert _composed() == (1 if expected is None else 0, expected)
+
+    def test_a_real_legacy_tree_stages_the_task_dir_the_record_and_the_index(
+        self, monkeypatch, tmp_path
+    ):
+        """Spelled out once, so the oracle above cannot agree with a wrong
+        answer: the three paths a legacy `work commit` has always staged."""
+        tree = build_legacy_plexus(tmp_path / "plexus-legacy")
+        _launch(monkeypatch, tree)
+        host, path = PRIMARY_REPO.split("/", 1)
+        rc, paths = _composed()
+        assert rc == 0
+        assert paths == [
+            f"{host}/{path}/develop/issue-12",
+            f"{host}/{path}/runs/{SLUG}",
+            f"{host}/{path}/specs",
+        ]
+        assert paths == _reference_commit_work_changes()
+
+    def test_neither_memory_scope_is_staged_in_a_legacy_tree(
+        self, monkeypatch, tmp_path
+    ):
+        """One scope, and it is `work memory persist`'s own push — adding it
+        here would change what a legacy tree commits."""
+        tree = build_legacy_plexus(tmp_path / "plexus-legacy")
+        _launch(monkeypatch, tree)
+        _rc, paths = _composed()
+        scopes = memory.memory_write_rel_paths()
+        assert scopes  # the scope exists, so it is genuinely being left out
+        assert [p for p in paths if p in scopes] == []
+
+    def test_the_message_is_passed_through_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        tree = build_legacy_plexus(tmp_path / "plexus-legacy")
+        _launch(monkeypatch, tree)
+        with patch(
+            "work_repo.git_ops.commit_work_path", return_value=0
+        ) as mock_commit:
+            assert commit_work_changes("Custom message") == 0
+        assert mock_commit.call_args[0][1] == "Custom message"
+
+
+class TestASchemaTreeStagesWhereItActuallyWrites:
+    """The session dir, the `_specs/` index and both memory scopes — every one
+    from the helper that owns it, and no `{task}/{target}` path, which in this
+    form names a directory nothing ever creates."""
+
+    def test_it_stages_the_session_dir_the_index_and_both_scopes(
+        self, monkeypatch, tmp_path
+    ):
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        _launch(monkeypatch, tree)
+        rc, paths = _composed()
+        assert rc == 0
+        assert paths == [
+            # The newest session of the group, then the group itself: the
+            # address a rename vacated is inside it.
+            f"{PROJECT}/_runs/{SLUG}/{SESSION_DIR_NAMES[1]}",
+            f"{PROJECT}/_runs/{SLUG}",
+            f"{PROJECT}/_specs",
+            f"{PROJECT}/_agents/memory",
+            "_agents/memory",
+        ]
+
+    def test_every_path_comes_from_the_helper_that_owns_it(
+        self, monkeypatch, tmp_path
+    ):
+        """One owner per path, so this list can never name a directory the
+        writer does not use (the specs index's own contract, extended)."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        _launch(monkeypatch, tree)
+        _rc, paths = _composed()
+        assert paths == (
+            run_state.run_rel_path_candidates()
+            + [specs_index.specs_rel_path()]
+            + memory.memory_write_rel_paths()
+        )
+
+    def test_no_task_target_path_is_staged_and_every_path_exists(
+        self, monkeypatch, tmp_path
+    ):
+        """The defect, stated as the difference: the oracle's first entry is a
+        directory this tree does not have, and every path composed now does."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        _launch(monkeypatch, tree)
+        _rc, paths = _composed()
+        stale = _reference_commit_work_changes()[0]
+        assert stale == f"{PRIMARY_REPO}/develop/issue-12"
+        assert not (tree.root / stale).exists()
+        assert stale not in paths
+        assert [p for p in paths if not (tree.root / p).exists()] == []
+
+    def test_the_bucket_gets_the_buckets_schema_areas(
+        self, monkeypatch, tmp_path
+    ):
+        """D9: an unregistered repo's work is parked in the host bucket, and
+        the staging list follows it there rather than to a short name."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        _set_context(
+            monkeypatch, tree.root, host=BUCKET_HOST, project=BUCKET_PROJECT,
+            task="develop", target="issue-3",
+        )
+        rc, paths = _composed()
+        bucket = f"{BUCKET_HOST}/{BUCKET_PROJECT}"
+        assert rc == 0
+        assert paths == [
+            f"{bucket}/_runs/develop-issue-3",
+            f"{bucket}/_specs",
+            f"{bucket}/_agents/memory",
+            "_agents/memory",
+        ]
+
+    def test_a_registry_problem_still_stages_the_bucket(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A broken registry is a fallback WITHIN the form, never a refusal:
+        the bucket resolves, so the commit proceeds and nothing is lost."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        tree.manifest.write_text(
+            "schema: 1\nname: example\nprojects:\n  lmer:\n"
+            f"    remotes:\n      - {PRIMARY_REPO}\n",
+            encoding="utf-8",
+        )
+        _launch(monkeypatch, tree)
+        host, path = PRIMARY_REPO.split("/", 1)
+        rc, paths = _composed()
+        assert rc == 0
+        assert paths == [
+            f"{host}/{path}/_runs/{SLUG}",
+            f"{host}/{path}/_specs",
+            f"{host}/{path}/_agents/memory",
+            "_agents/memory",
+        ]
+        # The refusal's other half: the entry is broken, the environment is
+        # not, and the announcement must not send the fix at the wrong one.
+        err = capsys.readouterr().err
+        assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
+
+
+class TestTheRefusalNamesTheReasonItHas:
+    """The folded misdiagnosis (issue #353, T24's helper): a verb that cannot
+    resolve a path says why, and an unreadable manifest is never reported as
+    unset environment variables."""
+
+    def test_a_legacy_tree_with_no_run_context_still_blames_the_env(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        _set_context(monkeypatch, tmp_path, host=None, project=None)
+        assert _composed() == (1, None)
+        assert (
+            "LMER_REPO_HOST and LMER_REPO_PROJECT must be set"
+            in capsys.readouterr().err
+        )
+
+    def test_an_unusable_manifest_names_the_manifest_not_the_env(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        tree.manifest.write_text(
+            "schema: 1\nname: example\nprojects: [oops\n", encoding="utf-8"
+        )
+        _launch(monkeypatch, tree)
+        assert _composed() == (1, None)
+        err = capsys.readouterr().err
+        assert str(tree.manifest) in err
+        assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
+
+    def test_it_is_the_one_helper_every_other_site_reads(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Not a third spelling of the sentence: the line printed here is the
+        line every other no-run-context site prints.
+
+        The helper lives in `utils` — the module both `cli` and `git_ops`
+        already import, and the one that owns `work_repo_layout`. It was in
+        `cli` when this test was written, which forced `git_ops` to reach for
+        it at call time to avoid closing an import cycle.
+        """
+        from work_repo import cli
+        from work_repo.utils import no_run_context_error
+
+        assert cli.no_run_context_error is no_run_context_error, (
+            "cli must read the same helper, not keep a copy"
+        )
+        _set_context(monkeypatch, tmp_path, host=None, project=None)
+        assert _composed() == (1, None)
+        printed = capsys.readouterr().err.strip()
+        assert printed == no_run_context_error()

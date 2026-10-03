@@ -18,11 +18,19 @@ else
 fi
 
 # Check for .claude.json
-if [ -f "$HOME/.claude.json" ]; then
+CLAUDE_CONFIG_FILE="${LMER_CLAUDE_CONFIG_FILE:-$HOME/.claude.json}"
+if [ -f "$CLAUDE_CONFIG_FILE" ]; then
     echo "✅ Claude config found at ~/.claude.json"
 else
     echo "⚠️  No .claude.json found"
 fi
+
+# Pre-trust the workspace so claude's folder-trust dialog (and, for a config
+# we have to seed, its first-run onboarding) never blocks the session (#415).
+# claude inherits this script's cwd, so that is the path it will key trust on.
+# shellcheck source=./claude-trust.sh
+source "$(dirname "$0")/claude-trust.sh"
+claude_pretrust_workspace "$CLAUDE_CONFIG_FILE" "$(pwd -P)"
 
 # Check statsig directory
 if [ -d "$HOME/.claude/statsig" ]; then
@@ -170,8 +178,43 @@ fi
 # ~/.claude/commands/, skills/, agents/ and output-styles/ with per-entry
 # symlinks from the global tree and the work repo (work overrides on name
 # collision).
-WORK_AGENT_FILES="/work/agent-files/claude"
-[ -d "$WORK_AGENT_FILES" ] || WORK_AGENT_FILES=""
+#
+# The work repo's tree has two names (lmer schema, D18): schema-form
+# `_agents/claude/` and legacy `agent-files/claude/`, read in place until the
+# tree migrates — and the migration is three independent moves (spec §9 step
+# 3), so `_agents/` can exist without `claude/` while `agent-files/claude/`
+# is still live. The resolver therefore picks the root that actually HOLDS
+# the `claude` leaf: LMER_WORK_AGENT_FILES_ROOT (taken as-is, blank when it
+# does not exist) > `_agents/claude` when present (a stderr notice names a
+# legacy copy that also exists) > `agent-files/claude` when present > blank
+# — then `/claude` under whichever root won, blank when absent as before.
+# harness_work_agent_files_root is a verbatim copy of the resolver in
+# harness-common.sh (this script does not source that file);
+# tests/test_work_agent_files_second_name.py guards the two against drift.
+harness_work_agent_files_root() {
+    local leaf="${1:?harness_work_agent_files_root: leaf required}"
+    local work="${2:-${LMER_WORK_REPO_PATH:-/work}}"
+    if [ -n "${LMER_WORK_AGENT_FILES_ROOT:-}" ]; then
+        [ -d "$LMER_WORK_AGENT_FILES_ROOT" ] && echo "$LMER_WORK_AGENT_FILES_ROOT"
+        return 0
+    fi
+    if [ -e "$work/_agents/$leaf" ]; then
+        if [ -e "$work/agent-files/$leaf" ]; then
+            echo "⚠️  Work agent-files: reading $work/_agents/$leaf; the legacy $work/agent-files/$leaf also exists and is ignored (migration leftover: merge it into _agents/$leaf and remove it)" >&2
+        fi
+        echo "$work/_agents"
+    elif [ -e "$work/agent-files/$leaf" ]; then
+        echo "$work/agent-files"
+    fi
+    return 0
+}
+WORK_AGENT_FILES_ROOT="$(harness_work_agent_files_root claude)"
+WORK_AGENT_FILES="${WORK_AGENT_FILES_ROOT:+$WORK_AGENT_FILES_ROOT/claude}"
+if [ -n "$WORK_AGENT_FILES" ] && [ -d "$WORK_AGENT_FILES" ]; then
+    echo "✅ Work agent-files: $WORK_AGENT_FILES"
+else
+    WORK_AGENT_FILES=""
+fi
 
 if [ -n "$CLAUDE_GLOBAL_AGENT_FILES" ] \
    && [ -f "$CLAUDE_GLOBAL_AGENT_FILES/settings.json" ] \

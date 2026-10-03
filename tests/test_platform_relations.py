@@ -910,3 +910,67 @@ def _function_source(text, signature):
     """
     start = text.index(signature)
     return text[start:text.index("\n}\n", start)]
+
+
+def test_all_pairs_reads_the_whole_fleet_once_per_relation(tracked, platform_root):
+    """The fleet-wide read the constellation map's edges come from (G12).
+
+    ``list_for`` answers "what is this run related to", and a map that asked it
+    once per run would cost a request per node per poll. This is the other
+    question — "what is related to what, anywhere" — and the store already
+    answers it in one read.
+
+    Each pair comes back **once**. That is a property of the storage (one
+    canonical sorted key per relation), not of this function remembering to
+    de-duplicate, which is exactly why it can be relied on.
+    """
+    relations.relate(DEVELOP, REVIEW)
+
+    pairs = relations.all_pairs()
+
+    assert pairs == [(runs.run_key(*DEVELOP), runs.run_key(*REVIEW))], (
+        "a relation should appear once, with its two runs in canonical order"
+    )
+
+
+def test_all_pairs_is_empty_rather_than_failing_when_nothing_is_related(platform_root):
+    """A fresh orchestrator relates nothing; that is a fleet with no edges."""
+    assert relations.all_pairs() == []
+
+
+def test_all_pairs_skips_a_malformed_entry_instead_of_emptying_the_fleet(
+    tracked, platform_root
+):
+    """One hand-edited entry must not cost every other edge on the map.
+
+    D2 says the file is repairable in an editor, which means a half-finished
+    edit is a state this has to survive. The bad entry is dropped and logged by
+    ``_members``; the good one still draws.
+    """
+    relations.relate(DEVELOP, REVIEW)
+    stored = json.loads(_read(store.snapshot_path(relations.RELATIONS_FILE)))
+    stored["relations"]["broken+entry"] = {"runs": ["not", "a", "mapping"]}
+    store.write_json(store.snapshot_path(relations.RELATIONS_FILE), stored)
+
+    pairs = relations.all_pairs()
+
+    assert pairs == [(runs.run_key(*DEVELOP), runs.run_key(*REVIEW))], (
+        "a malformed entry took the well-formed relations with it"
+    )
+
+
+def test_all_pairs_does_not_depend_on_which_run_was_named_first(
+    tracked, platform_root
+):
+    """The entry stores the order ``relate`` was called with; this must not.
+
+    Otherwise the fleet payload's edges would differ depending on which run an
+    operator happened to name first, and two orchestrators holding the same
+    relation would report it differently.
+    """
+    relations.relate(REVIEW, DEVELOP)
+
+    pairs = relations.all_pairs()
+
+    expected = tuple(sorted((runs.run_key(*DEVELOP), runs.run_key(*REVIEW))))
+    assert pairs == [expected]

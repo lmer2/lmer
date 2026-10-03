@@ -32,6 +32,20 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 import pytest
 
+from tests.conftest import strip_lmer_env
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    # Without this the shims reach the *live* bus of the container running the
+    # suite. `lmer-slack post` resolves it through `ask_channel.bus`, which reads
+    # LMER_FASTAPI_PORT + LMER_FASTAPI_TOKEN, or LMER_SUPERVISOR_URL — those three
+    # are what must go. The fixture text was posted as a real record on the
+    # operator's own channel, and the shim then returned 0 because the bus had
+    # accepted it.
+    strip_lmer_env(monkeypatch)
+
+
 # ---------------------------------------------------------------------------
 # Deferred import — collected regardless; fails at runtime until impl lands.
 # ---------------------------------------------------------------------------
@@ -1416,3 +1430,79 @@ class TestEndSession:
         client.post_message.assert_not_called()
         mock_kill.assert_called_once_with(FAKE_SUPERVISOR_PID, signal.SIGUSR1)
         assert "could not resolve" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# #407: post/history/watch/poll are one-release shims over the session bus
+# ---------------------------------------------------------------------------
+
+from slack_chat import cli  # noqa: E402
+from tests.test_lmer_signal_cli import Rig as _BusRig  # noqa: E402
+
+
+class TestBusShims:
+    @pytest.fixture
+    def bus_rig(self, tmp_path, monkeypatch):
+        return _BusRig(tmp_path, monkeypatch)
+
+    def test_post_goes_to_the_bus_when_no_token_is_in_the_container(self, bus_rig, monkeypatch, capsys, routing_call):
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
+        monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
+        assert cli.main(["post", "hello there"]) == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "000001"
+        assert "deprecated" in captured.err
+        (record,) = bus_rig.records()
+        assert (record.kind, record.text, record.source.channel) == ("message", "hello there", "agent")
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
+
+    def test_post_with_a_legacy_token_also_reaches_slack(self, bus_rig, monkeypatch, capsys, routing_call):
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-legacy")
+        monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
+        monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
+        posted = []
+
+        class FakeSlack:
+            def __init__(self):
+                pass
+
+            def post_message(self, channel, thread_ts, text):
+                posted.append((channel, thread_ts, text))
+                return "9.9"
+
+        monkeypatch.setattr(cli, "SlackClient", FakeSlack)
+        assert cli.main(["post", "hello there"]) == 0
+        assert capsys.readouterr().out.split() == ["000001", "9.9"]
+        assert posted == [("C1", "1.2", "hello there")]
+        assert len(bus_rig.records()) == 1
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
+
+    def test_post_with_neither_bus_nor_token_is_no_channel(self, tmp_path, monkeypatch, capsys, routing_call):
+        _BusRig(tmp_path, monkeypatch, with_bus=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
+        monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
+        assert cli.main(["post", "hello"]) == cli.NO_CHANNEL_EXIT_CODE
+        from lmer_cli.routing_receipts import delivered
+        assert not delivered('call', 'claude-test')
+
+    def test_history_without_a_token_lists_the_bus(self, bus_rig, monkeypatch, capsys):
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
+        monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
+        bus_rig.log.append(kind="message", text="hi", source=__import__("lmer_cli.comms", fromlist=["Source"]).Source("slack", author="tester", ref="t1"))
+        assert cli.main(["history"]) == 0
+        captured = capsys.readouterr()
+        assert "message from slack · tester: hi" in captured.out
+        assert "deprecated" in captured.err
+
+    @pytest.mark.parametrize("verb", ["watch", "poll"])
+    def test_watch_and_poll_without_a_token_say_inbound_is_delivered(self, bus_rig, monkeypatch, verb, capsys):
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
+        monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
+        assert cli.main([verb]) == 0
+        assert "arrive in this session as turns" in capsys.readouterr().err

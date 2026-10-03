@@ -1,4 +1,8 @@
-"""Host-side Slack listener that spawns one ``lmer chat`` session per thread.
+"""Host-side Slack listener with optional assistant routing.
+
+``LMER_ASSISTANT_MENTION_ROUTING`` selects the assistant's private inbox;
+``docs/ASSISTANT-MENTIONS.md`` describes admission and reply destinations.
+The default mode below spawns one ``lmer chat`` session per thread.
 
 ``lmer-slack-listener`` is a long-lived process that runs **on the host**,
 not inside a container. It holds a Slack socket-mode connection and, when
@@ -26,11 +30,15 @@ import logging
 import os
 import sys
 
+from lmer_cli import dm_access
+from lmer_cli import assistant_mentions
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
+from .sessions import preset_ack_parts
 from .sessions import SessionManager
+from lmer_platform import projects, ingress_store
 
 logger = logging.getLogger("lmer_slack.listener")
 
@@ -95,10 +103,9 @@ def _csv_env_set(name: str, default: str = "") -> set[str]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
-# Slack user IDs allowed to hold conversational DM sessions. When empty (the
-# default) DMs are open to everyone; when set, a DM from anyone not on the
-# list is silently ignored. Repopulated from env in main() after .env load.
-DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+# Slack users allowed to hold conversational DM sessions. Repopulated from env
+# in main() after .env load.
+DM_ALLOWED_USERS: set[str] = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
 
 # Operator-defined startup presets a user can select with the ``$preset:<name>``
 # token (see :mod:`lmer_cli.presets`). Empty when LMER_PRESETS_FILE is
@@ -108,65 +115,7 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 # Whether a listener-wide default is defined is a question about the spawned
 # CLI's environment instead — see SessionManager.child_presets (issue #279).
 PRESETS: dict[str, Preset] = load_presets()
-
-
-def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
-    """Say which preset the session being spawned is actually getting.
-
-    Returns ``(clause, warning)`` — a fragment appended to the connecting ack,
-    and an optional separate warning line.
-
-    Both selectors are reported, because both are invisible from Slack
-    (issue #181). A ``$preset:`` token names the preset it applies and, when it
-    replaced a listener-wide default, says so; with no token the
-    env-selected default is named too, since "my session silently got a preset
-    I never asked for" is exactly the confusion this is fixing. The person who
-    needs to know is the one who just typed the message, so this belongs in the
-    thread and not only in ``lmer_session_spawned``.
-
-    A default naming a preset that is not defined gets the warning line: the
-    spawned CLI rejects an unknown preset with exit 2, so the session would
-    otherwise die seconds after a cheerful "Connecting…" with the reason
-    visible only in the listener's log. Unlike an unknown *token* — a user
-    error, rejected before spawning — this is an operator misconfiguration of
-    the listener itself, so the spawn still goes ahead and only the diagnosis
-    is surfaced.
-
-    The default is resolved through the session manager because it owns the
-    ``.env`` files the spawned CLI seeds itself from: a default that lives
-    only in the forwarded ``--env-file`` applies to the session and must be
-    named here too (issue #259). Its *availability* is asked of the manager for
-    the same reason (issue #279): ``LMER_PRESETS_FILE`` travels those same
-    tiers, so checking a file-sourced default against the listener's own
-    ``PRESETS`` — loaded from an environment that never reads that file —
-    warned that a session would fail to start when the child was about to load
-    the very preset being named. ``PRESETS`` still answers for a ``$preset:``
-    token, which is resolved here and must name something this listener holds.
-    """
-    default_name, default_source = session_manager.default_preset()
-    if preset is not None:
-        if default_name and default_name != preset.name:
-            return (
-                f" using preset `{preset.name}` (replacing the listener "
-                f"default `{default_name}` from `{default_source}`)",
-                "",
-            )
-        return f" using preset `{preset.name}`", ""
-    if not default_name:
-        return "", ""
-    child_presets = session_manager.child_presets()
-    if default_name in child_presets:
-        return (
-            f" using the listener default preset `{default_name}` "
-            f"(from `{default_source}`)",
-            "",
-        )
-    available = ", ".join(sorted(child_presets)) or "(none configured)"
-    return "", (
-        f"⚠️ The listener default preset `{default_name}` (from "
-        f"`{default_source}`) is not defined, so this session will fail to "
-        f"start. Available presets: {available}."
-    )
+MENTIONS = assistant_mentions.Settings()
 
 
 def build_app(token: str | None = None):
@@ -417,7 +366,7 @@ async def _connect_lmer_session(
             )
             return
 
-    preset_clause, preset_warning = _preset_ack_parts(preset)
+    preset_clause, preset_warning = preset_ack_parts(preset, session_manager)
     ack = "Connecting a session to this thread"
     ack += preset_clause
     ack += "... ⏳ (the first reply can take a minute)"
@@ -429,15 +378,29 @@ async def _connect_lmer_session(
 
 
 def _dm_user_allowed(user_id: str | None) -> bool:
-    """Whether *user_id* may hold a conversational DM session.
+    """Whether *user_id* may hold a conversational DM session."""
+    return bool(user_id) and dm_access.permits(user_id, entries=DM_ALLOWED_USERS)
 
-    Returns True when the allowlist (``LMER_SLACK_DM_ALLOWED_USERS``) is empty -
-    i.e. unset, so DMs are open to everyone - or when the user is on it. A
-    missing ``user_id`` is never allowed once a list is configured.
-    """
-    if not DM_ALLOWED_USERS:
+
+async def _dm_user_allowed_with_handle(user_id: str | None) -> bool:
+    if _dm_user_allowed(user_id):
         return True
-    return user_id in DM_ALLOWED_USERS
+    if not user_id or not DM_ALLOWED_USERS:
+        return False
+    try:
+        reply = await app.client.users_info(user=user_id)
+    except Exception as exc:
+        logger.warning("dm_handle_lookup_failed user_id=%s error=%s", user_id, exc)
+        return False
+    try:
+        ok = reply.get("ok")
+        member = reply.get("user")
+    except (AttributeError, ValueError):
+        return False
+    if not ok or not isinstance(member, dict) or member.get("id") != user_id:
+        return False
+    handle = member.get("name")
+    return dm_access.permits(user_id, spellings=(handle,), entries=DM_ALLOWED_USERS)
 
 
 async def handle_mention(event, say):
@@ -461,6 +424,12 @@ async def handle_mention(event, say):
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
 
+    if MENTIONS.enabled:
+        if not projects.enabled() and (session_manager.touch(channel, thread_ts) or is_thread_connected(channel, thread_ts)):
+            return
+        await _forward_assistant(channel, event)
+        return
+
     # DM detection here uses the channel-ID prefix rather than the
     # ``channel_type == "im"`` test used elsewhere: app_mention payloads don't
     # reliably carry ``channel_type``, whereas Slack DM channel IDs always
@@ -470,8 +439,11 @@ async def handle_mention(event, say):
 
     # A mention inside a DM is a conversational DM, so it is subject to the DM
     # allowlist. Channel mentions are never gated - the allowlist is DM-scoped.
-    if is_dm and not _dm_user_allowed(user_id):
-        logger.info("dm_mention_not_allowlisted user_id=%s channel=%s", user_id, channel)
+    if is_dm and not await _dm_user_allowed_with_handle(user_id):
+        logger.info(
+            "dm_mention_refused user_id=%s channel=%s allow_list=%s",
+            user_id, channel, dm_access.SLACK_ALLOW_LIST_ENV,
+        )
         return
 
     logger.info(
@@ -496,8 +468,7 @@ async def handle_message_event(event, say):
 
     1. Any message in a thread with a running session (human replies and
        the session agent's own posts alike) resets that session's idle
-       timer. The spawned agent is expected to post progress notes during
-       long autonomous work, so a working session keeps itself alive.
+       timer. The reaper also reads quiet session activity from its connector.
     2. In DMs, Slack sends regular 'message' events instead of
        'app_mention'. Non-bot DM messages connect an lmer session to the
        DM thread, mirroring the channel-mention behavior.
@@ -511,8 +482,7 @@ async def handle_message_event(event, say):
 
     # Activity tracking: every message in a tracked thread resets the idle
     # timer, including bot posts from the session's own agent.
-    if channel and thread_ts:
-        session_manager.touch(channel, thread_ts)
+    tracked = session_manager.touch(channel, thread_ts) if channel and thread_ts else False
 
     # The rest is DM session routing only
     if event.get("channel_type") != "im":
@@ -522,13 +492,19 @@ async def handle_message_event(event, say):
     if event.get("bot_id") or event.get("subtype"):
         return
 
+    if MENTIONS.enabled:
+        if not event.get("thread_ts") or tracked or is_thread_connected(channel, thread_ts):
+            return
+        await _forward_assistant(channel, event)
+        return
+
     user_id = event.get("user")
 
-    # DM allowlist: when LMER_SLACK_DM_ALLOWED_USERS is set, only listed users
-    # may hold conversational DM sessions. Anyone else is silently ignored (no
-    # session, no reply). Unset = open to everyone.
-    if not _dm_user_allowed(user_id):
-        logger.info("dm_not_allowlisted user_id=%s channel=%s", user_id, channel)
+    if not await _dm_user_allowed_with_handle(user_id):
+        logger.info(
+            "dm_refused user_id=%s channel=%s allow_list=%s",
+            user_id, channel, dm_access.SLACK_ALLOW_LIST_ENV,
+        )
         return
 
     logger.info("received_dm_message user_id=%s thread_ts=%s", user_id, thread_ts)
@@ -549,6 +525,13 @@ async def handle_message_event(event, say):
         dedup_channel=dedup_channel,
         preset_name=preset_name,
     )
+
+
+async def _forward_assistant(channel: str, event: dict) -> None:
+    try:
+        await asyncio.to_thread(assistant_mentions.forward, "slack", channel, event)
+    except Exception as exc:
+        logger.error("assistant_routing_failed transport=slack error=%s", exc)
 
 
 async def _run() -> None:
@@ -580,7 +563,13 @@ async def _run() -> None:
         session_manager.max_sessions,
         session_manager.idle_timeout_minutes,
     )
-    handler = AsyncSocketModeHandler(app, app_token)
+    class DurableMentionHandler(AsyncSocketModeHandler):
+        async def handle(self, client, request):
+            if MENTIONS.enabled:
+                await asyncio.to_thread(ingress_store.slack_event, request)
+            await super().handle(client, request)
+
+    handler = DurableMentionHandler(app, app_token)
     try:
         await handler.start_async()
     finally:
@@ -630,10 +619,14 @@ def main(argv=None) -> int:
     # SSL_CERT_FILE override is honored.
     _ensure_ca_bundle()
 
-    global session_manager, DM_ALLOWED_USERS, PRESETS
+    global session_manager, DM_ALLOWED_USERS, PRESETS, MENTIONS
     session_manager = SessionManager(lmer_env_file=args.lmer_env_file)
-    DM_ALLOWED_USERS = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+    DM_ALLOWED_USERS = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
     PRESETS = load_presets()
+    try:
+        MENTIONS = assistant_mentions.Settings.from_env()
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if not os.environ.get("SLACK_BOT_TOKEN"):
         logger.error("slack_bot_token_missing")

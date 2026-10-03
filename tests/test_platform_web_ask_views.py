@@ -208,27 +208,14 @@ def test_the_record_answers_nothing():
     assert "emit" not in record, "the record tells the fleet something changed"
 
 
-def test_the_record_holds_every_entry_the_channel_has():
-    """Including the ones the dock stopped showing — that is the whole point.
+def test_the_record_preserves_entry_contents_with_optional_retention():
+    """Retention changes the displayed count; each retained entry stays whole.
 
-    Answered, closed by the session, never answered, and cleared: a record that
-    filtered any of those would leave an operator who cleared the dock with no way
-    to read back what they cleared, which is the failure that makes clearing
-    unsafe rather than the clearing itself.
+    Mounted tests in web/tests/OperatorChat.test.js cover default-off behavior,
+    hiding the oldest entries, and restoring them when retention is disabled.
     """
     record = _without_comments(_read(RECORD))
-    assert re.search(r'v-for="entry in entries"', record), (
-        "the record renders something other than the channel's own entries"
-    )
-    # What it renders is the whole list, so nothing may sit between the fetch and
-    # the loop. (`!entry.answered` is a different thing and stays: it decides
-    # whether the closure sentence is shown *under* an entry, not whether the
-    # entry is.)
-    for filtering in ("dismissed", ".filter(", "v-for=\"entry in "):
-        assert record.count(filtering) == (1 if filtering.startswith("v-for") else 0), (
-            f"the record drops entries ({filtering}); it is the one view that must "
-            "show all of them"
-        )
+    assert re.search(r'v-for="entry in entries"', record)
     # Each entry keeps what makes it a record rather than a summary. Drawn by
     # AskEntry.vue since #274, so what an entry carries is read there — and the
     # record is checked to be handing every entry to it, which is what makes that

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from lmer_cli import runref
 from lmer_platform.store import ensure_state_dir, read_json, write_json
 
 #: The filename inside :attr:`matrix_bridge.config.MatrixConfig.state_dir`.
@@ -42,7 +43,7 @@ class RunKey:
     slug: str
 
     def __str__(self) -> str:
-        return f"{self.host}/{self.project}/{self.slug}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @classmethod
     def parse(cls, text: str) -> "RunKey":
@@ -50,15 +51,16 @@ class RunKey:
 
         Split from both ends rather than by count: a GitLab project is a path
         (``group/project``, ``group/team/project``) and only the first and
-        last segments are fixed.
+        last segments are fixed. The rule itself is
+        :func:`lmer_cli.runref.split`; what stays here is this type's refusal.
         """
-        parts = text.split("/")
-        if len(parts) < 3:
+        parts = runref.split(text)
+        if parts is None:
             raise ValueError(
                 f"{text!r} is not a run key (host/project/slug, project may "
                 f"contain slashes)"
             )
-        return cls(parts[0], "/".join(parts[1:-1]), parts[-1])
+        return cls(*parts)
 
     @classmethod
     def from_row(cls, row: Mapping) -> "RunKey":

@@ -1,8 +1,25 @@
 # Documentation Index
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 This directory contains comprehensive documentation for the LMER (LLM Environment Runtime) project. Each document covers a specific aspect of the system.
 
 ## Documentation Files
+
+### [HOW-LMER-WORKS.md](./HOW-LMER-WORKS.md)
+**How lmer works**
+
+A one-page, end-user tour of every component and how they interact, in
+small mermaid charts: the big picture, the life of one session, the work
+repo as memory, gates, the platform and its ways of reaching you, harnesses,
+service mode and fan-out, the release flow — plus a list of the design's
+strong points.
+
+**Best for**: Understanding what lmer is and how the pieces fit before
+reading any reference page.
+
+---
 
 ### [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md)
 **Platform Quickstart**
@@ -19,6 +36,13 @@ assistant) on a host:
   file count does and does not show
 
 **Best for**: Getting the platform running and usable in a few minutes.
+
+Platform web guides:
+
+- [Copy messages and code](../web/docs/CLIPBOARD.md)
+- [Operator chat retention, count, and unread indicator](../web/docs/OPERATOR-CHAT.md)
+- [Fleet state in the browser tab title](../web/docs/FLEET-TITLE.md)
+- [Forget all completed runs](../web/docs/FORGET-COMPLETED.md)
 
 ---
 
@@ -95,6 +119,8 @@ User guide for the `lmer` command-line interface:
 - Repository targeting (URLs, local paths, PR/MR/issue URLs)
 - Canonical source configuration (`sources.yaml`)
 - Exec mode and debugging options
+- `lmer-schema validate`: checking a work repo against the schema, its output modes and exit codes
+- `work sessions` and resuming a specific session by id
 
 **Best for**: Learning how to use the `lmer` CLI tool, understanding task workflows, and getting started with LMER.
 
@@ -146,6 +172,23 @@ any change to lmer itself.
 
 ---
 
+### [SESSION-STATUS.md](./SESSION-STATUS.md)
+**The session status document (schema 1)**
+
+The contract a session publishes its own status-line numbers through, so the
+platform can show them:
+- Where the document goes (`$LMER_STATUS_DIR/status.json`) and the atomic-write
+  and permission rules
+- Every field, what absence means, and which parts are the harness's vocabulary
+  rather than the platform's
+- What the platform serves it on, and the bounds it enforces reading it
+- How a drop-in harness publishes the same document
+
+**Best for**: Showing a harness's context and usage numbers in the fleet view,
+or teaching a drop-in to report them.
+
+---
+
 ### [PROMPT-FRAGMENTS.md](./PROMPT-FRAGMENTS.md)
 **Prompt Fragments**
 
@@ -183,13 +226,36 @@ How lmer provides default AGENTS.md and rules/ files when the target repository 
 **Run D.M.C. — Durable Run State**
 
 Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume briefs, `work` CLI verbs, cleaner contract:
-- The `runs/<slug>/` layout and the `state.yaml` schema
+- The `runs/<slug>/` layout and the `state.yaml` schema — and the note that in schema form the run dir is the session dir (`_runs/<slug>/<session-id>/`, file shapes unchanged; layout per SCHEMA.md)
 - Deterministic slug derivation and the completed-run policy
 - `work` CLI verbs (`state`, `state set`, `event`, `resume`, `artifact`, `session-start`, `session-end`)
 - Session lifecycle (seeding, owner claims, `LMER_SESSION_ID`) and fail-soft guarantees
 - The external cleaner contract and the deferred growth path
 
-**Best for**: Understanding how sessions persist and resume machine-readable state, and what external tools can rely on when reading `runs/<slug>/`.
+**Best for**: Understanding how sessions persist and resume machine-readable state, and what external tools can rely on when reading a run dir — legacy `runs/<slug>/` or a schema-form session dir.
+
+---
+
+### [WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)
+
+Git state guards, staged-marker validation, verified publication, and recovery
+for memory, work logs, and napkin repositories.
+
+**Best for**: Recovering failed work publication and understanding clean retries.
+
+---
+
+### [SCHEMA.md](./SCHEMA.md)
+**The lmer schema (version 1)**
+
+The normative layout of everything lmer reads and writes outside the code repos it works on — one repository holding it is a *plexus*:
+- The single form: flat short-name project dirs, `_`-prefixed schema-owned names, and the `{host}/{project}/` host bucket for repos nobody has named yet
+- The areas (napkin, plans, knowledge, memory at two scopes, record, `_agents/`) and their writer/shape/strictness contracts
+- The `_plexus.yaml` manifest: schema int, registry identity (`repo:`/`remotes:`, repoless projects), sources, housekeeping policy
+- Sessions as the unit of record (`_runs/<slug>/<session-id>[--<name>]/`), archive, and the legacy mapping
+- What `lmer-schema validate` checks at each strictness tier, versioning, and the change process
+
+**Best for**: Migrating a work repo to the schema, validating a tree with `lmer-schema validate`, and knowing exactly where a file belongs.
 
 ---
 
@@ -199,6 +265,24 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy. Plus **service slots**: named single-occupancy bindings from a runner to one of this host's dev services, declared in the platform's `config.json`, so several agents can share a host without two of them landing on one database.
 
 **Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.), and handing out one dev stack across a fleet.
+
+---
+
+### [COMMS.md](./COMMS.md)
+**The unified communications channel**
+
+One channel per session, both directions, with the supervisor as the single
+port: the agent's one command (`lmer-signal`), the message model and the bus
+routes, how the platform, Slack, matrix and the terminal connect, the
+first-answer-wins question flow, source tags, loop rules, and the one-release
+compatibility shims.
+- The message record (schema 1), its kinds and the question fold
+- Supervisor routes (`/messages`) and daemon routes (`/api/comms/*`)
+- Slack and matrix threads as session targets, the connectors and listeners
+- Where the log lives, the drain grace, every `LMER_*` variable involved
+
+**Best for**: Writing or operating anything that talks to a session, and
+understanding what `lmer-signal` does with what you post.
 
 ---
 
@@ -239,9 +323,9 @@ Named, operator-defined startup configurations (`LMER_PRESETS_FILE`) that a sess
 ### [MCP-CONFIGURATION.md](./MCP-CONFIGURATION.md)
 **MCP Server Configuration**
 
-How `.mcp.json` is loaded and how MCP servers are exposed to Claude inside the lmer container.
+How `.mcp.json` is loaded and how MCP servers are exposed to Claude inside the lmer container. lmer wires none by default; browser automation is the `chrome-agent` skill rather than an MCP.
 
-**Best for**: Adding or troubleshooting Model Context Protocol servers (e.g. Playwright).
+**Best for**: Adding or troubleshooting Model Context Protocol servers, and deciding whether a capability wants an MCP or a CLI.
 
 ---
 
@@ -306,11 +390,13 @@ One-time, operator-performed production configuration receipts for the lmer rele
 
 ## Quick Navigation
 
-- **New to LMER?** Start with [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
+- **New to LMER?** Read [HOW-LMER-WORKS.md](./HOW-LMER-WORKS.md) for the picture, then [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
-- **Answering runs from your phone?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
+- **Talking to a session from Slack, matrix or the chat pane?** See [COMMS.md](./COMMS.md)
+- **Announcing runs that want a human into a Matrix room?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
+- **Migrating a work repo to the schema?** See [SCHEMA.md](./SCHEMA.md) for the normative layout, then check the tree with `lmer-schema validate`
 - **Need to troubleshoot?** All documents include troubleshooting sections
 
 ---

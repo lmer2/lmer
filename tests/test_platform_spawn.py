@@ -23,16 +23,18 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 from ask_channel import protocol
 from lmer_cli import supervisor
-from lmer_cli.cli import parse_args, parse_dir_mount_specs
+from lmer_cli.cli import _parse_repo_url, parse_args, parse_dir_mount_specs
 from lmer_cli.harness import HARNESSES
 from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import (
-    ask, memory, registry, runs, session_io, spawn, store, transcripts, uploads,
+    ask, memory, registry, runs, session_io, spawn, statusline, store,
+    transcripts, uploads, workrepo,
 )
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
@@ -263,6 +265,226 @@ def test_ssh_repo_urls_resolve(config):
         request_for(), "git@gitlab.example.com:agents/global.git"
     )
     assert (host, project) == ("gitlab.example.com", "agents/global")
+
+
+# --- one project, one identity, whichever remote it was reached through ------
+#
+# A project with ``remotes:`` is reachable at more than one URL (D8), and the
+# CONTAINER places its record by the registry's UNION of ``repo:`` + ``remotes:``
+# — so a launch through the secondary writes under the same project as one
+# through the primary. The identity derived from the launch URL verbatim did
+# not: the run was TRACKED under the secondary and LISTED (by the mirror walk,
+# which keys on ``repo:``) under the primary, one directory answering to two
+# keys. The adoption picker then offered a run this orchestrator had just
+# spawned, adopting it wrote a second index entry for that one directory, and
+# the one-run-one-session refusal did not see the two launches as one run.
+#
+# The fold closes all three at the point identity is derived, so the two halves
+# agree by construction rather than by a lookup on every read path.
+
+#: The manifest's own spelling of a two-remote project. Scheme-less because that
+#: is what ``lmer_schema`` writes and compares (D21) — and deliberately not a
+#: spelling ``_parse_repo_url`` can read, which is the trap
+#: :func:`test_the_fold_reads_the_registrys_own_spelling` pins.
+REGISTERED_PRIMARY = "gitlab.example.com/acme/widgets"
+REGISTERED_SECONDARY = "github.com/acme/widgets"
+
+#: The two URLs a launch arrives with, and the identity each parses to on its own.
+PRIMARY_URL = "ssh://git@gitlab.example.com/acme/widgets.git"
+SECONDARY_URL = "https://github.com/acme/widgets.git"
+PRIMARY_IDENTITY = ("gitlab.example.com", "acme/widgets")
+SECONDARY_IDENTITY = ("github.com", "acme/widgets")
+
+#: One task, launched either way — only the remote differs, which is the whole
+#: variable under test.
+WIDGETS_TARGET = "https://gitlab.example.com/acme/widgets/-/work_items/42"
+
+
+def plant_manifest(config, projects, *, name="example-plexus"):
+    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
+        encoding="utf-8",
+    )
+    return config.mirror_path / "_plexus.yaml"
+
+
+def register_widgets(config):
+    """The mirror of a plexus that knows ``widgets`` at both of its remotes."""
+    return plant_manifest(config, {
+        "widgets": {"repo": REGISTERED_PRIMARY, "remotes": [REGISTERED_SECONDARY]},
+    })
+
+
+def widgets_request(repo_url):
+    return request_for(target=WIDGETS_TARGET, repo_url=repo_url)
+
+
+def test_a_launch_through_a_secondary_remote_is_identified_by_the_primary(config):
+    """The run is filed where its record lands: under the project's ``repo:``.
+
+    The container resolves placement across the registry's union, so this launch
+    writes into ``widgets/`` either way; deriving the identity from the launch URL
+    verbatim tracked it under ``github.com/acme/widgets`` while the walk listed
+    the very same directory under ``gitlab.example.com/acme/widgets``.
+    """
+    register_widgets(config)
+
+    host, project, slug = spawn.derive_run_identity(
+        widgets_request(SECONDARY_URL), SECONDARY_URL, config
+    )
+
+    assert (host, project) == PRIMARY_IDENTITY
+    assert slug.startswith("develop-"), "the fold is about the repo, not the slug"
+
+
+def test_a_launch_through_the_primary_remote_is_unmoved(config):
+    """The paired half: folding to the primary must be identity ON the primary,
+    or the fix would re-key every run that was already right."""
+    register_widgets(config)
+
+    host, project, _slug = spawn.derive_run_identity(
+        widgets_request(PRIMARY_URL), PRIMARY_URL, config
+    )
+
+    assert (host, project) == PRIMARY_IDENTITY
+
+
+def test_the_fold_reads_the_registrys_own_spelling(config):
+    """``repo:`` is canonical and scheme-less, and the URL parser cannot read it.
+
+    Fed to ``_parse_repo_url`` a ``repo:`` yields ``(None, None)``, which is not a
+    smaller version of this bug but a bigger one: an identity-less spawn is not
+    tracked AT ALL (:func:`spawn._untracked_run_warning`), so its row leaves the
+    fleet view when the session exits. The fold therefore goes through the ONE
+    normalizer (D21, ``workrepo._identity_from_repo``), and this pins the outcome
+    rather than the route.
+    """
+    register_widgets(config)
+    assert _parse_repo_url(REGISTERED_PRIMARY) == (None, None), (
+        "the trap this guards is gone — re-read the fold"
+    )
+
+    host, project, _slug = spawn.derive_run_identity(
+        widgets_request(SECONDARY_URL), SECONDARY_URL, config
+    )
+
+    assert (host, project) == PRIMARY_IDENTITY
+
+
+def _no_mirror(config):
+    """An orchestrator whose mirror has never been cloned."""
+
+
+def _mirror_without_a_manifest(config):
+    """A legacy work repo: a mirror, and no ``_plexus.yaml`` anywhere in it."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+
+
+def _unusable_manifest(config):
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 1\nname: example\nprojects: [this is not a mapping]\n",
+        encoding="utf-8",
+    )
+
+
+def _manifest_this_build_cannot_read(config):
+    """A manifest from a newer writer: present, parseable, and refused."""
+    plant_manifest(config, {"widgets": {"repo": REGISTERED_PRIMARY}},
+                   name="example-plexus")
+    path = config.mirror_path / "_plexus.yaml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("schema: 1", "schema: 99"),
+        encoding="utf-8",
+    )
+
+
+def _a_project_the_registry_does_not_know(config):
+    plant_manifest(config, {"other": {"repo": "gitlab.example.com/acme/other"}})
+
+
+@pytest.mark.parametrize("arrange", [
+    _no_mirror,
+    _mirror_without_a_manifest,
+    _unusable_manifest,
+    _manifest_this_build_cannot_read,
+    _a_project_the_registry_does_not_know,
+], ids=lambda fn: fn.__name__.lstrip("_"))
+def test_the_fold_degrades_to_the_launch_urls_own_identity(config, arrange):
+    """Best-effort, and never a refusal: every way the registry can fail to answer
+    leaves the identity exactly as it was before the fold existed.
+
+    A spawn that failed because the mirror was cold would be a worse bug than the
+    two keys this fixes — the run would not start at all, where today it starts
+    and is merely keyed twice.
+    """
+    arrange(config)
+
+    host, project, slug = spawn.derive_run_identity(
+        widgets_request(SECONDARY_URL), SECONDARY_URL, config
+    )
+
+    assert (host, project) == SECONDARY_IDENTITY
+    assert slug, "an unanswerable fold must not cost the run its slug either"
+
+
+def test_a_mirror_that_cannot_be_read_costs_the_fold_and_not_the_session(
+    config, monkeypatch
+):
+    """The catch is deliberately broad and deliberately here rather than around
+    the spawn: a mirror the daemon trips over must cost this one lookup, leaving
+    the session to start under the identity its own URL names."""
+    register_widgets(config)
+
+    def unreadable(_root):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(workrepo, "load_registry", unreadable)
+
+    host, project, slug = spawn.derive_run_identity(
+        widgets_request(SECONDARY_URL), SECONDARY_URL, config
+    )
+
+    assert (host, project) == SECONDARY_IDENTITY
+    assert slug
+
+
+def test_a_spawn_with_no_config_derives_exactly_what_it_always_did(config):
+    """The manifest reaches the fold through the caller's config, so a caller
+    that has none (or has not been given one) keeps today's answer rather than
+    losing an identity to an argument it did not pass."""
+    register_widgets(config)
+
+    host, project, _slug = spawn.derive_run_identity(
+        widgets_request(SECONDARY_URL), SECONDARY_URL
+    )
+
+    assert (host, project) == SECONDARY_IDENTITY
+
+
+def test_a_run_reached_through_either_remote_still_gets_one_session(config):
+    """Symptom C of the two keys: ``_refuse_if_run_is_live`` matches on the
+    derived identity, so before the fold a second launch of one run through the
+    OTHER remote was not refused — two containers, one run, both claiming its
+    owner slot and writing its state.
+    """
+    register_widgets(config)
+    host, project, slug = spawn.derive_run_identity(
+        widgets_request(PRIMARY_URL), PRIMARY_URL, config
+    )
+    registry.register(
+        "s-live", pid=os.getpid(),
+        run={"host": host, "project": project, "slug": slug},
+    )
+
+    with pytest.raises(spawn.RunAlreadyLive):
+        spawn.spawn_session(config, widgets_request(SECONDARY_URL))
+
+    assert len(registry.list_sessions(live_only=False)) == 1, (
+        "the second launch started a session for a run that already had one"
+    )
 
 
 # --- spawning ---------------------------------------------------------------
@@ -1039,6 +1261,33 @@ def test_crash_leaves_the_entry_as_the_crash_signal(config, monkeypatch):
     assert registry.is_live(entry) is False
 
 
+def test_a_bad_exit_is_recorded_on_the_entry_and_not_only_in_history(
+    config, monkeypatch
+):
+    """Survival says a watcher kept the entry; it cannot say *why* it kept it.
+
+    Without the record a wound-down session's mark outranks a death a watcher
+    actually saw (`inventory._observed_bad_exit`).
+    """
+    monkeypatch.setenv("FAKE_LMER_EXIT", "137")
+    result = spawn.spawn_session(config, request_for())
+
+    assert wait_for(
+        lambda: (registry.read_session(result.session_id) or {}).get("exited")
+    )
+    exited = registry.read_session(result.session_id)["exited"]
+    assert exited["code"] == 137
+    assert exited["clean"] is False
+    assert exited["at"].endswith("Z")
+
+
+def test_a_clean_exit_records_nothing_because_the_entry_is_gone(config):
+    """Why an absent record means "nobody saw it end badly" rather than "it ended
+    badly and we lost the note"."""
+    result = spawn.spawn_session(config, request_for())
+    assert wait_for(lambda: registry.read_session(result.session_id) is None)
+
+
 def test_exit_is_recorded_in_platform_history(config):
     result = spawn.spawn_session(config, request_for())
     assert wait_for(lambda: registry.read_session(result.session_id) is None)
@@ -1730,6 +1979,119 @@ def test_no_answer_flag_without_an_answer(config):
     )
 
 
+# --- which record the session writes in (issue #353, D22) --------------------
+#
+# `LMER_SESSION_ID` decides which `<project>/_runs/<slug>/<session-id>/` a launch
+# writes its record in, and the container mints one only when the host injected
+# none. `--session` is how the platform injects it, and it is a typed field for
+# the same reason `--answer` is: it decides where a whole run record lands, so it
+# has to be a value this package can validate — not caller text that wins by
+# arriving later in argv.
+
+#: A record dir in the `LMER_SESSION_ID` grammar. Not a container session id
+#: (`s-...`): the two namespaces both get called a session and neither is derived
+#: from the other (lmer_platform.resume's module docstring).
+RECORD_SESSION_ID = "20260824-165230-2-31245"
+
+
+def test_the_session_field_becomes_one_flag_token_before_extra_args(config):
+    """One token for `--answer`'s reason, and ahead of extra_args for its other
+    one: those may end in a bare `--`, after which nothing reaches lmer's parser."""
+    result = spawn.spawn_session(
+        config,
+        request_for(session_id=RECORD_SESSION_ID, extra_args=("--", "echo", "hi")),
+    )
+    token = f"{spawn.SESSION_FLAG}={RECORD_SESSION_ID}"
+    assert token in result.command
+    assert result.command.index(token) < result.command.index("--")
+    assert spawn.SESSION_FLAG not in result.command, (
+        "a bare --session token means the id was passed as a separate argument"
+    )
+
+
+def test_no_session_flag_when_no_record_was_named(config):
+    """The ordinary spawn founds a launch rather than continuing one, and the
+    container minting its own id is exactly right for that."""
+    assert not any(
+        arg.startswith(spawn.SESSION_FLAG)
+        for arg in spawn.spawn_session(config, request_for()).command
+    )
+
+
+@pytest.mark.parametrize("bad_arg", [
+    "--session", f"--session={RECORD_SESSION_ID}", "--sessio=x", "--sess",
+])
+def test_a_session_in_extra_args_is_refused(config, bad_arg):
+    """extra_args is the POST body verbatim, and this flag picks the record a
+    session writes in — so a raw spawn could point one at another run's record,
+    which is precisely what the resume and answer verbs check before they spawn.
+    Abbreviations included: argparse takes any unambiguous prefix.
+    """
+    with pytest.raises(spawn.SpawnError, match="not allowed in extra_args"):
+        spawn.spawn_session(config, request_for(extra_args=(bad_arg, "x")))
+    assert registry.list_sessions(live_only=False) == []
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 5, [RECORD_SESSION_ID]])
+def test_an_unusable_session_id_field_is_refused(config, bad):
+    """`--session=` with nothing behind it, or a repr, would reach lmer as text."""
+    with pytest.raises(spawn.SpawnError, match="session_id must be non-empty text"):
+        spawn.spawn_session(config, request_for(session_id=bad))
+    assert registry.list_sessions(live_only=False) == []
+
+
+@pytest.mark.parametrize("bad", [
+    "a/b", f"../{RECORD_SESSION_ID}", "..", ".", "a\\b", f"{RECORD_SESSION_ID}\x00",
+])
+def test_a_session_id_that_is_not_one_directory_name_is_refused(config, bad):
+    """It is joined under the run's grouping dir inside the container, so it names
+    one launch of this run and nothing else — a path there would put the record in
+    another group, or outside the run area entirely."""
+    with pytest.raises(spawn.SpawnError, match="names one launch"):
+        spawn.spawn_session(config, request_for(session_id=bad))
+    assert registry.list_sessions(live_only=False) == []
+
+
+@pytest.mark.parametrize("bad", [
+    "2026*", "2026?", "2026[0-9]", f" {RECORD_SESSION_ID}", f"{RECORD_SESSION_ID} ",
+])
+def test_a_session_id_the_host_cli_would_refuse_is_refused_here(config, bad):
+    """The platform must not emit a value its own child rejects.
+
+    ``lmer --session`` refuses a glob character and surrounding whitespace
+    (``lmer_cli.cli._session_id_refusal``). Letting one through here spends the
+    port, the token, the registry entry and the tracked run before the child
+    exits 2 — an accepted spawn the operator watches fail, which is what the
+    field validation exists to prevent.
+
+    Reachable, not theoretical: ``workrepo.record_session_id`` deliberately
+    answers with an out-of-form directory name so a record the fleet view shows
+    can still be continued, and nothing stops a directory called ``2026*``.
+    """
+    with pytest.raises(spawn.SpawnError, match="never a path or a pattern"):
+        spawn.spawn_session(config, request_for(session_id=bad))
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_platform_floor_admits_every_id_the_host_cli_admits(config):
+    """The other direction, so the two rules cannot drift into disagreement:
+    a value this refuses that `lmer` would have accepted is a record the
+    operator can see and cannot continue."""
+    from lmer_cli.cli import _session_id_refusal
+
+    for good in (RECORD_SESSION_ID, f"{RECORD_SESSION_ID}--a name", "backup-2026"):
+        assert _session_id_refusal(good) is None, good
+        spawn._reject_unsafe_session_id(good)  # must not raise
+
+
+def test_a_dash_leading_session_id_is_refused(config):
+    """The `=` spelling would carry it through argparse intact, which is the
+    reason to refuse it here rather than rely on the parser: `--session=-x` is
+    a value shaped like a flag, and no record is named that."""
+    with pytest.raises(spawn.SpawnError, match="may not begin with a dash"):
+        spawn.spawn_session(config, request_for(session_id="-x"))
+
+
 def test_a_reserved_arg_after_a_double_dash_is_the_container_s_business(config):
     """Everything after `--` is the container command, not lmer's own parser."""
     result = spawn.spawn_session(
@@ -1966,10 +2328,12 @@ HARNESS_SESSION_DIRS = {
 #: as a set rather than a count so a test that adds a mount has to say which one,
 #: and so "the mounts do not collide" keeps meaning all of them.
 PLATFORM_MOUNT_DESTINATIONS = {
+    '/home/developer/.codex',
     *HARNESS_SESSION_DIRS.values(),
     ask.CONTAINER_ASK_DIR,
     uploads.CONTAINER_UPLOADS_DIR,
     supervisor.CONTAINER_SESSION_LOG_DIR,
+    statusline.CONTAINER_STATUS_DIR,
 }
 
 
@@ -2583,7 +2947,12 @@ def test_an_older_image_writes_no_log_and_is_served_the_host_tee(config):
     assert (path, source) == (
         spawn.log_path_for(result.session_id), session_io.LOG_SOURCE_HOST,
     )
-    assert b"fake lmer started" in session_io.read_log(result.session_id).data
+    # `_watch` and `_drain` are separate threads for separate events, so the tee
+    # can still be catching up when the exit is already recorded — nothing
+    # promises otherwise, and reading the file straight raced it in CI.
+    assert wait_for(
+        lambda: b"fake lmer started" in session_io.read_log(result.session_id).data
+    ), session_io.read_log(result.session_id).data
 
 
 def test_a_newer_image_writes_its_own_log_and_that_is_what_is_served(
@@ -3091,11 +3460,19 @@ def test_the_child_sees_both_halves_of_the_upload_store(config):
     assert marker.read_text(encoding="utf-8") == uploads.CONTAINER_UPLOADS_DIR
 
 
-def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(config):
+def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(
+    config, monkeypatch,
+):
     """The route reads this rather than looking for the directory: uber lmer's
     store is per host, so its existence says nothing about the container that is
-    running now."""
-    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    running now.
+
+    Kept alive through the assertion with ``FAKE_LMER_SLEEP``: a clean exit reaps
+    the entry, so reading it after a stub that exits immediately is a race. The
+    ``--sleep`` this used to pass is not a flag the stub or ``lmer`` has.
+    """
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for())
     entry = registry.read_session(result.session_id) or {}
     assert entry.get("uploads", {}).get("container_path") == (
         uploads.CONTAINER_UPLOADS_DIR
@@ -3140,7 +3517,9 @@ def test_a_session_whose_upload_store_cannot_be_created_still_starts(
         return real_popen(command, **kwargs)
 
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
-    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    # Alive through the read, for the reason the test above gives.
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for())
     assert result.session_id
     assert uploads.CONTAINER_UPLOADS_DIR not in [
         spec.split(":")[1] for spec in mount_specs_in(captured["command"])
@@ -3272,12 +3651,18 @@ def test_the_event_table_cannot_grow_without_bound(config):
 
 
 def slot_config(fake_lmer, entries=None):
-    return cfg.load({
-        "lmer_bin": str(fake_lmer),
+    """A config declaring *entries*, written to the file the gate reads.
+
+    Not a ``load`` override: since #256 the spawn gate re-reads ``slots`` from
+    ``config.json`` at claim time, so a slot that exists only in a resolved
+    config is a slot the daemon does not have.
+    """
+    cfg.update_stored({
         "slots": entries if entries is not None else [
             {"name": "webapp", "preset": "webapp_dev", "description": "Web app dev"},
         ],
     })
+    return cfg.load({"lmer_bin": str(fake_lmer)})
 
 
 def test_a_slot_spawn_emits_the_slots_preset(platform_root, fake_lmer, slot_host):
@@ -3449,10 +3834,10 @@ def test_the_slot_gate_and_the_cap_refuse_independently(
     A free slot on a capped host still refuses, and an occupied slot on an idle
     host still refuses — each naming which gate closed.
     """
+    cfg.update_stored({"slots": [{"name": "webapp", "preset": "webapp_dev"}]})
     capped = cfg.load({
         "lmer_bin": str(fake_lmer),
         "max_concurrent_sessions": 1,
-        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
     })
     # A live worker that holds no slot: the host is full, the slot is free.
     registry.register("s-worker", pid=os.getpid())
@@ -3464,7 +3849,6 @@ def test_the_slot_gate_and_the_cap_refuse_independently(
     roomy = cfg.load({
         "lmer_bin": str(fake_lmer),
         "max_concurrent_sessions": 10,
-        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
     })
     registry.register("s-holder", pid=os.getpid(), slot="webapp")
 
@@ -3477,10 +3861,13 @@ def test_a_refused_slot_spawn_leaves_nothing_behind(
 ):
     """The gate runs before the port is drawn and the directories are made."""
     registry.register("s-holder", pid=os.getpid(), slot="webapp")
+    # Built before the snapshot: declaring the slot writes config.json, which is
+    # not a trace of the refused spawn.
+    config = slot_config(fake_lmer)
     before = sorted(p.name for p in platform_root.rglob("*") if p.is_file())
 
     with pytest.raises(spawn.SlotOccupied):
-        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+        spawn.spawn_session(config, request_for(slot="webapp"))
 
     assert sorted(p.name for p in platform_root.rglob("*") if p.is_file()) == before
 
@@ -3523,10 +3910,10 @@ def test_a_spawn_is_refused_when_its_service_is_held_under_another_slot(
         "p_a": {"checkout": "/srv/w", "service": "web"},
     }), encoding="utf-8")
     monkeypatch.setenv("LMER_PRESETS_FILE", str(presets))
-    config = cfg.load({
-        "lmer_bin": str(fake_lmer),
-        "slots": [{"name": "a", "preset": "p_a"}, {"name": "b", "preset": "clean"}],
-    })
+    config = slot_config(
+        fake_lmer,
+        [{"name": "a", "preset": "p_a"}, {"name": "b", "preset": "clean"}],
+    )
     registry.register(
         "s-b", pid=os.getpid(), slot="b",
         task={"preset": "clean", "slot_service": "web"},
@@ -3686,6 +4073,15 @@ def env_of_spawn(monkeypatch, config, **kwargs):
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
     spawn.spawn_session(config, request_for(), **kwargs)
     return captured
+
+
+@pytest.mark.parametrize("override, expected", [(None, "75"), ("90", "90"), ("invalid", "75")])
+def test_terminal_confirmation_window_reaches_the_spawned_process(config, monkeypatch, override, expected):
+    cfg.update_stored({"terminal_confirm_seconds": 75})
+    if override is not None:
+        monkeypatch.setenv("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS", override)
+    captured = env_of_spawn(monkeypatch, config)
+    assert captured["LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"] == expected
 
 
 def test_the_assistant_gets_a_memory_mount(config):
@@ -3898,3 +4294,172 @@ def test_a_store_that_could_not_be_prepared_leaves_the_route_closed(
         spec for spec in mount_specs_in(result.command)
         if spec.split(":")[1:2] == [memory.CONTAINER_STAGED_DIR]
     ]
+
+
+# ── The side channels as one answer (#383 item 1) ────────────────────────────
+# The extraction's proof is the tests above passing unchanged; these add the seam
+# itself, so the next channel can be tested without driving a whole spawn.
+
+
+def test_the_channels_of_a_worker_are_mounts_links_and_the_env_that_names_them(
+    config, _no_user_harnesses, platform_root
+):
+    channels = spawn._prepare_session_channels("s-worker", registry.WORKER_KIND)
+
+    assert channels.host_flags, "a worker gets its ask channel and log directory"
+    assert channels.env[ask.ASK_DIR_ENV] == ask.CONTAINER_ASK_DIR
+    assert channels.env[uploads.UPLOADS_DIR_ENV] == uploads.CONTAINER_UPLOADS_DIR
+    assert memory.PERSIST_ENV_VAR not in channels.env, (
+        "a worker's memory route is the work repo, and this closes it"
+    )
+    assert memory.CONTAINER_STAGED_DIR not in [
+        staged for _, staged in channels.link_pairs
+    ]
+
+
+def test_an_assistant_also_gets_the_host_memory_store(
+    config, _no_user_harnesses, platform_root
+):
+    channels = spawn._prepare_session_channels("s-assistant", registry.ASSISTANT_KIND)
+
+    assert channels.env[memory.PERSIST_ENV_VAR] == "", (
+        "platform-local only: the shared-work-repo route is closed on the kind"
+    )
+    assert memory.CONTAINER_STAGED_DIR in [
+        staged for _, staged in channels.link_pairs
+    ]
+    assert "--mount-dir" in channels.host_flags
+
+
+def test_a_channel_that_could_not_be_prepared_is_announced_as_blank(
+    config, _no_user_harnesses, platform_root, monkeypatch
+):
+    """The child seeds its own environment from .env files first-wins, so a
+    deleted key is one a file may hand back — and then an agent claims a channel
+    it never got."""
+    monkeypatch.setattr(spawn, "_prepare_ask_dir", lambda session_id: None)
+    monkeypatch.setattr(spawn, "_prepare_upload_dir", lambda session_id, kind: None)
+
+    channels = spawn._prepare_session_channels("s-worker", registry.WORKER_KIND)
+
+    assert channels.env[ask.ASK_DIR_ENV] == ""
+    assert channels.env[uploads.UPLOADS_DIR_ENV] == ""
+    assert channels.upload_dir is None
+
+
+def test_the_link_pairs_never_name_a_destination_nothing_bound(
+    config, _no_user_harnesses, platform_root, monkeypatch
+):
+    """A pair for an unmounted staged path leaves a dangling symlink where the
+    harness looks for its own state."""
+    monkeypatch.setattr(spawn, "_prepare_transcript_dir", lambda session_id: None)
+
+    # The assistant kind, so a pair survives the transcript mounts going away; a
+    # worker would leave the assertion below holding vacuously.
+    channels = spawn._prepare_session_channels("s-a", registry.ASSISTANT_KIND)
+    assert channels.link_pairs
+
+    mounted = {
+        spec.split(":")[1]
+        for flag, spec in zip(channels.host_flags, channels.host_flags[1:])
+        if flag == "--mount-dir"
+    }
+    assert all(staged in mounted for _, staged in channels.link_pairs)
+
+
+@pytest.mark.parametrize("kind", ["worker", "assistant"])
+def test_spawn_passes_all_threads_and_host_assigned_kind(config, monkeypatch, kind):
+    from lmer_cli.targets import partition_targets
+
+    links = ["https://team.slack.com/archives/C1/p1700000000000001", "https://matrix.to/#/!room:example.org/$root"]
+    captured = {}
+    original = spawn.subprocess.Popen
+    def capture(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    monkeypatch.setenv("LMER_SESSION_KIND", "incorrect-inherited-kind")
+    request = spawn.SpawnRequest("orchestrate", "fleet", targets=links, no_repo=True)
+    result = spawn.spawn_session(config, request, kind=kind)
+    parsed, _ = parse_args(result.command[1:])
+    assert parsed.target == ["fleet", *links]
+    repo, handlers = partition_targets(parsed.target)
+    assert repo == ["fleet"]
+    assert [h.targets for h in handlers] == [[links[0]], [links[1]]]
+    assert captured["LMER_SESSION_KIND"] == kind
+
+
+@pytest.mark.parametrize("targets", ["url", {}, False, [None], ["--exec"], ["https://example.org/repo"], ["https://team.slack.com/archives/C1/p1700000000000001\n"]])
+def test_spawn_refuses_invalid_extra_thread_targets(config, targets):
+    with pytest.raises(spawn.SpawnError, match="targets"):
+        spawn.spawn_session(config, spawn.SpawnRequest("chat", "fleet", targets=targets, no_repo=True))
+    assert registry.list_sessions(live_only=False) == []
+
+
+class TestAssistantResourceFlags:
+    """The supervising assistant's own allocation (issue #453), keyed on the
+    registry kind rather than on the taskdef it happens to run."""
+
+    def test_the_assistant_launch_carries_both_flags(self, config, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_a_worker_on_the_orchestrate_taskdef_gets_neither(self, config, monkeypatch):
+        """The taskdef is not the identity: only one session at a time IS the
+        supervising assistant, and a worker running the same taskdef must not
+        inherit its allocation."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(taskdef="orchestrate"))
+        assert "--memory" not in result.command
+        assert "--cpus" not in result.command
+
+    def test_a_worker_default_does_not_leak_into_the_assistant(self, config, monkeypatch):
+        """Raising the global worker allocation still emits the assistant's own
+        values. That the flag then beats the environment the child inherits is
+        the CLI's half, covered in tests/test_lmer_cli_runtime.py; what is
+        asserted here is that the daemon emits the assistant's numbers rather
+        than the worker ones."""
+        monkeypatch.setenv("LMER_MEMORY", "8g")
+        monkeypatch.setenv("LMER_CPUS", "8")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_an_unset_setting_contributes_no_flag(self, config, monkeypatch):
+        """Nothing configured leaves the launch on the worker ladder rather
+        than on a guess."""
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert "--memory" not in result.command
+        assert "--cpus" not in result.command
+
+    def test_an_invalid_setting_costs_the_flag_not_the_assistant(self, config, monkeypatch):
+        """A typo in an export must never make the assistant unstartable: the
+        standing layer warns and resolves as unset."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "heaps")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert "--memory" not in result.command
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_one_knob_alone_is_enough(self, config, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert "--cpus" not in result.command
+
+    @pytest.mark.parametrize("flag", ["--memory", "--cpus"])
+    def test_a_request_may_not_smuggle_a_second_spelling(self, config, flag):
+        """extra_args arrives verbatim from POST /api/sessions and argparse is
+        last-wins, so an unreserved spelling would let a worker hand itself a
+        bound nobody configured."""
+        with pytest.raises(spawn.SpawnError):
+            spawn.spawn_session(config, request_for(extra_args=(flag, "64g")))

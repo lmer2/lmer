@@ -13,19 +13,8 @@
 // every run. An empty card headed "operator channel" would be noise on every
 // detail view for a feature most sessions never use.
 //
-// Two views of one channel (T40)
-// ------------------------------
-// This one is docked above the tabs, where a remembered tab cannot hide it, and it
-// answers "is anything waiting on me". AskHistory.vue is the whole record, in the
-// lmer tab's operator-chat pane, and it answers "what was said". They are separate
-// components rather than one with a mode because they are answering different
-// questions: this one is allowed to *stop showing* an entry, and the record is not.
-//
-// Which is what makes clearing safe. Clearing is a view operation: it dismisses an
-// entry from this dock and never touches the channel, so everything cleared is
-// still in the history tab, with its text, its timestamps and its answer. The line
-// under the card says so, because a "clear" that quietly destroyed the record would
-// make the other view a lie.
+// Dock clearing and history retention hide entries independently. Neither
+// changes channel records; the dock must keep live questions answerable.
 //
 // Where the cleared state lives, and why it lives there
 // ----------------------------------------------------
@@ -77,6 +66,7 @@ import { fetchSessionAsk } from '../api.js'
 import { clearedIds, rememberCleared } from '../dismissals.js'
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
   sessionId: { type: String, required: true },
   // Whether the session is still running — the liveness the server refuses on,
   // not reachability, so a detached session still gets its box (spec D23). Decides
@@ -91,7 +81,7 @@ const props = defineProps({
   now: { type: Number, default: () => Date.now() },
 })
 
-const emit = defineEmits(['answered'])
+const emit = defineEmits(['answered', 'entries'])
 
 // Slower than the terminal, same as the transcript: a human is typing the reply
 // at the other end, and each poll is a directory listing on the daemon.
@@ -163,6 +153,7 @@ async function load() {
     const page = await fetchSessionAsk(props.sessionId)
     if (disposed || mine !== generation) return
     entries.value = page.entries || []
+    emit('entries', { sessionId: props.sessionId, entries: entries.value })
     problem.value = null
   } catch (exc) {
     if (disposed || mine !== generation) return
@@ -218,6 +209,7 @@ watch(() => props.live, start)
       v-for="question in waiting"
       :key="question.id"
       :session-id="sessionId"
+      :workspace-id="workspaceId"
       :question="question"
       :now="now"
       @answered="answered"
@@ -273,7 +265,7 @@ watch(() => props.live, start)
          cleared a channel has no way of knowing they can read it back. -->
     <p v-if="clearedCount" class="text-body-small text-medium-emphasis">
       {{ clearedCount }} cleared from here this visit. Nothing was deleted — the
-      whole channel, answers included, is in the lmer tab's operator chat.
+      channel is in the lmer tab's operator chat. Its display setting may hide older entries.
     </p>
   </div>
 </template>

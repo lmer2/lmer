@@ -14,12 +14,17 @@ import AskHistory from './AskHistory.vue'
 import Chat from './Chat.vue'
 import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
-import { forgetRun, resumeRun } from '../api.js'
+import ThreadLinks from './ThreadLinks.vue'
+import StatusStrip from './StatusStrip.vue'
+import { forgetRun, resumeRun, moveRun } from '../api.js'
+import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
   targetLink, targetRef, toneColor,
 } from '../format.js'
 import { rememberChoice, storedChoice } from '../preferences.js'
+import { projectColor } from '../projects.js'
+import { runKey as composeRunKey } from '../runref.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
 // it arrives as its own chunk. It is now deferred twice over: a tab panel renders
@@ -42,7 +47,10 @@ const Terminal = defineAsyncComponent(() => import('./Terminal.vue'))
 const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 
 const props = defineProps({
+  projects: { type: Array, default: () => [] },
+  slots: { type: Array, default: () => [] },
   run: { type: Object, required: true },
+  identifiedWorkspaceId: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -52,7 +60,22 @@ const props = defineProps({
 // to reach around it, and this component is built for exactly one run.
 const emit = defineEmits(['close', 'changed', 'open'])
 
+const moveDestination = ref(null)
+const projectConfirmed = ref(false)
+const selectedSlot = ref(null)
+async function transferRun() {
+  if (!moveDestination.value) return
+  busy.value = true
+  moveError.value = null
+  try { await moveRun(props.run, moveDestination.value); emit('changed'); emit('close') }
+  catch (exc) { moveError.value = exc.message }
+  finally { busy.value = false }
+}
 const busy = ref(false)
+// The move control sits on the identity line and the forget control in the exit
+// tab, so one shared error ref would report a move failure at the bottom of a tab
+// nobody is looking at — the hidden refusal this fix exists to remove.
+const moveError = ref(null)
 const error = ref(null)
 
 // --- which view of a run this operator likes (T49) ---------------------------
@@ -190,9 +213,7 @@ const session = computed(() => props.run.session || null)
 // for a directory it actually found (workrepo.resolve_run_dir confirms it by
 // content), and a row with no directory yet — tracked but unpushed, or a session
 // whose first commit has not landed — has this instead.
-const runKey = computed(
-  () => `${props.run.host}/${props.run.project}/${props.run.slug}`,
-)
+const runKey = computed(() => composeRunKey(props.run))
 
 // What the run last recorded about itself, joined here rather than in the
 // template. Two things follow from that, and both are the fleet row's `committed`
@@ -251,6 +272,16 @@ const targetHref = computed(() => targetLink(props.run.target))
 // A clean exit removes the registry entry while the log deliberately stays, and
 // that history is the record of everything the run did.
 const terminalSession = computed(() => props.run.last_session_id || null)
+const operatorEntries = ref([])
+const operatorActive = computed(() => tab.value === 'lmer' && pane.value === 'chat')
+const { count: operatorCount, unread: operatorUnread } = useOperatorChat(
+  terminalSession, operatorEntries, operatorActive,
+)
+watch(terminalSession, () => { operatorEntries.value = [] })
+
+function receiveOperatorEntries(page) {
+  if (page.sessionId === terminalSession.value) operatorEntries.value = page.entries
+}
 
 // A run stopped on a question has no session to type into, and answering it is a
 // separate action from chatting (T19). The chat view needs to know which of those
@@ -312,6 +343,25 @@ const windDownAt = computed(
   () => windDownSent.value?.requested_at || lifecycle.value?.requested_at || null,
 )
 
+// What a watcher recorded about this session's ending, when one did. Absent for
+// every session nobody watched — a re-attached one, or a `platform spawn` —
+// which is the case the wind-down mark is allowed to speak for.
+const observedExit = computed(() => {
+  const exited = session.value?.exited
+  // `null` really is "nobody recorded anything": the daemon normalises a
+  // present-but-unreadable record to `{}` so this side need not reconstruct a
+  // distinction JSON cannot carry.
+  if (!exited || typeof exited !== 'object') return null
+  if (exited.clean === true) return null
+  const code = exited.code
+  // Only a primitive is a status; interpolating an object prints
+  // "[object Object]" at the operator.
+  const readable = ['string', 'number', 'boolean'].includes(typeof code)
+  return readable
+    ? `A watcher saw this session exit with status ${code}.`
+    : 'A watcher saw this session exit, but could not read its status.'
+})
+
 // The backstop the daemon recorded (spec R18). Nothing escalates when it passes —
 // D22 forbids that — so this is the surfacing instead: past the deadline the card
 // says the wind-down has not finished and leaves the choice where it belongs.
@@ -352,7 +402,7 @@ async function postVerb(verb, body) {
       credentials: 'same-origin',
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body || {}),
+      body: JSON.stringify({ ...body, workspace_id: props.run.workspace_id, home_revision: props.run.home_revision }),
     },
   )
   const payload = await response.json().catch(() => null)
@@ -452,7 +502,8 @@ const canResume = computed(() => !props.run.live)
 // seconds and this section goes with it, and a second tap in the gap would only
 // earn the daemon's "already has a live session" refusal.
 const resumeHandedOff = computed(() => !!resumeStarted.value)
-const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value)
+const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value
+  && (!props.run.confirm_project || projectConfirmed.value))
 
 // Both are refusals; only one of them is a problem. Being asked for the repository
 // URL is the designed path — the platform will not invent that field — and painting
@@ -488,6 +539,7 @@ async function resume() {
       taskdef: resumeTaskdef.value,
       repoUrl: resumeRepoUrl.value,
       direction: resumeDirection.value,
+      confirmProject: projectConfirmed.value, slot: selectedSlot.value,
     })
     resumeNeeds.value = null
     emit('changed')
@@ -520,6 +572,18 @@ async function forget() {
 
 <template>
   <div>
+    <div class="d-flex flex-wrap ga-2 align-center mb-3">
+      <v-chip v-if="!run.workspace_id || run.workspace_id !== identifiedWorkspaceId"
+        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
+      <template v-if="!run.live && !run.orchestrator">
+        <v-select v-model="moveDestination" :items="projects.filter(project => !project.archived && project.id !== run.workspace_id)"
+          item-title="name" item-value="id" label="Move to project" hide-details density="compact" style="min-width: 180px" />
+        <v-btn :disabled="!moveDestination || busy" @click="transferRun">Move run</v-btn>
+      </template>
+    </div>
+    <v-alert v-if="moveError" type="error" density="compact" class="mb-3">
+      {{ moveError }}
+    </v-alert>
     <!-- The run's identity, and the reason it is asking for you. Both sit above
          the tabs on purpose: which panel is showing is the operator's remembered
          choice now, so this view no longer decides what they land on — and
@@ -569,6 +633,20 @@ async function forget() {
         v-if="run.title"
         class="text-body-small text-medium-emphasis scroll-x"
       >{{ run.label }}</span>
+      <v-spacer />
+      <!-- The same two icons the fleet row carries, in the header for the same
+           reason the state chip is: which humans can reach this run, and how to
+           change it, is a fact about the run and not a panel to go looking for.
+           `changed` is the shell's reload, so the row and this view never
+           disagree about what is connected. -->
+      <ThreadLinks
+        :session-id="run.session?.id"
+        :workspace-id="run.workspace_id"
+        :threads="run.threads"
+        :references="run.references || []"
+        :live="run.live"
+        @changed="emit('changed')"
+      />
     </div>
 
     <!-- What the run IS — the taskdef, the repo and the thing it is working on —
@@ -683,6 +761,12 @@ async function forget() {
         :text="run.attention.note"
         inline
       /></template>
+      <!-- Beside a crash this is the whole reason the row is one: with the
+           record it reads `crashed`, without it `dormant`. It renders under any
+           attention reason, so a yielded run whose session died shows it too. -->
+      <div v-if="observedExit" class="text-caption mt-1">
+        {{ observedExit }}
+      </div>
     </v-alert>
 
     <!-- Answering stays above the tabs for the same reason, and it is the stronger
@@ -691,7 +775,7 @@ async function forget() {
          with the box that clears the question one tap out of sight. -->
     <template v-if="questionPending">
       <div class="section-title">answer</div>
-      <AnswerBox :run="run" @answered="emit('changed')" />
+      <AnswerBox :run="run" :slots="slots" @answered="emit('changed')" />
     </template>
 
     <!-- The session's own channel, docked here for the same reason and one of its
@@ -706,8 +790,10 @@ async function forget() {
     <AskChannel
       v-if="terminalSession"
       :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
       :live="!!run.live"
       :initial="run.questions || []"
+      @entries="receiveOperatorEntries"
       :now="now"
       @answered="emit('changed')"
     />
@@ -820,6 +906,16 @@ async function forget() {
                 <dd v-if="session.log_path"><code class="scroll-x">{{ session.log_path }}</code></dd>
               </dl>
 
+              <!-- This session's own status line (issue 248). Outside the
+                   key/value list above because most of it is proportions, and a
+                   meter answers "how much is left" at a glance where a
+                   percentage in a definition list has to be read. -->
+              <StatusStrip
+                :status="run.statusline"
+                :now="now"
+                class="mt-3"
+              />
+
               <!-- How long the harness has been quiet (T95), in the fleet row's
                    idiom: dimmed, subordinate, no chip and no colour. The state
                    above is derived with liveness first (spec D24), so it reads
@@ -875,6 +971,10 @@ async function forget() {
                    asking for something only the operator has. Shown in the daemon's
                    own words, which say both what is missing and what supplying it
                    will do. -->
+              <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
+          item-title="name" item-value="name" label="Service slot" clearable
+          hint="Leave empty to reuse this run's remembered slot. Choose an applicable slot if its assignment changed." persistent-hint />
+      <v-checkbox v-if="run.confirm_project" v-model="projectConfirmed" :label="`Continue this run in ${run.workspace_name} with its current project settings`" />
               <v-alert
                 v-if="resumeError"
                 :type="resumeAsksForAField ? 'warning' : 'error'"
@@ -1087,7 +1187,7 @@ async function forget() {
            three are offered for a session that has gone. -->
       <v-tabs-window-item value="lmer" class="pt-3">
         <template v-if="terminalSession">
-          <v-tabs v-model="pane" grow color="primary">
+          <v-tabs v-model="pane" grow color="primary" class="session-panes">
             <v-tab value="conversation"><v-icon
               :icon="mdiForumOutline"
               size="small"
@@ -1102,17 +1202,23 @@ async function forget() {
                  this pane renders and the drawer draws on a run that is waiting to
                  be answered. Nothing like the conversation's: replying to the
                  session and reading what it said are different acts. -->
-            <v-tab value="chat"><v-icon
+            <v-tab value="chat" class="operator-chat-tab"><v-icon
               :icon="mdiCommentQuestionOutline"
               size="small"
               class="me-1"
-            />operator chat</v-tab>
+            />operator chat
+              <span class="operator-count">
+                {{ operatorCount }}
+                <span v-if="operatorUnread" class="text-primary" aria-label="Unread messages" title="Unread messages">●</span>
+              </span>
+            </v-tab>
           </v-tabs>
 
           <v-tabs-window v-model="pane">
             <v-tabs-window-item value="conversation" class="pt-3">
               <Chat
                 :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
                 :question-pending="questionPending"
                 :ask-pending="askPending"
                 :now="now"
@@ -1120,27 +1226,25 @@ async function forget() {
             </v-tabs-window-item>
 
             <v-tabs-window-item value="terminal" class="pt-3">
-              <Terminal :session-id="terminalSession" :harness="run.harness" />
+              <Terminal :session-id="terminalSession"
+                :workspace-id="run.workspace_id" :harness="run.harness" />
             </v-tabs-window-item>
 
             <v-tabs-window-item value="chat" class="pt-3">
-              <!-- The record, not the dock (T40). Everything the session posted
-                   on its channel is here — including whatever was cleared from
-                   above, which is what makes clearing up there a view operation
-                   rather than a deletion. Read-only on purpose: replying belongs
-                   in the one place the question that needs an answer is, and a
-                   second box down here would be a second way to send the same
-                   file, out of sight of the alert that says whether the session
-                   is even alive. -->
               <p class="text-medium-emphasis mb-3">
-                Everything this run's session posted on its channel and everything
-                you replied, oldest first — notes, questions it was blocked on, the
-                ones it stopped waiting for, and any that were never answered.
-                Clearing the dock above this page does not remove anything from
-                here. A session that never used the channel has nothing here.
+                This session’s notes and questions, with your replies, oldest first.
+                <template v-if="chatKeepLast">Auto-clear shows the newest {{ chatKeepLast }} entries.</template>
+                <template v-else>Auto-clear is off; all entries are shown.</template>
+                Change it in settings. Clearing the dock does not change
+                this pane. The journal and transcript keep the full history.
               </p>
+              <v-alert v-if="chatConfigProblem" type="warning" density="compact" class="mb-3">
+                Could not load chat display settings: {{ chatConfigProblem }}
+              </v-alert>
               <AskHistory
+                :keep-last="chatKeepLast"
                 :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
                 :live="!!run.live"
                 :now="now"
               />
@@ -1313,3 +1417,21 @@ async function forget() {
     <RelatedRuns :run="run" @open="emit('open', $event)" />
   </div>
 </template>
+
+<style scoped>
+.operator-count {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  font-size: 10px;
+  line-height: 12px;
+}
+@media (max-width: 600px) {
+  .session-panes :deep(.v-tab) {
+    min-width: 0;
+    padding-inline: 4px;
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+}
+</style>

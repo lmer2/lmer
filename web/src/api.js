@@ -7,6 +7,14 @@
 // (A login form exchanging the secret for an httpOnly cookie is the eventual
 // design, spec §10.5; it is not needed to make the UI work.)
 
+function workspacePath(path, workspaceId) {
+  return workspaceId ? `${path}${path.includes('?') ? '&' : '?'}workspace_id=${encodeURIComponent(workspaceId)}` : path
+}
+
+function runQuery(fields) {
+  return new URLSearchParams(Object.fromEntries(Object.entries(fields).filter(([, value]) => value != null)))
+}
+
 const jsonHeaders = { 'Content-Type': 'application/json' }
 
 async function request(path, options = {}) {
@@ -45,6 +53,60 @@ export function fetchState() {
   return request('api/state')
 }
 
+export function fetchProjects() {
+  return request('api/projects')
+}
+
+export function createProject(name) {
+  return request('api/projects', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ name }) })
+}
+
+export function updateProject(workspaceId, changes) {
+  return request(`api/projects/${encodeURIComponent(workspaceId)}`, {
+    method: 'PATCH', headers: jsonHeaders, body: JSON.stringify(changes),
+  })
+}
+
+export function archiveProject(workspaceId, restore = false) {
+  return request(`api/projects/${encodeURIComponent(workspaceId)}/${restore ? 'restore' : 'archive'}`, { method: 'POST' })
+}
+
+export function moveRun(run, destinationId) {
+  return request('api/runs/move', {
+    method: 'POST', headers: jsonHeaders,
+    body: JSON.stringify({ ...runRef(run), workspace_id: run.workspace_id,
+      home_revision: run.home_revision, destination_id: destinationId }),
+  })
+}
+
+export function fetchPlatformSettings() {
+  return request('api/settings')
+}
+
+export function setPlatformSettings(changes) {
+  return request('api/settings', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(changes) })
+}
+
+export function fetchConversationRequests(workspaceId) {
+  return request(workspacePath('api/assistant/requests', workspaceId))
+}
+
+export function parkConversationRequest(identity, workspaceId, reason) {
+  return request(`api/assistant/requests/${encodeURIComponent(identity)}/park`, {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ workspace_id: workspaceId, reason }),
+  })
+}
+
+export function releaseConversationRequest(identity, workspaceId, reason) {
+  return request(`api/assistant/requests/${encodeURIComponent(identity)}/release`, {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ workspace_id: workspaceId, reason }),
+  })
+}
+
+export function fetchHealth() {
+  return request('api/health')
+}
+
 export function rescan() {
   return request('api/rescan', { method: 'POST' })
 }
@@ -57,19 +119,19 @@ export function fetchCandidates() {
   return request('api/runs/candidates')
 }
 
-export function adoptRun({ host, project, slug }) {
+export function adoptRun({ host, project, slug, workspace_id, home_revision }) {
   return request('api/runs/adopt', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision }),
   })
 }
 
-export function forgetRun({ host, project, slug }) {
+export function forgetRun({ host, project, slug, workspace_id, home_revision }) {
   return request('api/runs/forget', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision }),
   })
 }
 
@@ -84,8 +146,8 @@ export function forgetRun({ host, project, slug }) {
 // told — this is platform state, so it belongs to this orchestrator and not to
 // the run. It is invisible to anyone else's fleet view and it goes when the run
 // is forgotten.
-export function fetchRunMeta({ host, project, slug }) {
-  const query = new URLSearchParams({ host, project, slug })
+export function fetchRunMeta({ host, project, slug, workspace_id, home_revision }) {
+  const query = runQuery({ host, project, slug, workspace_id, home_revision })
   return request(`api/runs/meta?${query}`)
 }
 
@@ -94,11 +156,11 @@ export function fetchRunMeta({ host, project, slug }) {
 // which is what lets the orchestrator agent set a title without deleting a
 // description somebody wrote. The reply is what was *stored*, not what was sent:
 // the title comes back collapsed to the single line it will be shown as.
-export function setRunMeta({ host, project, slug }, { title, description }) {
+export function setRunMeta({ host, project, slug, workspace_id, home_revision }, { title, description }) {
   return request('api/runs/meta', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, title, description }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, title, description }),
   })
 }
 
@@ -111,8 +173,8 @@ export function setRunMeta({ host, project, slug }, { title, description }) {
 // one is ordinary, not an error: relating a run before adopting it is allowed, and
 // forgetting a run leaves its relations alone. It is a key to show, never a run to
 // open — the shell selects out of the fleet, so opening one would land on nothing.
-export function fetchRunRelations({ host, project, slug }) {
-  const query = new URLSearchParams({ host, project, slug })
+export function fetchRunRelations({ host, project, slug, workspace_id, home_revision }) {
+  const query = runQuery({ host, project, slug, workspace_id, home_revision })
   return request(`api/runs/relations?${query}`)
 }
 
@@ -124,11 +186,11 @@ export function fetchRunRelations({ host, project, slug }) {
 //
 // The reply is the *subject* run's relations as they now are, which is what the
 // view renders — nothing is patched locally.
-export function relateRun({ host, project, slug }, related) {
+export function relateRun({ host, project, slug, workspace_id, home_revision }, related) {
   return request('api/runs/relate', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, related: runRef(related) }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, related: runRef(related) }),
   })
 }
 
@@ -136,11 +198,11 @@ export function relateRun({ host, project, slug }, related) {
 // this removes both directions at once and the order the runs are named in does
 // not matter. It needs no adoption, which is what makes it the way to clear a
 // relation naming a run this host no longer tracks.
-export function unrelateRun({ host, project, slug }, related) {
+export function unrelateRun({ host, project, slug, workspace_id, home_revision }, related) {
   return request('api/runs/unrelate', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, related: runRef(related) }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, related: runRef(related) }),
   })
 }
 
@@ -157,11 +219,11 @@ function runRef({ host, project, slug }) {
 // into — the daemon starts a fresh session carrying the answer. Nothing is
 // recorded when this resolves (the reply is a 202); the answer lands in the run's
 // state a moment later, which the next fleet poll picks up.
-export function answerRun({ host, project, slug }, answer) {
+export function answerRun({ host, project, slug, workspace_id, home_revision }, answer, { confirmProject = false, slot } = {}) {
   return request('api/runs/answer', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, answer }),
+    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, answer, confirm_project: confirmProject || undefined, slot: slot || undefined }),
   })
 }
 
@@ -177,9 +239,9 @@ export function answerRun({ host, project, slug }, answer) {
 // happened. `repoUrl` and `direction` are what the daemon's two "one more field"
 // refusals ask for — see the `code` on a rejected request.
 export function resumeRun(
-  { host, project, slug }, { taskdef, repoUrl, direction } = {},
+  { host, project, slug, workspace_id, home_revision }, { taskdef, repoUrl, direction, confirmProject = false, slot } = {},
 ) {
-  const body = { host, project, slug }
+  const body = { host, project, slug, workspace_id, home_revision, confirm_project: confirmProject || undefined, slot: slot || undefined }
   if (taskdef?.trim()) body.taskdef = taskdef.trim()
   if (repoUrl?.trim()) body.repo_url = repoUrl.trim()
   if (direction?.trim()) body.direction = direction.trim()
@@ -225,6 +287,53 @@ export function spawnSession(payload) {
     headers: jsonHeaders,
     body: JSON.stringify(payload),
   })
+}
+
+// --- service slots (issue #256) ----------------------------------------------
+
+// A patch of one slot, never a POST of the whole list: the daemon merges it into
+// `config.json` as the file is at write time, so a slot added in an editor since
+// this page loaded is not lost to a save here.
+//
+// `dryRun` runs every check and writes nothing, answering with the row the slot
+// *would* have — the same route the save takes, which is what stops the form
+// growing a second opinion about what makes a slot valid. `etag` travels as
+// `If-Match`: the daemon recomputes it under its write lock and refuses (412,
+// `slot_changed`) rather than overwriting an edit made behind this one.
+export function createSlot(slot, { dryRun = false } = {}) {
+  return request(`api/slots${dryRun ? '?dry_run=true' : ''}`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(slot),
+  })
+}
+
+// `confirm` on either verb is the operator saying yes to a change the daemon
+// refused because a live session is in the slot — a removal, or a re-point that
+// moves what that session is bound to. Absent by default, so the refusal is what
+// an unthinking press gets.
+export function updateSlot(
+  name, changes, { etag, dryRun = false, confirm = false } = {},
+) {
+  const query = new URLSearchParams()
+  if (dryRun) query.set('dry_run', 'true')
+  if (confirm) query.set('confirm', 'true')
+  const suffix = query.toString()
+  return request(
+    `api/slots/${encodeURIComponent(name)}${suffix ? `?${suffix}` : ''}`,
+    {
+      method: 'PUT',
+      headers: { ...jsonHeaders, 'If-Match': etag || '' },
+      body: JSON.stringify(changes),
+    },
+  )
+}
+
+export function removeSlot(name, { etag, confirm = false } = {}) {
+  return request(
+    `api/slots/${encodeURIComponent(name)}${confirm ? '?confirm=true' : ''}`,
+    { method: 'DELETE', headers: { 'If-Match': etag || '' } },
+  )
 }
 
 // --- one session's terminal --------------------------------------------------
@@ -275,6 +384,12 @@ export function fetchSessionMessages(sessionId, { since = 0, limit } = {}) {
   return request(`api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`)
 }
 
+export function fetchAssistantHistory(sessionId, { since = -40, before, limit = 40, view = 'conversation' } = {}) {
+  const query = new URLSearchParams({ since: String(since), limit: String(limit), view })
+  if (before) query.set('before', before)
+  return request(`api/assistant/history/${encodeURIComponent(sessionId)}?${query}`)
+}
+
 // The chat view's write half, and pointedly a different route from the read half:
 // this types into the live session's control plane, while what comes back arrives
 // through the transcript whenever the harness writes it. `appendNewline` is the
@@ -283,15 +398,28 @@ export function fetchSessionMessages(sessionId, { since = 0, limit } = {}) {
 // is prose intended to steer the session, rather than raw terminal keystrokes.
 // That lets the supervisor defuse a message a TUI would otherwise run as a shell
 // command. Off unless a caller says so, so raw paths keep their old semantics.
+//
+// Since the unified channel (issue 407) a *submitted* message is a record on the
+// session's bus, so every connected channel sees it. The keystroke form —
+// `appendNewline: false`, text left in the prompt unsent — is not a message
+// anyone else should see and keeps the raw `/input` route. `sanitize` is
+// accepted for the callers that still pass it; the bus defuses by construction.
 export function sendSessionInput(
-  sessionId, data, { appendNewline = true, sanitize = false } = {},
+  sessionId, data, { appendNewline = true, sanitize = false, workspaceId } = {},
 ) {
-  const body = { data, append_newline: appendNewline }
-  if (sanitize) body.sanitize = true
-  return request(`api/sessions/${encodeURIComponent(sessionId)}/input`, {
+  if (!appendNewline) {
+    const body = { data, append_newline: false, workspace_id: workspaceId }
+    if (sanitize) body.sanitize = true
+    return request(`api/sessions/${encodeURIComponent(sessionId)}/input`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    })
+  }
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/comms`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify(body),
+    body: JSON.stringify({ kind: 'message', text: data, workspace_id: workspaceId }),
   })
 }
 
@@ -318,11 +446,11 @@ export function sendSessionInput(
 // that reply against the tray entry, so sending again names the file already
 // stored instead of storing a second copy — but the copy from the abandoned send
 // is on the host, and only the session it was stored for can remove it.
-export function uploadSessionFile(sessionId, { name, data }) {
+export function uploadSessionFile(sessionId, { name, data, workspaceId }) {
   return request(`api/sessions/${encodeURIComponent(sessionId)}/uploads`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ name, data }),
+    body: JSON.stringify({ name, data, workspace_id: workspaceId }),
   })
 }
 
@@ -353,10 +481,10 @@ export function fetchSessionAsk(sessionId) {
 // means the session that would have read the reply has exited (T94), which no
 // retry fixes: the channel belongs to that one session, so resuming the run is
 // what the operator can still do.
-export function answerSessionQuestion(sessionId, questionId, answer) {
+export function answerSessionQuestion(sessionId, questionId, answer, workspaceId) {
   return request(
     `api/sessions/${encodeURIComponent(sessionId)}/ask/${encodeURIComponent(questionId)}/answer`,
-    { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ answer }) },
+    { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ answer, workspace_id: workspaceId }) },
   )
 }
 
@@ -366,8 +494,60 @@ export function answerSessionQuestion(sessionId, questionId, answer) {
 // a client renders one shape however it arrived at it — and a read that starts
 // nothing: the route is deliberately not the module's `ensure_running` (api.py),
 // because opening a drawer must not cost a session slot.
-export function fetchAssistant() {
-  return request('api/assistant')
+// The chat threads one session is mirrored into (issue #412). Three calls over
+// one record: the daemon runs a connector process per connection, so connecting
+// is a write and disconnecting is a delete — neither restarts anything.
+//
+// Nothing here patches a local copy of the reply: the fleet poll (and the
+// assistant status, for uber lmer) is what the icons render from, and one source
+// for that is what keeps every copy of the icons on screen agreeing — which is
+// also why there is no client for the GET: nothing would read it.
+// The link determines transport; a separate transport field could disagree.
+export function connectSessionThread(sessionId, permalink, workspaceId) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/threads`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ permalink, workspace_id: workspaceId }),
+  })
+}
+
+// Open a new thread in a channel and connect the session to it (#429). The same
+// route as a connect, and each body carries exactly one of the two: a permalink
+// names a thread that exists, a channel a place to make one.
+export function openSessionThread(sessionId, channel, title, workspaceId) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/threads`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ channel, title, workspace_id: workspaceId }),
+  })
+}
+
+export function disconnectSessionThread(sessionId, threadId, workspaceId) {
+  return request(
+    workspacePath(`api/sessions/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(threadId)}`, workspaceId),
+    { method: 'DELETE' },
+  )
+}
+
+// A thread the run is pointed at rather than connected to (#414): saving one
+// starts nothing — the run is told once and reads or posts it on demand.
+export function addSessionReference(sessionId, permalink, title, workspaceId) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/references`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ permalink, title, workspace_id: workspaceId }),
+  })
+}
+
+export function removeSessionReference(sessionId, referenceId, workspaceId) {
+  return request(
+    workspacePath(`api/sessions/${encodeURIComponent(sessionId)}/references/${encodeURIComponent(referenceId)}`, workspaceId),
+    { method: 'DELETE' },
+  )
+}
+
+export function fetchAssistant(workspaceId) {
+  return request(workspacePath('api/assistant', workspaceId))
 }
 
 // Starting one by hand. The daemon supervises it and normally starts it itself
@@ -375,8 +555,8 @@ export function fetchAssistant() {
 // the usual path. The reply is the reconciled status and not an acknowledgement —
 // it returns once the session is spawned and in the registry. A 409 means one is
 // already running, which is not a failure to report: re-read the status.
-export function startAssistant() {
-  return request('api/assistant/start', { method: 'POST' })
+export function startAssistant(workspaceId) {
+  return request(workspacePath('api/assistant/start', workspaceId), { method: 'POST' })
 }
 
 // Stopping one by hand, and deliberately not `POST api/sessions/{id}/exit`: that
@@ -391,8 +571,8 @@ export function startAssistant() {
 // `rotation` — otherwise "why did the last one end" is unanswerable afterwards.
 // Nothing here restarts one: the daemon's supervisor does that when it is watching,
 // and `startAssistant` is what brings one back when it is not.
-export function stopAssistant() {
-  return request('api/assistant/stop', { method: 'POST' })
+export function stopAssistant(workspaceId) {
+  return request(workspacePath('api/assistant/stop', workspaceId), { method: 'POST' })
 }
 
 // Replacing the incarnation with a fresh context window — one call rather than a
@@ -410,22 +590,18 @@ export function stopAssistant() {
 // one is the incarnation being replaced, since it is the only one that knows what
 // it was doing. Standing orders are not a handoff and survive either way: nothing
 // consumes them and every incarnation reads them at startup.
-export function rotateAssistant() {
-  return request('api/assistant/rotate', { method: 'POST' })
+export function rotateAssistant(workspaceId) {
+  return request(workspacePath('api/assistant/rotate', workspaceId), { method: 'POST' })
 }
 
-// The operator's standing orders for uber lmer (T87). A read and only a read: the
-// write path is the chat, which the operator chose over a settings screen — they
-// state a rule, uber lmer confirms the wording and stores the document, and this UI
-// shows it so the rule can be checked without asking. Two writers of the same prose
-// would be a merge nobody asked for, and the panel exists because the chat is not a
-// place you can re-read a document in.
-//
-// Fetched on demand rather than polled: the drawer already polls the status every
-// ten seconds and standing orders change a handful of times a month, so the panel
-// asks when it is opened.
-export function fetchAssistantInstructions() {
-  return request('api/assistant/instructions')
+export function fetchAssistantInstructions(workspaceId) {
+  return request(workspacePath('api/assistant/instructions', workspaceId))
+}
+
+export function setAssistantInstructions(workspaceId, instructions) {
+  return request(workspacePath('api/assistant/instructions', workspaceId), {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ instructions }),
+  })
 }
 
 // How the NEXT incarnation will be run (issue #234): model/harness/preset/agents,

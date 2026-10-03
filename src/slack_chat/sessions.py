@@ -6,11 +6,10 @@ module owns the lifecycle of those processes:
 
 - Spawning ``lmer chat <thread-permalink>`` as a host-side subprocess.
 - Tracking one session per ``(channel, thread_ts)`` pair.
-- Resetting an idle timer on any activity in a tracked thread (human
-  messages and the agent's own posts both count - the spawned agent is
-  expected to post progress notes during long autonomous work).
+- Resetting an idle timer on thread messages and new session bus activity,
+  including quiet progress notes.
 - Reaping sessions whose process exited, and disconnecting sessions whose
-  thread has been silent for longer than the idle timeout.
+  thread and session bus have been idle longer than the configured timeout.
 
 The lmer process is spawned under a dedicated PTY. lmer only passes
 ``-it`` to ``docker``/``podman`` when its stdin is a TTY, and the
@@ -29,6 +28,7 @@ escalating to signals.
 import asyncio
 import errno
 import logging
+import math
 import os
 import pty
 import signal
@@ -47,7 +47,69 @@ from lmer_cli.presets import (
     select_preset_name,
 )
 
+from .connector import ATTACH_ACK_ENV
+
 logger = logging.getLogger("lmer_slack.sessions")
+
+
+def preset_ack_parts(preset: Preset | None, manager: "SessionManager") -> tuple[str, str]:
+    """Say which preset the session being spawned is actually getting.
+
+    Returns ``(clause, warning)`` — a fragment appended to the connecting ack,
+    and an optional separate warning line.
+
+    Both selectors are reported, because both are invisible from Slack
+    (issue #181). A ``$preset:`` token names the preset it applies and, when it
+    replaced a listener-wide default, says so; with no token the
+    env-selected default is named too, since "my session silently got a preset
+    I never asked for" is exactly the confusion this is fixing. The person who
+    needs to know is the one who just typed the message, so this belongs in the
+    thread and not only in ``lmer_session_spawned``.
+
+    A default naming a preset that is not defined gets the warning line: the
+    spawned CLI rejects an unknown preset with exit 2, so the session would
+    otherwise die seconds after a cheerful "Connecting…" with the reason
+    visible only in the listener's log. Unlike an unknown *token* — a user
+    error, rejected before spawning — this is an operator misconfiguration of
+    the listener itself, so the spawn still goes ahead and only the diagnosis
+    is surfaced.
+
+    The default is resolved through the caller's session manager because it owns
+    the ``.env`` files the spawned CLI seeds itself from: a default that lives
+    only in the forwarded ``--env-file`` applies to the session and must be
+    named here too (issue #259). Its *availability* is asked of the manager for
+    the same reason (issue #279): ``LMER_PRESETS_FILE`` travels those same
+    tiers, so checking a file-sourced default against the listener's own
+    ``PRESETS`` — loaded from an environment that never reads that file —
+    warned that a session would fail to start when the child was about to load
+    the very preset being named. ``PRESETS`` still answers for a ``$preset:``
+    token, which is resolved here and must name something this listener holds.
+    """
+    default_name, default_source = manager.default_preset()
+    if preset is not None:
+        if default_name and default_name != preset.name:
+            return (
+                f" using preset `{preset.name}` (replacing the listener "
+                f"default `{default_name}` from `{default_source}`)",
+                "",
+            )
+        return f" using preset `{preset.name}`", ""
+    if not default_name:
+        return "", ""
+    child_presets = manager.child_presets()
+    if default_name in child_presets:
+        return (
+            f" using the listener default preset `{default_name}` "
+            f"(from `{default_source}`)",
+            "",
+        )
+    available = ", ".join(sorted(child_presets)) or "(none configured)"
+    return "", (
+        f"⚠️ The listener default preset `{default_name}` (from "
+        f"`{default_source}`) is not defined, so this session will fail to "
+        f"start. Available presets: {available}."
+    )
+
 
 # The taskdef every spawned session runs: the listener's command is always
 # `lmer chat <permalink>`. Named because it is also what decides which
@@ -145,8 +207,8 @@ class SessionManager:
     configuration.
 
     Args:
-        idle_timeout_minutes: Minutes of total thread silence (no human or
-            agent messages) before a session is disconnected.
+        idle_timeout_minutes: Minutes without thread messages or new session
+            bus activity before a session is disconnected.
         max_sessions: Maximum number of concurrently running sessions.
         lmer_bin: Executable used to spawn sessions (default ``lmer``).
         spawn_cwd: Working directory for spawned processes. Must NOT be a
@@ -172,7 +234,11 @@ class SessionManager:
         spawn_cwd: str | None = None,
         log_dir: str | None = None,
         lmer_env_file: str | None = None,
+        transport: str = "slack",
     ):
+        if transport not in ("slack", "matrix"):
+            raise ValueError("listener transport must be slack or matrix")
+        self.transport = transport
         self.idle_timeout_minutes = (
             idle_timeout_minutes
             if idle_timeout_minutes is not None
@@ -429,6 +495,14 @@ class SessionManager:
 
         # Base command + inherited environment, then layer the preset on top.
         env = dict(os.environ)
+        # This listener announces the thread itself, at once and with more to say
+        # than a connector can know (which preset the session got, how long the
+        # first reply may take), so the connector in this child stays quiet. A
+        # fact imposed on the process that must honour it, rather than a text
+        # match against the ack in the thread. The child's *disconnect* note is
+        # unaffected: it is what tells a thread nobody is reading it any more,
+        # and that is true however the attachment was made (issue #412).
+        env[ATTACH_ACK_ENV] = "0"
         cmd: list[str] = [self.lmer_bin]
         # Global lmer flags precede the `chat` subcommand. Forward an explicit
         # .env into the chat container when configured, so vars that live only
@@ -666,6 +740,7 @@ class SessionManager:
                     await on_crash(session)
                 continue
 
+            self._refresh_bus_activity(session)
             if session.idle_seconds() >= idle_cutoff:
                 logger.info(
                     "lmer_session_idle_disconnect %s",
@@ -678,6 +753,22 @@ class SessionManager:
                 await self.terminate(session)
                 if on_idle_disconnect is not None:
                     await on_idle_disconnect(session)
+
+    def _refresh_bus_activity(self, session: Session) -> None:
+        from lmer_cli.connector_ownership import same_process
+        from .registry import thread_holder
+
+        owner = thread_holder(*session.key, kind=self.transport) or {}
+        activity = owner.get("activity_at")
+        if (type(activity) not in (int, float) or not math.isfinite(activity)
+                or not session.last_activity < activity <= time.monotonic()
+                or owner.get("parent_pid") != session.process.pid):
+            return
+        try:
+            if same_process(session.process.pid, owner.get("parent_start")):
+                session.last_activity = activity
+        except (OSError, RuntimeError) as exc:
+            logger.warning("lmer_session_activity_unavailable %s", _kv(error=exc))
 
     async def run_reaper(self, on_idle_disconnect=None, on_crash=None) -> None:
         """Run the reaper loop forever (intended as a background task)."""

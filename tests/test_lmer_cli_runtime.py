@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tests for lmer_cli.runtime module"""
 
+import csv
 import os
 import pytest
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -23,7 +25,13 @@ from lmer_cli.runtime import (
     _resolve_cpus,
     _resolve_limit_env,
     _resolve_memory,
+    _resolve_gpu,
     _resolve_pids_limit,
+    GPUGrant,
+    gpu_grant_plan,
+    LaunchScope,
+    resource_env_names,
+    resource_limit_plan,
     _user_cgroup_controllers_path,
     DEFAULT_CPUS,
     DEFAULT_MEMORY,
@@ -283,6 +291,11 @@ class TestBaseRunArgs:
             args = base_run_args("docker", False, "developer")
             assert args[args.index("--memory") + 1] == DEFAULT_MEMORY
 
+    def test_base_args_use_the_announced_gpu_plan(self):
+        grant = GPUGrant("0", "LMER_GPU", ("--gpus", "device=0"))
+        args = base_run_args("docker", False, "developer", gpu=grant)
+        assert args[args.index("--gpus") + 1] == "device=0"
+
 
 class TestResolvePidsLimit:
     """Test LMER_PIDS_LIMIT parsing for the container --pids-limit value."""
@@ -291,53 +304,53 @@ class TestResolvePidsLimit:
         """Unset LMER_PIDS_LIMIT yields the default cap."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LMER_PIDS_LIMIT", None)
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_empty_returns_default(self):
         """Empty/whitespace LMER_PIDS_LIMIT yields the default cap."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "   "}):
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_positive_integer_accepted(self):
         """A positive integer is passed through verbatim."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "4096"}):
-            assert _resolve_pids_limit() == "4096"
+            assert _resolve_pids_limit()[0] == "4096"
 
     def test_whitespace_is_stripped(self):
         """Surrounding whitespace is stripped before parsing."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "  2048  "}):
-            assert _resolve_pids_limit() == "2048"
+            assert _resolve_pids_limit()[0] == "2048"
 
     def test_minus_one_means_unlimited(self):
         """-1 is accepted (Docker/Podman 'unlimited')."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "-1"}):
-            assert _resolve_pids_limit() == "-1"
+            assert _resolve_pids_limit()[0] == "-1"
 
     def test_zero_rejected_falls_back(self):
         """0 is out of range and falls back to the default."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "0"}):
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_other_negative_rejected_falls_back(self):
         """Negatives other than -1 fall back to the default."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "-5"}):
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_non_numeric_rejected_falls_back(self):
         """A non-numeric value falls back to the default."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "lots"}):
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_float_rejected_falls_back(self):
         """A float string is not an integer and falls back to the default."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "1024.5"}):
-            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+            assert _resolve_pids_limit()[0] == DEFAULT_PIDS_LIMIT
 
     def test_accepted_value_is_normalised(self):
         """An in-grammar spelling reaches the runtime as the integer it names,
         not as typed — the validator returns a value, not a verdict."""
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "+5"}):
-            assert _resolve_pids_limit() == "5"
+            assert _resolve_pids_limit()[0] == "5"
 
     def test_invalid_value_warns(self, capsys):
         """The rejection is loud: it names the variable and the default used."""
@@ -355,90 +368,90 @@ class TestResolveCpus:
         """Unset LMER_CPUS yields the default core count."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LMER_CPUS", None)
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_empty_returns_default(self):
         """Empty/whitespace LMER_CPUS yields the default core count."""
         with patch.dict(os.environ, {"LMER_CPUS": "   "}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_positive_integer_accepted(self):
         """A positive integer is passed through verbatim."""
         with patch.dict(os.environ, {"LMER_CPUS": "2"}):
-            assert _resolve_cpus() == "2"
+            assert _resolve_cpus()[0] == "2"
 
     def test_fraction_below_one_accepted(self):
         """A fractional value below one core is valid to both runtimes."""
         with patch.dict(os.environ, {"LMER_CPUS": "0.5"}):
-            assert _resolve_cpus() == "0.5"
+            assert _resolve_cpus()[0] == "0.5"
 
     def test_fraction_above_one_accepted(self):
         """A fractional value above one core is passed through verbatim."""
         with patch.dict(os.environ, {"LMER_CPUS": "1.5"}):
-            assert _resolve_cpus() == "1.5"
+            assert _resolve_cpus()[0] == "1.5"
 
     def test_whitespace_is_stripped(self):
         """Surrounding whitespace is stripped before parsing."""
         with patch.dict(os.environ, {"LMER_CPUS": "  4  "}):
-            assert _resolve_cpus() == "4"
+            assert _resolve_cpus()[0] == "4"
 
     def test_zero_rejected_falls_back(self):
         """0 would mean no quota at all and falls back to the default."""
         with patch.dict(os.environ, {"LMER_CPUS": "0"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_negative_rejected_falls_back(self):
         """A negative value falls back to the default (no 'unlimited' spelling)."""
         with patch.dict(os.environ, {"LMER_CPUS": "-2"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_non_numeric_rejected_falls_back(self):
         """A non-numeric value falls back to the default."""
         with patch.dict(os.environ, {"LMER_CPUS": "abc"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_infinity_rejected_falls_back(self):
         """'inf' parses as a float in Python but is not a core count."""
         with patch.dict(os.environ, {"LMER_CPUS": "inf"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_nan_rejected_falls_back(self):
         """'nan' parses as a float in Python but is not a core count."""
         with patch.dict(os.environ, {"LMER_CPUS": "nan"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_scientific_notation_rejected_falls_back(self):
         """Scientific notation is not part of the accepted grammar."""
         with patch.dict(os.environ, {"LMER_CPUS": "1e2"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_non_ascii_digits_rejected_falls_back(self):
         """Python's \\d matches non-ASCII digits; the runtimes don't."""
         with patch.dict(os.environ, {"LMER_CPUS": "٣"}):  # Arabic-Indic 3
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_excess_precision_rejected_falls_back(self):
         """docker's nano-CPU parser rejects >9 fractional digits as 'too
         precise'; pre-screen those rather than abort the launch."""
         with patch.dict(os.environ, {"LMER_CPUS": "1.0000000001"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_nanocpu_wrap_magnitude_rejected_falls_back(self):
         """2**64 nano-CPUs spelled as cores wraps docker's int64 encoding to
         0 — byte-identical to no --cpus at all. The magnitude bound exists so
         no accepted value can resolve to the unset encoding."""
         with patch.dict(os.environ, {"LMER_CPUS": "18446744073.709551616"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_max_cpus_boundary_accepted(self):
         """The bound itself is a valid core count."""
         with patch.dict(os.environ, {"LMER_CPUS": "4096"}):
-            assert _resolve_cpus() == "4096"
+            assert _resolve_cpus()[0] == "4096"
 
     def test_above_max_cpus_rejected_falls_back(self):
         """Anything past the bound falls back, however far from the wrap."""
         with patch.dict(os.environ, {"LMER_CPUS": "4097"}):
-            assert _resolve_cpus() == DEFAULT_CPUS
+            assert _resolve_cpus()[0] == DEFAULT_CPUS
 
     def test_invalid_value_warns(self, capsys):
         """The rejection is loud: it names the variable and the default used."""
@@ -456,89 +469,89 @@ class TestResolveMemory:
         """Unset LMER_MEMORY yields the default cap."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LMER_MEMORY", None)
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_empty_returns_default(self):
         """Empty/whitespace LMER_MEMORY yields the default cap."""
         with patch.dict(os.environ, {"LMER_MEMORY": "   "}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_gigabyte_suffix_accepted(self):
         """A size with a 'g' suffix is passed through verbatim."""
         with patch.dict(os.environ, {"LMER_MEMORY": "4g"}):
-            assert _resolve_memory() == "4g"
+            assert _resolve_memory()[0] == "4g"
 
     def test_megabyte_suffix_accepted(self):
         """A size with an 'm' suffix is passed through verbatim."""
         with patch.dict(os.environ, {"LMER_MEMORY": "512m"}):
-            assert _resolve_memory() == "512m"
+            assert _resolve_memory()[0] == "512m"
 
     def test_bare_integer_accepted(self):
         """A suffix-less value is bytes to both runtimes and is accepted."""
         with patch.dict(os.environ, {"LMER_MEMORY": "1073741824"}):  # 1 GiB
-            assert _resolve_memory() == "1073741824"
+            assert _resolve_memory()[0] == "1073741824"
 
     def test_below_floor_bytes_rejected_falls_back(self):
         """A bare 8 is eight bytes — the runtime would refuse to start; the
         floor pre-screens it to warn-and-default instead."""
         with patch.dict(os.environ, {"LMER_MEMORY": "8"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_below_floor_suffixed_rejected_falls_back(self):
         """Suffixed sizes below docker's 6m minimum are rejected too."""
         with patch.dict(os.environ, {"LMER_MEMORY": "5m"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_floor_boundary_accepted(self):
         """Exactly the runtime minimum (6m) is a valid size."""
         with patch.dict(os.environ, {"LMER_MEMORY": "6m"}):
-            assert _resolve_memory() == "6m"
+            assert _resolve_memory()[0] == "6m"
 
     def test_suffix_is_case_insensitive(self):
         """An uppercase suffix is accepted and passed through unchanged."""
         with patch.dict(os.environ, {"LMER_MEMORY": "2G"}):
-            assert _resolve_memory() == "2G"
+            assert _resolve_memory()[0] == "2G"
 
     def test_two_letter_suffix_accepted(self):
         """The two-letter suffix forms ('gb', 'mb', 'kb') are valid too."""
         with patch.dict(os.environ, {"LMER_MEMORY": "1gb"}):
-            assert _resolve_memory() == "1gb"
+            assert _resolve_memory()[0] == "1gb"
 
     def test_whitespace_is_stripped(self):
         """Surrounding whitespace is stripped before parsing."""
         with patch.dict(os.environ, {"LMER_MEMORY": "  8g  "}):
-            assert _resolve_memory() == "8g"
+            assert _resolve_memory()[0] == "8g"
 
     def test_zero_rejected_falls_back(self):
         """0 would mean no cap at all and falls back to the default."""
         with patch.dict(os.environ, {"LMER_MEMORY": "0"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_negative_rejected_falls_back(self):
         """A negative size falls back to the default."""
         with patch.dict(os.environ, {"LMER_MEMORY": "-1g"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_embedded_space_rejected_falls_back(self):
         """Prose spellings are rejected, not guessed at."""
         with patch.dict(os.environ, {"LMER_MEMORY": "2 gigs"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_leading_suffix_rejected_falls_back(self):
         """A suffix before the number is not the accepted grammar."""
         with patch.dict(os.environ, {"LMER_MEMORY": "g2"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_fraction_rejected_falls_back(self):
         """Fractions are outside the accepted subset (deliberately narrower
         than the runtimes' own size parser, which does take 2.5g)."""
         with patch.dict(os.environ, {"LMER_MEMORY": "2.5g"}):
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_non_ascii_digits_rejected_falls_back(self):
         """Python's \\d matches non-ASCII digits; the runtimes don't."""
         with patch.dict(os.environ, {"LMER_MEMORY": "٣g"}):  # Arabic-Indic 3
-            assert _resolve_memory() == DEFAULT_MEMORY
+            assert _resolve_memory()[0] == DEFAULT_MEMORY
 
     def test_invalid_value_warns(self, capsys):
         """The rejection is loud: it names the variable and the default used."""
@@ -547,6 +560,178 @@ class TestResolveMemory:
         out = capsys.readouterr().out
         assert "LMER_MEMORY" in out
         assert DEFAULT_MEMORY in out
+
+
+class TestResolveGpu:
+    """GPU access is absent by default and uses the scoped resource ladder."""
+
+    def test_unset_and_blank_disable_gpu_access(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+        with patch.dict(os.environ, {"LMER_GPU": "   "}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+
+    @pytest.mark.parametrize("value", ["all", "0", "0,1", "12,3,400"])
+    def test_supported_spellings_are_accepted(self, value):
+        with patch.dict(os.environ, {"LMER_GPU": value}, clear=True):
+            assert _resolve_gpu() == (value, "LMER_GPU")
+
+    @pytest.mark.parametrize(
+        "value", ["ALL", "gpu0", "0-1", "0,", ",0", "0,,1", "٣"]
+    )
+    def test_other_spellings_warn_and_disable(self, value, capsys):
+        with patch.dict(os.environ, {"LMER_GPU": value}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+        out = capsys.readouterr().out
+        assert "LMER_GPU" in out
+        assert "leaving the resource disabled" in out
+
+    def test_invalid_specific_value_falls_through_to_general(self, capsys):
+        scope = LaunchScope("develop", "group/project")
+        with patch.dict(
+            os.environ,
+            {"LMER_DEVELOP__GROUP_PROJECT__GPU": "many", "LMER_GPU": "0"},
+            clear=True,
+        ):
+            assert _resolve_gpu(scope) == ("0", "LMER_GPU")
+        assert "using LMER_GPU (0)" in capsys.readouterr().out
+
+    def test_repo_value_beats_task_and_general_values(self):
+        scope = LaunchScope("develop", "group/project")
+        with patch.dict(
+            os.environ,
+            {
+                "LMER_GPU": "0",
+                "LMER_DEVELOP_GPU": "1",
+                "LMER_DEVELOP__GROUP_PROJECT__GPU": "0,1",
+            },
+            clear=True,
+        ):
+            assert _resolve_gpu(scope) == (
+                "0,1",
+                "LMER_DEVELOP__GROUP_PROJECT__GPU",
+            )
+
+
+class TestGpuGrantPlan:
+    """Runtime metadata decides whether an accepted request becomes a grant."""
+
+    def test_disabled_request_never_reads_runtime_metadata(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run") as run:
+                assert gpu_grant_plan("docker") == GPUGrant(None, "default")
+        run.assert_not_called()
+
+    def test_docker_all_uses_the_native_flag(self):
+        info = subprocess.CompletedProcess([], 0, '{"runc": {}, "nvidia": {}}', "")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info) as run:
+                grant = gpu_grant_plan("docker")
+        assert grant == GPUGrant("all", "LMER_GPU", ("--gpus", "all"))
+        run.assert_called_once_with(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_docker_device_list_survives_csv_decoding(self):
+        info = subprocess.CompletedProcess([], 0, '{"nvidia": {}}', "")
+        with patch.dict(os.environ, {"LMER_GPU": "0,1"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("docker")
+        options = next(csv.reader([grant.args[1]]))
+        device_option = next(option for option in options if option.startswith("device="))
+        assert device_option.removeprefix("device=").split(",") == ["0", "1"]
+
+    def test_podman_uses_one_cdi_selector_per_device(self):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"cdi","id":"nvidia.com/gpu=all"},'
+            '{"source":"cdi","id":"nvidia.com/gpu=0"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "0,1"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.args == (
+            "--device",
+            "nvidia.com/gpu=0",
+            "--device",
+            "nvidia.com/gpu=1",
+        )
+
+    def test_podman_all_uses_the_cdi_all_selector(self):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"cdi","id":"nvidia.com/gpu=all"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info) as run:
+                grant = gpu_grant_plan("podman")
+        assert grant.args == ("--device", "nvidia.com/gpu=all")
+        run.assert_called_once_with(
+            ["podman", "info", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_podman_requires_a_cdi_discovered_device(self, capsys):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"other","id":"nvidia.com/gpu=all"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.value is None
+        assert "launching without GPU access" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("runtime", "stdout", "expected"),
+        [
+            ("docker", '{"runc": {}}', "nvidia runtime"),
+            ("podman", '{"host":{"discoveredDevices":[]}}', "CDI device"),
+        ],
+    )
+    def test_missing_support_drops_the_grant_with_remediation(
+        self, runtime, stdout, expected, capsys
+    ):
+        info = subprocess.CompletedProcess([], 0, stdout, "")
+        with patch.dict(os.environ, {"LMER_GPU": "0"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan(runtime)
+        assert grant.value is None and grant.args == ()
+        assert grant.source == "LMER_GPU; unsupported"
+        out = capsys.readouterr().out
+        assert expected in out
+        assert "launching without GPU access" in out
+        assert "NVIDIA" in out
+
+    def test_unreadable_metadata_drops_the_grant(self, capsys):
+        info = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("docker")
+        assert grant.value is None
+        assert "docker info exited 1" in capsys.readouterr().out
+
+    def test_malformed_metadata_drops_the_grant(self, capsys):
+        info = subprocess.CompletedProcess([], 0, "not-json", "")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.value is None
+        assert "podman info returned malformed JSON" in capsys.readouterr().out
 
 
 class TestResolveLimitEnv:
@@ -567,7 +752,7 @@ class TestResolveLimitEnv:
             return raw
 
         with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "   "}):
-            assert _resolve_limit_env("LMER_FAKE_LIMIT", "7", validator, "hint") == "7"
+            assert _resolve_limit_env(["LMER_FAKE_LIMIT"], "7", validator, "hint") == ("7", "default")
         assert consulted == []
 
     def test_validator_return_value_is_what_reaches_the_runtime(self):
@@ -576,9 +761,9 @@ class TestResolveLimitEnv:
         pass/fail, or '+5' would reach the runtime as typed."""
         with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "  +5  "}):
             resolved = _resolve_limit_env(
-                "LMER_FAKE_LIMIT", "7", lambda raw: str(int(raw)), "hint"
+                ["LMER_FAKE_LIMIT"], "7", lambda raw: str(int(raw)), "hint"
             )
-        assert resolved == "5"
+        assert resolved == ("5", "LMER_FAKE_LIMIT")
 
     def test_rejection_warns_and_defaults(self, capsys):
         """None means rejected — warn and fall back, never abort the launch and
@@ -586,14 +771,14 @@ class TestResolveLimitEnv:
         was read, the grammar it failed, and the default that took its place."""
         with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "bogus"}):
             resolved = _resolve_limit_env(
-                "LMER_FAKE_LIMIT", "7", lambda raw: None, "must be a positive widget"
+                ["LMER_FAKE_LIMIT"], "7", lambda raw: None, "must be a positive widget"
             )
-        assert resolved == "7"
+        assert resolved == ("7", "default")
         out = capsys.readouterr().out
         assert "LMER_FAKE_LIMIT" in out
         assert "'bogus'" in out
         assert "must be a positive widget" in out
-        assert "using default 7" in out
+        assert "the default 7" in out
 
 
 class TestContainerEnv:
@@ -880,3 +1065,154 @@ class TestBaseRunArgsCgroupGating:
         out = capsys.readouterr().out
         assert "not delegated" in out  # the drop itself still warns
         assert "LMER_CPUS" not in out  # but not about an unused override
+
+
+class TestScopedResourceVars:
+    """The taskdef/repo-scoped resource ladder (issue #453).
+
+    The ladder decides by specificity, not by the layer a value arrived
+    through: exports, ``.env`` files and a preset's ``env`` have all been
+    merged into ``os.environ`` before a container is built, so these cases
+    drive ``os.environ`` directly — that IS the merged environment the
+    resolvers read.
+    """
+
+    def test_task_and_repo_tiers_are_offered_most_specific_first(self):
+        names = resource_env_names("MEMORY", LaunchScope("develop", "agents/global"))
+        assert names == [
+            "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY",
+            "LMER_DEVELOP_MEMORY",
+            "LMER_MEMORY",
+        ]
+
+    def test_no_repo_drops_only_the_repo_tier(self):
+        assert resource_env_names("CPUS", LaunchScope("develop", None)) == [
+            "LMER_DEVELOP_CPUS",
+            "LMER_CPUS",
+        ]
+
+    def test_no_scope_at_all_leaves_the_generic_name(self):
+        assert resource_env_names("CPUS", None) == ["LMER_CPUS"]
+
+    def test_separators_collapse_in_both_segments(self):
+        """Taskdef ids and project paths are directory/forge names, not
+        identifiers: everything outside [A-Za-z0-9] becomes an underscore."""
+        names = resource_env_names("MEMORY", LaunchScope("code-review", "agents/sub/global"))
+        assert names[0] == "LMER_CODE_REVIEW__AGENTS_SUB_GLOBAL__MEMORY"
+
+    def test_an_unnameable_id_contributes_no_tier_rather_than_a_broken_name(self):
+        """A taskdef with no ASCII alphanumerics has no scoped spelling at all;
+        the generic variable still works for it."""
+        assert resource_env_names("MEMORY", LaunchScope("レビュー", "agents/global")) == [
+            "LMER_MEMORY"
+        ]
+
+    def test_task_value_beats_general_value(self):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "4g"}):
+            assert _resolve_memory(scope) == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_repo_value_beats_task_value(self):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {
+            "LMER_MEMORY": "2g",
+            "LMER_DEVELOP_MEMORY": "4g",
+            "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY": "8g",
+        }):
+            assert _resolve_memory(scope) == ("8g", "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY")
+
+    def test_another_taskdefs_value_is_not_read(self):
+        """The scoped name is per taskdef: a review setting leaves develop on
+        the general value."""
+        with patch.dict(os.environ, {"LMER_MEMORY": "2g", "LMER_REVIEW_MEMORY": "8g"}):
+            assert _resolve_memory(LaunchScope("develop", None)) == ("2g", "LMER_MEMORY")
+
+    def test_another_repos_value_is_not_read(self):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {
+            "LMER_MEMORY": "2g",
+            "LMER_DEVELOP__OTHER_PROJECT__MEMORY": "8g",
+        }):
+            assert _resolve_memory(scope) == ("2g", "LMER_MEMORY")
+
+    def test_blank_scoped_value_falls_through_rather_than_selecting_nothing(self):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "   "}):
+            assert _resolve_memory(scope) == ("2g", "LMER_MEMORY")
+
+    def test_invalid_scoped_value_falls_through_to_the_next_candidate(self, capsys):
+        """Not to the default: an operator with both set meant the general one
+        to answer when the specific one cannot."""
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {"LMER_MEMORY": "4g", "LMER_DEVELOP_MEMORY": "lots"}):
+            assert _resolve_memory(scope) == ("4g", "LMER_MEMORY")
+        out = capsys.readouterr().out
+        assert "LMER_DEVELOP_MEMORY" in out
+        # The warning names the bound that actually took effect, not the next
+        # candidate it had yet to validate.
+        assert "using LMER_MEMORY (4g)" in out
+
+    def test_every_candidate_invalid_still_leaves_a_finite_bound(self, capsys):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {"LMER_MEMORY": "heaps", "LMER_DEVELOP_MEMORY": "lots"}):
+            assert _resolve_memory(scope) == (DEFAULT_MEMORY, "default")
+        out = capsys.readouterr().out
+        assert "LMER_DEVELOP_MEMORY" in out and "LMER_MEMORY" in out
+        # Both warnings name the default, because that is what was used — an
+        # earlier version named the next SET candidate, which was then rejected
+        # too, so the first warning described a bound nothing ever had.
+        assert out.count(f"using the default {DEFAULT_MEMORY}") == 2
+
+    def test_pids_limit_has_no_scoped_spelling(self):
+        """Issue #453 leaves PID policy alone: a taskdef-scoped name for it is
+        not read, so setting one changes nothing."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LMER_PIDS_LIMIT", None)
+            os.environ["LMER_DEVELOP_PIDS_LIMIT"] = "4096"
+            assert _resolve_pids_limit() == (DEFAULT_PIDS_LIMIT, "default")
+
+
+class TestResourceLimitPlan:
+    """One resolution behind the container arguments and the diagnostic."""
+
+    def test_plan_reports_the_variable_that_answered(self):
+        with patch.dict(os.environ, {"LMER_DEVELOP_MEMORY": "8g"}):
+            plan = resource_limit_plan("docker", LaunchScope("develop", None))
+        memory = next(limit for limit in plan if limit.flag == "--memory")
+        assert (memory.value, memory.source) == ("8g", "LMER_DEVELOP_MEMORY")
+
+    def test_a_flag_override_beats_every_tier_and_says_so(self):
+        scope = LaunchScope("develop", "agents/global")
+        with patch.dict(os.environ, {
+            "LMER_MEMORY": "2g",
+            "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY": "8g",
+        }):
+            plan = resource_limit_plan("docker", scope, {"--memory": "16g"})
+        memory = next(limit for limit in plan if limit.flag == "--memory")
+        assert (memory.value, memory.source) == ("16g", "--memory")
+
+    def test_an_override_of_one_knob_leaves_the_other_on_its_ladder(self):
+        with patch.dict(os.environ, {"LMER_DEVELOP_CPUS": "3", "LMER_DEVELOP_MEMORY": "8g"}):
+            plan = resource_limit_plan("docker", LaunchScope("develop", None), {"--cpus": "1"})
+        by_flag = {limit.flag: (limit.value, limit.source) for limit in plan}
+        assert by_flag["--cpus"] == ("1", "--cpus")
+        assert by_flag["--memory"] == ("8g", "LMER_DEVELOP_MEMORY")
+
+    def test_args_are_rendered_from_the_plan(self):
+        """The diagnostic and the arguments read one object, so they cannot
+        describe different launches."""
+        with patch.dict(os.environ, {"LMER_DEVELOP_MEMORY": "8g"}):
+            plan = resource_limit_plan("docker", LaunchScope("develop", None))
+            args = base_run_args("docker", False, "developer", plan)
+        for limit in plan:
+            assert args[args.index(limit.flag) + 1] == limit.value
+
+    def test_a_dropped_flag_is_absent_from_the_plan_and_the_args(self, monkeypatch):
+        """Rootless podman without delegated controllers: what is not passed is
+        not announced either."""
+        monkeypatch.setattr("lmer_cli.runtime.os.geteuid", lambda: 1000)
+        monkeypatch.setattr("lmer_cli.runtime._available_controllers", lambda: {"pids"})
+        plan = resource_limit_plan("podman", LaunchScope("develop", None))
+        assert [limit.flag for limit in plan] == ["--pids-limit"]
+        args = base_run_args("podman", False, "developer", plan)
+        assert "--memory" not in args and "--cpus" not in args
