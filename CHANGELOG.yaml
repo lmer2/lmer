@@ -5,6 +5,10 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.10.1:
+  fixed:
+  - Graph groups use platform configuration with a simple settings editor, safe literal
+    text matching, and empty defaults that retain repository clusters.
 0.10.0:
   added:
   - 'gpg-agent forwarding for `ansible`-taskdef sessions: sign and decrypt with the
@@ -124,7 +128,8 @@ unreleased:
     default.'
   - The fleet payload now carries every relation in the fleet, so the map draws its
     edges without a request per run.
-  - Configure visual graph groups in Platform settings using ordered, case-insensitive text matches; unconfigured repositories keep their own clusters.
+  - Configure visual graph groups in Platform settings using ordered, case-insensitive
+    text matches; unconfigured repositories keep their own clusters.
   - "Every cluster the map draws is named \u2014 a run with no project committed yet\
     \ reads `unidentified` instead of a dash."
   - The map carries a legend for the tones it paints, the attention ring and the relation
