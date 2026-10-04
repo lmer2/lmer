@@ -906,23 +906,39 @@ def test_a_probe_that_fails_on_a_rescan_cannot_unmark_a_working_drain(
     """
     plant_session("s-1", port=plane.port)
     reattach.reattach_session("s-1", poll=FAST_POLL)
+    drain = reattach._ACTIVE["s-1"]
     plane.emit(b"BEFORE-THE-RESCAN")
     wait_for_log("s-1", b"BEFORE-THE-RESCAN")
+    # Log bytes become visible before poll_once advances the cursor. Complete
+    # that read before comparing the registry and report's cursor snapshots.
+    expected_cursor = len(b"BEFORE-THE-RESCAN")
+    wait_for(
+        lambda: drain.cursor == expected_cursor,
+        what="the drain cursor advancing before the rescan",
+    )
+    probe_calls = []
 
     def blip(session_id):
+        probe_calls.append(session_id)
         raise session_io.ControlUnavailable("the plane chose this moment not to answer")
 
     monkeypatch.setattr(reattach, "probe_health", blip)
     second = reattach.reattach_session("s-1", poll=FAST_POLL)
 
+    assert probe_calls == []
     assert (second.detached, second.draining) == (True, True)
     assert detached_of("s-1")["output"] == reattach.OUTPUT_CONTROL_PLANE
-    assert second.cursor is not None, (
+    assert second.cursor == expected_cursor, (
         "the offset can only be the drain's own position: nothing answered a probe"
     )
     assert detached_of("s-1")["cursor"] == second.cursor
     plane.emit(b"AFTER-THE-RESCAN")
     wait_for_log("s-1", b"AFTER-THE-RESCAN")
+    wait_for(
+        lambda: drain.cursor == expected_cursor + len(b"AFTER-THE-RESCAN"),
+        what="the same drain advancing after the rescan",
+    )
+    assert reattach._ACTIVE["s-1"] is drain
 
 
 # --- the drain itself --------------------------------------------------------
