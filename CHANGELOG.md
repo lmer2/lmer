@@ -4,6 +4,11 @@
 ## Unreleased
 
 
+## 0.10.1
+### Fixed
+- Graph groups use platform configuration with a simple settings editor, safe literal text matching, and empty defaults that retain repository clusters.
+
+
 ## 0.10.0
 ### Added
 - gpg-agent forwarding for `ansible`-taskdef sessions: sign and decrypt with the host key, which never enters the container
