@@ -9,6 +9,7 @@ as messages.
 """
 from __future__ import annotations
 
+import html
 import threading
 import time
 from dataclasses import replace
@@ -1039,3 +1040,141 @@ def test_attachment_metadata_does_not_override_the_ack_off_switch(tmp_path):
     rig.connector._announce_attached()
     assert rig.slack.posted == []
     rig.log.close()
+
+
+# ---------------------------------------------------------------------------
+# credential redaction at the outbound boundary (issue #539)
+# ---------------------------------------------------------------------------
+
+# Fabricated: a GitHub-shaped token and a value that only the environment knows.
+_SHAPED = "ghp_" + "Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz3"
+_ENV_VALUE = "fabricated-env-value-0123456789"
+
+
+class TestOutboundRedaction:
+    @pytest.fixture(autouse=True)
+    def _env_secret(self, monkeypatch):
+        monkeypatch.setenv("LMER_FABRICATED_API_TOKEN", _ENV_VALUE)
+
+    def _record(self, kind, text, **extra):
+        return {"id": f"sess-1/{kind}", "kind": kind, "text": text,
+                "source": {"channel": "agent"}, "meta": {}, **extra}
+
+    @pytest.mark.parametrize("secret", [_SHAPED, _ENV_VALUE], ids=["shape", "env-value"])
+    @pytest.mark.parametrize("kind", ["message", "milestone", "command", "close"])
+    def test_every_kind_reaches_slack_redacted(self, rig, kind, secret):
+        rig.connector._send_record(self._record(kind, f"using {secret} now"))
+        (_, _, posted), = rig.slack.posted
+        assert secret not in posted
+        assert "***REDACTED***" in posted
+
+    @pytest.mark.parametrize("secret", [_SHAPED, _ENV_VALUE], ids=["shape", "env-value"])
+    def test_question_text_and_options_are_redacted(self, rig, secret):
+        rig.connector._send_record(self._record(
+            "question", f"use {secret}?", options=[f"yes {secret}", "no"],
+        ))
+        (_, _, posted), = rig.slack.posted
+        assert secret not in posted
+        assert posted.startswith("❓ use ***REDACTED***?\n1. yes ***REDACTED***\n2. no\n")
+
+    def test_attachment_names_and_the_automatic_terminal_mirror_are_redacted(self, rig):
+        record = self._record("message", "typed", attachments=[{"name": f"{_SHAPED}.txt"}])
+        record["source"] = {"channel": "terminal", "author": _ENV_VALUE}
+        record["meta"] = {"fidelity": "confirmed"}
+        rig.connector._send_record(record)
+        (_, _, posted), = rig.slack.posted
+        assert _SHAPED not in posted and _ENV_VALUE not in posted
+
+    def test_the_quoted_question_in_an_answer_line_is_redacted(self, rig):
+        question = self._record("question", f"use {_SHAPED}?", id="q1")
+        answer = self._record("answer", "yes", in_reply_to="q1")
+        answer["source"] = {"channel": "matrix", "author": "@a:x"}
+        assert _SHAPED not in connector.render_outbound(answer, {"q1": question})
+
+    def test_the_connection_notice_is_redacted(self, rig):
+        rig.connector._send_notice(f"launched with {_ENV_VALUE}")
+        assert _ENV_VALUE not in rig.slack.posted[0][2]
+
+    def test_a_credential_cut_by_the_clip_is_still_redacted(self, rig):
+        # The token straddles the limit: clipped first, its surviving prefix
+        # would no longer look like a token.
+        lead = "x " * ((connector.MAX_SLACK_CHARS - 12) // 2)
+        rig.connector._send_record(self._record("message", lead + _SHAPED))
+        posted = rig.slack.posted[0][2]
+        assert "ghp_" not in posted
+        assert len(posted) <= connector.MAX_SLACK_CHARS
+
+    def test_a_credential_cut_by_the_answer_headline_is_still_redacted(self):
+        # _head keeps 80 characters of the question it quotes.
+        text = "a" * 70 + _SHAPED
+        question = self._record("question", text, id="q1")
+        answer = self._record("answer", "yes", in_reply_to="q1")
+        answer["source"] = {"channel": "matrix", "author": "@a:x"}
+        assert "ghp_" not in connector.render_outbound(answer, {"q1": question})
+
+    def test_the_bus_record_is_not_rewritten_and_the_answer_still_routes(self, rig):
+        rig.connector._poll_thread(replay=True)
+        question = rig.agent("question", "which?", options=[f"use {_SHAPED}", "no"])
+        record = question.to_dict()
+        rig.connector._send_record(record)
+        assert _SHAPED not in rig.slack.posted[-1][2]
+        assert record["options"][0] == f"use {_SHAPED}"
+        rig.slack.human_says("1")
+        assert rig.connector._poll_thread() == 1
+        answer = rig.log.read_since(question.seq)[0][0]
+        assert (answer.kind, answer.text, answer.in_reply_to) == ("answer", f"use {_SHAPED}", question.id)
+
+    def test_ordinary_text_is_untouched(self, rig):
+        rig.connector._send_record(self._record("message", "branch main is green"))
+        assert rig.slack.posted[0][2] == "branch main is green"
+
+    def test_matrix_headline_of_a_quoted_question_is_redacted(self):
+        # Matrix clips its own copy too, so the leak this pins is the 80-character
+        # headline, which the shared renderer used to cut before Matrix scrubbed.
+        from matrix_chat.connector import render_outbound as matrix_render
+
+        question = self._record("question", "a" * 70 + _SHAPED, id="q1")
+        answer = self._record("answer", "yes", in_reply_to="q1")
+        answer["source"] = {"channel": "slack", "author": "tester"}
+        assert "ghp_" not in matrix_render(answer, {"q1": question})
+
+    def test_a_launch_label_is_scrubbed_before_it_is_clipped_and_escaped(self, monkeypatch):
+        # The escape changes this value itself, so only a scrub of the raw label finds it.
+        special = "fabricated<&>label-value-0123456789"
+        monkeypatch.setenv("LMER_FABRICATED_ESCAPE_TOKEN", special)
+        for markup in (True, False):
+            clipped = connector.attachment_notice(
+                {"preset": "p" * 150 + " " + _SHAPED}, slack_markup=markup,
+            )
+            assert "ghp_" not in clipped
+            text = connector.attachment_notice({"model": special}, slack_markup=markup)
+            assert special not in text and html.escape(special, quote=False) not in text
+
+    def test_the_automatic_loop_posts_only_redacted_json_through_the_real_client(self, rig):
+        """Bus record → ``_outbound_once`` → ``SlackClient`` → the request JSON."""
+        from slack_chat.client import SlackClient
+
+        sent = []
+
+        class _Response:
+            headers: dict = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"ok": True, "ts": f"1700000500.{len(sent):06d}"}
+
+        client = SlackClient("xoxb-test")
+        client.session.request = lambda method, url, **kw: (sent.append((url, kw.get("json"))), _Response())[1]
+        rig.connector._slack = client
+        rig.connector._ensure_ready()
+        rig.agent("question", f"use {_SHAPED}?", options=[f"yes {_ENV_VALUE}", "no"])
+        rig.connector._outbound_once()
+        rig.connector._notice(f"launched with {_SHAPED} {_ENV_VALUE}", "attached")
+        assert len(sent) == 2
+        for url, payload in sent:
+            assert url.endswith("/chat.postMessage")
+            assert _SHAPED not in repr(payload) and _ENV_VALUE not in repr(payload)
+        assert sent[0][1]["text"].startswith("❓ use ***REDACTED***?\n1. yes ***REDACTED***\n2. no\n")
+        assert "***REDACTED***" in sent[1][1]["blocks"][0]["text"]["text"]

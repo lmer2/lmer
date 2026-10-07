@@ -1,0 +1,2 @@
+security:
+- "Slack mirroring and thread posts now redact credentials from messages, question options and notices before posting; Matrix no longer lets a clipped token escape redaction."
