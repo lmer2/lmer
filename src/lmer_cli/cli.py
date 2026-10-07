@@ -633,6 +633,8 @@ def parse_args(
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
+    parser.add_argument("--name", dest="run_name", help="kebab-case run name recorded at session start, exported to the container as LMER_RUN_NAME and applied once by `work session-start` (on the call that opens the record's session); names are unique per project — a held name is reported in the session's start output and the run stays unnamed. This flag is the only source: a host-exported or .env LMER_RUN_NAME is never forwarded. Refused with --no-task (no run context to record it in); with --exec it applies only if the command runs `work session-start`.")
+    parser.add_argument("--goal", dest="run_goal", help="Run goal recorded at session start, exported to the container as LMER_RUN_GOAL and applied once by `work session-start` (it replaces a goal inherited from a continuation source). This flag is the only source: a host-exported or .env LMER_RUN_GOAL is never forwarded. Refused with --no-task; with --exec it applies only if the command runs `work session-start`.")
     parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
     parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID.")
     parser.add_argument("--allow-unsigned-source", dest="allow_unsigned_source", metavar="SESSION_UID", help="Explicitly continue fresh when the selected schema-2 source has no final session_end. Must exactly equal --session, so the decision authorizes only that source; omit it to cancel/wait after a refusal.")
@@ -756,6 +758,30 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
         return None, None
 
     return host, path
+
+
+def container_task_target(
+    primary_target: str | None, host_repo_path: Path | None
+) -> str | None:
+    """The ``LMER_TASK_TARGET`` a launch exports for its primary target.
+
+    A local filesystem path (``.``, ``./``, ``../x``, an absolute checkout
+    path) is a plain project session: the repository comes from the
+    checkout's git origin, and the path spelling carries no identity worth a
+    slug — it used to be forwarded verbatim and every slug copy filed the run
+    under ``chat-.`` instead of the bare taskdef ``chat``. So when
+    ``resolve.normalize_repo_url`` resolved a host path (``host_repo_path``
+    is not None) the exported target is the **empty string**, which every
+    container reader already treats as "no target", and it is exported
+    empty rather than dropped so the container cannot fall back to whatever
+    its environment holds. A URL target (``host_repo_path`` is None) is
+    exported exactly as given, and ``primary_target`` itself — the value
+    the GitLab MR parsing, the host-repo mount and the secondary-target
+    list read — is never touched. Pure: no filesystem, no environment.
+    """
+    if host_repo_path is not None:
+        return ""
+    return primary_target
 
 
 def _derive_repo_url_from_task_target(target: str) -> str | None:
@@ -1476,6 +1502,28 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     if not ns.no_task and not ns.task and not ns.show_env:
         error("Task type is required unless --no-task is specified")
         return 2
+    # --name / --goal are recorded by `work session-start` inside the
+    # container; the host refuses only what the container could not record
+    # (normalisation itself stays in the container, with `work name`).
+    if ns.run_name is not None:
+        if not ns.run_name.strip():
+            error("--name requires a non-empty value")
+            return 2
+        if "\n" in ns.run_name or "\r" in ns.run_name:
+            error("--name must be a single line (a run name is a kebab-case label)")
+            return 2
+    if ns.run_goal is not None and not ns.run_goal.strip():
+        error("--goal requires a non-empty value")
+        return 2
+    if ns.run_name is not None or ns.run_goal is not None:
+        if ns.no_task:
+            error("--name/--goal need a run to record them in and are refused with --no-task")
+            return 2
+        if ns.exec_mode:
+            warning(
+                "ℹ️  --name/--goal are recorded by work session-start; "
+                "this --exec command must run it for them to apply"
+            )
     if ns.service and not ns.checkout:
         error("--service requires --checkout (path to local source checkout)")
         return 2
@@ -3164,7 +3212,12 @@ def main(argv: list[str] | None = None) -> int:
         **gpg_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
-        "LMER_TASK_TARGET": primary_target if not ns.no_task else None,
+        # Empty (delivered as `LMER_TASK_TARGET=`, never absent) for a local
+        # filesystem path target, so every slug copy derives the bare taskdef;
+        # the URL spelling otherwise. `primary_target` itself is untouched.
+        "LMER_TASK_TARGET": (
+            container_task_target(primary_target, host_repo_path) if not ns.no_task else None
+        ),
         "LMER_SESSION_KIND": os.environ.get("LMER_SESSION_KIND"),
         "LMER_WORKSPACE_ID": os.environ.get("LMER_WORKSPACE_ID"),
         "LMER_SECONDARY_TARGETS": ",".join(secondary_targets) if secondary_targets else None,
@@ -3213,6 +3266,15 @@ def main(argv: list[str] | None = None) -> int:
         # question-stop. Applied in-container by `work session-start` before
         # the brief prints.
         "LMER_ANSWER": ns.answer if ns.answer else None,
+        # A run's name and goal from the launch (`--name` / `--goal`), applied
+        # once in-container by `work session-start` on the call that opens
+        # the record's session. Sourced from the flags ONLY — no os.environ
+        # fallback, the LMER_ANSWER rule above: a name is one-shot launch
+        # data, and a stale export would name (or re-goal) every future run
+        # on the project. The None seeds block the .env merge below. A
+        # multi-line goal rides the `-e NAME` marker leg on its own.
+        "LMER_RUN_NAME": ns.run_name or None,
+        "LMER_RUN_GOAL": ns.run_goal or None,
         # The record this launch continues (issue #353 D22). Sourced from
         # --session ONLY — no os.environ fallback, and the reason is stronger
         # here than for the two flag-only entries above. LMER_SESSION_ID is

@@ -87,6 +87,7 @@ renaming them makes them silently invisible.
 | `_taskdef/` | you, or a mounted taskdef repo | `taskdef_search_dirs()` | yes (`_taskdef` then `taskdef`) | `lmer --task <name>` |
 | `_agents/` | see *Agent surface* | | yes | |
 | `_archive/` | housekeeping tooling | humans | n/a | nothing ships at schema 1 |
+| `README.md` | you (outside the markers); `lmer-schema index --write` (the block) | humans on GitLab; the validator | n/a | `lmer-schema index .` |
 | any other top-level name | humans | the validator | n/a | `lmer-schema validate` — project-shaped with no registry entry: `tree.unregistered-project` WARN; dotted: `tree.host-bucket` INFO; a registered remote's old path as a real directory: `tree.bucket-collision` ERROR |
 
 **`_napkin/` has no reader in this release.** Subdir mode resolves
@@ -111,6 +112,7 @@ your notes in two and the validator will not say a word, because a bare
 | `<project>/_taskdef/` | you | `taskdef_search_dirs()` | yes | `lmer --task <name>` |
 | `<project>/_agents/` | see *Agent surface* | | no (memory) | |
 | `<project>/_archive/` | housekeeping; the session cleaner | humans | n/a | nothing ships at schema 1 |
+| `<project>/README.md` | every durability push in the project (block); you (outside); `lmer-schema index --write` | humans on GitLab; the validator | no | `work commit` |
 
 ### Session directory
 
@@ -341,6 +343,15 @@ commit).
 holds migrated and unmigrated projects at once; that is the point of the `_`
 prefix.
 
+**9. Render the index blocks.** `lmer-schema index . --write` (preview first
+without `--write`): every project README gets its generated run table and the
+root README its project list, text outside the markers untouched. Commit the
+result as one change through the normal gated commit — the root `README.md`
+included: no session's push ever stages it, so `work commit` would leave it
+behind. From here every durability push keeps the project blocks fresh on
+its own; the root block is yours to re-render, and commit the same way, when
+`_plexus.yaml` changes.
+
 ### What to leave alone
 
 - `napkin/` — no reader for `_napkin/` in this release (§2).
@@ -348,6 +359,8 @@ prefix.
   legacy and read-side fallback; both informational, neither required to move.
 - Instance `agent-files/`, `mirrors/`, `taskdef/` — dual-read, so they migrate
   independently and whenever you like.
+- `<project>/README.md` text outside the markers is yours; the block is
+  regenerated; edit the hand text in a separate clone while sessions push.
 
 ## 4. Cutting over from schema 1 to schema 2
 
@@ -358,6 +371,43 @@ CLIs, containers, platform-launched sessions and independent harness children.
 A schema-1-only runtime refuses the newer manifest. Stop existing writers
 before cutover; a clean validator does not prove that the fleet is stopped.
 Keep the legacy layout adoption in §3 separate from this version change.
+
+Upgrade every operator's host `lmer` as well, before the cut-over, not only
+the image: the host CLI alone exports `LMER_TASK_TARGET`, so a lagging host
+keeps filing local-path launches (`lmer chat .`) under `chat-.` beside the
+`chat` groups that current hosts create. The migration owner can detect a
+lagging host afterwards with one line — any `chat-.` record added after the
+cut-over names it in the commit's author:
+
+```bash
+git log --since=<cutover> --diff-filter=A --name-only -- '*/_runs/chat-./*' | grep -c state.yaml
+```
+
+On each operator host, from the checkout of the merged tree:
+
+1. Reinstall the CLI so `lmer`, `work` and `lmer-schema` run that tree:
+   `uv tool install --force --from <checkout> lmer` (a copied install,
+   repeated after every pull) or `uv tool install --force --editable
+   <checkout>` (follows the checkout). `lmer-schema --list-checks` lists
+   61 codes on this release.
+2. Re-run `bash <checkout>/hooks/install.sh`. The pre-push hook it writes is
+   not self-updating — the container entrypoint installs it only into a
+   checkout that has none — so a checkout set up before #116 keeps a hook
+   that substring-matches the remote URL and refuses every `repo|refpattern`
+   allow-list entry. The symptom is `gate-push` passing every check,
+   including the full suite, and the push itself then failing with
+   `PUSH BLOCKED: Repository not in allow list`.
+   `grep -q refpattern <checkout>/.git/hooks/pre-push` confirms the current
+   hook; linked worktrees share the checkout's hooks, so one run covers
+   them. The installer also writes the `rgr`/`rgrpc`/`pc` wrappers into
+   `~/.local/bin` and leaves existing `~/.claude/commands` and
+   `~/.claude/settings.json` alone.
+3. Rebuild the session image.
+
+In the session image, confirm that PyYAML bundles libyaml
+(`python3 -c "import yaml; assert yaml.__with_libyaml__"`): the index
+kernel's fast reader keeps the per-push render cheap either way, and libyaml
+makes its full-parse fallback an order of magnitude faster.
 
 Use an isolated clone of the intended committed migration tree. A plain
 `git clone` does not copy staged or unstaged changes from a live checkout.
@@ -441,6 +491,47 @@ state. After v2 records, shared claims or retirement markers exist, changing
 `schema: 2` back to `1` is not a safe rollback; retain a v2-capable runtime
 and recover with the recorded data intact.
 
+### Survey chain depth, then backfill the index blocks
+
+Every durability push in a project re-renders that project's `README.md`
+index block from its records, and a continuation record embeds its source's
+whole state, so the deepest continuation chain sets the per-push cost. Survey
+it before the cut-over: `grep -c '^context:'` is not enough (it counts one
+level per record), so count the `source_session_uid` links and follow them to
+the longest chain. A 20-deep chain renders in tens of milliseconds with the
+kernel's context cut; a project that measures much slower deserves a look
+before hundreds of sessions start paying for it on every push.
+
+After the manifest change is published, backfill the blocks as an explicit
+step of the migration, not as something the first pushes will get round to:
+
+```bash
+lmer-schema index .
+lmer-schema index . --write
+lmer-schema validate .
+```
+
+The preview lists one action per README (`create`, `update`, `unchanged`, or
+`refused` with its reason); `--write` creates every project README that is
+missing — a registered project without records gets the zero-record block —
+and the root project list, text outside the markers untouched. Commit the
+result through the normal gated commit, and make sure the root `README.md` is
+in it: `work commit` publishes records, specs, memory and project READMEs,
+never the root, which stays off the push hot path on purpose. The `--write`
+summary line says so whenever it wrote the root (`commit the root README.md
+explicitly through the normal gated commit`); a root left to `work commit`
+stays uncommitted and disappears with the container. From then on the
+project blocks keep themselves fresh; the root block is re-rendered, and
+committed the same way, when `_plexus.yaml` changes.
+
+The backfill never writes inside a historical record. A project directory is
+written into only when it is the real directory its name says: one that is a
+symlink (a registered short name aliased to another path), resolves outside
+the repository, or lies inside a `_runs/` record is `refused` before
+anything is written, and the publication path skips it with a warning. An
+alias like that is a layout error to fix, not a project to index; running
+the command through a symlink to the repository root is fine.
+
 ## 5. Test checklist
 
 Run these checks against the runtime version you intend to deploy. The
@@ -452,13 +543,13 @@ is any empty directory.
 **1. The validator is installed and complete.**
 
 ```bash
-PYTHONPATH=src python -m lmer_schema.cli --list-checks | wc -l      # v2: 59
+PYTHONPATH=src python -m lmer_schema.cli --list-checks | wc -l      # v2: 61
 PYTHONPATH=src python -m lmer_schema.cli --list-checks --json \
   | python -c 'import json,sys; d=json.load(sys.stdin); print(len(d["checks"]))'
 ```
 
-The v2 runtime registers 59 codes: 29 ERROR, 21 WARN, 9 INFO; tiers
-`machine` 50, `legacy` 5, `not-schema` 3, `opaque` 1. The schema-1 runtime
+The v2 runtime registers 61 codes: 29 ERROR, 22 WARN, 10 INFO; tiers
+`machine` 52, `legacy` 5, `not-schema` 3, `opaque` 1. The schema-1 runtime
 registered 56 codes (26 ERROR and 47 machine-tier checks). Five soften under the legacy tier
 (`agents.memory-entry-without-file`, `agents.memory-scope-mismatch`,
 `index.dangling-link`, `index.entry-without-file`,
@@ -482,10 +573,11 @@ PYTHONPATH=src python -m lmer_schema.cli validate "$SCRATCH/plexus-legacy"; echo
 ```
 
 On the v2 runtime the schema-1 fixture gives `exit=0`,
-`0 error(s), 1 warning(s), 2 informational`: `manifest.schema-older`, plus
-`tree.host-bucket` for the fixture's unnamed repo and `record.session-stale`
-for its in-progress session. Legacy tree: `exit=0`, `0 / 0 / 7`, verdict line
-ending *"a migration aid, not a gate"*.
+`0 error(s), 1 warning(s), 3 informational`: `manifest.schema-older`, plus
+`tree.host-bucket` for the fixture's unnamed repo, `record.session-stale` for
+its in-progress session and `index.readme-missing` for `lmer/README.md` (the
+project holds run records and no generated index block). Legacy tree:
+`exit=0`, `0 / 0 / 7`, verdict line ending *"a migration aid, not a gate"*.
 
 **3. Exit codes mean what they say.**
 
@@ -509,7 +601,7 @@ PYTHONPATH=src python -m lmer_schema.cli validate "$SCRATCH/plexus-schema" --jso
   | python -c 'import json,sys; d=json.load(sys.stdin); print(d["form"], d["exit_code"], d["counts"])'
 ```
 
-On the v2 runtime: `schema 0 {'error': 0, 'warn': 1, 'info': 2}`. Every finding carries exactly
+On the v2 runtime: `schema 0 {'error': 0, 'warn': 1, 'info': 3}`. Every finding carries exactly
 `code`, `severity`, `path`, `message`, `detail`; `path` is repo-relative and
 never absolute.
 
@@ -536,6 +628,21 @@ declares one (`.lmer/gate-check.yaml`), so a docs-only branch runs that subset,
 not the whole suite. The subset lists `tests/test_lmer_schema_cli.py`, the
 two-directional check that `--list-checks` and SCHEMA.md's check-code table
 agree.
+
+**7. The index blocks are fresh.**
+
+```bash
+PYTHONPATH=src python -m lmer_schema.cli index "$TREE"; echo "exit=$?"       # 0
+```
+
+- `lmer-schema index $TREE` prints `unchanged` for every file and exits `0`;
+  a `create` or `update` is a block the next push would rewrite anyway
+  (`--write` applies it now), and a `refused` line names a README a human has
+  to fix (the reason is on the line).
+- Validate a clean clone: the validator and the dry run both render what is
+  on disk without consulting git, so a checkout holding unpushed records may
+  report `index.readme-stale` where a clean clone of the same repository is
+  silent.
 
 ## See also
 

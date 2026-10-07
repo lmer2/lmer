@@ -1497,6 +1497,14 @@ def list_sessions(
     `orphaned=None` — no verdict, rather than a verdict of "fine". Dropping
     it would be how a live run disappears from the operator's view, which is
     the failure this listing exists to prevent.
+
+    A schema-2 row has no `orphaned` verdict (nothing infers death from a
+    claim or a timestamp there); it carries `signed_out` and, derived from
+    the record plus this call's own `now`, `state` — one of `closed`,
+    `waiting on question`, `ended, not closed`, `active`, `stale`
+    (:func:`session_record.display_state`, the 14-day
+    :data:`session_record.STALE_AFTER_SECONDS` window). Every row carries
+    the record's `stop_reason`.
     """
     if base is None:
         base = runs_base()
@@ -1514,6 +1522,7 @@ def list_sessions(
             "slug": None,
             "name": None,
             "status": None,
+            "stop_reason": None,
             "phase": None,
             "created": None,
             "updated": None,
@@ -1526,6 +1535,7 @@ def list_sessions(
                     "slug": state.get("slug"),
                     "name": state.get("name"),
                     "status": state.get("status"),
+                    "stop_reason": state.get("stop_reason"),
                     "phase": state.get("phase"),
                     "created": state.get("created"),
                     "updated": state.get("updated"),
@@ -1535,7 +1545,7 @@ def list_sessions(
                 }
             )
             if state.get("schema") == 2:
-                from .session_record import signed_out
+                from .session_record import display_state, signed_out
 
                 row["session"] = state.get("session")
                 # `seeded`: `work seed` wrote it and nothing has run in it
@@ -1545,6 +1555,14 @@ def list_sessions(
 
                 row["seeded"] = is_seeded(state, read_events(rdir, last_n=0))
                 row["signed_out"] = signed_out(read_events(rdir, last_n=0))
+                row["state"] = display_state(
+                    readable=True,
+                    status=state.get("status"),
+                    stop_reason=state.get("stop_reason"),
+                    signed_out=row["signed_out"],
+                    updated=state.get("updated"),
+                    now=now,
+                )
         rows.append(row)
     if any("session" in row for row in rows):
         from .session_record import sort_key

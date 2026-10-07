@@ -487,6 +487,30 @@ def work_repo_manifest_problem() -> Optional[str]:
     return work_repo_layout().problem
 
 
+def work_repo_project_rels(root: Path) -> list[str]:
+    """Repo-relative dirs of every project of the plexus at *root*.
+
+    Registered projects first, in registry order, then the host buckets —
+    exactly what the core's walk yields for the tree's own registry — and
+    ``[]`` on a legacy tree (no manifest), where there is no project set to
+    speak of. This is the work CLI's one spelling of "which directories are
+    projects" (the publication choke point indexes exactly these), kept here
+    because naming the core's walk IS re-deriving the form (issue #353 D20).
+
+    A present manifest the core cannot use raises what the core raises
+    (``ManifestError``, ``RegistryError``), and a build without the core
+    raises ``ImportError``: the caller decides its own fallback, never this
+    function, which would otherwise have to guess at a project set.
+    """
+    from lmer_schema.checks.walk import project_dirs
+    from lmer_schema.registry import load_registry
+
+    registry = load_registry(root)
+    if registry is None:
+        return []
+    return [project.rel for project in project_dirs(root, registry=registry)]
+
+
 def _schema_layout(root, repo_host, repo_project, legacy_base):
     """The schema-form layout, or ``None`` when this is not that case.
 

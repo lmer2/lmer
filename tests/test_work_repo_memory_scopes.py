@@ -717,9 +717,12 @@ class TestWriteScopeNamesWhatIsWritten:
             f"{PROJECT}/_agents/memory",
             "_agents/memory",
         ]
+        # The push behind persist may also regenerate or sweep the project's
+        # README index block, so the journalled scope names it too.
         assert self._intent(command="memory", memory_action="persist") == [
             f"{PROJECT}/_agents/memory",
             "_agents/memory",
+            f"{PROJECT}/README.md",
         ]
 
     def test_no_run_context_names_nothing(self, monkeypatch, tmp_path):

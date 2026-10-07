@@ -1,0 +1,10 @@
+added:
+- "generated project index: every durability push renders the `<project>/README.md` index block (one row per committed run record, newest first) and stages it with the record; `lmer-schema index PATH [--write] [--diff]` previews and backfills every project README and the root README's project list"
+- "`lmer --name <kebab> --goal <text>` record a run's name and goal at session start; every push prints a one-line reminder while a run is unnamed"
+- "validator codes `index.readme-missing` (INFO) and `index.readme-stale` (WARN) for the generated README index blocks"
+changed:
+- "a local filesystem path target (`.`, `./`, `../x`) is a plain project session: the host exports an empty task target, so the slug is the bare taskdef (`chat`, not `chat-.`); existing `chat-.` groups stay addressable by their recorded slug and `work session-start` warns when a continuation crosses groups; such records are host-only — the platform's resume and answer refuse an empty recorded target until a follow-up lands"
+- "a rebase conflict confined to generated README index blocks is resolved by rendering them again from the merged tree (the usual case when two sessions push in one project); any other conflict aborts publication as before; every git call `work_repo.git_ops` makes (the publication path: pull --rebase, rebase --continue, commit, push) runs with GIT_EDITOR and GIT_SEQUENCE_EDITOR pinned to `true`"
+- "`work sessions` on a schema-2 work repo reports a derived state per row (closed, waiting on question, ended not closed, active, stale) and `--json` rows carry `stop_reason` and `state`"
+fixed:
+- "`work sessions` on a schema-2 work repo no longer prints `state unreadable` on every row"

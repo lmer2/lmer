@@ -326,14 +326,17 @@ def _check_record(context: Context) -> None:
 
 
 def _check_index_links(context: Context) -> None:
-    """``check_index_links(root, report, *, projects=None) -> None`` — the
-    same project list, spelled ``projects=`` here.
+    """``check_index_links(root, report, *, projects=None, manifest=None) ->
+    None`` — the same project list, spelled ``projects=`` here, and the
+    manifest loaded once at the top of the run, which gates the generated
+    README index codes (a legacy tree has no index, so none is passed there).
 
     This module decides the bucket tier itself (from the top-level name), so
     the view would leave every one of its findings alone; it gets the report.
     """
     index_checks.check_index_links(
-        context.root, context.report, projects=context.project_dirs
+        context.root, context.report, projects=context.project_dirs,
+        manifest=context.manifest,
     )
 
 

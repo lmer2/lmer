@@ -30,7 +30,8 @@ from lmer_cli.container.clone_and_exec import _scrub_credentials
 # definition, and a second copy here would drift from the gates that write it.
 from lmer_cli import gate_lock
 
-from .run_state import append_event, run_dir, run_rel_path_candidates
+from . import project_index, utils
+from .run_state import LEGACY_STATE_FILE, STATE_FILE, append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
 from .utils import no_run_context_error, task_target_dir, work_repo_layout
 from .transactions import (
@@ -39,6 +40,31 @@ from .transactions import (
 )
 
 PUSH_RETRIES = 3
+
+#: The environment every git call this module makes runs with, over the
+#: process's own. ``LC_ALL=C`` pins git's message locale: claim_push_once
+#: classifies CAS outcomes by substring-matching English output, and a
+#: localized "non-fast-forward" would misread as CLAIM_PUSH_ERROR (fail-closed
+#: direction, but it would break the bounded re-evaluate loop). The two editor
+#: variables pin ``rebase --continue`` to finish without an editor when the
+#: index-conflict handler resumes a paused rebase: an exported ``GIT_EDITOR``
+#: outranks ``-c core.editor``, so a host or container that exports one would
+#: otherwise leave the rebase paused. The ``-c`` flags on that call stay as
+#: belt and braces.
+_GIT_BASE_ENV = {"LC_ALL": "C", "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+
+#: Bound on OUR unpushed commits replaying onto a changed project README in
+#: one pull — normally one — not on upstream's commits or the push attempts.
+INDEX_CONFLICT_ROUNDS = 10
+
+#: The index lines of the CLI surface (docs/WORK-REPO-SAFETY.md, the design spec).
+INDEX_NUDGE = (
+    "💡 this run has no name yet — work name <kebab-case> (or launch with lmer --name); "
+    "the index lists it by its goal or first log line until then"
+)
+INDEX_SKIPPED = "⚠️  project index skipped: "
+INDEX_LEFTOVER_SKIPPED = "⚠️  project index leftover skipped: "
+INDEX_RESOLVED = "↻ regenerated project index on the merged head"
 
 #: Where a deferred commit parks its trace until a commit can actually land
 #: (issue #201). It lives beside the gate markers in /tmp, NOT in the run dir,
@@ -108,17 +134,15 @@ def run_git_command(
         Tuple of (exit_code, output)
     """
     try:
-        # LC_ALL=C pins git's message locale: claim_push_once classifies CAS
-        # outcomes by substring-matching English output, and a localized
-        # "non-fast-forward" would misread as CLAIM_PUSH_ERROR (fail-closed
-        # direction, but it would break the bounded re-evaluate loop).
+        # The base env (locale, editors) is the one place that reaches every
+        # call: the push-safety tests' shim drops ``extra_env`` on purpose.
         result = subprocess.run(
             ["git"] + cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
             check=check,
-            env={**os.environ, "LC_ALL": "C", **(extra_env or {})},
+            env={**os.environ, **_GIT_BASE_ENV, **(extra_env or {})},
         )
         if result.returncode == 0:
             return result.returncode, result.stdout
@@ -665,6 +689,248 @@ def _verify_published(
     return 0
 
 
+# ---------------------------------------------------------------------------
+# The project README index at the choke point
+# ---------------------------------------------------------------------------
+#
+# Every durability push and every pending replay crosses
+# _commit_work_path_locked, so that is where a project's README index block is
+# rendered from the records the commit will contain and staged with them. The
+# kernel (work_repo.project_index) renders and splices; nothing here composes a
+# line. Everything here is fail-soft to a fault: a README the generator must
+# not touch is skipped with one warning, and no exception raised while
+# regenerating may change a push's exit code — the record publishes exactly
+# as it did before the index existed (design spec, "Concurrency and failure
+# handling").
+
+
+def _index_project_rels(work_repo_path: Path) -> list[str]:
+    """Repo-relative dirs of every project whose README carries an index block.
+
+    Registered projects first, in registry order, then the host buckets —
+    :func:`work_repo.utils.work_repo_project_rels`, the one module in the
+    work CLI that spells the core's walk (issue #353 D20; the core is
+    imported there, lazily, so the import direction stays ``work_repo ->
+    lmer_schema``). ``[]`` on a legacy tree (no manifest) and when the schema
+    core is not installed. When the manifest is present but unusable, this
+    session's own base — the host bucket the layout resolves to — so its push
+    still indexes where it writes.
+    """
+    try:
+        return utils.work_repo_project_rels(Path(work_repo_path))
+    except ImportError:
+        return []
+    except Exception:
+        try:
+            base = _rel_to_root(work_repo_layout().base, Path(work_repo_path))
+        except Exception:
+            return []
+        return [base] if base else []
+
+
+def _porcelain_paths(output: str) -> list[str]:
+    """The paths a ``status --porcelain -z`` listing names, a rename's source included."""
+    paths: list[str] = []
+    fields = output.split("\0")
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        paths.append(path)
+        if ("R" in status or "C" in status) and index < len(fields):
+            paths.append(fields[index])
+            index += 1
+    return paths
+
+
+def _dirty_index_rels(work_repo_path: Path) -> list[str]:
+    """Project READMEs a tool left dirty: generated (both markers), no marker line.
+
+    The crash shape: a session wrote its record and its README, then the
+    container went away before the commit. The next push from any session in
+    the checkout commits that README rather than letting ``pull --rebase
+    --autostash`` carry it. A human's markerless draft is never swept (the
+    project's next record push appends the block to it); a README whose hand
+    text holds a conflict-marker line, or whose block a newer runtime wrote
+    (this one must not downgrade it), is named and left alone. Only what the
+    refresh can actually stage is selected. No git call when the tree has no
+    project dirs: a bare ``git status --porcelain --`` would report the whole
+    worktree. The untracked mode is named on the command line: a leftover
+    README is untracked until its first commit, and a checkout whose config
+    says ``status.showUntrackedFiles=no`` would otherwise hide it. A README
+    whose project directory is outside the write boundary (a tracked
+    project dir later replaced by a symlink is listed as deleted, and the
+    file read through the link may carry a block) is named and left alone.
+    """
+    try:
+        projects = _index_project_rels(work_repo_path)
+        if not projects:
+            return []
+        readmes = [f"{rel}/{project_index.README_NAME}" for rel in projects]
+        rc, output = run_git_command(
+            ["status", "--porcelain", "-z", "--untracked-files=normal", "--", *readmes],
+            work_repo_path, check=False,
+        )
+        if rc != 0:
+            return []
+        leftovers: list[str] = []
+        for rel in _porcelain_paths(output):
+            if rel not in readmes or rel in leftovers:
+                continue
+            boundary = project_index.project_dir_refusal(
+                work_repo_path, rel[: -(len(project_index.README_NAME) + 1)]
+            )
+            if boundary is not None:
+                print(f"{INDEX_LEFTOVER_SKIPPED}{rel} — {boundary}")
+                continue
+            path = Path(work_repo_path) / rel
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                text = path.read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                block = project_index.extract_block(text)
+            except project_index.MalformedMarkers:
+                continue
+            if block is None:
+                continue
+            token = project_index.block_format(block)
+            if token is not None and token > project_index.FORMAT:
+                print(
+                    f"{INDEX_LEFTOVER_SKIPPED}{rel} — index block is of a newer format "
+                    f"({token} > {project_index.FORMAT}); upgrade lmer"
+                )
+                continue
+            if project_index.hand_text_has_marker(text):
+                print(
+                    f"{INDEX_LEFTOVER_SKIPPED}{rel} — hand text holds a conflict-marker line "
+                    "(seven = < > or |); indent or lengthen the line"
+                )
+                continue
+            leftovers.append(rel)
+        return leftovers
+    except Exception as exc:
+        print(f"{INDEX_LEFTOVER_SKIPPED}{exc}")
+        return []
+
+
+def _project_heading(project_rel: str) -> str:
+    """What a README created from nothing is headed with: the short name — a
+    registered project's rel IS its name, and a bucket's last segment is the
+    repository's."""
+    return project_rel.rsplit("/", 1)[-1]
+
+
+def _ignored(work_repo_path: Path, rel: str) -> bool:
+    """Whether the checkout's ignore rules would make ``git add`` refuse *rel*."""
+    rc, _ = run_git_command(["check-ignore", "-q", "--", rel], work_repo_path, check=False)
+    return rc == 0
+
+
+def _refresh_project_indexes(
+    work_repo_path: Path, paths: list[str], leftovers: list[str]
+) -> tuple[list[str], list[tuple[str, Optional[bytes]]]]:
+    """Render the README index block of every project this commit touches.
+
+    The projects are those owning a staged ``_runs`` path plus the projects
+    of the swept *leftovers*. Each is rendered over the records whose state
+    file is tracked or lies under a staged path — exactly what the commit
+    will contain, so no row can point at a directory origin will not have —
+    and written only when the bytes differ. Returns ``(README rels to stage,
+    [(rel, previous bytes or None)] for every file rewritten)`` so a refused
+    staging can put the files back. A README that is ignored, a symlink, a
+    directory, malformed, of a newer format, or whose hand text holds a
+    conflict-marker line is skipped with one warning and the record still
+    publishes. A project directory outside the write boundary
+    (:func:`work_repo.project_index.project_dir_refusal`: a symlink, a path
+    resolving outside the checkout, a ``_runs`` record) is skipped the same
+    way, before any git call or write in it. Any other exception restores
+    what was already rewritten and yields ``([], [])`` after a warning: the
+    push's exit code is never this function's to change.
+    """
+    written: list[tuple[str, Optional[bytes]]] = []
+    current: Optional[str] = None
+    try:
+        projects = _index_project_rels(work_repo_path)
+        if not projects:
+            return [], []
+        targets = project_index.project_rels_for_paths(paths, projects)
+        for rel in leftovers:
+            project = rel.rsplit("/", 1)[0]
+            if project not in targets:
+                targets.append(project)
+        staged: list[str] = []
+        for project in targets:
+            current = readme_rel = f"{project}/{project_index.README_NAME}"
+            try:
+                boundary = project_index.project_dir_refusal(work_repo_path, project)
+                if boundary is not None:
+                    raise project_index.IndexSkipped(boundary)
+                if _ignored(work_repo_path, readme_rel):
+                    raise project_index.IndexSkipped("ignored by the checkout (git add would refuse it)")
+                include = project_index.tracked_record_filter(work_repo_path, project, staged=paths)
+                changed, previous = project_index.write_project_readme(
+                    Path(work_repo_path) / project, include=include, project_rel=project,
+                    heading=_project_heading(project),
+                )
+            except project_index.IndexSkipped as exc:
+                print(f"{INDEX_SKIPPED}{readme_rel} — {exc}")
+                continue
+            if changed:
+                written.append((readme_rel, previous))
+            if changed or readme_rel in leftovers:
+                staged.append(readme_rel)
+        return staged, written
+    except Exception as exc:
+        print(f"{INDEX_SKIPPED}{current or 'all projects'} — {exc}")
+        _restore_index_files(work_repo_path, written)
+        return [], []
+
+
+def _restore_index_files(work_repo_path: Path, previous: list[tuple[str, Optional[bytes]]]) -> None:
+    """Put every README the regeneration rewrote back to its pre-call bytes,
+    removing a file that did not exist before. Fail-soft."""
+    for rel, data in previous:
+        path = Path(work_repo_path) / rel
+        try:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(data)
+        except OSError as exc:
+            print(f"⚠️  project index restore failed: {rel} — {exc}", file=sys.stderr)
+
+
+def _nudge_unnamed(rdir: Optional[Path]) -> None:
+    """One stdout line while this run's record is readable and has no name.
+
+    Every durability push prints it (R4(b) of the design brief): the index
+    lists an unnamed run by its goal or first log line, and `work name` is
+    the cure. Read with the kernel's lock-free fast reader; fail-soft.
+    """
+    if rdir is None:
+        return
+    try:
+        rdir = Path(rdir)
+        path = next((rdir / name for name in (STATE_FILE, LEGACY_STATE_FILE)
+                     if (rdir / name).exists()), None)
+        if path is None:
+            return
+        state = project_index.read_state_fast(path)
+        if not isinstance(state, dict):
+            return
+        name = state.get("name")
+        if name is None or (isinstance(name, str) and not name.strip()):
+            print(INDEX_NUDGE)
+    except Exception:
+        pass
+
+
 def commit_work_path(target_path, commit_message=None, allow_during_gate=False) -> int:
     """Serialize publication and replay complete deferred transition paths.
 
@@ -779,22 +1045,44 @@ def _commit_work_path_locked(
         _queue_deferral(_current_run_dir(), marker, paths)
         return 0
 
-    if not paths:
+    # Every durability push that gets past the gate — the no-op and
+    # leftover-only branches included — reminds an unnamed run of its name,
+    # and sweeps a generated README a crashed session left dirty.
+    rdir = _current_run_dir()
+    _nudge_unnamed(rdir)
+    leftovers = _dirty_index_rels(work_repo_path)
+    if not paths and not leftovers:
         print("No existing paths to commit in work repository")
         return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
 
     # Parked deferrals land as events now, so this commit carries the trace of
     # the commits it is standing in for.
-    flushed = _flush_deferrals(_current_run_dir())
+    flushed = _flush_deferrals(rdir)
     if flushed:
         print(
             f"↩️  Recording {flushed} commit deferred during a gate window "
             "(issue #201); this commit carries the trace."
         )
 
+    # The project README index blocks, rendered from the records this commit
+    # will contain and staged with them; never persisted into a pending entry
+    # (recomputed per call), so pending-path semantics are untouched.
+    index_rels, previous = _refresh_project_indexes(work_repo_path, paths, leftovers)
+    paths = paths + [rel for rel in index_rels if rel not in paths]
+    if not paths:
+        # Only a leftover got this far and the refresh could not stage it (a
+        # skip, or a failure that put it back): nothing is ours to commit, and
+        # an empty pathspec would hand `git add -A` the whole shared worktree
+        # — every sibling's record and anything else lying around.
+        print("No existing paths to commit in work repository")
+        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
+
     print(f"➕ Staging {', '.join(paths)} in work repository...")
     rc, status_output = _stage_and_check(work_repo_path, paths, "work repo")
     if rc != 0:
+        # The git index is already back (_stage_and_check); the README bytes
+        # follow, so a refused push leaves the file exactly as it found it.
+        _restore_index_files(work_repo_path, previous)
         return rc
     if not status_output.strip():
         print("No new file changes to commit in work repository")
@@ -846,7 +1134,7 @@ def _git_raw(
     """``git`` with byte-exact input and output — content must round-trip."""
     result = subprocess.run(
         ["git", *args], cwd=str(repo_path), input=stdin, capture_output=True,
-        env={**os.environ, "LC_ALL": "C", **(extra_env or {})},
+        env={**os.environ, **_GIT_BASE_ENV, **(extra_env or {})},
     )
     if result.returncode == 0:
         return 0, result.stdout
@@ -1007,6 +1295,119 @@ def _stash_head(repo_path: Path, label: str) -> tuple[int, str]:
     return 0, output.strip()
 
 
+def _rebase_in_progress(repo_path: Path) -> bool:
+    """Whether a rebase is paused in *repo_path* — quietly, with no failure line."""
+    rc, output = run_git_command(["rev-parse", "--absolute-git-dir"], repo_path, check=False)
+    if rc != 0 or not output.strip():
+        return False
+    git_dir = Path(output.strip())
+    return any((git_dir / name).exists() for name in ("rebase-merge", "rebase-apply"))
+
+
+def _is_index_rel(repo_path: Path, rel: str) -> bool:
+    """Whether *rel* is a project README this runtime regenerates."""
+    readme = project_index.README_NAME
+    return rel in {f"{project}/{readme}" for project in _index_project_rels(repo_path)}
+
+
+def _index_stage(repo_path: Path, stage: int, rel: str) -> Optional[str]:
+    """The text of *rel* at index *stage* during a paused rebase — 2 is
+    upstream, 3 the commit being replayed — or ``None`` when that stage is
+    missing (a delete/modify conflict) or the blob is not UTF-8 text."""
+    rc, data = _git_raw(repo_path, ["show", f":{stage}:{rel}"])
+    if rc != 0:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _regenerate_conflicted_readme(repo_path: Path, rel: str) -> bool:
+    """Resolve one conflicted project README inside the paused rebase.
+
+    Only a conflict confined to the generated block is this command's to
+    resolve: both stages must exist, both must carry well-formed markers, the
+    text outside the markers must be identical on both sides (a human's
+    conflict in the prose is a human's to merge) and upstream's block must
+    not be of a newer format (a newer runtime wrote it; this one must not
+    downgrade it). The resolution keeps upstream's hand text and renders the
+    block again from the merged tree — the index holds upstream's records
+    and this commit's own, and the tracked filter keeps an untracked sibling
+    that remains visible in the worktree out — then stages the file.
+    """
+    upstream = _index_stage(repo_path, 2, rel)
+    ours = _index_stage(repo_path, 3, rel)
+    if upstream is None or ours is None:
+        return False
+    try:
+        token = project_index.block_format(project_index.extract_block(upstream))
+        project_index.extract_block(ours)
+        same_hand_text = project_index.strip_block(upstream) == project_index.strip_block(ours)
+    except project_index.MalformedMarkers:
+        return False
+    if token is not None and token > project_index.FORMAT:
+        return False
+    if not same_hand_text:
+        return False
+    project = rel[: -(len(project_index.README_NAME) + 1)]
+    include = project_index.tracked_record_filter(repo_path, project)
+    block = project_index.render_project_block(
+        project_index.scan_project(Path(repo_path) / project, include=include, project_rel=project)
+    )
+    text = project_index.splice_block(upstream, block, heading=_project_heading(project))
+    (Path(repo_path) / rel).write_bytes(text.encode("utf-8"))
+    rc, _ = run_git_command(["add", "--", rel], repo_path, check=False)
+    return rc == 0
+
+
+def _continue_past_index_conflicts(repo_path: Path, label: str) -> bool:
+    """Finish a paused rebase whose only conflicts are generated README blocks.
+
+    The normal path for concurrent writers in one project: two new rows
+    under the header, or a new row beside the previously newest row's edit,
+    are adjacent hunks and conflict. Each round regenerates every unmerged
+    README (:func:`_regenerate_conflicted_readme`) and runs ``rebase
+    --continue`` with the editors pinned; a replay that regenerates to
+    upstream's bytes is dropped by ``--continue`` itself (git ≥ 2.26, merge
+    backend). Another of our unpushed commits stopping on the README starts
+    the next round, bounded by :data:`INDEX_CONFLICT_ROUNDS`.
+
+    ``True`` when the rebase completed with only index files regenerated.
+    ``False`` — so the caller's ``❌`` line and ``rebase --abort`` run exactly
+    as before — for any unmerged path that is not a project README, a
+    missing stage, malformed markers on either side, a newer-format upstream
+    block, hand text that differs, a ``rebase --continue`` that fails for
+    any other reason, the bound exhausted, or anything raising. *label*
+    names the repository as every publication helper is told it; this one
+    prints nothing of its own, because the caller already names the failure.
+    """
+    try:
+        for _round in range(INDEX_CONFLICT_ROUNDS):
+            rc, output = run_git_command(
+                ["diff", "--name-only", "-z", "--diff-filter=U"], repo_path, check=False
+            )
+            if rc != 0:
+                return False
+            unmerged = [rel for rel in output.split("\0") if rel]
+            if not unmerged or not all(_is_index_rel(repo_path, rel) for rel in unmerged):
+                return False
+            for rel in unmerged:
+                if not _regenerate_conflicted_readme(repo_path, rel):
+                    return False
+            rc, output = run_git_command(
+                ["-c", "core.editor=true", "-c", "sequence.editor=true", "rebase", "--continue"],
+                repo_path, check=False,
+            )
+            if rc == 0:
+                return not _rebase_in_progress(repo_path)
+            if not _rebase_in_progress(repo_path):
+                return False
+        return False
+    except Exception:
+        return False
+
+
 def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
     """Publish existing commits for work, napkin, and pending-commit retries.
 
@@ -1028,20 +1429,26 @@ def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
             ["pull", "--rebase", "--autostash", remote, ref], repo_path, check=False
         )
         if rc != 0:
-            _git_failure("git pull --rebase", label, rc, output)
-            git_dir = _git_directory(repo_path, label)
-            if git_dir and any(
-                (git_dir / p).exists() for p in ("rebase-merge", "rebase-apply")
-            ):
-                arc, detail = run_git_command(["rebase", "--abort"], repo_path, check=False)
-                if arc != 0:
-                    _git_failure("git rebase --abort", label, arc, detail)
-                else:
-                    print(
-                        "Rebase aborted; local commits retained. "
-                        "Resolve the conflict before retrying.", file=sys.stderr,
-                    )
-            return rc
+            # The normal concurrent path first: another session landed in the
+            # same project and the only conflict is the generated README
+            # block. Then, and only then, the failure line and the abort.
+            if _rebase_in_progress(repo_path) and _continue_past_index_conflicts(repo_path, label):
+                print(INDEX_RESOLVED)
+            else:
+                _git_failure("git pull --rebase", label, rc, output)
+                git_dir = _git_directory(repo_path, label)
+                if git_dir and any(
+                    (git_dir / p).exists() for p in ("rebase-merge", "rebase-apply")
+                ):
+                    arc, detail = run_git_command(["rebase", "--abort"], repo_path, check=False)
+                    if arc != 0:
+                        _git_failure("git rebase --abort", label, arc, detail)
+                    else:
+                        print(
+                            "Rebase aborted; local commits retained. "
+                            "Resolve the conflict before retrying.", file=sys.stderr,
+                        )
+                return rc
         # Git can return zero even when applying the autostash failed.
         rc, stash_after = _stash_head(repo_path, label)
         if rc != 0:

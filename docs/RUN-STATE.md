@@ -142,7 +142,10 @@ artifact set is:
 Register session-written artifacts with `work artifact <name>.md --file
 <path>` so they land in `state.artifacts` with an audit event. Host-side or
 manual runs follow the same convention with plain files and a work-repo
-commit. The work repo's own README documents the full repository layout.
+commit. The work repo's root `README.md` carries a generated project index
+block and each project's `README.md` a generated run index
+([SCHEMA-V2.md](./SCHEMA-V2.md#project-index)); the layout itself is
+specified by [SCHEMA.md](./SCHEMA.md).
 
 ### Masterplan artifact links
 
@@ -431,7 +434,11 @@ The three mechanisms now know about each other, through one marker:
   CAS claim path (arbitration, not durability — it never routes through this
   function) and `work session-end` (`allow_during_gate=True`: the container is
   going away, so the gate whose window a deferral would protect is being torn
-  down with it, and there is no later commit to flush into).
+  down with it, and there is no later commit to flush into). Every durability
+  push that does go through also re-renders the project's `README.md` index
+  block from the records the commit will contain and stages it with the
+  record ([SCHEMA-V2.md](./SCHEMA-V2.md#project-index)); a deferral touches
+  no README, and the replay regenerates it.
 - **The Stop hook stands down.** `work resume --json` reports `gate_in_flight`
   (derived server-side, like `run_dir_url`), and `hooks/run_state_guard.py`
   suppresses **every** trigger while it is true — not just the push nudge:
@@ -658,6 +665,16 @@ Per project (the `{host}/{project}/` prefix already namespaces):
 - Named branch, no issue/MR → `<taskdef>-<slugified-branch>`
 - No target (plain project session) → `<taskdef>` (e.g. `chat` — one
   long-lived per-project run; events accumulate per session)
+- Local filesystem path (`.`, `./`, `../x`, an absolute checkout path — a
+  project session launched from a checkout) → the host exports an **empty**
+  target, so the slug is the bare `<taskdef>` and `state.target` is empty.
+  Groups created before this rule (`chat-.`) stay addressable by their
+  recorded slug, and a continuation of such a record lands under the bare
+  taskdef with `source_session_uid` provenance into the old group (`work
+  session-start` says so; nothing in the old group moves). Such records
+  are host-only through the platform — its resume and answer routes refuse
+  an empty recorded target — like every target-less run, until a follow-up
+  lands.
 
 Same target + same taskdef ⇒ same slug ⇒ a fresh container lands on the
 existing run — the resolver matches the recorded `state.slug`, never the
@@ -703,9 +720,9 @@ engagement seeds a fresh run.
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). On schema 2 the seed is a record of its own, never this launch's (#535): a fresh uid is minted and the record is written in full inside `.new-<uid>-*` — `state.yaml` with the goal and name, then `run_seeded`, `goal_set`, `run_named` — and renamed once to `_runs/<slug>/<uid>`. It carries `session: {uid, seeded_by, started_at}` (`seeded_by` is the seeding launch's uid; none of that launch's other metadata is copied) and an empty lineage, and after the rename it is read-only to the seeding launch like any other prior record. The command prints the uid and the launch line that consumes it — `lmer <taskdef> [<target>] --source-session <uid>` — which on schema 2 is the only way a seed is picked up. A group that already holds records is informational (`group already holds N record(s)`): the seed goes beside them. Legacy trees keep the existing-run refusal (there the directory is the record). Does **not** claim `owner` (seeding is not owning) and does **not** push. A name conflict is an error in both forms. |
 | `work release claim` / `claim-status` / `unclaim` / `record …` / `status` / `abort` | The release-run verbs (§7): the single-flight release claim (claim-by-push CAS — never the rebase-retry push path), the write-once release record (`release.yaml`), the derived-leg status view, and the terminal abort. Verb-by-verb tables, exit codes, and semantics live in §7. |
-| `work sessions [--running] [--json]` | Read-only listing of the run's launches (schema form: one row per session dir; legacy: one row per run dir, id `-`, since several launches interleave in one directory). Columns: session id, address (run-area-relative), status, phase, `updated`, and `orphaned` — an in-progress record with no live claim, or a claim stale past the threshold. `--running` filters to `status == in-progress` and not orphaned; an orphan stays listed and marked rather than hidden (hiding it is how a crashed session reads as a finished one). `--json` emits `{form, count, sessions[…]}`; a record whose state cannot be read — or cannot be represented in JSON — is listed with its address fields and null state, never dropped. Always exits 0. |
-| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). `--session <id>` continues an existing launch instead of opening a new one (schema form): the id is chained into that record's `sessions:` lineage (§2), so every later `work` invocation of this launch finds the directory through the record and no *second* variable has to be minted and kept in step with it. It is one of two ways a launch says which record it writes in, and the container's ordinary one is the other — with no flag the kernel resolves to the record that answers to this launch's `LMER_SESSION_ID` (§5, then the lineage, then the launch's creation address), so a launch the host already addressed (`lmer --session`) needs no flag at all and `hooks/start.py` passes none. With neither — a relaunch carrying only `LMER_ANSWER`, which has opened no record of its own — the verb reroutes itself to the launch that asked the question, because an answer filed in a fresh record leaves the question standing in the record that asked it. The id names one launch inside the run's group; a value that is a path or a pattern is refused. Always exits 0. |
-| `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path via `work commit`. Always exits 0. |
+| `work sessions [--running] [--json]` | Read-only listing of the run's launches (schema form: one row per session dir; legacy: one row per run dir, id `-`, since several launches interleave in one directory). Columns: session id, address (run-area-relative), status, phase, `updated`, and — on a schema-1 record — `orphaned`: an in-progress record with no live claim, or a claim stale past the threshold. A schema-2 record has no claim verdict; its row ends with `state=<word>`, derived from the record and the listing's own clock: `closed` (status complete or archived), `waiting on question` (`stop_reason` question, which outranks a sign-out), `ended, not closed` (in progress with a recorded final `session_end`), `active` (no sign-out, `updated` within the validator's 14-day `record.session-stale` window) or `stale` (no sign-out, quiet for longer) — never auto-ended, and `stale` is a reading of the record, not a verdict on the run; the header of such a listing counts the non-zero states. `--running` filters to `status == in-progress` and not orphaned (schema 1) or not signed out, i.e. `active` or `stale` (schema 2); an orphan stays listed and marked rather than hidden (hiding it is how a crashed session reads as a finished one). `--json` emits `{form, count, sessions[…]}`, every row carrying `stop_reason` and a schema-2 row also `session`, `signed_out` and `state`; a record whose state cannot be read — or cannot be represented in JSON — is listed with its address fields and null state, never dropped. Always exits 0. |
+| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), append `session_start`, apply the launch name and goal (below), decide the resume brief *before* claiming, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). `--session <id>` continues an existing launch instead of opening a new one (schema form): the id is chained into that record's `sessions:` lineage (§2), so every later `work` invocation of this launch finds the directory through the record and no *second* variable has to be minted and kept in step with it. It is one of two ways a launch says which record it writes in, and the container's ordinary one is the other — with no flag the kernel resolves to the record that answers to this launch's `LMER_SESSION_ID` (§5, then the lineage, then the launch's creation address), so a launch the host already addressed (`lmer --session`) needs no flag at all and `hooks/start.py` passes none. With neither — a relaunch carrying only `LMER_ANSWER`, which has opened no record of its own — the verb reroutes itself to the launch that asked the question, because an answer filed in a fresh record leaves the question standing in the record that asked it. The id names one launch inside the run's group; a value that is a path or a pattern is refused. Applies `LMER_RUN_NAME`/`LMER_RUN_GOAL` (from `lmer --name/--goal`) **once**, on the call that opens the record's session: the name through the `work name` rules (a held or unusable name is a stdout warning and the run stays unnamed), the goal replacing one inherited from a continuation source (`run_named`/`goal_set` events with `data.source: launch`); a failure to apply either is a warning, never a refusal. Both land *before* anything is printed, because this verb's stdout is all the agent sees of them (`hooks/start.py` injects it into the prompt): a schema-1 brief carries them in its `Run: <name> (slug: …)` header and `Goal:` line; a schema-2 start, which prints no brief of its own — only a continuation's read-only `Context from session <uid> (read-only):` block — follows it with `This launch (lmer --name/--goal, already recorded):` and the `Run name:` / `Goal:` lines that landed. When the launch goal replaced a continuation's inherited one, the context block drops its `Goal:` line and the old goal appears once, as `Predecessor goal (context only, replaced by the launch goal): …`, so it is never read as the current goal. A held or unusable name prints no `Run name:` line, and the run-state taskdef fragment's naming step stays the agent's. Warns when a continuation's source was recorded under another slug (a `chat-.` record continued under `chat` after the local-path rule, §3): the new record keeps `source_session_uid` provenance into the old group, which stays as history. Always exits 0. |
+| `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path together with the project's regenerated `README.md` index block via `work commit`. Always exits 0. |
 
 `work state set` field choices: `--stop-reason` is one of
 `question|yield|complete|critical_error|none` (`none` clears it back to
@@ -762,11 +779,17 @@ event's data — a goal without them behaves byte-for-byte as before.
   continued instead of opening a fresh one beside it. Defaults to
   `"unknown"` if unset.
 - **Start:** the `/start` render pipeline calls `work session-start`, which
-  seeds the run if absent (`run_seeded`), appends `session_start`, claims
-  `owner`, and returns a resume brief that gets injected into the rendered
-  instructions. A session opening on an existing run *begins* with its
-  state — resume is the default, not a recovery procedure.
+  seeds the run if absent (`run_seeded`), appends `session_start`, applies
+  any `lmer --name/--goal`, claims `owner`, and returns a resume brief that
+  gets injected into the rendered instructions — its stdout is the only part
+  the agent sees, so the brief already names the launch's run and goal. A
+  session opening on an existing run *begins* with its state — resume is
+  the default, not a recovery procedure.
 - **End:** `work session-end` clears `owner` and pushes the run-state path.
+  Every durability push — this one included — prints a one-line nudge while
+  the run has no `name` (`💡 this run has no name yet — work name
+  <kebab-case> (or launch with lmer --name); …`), so an unnamed run is
+  noticed before the project index labels its row by a goal or log line.
   It runs twice by design: the `SessionEnd` Claude Code hook (best-effort —
   `command -v work` guarded, `|| true`) and, authoritatively, the harness
   teardown in `clone_and_exec.dispatch_runner` after the runner exits —
@@ -811,6 +834,11 @@ enum, `updated` timestamps, `owner` claims. Actions:
 - Optionally migrate legacy `{task_type}/{target}/` log/report dirs into
   the matching run dir — the CLI only ever falls back to them on read and
   never moves them itself.
+
+The cleaner does not refresh the generated `README.md` index blocks: the
+project's next durability push re-renders its block from the records that
+remain, and `lmer-schema index --write` backfills
+([SCHEMA-V2.md](./SCHEMA-V2.md#project-index)).
 
 ## 7. Single-flight release claim (`work release`)
 

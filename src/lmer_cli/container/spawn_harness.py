@@ -221,6 +221,14 @@ def build_child_env(
     show it lost one.
     """
     child = dict(parent_env)
+    # The parent's launch name and goal (`lmer --name/--goal`) describe the
+    # PARENT's record. A child starts through ``harness_session`` →
+    # ``work session-start``, which would otherwise apply them to the child's
+    # own record on schema 2 — and names exist on schema 1 too, where a child
+    # shares the parent's run dir and the same start would re-name it. So
+    # both go, for every child, before the overlays.
+    for key in ("LMER_RUN_NAME", "LMER_RUN_GOAL"):
+        child.pop(key, None)
     from work_repo import session_record
 
     if session_record.schema_version(Path(child.get("LMER_WORK_REPO_PATH", "/work"))) >= 2:

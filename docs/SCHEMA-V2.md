@@ -126,7 +126,13 @@ state, its state snapshot, and recent events. It does not append lineage,
 answers, owner changes or sign-out events to the predecessor.
 Goal, phase, question and ledger/release checkpoints seed the new record.
 The context snapshot records their provenance; owner, claim and terminal
-status are not inherited.
+status are not inherited. A launch goal (`lmer --goal`, applied once by
+`work session-start`) replaces the inherited one. A continuation whose source
+was filed under a different slug — a `chat-.` record from before local-path
+targets exported an empty target — lands under the current derivation
+(`chat`), keeps `source_session_uid` and `context.source_path` into the old
+group, and `work session-start` warns that it crossed groups; nothing in the
+old group moves.
 
 A source without a recorded final `session_end` requires a warning and an
 explicit decision. Present the available UID, operator, hostname, start time
@@ -304,6 +310,77 @@ including requests from other sessions sharing the marker. Requests are removed
 only after verified publication, so an event flush or failed retry cannot lose
 half of a transition.
 
+## Project index
+
+A project directory's `README.md` may carry one generated Markdown block
+between `<!-- lmer:index:start -->` and `<!-- lmer:index:end -->`: a table
+with one row per execution record under `_runs/`, newest first, rendered from
+each record's own `state.yaml`, `events.jsonl` and — only when the record has
+neither name nor goal — `log.yaml`. The root `README.md` may carry the same
+kind of block listing the registered projects from `_plexus.yaml`. Text
+outside the markers is human content, never touched and never checked; the
+first append normalises only the hand text's trailing newlines.
+
+**Who writes it.** Every durability push of a session in the project —
+`work commit` and the implicit pushes of `work state set`, `goals`,
+`ledger set`, `artifact`, `answer`, `release record` and `session-end` —
+re-renders the project's block from the records the commit will contain
+(state files already tracked, or under a path the push stages) and stages
+the README with the record, so no row can point at a directory the remote
+does not have. A push that stages no record (the memory verbs) re-renders
+nothing; it only carries a tool-written README another push left behind. `lmer-schema index PATH [--write] [--diff]`
+previews and backfills every project README and is the only writer of the
+root block, which never changes on the hot path. It never commits, and since
+no push stages the root `README.md`, a backfill that wrote the root needs an
+explicit commit through the normal gated commit; `work commit` carries only
+the project READMEs. Both writers hold a project directory to the same
+boundary before writing in it: one that is a symlink, resolves outside the
+repository or lies inside a `_runs/` record is never written (the push skips
+it with a warning, the backfill reports it `refused`), so neither can reach
+outside the tree or into a historical record.
+
+**What a row says.** The label is the record's `name`, else the goal's first
+line, else the first `log.yaml` message (a derived label is marked
+`_(unnamed)_`); a continuation links its source record. The state cell uses
+four clock-free words — `closed` (status complete or archived),
+`waiting on question` (a recorded question outranks a sign-out),
+`ended, not closed` (in progress with a recorded final `session_end`) and
+`open` (no sign-out recorded) — beside a last-activity column that is the
+date the record last changed. Nothing in the block ends a run; as everywhere
+in this schema, age or silence never means “signed out” (`work sessions`,
+which holds its own clock, is where `open` splits into `active` and `stale`).
+Every row is a pure function of its own record — no generated-at stamp, no
+counts, no mtime — so two regenerations differ only where records differ.
+
+**Concurrency.** Because rows are pure and ordered by the record's own start
+time, git's three-way merge of two regenerations is the fresh render whenever
+it merges cleanly. Two sessions pushing in one project usually touch adjacent
+lines, so the conflict case is the normal one, not the exception: when
+`pull --rebase` stops and every unmerged path is a project README whose text
+outside the markers is identical on both sides and whose upstream block is
+not of a newer format, the push keeps the upstream text, renders the block
+again from the merged tree and continues the rebase; any other conflict
+aborts publication as before ([WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)).
+
+**Mixed versions.** The legend carries a format token
+(`lmer index format 1`). A writer never rewrites, the conflict handler never
+resolves over, and the validator never judges a block of a newer format than
+its own. A block an older runtime left behind is a self-healing
+`index.readme-stale` WARN until the next push from a current runtime or an
+`lmer-schema index --write`; old runtimes never write READMEs, so they never
+conflict on them.
+
+**The hand-text rule.** A project README whose text outside the markers
+holds a line git reads as a conflict marker — seven identical `<`, `=`, `>`
+or `|` at column 0, a setext `=======` underline being the usual case — is
+never staged by the generator, because the staged-marker gate would otherwise
+refuse every push of the project. The record still publishes, each push
+prints a one-line warning, and the validator reports the file
+(`index.readme-missing` INFO without a block, `index.readme-stale` WARN with
+one) until the line is indented or lengthened. The validator compares an
+existing block with a fresh render of what is on disk, clock-free, so
+validate a clean clone: a checkout holding unpushed records may differ.
+
 ## Compatibility rule
 
 An optional addition may keep the same version only when old readers **and
@@ -350,8 +427,11 @@ commit and publish the result through the normal repository gates.
 | `<project>/_claims/release.yaml` | Release claim CLI | Optional machine-owned shared resource claim |
 | `<session-dir>/state.yaml` → `session` | Current execution | Freeform metadata dictionary, opaque UID required |
 | `<session-dir>/events.jsonl` → `session_start.data.session` | Current execution | Start metadata snapshot |
+| `README.md` → index block | `lmer-schema index --write` | Optional generated project list between the index markers, rendered from `_plexus.yaml` plus a fixed legend; text outside the markers is content |
+| `<project>/README.md` → index block | Every durability push in the project; `lmer-schema index --write` | Optional generated run table between the index markers, one row per committed record, newest first; text outside the markers is content |
 
 The validator accepts unknown session metadata. It reports invalid identity
 envelopes as `record.session-metadata`, invalid shared claims as
-`record.release-claim`, and malformed retirement state as
-`agents.memory-retirement`.
+`record.release-claim`, malformed retirement state as
+`agents.memory-retirement`, and a missing or stale index block as
+`index.readme-missing` / `index.readme-stale`.

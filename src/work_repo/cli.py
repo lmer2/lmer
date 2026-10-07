@@ -2303,18 +2303,31 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
     row. A legacy run dir has no session id — several sessions interleave in
     one dir, so none of them names it — and prints `-` in that column rather
     than a directory name pretending to be a launch.
+
+    A schema-2 row (one carrying `signed_out`, `run_state.list_sessions`)
+    has no `orphaned` verdict, so it ends with the state the listing derived
+    from the record and its own clock — `state=<word>` — and a listing with
+    any such row heads with the non-zero state buckets instead of the
+    schema-1 running/orphaned pair. Nothing is derived here: `state` is
+    `list_sessions`'s. `⚠️  state unreadable` marks a record whose state
+    really could not be read (every state field None), never a readable
+    record that simply has no claim verdict. A schema-1-only listing prints
+    exactly what it always did.
     """
     if not rows:
         return "No sessions running" if running_only else "No sessions recorded"
     id_width = max(len(row["id"] or "-") for row in rows)
     slug_width = max(len(str(row["slug"] or "?")) for row in rows)
-    orphaned = sum(1 for row in rows if row["orphaned"] is True)
-    running = sum(
-        1 for row in rows if row["status"] == "in-progress" and row["orphaned"] is False
-    )
-    head = f"Running sessions: {len(rows)}" if running_only else (
-        f"Sessions: {len(rows)} ({running} running, {orphaned} orphaned)"
-    )
+    if running_only:
+        head = f"Running sessions: {len(rows)}"
+    elif any("signed_out" in row for row in rows):
+        head = f"Sessions: {len(rows)}{_state_buckets(rows)}"
+    else:
+        orphaned = sum(1 for row in rows if row["orphaned"] is True)
+        running = sum(
+            1 for row in rows if row["status"] == "in-progress" and row["orphaned"] is False
+        )
+        head = f"Sessions: {len(rows)} ({running} running, {orphaned} orphaned)"
     lines = [head]
     for row in rows:
         parts = [
@@ -2326,10 +2339,41 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
                 parts.append(f"{key}={row[key]}")
         if row["orphaned"] is True:
             parts.append("⚠️  orphaned (no live owner)")
-        if row["orphaned"] is None:
+        if "signed_out" in row:
+            parts.append(f"state={row['state']}")
+        if row["orphaned"] is None and row["slug"] is None and row["status"] is None:
             parts.append("⚠️  state unreadable")
         lines.append(" ".join(parts).rstrip())
     return "\n".join(lines)
+
+
+#: The `work sessions` header buckets for a schema-2 listing, in print order:
+#: the row's derived state word and the label the header counts it under.
+_STATE_BUCKETS = (
+    ("active", "active"),
+    ("stale", "stale"),
+    ("ended, not closed", "ended not closed"),
+    ("waiting on question", "waiting on question"),
+    ("closed", "closed"),
+)
+
+
+def _state_buckets(rows: list[dict]) -> str:
+    """The non-zero state buckets of a schema-2 listing, as the header's tail.
+
+    `" (1 active, 2 closed)"` — buckets with no row are left out. The tail is
+    empty rather than empty parentheses when no row's state is a bucket word:
+    a schema-2 row whose `updated` cannot be parsed reads `open` under the
+    listing's clock (`session_record.display_state`), which no bucket counts.
+    (A record whose state could not be read carries no `signed_out`, so a
+    listing of only such records never reaches this header at all.)
+    """
+    counts = [
+        (label, sum(1 for row in rows if row.get("state") == word))
+        for word, label in _STATE_BUCKETS
+    ]
+    shown = ", ".join(f"{count} {label}" for label, count in counts if count)
+    return f" ({shown})" if shown else ""
 
 
 def _session_json_entry(row: dict) -> dict:
@@ -2349,6 +2393,11 @@ def _session_json_entry(row: dict) -> dict:
     blanket coercion over the whole document (`default=str`) would instead
     reshape good rows to rescue a bad one, and the reader could no longer
     tell a recorded timestamp from a repr of something else.
+
+    The entry is the row as `list_sessions` built it, so it carries every
+    key the row does — `stop_reason` on every row, `session`, `signed_out`
+    and the derived `state` on a schema-2 row — and the clearing below nulls
+    those with the rest, since they too were read out of the state file.
     """
     entry = dict(row)
     entry["path"] = str(row["path"])
@@ -3981,6 +4030,134 @@ def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
     return state, answered
 
 
+def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
+    """Apply `lmer --name/--goal` (`LMER_RUN_NAME`/`LMER_RUN_GOAL`) once, on
+    the `work session-start` call that opened the record's session.
+
+    Both variables are flag-only host exports that live for the whole
+    container, so `opened` — "this call appended the record's first
+    `session_start`" — is what keeps a later start of the same launch from
+    naming or re-goaling the run again (the `LMER_ANSWER` consume-once idea,
+    decided from the record rather than a marker file). The name goes through
+    the same rules as `work name` (`_validate_name`, then `_name_conflict`
+    over the whole project) and lands only when the record has none; a held
+    or unusable name is a one-line stdout warning and the run stays unnamed,
+    because a cosmetic label must never refuse a session. The goal is
+    redacted like every other free-text writer and replaces a goal inherited
+    from a continuation source — an explicit launch goal outranks the
+    predecessor's.
+
+    Persistence is this function's own (`write_state` before the events, the
+    `cmd_name` / `cmd_seed` shape), so it never depends on which branch the
+    caller takes afterwards: the legacy claimed-by-other branch writes no
+    state of its own. The shared `state` is updated only after the write
+    succeeded, so a failed write leaves the caller's later owner write with
+    nothing to persist and the record truthfully unnamed.
+
+    Returns the fields that landed — `{"name": ..., "goal": ...}`, either
+    key absent when it was not applied, `{}` when nothing was — and announces
+    nothing itself on success: the callers run it BEFORE building the brief
+    they print, so the brief (and, for a schema-2 record, the launch lines
+    from :func:`_launch_identity_lines`) is what tells the agent.
+    `hooks/start.py` hands the agent session-start's stdout and nothing else;
+    a name and goal that only reached state.yaml would leave it naming the
+    run again, or working from a predecessor's goal.
+
+    Fail-soft, whole: every exception becomes one stdout warning and the
+    call returns `{}` — the hook that runs session-start drops the entire
+    brief on a non-zero exit, and `_start_process_record` turns a kernel
+    error into exit 2, so nothing here may raise.
+    """
+    try:
+        if not opened:
+            return {}
+        name_text = os.environ.get("LMER_RUN_NAME") or ""
+        goal_text = os.environ.get("LMER_RUN_GOAL") or ""
+        if not name_text.strip() and not goal_text.strip():
+            return {}
+        candidate = dict(state)
+        events: list[tuple[str, str]] = []
+        if name_text.strip() and state.get("name") is None:
+            name = _validate_name(name_text)
+            if name is None:
+                print(f"⚠️  launch name '{name_text}' not applied: not a usable name; "
+                      "this run stays unnamed — work name <other>")
+            else:
+                holder = _name_conflict(rdir, name, state.get("slug"))
+                if holder is not None:
+                    print(f"⚠️  launch name '{name}' not applied: held by run '{holder}' "
+                          "(names are unique per project); this run stays unnamed — "
+                          "work name <other>")
+                else:
+                    candidate["name"] = name
+                    events.append(("run_named", name))
+        if goal_text.strip():
+            goal = redact_secrets(goal_text)
+            candidate["goal"] = goal
+            events.append(("goal_set", goal))
+        if not events:
+            return {}
+        run_state.write_state(rdir, candidate)
+        state.update(candidate)
+        applied = {}
+        for event_type, note in events:
+            applied["name" if event_type == "run_named" else "goal"] = note
+            run_state.append_event(rdir, event_type, note=note, data={"source": "launch"})
+        return applied
+    except Exception as exc:
+        print(f"⚠️  launch name/goal not applied (continuing): {exc}")
+        return {}
+
+
+def _launch_identity_lines(applied: dict, replaced_goal: str | None = None) -> list[str]:
+    """The lines a schema-2 `work session-start` prints for what
+    :func:`_apply_launch_identity` recorded, or `[]` when nothing landed.
+
+    A schema-2 record has no resume brief of its own to carry them: a fresh
+    launch prints none at all, and a continuation's brief is the
+    predecessor's read-only context. These lines are therefore the agent's
+    only sight of the launch's name and goal, worded as the CURRENT ones — the
+    `Run name:` line is what `taskdef/run-state.jinja2` tells the agent to
+    skip `work name` for. `replaced_goal` is the goal a continuation inherited
+    and the launch goal replaced: it stays visible, but labelled as context,
+    so the predecessor's goal is never read as this session's.
+    """
+    if not applied:
+        return []
+    lines = ["This launch (lmer --name/--goal, already recorded):"]
+    if applied.get("name"):
+        lines.append(f"Run name: {applied['name']}")
+    if applied.get("goal"):
+        lines.append(f"Goal: {applied['goal']}")
+        if replaced_goal and replaced_goal != applied["goal"]:
+            lines.append(
+                f"Predecessor goal (context only, replaced by the launch goal): {replaced_goal}"
+            )
+    return lines
+
+
+def _source_slug_warning(context: dict, slug: str | None) -> str | None:
+    """The line `work session-start` prints when a continuation's source was
+    recorded under another slug, or None when the groups agree.
+
+    A local-path launch used to export `.` and file under `chat-.`; the host
+    now exports an empty target, so a continuation of such a record lands
+    under the bare taskdef (`chat`) with `source_session_uid` provenance into
+    the old group. Nothing moves and nothing is renamed — the old group is
+    history — but the operator looking for the record under its old group
+    deserves to be told where the new one went.
+    """
+    source_state = context.get("state") if isinstance(context, dict) else None
+    recorded = source_state.get("slug") if isinstance(source_state, dict) else None
+    if recorded in (None, slug):
+        return None
+    return (
+        f"⚠️  continuing session {context.get('source_session_uid')} recorded under "
+        f"slug '{recorded}'; this execution is filed under '{slug}' "
+        "(the old group stays as history)"
+    )
+
+
 @work_transaction
 def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
@@ -4066,11 +4243,24 @@ def cmd_session_start(session: str | None = None) -> int:
 
         state, answered = _apply_pushed_answer(rdir, state)
 
-        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
-        # All events for the sessions-used count (issue #99) — this session's
-        # own session_start lands after the decide, so the count reads
+        # All events for the sessions-used count (issue #99), read BEFORE
+        # this session's own session_start is appended, so the count reads
         # "sessions used so far"; the brief still shows the last 5.
         all_events = run_state.read_events(rdir, last_n=0)
+        run_state.append_event(rdir, "session_start")
+        # `lmer --name/--goal` land once, on the call that opened the record's
+        # first session; `all_events` was read before the append, so it says
+        # whether this is that call. Isolated: never a refusal, and it
+        # persists itself because the claimed-by-other branch below does not.
+        # Applied BEFORE the decide: the brief printed below is the agent's
+        # only sight of the run (`hooks/start.py` injects this stdout), so it
+        # must already carry the launch name and goal.
+        _apply_launch_identity(
+            rdir, state,
+            opened=not any(e.get("type") == "session_start" for e in all_events),
+        )
+
+        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
         try:
             ledger = run_state.load_ledger(rdir)
         except (run_state.RunStateError, OSError):
@@ -4081,7 +4271,6 @@ def cmd_session_start(session: str | None = None) -> int:
             release=_release_record_for_brief(rdir, state),
         )
 
-        run_state.append_event(rdir, "session_start")
         if run_state.is_claimed_by_other(state, run_state.current_session_id()):
             # A LIVE foreign release claim (RUN-STATE.md §7) is enforced,
             # not advisory: a session starting on a claimed release run
@@ -4113,20 +4302,42 @@ def cmd_session_start(session: str | None = None) -> int:
 
 
 def _start_process_record(source_session: str | None = None) -> int:
-    """Schema-2 hook: seed our record and print read-only predecessor context."""
+    """Schema-2 hook: seed our record and print read-only predecessor context,
+    then this launch's own name and goal when `lmer --name/--goal` set them."""
     try:
         rdir, state = run_state.ensure_run(session=source_session)
         state, answered = _apply_pushed_answer(rdir, state)
         context = state.get("context") or {}
-        if context:
-            decision = run_state.decide(
-                state, run_state.read_events(rdir, last_n=25), run_state.current_session_id()
-            )
-            print(f"Context from session {context['source_session_uid']} (read-only):")
-            print(run_state.format_brief(decision, answered=answered))
-        starts = [e for e in run_state.read_events(rdir, last_n=0) if e.get("type") == "session_start"]
+        events = run_state.read_events(rdir, last_n=0)
+        # The predecessor's view, taken before the launch identity lands: the
+        # context brief is what this record inherited, never this launch's.
+        inherited = dict(state)
+        starts = [e for e in events if e.get("type") == "session_start"]
         if not starts:
             run_state.append_event(rdir, "session_start", data={"session": state["session"]})
+        # `lmer --name/--goal`, once, on the call that opened the session
+        # (`starts` was read before the append). Isolated: cannot reach the
+        # exit-2 branch below. Applied before anything is printed, so the
+        # output below can say which goal is current.
+        applied = _apply_launch_identity(rdir, state, opened=not starts)
+        if context:
+            decision = run_state.decide(
+                inherited, events[-25:], run_state.current_session_id()
+            )
+            if applied.get("goal"):
+                # The launch goal replaced the inherited one: the context
+                # brief must not present the old goal as the goal, so it moves
+                # to the launch lines below, labelled as replaced.
+                decision["goal"] = None
+            print(f"Context from session {context['source_session_uid']} (read-only):")
+            print(run_state.format_brief(decision, answered=answered))
+            warning = _source_slug_warning(context, state.get("slug"))
+            if warning:
+                print(warning)
+        for line in _launch_identity_lines(
+            applied, replaced_goal=inherited.get("goal") if context else None
+        ):
+            print(line)
         state["owner"] = {"session_id": run_state.current_session_id(), "claimed_at": run_state.utc_now_iso()}
         run_state.write_state(rdir, state)
         print(f"Session {state['session']['uid']} owns {rdir}")
@@ -4272,15 +4483,23 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         except Exception:
             return []
 
+    def pushing(rels: list[str]) -> list[str]:
+        """The scope of a verb whose write reaches `commit_work_path`: it may
+        regenerate or sweep the project README index block as well."""
+        rels = list(rels)
+        rels.extend(rel for rel in _index_rel_paths() if rel not in rels)
+        return rels
+
     if command == "log":
         return None if args.message is None else run_candidates()
     if command == "goal":
         return None if args.description is None else run_candidates()
     if command == "name":
         return None if args.value is None else run_candidates()
-    if command in ("event", "answer", "verify", "report",
-                   "session-start", "session-end"):
+    if command in ("event", "verify", "report", "session-start"):
         return run_candidates()
+    if command in ("answer", "session-end"):
+        return pushing(run_candidates())
     if command == "release":
         action = getattr(args, "release_action", None)
         if action in ("claim", "unclaim", "abort", "record"):
@@ -4289,19 +4508,19 @@ def _write_intent_rel_paths(args) -> list[str] | None:
                 from . import release_claims
 
                 rels.append(release_claims.claim_rel_path())
-            return rels
+            return pushing(rels)
         return None
     if command in ("state", "ledger"):
-        return run_candidates() if getattr(args, "action", None) == "set" else None
+        return pushing(run_candidates()) if getattr(args, "action", None) == "set" else None
     if command == "goals":
         action = getattr(args, "goals_action", None)
-        return run_candidates() if action in ("freeze", "amend", "assess") else None
+        return pushing(run_candidates()) if action in ("freeze", "amend", "assess") else None
     if command == "artifact":
         rels = run_candidates()
         specs_rel = specs_index.specs_rel_path()
         if specs_rel:
             rels.append(specs_rel)
-        return rels
+        return pushing(rels)
     if command == "specs-index":
         if not getattr(args, "rebuild", False):
             return None
@@ -4318,14 +4537,35 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         if getattr(args, "memory_action", None) in ("forget", "revive"):
             from .memory import memory_retirement_paths
 
-            return memory_retirement_paths(args.scoped_path)
+            return pushing(memory_retirement_paths(args.scoped_path))
         if getattr(args, "memory_action", None) != "persist":
             return None
         # The writer owns the shape: memory has one scope in a legacy tree and
         # two in a schema-form one (issue #353 D17), and a hand-built
         # {host}/{project}/memory would journal a path persist never touches.
-        return memory_write_rel_paths()
+        return pushing(memory_write_rel_paths())
     return None
+
+
+def _index_rel_paths() -> list[str]:
+    """The project README a durability push may regenerate or sweep.
+
+    In schema form every push through `commit_work_path` renders this
+    session's project README index block from the records the commit will
+    contain and stages it with them (`git_ops._refresh_project_indexes`), and
+    sweeps a generated README a crashed session left dirty — so the honest
+    scope of every pushing verb names the file, whether or not this push
+    happens to change it. A legacy tree has no index. Fail-soft: no layout,
+    no path.
+    """
+    try:
+        layout = work_repo_layout()
+        if not layout.is_schema or layout.base is None:
+            return []
+        rel = Path(layout.base).relative_to(layout.root).as_posix()
+    except Exception:
+        return []
+    return [f"{rel}/README.md"]
 
 
 def _journal_write_intent(args) -> None:
