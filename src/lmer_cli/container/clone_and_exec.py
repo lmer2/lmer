@@ -46,6 +46,16 @@ fall back to the legacy names: that fallback would write a schema-form
 tree's record at ``{host}/{project}/runs/`` and split the tree in two
 (D20). This is the one exception to the stdlib-only rule above and it is
 a degrade-to-legacy exception, not a dependency.
+
+The same seam serves the manifest's ``sources:`` tier (issue #370): a
+present ``_plexus.yaml`` is the second declaration file, and
+``_resolve_declared_sources`` reads it through the core's ONE manifest
+parser (``lmer_schema.manifest.load_manifest``, imported function-locally
+and guarded exactly like the placement code's) and hands the raw section
+to the standalone loader (``load_sources(..., manifest_sources=,
+manifest_path=)``). A tree with neither declaration file stays stdlib-only
+and silent; a present manifest that PyYAML or the core cannot read refuses
+start, exactly as a present ``sources.yaml`` does.
 """
 from __future__ import annotations
 
@@ -157,6 +167,14 @@ _SOURCE_DESTS = {"taskdef": "/taskdef", "napkin": "/napkin"}
 # ORIGIN_UNSET_FALLBACK never prints a banner — silent legacy mode is
 # literally zero output (spec G5) — but stays in the shared vocabulary for
 # --show-env parity.
+# ORIGIN_DECLARED is the legacy-only spelling (mirrored by sources.py's
+# ORIGIN_DECLARED). Once a `_plexus.yaml` is present (issue #370) a declared
+# row names its tier instead — `declared (manifest)` / `declared
+# (sources.yaml)` — and that label is spelled by the standalone loader's
+# declared_origin_label, never by hand here, so the banner and --show-env
+# cannot drift. The env rows (env-match, env-override, env-only) keep their
+# spelling at either tier: the value in effect came from the env, not from a
+# file. tests/test_clone_and_exec_sources.py pins both mirrors.
 ORIGIN_DECLARED = "declared"
 ORIGIN_ENV_MATCH = "env-match"
 ORIGIN_ENV_OVERRIDE = "env-override"
@@ -393,17 +411,21 @@ def _clear_lmer_git_credential_helper(
         )
 
 
-# --- Canonical source config (sources.yaml, issue #105) ---------------------
-# {work_repo}/sources.yaml declares the canonical taskdef/napkin sources.
-# Reading it needs PyYAML — the one sanctioned non-stdlib import in this
-# module (see the docstring contract above). The import seam below keeps the
-# entrypoint runnable stdlib-only when no sources.yaml exists, while a
-# present-but-unreadable config refuses start instead of being silently
+# --- Canonical source config (sources.yaml / _plexus.yaml, #105, #370) -------
+# {work_repo}/sources.yaml declares the canonical taskdef/napkin sources; in
+# a schema-form tree the same declaration is the manifest's `sources:`
+# section ({work_repo}/_plexus.yaml, issue #370), which outranks the legacy
+# file per source key. Reading either needs PyYAML — the one sanctioned
+# non-stdlib import in this module (see the docstring contract above) — and
+# the manifest additionally needs the lmer-schema core, imported lazily and
+# guarded like the placement code's. The import seam below keeps the
+# entrypoint runnable stdlib-only when neither file exists, while a
+# present-but-unreadable declaration refuses start instead of being silently
 # ignored. Resolution (_resolve_declared_sources and helpers, further down)
-# runs in main() between the work-repo clone and clone_aux_repos, where
-# sources.yaml is guaranteed present and fresh. The section's constants
-# (SOURCES_CONFIG_NAME, _TASKDEF_REF_ENV, _SOURCE_DESTS, ORIGIN_*) live in
-# the top-of-file constants block, per house style.
+# runs in main() between the work-repo clone and clone_aux_repos, where the
+# declaration files are guaranteed present and fresh. The section's constants
+# (SOURCES_CONFIG_NAME, PLEXUS_MANIFEST_NAME, _TASKDEF_REF_ENV, _SOURCE_DESTS,
+# ORIGIN_*) live in the top-of-file constants block, per house style.
 
 
 def _import_yaml():
@@ -422,35 +444,135 @@ def _import_yaml():
     return yaml
 
 
-def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
-    """Refuse start when ``{work_repo}/sources.yaml`` exists but PyYAML doesn't.
+def _declaration_files_present(work_repo_path: Path) -> "tuple[bool, bool]":
+    """Which declaration files the work repo carries: ``(manifest, legacy)``.
 
-    A present config that cannot be read must never be silently ignored —
-    running without the declared canonical sources is exactly the failure
-    class sources.yaml exists to kill. Returns 0 when startup may proceed
-    (no sources.yaml, or PyYAML importable) and 2 (the refuse-start exit
-    code, matching existing CLI refusals) after printing a
-    credential-scrubbed error otherwise. Called by the resolution step
-    (later task) after the work-repo clone, before ``clone_aux_repos``.
+    Two stdlib stats and nothing else — this is the question that decides
+    whether the resolution seam does any work at all, and a tree with neither
+    file must stay on the stdlib-only path. The manifest probe is the one
+    ``_resolve_work_repo_placement`` and the core itself use (``is_symlink()``
+    first, so a dangling manifest symlink still reads as present); the legacy
+    probe is the pre-#370 ``exists()``.
     """
-    sources = Path(work_repo_path) / SOURCES_CONFIG_NAME
-    if not sources.exists():
+    root = Path(work_repo_path)
+    manifest = root / PLEXUS_MANIFEST_NAME
+    return (manifest.is_symlink() or manifest.exists()), (root / SOURCES_CONFIG_NAME).exists()
+
+
+def _declaration_present_clause(work_repo_path: Path, manifest_present: bool, legacy_present: bool) -> str:
+    """``"<file> is present"`` / ``"<manifest> and <legacy> are present"`` —
+    the subject of a refuse-start message, naming exactly the declaration
+    file(s) found."""
+    root = Path(work_repo_path)
+    files = []
+    if manifest_present:
+        files.append(str(root / PLEXUS_MANIFEST_NAME))
+    if legacy_present:
+        files.append(str(root / SOURCES_CONFIG_NAME))
+    return f"{' and '.join(files)} {'is' if len(files) == 1 else 'are'} present"
+
+
+def _without_declarations_hint(manifest_present: bool) -> str:
+    """The "run without declarations" remediation: which file to edit."""
+    if manifest_present:
+        return (
+            f"remove the `sources:` section from {PLEXUS_MANIFEST_NAME} (and "
+            f"{SOURCES_CONFIG_NAME}, if present) to run without declarations"
+        )
+    return f"remove {SOURCES_CONFIG_NAME} from the work repo to run without declarations"
+
+
+def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
+    """Refuse start when a declaration file exists but PyYAML doesn't.
+
+    A present declaration that cannot be read must never be silently
+    ignored — running without the declared canonical sources is exactly the
+    failure class the declaration exists to kill. Both files need PyYAML:
+    the legacy ``sources.yaml`` is parsed by the standalone loader and the
+    manifest's ``sources:`` tier (issue #370) by ``lmer_schema.manifest``,
+    which imports PyYAML at module scope — so this guard runs FIRST and a
+    missing PyYAML is blamed on PyYAML, never reported as a missing core.
+    Returns 0 when startup may proceed (no declaration file, or PyYAML
+    importable) and 2 (the refuse-start exit code, matching existing CLI
+    refusals) after printing a credential-scrubbed error otherwise. Called
+    by the resolution step after the work-repo clone, before
+    ``clone_aux_repos``.
+    """
+    manifest_present, legacy_present = _declaration_files_present(work_repo_path)
+    if not (manifest_present or legacy_present):
         # No declaration — silent legacy mode, stdlib-only path untouched.
         return 0
     if _import_yaml() is not None:
         return 0
+    # Removing the legacy file is a way out only while it is the sole
+    # declaration: a manifest needs PyYAML to be read at all.
+    hint = f" (Or {_without_declarations_hint(False)}.)" if not manifest_present else ""
     print(
         _scrub_credentials(
-            f"❌ {sources} is present but PyYAML is not importable in the "
-            f"container interpreter — refusing to start rather than silently "
-            f"ignoring the declared sources. Rebuild the image with a lmer "
-            f"version that guarantees PyYAML: lmer build. (Or remove "
-            f"{SOURCES_CONFIG_NAME} from the work repo to run without "
-            f"declarations.)"
+            f"❌ {_declaration_present_clause(work_repo_path, manifest_present, legacy_present)} "
+            f"but PyYAML is not importable in the container interpreter — refusing to start "
+            f"rather than silently ignoring the declared sources. Rebuild the image with a lmer "
+            f"version that guarantees PyYAML: lmer build.{hint}"
         ),
         file=sys.stderr,
     )
     return 2
+
+
+def _read_manifest_sources_tier(work_repo_path: Path) -> "tuple[int, object | None]":
+    """Read the manifest for its ``sources:`` tier (issue #370).
+
+    Returns ``(0, None)`` when the work repo carries no ``_plexus.yaml`` —
+    decided by the stdlib probe alone, so a legacy tree never imports the
+    core — ``(0, manifest)`` with the parsed ``lmer_schema.manifest.Manifest``
+    when it does, and ``(2, None)`` after printing a credential-scrubbed
+    refusal when the manifest is present but cannot be read: the core is not
+    importable (PyYAML is ruled out first by
+    ``_refuse_start_if_sources_unreadable``, so the blame here is the
+    core's), or ``load_manifest`` raises ``ManifestError`` (unparseable, a
+    ``schema:`` bool or an int this lmer does not understand, …). A present
+    manifest is never demoted to the legacy file beside it (D20) — the rule
+    the placement code applies, and the loader applies to a present
+    ``sources.yaml``. The core is the ONE manifest parser: nothing here
+    opens the file, and ``Manifest.warnings`` (the validator's findings)
+    are never printed.
+    """
+    root = Path(work_repo_path)
+    manifest_path = root / PLEXUS_MANIFEST_NAME
+    if not (manifest_path.is_symlink() or manifest_path.exists()):
+        return 0, None
+    try:
+        # Guarded and lazy, like PyYAML above and the placement code's import:
+        # reached only once a manifest is known to be present.
+        from lmer_schema.manifest import ManifestError, load_manifest
+    except ImportError as exc:
+        print(
+            _scrub_credentials(
+                f"❌ {manifest_path} is present but the lmer-schema core API "
+                f"(lmer_schema.manifest) is not importable in the container "
+                f"interpreter ({exc}) — refusing to start rather than silently "
+                f"ignoring its `sources:` declarations. Rebuild the image with a "
+                f"lmer version that ships the core: lmer build."
+            ),
+            file=sys.stderr,
+        )
+        return 2, None
+    try:
+        manifest = load_manifest(root)
+    except ManifestError as exc:
+        # A YAML error can quote the offending line, so scrub it like a
+        # SourcesConfigError. The core's message carries the specific fix
+        # (upgrade lmer for a newer `schema:`, repair the file otherwise).
+        print(
+            f"❌ {_scrub_credentials(str(exc))} — refusing to start: a present "
+            f"{PLEXUS_MANIFEST_NAME} this lmer cannot read is never treated as a "
+            f"legacy tree.",
+            file=sys.stderr,
+        )
+        return 2, None
+    if manifest is None:  # removed between the stat and the read
+        return 0, None
+    return 0, manifest
 
 
 def _load_sources_module():
@@ -478,7 +600,10 @@ def _load_sources_module():
     return module
 
 
-def _prompt_source_choice(name, field, declared_value, env_value, env_var, input_fn=input) -> str:
+def _prompt_source_choice(
+    name, field, declared_value, env_value, env_var, input_fn=input, *,
+    declared_in=SOURCES_CONFIG_NAME,
+) -> str:
     """Mismatch-row prompt (spec §2 row 3): ask once which value wins.
 
     Returns ``"declared"``, ``"env"``, or ``PROMPT_ABORTED`` when stdin
@@ -493,10 +618,13 @@ def _prompt_source_choice(name, field, declared_value, env_value, env_var, input
     credential-scrubbed — everything this function prints is
     operator-visible. Kept separate from the matrix so a fake-TTY unit test
     can drive it via *input_fn* (and so the matrix stays pure-ish).
+    *declared_in* names the file the declaration came from (issue #370: a
+    manifest-tier row prints ``_plexus.yaml``; the default is the legacy
+    spelling, byte for byte).
     """
     print(
         f"⚠️  source {name}: {field} mismatch —\n"
-        f"     sources.yaml declares: {declared_value}\n"
+        f"     {declared_in} declares: {declared_value}\n"
         f"     {env_var} is set to:   {env_value}",
         file=sys.stderr,
     )
@@ -571,6 +699,15 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
     Performs no env mutation, no filesystem I/O, and no cloning — main()
     applies the returned plan via _apply_sources_resolution.
 
+    Declaration tiers (issue #370): ``config["tiers"]`` rides on the loader's
+    result only when the manifest tier was consulted. Without it every label
+    below is today's legacy spelling, byte for byte; with it every declared
+    row names its tier — the origin through the loader's one label helper
+    (``declared (manifest)`` / ``declared (sources.yaml)``), the file by name
+    in the prompt, the error, the ref note and the clone remediation — and
+    an undeclared row's note names both files that were searched. The env
+    updates are the same at either tier.
+
     Returns a dict:
     - ``exit_code``: 0 (proceed) or 2 (headless mismatch — refuse start
       before any aux clone)
@@ -586,7 +723,8 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
       env-override) main() must clone LOUDLY
       (spec N3), each carrying the scrubbed URL for messages, the
       derivation mode (either anonymous mode drives the anonymous hint,
-      each with its own reason), and
+      each with its own reason), the file the declaration came from
+      (``declared_in``, named by the clone-failure remediation), and
       the ``legacy_env`` state continue-legacy reverts to.
     """
     result = {
@@ -600,6 +738,17 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
     }
     scrub = sources_mod.scrub_credentials
     declared_sources = (config or {}).get("sources") or {}
+    # Declaration tiers (issue #370): the loader attaches `tiers` only when
+    # the manifest tier was consulted. Without it every label below is the
+    # legacy spelling, byte for byte; with it an undeclared row's note names
+    # both files that were searched, and a declared row names its own tier
+    # (resolved per row below).
+    tiers = (config or {}).get("tiers")
+    searched = (
+        f"{PLEXUS_MANIFEST_NAME} or {SOURCES_CONFIG_NAME}"
+        if tiers is not None
+        else SOURCES_CONFIG_NAME
+    )
     for name, env_var in sources_mod.SOURCE_ENV_OVERRIDES.items():
         declared = declared_sources.get(name)
         env_repo = (env.get(env_var) or "").strip() or None
@@ -609,7 +758,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 # declaration exists (plus the greppable banner).
                 result["origins"][name] = ORIGIN_ENV_ONLY
                 result["notes"].append(
-                    f"ℹ️  source {name}: no declaration in {SOURCES_CONFIG_NAME} — "
+                    f"ℹ️  source {name}: no declaration in {searched} — "
                     f"using {env_var} (env-only)"
                 )
                 result["banners"].append(
@@ -621,6 +770,14 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
             continue
 
         declared_repo = declared["repo"]
+        # The file this row's declaration came from and the origin its banner
+        # prints: the legacy spelling without a manifest; otherwise the tier,
+        # through the loader's ONE label helper (never spelled by hand).
+        if tiers is None:
+            declared_in, declared_origin = SOURCES_CONFIG_NAME, ORIGIN_DECLARED
+        else:
+            declared_in = _declaration_file(tiers[name], sources_mod)
+            declared_origin = sources_mod.declared_origin_label(tiers[name])
         conflicts = []  # (field, declared_value, env_value, env_var)
 
         # repo field, rows 1-3.
@@ -649,7 +806,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
             elif declared_ref is None:
                 ref_choice = "env"
                 ref_note = (
-                    f"ℹ️  source taskdef: no ref declared in {SOURCES_CONFIG_NAME} — "
+                    f"ℹ️  source taskdef: no ref declared in {declared_in} — "
                     f"using {_TASKDEF_REF_ENV} (env-only)"
                 )
             elif declared_ref == env_ref:
@@ -664,7 +821,8 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 # Row 3 interactive: prompt once per conflicting field.
                 for field, declared_value, env_value, var in conflicts:
                     choice = _prompt_source_choice(
-                        name, field, scrub(declared_value), scrub(env_value), var, input_fn
+                        name, field, scrub(declared_value), scrub(env_value), var, input_fn,
+                        declared_in=declared_in,
                     )
                     if choice == PROMPT_ABORTED:
                         # Stdin closed mid-prompt: stop asking and fall into
@@ -702,15 +860,15 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                             " the prompt."
                         )
                     fix = (
-                        f" Fix: update {SOURCES_CONFIG_NAME}, or change or unset"
+                        f" Fix: update {declared_in}, or change or unset"
                         f" {var} to match."
                         if aborted
-                        else f" Fix: update {SOURCES_CONFIG_NAME}, change or"
+                        else f" Fix: update {declared_in}, change or"
                         f" unset {var} to match, or launch interactively to"
                         " choose."
                     )
                     result["errors"].append(
-                        f"source {name}: {field} mismatch — {SOURCES_CONFIG_NAME} "
+                        f"source {name}: {field} mismatch — {declared_in} "
                         f"declares {scrub(declared_value)} but {var} is set to "
                         f"{scrub(env_value)}.{note}{fix}"
                     )
@@ -722,7 +880,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
         derived_mode = None
         if repo_choice == "declared":
             clone_url, derived_mode = sources_mod.derive_clone_url(declared_repo, work_repo_url)
-            origin = ORIGIN_DECLARED
+            origin = declared_origin
             result["env_updates"][env_var] = clone_url
             if name == "taskdef":
                 # The host appends /taskdef to LMER_TASKDEF_PATHS only when
@@ -757,6 +915,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 "ref": resolved_ref,
                 "derived_mode": derived_mode,
                 "env_var": env_var,
+                "declared_in": declared_in,
                 "legacy_env": _legacy_env_state(name, env),
             }
         )
@@ -815,7 +974,7 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
                 f"verify {clone['scrubbed_url']} exists and the work-repo "
                 f"credential can read it, set {clone['env_var']} to an "
                 f"accessible URL, or remove the {name} declaration from "
-                f"{SOURCES_CONFIG_NAME}."
+                f"{clone['declared_in']}."
             )
             if not isatty:
                 print(
@@ -849,43 +1008,65 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
     return 0
 
 
+def _declaration_file(tier, sources_mod) -> str:
+    """The file a declared row came from, by tier (issue #370): the manifest
+    tier is ``_plexus.yaml``, the legacy tier ``sources.yaml``. What the
+    mismatch prompt and error, the ref note and the declared-clone
+    remediation name once a manifest is in play."""
+    return PLEXUS_MANIFEST_NAME if tier == sources_mod.TIER_MANIFEST else SOURCES_CONFIG_NAME
+
+
 def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=None, input_fn=input) -> int:
     """Container-side canonical source resolution (spec §2) — the seam
     main() calls between the work-repo clone and clone_aux_repos.
 
-    Absent ``sources.yaml`` → silent legacy mode: return 0 with literally
-    zero output and no imports beyond stdlib. Present → load it through the
-    standalone sources module (never via lmer_cli), resolve the matrix, and
-    apply propagation plus the loud declared clones. Returns 0 to proceed
-    or 2 to refuse start (before any aux clone). *env*/*isatty*/*input_fn*
-    default to the real process environment, ``sys.stdin.isatty()`` (the
-    headless predicate), and ``input`` — injectable for tests.
+    Neither ``sources.yaml`` nor ``_plexus.yaml`` present → silent legacy
+    mode: return 0 with literally zero output and no imports beyond stdlib
+    (two stats). Either present → the PyYAML guard; then the manifest tier
+    through the core's one parser (issue #370 — a legacy tree never reaches
+    that import); then the standalone sources module (never via lmer_cli),
+    whose ``load_sources`` validates both tiers and merges them (env >
+    manifest > legacy); then the matrix, propagation and the loud declared
+    clones. Returns 0 to proceed or 2 to refuse start (before any aux
+    clone): PyYAML or the core missing while a manifest is present, a
+    ``ManifestError``, a ``SourcesConfigError`` from either tier, a headless
+    mismatch, a failed declared clone. The loader's warnings — including the
+    stale-legacy WARN for a key both files declare — are printed; the
+    manifest's own (``Manifest.warnings``) are the validator's and are not.
+    A manifest that declares nothing, with no legacy file, is silent legacy
+    mode too. *env*/*isatty*/*input_fn* default to the real process
+    environment, ``sys.stdin.isatty()`` (the headless predicate), and
+    ``input`` — injectable for tests.
     """
     work_repo_path = Path(work_repo_path)
+    manifest_present, legacy_present = _declaration_files_present(work_repo_path)
+    if not (manifest_present or legacy_present):
+        # Silent legacy mode: the matrix never engages (spec G5).
+        return 0
     rc = _refuse_start_if_sources_unreadable(work_repo_path)
     if rc:
         return rc
+    rc, manifest = _read_manifest_sources_tier(work_repo_path)
+    if rc:
+        return rc
     sources_path = work_repo_path / SOURCES_CONFIG_NAME
-    if not sources_path.exists():
-        # Silent legacy mode: the matrix never engages (spec G5).
-        return 0
     try:
         sources_mod = _load_sources_module()
     except Exception as e:
         # Same failure class as the PyYAML guard above — a present
-        # sources.yaml we cannot read — so it takes the same refuse-start
+        # declaration we cannot read — so it takes the same refuse-start
         # path instead of a raw traceback after the work-repo clone
         # (review finding). The realistic trigger is a dev session
         # live-mounting a partial src/ tree over the baked image.
         print(
             _scrub_credentials(
-                f"❌ {sources_path} is present but the resolver "
+                f"❌ {_declaration_present_clause(work_repo_path, manifest_present, legacy_present)} "
+                f"but the resolver "
                 f"({Path(__file__).resolve().parent / 'sources.py'}) could not "
                 f"be loaded: {type(e).__name__}: {e}. Refusing to start rather "
                 f"than silently ignoring the declared sources. Rebuild or "
                 f"un-mount a partial source checkout (see LMER_SOURCE_COMMIT in "
-                f"bin/doctor), or remove {SOURCES_CONFIG_NAME} from the work "
-                f"repo to run without declarations."
+                f"bin/doctor), or {_without_declarations_hint(manifest_present)}."
             ),
             file=sys.stderr,
         )
@@ -895,12 +1076,26 @@ def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=No
     if isatty is None:
         isatty = sys.stdin.isatty()
     try:
-        config, warnings = sources_mod.load_sources(sources_path, work_repo_url)
+        if manifest is not None:
+            # The manifest tier: the raw `sources:` section the core already
+            # parsed, plus the path to name in messages — the loader never
+            # opens the manifest itself (one parser).
+            config, warnings = sources_mod.load_sources(
+                sources_path, work_repo_url,
+                manifest_sources=manifest.sources, manifest_path=manifest.path,
+            )
+        else:
+            config, warnings = sources_mod.load_sources(sources_path, work_repo_url)
     except sources_mod.SourcesConfigError as e:
         print(f"❌ {sources_mod.scrub_credentials(str(e))}", file=sys.stderr)
         return 2
     for warning in warnings:
         print(f"⚠️  {sources_mod.scrub_credentials(warning)}", file=sys.stderr)
+    if config is None:
+        # Neither tier declares anything (a manifest without `sources:`, no
+        # legacy file): the loader's silent legacy mode — the matrix never
+        # engages, exactly as for a tree with no declaration file at all.
+        return 0
     result = _resolve_sources_matrix(
         config, env, isatty, work_repo_url, sources_mod, input_fn=input_fn
     )
@@ -3275,12 +3470,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Session start refused: {_scrub_credentials(str(exc))}", file=sys.stderr)
             return 2
 
-    # Canonical source resolution (sources.yaml, issue #105): runs here —
-    # after the work-repo clone (the declaration is now present and fresh)
-    # and before every aux clone below. Propagates declared sources
-    # into the env vars the aux-clone and napkin/link steps read, and
-    # refuses start (exit 2) on a headless mismatch or an untrustable
-    # config. Absent sources.yaml is silent legacy mode: zero output.
+    # Canonical source resolution (sources.yaml, issue #105; the manifest's
+    # `sources:` tier, issue #370): runs here — after the work-repo clone
+    # (the declaration files are now present and fresh) and before every
+    # aux clone below. Propagates declared sources into the env vars the
+    # aux-clone and napkin/link steps read, and refuses start (exit 2) on a
+    # headless mismatch, an untrustable config or a manifest this build
+    # cannot read. Neither file present is silent legacy mode: zero output.
     rc = _resolve_declared_sources(work_repo_path, work_repo_url)
     if rc:
         return rc
