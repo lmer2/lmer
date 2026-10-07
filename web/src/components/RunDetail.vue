@@ -950,11 +950,11 @@ async function forget() {
 
               <!-- How long the harness has been quiet (T95), in the fleet row's
                    idiom: dimmed, subordinate, no chip and no colour. The state
-                   above is derived with liveness first (spec D24), so it reads
-                   "running" from the moment a session starts until it exits — a
-                   session that finished its work and is sitting at its prompt
-                   looks exactly like one that is working, and this is the line
-                   that tells them apart. The tooltip is the moment the container
+                   above is derived with liveness first (spec D24), so while the
+                   run is non-terminal it reads "running" from the moment a
+                   session starts until it exits — a session that finished its
+                   work and is sitting at its prompt looks exactly like one that
+                   is working, and this is the line that tells them apart. The tooltip is the moment the container
                    dated the output to, because a rendered age would depend on
                    this device's clock. Nothing at all when there is no reading. -->
               <div

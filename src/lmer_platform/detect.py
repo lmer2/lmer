@@ -622,10 +622,10 @@ def _identity(row: object) -> Optional[tuple]:
 def _signals_of_row(row: object) -> list:
     """Every material condition one fleet row carries, or an empty list.
 
-    A row can in principle contribute both an attention reason and a material
-    state; today's :func:`lmer_platform.inventory._derive` never returns both at
-    once (a ``complete`` run has no attention record), and this does not depend on
-    that staying true.
+    A row can contribute both an attention reason and a material state: a
+    ``complete`` run whose live session still holds an open question carries a
+    ``live_question`` attention record (:func:`lmer_platform.inventory._derive`,
+    #308), and a finished run with nothing outstanding carries none.
     """
     identity = _identity(row)
     if isinstance(row, dict):

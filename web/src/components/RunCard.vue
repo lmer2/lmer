@@ -44,11 +44,13 @@ const meta = computed(() => stateMeta(props.run.state))
 const ledger = computed(() => ledgerSummary(props.run.ledger))
 
 // What the run says about itself, which is not what the chip says: the state in
-// `meta` is *derived*, and liveness outranks the committed record by design (spec
-// D24) — so a live session reads "running" while its own state.yaml can say it is
-// paused, or say nothing yet. A row carrying only the derived word makes that
-// disagreement invisible, and the disagreement is the thing an operator has to be
-// able to see from the fleet.
+// `meta` is *derived*, and liveness outranks a non-terminal committed record by
+// design (spec D24) — so a live session reads "running" while its own state.yaml
+// can say it is paused, or say nothing yet. A terminal status is the exception:
+// the chip reads "complete" and the session is still reported, so a finished run
+// that is still up does not read as one still working (issue 308). A row carrying
+// only the derived word makes that disagreement invisible, and the disagreement is
+// the thing an operator has to be able to see from the fleet.
 //
 // The status and not the phase, since the operator asked for the phase to be shown
 // plainly (2026-07-29): a phase is where the work has got to, which is what the row
@@ -64,9 +66,10 @@ const committed = computed(
 )
 
 // How long the live session's harness has been quiet, which is the one thing the
-// state chip cannot say: the chip reads `running` from the moment a session starts
-// until the moment it exits (spec D24 — run state moves at the *end*), so a run
-// that finished its work and is sitting at its prompt looks exactly like one that
+// state chip cannot say: while a run is non-terminal the chip reads `running` from
+// the moment a session starts until the moment it exits (spec D24 — run state moves
+// at the *end*), so a run that finished its work and is sitting at its prompt looks
+// exactly like one that
 // is working. "idle 22m" is what tells them apart, and it is the difference
 // between winding a run down and interrupting it.
 //
@@ -159,13 +162,13 @@ const answerLabel = computed(
 )
 
 // Whether this row may offer to stop tracking the run (T101). Two conditions, and
-// the second is the row's own reading rather than a second definition of it: the
-// state is derived with liveness outranking the committed record (spec D24), so a
-// live session reads `running` however finished its state.yaml says it is — which
-// already keeps a running container out of ENDED_STATES. `live` is tested beside
-// it anyway, because the row that must never offer this is the one with a session
-// behind it: winding a session down is what that case has, and a one-tap forget
-// there would drop the platform's own handle on a container still doing work.
+// the second is the row's own reading rather than a second definition of it. The
+// state alone does not keep a live container out of ENDED_STATES: a run whose
+// state.yaml is terminal reads `complete` even while its session is still live,
+// so `!live` is the only thing hiding forget on that row. Do not drop it —
+// the row that must never offer this is the one with a session behind it: winding
+// a session down is what that case has, and a one-tap forget there would drop the
+// platform's own handle on a container still doing work.
 const forgettable = computed(
   () => !props.run.live && ENDED_STATES.includes(props.run.state),
 )

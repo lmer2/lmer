@@ -131,6 +131,13 @@ consult relevant prior exchanges when context is missing.
   replying to a *live* one is delivered into the waiting session.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
+- **Finished but still live** — a run whose `state.yaml` records a terminal
+  status (`complete`/`archived`) reads `complete` even while its session is still
+  up. The run's own record is a deliberate act by `work state set`, and a session
+  sitting at its prompt afterwards can still add artifacts; reporting it as
+  `running` kept a finished run drawing check-ins for hours (#308). The row keeps
+  reporting the live session, so "complete, session still up" is distinguishable
+  from a run that is still working.
 - **Wound down, not crashed** — a dead session's leftover registry entry is
   normally the only evidence that something died, so the fleet reads it as a
   crash. The exception is an ending the operator asked for: a wind-down leaves a
