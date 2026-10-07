@@ -122,15 +122,13 @@ RESERVED_SOURCE_NAMES = ("knowledge", "plans")
 #: Documented keys of a ``sources.<name>`` entry, PER NAME — the vocabulary
 #: is not uniform. SCHEMA.md's sources table gives ``taskdef`` ``{repo, ref?}``
 #: and every other name ``{repo}``, and ``load_sources`` enforces exactly that
-#: asymmetry on a standalone ``sources.yaml`` ("`ref:` is valid under
-#: `sources.taskdef` only in schema 1 (there is no LMER_NAPKIN_REF)") — a
-#: refuse-start error, not a warning. A uniform set here would accept
-#: ``sources.napkin.ref`` in a manifest, where nothing would ever act on it:
-#: the manifest's ``sources:`` tier is declared-only until its loader lands
-#: (issue #370), so the ref takes effect nowhere and no tool says a word.
-#: The day that loader arrives, every manifest already carrying one becomes a
-#: tree that refuses to start — which is why the key set is per-name NOW,
-#: while the warning still costs an operator one edit.
+#: asymmetry at every tier through its one per-entry rule set
+#: (``validate_source_entry``: "`ref:` is valid under `sources.taskdef` only
+#: in schema 1 (there is no LMER_NAPKIN_REF)") — a refuse-start error, not a
+#: warning. The manifest's ``sources:`` tier is read by that loader since
+#: issue #370, so a ``sources.napkin.ref`` in a manifest refuses start at
+#: container launch; this per-name key set is what makes the validator warn
+#: about it first, while the fix still costs an operator one edit.
 #:
 #: Keyed by name rather than special-cased at the call site: which names take
 #: ``ref`` is a schema fact, and a second place that knows it is a second

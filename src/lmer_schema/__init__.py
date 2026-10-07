@@ -23,15 +23,20 @@ Import spelling — decided here so every sibling subsystem uses ONE spelling:
 - ``lmer_schema.cli`` (the console entry ``lmer-schema``) and the
   ``lmer_schema.checks`` package (validator internals) are NOT part of the
   surface and are never re-exported here.
-- The surface is the four core modules' own ``__all__``, flattened: the
+- The surface is the five core modules' own ``__all__``, flattened: the
   manifest envelope (``lmer_schema.manifest``), the D21 URL adapter
   (``lmer_schema.urls``), identity and project-dir resolution
-  (``lmer_schema.registry``) and D20 form detection (``lmer_schema.form``).
-  Re-exports are the same objects, not copies, so ``is``/``isinstance`` hold
-  across both spellings. ``is_short_name`` and ``SHORT_NAME_RE`` come from
+  (``lmer_schema.registry``), D20 form detection (``lmer_schema.form``) and
+  the manifest write API (``lmer_schema.writer``, issue #366 — the one
+  tool-side write path ``work adopt``/``work migrate`` share). Re-exports
+  are the same objects, not copies, so ``is``/``isinstance`` hold across
+  both spellings. ``is_short_name`` and ``SHORT_NAME_RE`` come from
   ``registry`` (``manifest`` defines the same rule for the documents it
   parses; the registry is where identity lives, and the two are pinned
-  against each other in their own tests).
+  against each other in their own tests). The writer's backend
+  (ruamel.yaml) is imported lazily inside that module, so this eager
+  re-export costs the read path nothing: ``import lmer_schema`` loads no
+  ``ruamel`` module, and its tests pin that in a fresh interpreter.
 - Adding or removing a name here is a deliberate contract change:
   ``tests/test_lmer_schema_package.py`` pins the exact list, so a name never
   joins the surface as a side effect of an edit inside a submodule.
@@ -91,6 +96,7 @@ from lmer_schema.registry import (
     resolve_project_dir,
 )
 from lmer_schema.urls import entry_keys, lookup_key, normalize
+from lmer_schema.writer import ManifestWriter, WriterError, create, load_for_write
 
 #: THE public surface (see the import-spelling decision above), kept sorted.
 __all__: list[str] = [
@@ -103,6 +109,7 @@ __all__: list[str] = [
     "MISS",
     "Manifest",
     "ManifestError",
+    "ManifestWriter",
     "PROJECT_MARKERS",
     "Project",
     "REGISTRY_HIT",
@@ -112,8 +119,10 @@ __all__: list[str] = [
     "SCHEMA_AREAS",
     "SHORT_NAME_RE",
     "SUPPORTED_SCHEMAS",
+    "WriterError",
     "bucket_path",
     "build_registry",
+    "create",
     "detect",
     "detect_form",
     "entry_keys",
@@ -122,6 +131,7 @@ __all__: list[str] = [
     "is_host_bucket_name",
     "is_project_shaped",
     "is_short_name",
+    "load_for_write",
     "load_manifest",
     "load_registry",
     "lookup_key",
