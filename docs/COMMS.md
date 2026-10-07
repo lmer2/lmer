@@ -910,7 +910,12 @@ is never blindly replayed. The connector runs until stopped:
   and records from its own channel, and posts the rest (a question with numbered options,
   an answer from another channel with who gave it, milestones with a
   glyph, other channels' messages tagged `[uber lmer] …`), and acks its
-  position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`);
+  position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`).
+  Every posted text, Slack's and matrix's alike, goes through the shared
+  value-and-shape credential scrub *before* it is clipped, so options display
+  redacted; the bus record stays raw, and replying by number still routes to the
+  original option. `post_thread` and `open_thread` scrub the same way on both
+  transports. Direct messages to a person are not scrubbed (tracked separately);
 - **inbound**: Slack polls `conversations.replies` every
   `LMER_SLACK_POLL_SECONDS` (default 3); matrix `/sync`s with a filter on the
   one room. Each new human message — and each post another run or the platform

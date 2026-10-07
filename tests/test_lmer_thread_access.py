@@ -663,6 +663,30 @@ class TestNamingAChannel:
         assert "connect that thread" in str(caught.value)
 
 
+class TestSlackEgressRedaction:
+    """The thread-post paths scrub like their Matrix twins (#539); the bus keeps the raw text."""
+
+    SHAPED = "ghp_" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8"
+
+    def test_a_post_reaches_slack_redacted_and_the_attachment_names_too(self, slack):
+        post_thread(
+            SLACK_LINK, f"found {self.SHAPED}", label="run", env=SLACK_ENV,
+            attachments=[{"name": f"{self.SHAPED}.md"}],
+        )
+        assert self.SHAPED not in slack.posted[0][2]
+        assert "***REDACTED***" in slack.posted[0][2]
+
+    def test_a_credential_cut_by_the_clip_is_still_redacted(self, slack):
+        lead = "x " * ((thread_access.MAX_POST_CHARS - 12) // 2)
+        post_thread(SLACK_LINK, lead + self.SHAPED, label="r", env=SLACK_ENV)
+        assert "ghp_" not in slack.posted[0][2]
+
+    def test_an_opened_root_reaches_slack_redacted(self, slack):
+        open_thread("#a-channel", f"the run {self.SHAPED}", env=SLACK_ENV)
+        assert self.SHAPED not in slack.opened[0][1]
+        assert "***REDACTED***" in slack.opened[0][1]
+
+
 class TestOpening:
     """Opening a thread in a named channel (issue #429).
 
