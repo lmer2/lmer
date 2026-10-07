@@ -448,27 +448,36 @@ def _github_http_forge(host: str) -> bool:
     return host == "github.com" or host.split(".", 1)[0] == "github"
 
 
-def _forge_route(path: str) -> tuple[bool, str, list[str]] | None:
-    """Split a http(s) URL's *path* at the forge's route boundary.
+def _forge_route(parsed) -> tuple[bool, str, str, list[str]] | None:
+    """Split a parsed http(s) URL at its forge's route boundary — the SHAPE
+    decided first, by host, then the route read where that shape puts it.
 
-    GitLab's is the first ``/-/``: the project is everything before it and
-    the route the segment after it. Without one, GitHub's shape puts the
-    route in the fixed ``/<owner>/<repo>/<route>`` position. Returns
-    ``(gitlab, route, payload)`` — which boundary was read, the route
-    lowercased, the segments after it — or ``None`` for a path with no route
-    (a project root, a bare ``/-/``). The payload is the route's own (an id,
-    a ref, a file path), so a work-item spelling inside it
-    (``/blob/main/issues/123``) is a filename and never a route (astra, !380).
+    GitHub's shape (:func:`_github_http_forge`): the project is the fixed
+    ``/<owner>/<repo>`` (a ``.git`` on the repo dropped), the route the third
+    segment, and everything after it the route's payload — a later ``/-/``
+    included, so ``/blob/main/-/issues/123`` is a file. Elsewhere the first
+    ``/-/`` is GitLab's boundary: the project is everything before it (nested
+    groups included), the route the segment after it. A path with no ``/-/``
+    off GitHub is read in GitHub's position too (codeberg, every Gitea, an
+    unknown host). Returns ``(gitlab, project, route, payload)`` — which
+    boundary was read, the project path, the route lowercased, the segments
+    after it — or ``None`` for a path with no route (a project root, a bare
+    ``/-/``). :func:`repository_of` reads the same split, so a filename is
+    never a route for one reader and a project for the other (astra, !380).
     """
-    if "/-/" in path:
-        gitlab, tail = True, path.split("/-/", 1)[1]
-        segments = [segment for segment in tail.split("/") if segment]
-    else:
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if _github_http_forge(parsed.hostname or "") or "/-/" not in parsed.path:
         gitlab = False
-        segments = [segment for segment in path.split("/") if segment][2:]
+        project = "/".join(segments[:2]).removesuffix(".git")
+        segments = segments[2:]
+    else:
+        gitlab = True
+        project, _, tail = parsed.path.partition("/-/")
+        project = project.strip("/")
+        segments = [segment for segment in tail.split("/") if segment]
     if not segments:
         return None
-    return gitlab, segments[0].lower(), segments[1:]
+    return gitlab, project, segments[0].lower(), segments[1:]
 
 
 def _repository_url_target(parsed) -> bool:
@@ -565,6 +574,14 @@ def classify_target(target: str | None) -> str:
       the path can: ``/blob/main/issues/123`` and
       ``/-/blob/main/compare/result.md`` name files and are references, not
       work items sharing a group with the issue they happen to spell.
+    - The shape is decided before the route, by host (round two): on a
+      GitHub-shaped host the route is the third segment and a later ``/-/``
+      is payload — ``/blob/main/-/issues/123`` is a file, not GitLab's
+      boundary — while elsewhere the FIRST ``/-/`` is that boundary, so a
+      nested group ``/g/sub/p/-/issues/1`` keeps its whole project and
+      ``/-/blob/main/-/issues/123`` still reads ``blob``. :func:`repository_of`
+      derives from the same split (:func:`_forge_route`), so no URL is a
+      reference here and a nonexistent repository there.
     - A GitHub-position reference route (``tree``, ``blob``, ``wiki``,
       ``commits``, the ``issues``/``pulls`` list pages) reads as forge
       content on a known forge host only (:func:`_known_http_forge`), so
@@ -593,9 +610,9 @@ def classify_target(target: str | None) -> str:
         if parsed is None:
             return "other"
         if parsed.scheme.lower() in ("http", "https"):
-            route = _forge_route(parsed.path)
-            if route is not None:
-                gitlab, name, payload = route
+            split = _forge_route(parsed)
+            if split is not None:
+                gitlab, _, name, payload = split
                 id_re = _WORK_ITEM_IDS.get(name)
                 if id_re is not None and payload and id_re.fullmatch(payload[0]):
                     return "work-item"
@@ -641,10 +658,12 @@ def repository_of(url: str | None) -> str | None:
     clone comes from (#523). By class (:func:`classify_target`):
 
     ``work-item``, ``reference``
-        A derived answer. GitLab-shaped (a ``/-/`` route in the path):
-        ``<scheme>://<host[:port]>/<the path before /-/>``. Otherwise the
-        GitHub shape: ``<scheme>://<host[:port]>/<owner>/<repo>``, a
-        ``.git`` on the repo segment dropped (what the derivation did).
+        A derived answer, ``<scheme>://<host[:port]>/<project>`` with the
+        project the classifier's own split (:func:`_forge_route`, shape
+        first): on a GitHub-shaped host the fixed ``<owner>/<repo>``, a
+        ``.git`` on the repo segment dropped (what the derivation did) and
+        a later ``/-/`` being payload; elsewhere the path before the first
+        ``/-/``, nested groups included.
         The host and port are the target's — the port is part of the
         address; userinfo is NOT carried over: this answer is read into run
         identities and platform logs, and a credential in a work-item link
@@ -672,18 +691,12 @@ def repository_of(url: str | None) -> str | None:
         return None
     parsed = urlparse(text)
     netloc = parsed.netloc.rpartition("@")[2]
-    if not netloc:
+    # The classifier's own split: the project is whatever sits before the
+    # route it read, never a second guess at the path.
+    split = _forge_route(parsed)
+    if not netloc or split is None or not split[1]:
         return None
-    if "/-/" in parsed.path:
-        project = parsed.path.split("/-/", 1)[0].strip("/")
-    else:
-        segments = [segment for segment in parsed.path.split("/") if segment]
-        if len(segments) < 2:
-            return None
-        project = f"{segments[0]}/{segments[1].removesuffix('.git')}"
-    if not project:
-        return None
-    return f"{parsed.scheme}://{netloc}/{project}"
+    return f"{parsed.scheme}://{netloc}/{split[1]}"
 
 
 # ---------------------------------------------------------------------------

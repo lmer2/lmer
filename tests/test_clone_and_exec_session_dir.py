@@ -115,6 +115,13 @@ BARE_TARGETS = [
         "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
         id="document-url-spelling-a-compare",
     ),
+    # round two: a literal ``-`` directory in a GitHub file path is payload,
+    # not GitLab's boundary — the shape is decided by the host first
+    pytest.param(
+        "https://github.com/acme/widget/blob/main/-/issues/123",
+        id="document-url-with-a-dash-directory",
+    ),
+    pytest.param("https://github.com/acme/widget/tree/main/-/blob/x", id="tree-url-with-a-dash-directory"),
     pytest.param(f"https://{PRIMARY_REPO}.git", id="issue-81-clone-url"),
     pytest.param("https://docs.python.org/3/library/os.html", id="off-forge-document"),
 ]

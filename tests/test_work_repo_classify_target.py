@@ -10,12 +10,16 @@ is pinned here, in the order the module decides it:
   names plus the decisions the task recorded in the docstring (GitHub
   ``/commits/<ref>`` is a reference; a credential on a non-HTTP transport is
   ``other``; the indicator constant's shape);
-- the route rule (astra, !380): a path is split at the forge's route
-  boundary — ``/-/`` on GitLab, the ``owner/repo/<route>`` position on
-  GitHub's shape — and only that route decides, so a work-item spelling
-  inside a file path (``/blob/main/issues/123``) is a filename; every
-  reference row is re-run with each id-bearing spelling spliced into its
-  payload, and a GitHub-position reference route needs a known forge host;
+- the route rule (astra, !380, two rounds): the forge SHAPE is decided
+  first, by host — GitHub's fixed ``owner/repo/<route>`` on a GitHub-shaped
+  host, where a later ``/-/`` is payload; the first ``/-/`` elsewhere, which
+  keeps nested GitLab groups whole — and only the route it puts there
+  decides, so a work-item spelling inside a file path
+  (``/blob/main/issues/123``, ``/blob/main/-/issues/123``) is a filename;
+  ``repository_of`` reads the same split; every reference row is re-run
+  with each id-bearing spelling spliced into its payload, with and without
+  a ``-/`` delimiter, and a GitHub-position reference route needs a known
+  forge host;
 - ``is_work_item`` over the same rows;
 - ``repository_of`` (A1-wave0.repository-of): a table of its own over both
   copies — GitLab ``/-/`` URLs with nested groups, a port and userinfo;
@@ -117,6 +121,7 @@ TABLE = [
     ("https://github.com/o/r/pull/9", "work-item"),
     ("https://codeberg.org/o/r/issues/5", "work-item"),
     ("https://x/org/p/pull/9", "work-item"),
+    ("https://gitlab.example.com/g/sub/p/-/issues/1", "work-item"),  # nested: the first /-/
     # work-item — the non-URL tail of the table
     (FULL_SHA, "work-item"),
     ("abc1234", "work-item"),
@@ -150,6 +155,12 @@ TABLE = [
     ("https://gitlab.example.com/team/widget/-/blob/main/compare/result.md", "reference"),
     (f"{GL}/-/tree/main/issues/5", "reference"),
     (f"{GH}/tree/main/pull/9", "reference"),
+    # reference — round two: a literal ``-`` directory in a GitHub payload is
+    # payload, the shape having been decided by the host first; GitLab's
+    # control reads its FIRST /-/
+    ("https://github.com/acme/widget/blob/main/-/issues/123", "reference"),
+    ("https://github.com/acme/widget/tree/main/-/blob/x", "reference"),
+    ("https://gitlab.example.com/team/widget/-/blob/main/-/issues/123", "reference"),
     # repository — forge roots, the deltas, transports, paths
     (GL, "repository"),
     (f"{GL}.git", "repository"),
@@ -272,6 +283,15 @@ REPOSITORY_OF = [
         "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
         "https://gitlab.example.com/team/widget",
     ),
+    # round two: a later /-/ on a GitHub-shaped host is payload; GitLab's
+    # control and a nested group keep the project before the FIRST /-/
+    ("https://github.com/acme/widget/blob/main/-/issues/123", "https://github.com/acme/widget"),
+    ("https://github.com/acme/widget/tree/main/-/blob/x", "https://github.com/acme/widget"),
+    (
+        "https://gitlab.example.com/team/widget/-/blob/main/-/issues/123",
+        "https://gitlab.example.com/team/widget",
+    ),
+    ("https://gitlab.example.com/g/sub/p/-/issues/1", "https://gitlab.example.com/g/sub/p"),
     # a repository: itself, as given — a credential in it is the consumer's
     (GL, GL),
     (f"{GL}.git", f"{GL}.git"),
@@ -402,29 +422,59 @@ class TestTheTable:
 # ---------------------------------------------------------------------------
 
 
-#: ``_forge_route``: ``(path, (gitlab, route, payload))`` — the split at the
-#: forge's route boundary, or ``None`` for a path with no route.
+#: ``_forge_route``: ``(url, (gitlab, project, route, payload))`` — the split
+#: at the forge's route boundary, the shape decided by the host first, or
+#: ``None`` for a path with no route.
 FORGE_ROUTES = [
-    ("/group/project/-/issues/141", (True, "issues", ["141"])),
-    ("/group/project/-/issues", (True, "issues", [])),
-    ("/group/project/-/Issues/5", (True, "issues", ["5"])),  # the route is lowercased
-    ("/group/subgroup/project/-/merge_requests/7/diffs", (True, "merge_requests", ["7", "diffs"])),
-    ("/team/widget/-/blob/main/compare/result.md", (True, "blob", ["main", "compare", "result.md"])),
-    ("/-/issues/5", (True, "issues", ["5"])),  # a route with no project before it
-    ("/owner/repo/pull/9/files", (False, "pull", ["9", "files"])),
-    ("/owner/repo.git/pull/9", (False, "pull", ["9"])),
-    ("/acme/widget/blob/main/issues/123", (False, "blob", ["main", "issues", "123"])),
-    ("/owner/repo/issues", (False, "issues", [])),
-    ("/owner/repo", None),
-    ("/owner/repo/", None),
-    ("/owner", None),
-    ("/", None),
-    ("", None),
-    ("/group/project/-/", None),  # a bare /-/ names no route
+    # GitLab's shape: the first /-/ is the boundary, the project everything
+    # before it — on any host, nested groups whole, a later /-/ payload
+    ("https://gitlab.example.com/group/project/-/issues/141", (True, "group/project", "issues", ["141"])),
+    ("https://gitlab.example.com/group/project/-/issues", (True, "group/project", "issues", [])),
+    ("https://gitlab.example.com/group/project/-/Issues/5", (True, "group/project", "issues", ["5"])),
+    (
+        "https://gitlab.example.com/group/subgroup/project/-/merge_requests/7/diffs",
+        (True, "group/subgroup/project", "merge_requests", ["7", "diffs"]),
+    ),
+    (
+        "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
+        (True, "team/widget", "blob", ["main", "compare", "result.md"]),
+    ),
+    (
+        "https://gitlab.example.com/team/widget/-/blob/main/-/issues/123",
+        (True, "team/widget", "blob", ["main", "-", "issues", "123"]),
+    ),
+    ("https://h/g/sub/p/-/issues/1", (True, "g/sub/p", "issues", ["1"])),  # an unknown host reads the marker
+    ("https://gitlab.example.com/-/issues/5", (True, "", "issues", ["5"])),  # no project before it
+    ("https://gitlab.example.com/group/project/-/", None),  # a bare /-/ names no route
+    # GitHub's shape: the host decides, the route is the third segment and
+    # anything after it — a later /-/ included — is the route's payload
+    ("https://github.com/owner/repo/pull/9/files", (False, "owner/repo", "pull", ["9", "files"])),
+    ("https://github.com/owner/repo.git/pull/9", (False, "owner/repo", "pull", ["9"])),
+    ("https://github.com/acme/widget/blob/main/issues/123", (False, "acme/widget", "blob", ["main", "issues", "123"])),
+    (
+        "https://github.com/acme/widget/blob/main/-/issues/123",
+        (False, "acme/widget", "blob", ["main", "-", "issues", "123"]),
+    ),
+    ("https://github.com/acme/widget/tree/main/-/blob/x", (False, "acme/widget", "tree", ["main", "-", "blob", "x"])),
+    (
+        "https://github.example.com:8443/acme/widget/blob/main/-/issues/123",  # Enterprise, by first label
+        (False, "acme/widget", "blob", ["main", "-", "issues", "123"]),
+    ),
+    ("https://github.com/owner/repo/issues", (False, "owner/repo", "issues", [])),
+    ("https://github.com/owner/repo", None),
+    ("https://github.com/owner/repo/", None),
+    ("https://github.com/owner", None),
+    ("https://github.com/", None),
+    ("https://github.com", None),
+    # no /-/ off GitHub: GitHub's position, whatever the host
+    ("https://codeberg.org/o/r/issues/5", (False, "o/r", "issues", ["5"])),
+    ("https://x/org/p/pull/9", (False, "org/p", "pull", ["9"])),
+    ("https://docs.example.com/a/b/tree/x", (False, "a/b", "tree", ["x"])),
 ]
 
 #: An id-bearing spelling as each forge writes it, to splice into a reference
-#: URL's payload: none of them may promote the reference to a work item.
+#: URL's payload: none of them may promote the reference to a work item —
+#: with a ``-/`` delimiter in front of it (round two) no more than without.
 WORK_ITEM_SPELLINGS = (
     "issues/123",
     "merge_requests/7",
@@ -433,6 +483,8 @@ WORK_ITEM_SPELLINGS = (
     "pulls/9",
     f"commit/{FULL_SHA}",
     "compare/main...feature",
+    "-/issues/123",
+    "-/merge_requests/7",
 )
 
 
@@ -446,8 +498,25 @@ class TestTheRouteDecides:
     @pytest.mark.parametrize("mod", COPIES)
     @pytest.mark.parametrize("row", FORGE_ROUTES, ids=lambda row: repr(row[0]))
     def test_the_split_at_the_route_boundary(self, mod, row):
-        path, expected = row
-        assert mod._forge_route(path) == expected
+        url, expected = row
+        assert mod._forge_route(urlparse(url)) == expected
+
+    @pytest.mark.parametrize("mod", COPIES)
+    @pytest.mark.parametrize(
+        "row",
+        [row for row in TABLE if row[1] in ("work-item", "reference") and "://" in (row[0] or "")],
+        ids=_row_id,
+    )
+    def test_repository_of_reads_the_same_split(self, mod, row):
+        """One boundary for both readers (round two): the repository a URL
+        derives is the project before the route the classifier read — never
+        a second, independent guess at where the route begins."""
+        target, _ = row
+        _, project, _, _ = mod._forge_route(urlparse(target))
+        answer = mod.repository_of(target)
+        assert (answer is None) is (not project)
+        if answer is not None:
+            assert urlparse(answer).path.strip("/") == project
 
     @pytest.mark.parametrize("mod", COPIES)
     @pytest.mark.parametrize("spelling", WORK_ITEM_SPELLINGS)
