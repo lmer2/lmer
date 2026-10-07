@@ -180,10 +180,55 @@ def current_metadata() -> dict:
     return metadata
 
 
+def seeded_session() -> dict:
+    """The `session` of a record THIS launch seeds for a later one (D13).
+
+    A fresh uid, this launch named once in `seeded_by`, and the moment of
+    seeding — nothing else. The launch's own metadata (operator, hostname,
+    harness, model, pid) describes an execution that never ran in that
+    record, so none of it is copied: the record says nothing has run in it
+    yet and still traces back to whoever seeded it. Like
+    :func:`current_metadata`, refuses without this launch's valid UID — a
+    seed without a seeder is not a schema 2 write.
+    """
+    return {
+        "uid": uuid.uuid4().hex,
+        "seeded_by": current_metadata()["uid"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def signed_out(events: list[dict]) -> bool:
     """Only an observed final session_end establishes a clean sign-out."""
     lifecycle = [event.get("type") for event in events if event.get("type") in {"session_start", "session_end"}]
     return bool(lifecycle) and lifecycle[-1] == "session_end"
+
+
+def is_seeded(state: dict, events: list[dict]) -> bool:
+    """A record `work seed` left for a later launch and nobody has run in (D13).
+
+    `session.seeded_by` names the launch that wrote it and no `session_start`
+    was ever logged there. `seeded_by` alone is not the fact: a record
+    something started in is an ordinary record whose seeding is history, and
+    `signed_out` is the question to ask of it. Pure, over the same parsed
+    events list `signed_out` takes.
+    """
+    metadata = state.get("session") if isinstance(state, dict) else None
+    seeded_by = metadata.get("seeded_by") if isinstance(metadata, dict) else None
+    if not isinstance(seeded_by, str) or not seeded_by:
+        return False
+    return not any(event.get("type") == "session_start" for event in events)
+
+
+def is_stopped(state: dict, events: list[dict]) -> bool:
+    """Whether nothing can still be running in a record: it signed out, or it
+    is seeded and nothing ever started in it. The ONE rule every reader of
+    "is this record live?" shares — the continuation source check, migration
+    and housekeeping — so they cannot drift apart on what a seed is. A caller
+    that cannot read the state or the events has no answer here; treating
+    such a record as not stopped is that caller's rule.
+    """
+    return signed_out(events) or is_seeded(state, events)
 
 
 def sort_key(path: Path) -> tuple[str, str]:
