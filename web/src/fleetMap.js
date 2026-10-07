@@ -130,84 +130,23 @@ function named(value) {
   return text && text !== UNIDENTIFIED ? text : null
 }
 
-// Which runs draw inside one ring, as a *list of rules* rather than as a rule.
-//
-// Deliberately not a namespace prefix. The operator's own example spans two
-// namespaces — `fullctl/ixctl`, `fullctl/peerctl` and `syseng/fullctl-site` are
-// one group — so "the first path segment" is the wrong shape: it would split the
-// group it is meant to draw. A regex over the project path holds all three.
-//
-// First match wins, so order is precedence. A project matching no rule is its own
-// group and draws exactly as it did before rules existed, which is what keeps a
-// fleet nobody has written rules for looking untouched.
-//
-// **This constant is the seam.** Every function below takes its rules as an
-// argument defaulting to this list, and a `pattern` may be a string as readily as
-// a RegExp — so the later slice (rules stored per operator and edited in the UI)
-// changes where the list comes from and nothing about how it is applied. That
-// slice is not built here.
-//
-// **A decision that slice must not re-open: an operator-typed pattern has to be
-// escaped into a literal substring, not compiled as a regex.** `groupRuns` runs
-// on every poll and every render, and a regex is not a safe thing to accept from
-// a text field — `(a+)+$` against a 31-character path backtracks for *minutes*,
-// measured, and the `try`/`catch` below cannot help because catastrophic
-// backtracking does not throw, it spins. That is the fleet view gone for the
-// session. Rules the *code* declares stay regexes; they are reviewed like code.
-// Unreachable today, which is exactly why it is settled here rather than left to
-// be discovered by the slice that makes it live.
-//
-// One boundary for all three rules, rather than each rule inventing its own.
-// `(^|[/-])name([/-]|$)` treats `/` and `-` alike, which is what the operator's
-// own example needs: `syseng/fullctl-site` is a fullctl project and a
-// segment-only anchor would drop it. What that boundary costs is stated plainly
-// because it is not obvious from reading the list — see the table in
-// `tests/test_platform_web_fleetmap.js`: it rejects `notfullctl/x`, and it still
-// admits `fullctl-archive/notes`. It has to. `fullctl-site` and
-// `fullctl-archive` are the same shape — a segment beginning `fullctl-` — so no
-// pattern can keep the first and drop the second, and naming the group is a
-// judgement only the operator can make.
-export const GROUP_RULES = [
-  { label: 'fullctl', pattern: /(^|[/-])fullctl([/-]|$)/i },
-  { label: 'peeringdb', pattern: /(^|[/-])peeringdb([/-]|$)/i },
-  { label: 'agents', pattern: /(^|[/-])agents([/-]|$)/i },
-]
+// Operator text stays literal: compiling it as regex can freeze the render path.
+export const GROUP_RULES = []
 
-// A rule's pattern as something safe to `test` with.
-//
-// `g` and `y` make `test` stateful — the same rule would match every *other* call
-// — and a rule is operator data one day, so the flags are dropped rather than the
-// rule rejected. A string is accepted because that is what an operator types.
-function toRegExp(pattern) {
-  if (pattern instanceof RegExp) {
-    const flags = pattern.flags.replace(/[gy]/g, '')
-    return flags === pattern.flags ? pattern : new RegExp(pattern.source, flags)
-  }
-  if (typeof pattern === 'string' && pattern.trim()) {
-    try {
-      return new RegExp(pattern, 'i')
-    } catch {
-      return null
-    }
-  }
-  return null
+function boundedText(value, limit) {
+  // Count code points like the config validator, with a cheap UTF-16 bound first.
+  return typeof value === 'string' && value.length <= limit * 2
+    && [...value].length <= limit && !!value.trim()
 }
 
-// The first rule a project path matches, or `null` for a project that is its own
-// group. A malformed rule costs its own rule and never the map: one bad pattern
-// in an operator's list must not stop the fleet from drawing.
 export function groupRuleFor(project, rules = GROUP_RULES) {
-  const path = named(project)
-  if (!path) return null
-  for (const rule of rules || []) {
-    if (!rule || !rule.label) continue
-    const pattern = toRegExp(rule.pattern)
-    if (!pattern) continue
-    try {
-      if (pattern.test(path)) return rule
-    } catch {
-      continue
-    }
+  const path = named(project)?.toLowerCase()
+  if (!path || !Array.isArray(rules) || rules.length > 32) return null
+  for (const rule of rules) {
+    if (!rule || !boundedText(rule.name, 64)) continue
+    if (!Array.isArray(rule.patterns) || !rule.patterns.length || rule.patterns.length > 16) continue
+    if (!rule.patterns.every(text => boundedText(text, 256))) continue
+    if (rule.patterns.some(text => path.includes(text.trim().toLowerCase()))) return rule
   }
   return null
 }
@@ -256,10 +195,10 @@ export function groupRuns(runs, rules = GROUP_RULES) {
         host: run.host,
         project: run.project,
         label: project || UNIDENTIFIED_LABEL,
-        // Namespaced so a rule called `agents` and a lone project called
-        // `agents` cannot collide into one ring.
-        group: rule ? `rule:${rule.label}` : `cluster:${key}`,
-        groupLabel: rule ? rule.label : project || UNIDENTIFIED_LABEL,
+        // Namespaced so a rule called `team` and a lone project called
+        // `team` cannot collide into one ring.
+        group: rule ? `rule:${rule.name}` : `cluster:${key}`,
+        groupLabel: rule ? rule.name : project || UNIDENTIFIED_LABEL,
         runs: [],
       })
     }
@@ -414,7 +353,7 @@ export function pairsFromReplies(replies) {
 // Both layers clamp to the top of the frame, and a group sitting near the top
 // clamps its own projects there too — so with one floor the group's label and a
 // project's label land on the same line and overlay each other (seen on the demo:
-// `fullctl/fullctl` drawn through `fullctl`). A group's label belongs above its
+// `team/team` drawn through `team`). A group's label belongs above its
 // projects', which is where it sits everywhere else, so the floors say what the
 // geometry already says.
 export const GROUP_LABEL_FLOOR = 14

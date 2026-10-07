@@ -1,5 +1,0 @@
-added:
-- "Connect and disconnect a running session to Slack and matrix threads from the platform UI, the API and lmer-ctl"
-- "Chat-thread connectors for platform-spawned sessions run as daemon processes that reattach after a daemon restart"
-changed:
-- "A chat-thread connector announces itself in the thread on attach and says so when it stops listening"

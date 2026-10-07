@@ -46,7 +46,10 @@ Answering — two routes, and never each other's::
 Steering::
 
     spawn TASKDEF TARGET            POST /api/sessions
-    send SESSION TEXT               POST /api/sessions/{id}/input
+    send SESSION TEXT               POST /api/sessions/{id}/comms
+    peers list                      GET  /api/assistant/peers
+    peers orders PROJECT --purpose TEXT   GET /api/assistant/peers/{id}/instructions
+    peers receipt REF               GET  /api/assistant/peers/receipts/{ref}
     wind-down SESSION               POST /api/sessions/{id}/wind-down
     exit SESSION                    POST /api/sessions/{id}/exit
     runs resume KEY                 POST /api/runs/resume
@@ -122,7 +125,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from lmer_cli import runref
+from lmer_cli import routing_receipts, runref
 
 from lmer_platform.client import (
     Call,
@@ -349,14 +352,7 @@ def _reference_of(spec: str) -> dict:
 
 
 def _call_send(args) -> Call:
-    """A message to the session, on its bus (issue #407).
-
-    The bus stamps the source from this caller's credential — ``uber lmer`` for
-    the assistant — and relays the text into the harness tagged, so the agent
-    sees who spoke and every other channel sees the message too. ``--no-newline``
-    keeps the pre-bus keystroke path: a fragment left in the prompt box is not a
-    message anyone else should see.
-    """
+    """Send on the bus; the server assigns worker or peer UL provenance."""
     text = _text(args.text)
     if args.no_newline:
         return Call(
@@ -373,8 +369,17 @@ def _call_send(args) -> Call:
     return Call(
         "POST",
         f"/api/sessions/{args.session}/comms",
-        body={"kind": "message", "text": text},
+        body={"kind": "message", "text": text, **_given(args, ("ref", "generation"))},
     )
+
+
+def _call_peers(args) -> Call:
+    if args.peer_action == "list":
+        return Call("GET", "/api/assistant/peers")
+    if args.peer_action == "orders":
+        return Call("GET", f"/api/assistant/peers/{args.project}/instructions",
+                    params=_given(args, ("purpose", "offset", "limit")))
+    return Call("GET", f"/api/assistant/peers/receipts/{args.ref}")
 
 
 def _call_command(args) -> Call:
@@ -497,6 +502,13 @@ def _call_threads_disconnect(args) -> Call:
     return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
 
 
+def _call_threads_recover(args) -> Call:
+    return Call("POST", f"/api/sessions/{args.session}/threads/{args.thread}/recover", body={
+        "action": args.action, "operation": args.operation, "remote_ref": args.remote_ref,
+        "acknowledge_duplicate": args.acknowledge_duplicate, "reason": args.reason,
+    })
+
+
 def _call_wind_down(args) -> Call:
     return Call(
         "POST",
@@ -527,7 +539,8 @@ def _call_runs_forget(args) -> Call:
 def _call_runs_answer(args) -> Call:
     return Call(
         "POST", "/api/runs/answer",
-        body={**_run_fields(args.key), "answer": _text(args.text)},
+        body={**_run_fields(args.key), "answer": _text(args.text),
+              **_given(args, ("slot", "home_revision", "confirm_project"))},
     )
 
 
@@ -536,7 +549,7 @@ def _call_runs_resume(args) -> Call:
         "POST", "/api/runs/resume",
         body={
             **_run_fields(args.key),
-            **_given(args, ("taskdef", "repo_url", "direction", "session_id")),
+            **_given(args, ("taskdef", "repo_url", "direction", "session_id", "slot", "home_revision", "confirm_project")),
         },
     )
 
@@ -688,7 +701,53 @@ def create_parser() -> argparse.ArgumentParser:
             "answers only once the container is up."
         ),
     )
+    parser.add_argument("--workspace-id", default=os.environ.get("LMER_WORKSPACE_ID"),
+                        help="Explicit named project identity; inherited by project assistants.")
+    parser.add_argument("--request-id", help="Bind an action to its originating conversation request.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    workspaces = sub.add_parser("projects", help="Named workspaces, separate from forge repositories.")
+    workspace_sub = workspaces.add_subparsers(dest="project_command")
+    workspace_sub.add_parser("list").set_defaults(call=lambda _args: Call("GET", "/api/projects"))
+    create = workspace_sub.add_parser("create")
+    create.add_argument("name")
+    create.set_defaults(call=lambda args: Call("POST", "/api/projects", body={"name": args.name}))
+    context = workspace_sub.add_parser("context", help="Explicit read-only fleet excerpt with named provenance.")
+    context.add_argument("source_workspace_id")
+    context.set_defaults(call=lambda args: Call("GET", "/api/project-context", params={"source_workspace_id": args.source_workspace_id}))
+    relay = workspace_sub.add_parser("relay", help="Relay the supplied text, with source project provenance.")
+    relay.add_argument("destination_id")
+    relay.add_argument("text")
+    relay.set_defaults(call=lambda args: Call("POST", "/api/project-relay", body={"destination_id": args.destination_id, "text": _text(args.text)}))
+    for action in ("archive", "restore"):
+        command = workspace_sub.add_parser(action)
+        command.add_argument("identity")
+        command.set_defaults(call=lambda args, action=action: Call("POST", f"/api/projects/{args.identity}/{action}"))
+    move = workspace_sub.add_parser("move-run")
+    _add_run_key(move)
+    move.add_argument("destination_id")
+    move.add_argument("--home-revision", type=int, required=True)
+    move.set_defaults(call=lambda args: Call("POST", "/api/runs/move", body={**_run_fields(args.key), "destination_id": args.destination_id, "home_revision": args.home_revision}))
+
+    requests = sub.add_parser("requests", help="Source-bound conversation requests.")
+    requests_sub = requests.add_subparsers(dest="requests_command")
+    requests_list = requests_sub.add_parser("list")
+    requests_list.set_defaults(call=lambda _args: Call("GET", "/api/assistant/requests"))
+    requests_reply = requests_sub.add_parser("reply")
+    requests_reply.add_argument("identity")
+    requests_reply.add_argument("text")
+    requests_reply.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/reply",
+                                                      body={"text": _text(args.text)}))
+    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining uncertain delivery.")
+    requests_park.add_argument("identity")
+    requests_park.add_argument("reason")
+    requests_park.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/park",
+                                                     body={"reason": _text(args.reason)}))
+    requests_release = requests_sub.add_parser("release", help="Operator-only: release a blocked request with no uncertain effects.")
+    requests_release.add_argument("identity")
+    requests_release.add_argument("reason")
+    requests_release.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/release",
+                                                        body={"reason": _text(args.reason)}))
 
     status = sub.add_parser(
         "status",
@@ -759,11 +818,14 @@ def create_parser() -> argparse.ArgumentParser:
         "send",
         help=(
             "Send a message to a live session on its bus; the agent sees it "
-            "tagged [uber lmer] and so does every connected channel "
+            "tagged [uber lmer] for workers, or [peer UL message] for an explicitly "
+            "addressed peer UL. Peer sends require --ref, remain native and never mirror to external threads "
             "(POST /api/sessions/{id}/comms)."
         ),
     )
     send.add_argument("session", help="Session id.")
+    send.add_argument("--ref", help="Stable peer-send reference; reuse only for an identical retry. Required across projects.")
+    send.add_argument("--generation", type=int, help="Expected peer UL generation; stale addresses are refused, never retargeted.")
     _add_text(send, "What to say.")
     send.add_argument(
         "--no-newline",
@@ -774,6 +836,20 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     send.set_defaults(call=_call_send)
+
+    peers = sub.add_parser("peers", help="Project UL metadata, explicit standing-order reads and native send receipts.")
+    peer_verbs = peers.add_subparsers(dest="peer_action")
+    peer_list = peer_verbs.add_parser("list", help="Discover peer names, current UL sessions/generations and connected thread links.")
+    peer_list.set_defaults(call=_call_peers)
+    peer_orders = peer_verbs.add_parser("orders", help="Read bounded peer standing orders for a human-directed task; adapt relevant material only.")
+    peer_orders.add_argument("project", help="Peer project ID from peers list.")
+    peer_orders.add_argument("--purpose", required=True, help="Human-requested task requiring this explicit read.")
+    peer_orders.add_argument("--offset", type=int)
+    peer_orders.add_argument("--limit", type=int, help="Characters to read, 1-4000 (default 2000).")
+    peer_orders.set_defaults(call=_call_peers)
+    peer_receipt = peer_verbs.add_parser("receipt", help="Inspect this project's original peer-send result without resending.")
+    peer_receipt.add_argument("ref")
+    peer_receipt.set_defaults(call=_call_peers)
 
     command = sub.add_parser(
         "command",
@@ -960,6 +1036,18 @@ def create_parser() -> argparse.ArgumentParser:
     # matched, so it would 404. `threads list` is where the id comes from.
     threads_disconnect.add_argument("thread", help="Thread id, as `threads list` reports it.")
     threads_disconnect.set_defaults(call=_call_threads_disconnect)
+    threads_recover = threads_sub.add_parser(
+        "recover", help="Inspect or recover a pending send in the host connector state.",
+    )
+    threads_recover.add_argument("session", help="Session id.")
+    threads_recover.add_argument("thread", help="Thread id from threads list.")
+    threads_recover.add_argument("action", choices=("inspect", "receipt", "retry", "clear"))
+    threads_recover.add_argument("--operation", help="Exact pending operation id from inspect.")
+    threads_recover.add_argument("--remote-ref", help="Receipt to verify against the remote thread.")
+    threads_recover.add_argument("--acknowledge-duplicate", action="store_true",
+                                 help="Required for clear: the selected send may be duplicated.")
+    threads_recover.add_argument("--reason", help="Required for clear: why the marker is being removed.")
+    threads_recover.set_defaults(call=_call_threads_recover)
     threads_references = threads_sub.add_parser(
         "references",
         help="The threads this run has been pointed at, connected to none of them.",
@@ -1138,6 +1226,9 @@ def _add_runs(sub) -> None:
     )
     _add_run_key(answer)
     _add_text(answer, "The answer.")
+    answer.add_argument("--slot")
+    answer.add_argument("--home-revision", type=int)
+    answer.add_argument("--confirm-project", action="store_true", default=None)
     answer.set_defaults(call=_call_runs_answer)
 
     resume = runs_sub.add_parser(
@@ -1161,6 +1252,9 @@ def _add_runs(sub) -> None:
              "that names none of them is refused with the list rather than "
              "resolved to a neighbouring record.",
     )
+    resume.add_argument("--slot")
+    resume.add_argument("--home-revision", type=int)
+    resume.add_argument("--confirm-project", action="store_true", default=None)
     resume.set_defaults(call=_call_runs_resume)
 
     meta = runs_sub.add_parser(
@@ -1244,9 +1338,20 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
         if isinstance(calls, Call):
             calls = [calls]
         for index, call in enumerate(calls):
+            headers = {}
+            if args.workspace_id:
+                headers["X-Lmer-Workspace-ID"] = args.workspace_id
+            if args.request_id:
+                headers["X-Lmer-Request-ID"] = args.request_id
             response = _request(
-                endpoint, call, timeout=args.timeout, transport=transport
+                endpoint, call, timeout=args.timeout, transport=transport,
+                **({"headers": headers} if headers else {}),
             )
+            if call.method == "POST" and call.path == "/api/comms/thread" and 200 <= response.status_code < 300:
+                payload = _payload(response.text)
+                posted = payload.get("posted") if isinstance(payload, dict) else None
+                if isinstance(posted, dict):
+                    routing_receipts.record("post", posted.get("ref"))
             # A verb made of several calls stops at the first refusal and reports
             # it, rather than pressing on with a step whose precondition the
             # daemon just declined. The last call's reply is the verb's reply.

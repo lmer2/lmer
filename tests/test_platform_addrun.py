@@ -1674,6 +1674,7 @@ def test_the_taskdef_menu_can_still_express_a_name_the_host_cannot_see():
 #: not work anyway.
 #:
 #: - ``taskdef`` — the operator's call, on the reasoning that the list is static.
+#: - ``destination`` — the platform's complete list of active workspace IDs.
 #: - ``slot`` — service slots are declared in the *daemon's own* ``config.json``
 #:   and validated by the same process that serves this list, so unlike the
 #:   presets file (read where ``lmer`` runs, not where the daemon does) there is
@@ -1683,7 +1684,7 @@ def test_the_taskdef_menu_can_still_express_a_name_the_host_cannot_see():
 #:
 #: Every other name field stays free text — see
 #: :func:`test_the_preset_and_agent_name_fields_stay_free_text`.
-MENU_FIELDS = {"spawn.taskdef", "spawn.slot"}
+MENU_FIELDS = {"spawn.taskdef", "spawn.slot", "destination"}
 
 
 def test_only_the_fields_the_host_can_enumerate_are_menus():
@@ -1702,6 +1703,9 @@ def test_only_the_fields_the_host_can_enumerate_are_menus():
     assert _field_elements(text, "spawn.taskdef")[0].split()[0] == "v-select", (
         "the taskdef field is no longer the menu the operator asked for"
     )
+    destination = re.search(r'<v-select v-model="destination".*?/>', text, re.S).group()
+    assert ':items="projects.filter(project => !project.archived)"' in destination
+    assert 'item-value="id"' in destination
 
 
 def test_the_default_taskdef_survives_discovery():
@@ -1738,7 +1742,7 @@ def test_the_menu_asks_again_when_the_target_or_the_repository_changes():
     assert "fetchSpawnOptions({ target, repoUrl })" in text, (
         "the lookup does not say which spawn it is asking about"
     )
-    watched = text[text.index("watch("):]
+    watched = text[text.index("watch(\n  ["):]
     watched = watched[:watched.index("\n)\n")]
     for field in ("spawn.value.target", "spawn.value.repo_url"):
         assert field in watched, f"a change to {field} does not refresh the menu"

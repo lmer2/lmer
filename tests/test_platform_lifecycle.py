@@ -1283,18 +1283,13 @@ def test_the_ui_posts_to_the_two_routes_it_documents():
 
 
 def test_the_new_markup_hardcodes_no_colour_and_no_swept_out_variant():
-    """The theme owns colour (one place, both schemes), and `outlined` and `flat`
-    were swept out of every component at the operator's request as reading like an
-    unfinished wireframe.
-
-    The hex scan runs on the comment-stripped source: an MR reference in a comment
-    ("MR #164") is hex-shaped to a regex, and a colour cannot act from inside a
-    comment — code is where it would reach the screen.
-    """
+    """Lifecycle controls keep theme styling; project identity uses its named palette."""
     detail = _without_comments(_detail())
     assert not re.findall(r"#[0-9a-fA-F]{3,8}\b", detail)
     assert 'variant="outlined"' not in detail
-    assert 'variant="flat"' not in detail
+    identity = re.search(r'<v-chip\b[^>]*:color="projectColor\(run.workspace_color\)"[^>]*>', detail)
+    assert identity is not None
+    assert 'variant="flat"' not in detail.replace(identity.group(), '')
 
 
 def test_the_icons_are_bundled_svg_paths():

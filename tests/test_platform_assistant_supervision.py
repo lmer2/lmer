@@ -47,7 +47,7 @@ import pytest
 from dotenv import dotenv_values
 from fastapi.testclient import TestClient
 
-from lmer_platform import api, assistant, daemon, registry, spawn, store
+from lmer_platform import api, assistant, daemon, projects, registry, spawn, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
 
@@ -365,6 +365,8 @@ def test_run_starts_the_assistant_before_it_serves(
     the first fleet view anyone renders.
     """
     save_config(lmer_bin=str(fake_lmer))
+    projects.migrate()
+    projects.request_start("general")
     at_serve = {}
     serve_nothing(monkeypatch, lambda _kwargs: at_serve.update(
         running=assistant.status().running, session=assistant.status().session_id
@@ -431,8 +433,14 @@ def test_a_refused_start_does_not_stop_the_daemon_serving(
     """A platform that boots and says the assistant is down beats one that
     refuses to boot: the fleet view is what an operator needs when something is
     broken, and it does not depend on the assistant at all."""
-    save_config(lmer_bin=str(fake_lmer), max_concurrent_sessions=1)
-    registry.register("s-worker", kind="worker", pid=os.getpid())
+    save_config(lmer_bin=str(fake_lmer))
+    projects.migrate()
+    projects.request_start("general")
+
+    def missing_taskdef():
+        raise assistant.TaskdefMissing("orchestrate is unavailable in this fixture")
+
+    monkeypatch.setattr(assistant, "_require_taskdef", missing_taskdef)
     served = []
     serve_nothing(monkeypatch, served.append)
 
@@ -711,27 +719,24 @@ def test_a_live_assistant_does_not_refuse_its_own_replacement(
         kill_live_assistant()
 
 
-def test_a_capacity_refusal_names_the_cap_that_refused_it(
-    platform_root, fake_lmer, monkeypatch, capsys
+def test_boot_with_full_workers_starts_the_assistant(
+    platform_root, fake_lmer, long_lived, monkeypatch, capsys
 ):
-    """The reservation is not an exemption: workers already holding every slot
-    are holding the one the assistant wanted too, and "I cannot open the chat"
-    needs the setting to raise in it.
-
-    The retired cap is asserted absent from the output as well (T75): a build that
-    reintroduced ``max_concurrent_assistant_spawns`` as an unenforced number would
-    put it back in front of an operator as a thing to lower.
-    """
     save_config(lmer_bin=str(fake_lmer), max_concurrent_sessions=1)
+    projects.migrate()
+    projects.request_start("general")
     registry.register("s-worker", kind="worker", pid=os.getpid())
     serve_nothing(monkeypatch)
 
-    daemon.main(["run"])
-    out = capsys.readouterr().out
-
-    assert "max_concurrent_sessions (1)" in out
-    assert "Free a worker slot" in out
-    assert "assistant_spawns" not in out
+    try:
+        assert daemon.main(["run"]) == 0
+        out = capsys.readouterr().out
+        assert "Assistant started as" in out
+        assert assistant.status().running is True
+        assert spawn._live_worker_count() == 1
+        assert "assistant_spawns" not in out
+    finally:
+        kill_live_assistant()
 
 
 # --- (4) the live assistant's environment is not rewritten under it ----------
@@ -814,6 +819,8 @@ def test_the_daemon_says_when_the_assistant_cannot_drive_the_platform(
     """
     pin_runtime(monkeypatch, "docker")
     save_config(lmer_bin=str(fake_lmer))
+    projects.migrate()
+    projects.request_start("general")
     serve_nothing(monkeypatch)
 
     try:
@@ -945,26 +952,28 @@ def test_a_stopped_supervisor_is_never_re_armed(config):
     assert registry.list_sessions(live_only=True) == [], "nothing may have started"
 
 
-def test_the_daemon_publishes_its_supervisor_and_withdraws_it(
+def test_the_daemon_joins_project_supervision_before_returning(
     platform_root, fake_lmer, long_lived, monkeypatch
 ):
-    """The route cannot re-arm what it cannot reach.
-
-    Registered while serving, gone afterwards: a stopped supervisor left reachable
-    would answer for a daemon on its way out, and in a process that runs this more
-    than once it would answer for the previous run.
-    """
     save_config(lmer_bin=str(fake_lmer))
-    while_serving = {}
-    serve_nothing(monkeypatch, lambda _kwargs: while_serving.update(
-        supervisor=assistant._SUPERVISOR
-    ))
+    projects.migrate()
+    projects.request_start("general")
+    observed = {}
+    supervise = daemon._supervise_assistant
 
+    def capture(config):
+        observed["supervisor"] = supervise(config)
+        return observed["supervisor"]
+
+    monkeypatch.setattr(daemon, "_supervise_assistant", capture)
+    serve_nothing(monkeypatch, lambda _kwargs: observed.update(
+        alive=observed["supervisor"]._thread.is_alive()
+    ))
     try:
         assert daemon.main(["run"]) == 0
-        assert isinstance(while_serving["supervisor"], assistant.Supervisor)
-        assert assistant._SUPERVISOR is None, (
-            "the supervisor outlived the daemon that owned it"
-        )
+        assert observed["alive"]
+        assert isinstance(observed["supervisor"], projects.Supervisor)
+        assert not observed["supervisor"]._thread.is_alive()
+        assert assistant.status().running
     finally:
         kill_live_assistant()

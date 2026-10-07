@@ -289,75 +289,38 @@ const D3_ALPHA_DECAY = 0.9772
 assert.ok(FORCE.reheatAlpha * (D3_ALPHA_DECAY ** SETTLE_STEPS) < FORCE.alphaMin,
   'SETTLE_STEPS is too few to decay reheatAlpha to alphaMin: the solve stops mid-motion')
 
-// --- grouping by rule -------------------------------------------------------
-//
-// The operator's own example is the test: `fullctl/ixctl`, `fullctl/peerctl` and
-// `syseng/fullctl-site` are one group. A first-path-segment rule would put the
-// third one somewhere else, which is exactly why the rules are regexes.
-
+// --- configured literal text, ordered first-match grouping --------------------
+const RULES = [{ name: 'Team', patterns: ['team/', 'tools/team-'] }]
+assert.deepEqual(GROUP_RULES, [])
+for (const project of ['team/widget', 'tools/team-site', 'catalog/data']) {
+  assert.equal(groupRuleFor(project), null, 'an unconfigured graph has a default group')
+}
 {
-  const rule = (project) => {
-    const found = groupRuleFor(project)
-    return found ? found.label : null
+  const rules = [...RULES, { name: 'Widget', patterns: ['widget'] }]
+  for (const project of ['team/widget', 'TEAM/service', 'tools/team-site']) {
+    assert.equal(groupRuleFor(project, rules)?.name, 'Team')
   }
-  assert.equal(rule('fullctl/ixctl'), 'fullctl')
-  assert.equal(rule('fullctl/peerctl'), 'fullctl')
-  assert.equal(rule('syseng/fullctl-site'), 'fullctl',
-    'a group that spans namespaces is the whole reason these are regexes')
-  assert.equal(rule('peeringdb/peeringdb'), 'peeringdb')
-  assert.equal(rule('agents/global'), 'agents')
-  // A project no rule names keeps its own group, so a fleet nobody has written
-  // rules for draws exactly as it did before rules existed.
-  assert.equal(rule('acme/widget'), null)
-  assert.equal(rule(null), null)
-  assert.equal(rule('\u2014'), null, 'the daemon dash is not a project to match against')
-
-  // One boundary for all three rules: `/` and `-` both end a name. The table is
-  // here rather than in prose because the interesting half is what it does NOT
-  // catch, and because the two lines below it are the honest cost.
-  assert.equal(rule('notfullctl/x'), null,
-    'a bare substring match is back: every project with the letters in it joins the ring')
-  assert.equal(rule('x/myagents'), null)
-  assert.equal(rule('agents-archive/x'), 'agents',
-    'the boundary admits `-`, which is what `syseng/fullctl-site` needs')
-
-  // Stated, not asserted away: `fullctl-site` and `fullctl-archive` are the same
-  // shape — a segment beginning `fullctl-` — so no pattern keeps the first and
-  // drops the second. Whether `fullctl-archive` belongs in the ring is the
-  // operator's judgement, and the editable-rules slice is where they make it.
-  assert.equal(rule('fullctl-archive/notes'), 'fullctl')
-  assert.equal(rule('syseng/fullctl-site'), 'fullctl')
-}
-
-// The boundary is one shape across every shipped rule, so an operator reading
-// the list can tell what they will get from any one of them.
-for (const shipped of GROUP_RULES) {
-  assert.ok(shipped.pattern instanceof RegExp, `rule ${shipped.label} is not a RegExp`)
-  assert.equal(shipped.pattern.source, `(^|[/-])${shipped.label}([/-]|$)`,
-    `rule ${shipped.label} uses a boundary of its own; the shipped set must agree`)
-}
-
-// Rules are data, and one bad rule must cost its own rule rather than the map.
-{
-  const rules = [
-    { label: 'broken', pattern: '(' },
-    { label: 'nameless' },
-    { pattern: /widget/i },
-    { label: 'good', pattern: 'widget' },
-  ]
-  const found = groupRuleFor('acme/widget', rules)
-  assert.ok(found, 'a malformed rule earlier in the list swallowed a good one')
-  assert.equal(found.label, 'good')
-}
-
-// A `g` flag makes `test` stateful, so the same rule would match every other
-// call. The map must not group a project on Tuesday and not on Wednesday.
-{
-  const rules = [{ label: 'sticky', pattern: /widget/g }]
-  for (let i = 0; i < 4; i += 1) {
-    const found = groupRuleFor('acme/widget', rules)
-    assert.ok(found && found.label === 'sticky', `a global-flagged rule missed on call ${i}`)
+  assert.equal(groupRuleFor('team/widget', [...rules].reverse())?.name, 'Widget')
+  for (const project of ['teamwork/service', 'tools/other-site', 'catalog/data', null, '\u2014']) {
+    assert.equal(groupRuleFor(project, rules), null)
   }
+  assert.equal(groupRuleFor('notteam/widget', RULES)?.name, 'Team', 'text matching is not a path-boundary rule')
+  const literal = [{ name: 'Literal', patterns: ['(a+)+$', '[', '*'] }]
+  assert.equal(groupRuleFor('a'.repeat(100000) + '!', literal), null)
+  assert.equal(groupRuleFor('team/widget', literal), null, '* is literal, not a wildcard')
+  assert.equal(groupRuleFor('tools/(a+)+$', literal)?.name, 'Literal')
+  assert.equal(groupRuleFor('tools/[draft]', literal)?.name, 'Literal')
+  assert.equal(groupRuleFor('tools/*', literal)?.name, 'Literal')
+  for (const bad of [null, {}, 'team', {name:'Bad'}, {name:'Bad', patterns:[{}]}, {name:'Bad',patterns:['']},
+    {name:'Bad',patterns:[/team/]}, {name:'Bad',patterns:['x'.repeat(257)]}, {name:'Bad',patterns:Array(17).fill('team')}]) {
+    assert.equal(groupRuleFor('team/widget', [bad, ...RULES])?.name, 'Team')
+  }
+  assert.equal(groupRuleFor('team/widget', {}), null)
+  assert.equal(groupRuleFor('team/widget', Array(33).fill(RULES[0])), null)
+  const unicode = [{ name: '🌍'.repeat(64), patterns: ['🌍'.repeat(256)] }]
+  assert.equal(groupRuleFor('🌍'.repeat(256), unicode), unicode[0])
+  assert.equal(groupRuleFor('🌍'.repeat(256), [{ ...unicode[0], name: '🌍'.repeat(65) }]), null)
+  assert.equal(groupRuleFor('🌍'.repeat(257), [{ ...unicode[0], patterns: ['🌍'.repeat(257)] }]), null)
 }
 
 // --- the orchestrator is not in anything ------------------------------------
@@ -398,7 +361,7 @@ for (const shipped of GROUP_RULES) {
   const fresh = { host: '\u2014', project: '\u2014', slug: 'brand-new', state: 'running' }
   const clusters = groupRuns([
     run('a'),
-    { host: 'gitlab.example.com', project: 'fullctl/ixctl', slug: 'i', state: 'running' },
+    { host: 'gitlab.example.com', project: 'team/widget', slug: 'i', state: 'running' },
     fresh,
   ])
   for (const cluster of clusters) {
@@ -413,35 +376,35 @@ for (const shipped of GROUP_RULES) {
 // --- groups gather clusters, and only a real group draws a ring -------------
 {
   const clusters = groupRuns([
-    { host: 'h', project: 'fullctl/ixctl', slug: 'a', state: 'running' },
-    { host: 'h', project: 'fullctl/peerctl', slug: 'b', state: 'running' },
-    { host: 'h', project: 'syseng/fullctl-site', slug: 'c', state: 'running' },
+    { host: 'h', project: 'team/widget', slug: 'a', state: 'running' },
+    { host: 'h', project: 'team/service', slug: 'b', state: 'running' },
+    { host: 'h', project: 'tools/team-site', slug: 'c', state: 'running' },
     { host: 'h', project: 'acme/widget', slug: 'd', state: 'running' },
-  ])
+  ], RULES)
   const groups = groupClusters(clusters)
-  const fullctl = groups.find((g) => g.label === 'fullctl')
-  assert.ok(fullctl, 'the fullctl rule gathered nothing')
-  assert.equal(fullctl.clusters.length, 3,
-    'the three fullctl projects did not land in one group')
+  const team = groups.find((g) => g.label === 'Team')
+  assert.ok(team, 'the Team rule gathered nothing')
+  assert.equal(team.clusters.length, 3,
+    'the three Team projects did not land in one group')
 
   const drawn = drawnGroups(clusters)
   assert.equal(drawn.length, 1, 'a one-project group drew a ring of its own')
-  assert.equal(drawn[0].label, 'fullctl')
+  assert.equal(drawn[0].label, 'Team')
 
   // The ungrouped project is still its own group — it just does not draw a ring.
   const lone = groups.find((g) => g.clusters.length === 1)
   assert.ok(lone && lone.clusters[0].project === 'acme/widget')
 }
 
-// A rule named `agents` and a lone project literally called `agents` must not
+// A rule named `Team` and a lone project literally called `Team` must not
 // collide into one ring.
 {
   const clusters = groupRuns(
     [
-      { host: 'h', project: 'agents/global', slug: 'a', state: 'running' },
-      { host: 'h', project: 'other/thing', slug: 'b', state: 'running' },
+      { host: 'h', project: 'team/widget', slug: 'a', state: 'running' },
+      { host: 'h', project: 'Team', slug: 'b', state: 'running' },
     ],
-    [{ label: 'agents', pattern: /^agents\// }],
+    [{ name: 'Team', patterns: ['team/'] }],
   )
   const keys = new Set(clusters.map((c) => c.group))
   assert.equal(keys.size, 2, 'a rule label collided with a cluster key')
@@ -450,16 +413,16 @@ for (const shipped of GROUP_RULES) {
 // --- seeding puts a group's projects together, and leaves the middle free ----
 {
   const clusters = seedPositions(groupRuns([
-    { host: 'h', project: 'fullctl/ixctl', slug: 'a', state: 'running' },
-    { host: 'h', project: 'syseng/fullctl-site', slug: 'b', state: 'running' },
+    { host: 'h', project: 'team/widget', slug: 'a', state: 'running' },
+    { host: 'h', project: 'tools/team-site', slug: 'b', state: 'running' },
     { host: 'h', project: 'acme/widget', slug: 'c', state: 'running' },
-  ]), { width: 1000, height: 600 })
+  ], RULES), { width: 1000, height: 600 })
   assert.equal(clusters.length, 3, 'seeding dropped or invented a cluster')
 
   const at = (project) => clusters.find((c) => c.project === project)
   const near = (p, q) => Math.hypot(p.x - q.x, p.y - q.y)
-  const ix = at('fullctl/ixctl')
-  const site = at('syseng/fullctl-site')
+  const ix = at('team/widget')
+  const site = at('tools/team-site')
   const widget = at('acme/widget')
   assert.ok(near(ix, site) < near(ix, widget),
     'two projects in one group seeded further apart than an unrelated project')
@@ -561,13 +524,6 @@ for (const shipped of GROUP_RULES) {
   assert.equal(centres.get('b').n, 1, 'a node with no finite position was averaged in')
 }
 
-// The shipped rules are the seam the later slice replaces — shape, not content.
-for (const rule of GROUP_RULES) {
-  assert.ok(rule.label && typeof rule.label === 'string', 'a shipped rule has no label')
-  assert.ok(groupRuleFor('nothing-matches-this-at-all', [rule]) === null
-    || typeof rule.pattern !== 'undefined', 'a shipped rule has no pattern')
-}
-
 // --- where a label goes -----------------------------------------------------
 //
 // An SVG <text> outside the viewBox is not clipped, it is absent — so every one
@@ -583,17 +539,17 @@ for (const rule of GROUP_RULES) {
 // A ring taller than the space above it puts its label inside rather than at a
 // negative y — and never above the floor.
 {
-  const huge = { label: 'fullctl', x: 500, y: 300, r: 400 }
+  const huge = { label: 'Team', x: 500, y: 300, r: 400 }
   const y = ringLabelY(huge, 15, GROUP_LABEL_FLOOR)
   assert.ok(y >= GROUP_LABEL_FLOOR, `a huge ring's label landed at ${y}`)
 }
 
-// The two layers cannot land on one line. This is the demo's `fullctl/fullctl`
-// drawn through `fullctl`: a group near the top clamps, and clamps its own
+// The two layers cannot land on one line. This is the demo's `team/team`
+// drawn through `Team`: a group near the top clamps, and clamps its own
 // projects with it, so one floor puts both labels at the same y.
 {
-  const group = { label: 'fullctl', x: 500, y: 120, r: 200 }
-  const child = { label: 'fullctl/fullctl', x: 500, y: 60, r: 40 }
+  const group = { label: 'Team', x: 500, y: 120, r: 200 }
+  const child = { label: 'team/team', x: 500, y: 60, r: 40 }
   const groupY = ringLabelY(group, 15, GROUP_LABEL_FLOOR)
   const childY = ringLabelY(child, 9, CLUSTER_LABEL_FLOOR)
   assert.ok(groupY >= GROUP_LABEL_FLOOR && childY >= CLUSTER_LABEL_FLOOR)
@@ -614,11 +570,11 @@ for (const rule of GROUP_RULES) {
 
 // Horizontally: a ring against an edge keeps its whole label on the frame.
 {
-  const left = { label: 'syseng/fullctl-site', x: 8, y: 300, r: 60 }
+  const left = { label: 'tools/team-site', x: 8, y: 300, r: 60 }
   const x = ringLabelX(left, 6.7, 1000)
   assert.ok(x - (left.label.length * 6.7) / 2 >= 0, `label runs off the left at x=${x}`)
 
-  const right = { label: 'syseng/fullctl-site', x: 995, y: 300, r: 60 }
+  const right = { label: 'tools/team-site', x: 995, y: 300, r: 60 }
   const rx = ringLabelX(right, 6.7, 1000)
   assert.ok(rx + (right.label.length * 6.7) / 2 <= 1000, `label runs off the right at x=${rx}`)
 

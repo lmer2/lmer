@@ -61,7 +61,7 @@ class TestTheList:
 class TestWhichTransport:
     @pytest.mark.parametrize("recipient, channel", [
         ("U0123ABC", CHANNEL_SLACK),
-        ("vegu", CHANNEL_SLACK),
+        ("tester", CHANNEL_SLACK),
         ("@someone:example.org", CHANNEL_MATRIX),
         ("@someone:example.org:8448", CHANNEL_MATRIX),
     ])
@@ -112,7 +112,7 @@ class TestTheGate:
             check_recipient("@a:example.org", env={})
 
     @pytest.mark.parametrize("listed, confirmed", [
-        ("vegu", "vegu"), ("@VEGU", "vegu"),
+        ("tester", "tester"), ("@TESTER", "tester"),
         ("walter", "walter"), ("user", "user"),
         ("u0123abcd", "u0123abcd"),
     ])
@@ -146,9 +146,9 @@ class TestTheGate:
 
     def test_a_resolved_spelling_also_matches_the_list(self):
         """The transport confirmed both this ID and its handle."""
-        check_recipient("U0123ABCD", spellings=("vegu",), env=env("U0123ABCD"))
-        check_recipient("U0123ABCD", spellings=("vegu",), env=env("vegu"))
+        check_recipient("U0123ABCD", spellings=("tester",), env=env("U0123ABCD"))
+        check_recipient("U0123ABCD", spellings=("tester",), env=env("tester"))
 
     def test_a_resolved_spelling_does_not_invent_permission(self):
         with pytest.raises(ThreadError):
-            check_recipient("U0123ABCD", spellings=("vegu",), env=env("U9999ZZZZ"))
+            check_recipient("U0123ABCD", spellings=("tester",), env=env("U9999ZZZZ"))

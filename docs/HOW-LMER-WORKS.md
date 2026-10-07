@@ -155,7 +155,7 @@ How a running session reaches you:
   Slack thread and in a connected matrix thread at once, the first answer from
   any of them wins, and the others see who answered. Whatever anyone types in
   any of those channels reaches the agent as a turn tagged with its source
-  (`[slack · vegu] …`). See [COMMS.md](./COMMS.md).
+  (`[slack · tester] …`). See [COMMS.md](./COMMS.md).
 - **Signals** — milestones (`lmer-signal "MR pushed"`) ride the same bus and
   reach uber lmer, which decides what to spawn or wind down next.
 - **Digests** — the daemon, not an AI, notices when a run needs attention or

@@ -582,6 +582,31 @@ def test_surrounding_whitespace_is_normalised_away(
     assert child_payload(dump)["prompt"] == "do the thing"
 
 
+def test_the_project_fields_are_normalised_like_every_other_field():
+    """The merge put two branches' field sets on one request; both are cleaned."""
+    cleaned = request_for(
+        workspace_id="  beta  ", home_revision=2, confirm_project=True, slot="  web  ",
+    ).validate()
+    assert cleaned.workspace_id == "beta"
+    assert cleaned.home_revision == 2
+    assert cleaned.confirm_project is True
+    assert cleaned.slot == "web"
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("workspace_id", 7, "workspace_id must be a string"),
+    ("slot", 7, "slot must be a string"),
+    ("home_revision", "2", "home_revision must be a non-negative integer"),
+    ("home_revision", True, "home_revision must be a non-negative integer"),
+    ("home_revision", -1, "home_revision must be a non-negative integer"),
+    ("confirm_project", "true", "confirm_project must be a boolean"),
+])
+def test_the_project_fields_are_refused_rather_than_coerced(field, value, message):
+    """A truthy ``confirm_project`` string is the failure mode worth refusing."""
+    with pytest.raises(resume_mod.ResumeError, match=message):
+        request_for(**{field: value}).validate()
+
+
 # --- the platform writes no run state (spec D3) ------------------------------
 
 def test_resuming_writes_nothing_into_the_mirror(config, stopped_run):

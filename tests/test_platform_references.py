@@ -21,7 +21,7 @@ from lmer_cli.threads import ThreadError
 from tests.conftest import strip_lmer_env
 
 SECRET = "test-secret-value"
-SLACK_LINK = "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+SLACK_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
 MATRIX_LINK = "https://matrix.to/#/!room:example.org/$root"
 RUN = ("gitlab.example.com", "agents/global", "develop-414")
 
@@ -68,10 +68,10 @@ def auth(secret=SECRET):
 
 class TestTheStore:
     def test_a_reference_keeps_the_thread_the_transport_names(self, tracked):
-        record = references.add(*RUN, SLACK_LINK, title="the design thread", by="vegu")
+        record = references.add(*RUN, SLACK_LINK, title="the design thread", by="tester")
         assert record.channel == "slack"
         assert record.title == "the design thread"
-        assert record.added_by == "vegu"
+        assert record.added_by == "tester"
         assert references.listing(*RUN)[0]["permalink"] == record.permalink
 
     def test_without_a_title_the_link_supplies_one(self, tracked):
@@ -168,7 +168,7 @@ class TestTheRoutes:
 class TestTheAnnouncement:
     def test_a_run_is_told_once_and_the_record_says_how_to_use_it(self, tracked, monkeypatch):
         session = register()
-        reference = references.add(*RUN, SLACK_LINK, title="the design thread", by="vegu")
+        reference = references.add(*RUN, SLACK_LINK, title="the design thread", by="tester")
         posted = []
 
         class _Hub:

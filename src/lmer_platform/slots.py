@@ -52,6 +52,7 @@ from lmer_cli.service import (
 
 from .config import PlatformConfig, _detected_runtime
 from .registry import list_sessions
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.slots")
 
@@ -100,7 +101,7 @@ PROBE_TTL_SECONDS = 30.0
 
 #: Keys a slot entry may define. Anything else is logged rather than fatal, so a
 #: key added by a newer build does not invalidate the slot on an older one.
-_KNOWN_KEYS = frozenset({"name", "preset", "description"})
+_KNOWN_KEYS = frozenset({"name", "preset", "description", "applicable_projects"})
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,24 @@ class SlotDefinition:
     #: *is* — it is what :attr:`etag` digests, and a definition built by hand
     #: has to compare equal to the same definition read off disk.
     entry: Optional[dict] = field(default=None, compare=False, repr=False)
+    applicable_projects: Optional[tuple] = None
+
+    def applicability_reason(self, workspace_id=None):
+        if not projects.enabled():
+            return None
+        if self.applicable_projects is None:
+            return "Needs project assignment"
+        if not self.applicable_projects:
+            return "No applicable projects"
+        chosen = workspace_id or project_context.current()
+        if chosen and chosen not in self.applicable_projects:
+            return "This slot is not applicable to the selected project"
+        if chosen:
+            try:
+                projects.get(chosen, active=True)
+            except projects.ProjectError as exc:
+                return str(exc)
+        return None
 
     @property
     def etag(self) -> str:
@@ -234,6 +253,8 @@ class SlotStatus:
             return SLOT_OCCUPIED
         if self.unusable_reason is not None:
             return SLOT_MISCONFIGURED
+        if self.definition.applicability_reason() is not None:
+            return SLOT_MISCONFIGURED
         if self.service_down_reason is not None:
             return SLOT_SERVICE_DOWN
         return SLOT_FREE
@@ -271,6 +292,7 @@ class SlotStatus:
         """Why this slot is not usable, whatever the state says."""
         return (
             self.unusable_reason
+            or self.definition.applicability_reason()
             or self.service_busy_reason
             or self.service_down_reason
         )
@@ -285,6 +307,8 @@ class SlotStatus:
             "name": self.definition.name,
             "preset": self.definition.preset,
             "description": self.definition.description,
+            "applicable_projects": list(self.definition.applicable_projects or ()),
+            "needs_project_assignment": self.definition.applicable_projects is None,
             # What an editor sends back as ``If-Match`` (issue #256): the row is
             # the only place a client ever sees the entry, so this is where the
             # version it edited against comes from.
@@ -376,14 +400,33 @@ def _build_slot(
         )
         description = None
 
-    return SlotDefinition(
-        name=name, preset=preset, description=description, entry=dict(entry)
-    )
+    assigned = entry.get("applicable_projects")
+    applicable = tuple(dict.fromkeys(assigned)) if isinstance(assigned, list) and all(
+        isinstance(item, str) and item for item in assigned) else None
+    return SlotDefinition(name=name, preset=preset, description=description, entry=dict(entry),
+                          applicable_projects=applicable)
 
 
 def slot_definitions(config: PlatformConfig) -> list[SlotDefinition]:
     """Every slot this host declares, in the order the file declares them."""
     return parse_slots(config.slots)
+
+
+def equivalent_slots(config, request):
+    """Resolve the CLI's actual service flags, including preset aliases."""
+    presets = load_presets()
+    preset = presets.get(request.preset)
+    tokens = (list(preset.cli_tokens()) if preset else []) + list(request.extra_args)
+    final, _rest = parse_args(tokens, quiet=True)
+    service, group = final.service, final.service_group
+    members = tuple(group_members(group)) if group else ()
+    bindings = {(_GROUP, group)} | {(_SERVICE, member) for member in members} if group else set()
+    if service:
+        bindings.add((_SERVICE, service))
+    if not bindings:
+        return service, group, members, []
+    matching = [row for row in slot_rows(config, cached=False) if bindings.intersection(row.bindings)]
+    return service, group, members, matching
 
 
 # --- the service probe ------------------------------------------------------
@@ -648,7 +691,9 @@ def _held(
     for entry in _live_entries(sessions):
         name = entry.get("slot")
         if not isinstance(name, str) or not name:
-            continue
+            if not projects.enabled():
+                continue
+            name = "configured service"
         occupant = _occupant_of(entry)
         by_name.setdefault(name, []).append(occupant)
         # More than one for a group session (it holds every member) and for a

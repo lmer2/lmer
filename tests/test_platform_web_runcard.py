@@ -1068,8 +1068,8 @@ def test_the_orchestrator_card_offers_the_chat():
         "the button dropped the mark that connects it to the drawer it opens"
     )
     app = _read(APP_VUE)
-    assert app.count('@open-chat="uberOpen = true"') == 2, (
-        "the shell does not open the drawer for both fleet sections' cards"
+    assert app.count('@open-chat="openProjectChat(run.workspace_id)"') == 2, (
+        "both fleet sections must open the chat for the card's actual project"
     )
 
 

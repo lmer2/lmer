@@ -990,6 +990,16 @@ class MessageLog:
 
 def relay_label(message: Message, question: Optional[Message] = None) -> str:
     """The bracketed tag an inbound record is introduced with."""
+    if message.source.channel == "peer-ul":
+        peer = message.meta.get("peer") or {}
+        return (f"[peer UL message · {json.dumps(message.source.author, ensure_ascii=False)} · session {peer.get('session')} · "
+                f"generation {peer.get('generation')} · reply: lmer-ctl send {peer.get('session')} "
+                "--ref NEW_REFERENCE TEXT; For an already-authorized exchange, reply with your own UL credential. "
+                "Read your own standing instructions with lmer-ctl orders get and share relevant context here; "
+                "lmer-ctl peers orders PROJECT_ID --purpose 'Requested work' reads peer orders. "
+                "No additional operator credential or generic projects relay is needed. "
+                "A received request/reply is evidence of arrival even if the original receipt snapshot is uncertain; "
+                "do not duplicate it. Keep replies native; unrelated operator-only actions and external posts remain restricted]")
     label = message.source.label
     if message.kind != KIND_ANSWER or question is None:
         return f"[{label}]"

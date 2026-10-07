@@ -75,7 +75,7 @@ import secrets
 import stat
 import subprocess
 import threading
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
@@ -114,6 +114,8 @@ from .store import (
     StoreError, ensure_state_dir, read_json, platform_dir, snapshot_path,
     write_json,
 )
+from .project_context import assistant_dir
+from . import project_context
 
 logger = logging.getLogger("lmer_platform.config")
 
@@ -146,6 +148,7 @@ __all__ = [
     "INT_SETTINGS", "NUDGE_SETTING_KEYS", "DEFAULT_NUDGE_AFTER_SECONDS",
     "DEFAULT_NUDGE_PENDING_THRESHOLD", "ENV_NUDGE_AFTER_SECONDS",
     "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
+    "BOOL_SETTINGS", "validate_bool_setting",
     "ROTATION_SETTING_KEYS", "DEFAULT_ROTATION_CONTEXT_THRESHOLD",
     "ENV_ROTATION_CONTEXT_THRESHOLD", "rotation_settings",
     "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
@@ -413,6 +416,14 @@ class _IntSettingRule:
 #: which raises: a daemon bound where nobody expects it beats one that will not
 #: start.
 INT_SETTINGS = {
+    "max_concurrent_sessions": _IntSettingRule(
+        default=DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1, floor_reason="at least one worker must be allowed",
+        log_key="platform_worker_cap_invalid", unit="workers", singular_unit="worker",
+    ),
+    "max_live_assistants": _IntSettingRule(
+        default=4, minimum=1, floor_reason="at least one assistant must be allowed",
+        log_key="platform_assistant_cap_invalid", unit="assistants", singular_unit="assistant",
+    ),
     "terminal_confirm_seconds": _IntSettingRule(
         default=DEFAULT_TERMINAL_CONFIRM_SECONDS,
         minimum=1,
@@ -504,6 +515,14 @@ INT_SETTINGS = {
     ),
 }
 
+#: PlatformConfig field -> default, for the boolean settings. :data:`INT_SETTINGS`'
+#: three postures apply unchanged — warn-and-default inside ``load()``,
+#: warn-and-fall-through per layer, refuse an explicit write — and the API
+#: derives its accepted keys from this table as it does from that one.
+BOOL_SETTINGS = {
+    "chat_show_transcript": False,
+}
+
 #: setting key -> (PlatformConfig field, optional env var). The one table the loader,
 #: the resolver and the API routes all read, so a fifth setting is added in
 #: exactly one place. Threads have no environment layer.
@@ -583,6 +602,7 @@ class PlatformConfig:
     #: assistant is not one of them — see
     #: :func:`lmer_platform.spawn._live_worker_count`.
     max_concurrent_sessions: int = DEFAULT_MAX_CONCURRENT_SESSIONS
+    max_live_assistants: int = 4
     # ``max_concurrent_assistant_spawns`` lived here, between the two caps it is
     # not. Retired by T75 rather than left standing: see the module docstring for
     # why an unattributable cap cannot be enforced, and what would have to become
@@ -609,6 +629,13 @@ class PlatformConfig:
     assistant_agents: Optional[str] = None
     assistant_threads: Optional[list[str]] = None
     chat_keep_last: int = 0
+    #: Whether the uber lmer chat pane draws the harness transcript — tool
+    #: calls, watch events, hook re-prompts, unposted prose — beside the
+    #: conversation (issue #488). Off, the pane draws bus records only. A pane
+    #: display setting like ``chat_keep_last``: no env var, read on config refresh.
+    chat_show_transcript: bool = False
+    #: Visual graph groups; read fresh for UI requests, independent of run ownership.
+    fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
     #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
     #: them into definitions and skips a malformed one with a warning; parsing
@@ -727,6 +754,7 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     for name in (
         "work_repo_pull_interval",
         "max_concurrent_sessions",
+        "max_live_assistants",
         "max_followup_rounds",
         "stuck_teardown_seconds",
     ):
@@ -784,7 +812,16 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         usable = _int_setting_value(getattr(config, field_name), field=field_name)
         if usable != getattr(config, field_name):
             config = replace(config, **{field_name: usable})
-    return config
+    for field_name in BOOL_SETTINGS:
+        usable = _bool_setting_value(getattr(config, field_name), field=field_name)
+        if usable is not getattr(config, field_name):
+            config = replace(config, **{field_name: usable})
+    try:
+        groups = validate_fleet_groups(config.fleet_groups)
+    except ConfigError as exc:
+        logger.warning("platform_config_unusable field=fleet_groups error=%s", exc)
+        groups = []
+    return replace(config, fleet_groups=groups)
 
 
 def _slots_value(value: object) -> tuple:
@@ -949,6 +986,60 @@ def validate_checkin_window(value: object) -> int:
     these and is what callers already import.
     """
     return validate_int_setting("checkin_window_seconds", value)
+
+
+def _coerced_bool(value: object) -> object:
+    """*value* as a bool when it is one written down, else unchanged.
+
+    ``"true"``/``"false"`` (any case) are what a hand-edited file or an export
+    would carry; a JSON body carries the bool itself. Nothing looser: ``1``,
+    ``"yes"`` and ``"on"`` keep their own refusal below, because a toggle that
+    reads ``"no"`` as on is the failure the strict check exists to prevent.
+    """
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+    return value
+
+
+def _bool_setting_reason(value: object) -> Optional[str]:
+    """Why *value* cannot be a boolean setting — ``None`` when it can."""
+    if isinstance(value, bool):
+        return None
+    return f"it is not true or false ({type(value).__name__})"
+
+
+def _bool_setting_value(value: object, *, field: str) -> bool:
+    """A usable value for one boolean setting, or its default with a warning.
+
+    :func:`_int_setting_value`'s posture, for the same reason: this resolves
+    inside ``load()``, where refusing would be a host that will not boot over a
+    display toggle.
+    """
+    coerced = _coerced_bool(value)
+    reason = _bool_setting_reason(coerced)
+    if reason is None:
+        return bool(coerced)
+    default = BOOL_SETTINGS[field]
+    logger.warning(
+        "platform_%s_invalid value=%r — %s; using the default of %s instead",
+        field, value, reason, default,
+    )
+    return default
+
+
+def validate_bool_setting(field: str, value: object) -> bool:
+    """A usable value for *field* from an explicit ask, or a refusal.
+
+    :func:`validate_int_setting`'s posture: the caller is attached and asking
+    for exactly this value, so an unusable one is refused rather than defaulted.
+    """
+    coerced = _coerced_bool(value)
+    reason = _bool_setting_reason(coerced)
+    if reason is not None:
+        raise ConfigError(f"{field} is unusable ({value!r}): {reason}")
+    return bool(coerced)
 
 
 def _assistant_value(value: object, *, field: str) -> Optional[object]:
@@ -1448,11 +1539,64 @@ def assistant_settings() -> dict:
     return resolved
 
 
+FLEET_GROUP_LIMITS = {"groups": 32, "name": 64, "patterns": 16, "pattern": 256}
+
+
+def validate_fleet_groups(value: Any) -> list[dict]:
+    """Validate and normalize an ordered list of literal repository-path matches."""
+    if not isinstance(value, list) or len(value) > FLEET_GROUP_LIMITS["groups"]:
+        raise ConfigError("fleet_groups must be a list of at most 32 groups.")
+
+    def text(raw: Any, limit: int, where: str) -> str:
+        if (not isinstance(raw, str) or len(raw) > limit or not raw.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
+            raise ConfigError(f"{where} must contain 1–{limit} characters without control characters.")
+        return raw.strip()
+
+    result, names = [], set()
+    for index, row in enumerate(value, 1):
+        where = f"Group {index}"
+        if not isinstance(row, dict) or set(row) != {"name", "patterns"}:
+            raise ConfigError(f"{where} must contain only name and patterns.")
+        name = text(row["name"], FLEET_GROUP_LIMITS["name"], f"{where} name")
+        if name.casefold() in names:
+            raise ConfigError(f"{where} name must be unique (case-insensitive).")
+        names.add(name.casefold())
+        patterns = row["patterns"]
+        if not isinstance(patterns, list) or not 1 <= len(patterns) <= FLEET_GROUP_LIMITS["patterns"]:
+            raise ConfigError(f"{where} must have 1–16 text entries.")
+        result.append({"name": name, "patterns": [
+            text(pattern, FLEET_GROUP_LIMITS["pattern"], f"{where}, entry {number}")
+            for number, pattern in enumerate(patterns, 1)
+        ]})
+    return result
+
+
+def fleet_group_settings() -> dict:
+    """Read current visual groups; report unusable stored input without blocking the UI."""
+    try:
+        stored = read_json(config_path()) or {}
+        groups = validate_fleet_groups(stored.get("fleet_groups", []))
+    except (ConfigError, StoreError) as exc:
+        return {"fleet_groups": [], "fleet_groups_problem": str(exc)}
+    return {"fleet_groups": groups, "fleet_groups_problem": None}
+
+
 def chat_settings() -> dict:
-    """Operator-pane retention, read fresh from stored configuration."""
-    return _int_group_settings(
+    """The chat panes' display settings, read fresh from stored configuration.
+
+    ``keep_last`` is the operator chat's retention; ``show_transcript`` is
+    whether the uber lmer pane draws the harness transcript beside the
+    conversation (issue #488). Neither has an environment variable: they are
+    browser display settings, and the pane re-reads them on config refresh.
+    """
+    resolved = _int_group_settings(
         {"keep_last": ("chat_keep_last", None)}, group="chat",
     )
+    resolved.update(_bool_group_settings(
+        {"show_transcript": ("chat_show_transcript", None)}, group="chat",
+    ))
+    return resolved
 
 
 def checkin_settings() -> dict:
@@ -1619,12 +1763,14 @@ def with_stored_slots(config: PlatformConfig) -> PlatformConfig:
     return replace(config, slots=stored_slots())
 
 
-def _int_group_settings(keys: dict, *, group: str) -> dict:
-    """One integer setting group, resolved layer by layer.
+def _group_settings(keys: dict, *, group: str, layer: Callable, default: Callable) -> dict:
+    """One setting group, resolved layer by layer.
 
     An unusable layer falls through with a warning, so the effective answer is
     the one the tick will read — a screen reporting a value the daemon would have
-    discarded is the screen lying.
+    discarded is the screen lying. *layer* reads one layer's raw value into a
+    usable one or ``None`` (:func:`_layer_int`, :func:`_layer_bool`); *default*
+    names a field's default.
     """
     try:
         stored = read_json(config_path())
@@ -1639,10 +1785,10 @@ def _int_group_settings(keys: dict, *, group: str) -> dict:
     resolved = {}
     for key, (field, env_var) in keys.items():
         raw = stored.get(field)
-        env_value = _layer_int(
+        env_value = layer(
             _env_str(env_var) if env_var else None, layer="env", field=field,
         )
-        file_value = _layer_int(raw, layer="config.json", field=field)
+        file_value = layer(raw, layer="config.json", field=field)
         if env_value is not None:
             resolved[key] = AssistantSetting(
                 value=env_value, source="env", stored=raw
@@ -1654,16 +1800,29 @@ def _int_group_settings(keys: dict, *, group: str) -> dict:
             )
             continue
         resolved[key] = AssistantSetting(
-            value=INT_SETTINGS[field].default, source="default", stored=raw
+            value=default(field), source="default", stored=raw
         )
     return resolved
+
+
+def _int_group_settings(keys: dict, *, group: str) -> dict:
+    return _group_settings(
+        keys, group=group, layer=_layer_int,
+        default=lambda field: INT_SETTINGS[field].default,
+    )
+
+
+def _bool_group_settings(keys: dict, *, group: str) -> dict:
+    return _group_settings(
+        keys, group=group, layer=_layer_bool, default=BOOL_SETTINGS.__getitem__,
+    )
 
 
 #: Bad ``(field, layer, value)`` triples already warned about. This resolution
 #: runs on every fleet read, so one typo in an export would otherwise warn every
 #: few seconds for the life of the daemon. Keyed on the value too, so a
 #: corrected-then-broken-again one is announced again.
-_WARNED_INT_SETTINGS: set = set()
+_WARNED_LAYER_SETTINGS: set = set()
 
 
 def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
@@ -1679,15 +1838,31 @@ def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
     reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
-    seen = (field, layer, repr(raw))
-    if seen not in _WARNED_INT_SETTINGS:
-        _WARNED_INT_SETTINGS.add(seen)
-        logger.warning(
-            "%s layer=%s value=%r — %s; resolving as if this layer were unset "
-            "(said once per value)",
-            INT_SETTINGS[field].log_key, layer, raw, reason,
-        )
+    _warn_layer_once(INT_SETTINGS[field].log_key, field=field, layer=layer, raw=raw, reason=reason)
     return None
+
+
+def _layer_bool(raw: object, *, layer: str, field: str) -> Optional[bool]:
+    """:func:`_layer_int` for a boolean setting: a bad layer says nothing usable."""
+    if raw is None:
+        return None
+    coerced = _coerced_bool(raw)
+    reason = _bool_setting_reason(coerced)
+    if reason is None:
+        return bool(coerced)
+    _warn_layer_once(f"platform_{field}_invalid", field=field, layer=layer, raw=raw, reason=reason)
+    return None
+
+
+def _warn_layer_once(log_key: str, *, field: str, layer: str, raw: object, reason: str) -> None:
+    seen = (field, layer, repr(raw))
+    if seen in _WARNED_LAYER_SETTINGS:
+        return
+    _WARNED_LAYER_SETTINGS.add(seen)
+    logger.warning(
+        "%s layer=%s value=%r — %s; resolving as if this layer were unset "
+        "(said once per value)", log_key, layer, raw, reason,
+    )
 
 
 #: Serializes :func:`update_stored`'s read-modify-write: the API handlers run in
@@ -1956,7 +2131,7 @@ _ASSISTANT_CREDENTIAL_MEMO: tuple = (None, None)
 
 def assistant_credential_path() -> Path:
     """Where the running assistant's minted credential lives."""
-    return platform_dir() / ASSISTANT_CREDENTIAL_FILENAME
+    return assistant_dir() / ASSISTANT_CREDENTIAL_FILENAME
 
 
 def mint_assistant_credential() -> str:
@@ -2024,6 +2199,21 @@ def active_assistant_credential() -> Optional[str]:
     _warn_if_permissive(path)
     _ASSISTANT_CREDENTIAL_MEMO = (key, credential)
     return credential
+
+
+def active_assistant_credentials() -> set[str]:
+    credentials = set()
+    with project_context.bound(None):
+        credential = active_assistant_credential()
+        if credential:
+            credentials.add(credential)
+    root = platform_dir() / "projects"
+    for path in root.glob(f"*/{ASSISTANT_CREDENTIAL_FILENAME}"):
+        with project_context.bound(path.parent.name):
+            credential = active_assistant_credential()
+            if credential:
+                credentials.add(credential)
+    return credentials
 
 
 def revoke_assistant_credential() -> bool:

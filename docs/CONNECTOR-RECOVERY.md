@@ -109,7 +109,74 @@ non-acceptance is safely recorded. A lost response, an unclassified transport
 exception or a response without a receipt is uncertain, even if the remote
 probably accepted the operation.
 
-## Explicit recovery CLI
+## Platform recovery
+
+The daemon inspects a pending send under its exclusive thread lease before
+starting a replacement connector. An exact-operation receipt in the checkpoint
+or receipt ledger completes recovery without another send. A recorded rejection
+or pre-send failure permits one automatic retry per pending part. The retry count
+is durable: restarting the daemon does not refill it. An interrupted safe retry
+authorization can finish without spending a second retry. Receipt and retry
+recovery both verify the original supervisor and source before changing state.
+
+An unknown outcome, incompatible state or exhausted retry allowance stays
+parked. Inspection uses durable operation evidence; matching text somewhere in
+the remote thread is not proof of delivery. A connector's unavailability is
+logged when its reason changes, and a successful start resets that comparison.
+Recovery-required remains operator-visible health. Under #512 it does not spool
+an unsolicited assistant digest or wake the assistant, including after restart
+or while the condition persists. Explicitly requested operations still return
+their actual failures to the caller; safe reconciliation continues normally.
+
+Thread listings expose `attention: "recovery-required"` while parked, otherwise
+`null`. The shared thread controls show a warning badge and the recovery detail
+in fleet, run and assistant views. The detail names the host-proxied command:
+
+```sh
+lmer-ctl threads recover SESSION THREAD_ID inspect
+lmer-ctl threads recover SESSION THREAD_ID receipt --operation OPERATION
+lmer-ctl threads recover SESSION THREAD_ID receipt --operation OPERATION --remote-ref REMOTE_REF
+lmer-ctl threads recover SESSION THREAD_ID retry --operation OPERATION
+lmer-ctl threads recover SESSION THREAD_ID clear --operation OPERATION --acknowledge-duplicate --reason "Restore the conversation after inspecting the thread"
+```
+
+`inspect` returns the pending operation, payload, receipt, duplicate risk,
+automatic retry count and `automatic_action` (`receipt`, `retry` or `null`). It
+leaves the marker, checkpoint and cursors unchanged. `receipt` verifies a supplied
+remote reference through the existing transport checks; a saved receipt needs no
+remote lookup. Plain `retry` refuses unknown outcomes. Both mutating actions
+reject stale operation IDs and a live owner retains its lease.
+Manual recovery holds the selected thread's lease without holding the daemon's
+global connector lock during remote verification. Slack and Matrix metadata
+requests use a 15-second HTTP timeout; Matrix attachment downloads retain the
+client's 60-second timeout. Slack rate limiting is returned immediately instead
+of sleeping for retries. Other threads remain available during the lookup. Before
+restarting, the daemon checks that the original connection and live supervisor
+are still current; a disconnect or replacement during recovery returns 409.
+
+`clear` is the explicit emergency override: it deletes only the selected marker,
+leaving the checkpoint and cursors intact. **The resumed connector may duplicate
+the send.** It requires the exact operation from inspection, a literal true
+duplicate acknowledgement and a reason of 1–1000 characters. The daemon logs the
+authenticated caller, operation and reason, applying the existing credential
+scrubber to the reason before either audit write. This override does not require the
+original source to remain available, but still validates the selected marker and
+checkpoint. Do not put credentials in the reason. After successful recovery the
+daemon attempts to start the connector immediately; any remaining start failure
+appears in the returned thread detail.
+
+The API is `POST /api/sessions/{session}/threads/{thread}/recover`. It accepts
+`action`, `operation`, optional `remote_ref`, and for clear,
+`acknowledge_duplicate: true` plus `reason`. It uses the platform's normal
+operator/assistant authentication; connector credentials are refused with 403.
+It returns `inspection`, `action`, `result`
+and the current `thread`. Invalid arguments return 400; missing connections 404;
+active ownership, stale selection or incompatible recovery state 409; remote
+receipt verification transport failures 502. State and
+transport credentials stay on the host, so the same commands work from the
+assistant's container.
+
+## Explicit host recovery CLI
 
 Use the host installation and the original supervisor's control endpoint. Use a
 canonical thread-root permalink, including a resolved Matrix room ID. Stop the

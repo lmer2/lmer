@@ -61,6 +61,7 @@ SLOT_ROW = WEB / "src" / "components" / "SlotRow.vue"
 SLOT_EDITOR = WEB / "src" / "components" / "SlotEditor.vue"
 API = WEB / "src" / "api.js"
 APP = WEB / "src" / "App.vue"
+SETTINGS = WEB / "src/components/PlatformSettings.vue"
 ADD_RUN = WEB / "src" / "components" / "AddRun.vue"
 FORMAT = WEB / "src" / "format.js"
 
@@ -99,45 +100,33 @@ def test_the_slot_row_component_exists():
 
 
 def test_the_shell_renders_one_row_per_slot():
-    text = APP.read_text(encoding="utf-8")
+    text = SETTINGS.read_text(encoding="utf-8")
 
-    assert "import SlotRow from './components/SlotRow.vue'" in text
+    assert "import SlotRow from './SlotRow.vue'" in text
     assert re.search(r'<SlotRow\b', text), "App.vue renders no SlotRow"
-    assert re.search(r'v-for="slot in slots"', text), (
+    assert re.search(r'v-for="row in slots"', text), (
         "the section is not one row per declared slot"
     )
-    assert re.search(r':key="slot\.name"', text), (
+    assert re.search(r':key="row\.name"', text), (
         "rows keyed on something other than the slot's name will re-render "
         "wholesale on every poll"
     )
 
 
 def test_the_slots_section_is_below_the_runs_and_outside_the_lists():
-    """Under the runs, never among them — and not nested in the runs branch.
-
-    Nested, it would vanish on a fleet tracking nothing, which is exactly when
-    an operator is about to spawn into a slot.
-    """
-    text = APP.read_text(encoding="utf-8")
-
-    runs_list = text.index('v-for="run in calmRows"')
-    empty_state = text.index("Nothing tracked yet.")
-    slot_section = text.index('v-for="slot in slots"')
-
-    assert slot_section > runs_list, "the slot rows are rendered above the runs"
-    # The empty-state card and the runs list are the two arms of one v-if chain;
-    # a slots section after both is outside it.
-    assert slot_section > empty_state, (
-        "the slot rows are inside the runs/empty-state branch, so they "
-        "disappear on a fleet that is tracking nothing"
-    )
+    app = APP.read_text()
+    settings = SETTINGS.read_text()
+    assert '<PlatformSettings' in app
+    assert 'v-for="row in slots"' in settings
+    assert 'runs.length' not in settings
+    assert 'v-for="slot in slots"' not in app
 
 
 def test_a_host_with_no_slots_says_so():
     """#254 reverses the earlier call. A section that renders nothing on a host
     declaring none is a feature the operator never learns exists — and asking
     the orchestrating assistant to configure one is the only way it comes to."""
-    text = APP.read_text(encoding="utf-8")
+    text = SETTINGS.read_text(encoding="utf-8")
 
     assert 'v-if="!loading && slots.length"' not in text, (
         "the section is still gated on there being slots, so a host with none "
@@ -148,12 +137,12 @@ def test_a_host_with_no_slots_says_so():
     # different things, and only one of them is worth a sentence. .index() is
     # the pin — the section is gone the moment that condition changes shape.
     section = text.index('<template v-if="!loading">')
-    title = text.index('<div class="section-title">service slots</div>')
+    title = text.index('>Service slots</h2>')
     assert "No service slots configured." in text, (
         "a host with no slots is told nothing"
     )
     hint = text.index("No service slots configured.")
-    assert section < title < hint, (
+    assert title < section < hint, (
         "the hint is not inside the slots section, under its title"
     )
 
@@ -183,7 +172,7 @@ def test_the_hint_needs_a_payload_before_it_claims_anything():
     about the host's configuration under the error alert. A later failed refresh
     keeps the previous payload, which is the case this deliberately still shows.
     """
-    text = APP.read_text(encoding="utf-8")
+    text = SETTINGS.read_text(encoding="utf-8")
 
     hint = text.index("No service slots configured.")
     tag = text[text.rindex("<p", 0, hint):hint]
@@ -343,30 +332,30 @@ def test_the_row_carries_no_attention_stripe_or_forget():
 # --- the editor (issue #256) -------------------------------------------------
 
 def test_the_editor_component_exists_and_is_mounted_by_the_shell():
-    app = APP.read_text(encoding="utf-8")
+    app = SETTINGS.read_text(encoding="utf-8")
 
     assert SLOT_EDITOR.is_file()
-    assert "import SlotEditor from './components/SlotEditor.vue'" in app
+    assert "import SlotEditor from './SlotEditor.vue'" in app
     assert re.search(r"<SlotEditor\b", app), "the shell mounts no editor"
 
 
 def test_every_row_can_be_edited_and_a_new_slot_declared():
     row = SLOT_ROW.read_text(encoding="utf-8")
-    app = APP.read_text(encoding="utf-8")
+    app = SETTINGS.read_text(encoding="utf-8")
 
     assert "emit('edit', row)" in row, "the row offers no edit"
-    assert '@edit="editSlot"' in app, "the shell does not listen for it"
-    assert 'editSlot(null)' in app, "there is no way to declare a new slot"
+    assert '@edit="edit"' in app, "the shell does not listen for it"
+    assert 'edit(null)' in app, "there is no way to declare a new slot"
 
 
 def test_the_editor_avoids_vues_reserved_slot_vocabulary():
     """SlotRow.vue's rule, for the same reason — see the row's own guard."""
     text = SLOT_EDITOR.read_text(encoding="utf-8")
-    app = APP.read_text(encoding="utf-8")
+    app = SETTINGS.read_text(encoding="utf-8")
 
     assert re.search(r"^\s*row: \{ type: Object", text, re.M)
     assert "slot: { type: Object" not in text
-    assert ':row="editingSlot"' in app
+    assert ':row="slot"' in app
 
 
 def test_the_editor_previews_through_the_daemons_dry_run():
@@ -746,7 +735,7 @@ def test_the_picker_offers_free_slots_only():
 def test_the_picker_is_absent_on_a_host_that_declares_none():
     text = ADD_RUN.read_text(encoding="utf-8")
 
-    assert re.search(r'v-if="freeSlots\.length"', text), (
+    assert re.search(r'v-if="availableSlots\.length"', text), (
         "an empty select explaining itself is furniture"
     )
 
@@ -787,13 +776,13 @@ def test_the_row_prop_avoids_vues_reserved_slot_vocabulary():
     """`slot` is legal as a prop name in Vue 3 but collides with the framework's
     own slot vocabulary and warns under the migration build. Cheap to avoid."""
     text = SLOT_ROW.read_text(encoding="utf-8")
-    app = APP.read_text(encoding="utf-8")
+    app = SETTINGS.read_text(encoding="utf-8")
 
     assert re.search(r"^\s*row: \{ type: Object", text, re.M), (
         "the row prop is not named `row`"
     )
     assert "slot: { type: Object" not in text
-    assert ':row="slot"' in app, "the shell still binds the reserved name"
+    assert ':row="row"' in app, "the shell still binds the reserved name"
 
 
 def test_a_contended_slot_names_every_holder():
@@ -818,7 +807,7 @@ def test_the_dialog_says_when_every_slot_is_busy():
 
     assert "slots: { type: Array" in text, "the dialog cannot see occupied slots"
     assert ':slots="slots"' in app, "the shell passes only the free ones"
-    assert re.search(r'v-if="slots\.length && !freeSlots\.length"', text), (
+    assert re.search(r'v-if="slots\.length && !availableSlots\.length"', text), (
         "an all-busy host is indistinguishable from a slot-less one"
     )
 

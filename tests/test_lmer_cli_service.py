@@ -166,7 +166,7 @@ class TestResolveGroup:
         assert len(m.call_args_list) == 2
 
     def test_twelve_members_still_cost_two_calls(self):
-        """The fullctl case: member count must not become a call count."""
+        """Member count must not become a call count."""
         ps = _ps_result(
             "".join(f"id{n:02d}\tstack-svc{n:02d}-1\n" for n in range(12))
         )

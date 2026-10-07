@@ -2289,6 +2289,9 @@ class GateSystem:
         the remote must be granted, and both the grant and the refusal name
         the target, the granting entry and its source (#107).
         """
+        self.authorized_push_urls = ()
+        self.push_by_url = False
+
         # `--push`, NOT the bare form: `git remote get-url <remote>` returns
         # the FETCH url, while `git push <remote>` uses
         # `remote.<name>.pushurl` whenever it is configured. Gating the
@@ -2371,6 +2374,10 @@ class GateSystem:
                                       env_entries, taskdef_entries,
                                       taskdef_manifest)
             return False
+
+        # Leased pushes pin these exact authorized URLs in the Git command.
+        self.authorized_push_urls = tuple(remote_urls)
+        self.push_by_url = by_url
 
         # Success is as transparent as refusal: name the entry that granted
         # each push URL and where that entry came from. A grant arriving

@@ -28,6 +28,8 @@ from lmer_cli.threads import ThreadError
 
 from . import config as cfg
 from . import connectors, meta, runs
+from .projects import session_operation
+from . import project_threads
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ __all__ = [
 BY_AGENT = "agent"
 
 
+@session_operation
 def connect(session_id: str, permalink: object, *, by: str) -> dict:
     """Connect *session_id* to the thread *permalink* names, and record it."""
     from . import assistant
@@ -56,6 +59,7 @@ def connect(session_id: str, permalink: object, *, by: str) -> dict:
     except assistant.AssistantError as exc:
         raise _refused(exc) from None
     record = component.connect(session_id, permalink, by=by)
+    project_threads.remember(session_id, record["permalink"])
     assistant.note_thread_change(session_id, record["permalink"], connected=True)
     return record
 
@@ -65,6 +69,7 @@ def _refused(exc: Exception) -> ThreadError:
     return ThreadError(str(exc), status=getattr(exc, "status", 400))
 
 
+@session_operation
 def disconnect(session_id: str, thread_id: str) -> dict:
     """Stop mirroring one thread, by the id a listing reports."""
     from . import assistant
@@ -74,6 +79,7 @@ def disconnect(session_id: str, thread_id: str) -> dict:
     return record
 
 
+@session_operation
 def disconnect_link(session_id: str, permalink: object) -> dict:
     """The same, by permalink — which is what a run holds rather than an id.
 
@@ -90,6 +96,7 @@ def disconnect_link(session_id: str, permalink: object) -> dict:
     return disconnect(session_id, ref.id)
 
 
+@session_operation
 def open_for(
     session_id: str,
     channel: object,

@@ -126,7 +126,7 @@ class TestPosting:
     def test_the_body_cannot_choose_who_the_thread_thinks_wrote_it(self, client, slack):
         client.post(
             "/api/comms/thread",
-            json={"permalink": SLACK_LINK, "text": "ship it", "author": "vegu", "label": "vegu"},
+            json={"permalink": SLACK_LINK, "text": "ship it", "author": "tester", "label": "tester"},
             headers=auth(),
         )
         assert slack.posted[0][2] == "[operator] ship it"
@@ -155,3 +155,113 @@ class TestPosting:
         )
         assert refused.status_code == 400
         assert slack.posted == []
+
+
+class TestAssistantConversation:
+    @pytest.fixture(autouse=True)
+    def assistant_pane(self, platform_root, tmp_path, monkeypatch):
+        from lmer_platform import assistant, assistant_history, comms, registry, transcripts
+        monkeypatch.setattr(transcripts, 'TRANSCRIPT_ROOT', str(tmp_path / 'transcripts'))
+        monkeypatch.setattr(registry, 'read_session', lambda sid: {'id': sid, 'kind': 'assistant' if sid == 'assistant-1' else 'run'})
+        assistant._write_state(assistant.AssistantState(session_id='assistant-1', generation=1))
+        assistant_history.register('assistant-1', number=1, started_at=None)
+        hub = comms.CommsHub()
+        monkeypatch.setattr(comms, '_HUB', hub)
+        self.hub = hub
+
+    def test_thread_reply_is_in_pane_without_broadcast(self, client, slack):
+        from lmer_platform import transcripts
+        response = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                               json={'permalink': SLACK_LINK, 'text': 'A reply only for this conversation.'})
+        assert response.status_code == 200, response.text
+        assert len(slack.posted) == 1
+        messages = transcripts.read_messages('assistant-1').messages
+        assert [m.text for m in messages] == ['A reply only for this conversation.']
+        assert messages[0].via == 'comms'
+        assert messages[0].thread == SLACK_LINK
+        assert self.hub.feed(0)[0] == []
+        assert transcripts.read_messages('run-1').messages == ()
+
+    def test_failed_or_operator_posts_do_not_become_assistant_replies(self, client, slack):
+        from lmer_platform import transcripts
+        refused = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                              json={'permalink': SLACK_LINK, 'text': ''})
+        assert refused.status_code == 400
+        assert client.post('/api/comms/thread', headers=auth(),
+                           json={'permalink': SLACK_LINK, 'text': 'Operator post'}).status_code == 200
+        assert transcripts.read_messages('assistant-1').messages == ()
+
+    def test_required_digests_survive_spool_drain_without_routine_traffic(self, monkeypatch):
+        from lmer_platform import assistant, transcripts
+        from lmer_platform.detect import Detector, Signal
+        detector = Detector(cfg.load())
+        monkeypatch.setattr(assistant, '_live_assistant', lambda: None)
+        for kind in ['question', 'live_question', 'crashed', 'complete', 'checkin', 'event']:
+            detector._deliver(Signal('example.org', 'example/project', 'run-1', kind, note='Needs attention'))
+        assert len(assistant.read_state().pending) == 6
+        assistant.take_pending()
+        messages = transcripts.read_messages('assistant-1').messages
+        assert len(messages) == 4
+        assert all(m.via == 'comms' and m.role == 'platform' for m in messages)
+        assert self.hub.feed(0)[0] == []
+        assert transcripts.read_messages('run-1').messages == ()
+
+    @pytest.mark.parametrize('transport, private', [
+        ('slack', True), ('matrix', True), ('matrix', False), ('matrix', 'unknown'),
+    ])
+    def test_thread_privacy_is_preserved_in_the_pane(self, client, monkeypatch, tmp_path, transport, private):
+        from lmer_cli import dm_parents
+        from lmer_cli.threads import parse_thread
+        from lmer_cli.routing_receipts import KEY
+        from lmer_platform import transcripts
+        from tests.test_lmer_thread_access import FakeMatrix, MATRIX_LINK
+        monkeypatch.setattr(dm_parents, 'REGISTRY_DIR', str(tmp_path / 'dm-parents'))
+        link = SLACK_LINK.replace('/C0123ABCDEF/', '/D0123ABCDEF/') if transport == 'slack' else MATRIX_LINK
+        provider = FakeSlack() if transport == 'slack' else FakeMatrix()
+        if transport == 'matrix':
+            def is_direct_room(room):
+                if private == 'unknown':
+                    raise RuntimeError('privacy lookup failed')
+                return private
+            provider.is_direct_room = is_direct_room
+        monkeypatch.setattr(thread_access, 'resolve_thread', lambda *args, **kw: (parse_thread(link), provider, []))
+        text = 'Private conversation reply content'
+        posted = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                             json={'permalink': link, 'text': text})
+        assert posted.status_code == 200, posted.text
+        assert len(provider.posted if transport == 'slack' else provider.sent) == 1
+        assert posted.json()[KEY]['id'] == posted.json()['posted']['ref']
+        messages = transcripts.read_messages('assistant-1').messages
+        assert len(messages) == 1
+        if private:
+            assert text not in messages[0].text
+            assert 'body not recorded' in messages[0].text
+            journal = (store.platform_dir() / 'comms' / 'assistant-conversation.jsonl').read_text()
+            assert text not in journal
+        else:
+            assert messages[0].text == text
+        assert self.hub.feed(0)[0] == []
+
+    def test_a_posted_reply_reports_a_failed_pane_record_without_resending(self, client, slack, monkeypatch):
+        from lmer_platform import assistant_conversation
+        from lmer_cli.routing_receipts import KEY
+        def fail(*args, **kwargs):
+            raise store.StoreError('write refused')
+        monkeypatch.setattr(assistant_conversation, 'record', fail)
+        result = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                             json={'permalink': SLACK_LINK, 'text': 'sent once'})
+        assert result.status_code == 200
+        assert result.json()['pane_recorded'] is False
+        assert result.json()[KEY]['id'] == result.json()['posted']['ref']
+        assert len(slack.posted) == 1
+
+    def test_an_unknown_credential_owner_does_not_assign_a_reply_to_the_current_generation(self, client, slack):
+        from lmer_platform import assistant_history, transcripts
+        assistant_history.register('assistant-1', number=1, started_at=None)
+        assistant_history.bind_credential('assistant-1', None)
+        result = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                             json={'permalink': SLACK_LINK, 'text': 'sent once, owner unknown'})
+        assert result.status_code == 200
+        assert result.json()['pane_recorded'] is False
+        assert len(slack.posted) == 1
+        assert transcripts.read_messages('assistant-1').messages == ()

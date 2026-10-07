@@ -1,4 +1,0 @@
-fixed:
-- "Codex automated delivery uses a private shared backend to preserve model selection and payload through latency menus, with native receipts and visible failures (#450)."
-- "Codex digest wake-ups now reach active conversations, coalescing pending notifications without draining the spool (#450)."
-- "Empty Codex exec wrapper rows collapse while prose, useful output, errors and raw details remain available (#450)."

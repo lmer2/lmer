@@ -40,6 +40,7 @@ import { applyChatSettings } from '../operatorChat.js'
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   running: { type: Boolean, default: false },
+  allowRestart: { type: Boolean, default: true },
   // What the running incarnation was launched with (the status's `settings`),
   // for the current-vs-next line — a pending change with nothing naming the
   // difference reads as either a no-op or a lie.
@@ -137,6 +138,7 @@ const savedTickShadowed = ref(false)
 const savedShadowed = ref(false)
 const fields = reactive({
   model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0',
+  showTranscript: false,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
 })
@@ -186,6 +188,10 @@ async function load() {
 
 function prefill(config) {
   fields.chatKeepLast = String(config.chat?.keep_last?.stored ?? 0)
+  // The effective value is the stored layer's own reading here: the chat group
+  // has no environment layer to shadow it, so nothing an export set can be
+  // baked into the file by saving this.
+  fields.showTranscript = config.chat?.show_transcript?.value === true
   applyChatSettings(config)
   for (const spec of TICK_FIELDS) {
     const stored = config[spec.group]?.[spec.key]?.stored
@@ -225,6 +231,9 @@ function changes() {
     return null
   }
   if (keepLast !== (reply.value?.chat?.keep_last?.stored ?? 0)) named.chat_keep_last = keepLast
+  if (fields.showTranscript !== (reply.value?.chat?.show_transcript?.value === true)) {
+    named.chat_show_transcript = fields.showTranscript
+  }
   for (const spec of TICK_FIELDS) {
     const stored = reply.value?.[spec.group]?.[spec.key]?.stored ?? null
     const edited = String(fields[spec.field] ?? '').trim()
@@ -271,7 +280,7 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = changed.includes('chat_keep_last')
+    savedDisplay.value = changed.includes('chat_keep_last') || changed.includes('chat_show_transcript')
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -411,6 +420,24 @@ onBeforeUnmount(() => {
             :disabled="saving"
           />
 
+          <!-- The uber lmer pane's one view switch (issue 488). Platform state,
+               not this browser's: the operator debugging a stuck session from a
+               phone should find it where they left it on the desktop. -->
+          <v-switch
+            v-model="fields.showTranscript"
+            color="primary"
+            density="compact"
+            hide-details
+            :disabled="saving"
+            label="Show uber lmer's working transcript in the chat"
+          />
+          <p class="text-body-small text-medium-emphasis mt-n1 mb-2">
+            Off, the chat is the conversation only: your messages, and what uber
+            lmer posted, asked and answered. On, its tool calls, watch events, hook
+            re-prompts and unposted working notes appear muted beside them.
+            Applies now; other open browsers follow within a poll.
+          </p>
+
           <!-- The daemon's own reminders. Their own block with their own scope
                line: everything above applies to the next incarnation, and every
                one of these applies on the next detection tick — so an operator
@@ -527,7 +554,7 @@ onBeforeUnmount(() => {
           </v-alert>
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh uber lmer starts — restart to apply it
-            now, or let the change wait for the next incarnation.
+            from the project chat, or let the change wait for the next incarnation.
             <p v-if="savedDisplay">Operator chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
@@ -535,7 +562,7 @@ onBeforeUnmount(() => {
               environment variable — it is saved, but the daemon goes on reading
               the export.
             </p>
-            <template #append>
+            <template v-if="allowRestart" #append>
               <v-btn
                 size="small"
                 variant="tonal"

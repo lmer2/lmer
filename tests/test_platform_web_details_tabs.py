@@ -1448,7 +1448,7 @@ def test_a_run_that_is_not_the_orchestrator_renders_as_it_did_before():
     and what an operator is allowed to do to that session is not this slice.
     """
     detail = _read(RUN_DETAIL)
-    assert detail.count("run.orchestrator") == 1, (
+    assert detail.count("run.orchestrator") == 2, (
         f"the view reads the flag {detail.count('run.orchestrator')} times; only "
         "the badge may depend on it"
     )

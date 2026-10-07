@@ -17,6 +17,9 @@ from .connector_ownership import Lease, ThreadKey, read_json, sync_directory, wr
 from .threads import parse_thread
 
 
+AUTOMATIC_RETRY_LIMIT = 1
+
+
 def _slack_text(text):
     from slack_chat.client import strip_run_references
 
@@ -71,12 +74,25 @@ class Recovery:
 
     def inspect(self):
         marker, state, part = self.read()
+        retries = part.get("automatic_retries", 0)
+        if type(retries) is not int or retries < 0:
+            raise RecoveryRequired("invalid automatic retry count; state preserved")
+        authorized = part["status"] == "retry-authorized" and (
+            part.get("authorization") or {}
+        ).get("known_not_sent") is True
+        certain = part["status"] in ("not-sent", "rejected") or authorized
+        action = None
+        if part.get("receipt"):
+            action = "receipt"
+        elif certain and (retries < AUTOMATIC_RETRY_LIMIT or authorized):
+            action = "retry"
         return {
             "operation": marker["operation"], "session": marker["session"],
             "thread": self.key.parts, "source_seq": state["pending"]["source"].get("seq"),
             "part": marker["part"], "status": part["status"],
             "receipt": part.get("receipt"), "payload": part["payload"],
-            "possible_duplicate": not part.get("receipt") and part["status"] not in ("not-sent", "rejected"),
+            "possible_duplicate": not part.get("receipt") and not certain,
+            "automatic_action": action, "automatic_retries": retries,
         }
 
     def _validate_source(self, marker, state, client):
@@ -104,7 +120,9 @@ class Recovery:
         marker_path(self.key).unlink()
         sync_directory(self.key.directory)
 
-    def retry(self, operation_id, client, *, inspected=False, accept_duplicate=False):
+    def retry(self, operation_id, client, *, inspected=False, accept_duplicate=False, automatic=False):
+        if automatic and self.inspect()["automatic_action"] != "retry":
+            raise RecoveryRequired("inspection does not permit an automatic retry")
         marker, state, part = self.read(operation_id)
         self._validate_source(marker, state, client)
         if part.get("receipt") or part.get("status") == "confirmed":
@@ -119,10 +137,25 @@ class Recovery:
             part.update(
                 id=uuid.uuid4().hex, status="retry-authorized", retry_of=operation_id,
                 authorization={"operation": operation_id, "at": time.time(),
-                               "inspected": inspected, "possible_duplicate_accepted": accept_duplicate},
+                               "inspected": inspected, "possible_duplicate_accepted": accept_duplicate,
+                               "known_not_sent": certain},
             )
+            if automatic:
+                part["automatic_retries"] = part.get("automatic_retries", 0) + 1
         self._complete(marker, state)
         return "one retry authorized; the connector will use its normal durable send protocol"
+
+    def clear(self, operation_id, *, acknowledge_duplicate=False):
+        """Explicitly remove one marker without changing its checkpoint or cursors."""
+        if acknowledge_duplicate is not True:
+            raise RecoveryRequired("clear requires acknowledgement that the send may be duplicated")
+        marker, _, _ = self.read(operation_id)
+        self.lease.validate()
+        if read_json(marker_path(self.key)) != marker:
+            raise RecoveryRequired("pending operation changed before clear")
+        marker_path(self.key).unlink()
+        sync_directory(self.key.directory)
+        return "pending marker cleared; the connector may duplicate the selected send"
 
     def receipt(self, operation_id, client, *, remote_ref=None, remote=None, sender=None):
         marker, state, part = self.read(operation_id)

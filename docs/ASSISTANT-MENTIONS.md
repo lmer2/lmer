@@ -1,13 +1,16 @@
 # Summon the assistant from Slack or Matrix
 
-The host listeners can route bot mentions to the existing Uber Lmer assistant.
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
+The platform daemon routes bot mentions to the existing Uber Lmer assistant.
 The assistant reads the request, answers in that conversation, or starts a worker
 under the operator's existing run-start policy. Receiving a mention does not
 start a worker or connect the conversation to the assistant's broadcast channel.
 
 ## Configuration
 
-Set these in the host environment or `~/.lmer/.env`, alongside the listener and
+Set these in the host environment or `~/.lmer/.env`, alongside the
 platform configuration:
 
 | Variable | Default | Accepted values |
@@ -15,23 +18,15 @@ platform configuration:
 | `LMER_ASSISTANT_MENTION_ROUTING` | `false` | `1`, `true`, `yes`, `on`; `0`, `false`, `no`, `off`, or empty. Case-insensitive. |
 | `LMER_ASSISTANT_MENTION_BACKLOG` | `10` | Integer from `0` through `100`. Zero omits preceding room/channel messages. |
 
-Restart the platform daemon and each listener after changing these values. Invalid
-values prevent startup with a message naming the variable. Both listeners must
-run on the platform host, with the same lmer state directory and transport
-account as the daemon. They read its configured bind address and secret file;
-they do not choose a remote assistant from a message or its sender.
+Restart the platform daemon after changing these values. Invalid routing values
+prevent startup with a message naming the variable. Transport setup, Slack app
+requirements and health diagnostics are in the
+[platform guide](./PLATFORM-QUICKSTART.md#assistant-mentions-and-dm-replies).
+Stop the legacy `lmer-slack-listener` and `lmer-matrix-listener` processes when
+switching to daemon ingress; neither is needed for assistant routing.
 
-Enable the existing `lmer-slack-listener` and/or `lmer-matrix-listener` as usual.
-The Slack app needs `app_mention` and direct-message events, the history scopes
-for the conversations it reads, and its existing message-post permissions. If
-`LMER_SLACK_DM_ALLOWED_USERS` contains handles, the app also needs `users:read`
-to confirm the sender of a top-level or threaded assistant mention or a DM
-reply; exact user-ID entries need no lookup. Matrix uses the existing bot account
-and joined-room configuration. Encrypted Matrix conversations remain subject to
-the existing chat transport limitations.
-
-When disabled, listeners retain their existing behavior: eligible mentions and
-Slack DMs can launch chat sessions. The added assistant DM-reply route is off.
+When disabled, the daemon starts no assistant ingress. The legacy listeners, if
+explicitly run separately, retain their old chat-session behavior.
 Disabling this setting does not disconnect any run or remove an already queued
 request. Ordinary connected-run delivery is independent of the setting.
 
@@ -105,7 +100,7 @@ use the thread-post verb to answer beneath the original DM parent.
 To hand work off, the assistant can use `lmer-ctl spawn` with an additional
 `--target-thread <permalink>` option, or connect a chosen live worker using
 `lmer-ctl threads connect <session-id> <permalink>`. The ordinary single-owner
-rule applies. The assistant decides whether to answer or spawn; the listener
+rule applies. The assistant decides whether to answer or spawn; ingress
 does not infer that decision from the message text.
 
 ## Replay and failures
@@ -119,13 +114,15 @@ host state directory and also have no automatic expiry.
 
 Conversation requests are protected from ordinary digest eviction. A full inbox
 refuses new requests with HTTP 429, leaving their identities eligible for retry.
-An unavailable daemon or failed history read is logged by the listener; there
-is no fallback worker spawn. A failed delivery is not marked accepted. Listener
-and daemon settings must agree: an enabled listener receiving `disabled` from
-the daemon logs a configuration failure and does not spawn a worker. Listener
-transport delivery is not a durable outbox: after a logged failure, retry by
-mentioning the bot again once the cause is resolved. An initial Matrix sync is
-still treated as history, as in the existing listener.
+An unavailable transport or failed history read is visible in daemon health and
+logs; there is no fallback worker spawn. A failed delivery is not marked accepted.
+Daemon ingress durably retains raw events before Slack acknowledgement and
+commits Matrix events with the sync cursor. Failed admission replays through the
+same deduplicated route after errors or daemon restart. Initial Matrix sync is
+treated as history; a persisted cursor prevents a new baseline after restart.
+A limited Matrix timeline is logged as `limited_sync` because the homeserver
+may have omitted events. This inbox does not retry an uncertain outgoing post:
+inspect those request receipts and the source thread before requesting new work.
 
 Slack context uses `conversations.history` with an exclusive `latest` bound.
 Matrix uses the trigger's `/context` backwards token and `/messages?dir=b`,
@@ -140,6 +137,7 @@ and [Matrix event context contract](https://spec.matrix.org/v1.15/client-server-
 `{transport: "slack"|"matrix", conversation: "…", event: {...}}` from the host
 listener. The platform's operator credential is required; assistant and connector
 credentials cannot submit transport identities. Responses report `accepted`,
-`duplicate`, `connected`, `ignored`, or `disabled`. Acceptance reports the current
+`duplicate`, `connected`, `ignored`, or `disabled`; ignored events also name a
+`reason`. Every refused event is logged by the daemon. Acceptance reports the current
 assistant session, if one is live, and the destination permalink. Bodies are
 stored in the private inbox, not broadcast to any assistant-connected thread.

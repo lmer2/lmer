@@ -1,5 +1,8 @@
 # Documentation Index
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 This directory contains comprehensive documentation for the LMER (LLM Environment Runtime) project. Each document covers a specific aspect of the system.
 
 ## Documentation Files

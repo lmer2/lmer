@@ -25,7 +25,7 @@ from lmer_cli.presets import Preset, load_presets, select_preset_name
 PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
 
 
-def sdk_user_response(user_id="U0123ABCD", handle="vegu"):
+def sdk_user_response(user_id="U0123ABCD", handle="tester"):
     return AsyncSlackResponse(
         client=None, http_verb="GET", api_url="https://slack.com/api/users.info",
         req_args={"user": user_id},
@@ -91,6 +91,14 @@ def slack_app(monkeypatch) -> types.SimpleNamespace:
     monkeypatch.setattr(listener, "app", fake_app)
     monkeypatch.setattr(listener, "_bot_user_id", None)
     return fake_app
+
+
+@pytest.fixture(autouse=True)
+def isolate_assistant_routing(monkeypatch):
+    """These legacy-mode tests must not inherit the daemon's routing switch."""
+    monkeypatch.delenv("LMER_ASSISTANT_MENTION_ROUTING", raising=False)
+    monkeypatch.delenv("LMER_ASSISTANT_MENTION_BACKLOG", raising=False)
+    monkeypatch.setattr(listener, "MENTIONS", listener.assistant_mentions.Settings())
 
 
 @pytest.fixture(autouse=True)
@@ -637,7 +645,7 @@ class TestHandleMessageEvent:
     async def test_handle_entry_allows_the_same_user_inbound(
         self, manager, slack_app, monkeypatch
     ):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@VEGU"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@TESTER"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         event = {
@@ -655,7 +663,7 @@ class TestHandleMessageEvent:
     async def test_sdk_handle_response_allows_dm_mention(
         self, manager, slack_app, monkeypatch
     ):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"tester"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
 
@@ -714,7 +722,7 @@ class TestHandleMessageEvent:
     async def test_handle_entry_refuses_a_different_account(
         self, manager, slack_app, monkeypatch
     ):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@VEGU"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@TESTER"})
         slack_app.client.users_info.return_value = {
             "ok": True, "user": {"id": "USTRANGER", "name": "stranger"},
         }
@@ -733,7 +741,7 @@ class TestHandleMessageEvent:
     async def test_sdk_handle_response_refuses_a_mismatched_id(
         self, manager, slack_app, monkeypatch
     ):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"tester"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
 
@@ -749,7 +757,7 @@ class TestHandleMessageEvent:
     async def test_handle_entry_refuses_when_slack_cannot_confirm_it(
         self, manager, slack_app, monkeypatch
     ):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"tester"})
         slack_app.client.users_info.side_effect = RuntimeError("missing_scope")
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)

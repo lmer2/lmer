@@ -1,2 +1,0 @@
-fixed:
-  - Widened the Slack connector tests' drain and wait budgets so parallel gate runs no longer fail on timing.
