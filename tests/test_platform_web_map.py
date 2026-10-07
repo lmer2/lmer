@@ -102,75 +102,11 @@ def test_the_map_does_not_carry_a_second_colour_table():
     )
 
 
-def test_the_group_rules_are_a_declared_seam_rather_than_a_buried_condition():
-    """Grouping is a list of rules, editable later without touching the layout.
-
-    The operator's next ask for this is editing the rules from the UI, so what is
-    pinned here is the shape that makes that a change of *source* rather than a
-    rewrite: a named constant of ``{label, pattern}`` entries, and grouping
-    functions that take their rules as an argument. A hardcoded ``if project
-    starts with`` would satisfy today's demo and cost that slice.
-    """
+def test_operator_groups_are_literal_and_have_no_deployment_defaults():
     source = _code(FLEET_MAP)
-    block = re.search(r"export const GROUP_RULES = \[(.*?)\]", source, re.S)
-    assert block, "the group rules are no longer a declared, replaceable list"
-
-    rules = re.findall(r"label:\s*'([^']+)'", block.group(1))
-    assert "fullctl" in rules, (
-        "the default rules no longer carry the operator's own example"
-    )
-    assert re.search(r"pattern:\s*(/|')", block.group(1)), (
-        "a rule no longer carries a pattern"
-    )
-    assert re.search(r"rules\s*=\s*GROUP_RULES", source), (
-        "the rules are read from the constant directly instead of being passed "
-        "in — operator-supplied rules would have nowhere to enter"
-    )
-
-
-def test_the_seam_records_that_typed_rules_must_be_escaped_not_compiled():
-    """The one decision the editable-rules slice must not re-open.
-
-    ``groupRuns`` runs on every poll and every render, and a regex is not a safe
-    thing to take from a text field: ``(a+)+$`` against a short path backtracks
-    for minutes, and the ``try``/``catch`` in ``groupRuleFor`` cannot catch it
-    because catastrophic backtracking does not throw — it spins, and the fleet
-    view is gone for the session. Unreachable today, which is why it is written
-    down now rather than found by the slice that makes it live.
-
-    Pinned as a *comment* deliberately: there is no behaviour to assert yet, and
-    a decision recorded nowhere is a decision the next session re-makes.
-    """
-    source = _read(FLEET_MAP)
-    seam = re.search(r"\*\*This constant is the seam\.\*\*(.*?)export const GROUP_RULES", source, re.S)
-    assert seam, "the group-rules seam no longer explains itself"
-    note = seam.group(1)
-    assert "escaped" in note and "literal" in note, (
-        "the seam no longer says an operator-typed pattern must be escaped into "
-        "a literal substring rather than compiled as a regex"
-    )
-    assert "backtrack" in note, (
-        "the seam no longer says why — a typed regex can hang the fleet view, "
-        "and that is the reason a future reader needs, not the rule alone"
-    )
-
-
-def test_the_shipped_group_rules_agree_about_what_a_boundary_is():
-    """One boundary shape across the set, or the list cannot be read.
-
-    An operator looking at three rules cannot tell which of two behaviours they
-    will get if one is segment-anchored and the others are bare substrings.
-    """
-    source = _code(FLEET_MAP)
-    block = re.search(r"export const GROUP_RULES = \[(.*?)\n\]", source, re.S)
-    assert block, "the group rules are no longer a declared list"
-    rules = re.findall(r"label: '([^']+)', pattern: /(.+)/[a-z]* \}", block.group(1))
-    assert rules, f"could not read the shipped rules: {block.group(1)!r}"
-    for label, pattern in rules:
-        assert pattern == f"(^|[/-]){label}([/-]|$)", (
-            f"rule {label!r} uses a boundary of its own ({pattern!r}); the "
-            "shipped set must agree about what ends a name"
-        )
+    assert "export const GROUP_RULES = []" in source
+    assert "new RegExp" not in source
+    assert ".includes(" in source
 
 
 def test_the_map_knows_the_orchestrator_by_its_flag_and_not_by_its_dashes():

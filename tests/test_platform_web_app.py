@@ -810,7 +810,7 @@ def test_a_forget_is_one_tap_with_no_dialog():
         "only one of the two sections can forget a run"
     )
     for confirming in ("<v-dialog", "window.confirm", "confirm("):
-        assert confirming not in text, (
+        assert confirming not in _function("forget", text), (
             f"forgetting goes through {confirming}; the undo window is the confirm"
         )
 

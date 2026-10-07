@@ -214,6 +214,17 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/slack_reply_guard.py"
+          }
+        ]
+      }
     ]
   }
 }

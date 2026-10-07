@@ -71,18 +71,24 @@ async def test_another_process_activity_cannot_keep_a_listener_session_alive(
     quiet_rig, monkeypatch, tmp_path,
 ):
     channel, rig = quiet_rig
+    now = [521.0]
+    clock = SimpleNamespace(monotonic=lambda: now[0])
+    monkeypatch.setattr(connector_ownership, "time", clock)
+    monkeypatch.setattr(sessions, "time", clock)
     manager = sessions.SessionManager(idle_timeout_minutes=30, transport=channel)
     key = rig.connector._lease.key
     session = sessions.Session(
         channel=key.conversation, thread_ts=key.root, permalink="unused",
         process=SimpleNamespace(pid=os.getpid() + 100000, returncode=None), master_fd=-1,
-        log_path=tmp_path / "unused.log", last_activity=0,
+        log_path=tmp_path / "unused.log", last_activity=now[0],
     )
     manager._sessions[session.key] = session
     terminate = AsyncMock()
     monkeypatch.setattr(manager, "terminate", terminate)
+    now[0] += 31 * 60
     rig.agent("note", "other session")
     rig.connector._outbound_once()
+    assert rig.connector._lease.validate()["activity_at"] == now[0]
 
     await manager.reap()
 

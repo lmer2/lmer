@@ -23,8 +23,8 @@ What is worth pinning here:
 - **A read stays a read.** ``ensure_running`` sits in the same module as
   ``status``, and a UI polls the status route; wiring the idempotent starter to a
   GET would make opening a page cost a session slot.
-- **The refusals keep their own status** (409 for a second assistant, 429 at the
-  cap, 503 for a host that cannot see the taskdef), because that is the whole
+- **The refusals keep their own status** (409 for a second assistant, 429 for a
+  full inbox, 503 for a host that cannot see the taskdef), because that is the whole
   reason the code rides on the exception.
 
 Sessions are started for real against the stub standing in for ``lmer`` that
@@ -54,6 +54,7 @@ SECRET = "test-secret-value"
 #: from the app — so a route added later without an entry in ``GET /api`` fails
 #: there rather than being silently unreachable for the assistant.
 ASSISTANT_ROUTES = (
+    ("GET", "/api/assistant/history/{session_id}"),
     ("GET", "/api/assistant"),
     ("POST", "/api/assistant/start"),
     ("POST", "/api/assistant/stop"),
@@ -62,8 +63,15 @@ ASSISTANT_ROUTES = (
     ("POST", "/api/assistant/handoff"),
     ("GET", "/api/assistant/instructions"),
     ("POST", "/api/assistant/instructions"),
+    ("GET", "/api/assistant/peers"),
+    ("GET", "/api/assistant/peers/{peer_id}/instructions"),
+    ("GET", "/api/assistant/peers/receipts/{ref}"),
     ("POST", "/api/assistant/pending"),
     ("POST", "/api/assistant/requests"),
+    ("GET", "/api/assistant/requests"),
+    ("POST", "/api/assistant/requests/{request_id}/reply"),
+    ("POST", "/api/assistant/requests/{request_id}/park"),
+    ("POST", "/api/assistant/requests/{request_id}/release"),
     ("GET", "/api/assistant/config"),
     ("POST", "/api/assistant/config"),
 )
@@ -458,21 +466,13 @@ def test_a_refused_start_does_not_rewrite_the_live_ones_environment(
         )
 
 
-def test_a_start_at_capacity_is_a_429_with_the_numbers(platform_root, fake_lmer):
-    """The assistant counts against the global cap like any other container, so the
-    refusal has to say what to free — "I cannot open the chat" needs a reason."""
+def test_a_start_at_capacity_uses_the_reserved_slot(platform_root, fake_lmer, long_lived):
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
 
-    response = client_for(config).post(
-        "/api/assistant/start", headers=bearer_header()
-    )
-
-    assert response.status_code == 429
-    detail = response.json()["detail"]
-    assert "1/1" in detail
-    assert "max_concurrent_sessions (1)" in detail
-    assert assistant.status().running is False
+    with running(client_for(config)) as status:
+        assert status["running"] is True
+        assert registry.is_live(registry.read_session("s-worker"))
 
 
 def test_a_host_that_cannot_see_the_taskdef_is_a_503(client, tmp_path, monkeypatch):
@@ -1534,7 +1534,7 @@ def test_an_unknown_setting_refusal_names_every_accepted_key(
     assert reply.status_code == 400, reply.text
     detail = reply.json()["detail"]
     for key in ("nudge_after_seconds", "nudge_pending_threshold",
-                "checkin_window_seconds", "model"):
+                "checkin_window_seconds", "chat_show_transcript", "model"):
         assert key in detail
 
 
@@ -1704,6 +1704,74 @@ def test_chat_retention_refuses_invalid_values_without_writing(client, platform_
     assert reply.status_code == 400
     assert "chat_keep_last" in reply.json()["detail"]
     assert not cfg.config_path().exists()
+
+
+# The uber lmer pane's transcript toggle (issue #488): a boolean beside
+# ``keep_last`` in the ``chat`` group, stored platform-side so it survives
+# browsers, applied on the pane's next config refresh rather than at a rotate.
+
+
+def test_chat_transcript_toggle_defaults_off_and_round_trips_through_config(client, platform_root):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": None,
+    }
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (True, False, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={"chat_show_transcript": value},
+        )
+        assert reply.status_code == 200, reply.text
+        expected = {
+            "value": bool(value),
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == ["chat_show_transcript"]
+        assert reply.json()["chat"]["show_transcript"] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["show_transcript"] == expected
+        assert cfg.load().chat_show_transcript is bool(value)
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert "chat_show_transcript" not in stored
+        else:
+            assert stored["chat_show_transcript"] is value
+    # The pane's own note about scope names it beside keep_last.
+    assert "chat_show_transcript" in reply.json()["note"]
+
+
+@pytest.mark.parametrize("bad", [1, 0, "yes", "on", 1.5, [], {}])
+def test_chat_transcript_toggle_refuses_non_booleans_without_writing(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"chat_show_transcript": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "chat_show_transcript" in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+
+
+def test_a_hand_written_true_in_the_file_reads_as_on_and_junk_reads_as_off(client, platform_root):
+    """The file layer is lenient the way the integer settings' is: a spelled-out
+    ``"true"`` is honoured, anything else costs that layer with a warning rather
+    than a daemon that will not load its config."""
+    cfg.update_stored({"assistant_model": "kept"})
+    path = cfg.config_path()
+    written = store.read_json(path)
+    written["chat_show_transcript"] = "TRUE"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": True, "source": "config.json", "stored": "TRUE",
+    }
+    assert cfg.load().chat_show_transcript is True
+    written["chat_show_transcript"] = "sometimes"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": "sometimes",
+    }
+    assert cfg.load().chat_show_transcript is False
 
 
 # The assistant's own container allocation (issue #453). Read-only and

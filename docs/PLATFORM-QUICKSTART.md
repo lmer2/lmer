@@ -1,5 +1,8 @@
 # Platform quickstart
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 Get the lmer platform — the web control plane for a fleet of lmer sessions,
 with its supervising assistant ("uber lmer") — running on a host in a few
 minutes. The full reference for a container deploy is
@@ -107,8 +110,9 @@ curl -X POST -H "Authorization: Bearer $(lmer platform secret)" \
     http://127.0.0.1:7180/api/assistant/rotate
 ```
 
-Standing orders and the handover note survive a restart; only the
-conversation window is lost.
+Standing orders, the handover note, and the visible conversation survive a
+restart. The replacement assistant starts with a fresh model context and can
+consult relevant prior exchanges when context is missing.
 
 ## Using it
 
@@ -146,7 +150,8 @@ conversation window is lost.
   session milestones (`lmer-signal`), can spawn/answer/wind-down runs on
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
-  drawer when needed.
+  drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
+  remains available across rotations, reloads, and daemon restarts.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
   view. Details worth knowing:
@@ -201,6 +206,13 @@ conversation window is lost.
   you restart it, and the dialog offers the restart. Standing orders are the
   chat's to edit and are deliberately not in this dialog. Thread permalinks go
   one per line; save and rotate to connect. The saved list survives rotations.
+  The dialog also holds the chat pane's **Show uber lmer's working transcript**
+  switch: off (the default) the pane draws the conversation only — your
+  messages, and what uber lmer posted, asked and answered; on, its tool calls,
+  watch events, hook re-prompts and unposted working notes appear muted beside
+  them. Platform state (`chat_show_transcript` in `config.json`): the browser
+  that saved it switches at once, and every other open drawer follows on its
+  next status poll. `docs/COMMS.md` §4 has the table of what each view draws.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
@@ -319,6 +331,90 @@ conversation window is lost.
   its context window has reached a threshold the operator set, the daemon
   recommends a rotation at its next breakpoint. Off by default; it never rotates
   anything itself. Full behaviour in the section below.
+
+## Assistant mentions and DM replies
+
+The daemon owns Slack and Matrix ingress for the assistant. Enable
+`LMER_ASSISTANT_MENTION_ROUTING=true` in its environment or `~/.lmer/.env`, set
+the transport credentials and sender allow-lists below, and restart the daemon
+once. Stop any standalone `lmer-slack-listener` or `lmer-matrix-listener`: they
+are legacy entry points and are not needed here. Running a second Socket Mode
+consumer can split Slack delivery between processes.
+
+Ingress adds requests to the assistant's private inbox. It never starts an
+`lmer chat` session. The assistant answers or starts a worker under the
+operator's run-start policy. A mention does not automatically start an offline
+assistant. See [admission and reply rules](./ASSISTANT-MENTIONS.md), including
+connected-run ownership and the exact assistant-parent requirement for DMs.
+
+### Slack app requirements
+
+Slack uses [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
+the same transport as the legacy listener. This avoids enumerating and polling
+every channel for mentions and needs no public HTTP endpoint.
+
+- Set `SLACK_BOT_TOKEN` to the installed bot token and `SLACK_APP_TOKEN` to the
+  app-level token with `connections:write`, for the same app/workspace.
+- Enable Socket Mode and subscribe to bot events `app_mention` and `message.im`.
+- Grant `app_mentions:read` and `im:history`, plus the existing history scopes
+  for context reads (`channels:history` for public channels and `groups:history`
+  for private channels). Keep `chat:write` for replies and `im:write` to start
+  assistant DMs. Reinstall the app after changing its granted scopes.
+- Invite the bot to the channels where it should receive mentions. Membership
+  still controls access to history; `not_in_channel` in the daemon log identifies
+  a refused context read.
+- Set `LMER_SLACK_DM_ALLOWED_USERS` to permitted Slack IDs or confirmed handles.
+  Unset or empty admits nobody, including channel mentions. Handle entries need
+  `users:read`; exact IDs avoid that lookup.
+
+### Matrix account requirements
+
+Set `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID` and
+`LMER_MATRIX_ACCESS_TOKEN` for the existing bot account. Set
+`LMER_MATRIX_ALLOWED_USERS` to permitted exact MXIDs; unset or empty admits
+nobody. `LMER_MATRIX_ROOMS` optionally selects rooms to join and sync; otherwise
+the daemon syncs all rooms the bot has joined. Room aliases are resolved by the
+join response before they enter the sync filter. The first sync establishes a
+cursor and ignores historical events; reconnects retain that cursor until the
+daemon restarts. Encrypted rooms retain the existing transport limitations.
+
+A failed selected-room join logs the room and error code and retries after
+30 seconds. Successfully selected rooms continue to sync. If none of the
+selected rooms can be joined, ingress reports `retrying` and waits for a join
+to succeed; it never falls back to syncing all joined rooms.
+The first sync after a selected room joins excludes that room's initial history.
+Other selected rooms keep receiving fresh events, and reconnects retain this
+per-room initialization state along with the cursor.
+
+### Ingress health and failures
+
+`GET /api/health` includes `ingress.slack` and `ingress.matrix`. Each contains
+`up`, `state`, `last_event_at`, and `last_error`. These are local snapshots;
+reading health never calls Slack or Matrix. The fleet UI's **Assistant message
+ingress** panel shows the same state, last event time and last error.
+
+`up` means the Socket Mode connection is live or Matrix sync succeeded.
+`last_event_at` records receipt of an event, including refused events, rather
+than the last empty poll. `last_error` retains the most recent error after
+recovery, and is empty until a failure occurs. Times/errors reset at daemon
+startup; inbox replay receipts remain durable.
+
+Disabled routing reports `disabled`. No credentials reports `unconfigured`;
+partial credentials reports `misconfigured` and names the missing variables.
+One transport failing does not stop the other or the API. Initial failures retry
+with bounded backoff; Socket Mode also reconnects through its SDK. Check the
+app's subscriptions and channel membership when ingress is up but no event
+arrives: connection health cannot verify an event the app never sends.
+
+Every received event that is not admitted produces an `assistant_ingress_dropped`
+daemon log record with its transport, identifiers and reason, such as `denied`,
+`connected`, `unmatched_dm_parent`, `duplicate`, or `not_in_channel`. Message
+bodies are not logged. Disabled submissions through the external API log
+`disabled`. Transport failures also update health; limited Matrix sync timelines
+log `limited_sync` because events may have been omitted by the homeserver.
+There is no durable ingress outbox: after a failed admission, mention again
+once the cause is fixed. External host listeners may still submit authenticated
+`POST /api/assistant/requests` events through the same admission rules.
 
 ## Digest nudges
 
@@ -566,6 +662,35 @@ own memory, keyed on the session it typed into, so a rotation never inherits a
 window and a successor is never held quiet by a reminder its predecessor received.
 A daemon restart while a reading sits above the threshold costs one extra
 reminder, which is the whole price of not storing it.
+
+### Reserved assistant capacity
+
+`max_concurrent_sessions` limits **workers**. uber lmer has one additional,
+reserved place: with a limit of eight, eight workers and one assistant may run
+at the same time. A full worker pool does not prevent assistant startup or
+replacement, and starting or rotating the assistant does not free a place for
+a ninth worker. The worker occupancy remains 8/8 during that rotation.
+
+This applies to `POST /api/assistant/start`, operator-initiated
+`POST /api/assistant/rotate`, self-rotation through `lmer-ctl rotate`, and the
+supervisor's startup and recovery paths. They share the same launcher, which
+applies the worker limit only to worker launches. Worker launches through
+spawn, answer, and resume remain subject to that limit, including workers
+requested by the assistant. The reservation follows the server-selected session
+kind; naming the `orchestrate` task does not grant it.
+
+The existing assistant lifecycle lock and live registry check still prevent
+duplicate assistants: a second start returns HTTP 409. Rotation stops the old
+assistant before publishing its successor, without stopping any worker. The
+successor inherits the handoff and pending updates; retained
+[conversation history](./ASSISTANT-HISTORY.md) links the generations. Old
+conversation text is not automatically inserted into the successor's context.
+
+Capacity admission still runs inside the shared launch lock, alongside request
+validation and publication safeguards. Reserved assistant capacity does not
+guarantee that a process can start when host resources or other launch
+requirements are unavailable. Configured **service slots** are a separate
+ownership mechanism and are unaffected.
 
 ### Rotating uber lmer, and who may
 

@@ -222,12 +222,9 @@ Nothing consumes it, a rotation carries it forward, and a stop-and-start does to
 :func:`dataclasses.replace` rather than rebuilding it, and pinning that is what
 the tests do from both ends.
 
-The write path is **chat**, not a settings screen (operator request, 2026-07-28:
-"I want to be able to do that via the chat, not some ux config thing"). The
-operator states a rule in the conversation, the assistant confirms the wording
-back and posts the whole updated document; the UI shows it read-only so there is
-one writer of the document's prose and it is the thing the operator is talking to.
-The taskdef owns both halves of that, since both are behaviour rather than state.
+The operator can edit the scoped document in Project settings or state a rule
+in chat for the assistant to confirm and store. Both use the same bounded,
+scrubbed whole-document write path.
 
 Two consequences worth stating, because they are what makes this safe to serve:
 
@@ -320,48 +317,15 @@ the manual route is the only place that fact is known.
 
 Caps: it holds its own slot (T75)
 ----------------------------------
-``max_concurrent_sessions`` counts **workers**. The assistant is excluded from it
-by :func:`lmer_platform.spawn._live_worker_count`, which is where the reservation
-had to land — worker spawns go through the same function, so a slot reserved
-anywhere else would not be reserved from them.
-
-That is a decision, not a convenience, and the earlier one is worth keeping in
-view: this module used to argue that the assistant should count "like any other
-container, because a cap you can exceed by one is not a cap". What made that
-wrong was the daemon starting the assistant at boot (T63). From then on the slot
-was spent from boot for the life of the daemon, so a host configured for four
-sessions ran *three* workers and a chat window, and the setting no longer meant
-what it says. The cap is about how much work a host can bear; the assistant is
-what routes that work, and it is one container whether the number is 1 or 40.
-So the number now means what an operator reads it to mean, and the one container
-they never asked for is not deducted from it.
-
-What did **not** change: a second assistant is still refused, and still by
-:func:`start` on the strength of the registry (D11), never by capacity. That
-matters both ways round — a worker cap rejecting an assistant would be one
-setting meaning two things, and the exclusion in the counting means a stale
-incarnation's entry cannot make its own replacement fail either.
-
-What remains true, and is why :class:`AssistantCapacityError` is still reachable:
-this is a reservation, not an exemption. Workers that already fill the cap are
-still holding every slot there is, so an assistant *start* against a full host is
-refused with the numbers and the setting to raise. The daemon starts the assistant
-before it serves anything, so in practice it is first; the refusal exists for the
-manual start on a host that came up busy.
-
-``max_concurrent_assistant_spawns`` is **gone** (T75). Per spec §6.4/§8.2 it
-bounded the sessions the assistant *initiates*, which is a different question from
-how many this host runs — and it was never enforced, only loaded, validated and
-served under ``GET /api/state``. Enforcing it is not possible today: there is one
-shared secret for the whole API and no way to attribute a spawn to the assistant
-rather than to the operator's browser, so the only cap it could have implemented
-would refuse the operator and blame the chat window. It is deleted rather than
-served, with the argument and the conditions for its return recorded in
-:mod:`lmer_platform.config`, because a setting an operator can lower and nothing
-reads is worse than an absent one: it reads as a control.
+``max_concurrent_sessions`` bounds workers only. Assistant start and rotation
+remain available when that pool is full; :func:`start` enforces the separate
+one-live-assistant rule through the registry. See docs/PLATFORM-QUICKSTART.md,
+"Reserved assistant capacity", for the launch paths and continuity guarantees.
 """
 
 from __future__ import annotations
+
+from .projects import serialized
 
 import json
 import logging
@@ -382,6 +346,7 @@ from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
     PlatformConfig,
+    active_assistant_credential,
     assistant_settings,
     container_base_url,
     mint_assistant_credential,
@@ -404,10 +369,11 @@ from .store import (
     append_event,
     ensure_state_dir,
     read_json,
-    snapshot_path,
     utc_now_iso,
     write_json,
 )
+from .project_context import assistant_dir
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.assistant")
 
@@ -534,11 +500,7 @@ SUPERVISE_POLL_SECONDS = 30.0
 RESPAWN_BACKOFF_SECONDS = 5.0
 RESPAWN_BACKOFF_CAP_SECONDS = 300.0
 
-#: Consecutive failures before the supervisor stops trying and says so. Bounded
-#: rather than infinite because every attempt is a clone and an image pull (§8.1
-#: promises a respawn, not an unbounded one), and not *one* because the common
-#: failure — the concurrency cap, a taskdef that is not installed yet — is one an
-#: operator clears while the daemon is up.
+#: Bound repeated image pulls while allowing transient launch failures to recover.
 MAX_RESPAWN_ATTEMPTS = 5
 
 #: How long an incarnation has to live before it counts as having worked. Under
@@ -586,11 +548,7 @@ class AssistantAlreadyRunning(AssistantError):
 
 
 class AssistantCapacityError(AssistantError):
-    """No room under ``max_concurrent_sessions``.
-
-    429, matching what ``POST /api/sessions`` already answers for a worker over
-    cap, so a client has one rule for "the host is full" rather than two.
-    """
+    """The assistant inbox is full; retry after it is drained (HTTP 429)."""
 
     status = 429
 
@@ -780,7 +738,7 @@ class AssistantState:
             instructions_at=_opt_str(payload.get("instructions_at")),
             stopped_at=_opt_str(payload.get("stopped_at")),
             stop_reason=_opt_str(payload.get("stop_reason")),
-            pending=pending[-MAX_PENDING:],
+            pending=pending if projects.enabled() else pending[-MAX_PENDING:],
             pending_since=_opt_str(payload.get("pending_since")),
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
@@ -850,9 +808,13 @@ class AssistantStatus:
         return _age_seconds(self.started_at)
 
     def to_dict(self) -> dict:
+        from . import assistant_history
+
+        history = assistant_history.latest()
         return {
             "running": self.running,
             "session_id": self.session_id,
+            "history_session": history["session"] if history else None,
             "pid": self.pid,
             "started_at": self.started_at,
             "age_seconds": self.age_seconds,
@@ -901,12 +863,12 @@ def _age_seconds(started_at: Optional[str]) -> Optional[float]:
 
 def state_path() -> Path:
     """Where the pointer and rotation bookkeeping live."""
-    return snapshot_path(STATE_FILE)
+    return assistant_dir() / STATE_FILE
 
 
 def env_file_path() -> Path:
     """Where the assistant's ``.env`` lives — see :func:`_prepare_environment`."""
-    return snapshot_path(ENV_FILE)
+    return assistant_dir() / ENV_FILE
 
 
 def read_state() -> AssistantState:
@@ -918,7 +880,7 @@ def read_state() -> AssistantState:
     generation 0.
     """
     try:
-        stored = read_json(state_path())
+        stored = projects.assistant_state() if projects.enabled() else read_json(state_path())
     except StoreError as exc:
         logger.error(
             "platform_assistant_state_unreadable error=%s — starting from empty", exc
@@ -939,7 +901,10 @@ def _write_state(state: AssistantState) -> bool:
     handoff, not the assistant.
     """
     try:
-        write_json(state_path(), state.to_dict())
+        if projects.enabled():
+            projects.save_assistant_state(state.to_dict())
+        else:
+            write_json(state_path(), state.to_dict())
     except StoreError as exc:
         logger.error(
             "platform_assistant_state_unwritable error=%s — the registry entry "
@@ -948,6 +913,16 @@ def _write_state(state: AssistantState) -> bool:
         )
         return False
     return True
+
+
+def history_for(session_id: str) -> Optional[dict]:
+    """Resolve a generation, migrating only the explicitly recorded incumbent."""
+    from . import assistant_history
+
+    with _LOCK:
+        known = assistant_history.generation(session_id)
+        state = read_state()
+        return assistant_history.remember(state) if state.session_id == session_id else known
 
 
 def taskdef_dir() -> Optional[Path]:
@@ -1091,11 +1066,14 @@ def _refuse_held_explicit_threads(
 
 def _stored_threads() -> list:
     """The assistant's stored launch list, as it is in ``config.json``."""
+    if projects.enabled():
+        return list(projects.get(project_context.current() or projects.GENERAL)["settings"].get("threads") or [])
     stored = assistant_settings().get("threads")
     raw = getattr(stored, "stored", None)
     return list(raw) if isinstance(raw, list) else []
 
 
+@serialized
 def note_thread_change(session_id: object, permalink: object, *, connected: bool) -> bool:
     """Keep the standing ``threads`` setting in step with a live connect (#412).
 
@@ -1132,7 +1110,12 @@ def note_thread_change(session_id: object, permalink: object, *, connected: bool
         # between a too-long list and a config.json that silently launches with
         # no threads at all is this check.
         validate_thread_targets(current)
-        update_stored({"assistant_threads": current})
+        if projects.enabled():
+            workspace_id = project_context.current() or projects.GENERAL
+            settings = projects.get(workspace_id)["settings"]
+            projects.update(workspace_id, {"settings": {**settings, "threads": current}})
+        else:
+            update_stored({"assistant_threads": current})
     except (ConfigError, ValueError) as exc:
         logger.warning(
             "platform_assistant_threads_unwritable connected=%s error=%s", connected, exc,
@@ -1150,9 +1133,11 @@ def _live_assistant() -> Optional[dict]:
     next; otherwise the oldest live one is the incumbent. More than one is
     logged, because it means something upstream let two starts through.
     """
+    workspace_id = project_context.current() or projects.GENERAL
     live = [
         entry for entry in registry.list_sessions(live_only=True)
         if entry.get("kind") == KIND
+        and (not projects.enabled() or projects.session_home(entry["id"]) == workspace_id)
     ]
     if not live:
         return None
@@ -1487,7 +1472,12 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
     for key, setting in assistant_settings().items():
         values[key] = setting.value
         sources[key] = setting.source
-    for key, value in (overrides or {}).items():
+    project_overrides = {}
+    if projects.enabled():
+        project_overrides = projects.get(project_context.current() or projects.GENERAL)["settings"]
+        if project_context.current() not in (None, projects.GENERAL):
+            values["threads"], sources["threads"] = [], "project"
+    for key, value in {**project_overrides, **(overrides or {})}.items():
         if key not in ASSISTANT_SETTING_KEYS:
             raise AssistantError(
                 f"unknown assistant setting {key!r}: expected one of "
@@ -1546,6 +1536,8 @@ def _assistant_credential(config: PlatformConfig) -> Optional[str]:
     try:
         return mint_assistant_credential()
     except ConfigError as exc:
+        if projects.enabled():
+            raise AssistantError(f"Could not mint a project-scoped assistant credential: {exc}") from exc
         logger.error(
             "platform_assistant_credential_unmintable error=%s — falling back to "
             "the shared secret, so this incarnation's calls cannot be told from "
@@ -1598,7 +1590,7 @@ def _assistant_environment(config: PlatformConfig) -> tuple:
 
 
 def _prepare_environment(config: PlatformConfig) -> tuple:
-    """Write the assistant's ``.env`` 0600. Returns ``(path, reach)``.
+    """Write the assistant's ``.env`` 0600. Returns ``(path, reach, credential)``.
 
     Why a file at all, when :func:`lmer_platform.spawn.spawn_session` already
     hands the child an environment: that environment belongs to the *host*
@@ -1633,6 +1625,9 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
     at all, which the taskdef reads as "say you cannot reach the platform".
     """
     values, reach = _assistant_environment(config)
+    if project_context.current():
+        values["LMER_WORKSPACE_ID"] = project_context.current()
+        values["LMER_WORKSPACE_NAME"] = projects.get(project_context.current())["name"]
     path = env_file_path()
     body = "".join(_dotenv_line(name, value) for name, value in values.items())
     try:
@@ -1655,7 +1650,7 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
             "starts with no platform URL or secret and cannot drive anything",
             path, exc,
         )
-        return None, reach
+        return None, reach, None
 
     if reach.reachable:
         logger.info(
@@ -1666,9 +1661,34 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
             "platform_assistant_unreachable reason=%s — the session is told so "
             "in its environment rather than handed a URL that fails", reach.reason,
         )
-    return path, reach
+    credential = values.get(ENV_PLATFORM_CREDENTIAL)
+    if credential != active_assistant_credential():
+        credential = None
+    return path, reach, credential
 
 
+def _remember_generation(state) -> None:
+    from . import assistant_history
+
+    assistant_history.remember(state)
+    if state.session_id:
+        assistant_history.bind_credential(state.session_id, active_assistant_credential())
+
+
+def authenticated_generation(credential: str) -> dict | None:
+    """Resolve an authenticated identity; migrate an incumbent under the lifecycle lock."""
+    from . import assistant_history
+
+    owner = assistant_history.credential_owner(credential)
+    if owner:
+        return owner
+    with _LOCK:
+        if active_assistant_credential() == credential:
+            _remember_generation(read_state())
+        return assistant_history.credential_owner(credential)
+
+
+@serialized
 def start(
     config: PlatformConfig,
     *,
@@ -1726,15 +1746,10 @@ def start(
             except AssistantThreadHeld as exc:
                 raise _refuse(exc, "thread_held")
 
-        # After the refusals this module raises and before the spawn, so a second
-        # start against a live assistant cannot rewrite the file the live one was
-        # already given — the reachability answer can change under it (an
-        # operator rebinding the platform), and the file would then disagree with
-        # what the running session actually read. A *capacity* refusal comes from
-        # the spawn below and does rewrite it, which costs nothing: the content is
-        # derived rather than accumulated, and the secret in it already sits
-        # beside it in the same directory with the same mode.
-        env_file, reach = _prepare_environment(config)
+        # A refused duplicate must not rewrite the incumbent's environment or
+        # credential, even if the host's reachability settings have changed.
+        _remember_generation(state)
+        env_file, reach, credential = _prepare_environment(config)
 
         # no_repo is the record of D17 in the request itself, and it says more
         # than an absent repo_url can: the session has no repository, so the
@@ -1746,6 +1761,7 @@ def start(
         # this produces is echoed over HTTP and written to events.jsonl, and the
         # only thing in it is the name of a 0600 file.
         request = spawn.SpawnRequest(
+            workspace_id=(project_context.current() or projects.GENERAL) if projects.enabled() else None,
             taskdef=TASKDEF,
             target=TARGET,
             targets=launch["threads"],
@@ -1779,17 +1795,28 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
+        from . import assistant_history
+
+        previous = assistant_history.latest()
         published = False
+        number = state.generation + 1
 
         def publish_registration(register, session_id: str, _pid: int) -> None:
-            nonlocal published
+            nonlocal published, number
             with _PUBLICATION_LOCK:
                 register()
+                record = assistant_history.register(
+                    session_id, number=number, started_at=now,
+                    previous=previous["session"] if previous else None,
+                    entry=registry.read_session(session_id),
+                )
+                assistant_history.bind_credential(session_id, credential)
+                number = record["generation"]
                 _write_state(replace(
                     state,
                     session_id=session_id,
                     started_at=now,
-                    generation=state.generation + 1,
+                    generation=number,
                     handoff=text,
                     handoff_at=stamp,
                     stopped_at=None,
@@ -1797,27 +1824,14 @@ def start(
                 ))
                 published = True
 
-        try:
-            result = spawn.spawn_session(
-                config,
-                request,
-                kind=KIND,
-                publish_registration=publish_registration,
-                # Settled above, where the layer each thread came from is still
-                # known: explicit refuses, standing defers (issue #413).
-                refuse_held_targets=False,
-            )
-        except spawn.CapacityError as exc:
-            raise _refuse(
-                AssistantCapacityError(
-                    f"{exc} — the assistant holds its own slot beside "
-                    "max_concurrent_sessions "
-                    f"({config.max_concurrent_sessions}), which counts workers, but "
-                    "it cannot take a slot that is already occupied. Free a worker "
-                    "slot and start it again"
-                ),
-                "cap_reached",
-            ) from exc
+        result = spawn.spawn_session(
+            config,
+            request,
+            kind=KIND,
+            publish_registration=publish_registration,
+            # Explicit threads refuse above; occupied standing threads defer.
+            refuse_held_targets=False,
+        )
 
         if not published:
             raise AssistantError(
@@ -1830,7 +1844,7 @@ def start(
             data={
                 "session": result.session_id,
                 "pid": result.pid,
-                "generation": state.generation + 1,
+                "generation": number,
                 "taskdef": TASKDEF,
                 "target": TARGET,
                 # Where it was told the platform is, never what it authenticates
@@ -1846,11 +1860,12 @@ def start(
         )
         logger.info(
             "platform_assistant_started id=%s pid=%s generation=%s",
-            result.session_id, result.pid, state.generation + 1,
+            result.session_id, result.pid, number,
         )
         return status()
 
 
+@serialized
 def stop(
     *, reason: str = "operator", handoff: Optional[str] = None
 ) -> bool:
@@ -1874,6 +1889,7 @@ def stop(
         now = utc_now_iso()
         text, stamp = _handoff_update(state, handoff, now)
         live = _live_assistant()
+        _remember_generation(state)
 
         # First, and on both paths: the credential is a file, not a session
         # property, so a stop that left it valid would be a container-spawning
@@ -1943,6 +1959,7 @@ def stop(
         return gone
 
 
+@serialized
 def rotate(
     config: PlatformConfig,
     *,
@@ -2468,6 +2485,7 @@ def resume_supervision() -> bool:
     return supervisor.resume()
 
 
+@serialized
 def set_handoff(text: str) -> AssistantState:
     """Record the compact summary the next incarnation should be told (§8.3).
 
@@ -2487,6 +2505,7 @@ def set_handoff(text: str) -> AssistantState:
         return read_state()
 
 
+@serialized
 def set_instructions(text: str) -> AssistantState:
     """Record the operator's standing orders, replacing the whole document (T87).
 
@@ -2531,7 +2550,18 @@ def set_instructions(text: str) -> AssistantState:
         return read_state()
 
 
+@serialized
 def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bool:
+    if projects.enabled():
+        destination = projects.destination(data)
+        if not destination:
+            raise AssistantError("Assistant notification has no project destination.")
+        with project_context.bound(destination):
+            return _notify_bound(note, kind=kind, data=data)
+    return _notify_bound(note, kind=kind, data=data)
+
+
+def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bool:
     """Spool a compact digest of a material event. Returns whether one is live.
 
     The seam §8.3 asks for, and the whole of it: the daemon detects and calls
@@ -2572,6 +2602,8 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         )
         pending = list(state.pending) + [entry]
         dropped = max(0, len(pending) - MAX_PENDING)
+        if projects.enabled():
+            dropped = 0
         if dropped:
             discard = next((i for i, item in enumerate(pending)
                             if item.kind != "conversation_request"), len(pending) - 1)
@@ -2600,9 +2632,14 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         append_event(
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
+        from . import assistant_conversation
+
+        if label in assistant_conversation.DIGEST_KINDS:
+            assistant_conversation.record(text, kind=label)
         return _live_assistant() is not None
 
 
+@serialized
 def notify_conversation(identity: str, data: dict) -> bool:
     """Atomically accept one request and its permanent, content-free replay key."""
     with _LOCK:
@@ -2701,6 +2738,7 @@ def _oldest_at(pending: tuple) -> Optional[str]:
     return min(stamps)
 
 
+@serialized
 def take_pending() -> list:
     """Drain the spooled digests, oldest first, and clear them.
 
@@ -2715,8 +2753,12 @@ def take_pending() -> list:
     empty either way, and a mark left behind by a take that raced the last digest
     out would suppress the next accumulation's first nudge for a window.
     """
+    from . import project_requests
+
     with _LOCK:
         state = read_state()
+        if projects.enabled():
+            return project_requests.drain(state)
         if not state.pending:
             if state.nudged_at is not None or state.pending_since is not None:
                 _write_state(replace(state, nudged_at=None, pending_since=None))

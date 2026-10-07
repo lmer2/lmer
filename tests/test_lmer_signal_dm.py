@@ -54,11 +54,14 @@ def dm_rig(tmp_path, monkeypatch):
 
 
 class TestDelivery:
-    def test_a_dm_reaches_the_person_and_prints_the_conversation(self, dm_rig, capsys):
+    def test_a_dm_reaches_the_person_and_prints_the_conversation(self, dm_rig, capsys, routing_call):
         dm_rig.serve(env=dm_env())
         assert run(["dm", "U0123ABCD", SECRET]) == 0
         assert dm_rig.slack_dm.posted == [("DU0123ABCD", SECRET)]
         out = capsys.readouterr()
+        from lmer_cli.routing_receipts import delivered
+        assert delivered("call", "claude-test")
+        assert SECRET not in out.err
         # The permalink alone on stdout, as `ask` puts its answer there, so a
         # shell can capture where the message went.
         assert out.out.strip().startswith("https://example.slack.com/archives/DU0123ABCD/")
@@ -112,10 +115,13 @@ class TestTheBodyNeverReachesTheBus:
 
 
 class TestRefusals:
-    def test_no_allow_list_refuses_and_journals_nothing(self, dm_rig, capsys):
+    def test_no_allow_list_refuses_and_journals_nothing(self, dm_rig, capsys, routing_call):
         dm_rig.serve(env=dm_env(allowed=""))
         assert run(["dm", "U0123ABCD", SECRET]) == 1
-        assert SLACK_ALLOW_LIST_ENV in capsys.readouterr().err
+        from lmer_cli.routing_receipts import delivered
+        error = capsys.readouterr().err
+        assert SLACK_ALLOW_LIST_ENV in error
+        assert not delivered("call", "claude-test")
         assert dm_rig.slack_dm.posted == []
         # A refused DM leaves no note either: nothing happened to report, and a
         # note naming the recipient would say the run tried.

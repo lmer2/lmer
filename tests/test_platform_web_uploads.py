@@ -124,7 +124,7 @@ def test_a_message_may_be_nothing_but_a_file():
     send = _chat_function("async function send(")
     assert "!typed && !staged.length" in send
     source = _chat_source()
-    assert ':disabled="!draft.trim() && !attachments.length"' in source, (
+    assert ':disabled="sendPaused || (!draft.trim() && !attachments.length)"' in source, (
         "send stays disabled for a message that is only an attachment"
     )
 

@@ -37,6 +37,7 @@ import { answerRun } from '../api.js'
 const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 
 const props = defineProps({
+  slots: { type: Array, default: () => [] },
   run: { type: Object, required: true },
 })
 
@@ -49,6 +50,8 @@ const emit = defineEmits(['answered'])
 const NO_QUESTION_NOTE = 'question text was not recorded — open the run to see'
 
 const draft = ref('')
+const projectConfirmed = ref(false)
+const selectedSlot = ref(null)
 const busy = ref(false)
 const error = ref(null)
 const startedSession = ref(null)
@@ -64,7 +67,8 @@ const questionRecorded = computed(
 // would only earn the daemon's "already has a live session" refusal.
 const handedOff = computed(() => !!startedSession.value)
 const canSend = computed(
-  () => !handedOff.value && !!draft.value.trim() && !busy.value,
+  () => !handedOff.value && !!draft.value.trim() && !busy.value
+    && (!props.run.confirm_project || projectConfirmed.value),
 )
 
 async function submitWithDecision(allowUnsignedSource = null) {
@@ -75,7 +79,11 @@ async function submitWithDecision(allowUnsignedSource = null) {
     const result = await answerRun(
       props.run,
       draft.value.trim(),
-      allowUnsignedSource ? { allowUnsignedSource } : {},
+      {
+        confirmProject: projectConfirmed.value,
+        slot: selectedSlot.value,
+        ...(allowUnsignedSource ? { allowUnsignedSource } : {}),
+      },
     )
     startedSession.value = result.session?.session_id || 'a new session'
     draft.value = ''
@@ -194,6 +202,10 @@ function cancelUnsignedSource() {
         @keydown.ctrl.enter.prevent="submit"
         @keydown.meta.enter.prevent="submit"
       />
+      <v-checkbox v-if="run.confirm_project" v-model="projectConfirmed" :label="`Authorize this answer in ${run.workspace_name} with its current project settings`" />
+      <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
+          item-title="name" item-value="name" label="Service slot" clearable
+          hint="Leave empty to reuse this run's remembered slot. Choose an applicable slot if its assignment changed." persistent-hint />
       <div class="send-row">
         <v-btn
           :prepend-icon="mdiReplyOutline"

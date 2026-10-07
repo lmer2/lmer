@@ -280,6 +280,8 @@ from .config import active_assistant_credential, active_secret
 from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
 from .store import logs_dir
+from . import projects
+from .config import active_assistant_credentials
 
 logger = logging.getLogger("lmer_platform.transcripts")
 
@@ -816,6 +818,8 @@ class Message:
     text: str
     at: Optional[str] = None
     origin: Optional[str] = None
+    session: Optional[str] = None
+    generation: Optional[int] = None
     #: Stable across reads, which ``seq`` is not — ``seq`` is a position in the
     #: merged conversation and every read renumbers, so a late transcript row
     #: shifts every turn after it and a client paging by position redraws one it
@@ -853,6 +857,7 @@ class Message:
     #: were addressed to a thread this session is not connected to — without this
     #: the pane shows them as a message to whoever is reading it.
     thread: Optional[str] = None
+    peer: Optional[dict] = None
 
     @property
     def empty(self) -> bool:
@@ -867,6 +872,8 @@ class Message:
             "kind": self.kind,
             "at": self.at,
             "origin": self.origin,
+            "session": self.session,
+            "generation": self.generation,
             "via": self.via,
             "text": self.text,
             "truncated": self.truncated,
@@ -878,6 +885,7 @@ class Message:
             "comms_kind": self.comms_kind,
             "fidelity": self.fidelity,
             "thread": self.thread,
+            **({"peer": self.peer} if self.peer else {}),
         }
 
 
@@ -898,6 +906,7 @@ class Source:
     vocabulary: Optional[str] = None
     messages: int = 0
     capped: bool = False
+    incomplete: bool = False
 
     @property
     def id(self) -> str:
@@ -912,6 +921,7 @@ class Source:
             "vocabulary": self.vocabulary,
             "messages": self.messages,
             "capped": self.capped,
+            "incomplete": self.incomplete,
         }
 
 
@@ -1100,6 +1110,12 @@ def locate_sources(session_id: str) -> list:
     roots = [own_dir, transcript_root()]
 
     entry = registry.read_session(session_id)
+    if entry is None:
+        from . import assistant_history
+
+        archived = assistant_history.generation(session_id)
+        if archived and archived["transcript"]:
+            entry = {"transcript": json.loads(archived["transcript"])}
     pointer = (entry or {}).get("transcript")
     if isinstance(pointer, dict) and pointer:
         located = _pointer_sources(session_id, pointer, roots)
@@ -1199,6 +1215,10 @@ def _scrub(text: str) -> str:
     for known in (_platform_secret(), _assistant_credential()):
         if known:
             text = text.replace(known, _REDACTED)
+    if projects.enabled():
+        for known in active_assistant_credentials():
+            if len(known) >= 8:
+                text = text.replace(known, _REDACTED)
     for pattern, replacement in _CREDENTIAL_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
@@ -2175,7 +2195,7 @@ def _message_from_record(record: dict, pending: dict, *, presentation: bool = Tr
     return None
 
 
-def _iter_records(path: Path) -> Iterator[dict]:
+def _iter_records(path: Path, *, problems: Optional[list] = None) -> Iterator[dict]:
     """Yield the JSON objects in a JSONL file, skipping what cannot be read.
 
     Line by line rather than whole-file: a long session's transcript runs to
@@ -2185,6 +2205,8 @@ def _iter_records(path: Path) -> Iterator[dict]:
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError as exc:
+        if problems is not None:
+            problems.append("unreadable")
         logger.warning(
             "platform_transcript_unreadable path=%s error=%s", path, exc
         )
@@ -2195,6 +2217,8 @@ def _iter_records(path: Path) -> Iterator[dict]:
             try:
                 raw = handle.readline(_MAX_LINE_BYTES)
             except OSError as exc:
+                if problems is not None:
+                    problems.append("read_failed")
                 logger.warning(
                     "platform_transcript_read_failed path=%s error=%s", path, exc
                 )
@@ -2210,6 +2234,8 @@ def _iter_records(path: Path) -> Iterator[dict]:
                 # like this is a chat view that is quietly missing part of itself.
                 if not oversized:
                     oversized = True
+                    if problems is not None:
+                        problems.append("oversized")
                     logger.warning(
                         "platform_transcript_line_oversized path=%s limit=%d",
                         path, _MAX_LINE_BYTES,
@@ -2221,6 +2247,8 @@ def _iter_records(path: Path) -> Iterator[dict]:
             try:
                 record = json.loads(line)
             except ValueError:
+                if problems is not None and not problems:
+                    problems.append("invalid_record")
                 continue
             if isinstance(record, dict):
                 yield record
@@ -2550,8 +2578,9 @@ def read_source(source: Source) -> tuple:
     precedence. A canonical file may therefore report ``vocabulary="lmer"``
     while its cosmetic ``harness`` label is a converter-declared name.
     """
+    problems: list = []
     messages, capped, vocabulary, harness = _normalise(
-        _iter_records(source.path), cap=MAX_MESSAGES_PER_SOURCE,
+        _iter_records(source.path, problems=problems), cap=MAX_MESSAGES_PER_SOURCE,
         origin=source.path,
     )
     if capped:
@@ -2568,6 +2597,7 @@ def read_source(source: Source) -> tuple:
         vocabulary=vocabulary,
         messages=len(messages),
         capped=capped,
+        incomplete=bool(problems),
     )
 
 
@@ -2674,7 +2704,7 @@ def _comms_messages(session_id: str) -> tuple:
     harness turn that is the same communication as a record already in *turns*,
     which the harness wrote down for its own two reasons:
 
-    - inbound, the exact line the supervisor typed in (``[slack · vegu] …``),
+    - inbound, the exact line the supervisor typed in (``[slack · tester] …``),
       recorded as a ``user`` turn;
     - outbound, the reply the agent wrote as prose before posting it, recorded
       as an ``assistant`` turn.
@@ -2687,21 +2717,27 @@ def _comms_messages(session_id: str) -> tuple:
     bus turns and nothing else.
     """
     try:
-        from lmer_cli import comms as bus
-
         from . import comms as hub_module
 
         events, _cursor = hub_module.ensure_hub().feed(
             0, session=session_id, limit=hub_module.PANE_LIMIT,
         )
+        from . import assistant_history
+
+        archived = assistant_history.events(session_id)
+        if archived:
+            events = archived
     except Exception as exc:  # pragma: no cover - defensive, see docstring
         logger.warning(
             "platform_transcript_comms_unreadable session=%s error=%s — the "
             "conversation is served without the bus's turns", session_id, exc,
         )
         return [], []
-    if not events:
-        return [], []
+    return _comms_turns(events, session_id)
+
+
+def _comms_turns(events: list, session_id: str) -> tuple:
+    from lmer_cli import comms as bus
 
     questions: dict = {}
     turns: list = []
@@ -2715,13 +2751,17 @@ def _comms_messages(session_id: str) -> tuple:
         if kind == "question":
             questions[record.get("id")] = record
         inbound = channel not in (None, "agent") and not meta.get("session_origin")
-        if kind == "command":
+        if kind in ("command", "digest"):
             role = PLATFORM_ROLE
         elif inbound:
             role = "user"
         else:
             role = "assistant"
         label = None if kind == "message" and inbound else kind
+        if channel == "peer-ul":
+            label = "peer UL message"
+        if kind == "digest":
+            label = f"digest: {meta.get('digest_kind', 'event')}"
         if kind == "answer" and meta.get("late"):
             label = "late answer"
         spoken, truncated = _present(str(record.get("text") or ""), TEXT_LIMIT, keep="tail")
@@ -2742,6 +2782,7 @@ def _comms_messages(session_id: str) -> tuple:
                 source=dict(source) if source else None, comms_kind=label,
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
+                peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``
@@ -3046,7 +3087,12 @@ def _collect_sources(session_id: str) -> list:
     """
     grouped: list = []
     files = 0
-    for member in sessions_for_run(session_id):
+    from . import assistant_history
+
+    entry = registry.read_session(session_id) or {}
+    members = ([session_id] if entry.get("kind") == "assistant" or assistant_history.generation(session_id)
+               else sessions_for_run(session_id))
+    for member in members:
         found: list = []
         for located in locate_sources(member):
             found.append(located)
@@ -3083,6 +3129,57 @@ def _source_name(session_id: str, path: Path) -> str:
     return hashlib.blake2b(str(path).encode("utf-8"), digest_size=8).hexdigest()
 
 
+def collect_messages(session_id: str) -> tuple:
+    """Normalize the named conversation without choosing a response page."""
+    _validated(session_id)
+    messages: list = []
+    read: list = []
+    for member, sources in _collect_sources(session_id):
+        loaded: list = []
+        for source in sources:
+            from_file, described = read_source(source)
+            read.append(described)
+            loaded.append((from_file, described.vocabulary, source))
+        selected = _prefer_adapter_tier(member, loaded, vocabulary_index=1)
+        found: list = []
+        for from_file, _vocabulary, source in selected:
+            # Numbered per file rather than across the run: a transcript is
+            # append-only, so a row's place in its own file is fixed once
+            # written, while its place in the merged conversation is not.
+            name = _source_name(member, source.path)
+            for index, message in enumerate(from_file):
+                if message.id is None:
+                    message.id = f"{member}:{name}#{index}"
+                found.append(message)
+        channel, copies = _merged_channel(member)
+        joined = _interleave(_without_bus_copies(found, copies), channel)
+        for message in joined:
+            message.session = member
+        messages.extend(joined)
+
+    from . import assistant_history
+
+    archived = assistant_history.generation(session_id)
+    entry = registry.read_session(session_id)
+    if not archived and isinstance(entry, dict) and entry.get("kind") == "assistant":
+        from . import assistant_conversation
+
+        channel, copies = _comms_turns(assistant_conversation.events(), session_id)
+        working = [message for message in messages if not message.via]
+        conversation = [message for message in messages if message.via]
+        messages = _interleave(
+            _without_bus_copies(working, copies), _interleave(conversation, channel),
+        )
+
+    for index, message in enumerate(messages):
+        message.seq = index
+        if archived:
+            message.session = session_id
+            message.generation = archived["generation"]
+
+    return messages, read
+
+
 def read_messages(
     session_id: str,
     *,
@@ -3108,30 +3205,7 @@ def read_messages(
     _validated(session_id)
     limit = max(1, min(int(limit), MAX_MESSAGE_LIMIT))
 
-    messages: list = []
-    read: list = []
-    for member, sources in _collect_sources(session_id):
-        loaded: list = []
-        for source in sources:
-            from_file, described = read_source(source)
-            read.append(described)
-            loaded.append((from_file, described.vocabulary, source))
-        selected = _prefer_adapter_tier(member, loaded, vocabulary_index=1)
-        found: list = []
-        for from_file, _vocabulary, source in selected:
-            # Numbered per file rather than across the run: a transcript is
-            # append-only, so a row's place in its own file is fixed once
-            # written, while its place in the merged conversation is not.
-            name = _source_name(member, source.path)
-            for index, message in enumerate(from_file):
-                if message.id is None:
-                    message.id = f"{member}:{name}#{index}"
-                found.append(message)
-        channel, copies = _merged_channel(member)
-        messages.extend(_interleave(_without_bus_copies(found, copies), channel))
-
-    for index, message in enumerate(messages):
-        message.seq = index
+    messages, read = collect_messages(session_id)
 
     total = len(messages)
     start = max(0, total + since) if since < 0 else min(since, total)
@@ -3146,6 +3220,12 @@ def read_messages(
         note = EMPTY_TRANSCRIPT_NOTE
     else:
         note = NO_TRANSCRIPT_NOTE
+
+    from . import assistant_history
+
+    archive_note = assistant_history.transcript_limit_note(session_id)
+    if archive_note:
+        note = archive_note
 
     return MessagePage(
         messages=tuple(page),

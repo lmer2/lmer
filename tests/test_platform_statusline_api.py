@@ -203,7 +203,7 @@ class TestTheAssistantRoute:
         monkeypatch.setattr(assistant, "_live_assistant", lambda: None)
         assert "statusline" in client.get("/api/assistant", headers=auth()).json()
 
-    def test_the_status_is_read_outside_the_publication_lock(self, monkeypatch):
+    def test_the_status_is_read_outside_the_publication_lock(self, monkeypatch, platform_root):
         """``status()``'s docstring promises the lock covers only two adjacent
         writes, and ``_memory_snapshot()`` sits outside it for that reason. This
         read is of a container-written file: inside the lock, a poll that stalls

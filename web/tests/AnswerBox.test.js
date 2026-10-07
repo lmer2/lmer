@@ -31,7 +31,32 @@ it('binds fresh answer continuation approval to the question source UID', async 
   await flushPromises()
 
   expect(answerRun).toHaveBeenLastCalledWith(
-    expect.any(Object), 'Proceed carefully', { allowUnsignedSource: uid },
+    expect.any(Object), 'Proceed carefully',
+    { confirmProject: false, slot: null, allowUnsignedSource: uid },
+  )
+})
+
+it('sends the project fields and the selected slot beside the answer', async () => {
+  answerRun.mockResolvedValueOnce({ session: { session_id: 's-answer' } })
+  const wrapper = mountPane(AnswerBox, {
+    slots: [{ name: 'web', applicable_projects: ['beta'] }],
+    run: {
+      host: 'git.example', project: 'acme/widget', slug: 'develop-1',
+      workspace_id: 'beta', home_revision: 2, confirm_project: true,
+      workspace_name: 'Example Beta',
+      attention: { note: 'Proceed?' },
+    },
+  })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+  await wrapper.get('input[type="checkbox"]').setValue(true)
+  await wrapper.findComponent({ name: 'VSelect' }).setValue('web')
+  await wrapper.findAll('button').find((button) => button.text() === 'answer').trigger('click')
+  await flushPromises()
+
+  expect(answerRun).toHaveBeenLastCalledWith(
+    expect.objectContaining({ workspace_id: 'beta', home_revision: 2 }),
+    'Proceed carefully',
+    { confirmProject: true, slot: 'web' },
   )
 })
 

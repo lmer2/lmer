@@ -34,6 +34,7 @@ from .store import (
     StoreError, ensure_state_dir, mutating, platform_dir,
     read_json, utc_now_iso, write_json,
 )
+from . import projects, project_events
 
 logger = logging.getLogger(__name__)
 
@@ -664,6 +665,16 @@ class CommsHub:
             # Before the journal/ack: a transient registry write failure must
             # leave this lifecycle fact eligible for the subscriber's retry.
             teardown.record_request(session_id, message)
+            from . import assistant_history
+
+            archived = assistant_history.generation(session_id)
+            if kind == "assistant" and archived is None:
+                from . import assistant
+
+                archived = assistant.history_for(session_id)
+            if kind == "assistant" or archived:
+                assistant_history.retain(session_id, message)
+            project_events.enqueue(session_id, message, run, kind)
             event = self.journal.append(session_id, message, run=run, session_kind=kind)
         except StoreError as exc:
             logger.warning("platform_comms_journal_failed session=%s error=%s", session_id, exc)
@@ -722,6 +733,7 @@ class CommsHub:
         options: Iterable[str] = (),
         attachments: Iterable[dict] = (),
         meta: Optional[dict] = None,
+        before_send: Optional[Callable] = None,
     ) -> dict:
         """Post one record on *session_id*'s bus and journal it at once.
 
@@ -750,6 +762,8 @@ class CommsHub:
         error: Optional[str] = None
         try:
             try:
+                if before_send is not None:
+                    before_send()
                 reply = session_io._post(endpoint, "/messages", body)
             except session_io.SessionIOError as exc:
                 error = str(exc)[:400]
@@ -791,6 +805,9 @@ class CommsHub:
 
     def queue_digest(self, event: FleetEvent) -> None:
         """Remember a non-milestone record for the next batched digest."""
+        if projects.enabled():
+            project_events.enqueue(event.session, event.message, event.run, event.session_kind)
+            return
         with self._lock:
             self._pending_digest.setdefault(event.session, []).append(event)
 
@@ -798,6 +815,9 @@ class CommsHub:
         """Coalesce queued records into one digest per session. Returns how many
         digests were spooled."""
         from . import assistant
+        if projects.enabled():
+            self._last_digest_flush = time.monotonic()
+            return project_events.flush()
 
         with self._lock:
             pending, self._pending_digest = self._pending_digest, {}
@@ -805,6 +825,10 @@ class CommsHub:
         spool = notify or assistant.notify
         count = 0
         for session_id, events in pending.items():
+            events = [event for event in events
+                      if (event.message.get("meta") or {}).get("notification_class") != "connector_health"]
+            if not events:
+                continue
             lines = []
             for event in events[-8:]:
                 message = event.message

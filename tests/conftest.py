@@ -104,6 +104,24 @@ def strip_lmer_env(monkeypatch):
             monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture
+def routing_call(tmp_path, monkeypatch):
+    """A shell invocation's harness identity and isolated producer records."""
+    import json
+    import tempfile
+    from lmer_cli import routing_receipts
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("LMER_SESSION_ID", "routing-test-session")
+
+    def select(tool="call", session="claude-test"):
+        monkeypatch.setenv(routing_receipts.CONTEXT_ENV, json.dumps({"session": session, "tool": tool}))
+
+    select()
+    return select
+
+
 def drain_connectors(instances, budget, *, announce=True):
     """Shared teardown for the connector suites' autouse lifetime fixtures.
 

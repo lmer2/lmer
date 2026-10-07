@@ -470,14 +470,12 @@ class TestTheLegacyTaskTree:
         read as a `{task_type}`, and every record under it left validation
         without a word.
 
-        This is the reviewer's tree, and it is the live work repo's shape:
-        `syseng/infra/ansible-roles/{caddy,common,...}/runs/` are six real run
-        areas, and the day `syseng/infra` gains one marker they all vanish.
+        A nested project must stay visible when its parent gains a marker.
         """
-        project = tmp_path / "h/syseng/infra"
+        project = tmp_path / "h/example/infra"
         (project / "info").mkdir(parents=True)
         (project / "runs").mkdir()
-        _plant(tmp_path, "h/syseng/infra/ansible-roles/caddy/runs/deploy-1/state.yaml")
+        _plant(tmp_path, "h/example/infra/roles/web/runs/deploy-1/state.yaml")
 
         report = _bare_report(tmp_path, form=Form.LEGACY)
 
@@ -486,7 +484,7 @@ class TestTheLegacyTaskTree:
             "validation because a namespace dir above it read as a task tree"
         )
         areas = {p.as_posix() for p, _ in record.iter_run_areas(tmp_path)}
-        assert any(a.endswith("ansible-roles/caddy/runs") for a in areas), (
+        assert any(a.endswith("roles/web/runs") for a in areas), (
             f"the nested project's run area is not walked at all: {areas}"
         )
 

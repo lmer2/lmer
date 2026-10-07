@@ -20,7 +20,7 @@ from lmer_cli.thread_access import (
 )
 from lmer_cli.threads import ThreadError, parse_channel, parse_thread
 
-SLACK_LINK = "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+SLACK_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
 SLACK_ENV = {"SLACK_BOT_TOKEN": "xoxb-test"}
 MATRIX_LINK = "https://matrix.to/#/!room:example.org/$root"
 MATRIX_ENV = {
@@ -69,7 +69,7 @@ class FakeSlack:
         not there). Outside ``fail``'s reach on purpose: that knob stands for the
         conversation refusing, which is what opening a thread has to report, and
         a fake that failed here first would report it for the wrong call."""
-        return {"host": "20c.slack.com", "scopes": self.scopes}
+        return {"host": "example.slack.com", "scopes": self.scopes}
 
     def post_root(self, channel, text):
         self._maybe_fail()
@@ -675,7 +675,7 @@ class TestOpening:
         result = open_thread("#a-channel", "the unified comms run", env=SLACK_ENV)
         assert slack.opened == [("#a-channel", "the unified comms run")]
         assert result["thread"]["permalink"] == (
-            "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+            "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
         )
         assert result["thread"]["channel"] == "slack"
 

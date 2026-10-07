@@ -32,6 +32,7 @@ from slack_chat.connector import (
 
 from .client import MatrixAccount, MatrixClient, MatrixError
 from .permalink import matrix_to_link, parse_matrix_permalink
+from lmer_cli.assistant_mentions import route_connected_mention
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +543,12 @@ class MatrixConnector(ConnectorLifecycle):
 
     def _post_inbound(self, event, poster=None):
         event_id = event.get("event_id")
+        if poster is None and event.get("sender") != self.config.user_id:
+            if route_connected_mention(CHANNEL, self.room_id, event, bot_id=self.config.user_id):
+                with self._state.lock:
+                    self._accept_inbound(event_id)
+                    self._state.save()
+                return True
         def prepare():
             content = event.get("content") if isinstance(event.get("content"), dict) else {}
             body, attachments = self._inbound_body(event)

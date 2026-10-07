@@ -38,6 +38,7 @@ from lmer_cli.tls import ensure_ca_bundle
 from .registry import is_thread_connected
 from .sessions import preset_ack_parts
 from .sessions import SessionManager
+from lmer_platform import projects, ingress_store
 
 logger = logging.getLogger("lmer_slack.listener")
 
@@ -424,7 +425,7 @@ async def handle_mention(event, say):
     thread_ts = event.get("thread_ts") or event.get("ts")
 
     if MENTIONS.enabled:
-        if session_manager.touch(channel, thread_ts) or is_thread_connected(channel, thread_ts):
+        if not projects.enabled() and (session_manager.touch(channel, thread_ts) or is_thread_connected(channel, thread_ts)):
             return
         await _forward_assistant(channel, event)
         return
@@ -562,7 +563,13 @@ async def _run() -> None:
         session_manager.max_sessions,
         session_manager.idle_timeout_minutes,
     )
-    handler = AsyncSocketModeHandler(app, app_token)
+    class DurableMentionHandler(AsyncSocketModeHandler):
+        async def handle(self, client, request):
+            if MENTIONS.enabled:
+                await asyncio.to_thread(ingress_store.slack_event, request)
+            await super().handle(client, request)
+
+    handler = DurableMentionHandler(app, app_token)
     try:
         await handler.start_async()
     finally:

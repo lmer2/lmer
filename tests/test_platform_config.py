@@ -1371,7 +1371,7 @@ def test_an_unusable_window_costs_its_layer_not_the_daemon(
     makes it the one memo here with no stat key to expire it — so this test
     clears it rather than assuming nothing earlier in the session tripped it.
     """
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     store.write_json(cfg.config_path(), {"checkin_window_seconds": 900})
     monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "soon")
     # Both readers, and the same answer from each: the loaded config and the
@@ -1452,7 +1452,7 @@ def test_a_threshold_of_zero_is_a_mistake_not_an_off_switch(
     """The one place the two knobs' rules differ, and it is the whole reason
     they carry a minimum each: a nudge about an empty spool is not a feature
     somebody switched on, and the refusal says where the off-switch is."""
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     monkeypatch.setenv(cfg.ENV_NUDGE_PENDING_THRESHOLD, "0")
 
     assert cfg.load().nudge_pending_threshold == 1
@@ -1471,7 +1471,7 @@ def test_a_threshold_of_zero_is_a_mistake_not_an_off_switch(
 def test_an_unusable_nudge_layer_costs_only_itself(
     platform_root, monkeypatch, caplog
 ):
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     store.write_json(cfg.config_path(), {"nudge_after_seconds": 300})
     monkeypatch.setenv(cfg.ENV_NUDGE_AFTER_SECONDS, "soon")
 
@@ -1522,7 +1522,7 @@ def test_a_threshold_above_a_hundred_is_refused_as_a_second_off_switch(
     """The ceiling exists for the reason the nudge threshold's does: a value the
     reading can never reach would be an off-switch nobody documented, and the one
     that is documented is 0."""
-    cfg._WARNED_INT_SETTINGS.clear()
+    cfg._WARNED_LAYER_SETTINGS.clear()
     monkeypatch.setenv(cfg.ENV_ROTATION_CONTEXT_THRESHOLD, "150")
 
     assert cfg.load().rotation_context_threshold == 0
@@ -1549,6 +1549,7 @@ def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     keys = {rule.log_key for rule in cfg.INT_SETTINGS.values()}
     assert len(keys) == len(cfg.INT_SETTINGS)
     assert set(cfg.INT_SETTINGS) == {
+        "max_live_assistants", "max_concurrent_sessions",
         "chat_keep_last", "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
         "terminal_confirm_seconds",

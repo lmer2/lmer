@@ -52,7 +52,9 @@ from pathlib import Path
 from typing import Optional
 
 from . import registry, store
-from .store import logs_dir, platform_dir
+from .store import logs_dir
+from .project_context import assistant_dir
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.uploads")
 
@@ -287,7 +289,7 @@ def session_upload_dir(session_id: str) -> Path:
 
 def assistant_upload_dir() -> Path:
     """uber lmer's store: ``<platform state>/assistant-uploads``."""
-    return platform_dir() / ASSISTANT_DIRNAME
+    return assistant_dir() / ASSISTANT_DIRNAME
 
 
 def upload_dir_for(session_id: str, kind: str) -> Path:
@@ -299,7 +301,8 @@ def upload_dir_for(session_id: str, kind: str) -> Path:
     incarnation is a thing to opt into, not to fall back to.
     """
     if kind == registry.ASSISTANT_KIND:
-        return assistant_upload_dir()
+        with project_context.bound(projects.session_home(session_id) or project_context.current()):
+            return assistant_upload_dir()
     return session_upload_dir(session_id)
 
 
@@ -406,14 +409,17 @@ def readable_store(session_id: str, entry: Optional[dict]) -> Path:
     has been reaped — the normal end state of a clean exit — still serves what it
     was sent, from the directory its id names.
 
-    What does not survive is uber lmer's: its store is the host's, named by no
-    session, so once an incarnation's entry is gone there is nothing that says
-    which files were handed to *it*. The pane degrades to the path line the turn
-    already carries.
+    Assistant generations retain their original association with the host's
+    assistant store after their registry entries have been removed.
     """
     pointer = (entry or {}).get("uploads")
     if isinstance(pointer, dict) and pointer.get("path"):
         return mounted_store(session_id, entry)
+    from . import assistant_history
+
+    archived = assistant_history.generation(session_id)
+    if archived and archived["uploads"]:
+        return upload_dir_for(session_id, registry.ASSISTANT_KIND)
     directory = session_upload_dir(session_id)
     if directory.is_dir():
         return directory

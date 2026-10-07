@@ -132,8 +132,8 @@ class TestSlackDelivery:
 
     def test_a_username_resolves_when_the_app_carries_the_scope(self):
         slack = FakeSlack(scopes=("chat:write", "users:read"),
-                          users=[{"id": "U0123ABCD", "name": "vegu"}])
-        thread_access.send_dm("vegu", "hi", env=env("U0123ABCD"), client=slack)
+                          users=[{"id": "U0123ABCD", "name": "tester"}])
+        thread_access.send_dm("tester", "hi", env=env("U0123ABCD"), client=slack)
         assert slack.posted == [("DU0123ABCD", "hi")]
 
     def test_a_username_is_refused_by_name_when_the_scope_is_known_absent(self):
@@ -142,7 +142,7 @@ class TestSlackDelivery:
         grant it."""
         slack = FakeSlack(scopes=("chat:write",))
         with pytest.raises(ThreadError) as caught:
-            thread_access.send_dm("vegu", "hi", env=env("vegu"), client=slack)
+            thread_access.send_dm("tester", "hi", env=env("tester"), client=slack)
         assert "users:read" in str(caught.value)
         assert not any(call.startswith("find_user") for call in slack.calls)
 
@@ -152,7 +152,7 @@ class TestSlackDelivery:
         attempted and Slack's own missing_scope is the authority."""
         slack = FakeSlack(scopes=None, users=SlackError("nope", code="missing_scope"))
         with pytest.raises(ThreadError) as caught:
-            thread_access.send_dm("vegu", "hi", env=env("vegu"), client=slack)
+            thread_access.send_dm("tester", "hi", env=env("tester"), client=slack)
         assert "users:read" in str(caught.value)
         assert any(call.startswith("find_user") for call in slack.calls)
 
@@ -189,7 +189,7 @@ class TestSlackDelivery:
         is compared (MR !315, review round 1)."""
         class DisplayNameMatch(FakeSlack):
             """`find_user` matches profile.display_name as well as the handle,
-            so a lookup for "stefan" can land on an account whose handle is
+            so a lookup for "example" can land on an account whose handle is
             nothing of the sort."""
 
             def find_user(self, name):
@@ -198,24 +198,24 @@ class TestSlackDelivery:
 
         slack = DisplayNameMatch(scopes=("users:read",))
         with pytest.raises(ThreadError) as caught:
-            thread_access.send_dm("stefan", "hi", env=env("stefan"), client=slack)
+            thread_access.send_dm("example", "hi", env=env("example"), client=slack)
         assert SLACK_ALLOW_LIST_ENV in str(caught.value)
         assert slack.posted == []
         # And the refusal calls them what the run typed, not the id it resolved.
-        assert "stefan" in str(caught.value)
+        assert "example" in str(caught.value)
 
     def test_the_handle_slack_holds_still_satisfies_the_list(self):
         """The legitimate case the rule above must not break."""
         slack = FakeSlack(scopes=("users:read",),
-                          users=[{"id": "U0123ABCD", "name": "vegu"}])
-        thread_access.send_dm("vegu", "hi", env=env("vegu"), client=slack)
+                          users=[{"id": "U0123ABCD", "name": "tester"}])
+        thread_access.send_dm("tester", "hi", env=env("tester"), client=slack)
         assert slack.posted == [("DU0123ABCD", "hi")]
 
     def test_the_allow_list_matches_the_resolved_id_too(self):
         """An operator who listed the id has authorised the person, however the
         run spelled them."""
-        slack = FakeSlack(scopes=("users:read",), users=[{"id": "U0123ABCD", "name": "vegu"}])
-        thread_access.send_dm("vegu", "hi", env=env("U0123ABCD"), client=slack)
+        slack = FakeSlack(scopes=("users:read",), users=[{"id": "U0123ABCD", "name": "tester"}])
+        thread_access.send_dm("tester", "hi", env=env("U0123ABCD"), client=slack)
         assert slack.posted == [("DU0123ABCD", "hi")]
 
     @pytest.mark.parametrize("listed, admitted", [

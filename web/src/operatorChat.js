@@ -2,6 +2,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { fetchAssistantConfig } from './api.js'
 
 export const chatKeepLast = ref(0)
+// Whether the uber lmer pane draws the harness transcript beside the
+// conversation (issue 488). Platform-side like `chatKeepLast`, so it survives
+// browsers; only an explicit `true` turns it on.
+export const chatShowTranscript = ref(false)
 export const chatConfigProblem = ref(null)
 const readEntries = new Map()
 let configGeneration = 0
@@ -10,6 +14,7 @@ export function applyChatSettings(config) {
   configGeneration += 1
   const value = config.chat?.keep_last?.value ?? 0
   chatKeepLast.value = Number.isSafeInteger(value) && value >= 0 ? value : 0
+  chatShowTranscript.value = config.chat?.show_transcript?.value === true
   chatConfigProblem.value = null
 }
 

@@ -1,2 +1,0 @@
-fixed:
-  - Launches refuse unverifiable thread identities so alternate links cannot bypass an existing thread holder.

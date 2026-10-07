@@ -15,7 +15,7 @@
 // drawing the icons at all is that it is readable at arm's length.
 import { computed, ref, watch } from 'vue'
 import {
-  mdiBookmarkOutline, mdiBookmarkPlusOutline, mdiClose, mdiLinkOff, mdiMatrix,
+  mdiAlertCircleOutline, mdiBookmarkOutline, mdiBookmarkPlusOutline, mdiClose, mdiLinkOff, mdiMatrix,
   mdiOpenInNew, mdiPlus, mdiSlack,
 } from '@mdi/js'
 import {
@@ -29,6 +29,7 @@ const TRANSPORTS = [
 ]
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
   sessionId: { type: String, default: null },
   threads: { type: Array, default: () => [] },
   live: { type: Boolean, default: false },
@@ -129,9 +130,14 @@ function hasMenu(transport) {
 const connectable = computed(() => !!props.sessionId && props.live)
 
 function ariaLabel(transport) {
+  if (needsAttention(transport)) return `${transport.label} threads: recovery required`
   return byChannel.value[transport.channel].length || referencesByChannel.value[transport.channel].length
     ? `${transport.label} threads`
     : `connect a ${transport.label} thread`
+}
+
+function needsAttention(transport) {
+  return byChannel.value[transport.channel].some((thread) => thread.attention === 'recovery-required')
 }
 
 // The menu already opens itself when there is one; this is the other case.
@@ -207,7 +213,7 @@ async function remember() {
   busy.value = true
   problem.value = null
   try {
-    await addSessionReference(props.sessionId, permalink.value.trim(), referenceTitle.value.trim())
+    await addSessionReference(props.sessionId, permalink.value.trim(), referenceTitle.value.trim(), props.workspaceId)
     dialog.value = false
     emit('changed')
   } catch (error) {
@@ -221,7 +227,7 @@ async function forget(reference) {
   busy.value = true
   failure.value = null
   try {
-    await removeSessionReference(props.sessionId, reference.id)
+    await removeSessionReference(props.sessionId, reference.id, props.workspaceId)
     emit('changed')
   } catch (error) {
     failure.value = error.message
@@ -246,9 +252,9 @@ async function connect() {
   try {
     let result
     if (opening.value) {
-      result = await openSessionThread(props.sessionId, permalink.value.trim(), rootTitle.value.trim())
+      result = await openSessionThread(props.sessionId, permalink.value.trim(), rootTitle.value.trim(), props.workspaceId)
     } else {
-      result = await connectSessionThread(props.sessionId, permalink.value.trim())
+      result = await connectSessionThread(props.sessionId, permalink.value.trim(), props.workspaceId)
     }
     if (mine !== generation) return
     operations.value = operations.value.map((item) => item.thread.id === operation.thread.id
@@ -275,7 +281,7 @@ async function disconnect(thread) {
   const mine = generation
   operations.value = [...operations.value, { action: 'disconnect', thread, accepted: false }]
   try {
-    await disconnectSessionThread(props.sessionId, thread.id)
+    await disconnectSessionThread(props.sessionId, thread.id, props.workspaceId)
     if (mine !== generation) return
     operations.value = operations.value.map((item) => item.thread.id === thread.id
       ? { ...item, accepted: true } : item)
@@ -298,9 +304,9 @@ async function disconnect(thread) {
   <div class="d-flex align-center ga-1">
     <template v-for="transport in TRANSPORTS" :key="transport.channel">
       <v-badge
-        :model-value="byChannel[transport.channel].length > 1"
-        :content="byChannel[transport.channel].length"
-        color="primary"
+        :model-value="needsAttention(transport) || byChannel[transport.channel].length > 1"
+        :content="needsAttention(transport) ? '!' : byChannel[transport.channel].length"
+        :color="needsAttention(transport) ? 'warning' : 'primary'"
         offset-x="4"
         offset-y="4"
       >
@@ -312,7 +318,7 @@ async function disconnect(thread) {
           variant="text"
           size="small"
           density="comfortable"
-          :color="byChannel[transport.channel].length ? 'primary' : undefined"
+          :color="needsAttention(transport) ? 'warning' : byChannel[transport.channel].length ? 'primary' : undefined"
           :title="hoverText(transport)"
           :aria-label="ariaLabel(transport)"
           :disabled="!hasMenu(transport) && !connectable"
@@ -329,6 +335,7 @@ async function disconnect(thread) {
                 rel="noopener"
                 :title="thread.label || thread.permalink"
                 :subtitle="threadStatus(thread)"
+                :prepend-icon="thread.attention ? mdiAlertCircleOutline : undefined"
                 :append-icon="mdiOpenInNew"
               />
               <v-divider v-if="byChannel[transport.channel].length" />

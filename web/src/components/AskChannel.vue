@@ -66,6 +66,7 @@ import { fetchSessionAsk } from '../api.js'
 import { clearedIds, rememberCleared } from '../dismissals.js'
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
   sessionId: { type: String, required: true },
   // Whether the session is still running — the liveness the server refuses on,
   // not reachability, so a detached session still gets its box (spec D23). Decides
@@ -208,6 +209,7 @@ watch(() => props.live, start)
       v-for="question in waiting"
       :key="question.id"
       :session-id="sessionId"
+      :workspace-id="workspaceId"
       :question="question"
       :now="now"
       @answered="answered"

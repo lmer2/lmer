@@ -1,2 +1,0 @@
-fixed:
-  - Codex platform sessions report dated token and quota usage and preserve run-scoped preferences across container replacements.

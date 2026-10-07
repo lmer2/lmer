@@ -342,6 +342,7 @@ from .store import (
 )
 from .transcripts import _scrub
 from .workrepo import resolve_run_dir
+from . import project_context, projects
 
 logger = logging.getLogger("lmer_platform.detect")
 
@@ -1285,6 +1286,7 @@ class Detector:
         #: ``{run ref: announced_at}`` for digests spooled but not recorded on
         #: disk; cleared by the first successful write (see :meth:`_check_ins`).
         self._announced: dict = {}
+        self._project_detectors: dict = {}
         #: ``(pending_seq, stamp)`` for the nudge this process last typed —
         #: ``_announced``' shape, and the bound when the durable mark cannot be
         #: written (issue #317's review, module docstring). Keyed on the sequence
@@ -1603,6 +1605,8 @@ class Detector:
         already be waiting in each — a restart carries one in, an unreadable
         mirror hides one.
         """
+        if self._project_stage("_nudge_stage"):
+            return
         try:
             self.codex_wake_once()
         except Exception as exc:
@@ -1618,10 +1622,23 @@ class Detector:
         Its own stage beside the nudge's: the two read different things, and one
         must not be able to cost the other. Called from all three tick exits.
         """
+        if self._project_stage("_rotation_stage"):
+            return
         try:
             self.rotation_once()
         except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
             self._absorb("rotation", exc)
+
+    def _project_stage(self, method):
+        if not projects.enabled() or project_context.current():
+            return False
+        for project in projects.listing(archived=False):
+            identifier = project["id"]
+            if identifier not in self._project_detectors:
+                self._project_detectors[identifier] = Detector(self.config, notifier=self._notify, sender=self._send)
+            with project_context.bound(identifier):
+                getattr(self._project_detectors[identifier], method)()
+        return True
 
     def rotation_once(self) -> Optional[rotation.Alert]:
         """Recommend a rotation when the reading has reached the threshold.
@@ -2029,11 +2046,20 @@ class Detector:
         stale = checkin.stale_runs(payload, window=window, marks=marks)
         if not stale:
             return []
-        note, data = checkin.digest(
-            stale, window=window, caveat=self._unattributed_caveat()
-        )
-        delivered, live = self._spool(note, checkin.STALE_DIGEST_KIND, data)
-        if not delivered:
+        groups = {}
+        for run in stale:
+            owner = (projects.run_home(run.ref) or {}).get("project_id") if projects.enabled() else None
+            groups.setdefault(owner, []).append(run)
+        delivered_runs, live = [], False
+        for owner, group in groups.items():
+            note, data = checkin.digest(group, window=window, caveat=self._unattributed_caveat())
+            if owner:
+                data["workspace_id"] = owner
+            delivered, live = self._spool(note, checkin.STALE_DIGEST_KIND, data)
+            if delivered:
+                delivered_runs.extend(group)
+        stale = delivered_runs
+        if not stale:
             return []
         stamped = utc_now_iso()
         try:

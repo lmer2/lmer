@@ -946,19 +946,15 @@ def test_the_terminal_is_still_only_loaded_when_it_is_opened():
 
 
 def test_the_resume_section_hardcodes_no_colour_and_no_swept_out_variant():
-    """House style: the theme owns colour, and `outlined`/`flat` were swept out of
-    every component — tonal and elevated are what this app uses.
-
-    The hex scan runs on the comment-stripped source: an MR reference in a comment
-    ("MR #164") is hex-shaped to a regex, and a colour cannot act from inside a
-    comment — the same reading test_platform_lifecycle.py gives this guard.
-    """
+    """Lifecycle controls keep theme styling; project identity uses its named palette."""
     detail = RUN_DETAIL.read_text(encoding="utf-8")
     detail = re.sub(r"<!--.*?-->", "", detail, flags=re.DOTALL)
     detail = re.sub(r"^\s*//.*$", "", detail, flags=re.MULTILINE)
     assert not re.findall(r"#[0-9a-fA-F]{3,8}\b", detail)
     assert 'variant="outlined"' not in detail
-    assert 'variant="flat"' not in detail
+    identity = re.search(r'<v-chip\b[^>]*:color="projectColor\(run.workspace_color\)"[^>]*>', detail)
+    assert identity is not None
+    assert 'variant="flat"' not in detail.replace(identity.group(), '')
 
 
 def test_the_run_detail_view_renders_no_raw_html():
