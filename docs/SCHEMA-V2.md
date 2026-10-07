@@ -89,6 +89,31 @@ and `started_at` describe the new execution; `execution_hostname` identifies
 the machine or container where that PID exists. This keeps a host-supplied
 `hostname` distinguishable from the container running the agent.
 
+A record `work seed` creates for a later launch carries a seed identity rather
+than a launch's metadata:
+
+```yaml
+session:
+  uid: 2f0c1a7e9b5d4c3e8a1f6b2d7c9e0a4b
+  seeded_by: 981ec036134f4a8580927ddca71658a9
+  started_at: '2026-10-07T09:00:00+00:00'
+```
+
+`uid` is fresh — never the seeding launch's own — `seeded_by` names the launch
+that wrote the seed, and `started_at` is the moment of seeding; nothing else.
+The seeding launch's operator, hostname, PID, harness and model describe an
+execution that never ran in that record, so none of them is copied, and the
+record's `sessions` lineage is empty. The seed is written whole — `state.yaml`
+with its goal and name, then `run_seeded`, `goal_set`, `run_named` — inside its
+`.new-<uid>-*` temporary directory and renamed once to its final address. That
+temporary directory is the single writer-rule exception: a launch may write a
+record whose persisted `session.seeded_by` is itself only while the record is
+still its `.new-<uid>-*` temp dir — judged on the `state.yaml` already on disk
+whenever there is one, so a relabelled in-memory copy cannot name its caller
+the seeder. From the final address on, the record is read-only to the seeding
+launch like any other prior record; `seeded_by` is never an owner at
+`_runs/<slug>/<uid>`.
+
 Session ordering uses the recorded start time, with the UID as a stable tie
 breaker. Random UID spelling is not chronological order. Directory modification
 time is only a fallback for records without a usable timestamp.
@@ -111,6 +136,12 @@ Stopping the predecessor is a separate user action. Age or silence never
 means “signed out”. Unattended callers receive a needs-decision refusal.
 The internal acknowledgement `LMER_ALLOW_UNSIGNED_SOURCE` names the exact
 source UID; a boolean or another source's UID grants nothing.
+A seeded source nothing ever started in — `session.seeded_by` set, no
+`session_start` logged — is stopped by the same rule as a signed-out one: no
+session can still be running in it, so it needs no acknowledgement, and an
+acknowledgement given anyway is not recorded. Once a `session_start` is logged
+in such a record its seeding is history, and the sign-out rule applies to it as
+to any other source.
 
 In the CLI, select context with `--source-session SOURCE_UID` (or the
 schema-2 interpretation of `--session SOURCE_UID`). The two flags are mutually
