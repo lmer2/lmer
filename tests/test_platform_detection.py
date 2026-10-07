@@ -922,9 +922,14 @@ def test_a_predecessor_s_stale_entry_stops_being_a_crashed_row(config, platform_
 
     assert detect.sweep_finished_sessions(config) == [finished]
 
-    assert [row.state for row in fleet_rows(config)] == ["running"], (
+    remaining = fleet_rows(config)
+    assert [row.state for row in remaining] == ["complete"], (
         "the crashed row outlived the session that was never reaped"
     )
+    # The run committed ``complete`` and its live session is still up, so the row
+    # reads ``complete`` rather than ``running`` (#308) — the predecessor's crash
+    # is gone, and the remaining row is the live session's.
+    assert remaining[0].session["id"] == "s-live"
     assert registry.read_session("s-live") is not None, (
         "the live session's own entry must not be swept with its predecessor's"
     )

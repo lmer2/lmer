@@ -532,10 +532,12 @@ class RunView:
             "taskdef": self.taskdef,
             "target": self.target,
             # The run's own account of itself, read off its state.yaml, beside the
-            # derived ``state`` above and never folded into it: liveness outranks
-            # the committed record there by design (:func:`_derive`), so a live
-            # session's row says "running" while these three can say it is paused,
-            # or say nothing yet. They cross so a listing can show that
+            # derived ``state`` above and never folded into it: a live session
+            # outranks a non-terminal committed record there by design
+            # (:func:`_derive`), so a live session's row says "running" while
+            # these three can say it is paused, or say nothing yet — a terminal
+            # status is the one thing that wins, and the row says "complete"
+            # then. They cross so a listing can show that
             # disagreement rather than hide it — a row that renders only the
             # derived word cannot. ``None`` is ordinary for all three, which is why
             # a client renders them only when present: a run in its first seconds
@@ -1026,11 +1028,21 @@ def _derive(
     git-eventual (spec D24) while liveness is immediate. Only once nothing is
     alive does the recorded stop reason decide what the run is waiting for.
 
+    The one thing liveness does not outrank is a **terminal** committed status.
+    ``complete``/``archived`` is a deliberate act by ``work state set`` — the
+    single writer of ``state.yaml`` — and a session that stays at its prompt
+    afterwards is ordinary: it can still add artifacts, but the run is over.
+    Reporting ``running`` there kept a finished run drawing check-ins for hours
+    (#308). The row still carries the live session, so "complete, session still
+    up" is distinguishable from "still working".
+
     A live session with an open question on its ask channel is the one case where
     "running" and "needs a human" are true at once, which is exactly what the two
     axes are for (spec D23): the state stays ``running`` — the container is up and
     holding a slot — while the attention record says a person is the only thing it
-    is waiting for.
+    is waiting for. The same separation holds on a terminal run: the state is
+    ``complete`` and a still-open question keeps its ``live_question`` attention,
+    so finishing never silently drops something a human still owes.
     """
     teardown_attention = _stuck_teardown(session)
     if teardown_attention is not None:
@@ -1049,6 +1061,18 @@ def _derive(
 
     live = bool(session and session.get("live"))
     stale_entry = bool(session and not session.get("live"))
+
+    if status in _TERMINAL_STATUSES:
+        # The run's own record of having finished outranks session liveness
+        # (#308). The live branch below still reports the session on the row, so
+        # the two facts are not collapsed into one.
+        if live and questions:
+            return "complete", Attention(
+                reason="live_question",
+                note=_live_question_note(questions),
+                since=questions[0].get("at"),
+            )
+        return "complete", None
 
     if live:
         # A live session outranks the committed run state, which lags. Unless the
@@ -1072,9 +1096,6 @@ def _derive(
         if stalled is not None:
             return derived, stalled
         return derived, None
-
-    if unreadable is None and status in _TERMINAL_STATUSES:
-        return "complete", None
 
     if stop_reason == "question":
         # `open_question` is optional in practice: a run can record
