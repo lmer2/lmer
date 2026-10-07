@@ -2384,6 +2384,9 @@ def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
     the flag: it is the resumable one, and hiding it is how a crashed
     session is mistaken for a finished one. A record whose state cannot be
     read has no verdict at all, so it is never `--running` and always listed.
+    Nor is a `seeded` record running (schema form; `work seed` wrote it and
+    nothing has started in it — D13): it is listed without the flag, and the
+    `--json` entry carries `seeded` so a reader can tell it from a crash.
 
     Read-only, and always exits 0 — the `work ledger` convention. No run
     context is a normal state (a `chat` session without a repo), not a
@@ -2403,7 +2406,7 @@ def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
     if running_only:
         rows = [
             row for row in rows
-            if row["status"] == "in-progress" and (
+            if row["status"] == "in-progress" and not row.get("seeded") and (
                 row.get("signed_out") is False if "signed_out" in row
                 else row["orphaned"] is False
             )
@@ -2698,8 +2701,13 @@ def cmd_seed(args) -> int:
     Creates a run for a slug OTHER than the current session's, through the
     same create-tmp → write-state → rename lifecycle as session seeding,
     recording CLI-shaped events (run_seeded, then goal_set / run_named as
-    applicable). Seeding is not owning: no `owner` claim is made. Writes
-    only — the caller batches the push with `work commit`.
+    applicable) — all of it inside the temp dir, before the one rename.
+    Seeding is not owning: no `owner` claim is made, and on schema 2 the
+    record is not even this launch's (#535, D13): it carries a fresh uid
+    with this launch in `session.seeded_by`, so the launch's own `run_dir()`
+    keeps resolving to one record and the seed is read-only to it once
+    renamed — the launch that picks it up is the one printed at the end.
+    Writes only — the caller batches the push with `work commit`.
     """
     base = run_state.runs_base()
     if base is None:
@@ -2707,15 +2715,33 @@ def cmd_seed(args) -> int:
         return 1
 
     slug = run_state.derive_slug(args.taskdef, args.target)
-    # match_names too: a sibling run NAMED like this slug would make the
-    # new run unfindable by name lookups — refuse the ambiguity outright.
-    existing = run_state.find_run_dir(slug, match_names=True)
-    if existing is not None:
-        print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
-        return 1
-    if (base / slug).exists():
-        print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
-        return 1
+    seeded = None
+    if run_state.is_process_record():
+        # Schema 2: the slug labels a GROUP and the record is its uid (D1),
+        # so a group that already holds records is where the seed goes
+        # beside them, never a collision — say so and carry on.
+        held = len(run_state._session_dirs(base / slug))
+        if held:
+            print(f"group {slug} already holds {held} record(s)")
+        from .session_record import seeded_session
+
+        try:
+            seeded = seeded_session()
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+    else:
+        # match_names too: a sibling run NAMED like this slug would make the
+        # new run unfindable by name lookups — refuse the ambiguity outright.
+        existing = run_state.find_run_dir(slug, match_names=True)
+        if existing is not None:
+            print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
+            return 1
+        # Kept for the legacy tree on purpose: here the directory IS the
+        # record, and the seed's rename onto it would clobber it.
+        if (base / slug).exists():
+            print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
+            return 1
 
     name = None
     if args.name:
@@ -2727,33 +2753,34 @@ def cmd_seed(args) -> int:
             print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
             return 1
 
+    # Agent-typed free text bound for the (shared) work repo — redacted once
+    # here so state.goal and the goal_set event agree, as `work goal` does.
+    # Goal and name travel INTO the seed: in both forms they land in the temp
+    # dir before the rename, which on schema 2 is the only moment this launch
+    # may write a record that is not its own.
+    goal = redact_secrets(args.goal)
     try:
-        rdir, state = run_state.seed_run_dir(
+        rdir, _ = run_state.seed_run_dir(
             slug,
             args.taskdef,
             args.target,
             note=f"seeded via `work seed` ({args.taskdef}, target: {args.target})",
             adopt_existing=False,  # seeding must never mutate a run it didn't create
+            seeded=seeded,
+            goal=goal,
+            name=name,
         )
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
 
-    # Agent-typed free text bound for the (shared) work repo — redacted once
-    # here so state.goal and the goal_set event agree, as `work goal` does.
-    goal = redact_secrets(args.goal)
-    if goal:
-        state["goal"] = goal
-    if name:
-        state["name"] = name
-    if goal or name:
-        run_state.write_state(rdir, state)
-        if goal:
-            run_state.append_event(rdir, "goal_set", note=goal)
-        if name:
-            run_state.append_event(rdir, "run_named", note=name)
-
     print(f"✅ Run seeded: {rdir}")
+    if seeded is not None:
+        launch = f"lmer {args.taskdef}"
+        if args.target:
+            launch += f" {shlex.quote(args.target)}"
+        print(f"   uid: {seeded['uid']}")
+        print(f"   Pick it up with: {launch} --source-session {seeded['uid']}")
     print("   Not pushed — run `work commit` to publish it.")
     return 0
 

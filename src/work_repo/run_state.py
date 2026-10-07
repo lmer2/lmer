@@ -1102,8 +1102,15 @@ def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
     return rels
 
 
-def seed_state(slug: str, taskdef: str, target: str) -> dict:
-    """Fresh state for a new run (spec §4.1). taskdef/target are immutable."""
+def seed_state(
+    slug: str, taskdef: str, target: str, session: Optional[dict] = None
+) -> dict:
+    """Fresh state for a new run (spec §4.1). taskdef/target are immutable.
+
+    In schema form the record carries its `session`: this launch's own
+    metadata by default, or *session* when the caller supplies one — the
+    mapping `work seed` mints (:func:`session_record.seeded_session`), which
+    names a record nobody has run in yet (D13)."""
     now = utc_now_iso()
     state = {
         "schema": 2 if is_process_record() else 1,
@@ -1125,9 +1132,11 @@ def seed_state(slug: str, taskdef: str, target: str) -> dict:
         "updated": now,
     }
     if is_process_record():
-        from .session_record import current_metadata
+        if session is None:
+            from .session_record import current_metadata
 
-        state["session"] = current_metadata()
+            session = current_metadata()
+        state["session"] = dict(session)
     return state
 
 
@@ -1140,6 +1149,9 @@ def seed_run_dir(
     adopt_existing: bool = True,
     session: Optional[str] = None,
     context: Optional[dict] = None,
+    seeded: Optional[dict] = None,
+    goal: Optional[str] = None,
+    name: Optional[str] = None,
 ) -> tuple[Path, dict]:
     """Create a run dir via the tmp-dir-then-rename lifecycle (issue #87 D2).
 
@@ -1166,6 +1178,19 @@ def seed_run_dir(
     one rename — and it keeps the grouping level clear: a leftover inside a
     group would be litter nobody sweeps and nobody reports. The group dir
     itself is created here, empty, and stays that way (D22).
+
+    `seeded` (schema 2, `work seed` — #535, D13) makes the record SOMEONE
+    ELSE'S from the start: it is the session mapping the record carries
+    (:func:`session_record.seeded_session` — a fresh uid, this launch in
+    `seeded_by`), the destination is that uid's address under the group and
+    never this launch's own session dir, the temp dir is `.new-<that uid>-*`,
+    and the lineage stays empty because nothing has run in it. Everything
+    the record gets — `goal` and `name` in state, then the `run_seeded`,
+    `goal_set` and `run_named` events — is written INSIDE the temp dir: the
+    one place the seeding launch may write it (:func:`_seeding_launch_may_write`);
+    after the rename the record is read-only to it like any prior record.
+    `goal` and `name` are honoured without `seeded` too, so a legacy `work
+    seed` makes the same writes in the same order, just unguarded.
     """
     base = runs_base()
     if base is None:
@@ -1175,12 +1200,12 @@ def seed_run_dir(
     # content (see :func:`_creation_address`) but it is where an unusable
     # explicit session id is refused, and a refusal after the mkdtemp would
     # leave a `.new-*` orphan for the external cleaner to sweep.
-    final = _creation_address(base, slug, session)
+    final = _creation_address(base, slug, seeded["uid"] if seeded is not None else session)
     tmp = Path(
-        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{_seed_session_label()}-", dir=base)
+        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{_seed_session_label(seeded)}-", dir=base)
     )
     os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
-    state = seed_state(slug, taskdef, target)
+    state = seed_state(slug, taskdef, target, session=seeded)
     if context is not None:
         from copy import deepcopy
 
@@ -1193,16 +1218,27 @@ def seed_run_dir(
                 state[key] = deepcopy(context["state"][key])
         if context["state"].get("stop_reason") == "question":
             state["stop_reason"] = "question"
-    if is_session_form():
+    if goal:
+        state["goal"] = goal
+    if name:
+        state["name"] = name
+    if is_session_form() and seeded is None:
         # The chain starts with the launch that opened the record, so a
         # resumed dir reads as the lineage it is. A synthesized id names a
-        # process, not a session anyone can resume, and is left out.
+        # process, not a session anyone can resume, and is left out — as is
+        # a launch that only SEEDED the record: nothing has run in it.
         _chain_session(state, launch_session_id() or "")
     write_state(tmp, state)
     if context is not None:
-        for name, checkpoint in context.get("checkpoints", {}).items():
-            (tmp / name).write_text(yaml.safe_dump(checkpoint["data"], sort_keys=False))
+        for filename, checkpoint in context.get("checkpoints", {}).items():
+            (tmp / filename).write_text(yaml.safe_dump(checkpoint["data"], sort_keys=False))
     append_event(tmp, "run_seeded", note=note)
+    # The CLI-shaped events `work seed` records, here with the rest: once
+    # renamed, a seeded record has no writer left to add them.
+    if goal:
+        append_event(tmp, "goal_set", note=goal)
+    if name:
+        append_event(tmp, "run_named", note=name)
     # Whose directory the group is, recorded BEFORE the mutation — the same
     # question, and the same answer, as the re-slug path below. `mkdir` with
     # `exist_ok=True` cannot report whether it created anything, so this is the
@@ -1245,11 +1281,15 @@ def seed_run_dir(
     return final, state
 
 
-def _seed_session_label() -> str:
+def _seed_session_label(seeded: Optional[dict] = None) -> str:
     """The writer id a `.new-*` seed dir carries. The launch's session id in
     schema form — `.new-<session-id>-*` is the documented seed name and the
     litter should say whose it is — and `current_session_id()`'s label in a
-    legacy tree, unchanged."""
+    legacy tree, unchanged. A record seeded for someone else (`seeded`) is
+    labelled with ITS uid: that is whose the litter is, and the prefix is
+    what lets the seeding launch write there at all (D13)."""
+    if seeded is not None:
+        return seeded["uid"]
     return _session_dir_id() if is_session_form() else current_session_id()
 
 
@@ -1257,7 +1297,7 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
     """Read a prior record without any corrupt-file recovery or other writes."""
     if not source_uid:
         return None
-    from .session_record import SOURCE_ACK_ENV, signed_out
+    from .session_record import SOURCE_ACK_ENV, is_stopped
 
     if not _usable_session_id(source_uid):
         raise RunStateError("source session must be a session UID, not a path")
@@ -1275,7 +1315,12 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
         raise RunStateError(f"source session {source_uid} has an unsupported record")
     events = read_events(source, last_n=0)
     acknowledged = os.environ.get(SOURCE_ACK_ENV) == source_uid
-    if not signed_out(events) and not acknowledged:
+    # A signed-out record and a seeded one nobody has run in (D13) are both
+    # stopped: there is no session that "may still be running" to warn
+    # about, so neither asks for the acknowledgement, and an acknowledgement
+    # given anyway is not recorded — it would name a decision nobody took.
+    stopped = is_stopped(state, events)
+    if not stopped and not acknowledged:
         metadata = state.get("session") or {}
         raise RunStateError(
             f"source session {source_uid} has no recorded sign-out "
@@ -1307,7 +1352,7 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
         "state": state,
         "events": events[-25:],
         "checkpoints": checkpoints,
-        "unsigned_source_acknowledged": acknowledged and not signed_out(events),
+        "unsigned_source_acknowledged": acknowledged and not stopped,
     }
 
 
@@ -1334,6 +1379,31 @@ def _ensure_process_record(slug, taskdef, target, source_uid):
         adopt_existing=False,
         context=context,
     )
+
+
+def _seeding_launch_may_write(rdir: Path, state) -> bool:
+    """The one writer-rule exception (D13, spec §5.2): the launch that seeded
+    a record may write it while the record is still its own `.new-<uid>-*`
+    temp dir. The seed is written whole there before the single rename; from
+    its final address on, the record is read-only to that launch like any
+    other prior record — `seeded_by` is never an owner at `_runs/<slug>/<uid>`.
+
+    *state* is the PERSISTED document whenever the dir has one, so a caller's
+    relabelled in-memory copy cannot name itself the seeder; only the very
+    first write, with nothing on disk yet, is judged on what it carries.
+    """
+    from .session_record import UID_RE
+
+    metadata = state.get("session") if isinstance(state, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    uid = metadata.get("uid")
+    if not isinstance(uid, str) or UID_RE.fullmatch(uid) is None:
+        return False
+    if not rdir.name.startswith(f"{TMP_DIR_PREFIX}{uid}-"):
+        return False
+    launch = launch_session_id()
+    return launch is not None and metadata.get("seeded_by") == launch
 
 
 def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
@@ -1364,6 +1434,8 @@ def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
     owner = metadata.get("uid") or session_id_of(rdir.name)
     address_matches = session_id_of(rdir.name) == owner or rdir.name.startswith(f"{TMP_DIR_PREFIX}{owner}-")
     if owner != launch_session_id() or not address_matches:
+        if _seeding_launch_may_write(rdir, persisted if path is not None else state):
+            return
         raise RunStateError("a session may write only its own record; use prior sessions as context")
 
 
@@ -1489,6 +1561,12 @@ def list_sessions(
                 from .session_record import signed_out
 
                 row["session"] = state.get("session")
+                # `seeded`: `work seed` wrote it and nothing has run in it
+                # (D13) — not running, still listed. Its own read of the
+                # events, so the sign-out line stays what it is.
+                from .session_record import is_seeded
+
+                row["seeded"] = is_seeded(state, read_events(rdir, last_n=0))
                 row["signed_out"] = signed_out(read_events(rdir, last_n=0))
         rows.append(row)
     if any("session" in row for row in rows):

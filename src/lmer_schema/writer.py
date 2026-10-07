@@ -8,7 +8,7 @@ polices — canonical remote spelling, key order, the schema-int refusal rule,
 comment handling — have exactly one implementation.
 
 The API
-=======
+-------
 - :func:`load_for_write` opens a manifest for mutation and returns a
   :class:`ManifestWriter` — the document handle, with the parsed model on
   ``.manifest``. It REFUSES (raises) a ``schema:`` newer than this lmer
