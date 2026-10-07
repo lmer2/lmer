@@ -785,6 +785,57 @@ class TestNothingIsCachedAcrossCalls:
 # ---------------------------------------------------------------------------
 
 
+class TestWorkRepoProjectRels:
+    """`work_repo_project_rels` is the one spelling of "which directories are
+    projects" the work CLI has: the publication choke point indexes exactly
+    those (`git_ops._index_project_rels`), so it must be the core walk's own
+    answer — registered projects first, then host buckets — and must stay
+    silent on a legacy tree, where there is nothing to index."""
+
+    def test_the_rels_are_the_core_walks_registered_first_then_buckets(self, tmp_path):
+        from lmer_schema.checks import walk
+        from lmer_schema.registry import load_registry
+
+        root = build_schema_plexus(tmp_path).root
+        projects = walk.project_dirs(root, registry=load_registry(root))
+
+        rels = utils.work_repo_project_rels(root)
+
+        assert rels == [project.rel for project in projects]
+        assert rels[0] == PROJECT
+        assert rels[-1] == f"{BUCKET_HOST}/{BUCKET_PROJECT}"
+        kinds = [project.kind for project in projects]
+        registered = [index for index, kind in enumerate(kinds) if kind == walk.REGISTERED]
+        buckets = [index for index, kind in enumerate(kinds) if kind == walk.BUCKET]
+        assert registered and buckets and max(registered) < min(buckets)
+
+    def test_a_legacy_tree_has_no_project_rels(self, tmp_path):
+        root = build_legacy_plexus(tmp_path).root
+        assert utils.work_repo_project_rels(root) == []
+
+    def test_a_present_but_unusable_manifest_raises_rather_than_guessing(self, tmp_path):
+        from lmer_schema.manifest import ManifestError
+
+        root = build_schema_plexus(tmp_path).root
+        _break_manifest(root, "schema: 1\nname: [unterminated\n")
+        with pytest.raises(ManifestError):
+            utils.work_repo_project_rels(root)
+
+    def test_the_choke_point_takes_its_project_set_from_this_helper(self, tmp_path, monkeypatch):
+        from work_repo import git_ops
+
+        root = build_schema_plexus(tmp_path).root
+        seen = []
+
+        def recording(path):
+            seen.append(Path(path))
+            return ["from-utils"]
+
+        monkeypatch.setattr(utils, "work_repo_project_rels", recording)
+        assert git_ops._index_project_rels(root) == ["from-utils"]
+        assert seen == [root]
+
+
 class TestOnlyThisModuleKnowsTheSecondNames:
     """The defect this task exists to prevent is a sibling re-deriving the
     form. `work_repo.utils` owns the manifest name, the core import and the

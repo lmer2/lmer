@@ -253,7 +253,8 @@ every extending body while everything still renders green. Two guards:
 fires, the template is rendered with:
 
 - every `LMER_*` environment variable (e.g. `{{ LMER_REPO_URL }}`,
-  `{{ LMER_TASK }}`, `{{ LMER_TASK_TARGET }}`) — minus sensitive entries:
+  `{{ LMER_TASK }}`, `{{ LMER_TASK_TARGET }}` — empty for a local filesystem
+  path target such as `lmer chat .`) — minus sensitive entries:
   a name matching `TOKEN | KEY | SECRET | PASSWORD | CREDENTIALS`
   (case-insensitive) is dropped from the context entirely, and a value that
   is a URL with embedded credentials is redacted in place to its tokenless
@@ -287,8 +288,9 @@ fires, the template is rendered with:
 - `{{ is_github }}` / `{{ is_gitlab }}` — booleans for the main task
   target's provider, so a template can branch on the review interface (e.g.
   use `github-review` vs `gitlab-review`). The host is taken from
-  `LMER_REPO_HOST` (falling back to the host parsed from `LMER_TASK_TARGET` /
-  `LMER_REPO_URL`); github.com and GitHub Enterprise hosts set `is_github`,
+  `LMER_REPO_HOST` (falling back to the host parsed from `LMER_TASK_TARGET` —
+  empty for a local filesystem path target — then `LMER_REPO_URL`);
+  github.com and GitHub Enterprise hosts set `is_github`,
   any other non-empty host sets `is_gitlab`, and both are `False` when no host
   can be determined.
 

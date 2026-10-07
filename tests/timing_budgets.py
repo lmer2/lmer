@@ -83,6 +83,14 @@ BACKLOG = stretch(900.0)
 #: Deliberately expired by tests of connection failure.
 CONNECT_EXPIRED = stretch(0.3)
 
+# Project-index render budgets (pure-Python PyYAML, no libyaml, must pass).
+
+#: Rendering one project's index block over 1,000 shallow run records (≈0.9s measured).
+INDEX_FLAT = stretch(5.0)
+#: Rendering one project's index block over ten 20-deep continuation chains
+#: (≈0.3s measured with the context cut; a full parse of the same records is ≈10s).
+INDEX_CHAINS = stretch(3.0)
+
 # Fixture child budgets.
 
 #: Exceeding this drain exits the fixture child without re-exec.

@@ -127,12 +127,17 @@ def test_independent_harness_children_have_own_identity_metadata_and_lifecycle(
 ):
     from lmer_cli.container import spawn_harness
 
-    parent, parent_dir, _ = seed_launch()
+    parent, parent_dir, parent_state = seed_launch()
+    # The parent is a NAMED run: its launch flags (`lmer --name/--goal`) are
+    # still in its environment, and a child must not inherit them.
+    parent_state["name"] = "parent-run"
+    run_state.write_state(parent_dir, parent_state)
     before = _snapshot_record(parent_dir)
     env = dict(os.environ, HOME=str(tmp_path / "child-home"),
                LMER_SOURCE_SESSION_ID=parent["uid"],
                LMER_ALLOW_UNSIGNED_SOURCE=parent["uid"],
-               LMER_SESSION_IS_SOURCE="1", LMER_ANSWER="stale answer")
+               LMER_SESSION_IS_SOURCE="1", LMER_ANSWER="stale answer",
+               LMER_RUN_NAME="parent-run", LMER_RUN_GOAL="the parent's goal")
     env["LMER_SESSION_METADATA"] = json.dumps({
         **parent, "harness": "parent", "model": "parent-model",
         "extension": {"kept": True}, "config": {"future": {"x": 3}},
@@ -148,6 +153,9 @@ Path(sys.argv[1]).write_text(json.dumps({
     "source": os.environ.get("LMER_SOURCE_SESSION_ID"),
     "ack": os.environ.get("LMER_ALLOW_UNSIGNED_SOURCE"),
     "answer": os.environ.get("LMER_ANSWER"),
+    "run_name": os.environ.get("LMER_RUN_NAME"),
+    "run_goal": os.environ.get("LMER_RUN_GOAL"),
+    "run_env": sorted(name for name in os.environ if name.startswith("LMER_RUN_")),
     "record": str(run_state.run_dir()),
 }))
 ''')
@@ -157,6 +165,8 @@ Path(sys.argv[1]).write_text(json.dumps({
             "LMER_HARNESS": "codex", "LMER_LLM_NAME": f"child-model-{number}",
             "LMER_REASONING_EFFORT": "high",
         }, {})
+        assert "LMER_RUN_NAME" not in child_env
+        assert "LMER_RUN_GOAL" not in child_env
         dump = tmp_path / f"child-{number}.json"
         assert spawn_harness.run_child(
             [sys.executable, str(script), str(dump)], child_env,
@@ -168,6 +178,12 @@ Path(sys.argv[1]).write_text(json.dumps({
         assert child["uid"] not in seen
         seen.append(child["uid"])
         assert child["source"] is child["ack"] is child["answer"] is None
+        assert child["run_name"] is child["run_goal"] is None
+        # The child's own environment dump, not just two lookups: a leaked
+        # LMER_RUN_NAME would be refused as held by the parent and leave the
+        # child's name null anyway, so absence of the variables is asserted
+        # directly, and the goal (which a leak WOULD apply) is asserted null.
+        assert child["run_env"] == []
         metadata = child["metadata"]
         assert metadata["pid"] == child["pid"]
         assert metadata["pid"] != parent["pid"]
@@ -181,6 +197,12 @@ Path(sys.argv[1]).write_text(json.dumps({
         assert directory.name == child["uid"]
         assert (directory / "log.yaml").is_file()
         assert session_record.signed_out(run_state.read_events(directory, last_n=0))
+        # The parent's name never reaches the child's record: the variables
+        # were stripped, so the child's own session start applied nothing.
+        child_state = run_state.load_state(directory)
+        assert child_state["name"] is None
+        assert child_state["goal"] is None
+        assert run_state.load_state(parent_dir)["name"] == "parent-run"
         assert _snapshot_record(parent_dir) == before
 
 
@@ -230,3 +252,66 @@ def test_schema_two_lifecycle_output_does_not_hide_empty_harness_result(
         [sys.executable, "-c", "pass"], child_env, str(output), 10, heartbeat=0,
     ) == 0
     assert "NO USABLE OUTPUT" in output.read_text()
+
+
+@pytest.mark.parametrize("continuation", [False, True], ids=["fresh", "continuation"])
+def test_the_hook_prompt_carries_the_launch_name_and_goal(
+    session_tree, monkeypatch, continuation
+):
+    """`lmer --name/--goal` reach the agent through the one channel it reads:
+    `hooks/start.py` runs the real `work session-start` and renders its stdout
+    into `taskdef/run-state.jinja2`. Persisting them to state.yaml is not
+    enough — the prompt must name the run (so the naming step is skipped) and
+    carry the launch goal as THE goal, a continuation's included."""
+    import subprocess
+    import types
+
+    import jinja2
+
+    from hooks import start as start_hook
+
+    repo = Path(__file__).resolve().parents[1]
+    if continuation:
+        old, source, source_state = seed_launch()
+        source_state["goal"] = "OLD goal"
+        run_state.write_state(source, source_state)
+        run_state.append_event(source, "session_end")
+        monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+    monkeypatch.setenv("LMER_RUN_NAME", "Fresh Run")
+    monkeypatch.setenv("LMER_RUN_GOAL", "NEW goal")
+    session_record.start_launch()
+
+    real_run = subprocess.run
+
+    def run_the_real_work_cli(argv, **kwargs):
+        assert argv == ["work", "session-start"]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(repo / "src"), str(repo), env.get("PYTHONPATH", "")]
+        )
+        return real_run([sys.executable, "-m", "work_repo.cli", *argv[1:]], env=env, **kwargs)
+
+    monkeypatch.setattr(start_hook.shutil, "which", lambda _name: "/usr/bin/work")
+    monkeypatch.setattr(start_hook, "subprocess", types.SimpleNamespace(run=run_the_real_work_cli))
+    brief = start_hook.run_state_session_start()
+    assert brief, "the hook dropped session-start's output"
+
+    prompt = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(repo / "taskdef"))
+    ).get_template("run-state.jinja2").render(
+        LMER_REPO_HOST=os.environ["LMER_REPO_HOST"],
+        LMER_REPO_PROJECT=os.environ["LMER_REPO_PROJECT"],
+        run_state_brief=brief,
+    )
+    lines = prompt.splitlines()
+    assert "Run name: fresh-run" in lines
+    assert [line for line in lines if line.startswith("Goal:")] == ["Goal: NEW goal"]
+    # The naming rule points at the line the agent now sees.
+    assert "`Run name:`" in prompt
+    if continuation:
+        assert f"Context from session {old['uid']} (read-only):" in lines
+        assert [line for line in lines if "OLD goal" in line] == [
+            "Predecessor goal (context only, replaced by the launch goal): OLD goal"
+        ]
+    record = run_state.load_state(run_state.run_dir())
+    assert (record["name"], record["goal"]) == ("fresh-run", "NEW goal")

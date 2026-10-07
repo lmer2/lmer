@@ -129,7 +129,7 @@ widgets/                  # a project, by short name
 gadgets/                  # another project, same shape
 capacity-planning/        # a project with no repository
 git.example.com/acme/…    # host bucket: an UNNAMED repository's work (not schema form)
-README.md                 # content namespace: anything human
+README.md                 # content namespace (human); MAY carry the generated index block (Inventory)
 ```
 
 Every directory in the tree above is OPTIONAL; the only required entry is the
@@ -147,7 +147,13 @@ are the same form; there is no other.
   guarantees a project short name can never collide with a schema directory.
 - Everything else is the **content namespace**: project directories, org and
   topic directories inside `_knowledge/` and `_napkin/`, and human files such
-  as `README.md`. Content-namespace files are never validated for shape.
+  as `README.md`. Content-namespace files are never validated for shape. The
+  one exception is the generated index block a `README.md` at the plexus root
+  or at a project root may carry between `<!-- lmer:index:start -->` and
+  `<!-- lmer:index:end -->`: tooling-owned, checked for freshness only; the
+  text outside the markers stays content and is never checked, except that a
+  line that git would read as a conflict marker keeps the generator away from
+  the file.
 - Schema-owned names are lowercase. Capitalised variants (`_Runs/`,
   `_Plans/`) are not schema names and MUST NOT be used; case-insensitive
   filesystems make them indistinguishable from the real name.
@@ -461,7 +467,11 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
   `_archive/` mirror and tombstone the index line.
 - Every tool write to a plexus is one git commit. A hosted service commits as
   its own bot identity.
-- Index files (`MEMORY.md`, `PLANS.md`) are last-writer-wins at schema 1.
+- Index files (`MEMORY.md`, `PLANS.md`) are last-writer-wins at schema 1. The
+  generated `README.md` index blocks are not: they are re-rendered from the
+  records (project) or the manifest (root), so concurrent writers converge,
+  and a rebase conflict confined to them is resolved by rendering again from
+  the merged tree ([WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)).
   Every schema-defined symlink MUST be relative and MUST resolve inside the
   plexus.
 - A bare `git clone` of any conforming plexus is readable markdown throughout
@@ -507,13 +517,15 @@ self-contained; nothing about it is shared with any other launch.
   timestamp `YYYYMMDD-HHMMSS`, a process id and a random suffix — four
   `-`-joined all-digit fields matching `\d{8}-\d{6}-\d+-\d+` (for example
   `20260824-165230-2-31245`). Timestamp-first means `ls _runs/<slug>/` lists
-  launches in start order. The id is minted by the launch that OPENS the
-  record; a launch that continues an existing record carries that record's id
-  instead of minting one (see **Resume** below), so the timestamp and pid in a
-  directory name are always the launch that opened it — which is what keeps
-  that listing in start order however often a record is resumed. A session dir
-  SHOULD carry a `state.yaml`; a session-id not matching this pattern is a
-  warning.
+  launches in start order. (Under schema 2 the id is an opaque UID and carries
+  no order — [SCHEMA-V2.md](./SCHEMA-V2.md); the generated
+  `<project>/README.md` block is the ordered view.) The id is minted by the
+  launch that OPENS the record; a launch that continues an existing record
+  carries that record's id instead of minting one (see **Resume** below), so
+  the timestamp and pid in a directory name are always the launch that opened
+  it — which is what keeps that listing in start order however often a record
+  is resumed. A session dir SHOULD carry a `state.yaml`; a session-id not
+  matching this pattern is a warning.
 - **`--<name>`** is appended to the directory name when the session is named
   at its pre-execution freeze; the rename happens at most once. Index symlinks
   are re-pointed by the tool that renames.
@@ -598,8 +610,9 @@ precedence); registry-to-directory consistency and bucket/registry collisions;
 host-bucket recognition; `_agents/` shape and reserved names; memory scope
 routing and index consistency at both scopes; session-unit shape under
 `_runs/`; state-file schemas and `events.jsonl` line-parseability;
-`_specs/`/`_plans/` symlink integrity and `PLANS.md` consistency; `_`
-reservation; archive mirror path validity; bundle and mirror opacity.
+`_specs/`/`_plans/` symlink integrity and `PLANS.md` consistency; generated
+`README.md` index block freshness; `_` reservation; archive mirror path
+validity; bundle and mirror opacity.
 
 **Out of scope:** napkin, knowledge and info content; legacy
 `{task_type}/{target}/` trees (informational); orchestration bundle internals.
@@ -673,6 +686,7 @@ memory scope) but never shape findings.
 | `_taskdef/` | operator, or the root of a mounted taskdef repository | the task-definition contract of [TASKDEFS.md](./TASKDEFS.md); validated by the taskdef loader, not by `lmer-schema` | optional | opaque |
 | `_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `_archive/` | housekeeping tooling; connectors' `archive_plan` and `forget` | mirror: `_archive/<relative path>`. A **`_`-prefixed** first component MUST be an area of this scope — `_agents`, `_knowledge`, `_napkin`, `_taskdef` — and anything else `_`-prefixed is a broken mirror path (an error). A content-namespace first component (`README.md`, a project's short name) is mirrored content and is never a finding; archived contents are not re-validated | optional | machine |
+| `README.md` | humans outside the markers; `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block rendered from `_plexus.yaml` (project list) plus a fixed legend; a block that differs from a fresh render is a warning; a block of a newer format than the tool is left alone; text outside the markers is never checked | optional | machine (the block only) |
 | any other top-level name | humans | content namespace, never checked; a `_`-prefixed name is a warning; a dotless directory that is project-shaped and unregistered is a warning; a dotted directory is a host bucket | optional | free-form |
 
 ### Project tree
@@ -693,6 +707,7 @@ memory scope) but never shape findings.
 | `<project>/_taskdef/` | operator | project-scoped task-definition overrides ([TASKDEFS.md](./TASKDEFS.md)) | optional | opaque |
 | `<project>/_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `<project>/_archive/` | housekeeping tooling; the session cleaner for archived sessions | mirror, same rule as the instance `_archive/` with this scope's areas (`_agents`, `_info`, `_plans`, `_runs`, `_specs`, `_taskdef`): `<project>/_archive/_runs/<slug>/<session-dir>/` for an archived session | optional | machine |
+| `<project>/README.md` | humans outside the markers; the durability push of any session in the project and `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block: one row per committed run record under `_runs/`, newest first, each a pure function of its own record; absence while records exist is informational; a block that differs from a fresh render is a warning; a conflict-marker line in the hand text keeps the generator away | optional | machine (the block only) |
 | any other name inside `<project>/` | humans | content namespace, never checked; a `_`-prefixed name is a warning | optional | free-form |
 
 ### Session directory
@@ -855,12 +870,15 @@ tier: a corrupt state file is broken in every form.
 | `record.session-stale` | INFO | | machine | an `in-progress` session untouched for longer than the staleness window: possibly orphaned, resumable, never auto-ended |
 | `record.masterplan-nested` | INFO | | opaque | a masterplan bundle in the pre-schema-1 nested `masterplan/<mp-slug>/` shape; reported for migration, never an error |
 
-#### `index.*` — the link mechanic of the indexes and the bundle
+#### `index.*` — the link mechanic of the indexes and the bundle, and the generated README index blocks
 
 One set of codes for every schema-defined symlink: the `_specs/` and `_plans/`
 index links and the `<session-dir>/<artifact>.md` bundle links (see
 [Index lines](#index-lines)). A link is reported once — an escaping target is
-never also reported dangling.
+never also reported dangling. The two `readme` codes are about the generated
+index block a root or project `README.md` carries: the block is compared with
+a fresh render by the same kernel that writes it, so the finding is exact and
+clock-free, and a block of a newer format than this tool is never judged.
 
 | code | severity | legacy | tier | reports |
 |---|---|---|---|---|
@@ -869,6 +887,8 @@ never also reported dangling.
 | `index.dangling-link` | ERROR | WARN | machine | a `_specs/`/`_plans/` index symlink or a `<session-dir>/<artifact>.md` bundle link whose target does not exist |
 | `index.entry-without-file` | ERROR | WARN | machine | a `PLANS.md` entry whose linked plan file does not exist |
 | `index.file-without-entry` | WARN | | machine | a `<project>/_plans/<slug>.md` plan file that no `PLANS.md` line carries |
+| `index.readme-missing` | INFO | | machine | a project holding run records whose `README.md` carries no generated index block (`<!-- lmer:index:start -->` … `<!-- lmer:index:end -->`); the project's next durability push or `lmer-schema index --write` creates it; the detail says when a conflict-marker line in the hand text is what keeps the generator away |
+| `index.readme-stale` | WARN | | machine | a `README.md` generated index block that no longer matches a fresh render of the records under `_runs/` (or, at the plexus root, of `_plexus.yaml`), whose markers are malformed, or whose hand text holds a conflict-marker line the generator refuses to stage; a block of a newer format than this tool is left alone; warnings never block |
 
 #### `runner.*` — the run itself
 
