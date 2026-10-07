@@ -131,3 +131,76 @@ it('marks a new answer to a previously viewed question unread', async () => {
   await flushPromises()
   expect(tab.find('[aria-label="Unread messages"]').exists()).toBe(true)
 })
+
+it('scrolls to and focuses the open question when the shell asks for it', async () => {
+  const question = { id: 'q1', kind: 'question', text: 'Ship it?', options: ['yes', 'no'], answered: false, closed: false }
+  fetchSessionAsk.mockResolvedValue({ entries: [question] })
+  const scrolled = vi.fn()
+  Element.prototype.scrollIntoView = scrolled
+  const run = { host: 'gitlab.example.com', project: 'acme/widget', slug: 'uber', orchestrator: true,
+    last_session_id: 'uber-session', state: 'waiting_on_you', live: true, questions: [question] }
+  const stubs = { Chat: true, Terminal: true, RelatedRuns: true, RunMeta: true, ThreadLinks: true }
+  const quiet = mountPane(RunDetail, { run }, { global: { stubs } })
+  await flushPromises()
+  expect(scrolled).not.toHaveBeenCalled()
+  quiet.unmount()
+  const wrapper = mountPane(RunDetail, { run, focusQuestions: 1 }, { global: { stubs } })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  expect(wrapper.text()).toContain('Ship it?')
+  expect(scrolled).toHaveBeenCalledTimes(1)
+  expect(document.activeElement.tagName).toBe('TEXTAREA')
+  expect(wrapper.element.contains(document.activeElement)).toBe(true)
+  document.activeElement.blur()
+  await wrapper.setProps({ focusQuestions: 2 })
+  await flushPromises()
+  expect(scrolled).toHaveBeenCalledTimes(2)
+  expect(document.activeElement.tagName).toBe('TEXTAREA')
+  delete Element.prototype.scrollIntoView
+})
+
+it('focuses the reply box, not a code-copy button, and waits for a question the fleet poll has not carried yet', async () => {
+  document.activeElement?.blur?.()
+  const question = { id: 'q1', kind: 'question', text: 'Run this?\n\n```\nmake deploy\n```', options: [], answered: false, closed: false }
+  const pending = deferred()
+  fetchSessionAsk.mockReturnValue(pending.promise)
+  Element.prototype.scrollIntoView = vi.fn()
+  const run = { host: 'gitlab.example.com', project: 'acme/widget', slug: 'uber-late', orchestrator: true,
+    last_session_id: 'uber-late-session', state: 'in-progress', live: true, questions: [] }
+  const wrapper = mountPane(RunDetail, { run, focusQuestions: 1 }, { global: { stubs: {
+    Chat: true, Terminal: true, RelatedRuns: true, RunMeta: true, ThreadLinks: true,
+  } } })
+  await flushPromises()
+  expect(document.activeElement.tagName).not.toBe('TEXTAREA')
+  pending.resolve({ entries: [question] })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  expect(wrapper.text()).toContain('make deploy')
+  expect(document.activeElement.tagName).toBe('TEXTAREA')
+  expect(wrapper.element.contains(document.activeElement)).toBe(true)
+  delete Element.prototype.scrollIntoView
+})
+
+it('gives up a focus request that no question answers within a poll or two', async () => {
+  document.activeElement?.blur?.()
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const pending = deferred()
+  fetchSessionAsk.mockReturnValue(pending.promise)
+  Element.prototype.scrollIntoView = vi.fn()
+  const run = { host: 'gitlab.example.com', project: 'acme/widget', slug: 'uber-much-later', orchestrator: true,
+    last_session_id: 'uber-much-later-session', state: 'in-progress', live: true, questions: [] }
+  mountPane(RunDetail, { run, focusQuestions: 1 }, { global: { stubs: {
+    Chat: true, Terminal: true, RelatedRuns: true, RunMeta: true, ThreadLinks: true,
+  } } })
+  await flushPromises()
+  vi.setSystemTime(Date.now() + 60000)
+  pending.resolve({ entries: [{ id: 'q9', kind: 'question', text: 'Much later?', options: [], answered: false, closed: false }] })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  expect(document.activeElement.tagName).not.toBe('TEXTAREA')
+  vi.useRealTimers()
+  delete Element.prototype.scrollIntoView
+})

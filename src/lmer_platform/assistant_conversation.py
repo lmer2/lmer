@@ -24,8 +24,35 @@ def _journal() -> comms.Journal:
         return _JOURNAL
 
 
+#: The run fields a digest's payload may carry, kept so the conversation can
+#: name and open the run without parsing the digest's prose.
+RUN_FIELDS = ("host", "project", "slug", "label")
+MAX_RUN_FIELD_CHARS = 200
+
+
+def digest_run(data: object) -> dict | None:
+    """``host/project/slug`` (+ ``label``) off a digest payload, or ``None``.
+
+    Only the label is shortened: a cut identity field would name a run that
+    does not exist, so an over-long one drops the link instead.
+    """
+    if not isinstance(data, dict):
+        return None
+    run = {
+        field: data[field] for field in RUN_FIELDS
+        if isinstance(data.get(field), str) and data[field]
+    }
+    if not all(field in run for field in RUN_FIELDS[:3]):
+        return None
+    if any(len(run[field]) > MAX_RUN_FIELD_CHARS for field in RUN_FIELDS[:3]):
+        return None
+    if "label" in run:
+        run["label"] = run["label"][:MAX_RUN_FIELD_CHARS]
+    return run
+
+
 def record(text: str, *, kind: str, thread: str | None = None,
-           session_id: str | None = None) -> None:
+           session_id: str | None = None, data: dict | None = None) -> None:
     from .transcripts import scrub_credentials
     from . import assistant, assistant_history
 
@@ -42,6 +69,9 @@ def record(text: str, *, kind: str, thread: str | None = None,
             "source": {"channel": "agent" if thread else "platform"},
             "meta": {"thread": thread, "digest_kind": kind},
         }
+        run = None if thread else digest_run(data)
+        if run:
+            message["meta"]["run"] = run
         if session_id:
             assistant_history.retain(session_id, message)
         _journal().append(session_id or "assistant", message, session_kind="assistant")

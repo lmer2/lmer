@@ -380,6 +380,26 @@ def test_a_harness_publishing_no_context_figure_is_reported_once(
     ]
     assert len(notices) == 1, "once, not once per tick"
     assert notices[0]["data"]["threshold"] == THRESHOLD
+    assert notices[0]["data"]["status_strip_off"] is False
+
+
+def test_the_notice_names_the_status_strip_switch_when_it_is_off(
+    detector, platform_root, caplog, monkeypatch
+):
+    """#507: the switch removes the document the threshold reads, so the
+    notice must not blame a harness for publishing nothing."""
+    from lmer_platform import statusline
+
+    monkeypatch.setenv(statusline.ENABLED_ENV, "0")
+    instance = detector(percent=None)
+    with caplog.at_level("WARNING"):
+        assert instance.rotation_once() is None
+    notices = [
+        event for event in events(platform_root)
+        if event.get("type") == detect.ASSISTANT_ROTATION_UNREADABLE
+    ]
+    assert notices[0]["data"]["status_strip_off"] is True
+    assert statusline.ENABLED_ENV in caplog.text
 
 
 def test_a_figure_that_starts_arriving_re_arms_the_notice(

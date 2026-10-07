@@ -319,7 +319,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, teardown, transcripts,
+    ask, assistant, checkin, nudge, registry, rotation, statusline, teardown,
+    transcripts,
 )
 from .api import build_state
 from . import config as config_module
@@ -1790,13 +1791,18 @@ class Detector:
                 # them apart afterwards.
                 "document": status.statusline is not None,
                 "session_age_seconds": age,
+                # A third absence (#507): the operator switched the strip off,
+                # which removes the document the threshold reads.
+                "status_strip_off": not statusline.enabled(),
             },
         )
         logger.warning(
             "platform_assistant_rotation_unreadable session=%s threshold=%d "
             "document=%s — no context figure to compare the threshold against, "
-            "so the rotation reminder cannot fire; said once until one arrives",
+            "so the rotation reminder cannot fire; said once until one arrives%s",
             session_id, threshold, status.statusline is not None,
+            "" if statusline.enabled() else
+            f" ({statusline.ENABLED_ENV} is off, so no session publishes one)",
         )
 
     def codex_wake_once(self) -> None:

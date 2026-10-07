@@ -122,6 +122,7 @@ async function release() {
   try {
     await releaseConversationRequest(target.id, target.project_id, releaseReason.value)
     releasing.value = null
+    error.value = null
     await refreshRequests()
     emit('changed')
   } catch (exc) { error.value = exc.message } finally { releaseBusy.value = false }

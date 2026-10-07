@@ -13,6 +13,7 @@ const ordersOpen = ref(undefined)
 const error = ref(null)
 const busy = ref(false)
 const overrideKeys = ['model', 'harness', 'preset', 'agents']
+const overrideLabels = { model: 'Model', harness: 'Harness', preset: 'Preset', agents: 'Fan-out presets' }
 
 watch(() => props.project.id, async (id, _previous, onCleanup) => {
   let current = true
@@ -72,7 +73,8 @@ async function archive() {
       </v-select>
       <v-textarea v-model="form.repositories" label="Repositories (one URL per line)" :disabled="busy" rows="2" />
       <p class="mb-3">Execution overrides apply at the next start or rotation. Empty fields inherit platform defaults.</p>
-      <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="key" :disabled="busy" />
+      <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
+        hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
       <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
       <v-expansion-panels v-model="ordersOpen" class="project-orders">
         <v-expansion-panel title="Standing instructions">

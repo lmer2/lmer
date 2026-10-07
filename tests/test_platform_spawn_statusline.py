@@ -192,6 +192,40 @@ class TestTheMount:
             assert status_mount_spec(result.command)
 
 
+class TestSwitchedOff:
+    """``LMER_PLATFORM_STATUS_STRIP=0`` (issue #507): fleet-wide, nothing to mount."""
+
+    @pytest.fixture(autouse=True)
+    def off(self, monkeypatch):
+        monkeypatch.setenv(statusline.ENABLED_ENV, "0")
+
+    def test_no_directory_and_no_mount(self, config):
+        result = spawn.spawn_session(config, request_for())
+        assert not spawn.status_dir_for(result.session_id).exists()
+        assert [arg for arg in result.command if statusline.CONTAINER_STATUS_DIR in str(arg)] == []
+
+    def test_the_child_is_told_nothing(self, tmp_path, platform_root):
+        recorded = tmp_path / "child-env"
+        script = tmp_path / "env-recording-lmer"
+        script.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s" "${{LMER_STATUS_DIR-<unset>}}" > "{recorded}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        result = spawn.spawn_session(cfg.load({"lmer_bin": str(script)}), request_for())
+        assert spawn.wait_for_exit_recorded(result.session_id, timeout=5)
+        assert recorded.read_text() == ""
+
+    @pytest.mark.parametrize("value", ["1", "yes", ""])
+    def test_on_and_unset_keep_the_strip(self, monkeypatch, config, value):
+        monkeypatch.setenv(statusline.ENABLED_ENV, value)
+        result = spawn.spawn_session(config, request_for())
+        assert spawn.status_dir_for(result.session_id).is_dir()
+        assert status_mount_spec(result.command)
+
+
 class TestWithoutADirectory:
     @pytest.fixture
     def unusable(self, monkeypatch):

@@ -580,3 +580,60 @@ it('posts project instructions as JSON to the explicitly scoped HTTP endpoint', 
     })
   } finally { vi.unstubAllGlobals() }
 })
+
+it('badges uber lmer\'s open questions from its status poll and asks the shell to open them', async () => {
+  vi.useFakeTimers()
+  const answers = [2, 1, 0]
+  api.fetchAssistant.mockImplementation(() => Promise.resolve({ running: true, lifecycle: 'running',
+    session_id: 's-alpha', generation: 3, open_questions: answers.length > 1 ? answers.shift() : answers[0] }))
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  const badge = () => wrapper.find('.open-questions')
+  expect(badge().exists()).toBe(true)
+  expect(badge().text()).toContain('2')
+  expect(badge().attributes('aria-label')).toBe('2 open questions from uber lmer — answer in its run view')
+  await badge().trigger('click')
+  expect(wrapper.emitted('questions')).toEqual([['s-alpha']])
+  await vi.advanceTimersByTimeAsync(10000)
+  expect(badge().text()).toContain('1')
+  expect(badge().attributes('aria-label')).toContain('1 open question from')
+  await vi.advanceTimersByTimeAsync(10000)
+  expect(badge().exists()).toBe(false)
+  wrapper.unmount()
+  vi.useRealTimers()
+})
+
+it('opens uber lmer\'s own run on its question badge and focuses the ask dock there', async () => {
+  const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'uber lmer', orchestrator: true,
+    workspace_id: 'alpha', workspace_name: projects[0].name, workspace_color: 'Blue', live: true,
+    last_session_id: 's-alpha', session: { id: 's-alpha' }, state: 'waiting_on_you', attention: { reason: 'live_question' },
+    questions: [{ id: 'q1', kind: 'question', text: 'Ship it?', options: [], answered: false, closed: false }] }
+  const runs = [...projects.map((project, i) => run(project, `question-${i}`)), orchestrator]
+  api.fetchState.mockResolvedValue({ runs, attention: runs, totals: {}, relations: [] })
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true, RunDetail: true } } })
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  wrapper.getComponent(AssistantChat).vm.$emit('questions', 's-unknown')
+  await flushPromises()
+  expect(wrapper.findComponent(RunDetail).exists()).toBe(false)
+  expect(document.body.textContent).toContain('not in the fleet view yet')
+  wrapper.getComponent(AssistantChat).vm.$emit('questions', 's-alpha')
+  await flushPromises()
+  const detail = wrapper.getComponent(RunDetail)
+  expect(detail.props('run').slug).toBe('s-alpha')
+  const first = detail.props('focusQuestions')
+  expect(first).toBeGreaterThan(0)
+  wrapper.getComponent(AssistantChat).vm.$emit('questions', 's-alpha')
+  await flushPromises()
+  expect(wrapper.getComponent(RunDetail).props('focusQuestions')).toBeGreaterThan(first)
+})
+
+it('labels project execution overrides readably and says what an empty one inherits', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const labels = wrapper.findAll('.v-field-label, label.v-label').map(node => node.text())
+  for (const label of ['Model', 'Harness', 'Preset', 'Fan-out presets']) expect(labels).toContain(label)
+  for (const raw of ['model', 'harness', 'preset', 'agents']) expect(labels).not.toContain(raw)
+  expect(wrapper.text()).toContain('Empty inherits the platform default.')
+})

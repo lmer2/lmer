@@ -6,7 +6,7 @@ import { mountPane } from './mount.js'
 afterEach(() => vi.unstubAllGlobals())
 
 function mountRequests(initial = []) {
-  const source = { rows: initial, fail: false, refuseRelease: false }
+  const source = { rows: initial, fail: false, refuseRelease: false, unavailable: 0 }
   const calls = []
   vi.stubGlobal('fetch', vi.fn(async (path, options) => {
     calls.push({ path, options })
@@ -16,6 +16,10 @@ function mountRequests(initial = []) {
     }
     if (path === 'api/assistant/requests/blocked/release') {
       if (source.refuseRelease) return Response.json({ detail: 'Outcome became uncertain; release refused' }, { status: 409 })
+      if (source.unavailable > 0) {
+        source.unavailable -= 1
+        return Response.json({ detail: 'Release service unavailable' }, { status: 503 })
+      }
       source.rows = source.rows.map(row => ({ ...row, state: 'invalid', recovery: { ...row.recovery,
         release_allowed: false, released: true, instruction: 'Request released; no reply sent. Completed action receipts are retained.' } }))
       return Response.json({ released: true })
@@ -104,4 +108,49 @@ it('keeps the blocked request when execution-time recovery is refused', async ()
   expect(dialog.textContent).toContain('Outcome became uncertain; release refused')
   expect(wrapper.text()).toContain('slack: delivered')
   expect(wrapper.text()).not.toContain('Request released; no reply sent')
+})
+
+async function confirmReleaseWith(wrapper, text) {
+  const dialog = document.querySelector('.v-dialog')
+  const reason = dialog.querySelector('textarea')
+  reason.value = text
+  reason.dispatchEvent(new Event('input', { bubbles: true }))
+  await flushPromises()
+  ;[...dialog.querySelectorAll('button')].find(item => item.textContent.includes('Release and allow')).click()
+  await flushPromises()
+  return dialog
+}
+
+it('clears the earlier release error when a retry in the same dialog succeeds', async () => {
+  const { wrapper, source } = mountRequests([blocked()])
+  source.unavailable = 1
+  await flushPromises()
+  await button(wrapper, 'Release blocked request').trigger('click')
+  await flushPromises()
+  const dialog = await confirmReleaseWith(wrapper, 'Allow independent work')
+  expect(dialog.textContent).toContain('Release service unavailable')
+  expect(wrapper.text()).toContain('Release service unavailable')
+  await confirmReleaseWith(wrapper, 'Allow independent work')
+  expect(wrapper.text()).not.toContain('Release service unavailable')
+  expect(wrapper.text()).toContain('Request released; no reply sent')
+  expect(wrapper.text()).toContain('POST /api/sessions: complete')
+  expect(button(wrapper, 'Release blocked request')).toBeUndefined()
+})
+
+it('keeps the error of a retry that fails again, and a later refresh failure', async () => {
+  const { wrapper, source } = mountRequests([blocked()])
+  source.unavailable = 2
+  await flushPromises()
+  await button(wrapper, 'Release blocked request').trigger('click')
+  await flushPromises()
+  await confirmReleaseWith(wrapper, 'Allow independent work')
+  const dialog = await confirmReleaseWith(wrapper, 'Allow independent work')
+  expect(dialog.textContent).toContain('Release service unavailable')
+  expect(wrapper.text()).toContain('slack: delivered')
+  await confirmReleaseWith(wrapper, 'Allow independent work')
+  expect(wrapper.text()).not.toContain('Release service unavailable')
+  source.fail = true
+  await button(wrapper, 'Refresh requests').trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('Request status unavailable')
 })

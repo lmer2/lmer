@@ -523,7 +523,7 @@ next config refresh in every browser. The run chat keeps its older rendering
 | a bus record: the operator's message from any channel, the agent's `post`/`note`/`ask`/answer/milestone, a platform `command` | `via: comms` | drawn as speech, with source and kind | drawn as speech |
 | a reply to a conversation request, sent with `lmer-ctl thread post` | assistant credential; platform-only conversation journal, `via: comms` | drawn with destination link; no broadcast to other threads | drawn |
 | a private DM reply | delivery fact only; body never journalled | drawn without body | drawn without body |
-| a question (`question`/`live_question`), crash (`crashed`), or completion (`complete`) digest | structured event kind; platform-only journal, `via: comms`, platform role | drawn even before the assistant drains its spool | drawn |
+| a question (`question`/`live_question`), crash (`crashed`), or completion (`complete`) digest | structured event kind; platform-only journal, `via: comms`, platform role, a `digest` field naming its kind and owning run | drawn even before the assistant drains its spool, as one compact *lmer platform* row: kind, the run's label (opens the run), a one-line preview that expands to the full text when tapped | drawn the same |
 | routine check-ins, wake traffic and other digest categories | excluded from the platform-only journal | hidden unless explicitly posted | any harness copy is muted |
 | the legacy ask-channel exchange, on a session with no bus | `via: ask` | drawn | drawn |
 | the agent's unposted prose | `role: assistant`, no `via` | hidden | drawn muted, chipped `transcript` |
