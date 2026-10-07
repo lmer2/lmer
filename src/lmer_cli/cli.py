@@ -30,6 +30,7 @@ import re
 from typing import Iterable, Mapping
 from dotenv import dotenv_values
 from work_repo import session_record
+from work_repo.utils import classify_target, repository_of
 
 from . import resolve
 from .clone_cache import (
@@ -717,9 +718,16 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
 
     Returns:
         Tuple of (host, project_path) or (None, None) if parsing fails
+
+    What is parsed is the repository the URL belongs to
+    (``work_repo.utils.repository_of``, spec §2), so a work-item or reference
+    URL — ``.../group/project/-/issues``, ``.../owner/repo/pull/9`` — yields
+    the project and not the route: ``LMER_REPO_PROJECT`` never contains
+    ``/-/`` (#391). A repository URL is its own answer and parses as before.
     """
     if not repo_url:
         return None, None
+    repo_url = repository_of(repo_url) or repo_url
 
     # Handle SSH format: git@host:path
     if repo_url.startswith("git@"):
@@ -761,66 +769,50 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
 def _derive_repo_url_from_task_target(target: str) -> str | None:
     """
     Best-effort derivation of a base repository URL from a task target URL
-    such as PR/MR/issue links.
+    such as PR/MR/issue links — and, since A1-wave0.repository-of, from a
+    reference URL inside a repository (a file, a tree, a wiki page, a commit
+    listing, an id-less list page), so a document target derives the
+    repository its clone comes from (#523).
 
     For GitLab hosts with available API tokens, returns HTTPS URL with token auth.
-    Otherwise returns SSH-format URL for git cloning.
+    Otherwise returns SSH-format URL for git cloning. A repository URL, a thread
+    permalink, a non-forge URL and a non-URL target derive None.
 
     Supports:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
-    - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project (if token available)
+    - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project.git (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
     - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
+    - GitLab: https://gitlab.com/group/project/-/blob/main/docs/x.md -> same as /-/issues/ (#523)
+    - GitLab: https://gitlab.com/group/project/-/issues (a list page) -> same as /-/issues/N (#391)
     """
-    try:
-        parsed = urlparse(target)
-    except Exception:
+    # The repository is repository_of's answer — the one definition behind
+    # this helper in both its copies and behind _parse_repo_url (#391) — for
+    # a work item or a reference and for nothing else. A repository URL
+    # derives None on purpose: spawn._plain_repo_url_from_target,
+    # clone_secondary_mr and _resolve_clone_url fall back to the target
+    # itself as the clone URL: the one class repository_of answers for that
+    # this helper must not, hence the class check ahead of it.
+    if classify_target(target) not in ("work-item", "reference"):
         return None
-
-    if not parsed.scheme or not parsed.netloc or not parsed.path:
+    repository = repository_of(target)
+    if repository is None:
         return None
-
+    parsed = urlparse(repository)
     host = parsed.hostname
-    if not host:
+    project_path = parsed.path.strip("/")
+    if not host or not project_path:
         return None
 
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if len(path_parts) < 2:
-        return None
-
-    # Heuristics: only attempt derive when a known resource path is present.
-    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
-    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
-    # match so a repo merely named 'work_items' isn't misread as a resource link.
-    lowered = '/'.join(path_parts).lower()
-    indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
-    )
-    if not any(tok in lowered for tok in indicators):
-        return None
-
-    # GitLab URLs use /-/ separator: group/project/-/merge_requests/123
-    # Find the /-/ separator and extract everything before it
-    if '/-/' in parsed.path:
-        # Split on /-/ and take everything before it
-        project_path = parsed.path.split('/-/')[0].strip('/')
-        if project_path:
-            # Check if we have a GitLab token for this host
-            token = _get_gitlab_token(host)
-            if token:
-                # Use HTTPS with token authentication
-                return f"https://oauth2:{token}@{host}/{project_path}.git"
-            # Fall back to SSH
-            return f"git@{host}:{project_path}"
-
-    # GitHub and simple URLs: owner/repo/pull/123 or owner/repo/issues/123
-    owner = path_parts[0]
-    repo = path_parts[1]
-
-    # Strip trailing .git if present in repo segment from some URLs
-    repo = re.sub(r"\.git$", "", repo)
-
-    return f"git@{host}:{owner}/{repo}"
+    # GitLab-shaped (a /-/ route): HTTPS with the host's token when there is
+    # one, SSH otherwise. The GitHub shape never looks a token up — it never
+    # did, and _get_gitlab_token reads GH_TOKEN for github.com and refuses a
+    # generic GITLAB_TOKEN with a notice, both of which would be new.
+    if "/-/" in urlparse(target).path:
+        token = _get_gitlab_token(host)
+        if token:
+            return f"https://oauth2:{token}@{host}/{project_path}.git"
+    return f"git@{host}:{project_path}"
 
 
 def _get_taskdef_paths(repo_root: Path | None) -> list[Path]:

@@ -73,6 +73,11 @@ PUBLIC_SURFACE = [
     "detect_form",
     "find_plexus_root",
     "has_manifest",
+    # lmer_schema.writer — the _plexus.yaml write API (issue #366)
+    "ManifestWriter",
+    "WriterError",
+    "create",
+    "load_for_write",
 ]
 
 
@@ -97,6 +102,9 @@ def test_public_surface_matches_documented_all():
         ("Resolution", "registry"),
         ("detect_form", "form"),
         ("Form", "form"),
+        ("load_for_write", "writer"),
+        ("create", "writer"),
+        ("WriterError", "writer"),
     ],
 )
 def test_reexport_is_the_same_object_as_the_submodule_name(name, submodule):

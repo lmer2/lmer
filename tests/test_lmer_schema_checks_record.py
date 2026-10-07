@@ -56,6 +56,7 @@ import pytest
 
 from lmer_schema.checks import CHECKS, Form, Report, Severity, Tier
 from lmer_schema.checks import record
+from lmer_schema.checks import walk
 from work_repo import run_state
 
 #: A fixed "now" one hour after the fixture record's last update: the fixture
@@ -439,11 +440,17 @@ class TestTheLegacyTaskTree:
 
     The discriminator cannot be the name. `{task_type}` is an open set (any
     `LMER_TASK` value: `develop`, `review`, whatever a taskdef is called), so
-    this boundary is drawn by SHAPE: a directory sitting directly inside a
-    project-shaped one whose own children are legacy TARGET dirs. Both halves
-    are asserted here — the scope-out is silent, and the legacy
-    `{host}/{project}/runs/` record the validator exists to check is not
-    swallowed with it.
+    this boundary is drawn by WHERE a directory sits and by WHAT it holds: a
+    `{task_type}/` sits directly inside a project, and its children are
+    legacy TARGET dirs. "Inside a project" is answered positionally when the
+    caller hands the layout walk's project list down (the runner's path,
+    #379's remaining half) and by the §1 marker test where the list is silent
+    — no list at all, or a nested project the list by its own rule never
+    names; "a target" is answered by what the legacy writers left there,
+    always, because that is the one thing separating a `{target}` from a
+    nested project. Both halves are asserted here — the scope-out is silent,
+    and the legacy `{host}/{project}/runs/` record the validator exists to
+    check is not swallowed with it.
     """
 
     @pytest.mark.parametrize("layout", ["runs", "_runs"])
@@ -500,13 +507,97 @@ class TestTheLegacyTaskTree:
         under-pruning costs a scope-out being checked, over-pruning costs a
         real project's records never being checked at all, and only one of
         those is silent.
+
+        #379's positional half looked at flipping this and did not. Handed
+        the layout walk's project list the prune knows WHERE the project is,
+        but the list — by its own rule, nothing below a project is a second
+        project — never names anything below one, so it says nothing about a
+        `{target}`; and `<project>/<x>/<y>/runs` with nothing else in `<y>`
+        is byte-for-byte the nested-project shape above
+        (`syseng/infra/ansible-roles/caddy/runs`). No position tells them
+        apart, only the writer's output does, so this is walked on both paths
+        and the pin now says so for both.
         """
         _legacy_project(tmp_path)
         _plant(tmp_path, f"{TASK_TREE}/runs/chat-.--x/state.yaml")
 
         report = _bare_report(tmp_path, form=Form.LEGACY)
-
         assert "record.state-enum" in _codes(report)
+
+        # The same tree on the runner's path: the list names `widgets` (it is
+        # project-shaped) and still says nothing about `mr-42`.
+        projects = walk.project_dirs(tmp_path)
+        assert {project.rel for project in projects} == {LEGACY_PROJECT}
+        report = Report(Form.LEGACY)
+        record.check_record(tmp_path, report, now=NOW, projects=projects)
+        assert "record.state-enum" in _codes(report)
+
+    def test_the_legacy_task_tree_prune_is_positional(self, tmp_path):
+        """#379's remaining half: handed the layout walk's project list, the
+        prune reads "directly inside a project" from the LIST, and falls back
+        to the §1 marker test only where the list is silent.
+
+        One tree, one leg per directory:
+
+        - `bare/` is a registered project that has not grown an area yet. By
+          shape it is nothing, so its legacy task tree is walked; by POSITION
+          it is a project, so the same tree is a scope-out. This is the case
+          the list closes that no marker test can.
+        - `h/syseng/infra/ansible-roles/caddy/` is a nested project — the live
+          shape, and the !271 review's tree. The walk's own rule never lists
+          it, so the list says nothing about it: its run area is still found
+          and the legacy task tree INSIDE it is still pruned, both by shape.
+          The list adds a project; it never becomes a whitelist.
+        - with no list at all the answer is today's, which
+          `lmer_schema.migration._record_blockers` and the runner tests'
+          negative control both depend on.
+
+        What the list does NOT decide is the `{target}` level — see
+        test_a_target_holding_only_a_run_area_is_left_alone.
+        """
+        bare = tmp_path / "bare"
+        _plant(tmp_path, "bare/develop/issue-12/log.yaml", "- {}\n")
+        _plant(tmp_path, "bare/develop/issue-12/runs/chat-.--x/state.yaml")
+        infra = tmp_path / "h" / "syseng" / "infra"
+        (infra / "info").mkdir(parents=True)
+        (infra / "runs").mkdir()
+        _plant(tmp_path, "h/syseng/infra/ansible-roles/caddy/runs/deploy-1/state.yaml")
+        _plant(tmp_path, "h/syseng/infra/ansible-roles/caddy/develop/issue-1/log.yaml", "- {}\n")
+        _plant(tmp_path, "h/syseng/infra/ansible-roles/caddy/develop/issue-1/runs/chat/state.yaml")
+
+        def areas(**kwargs):
+            return {
+                path.relative_to(tmp_path).as_posix()
+                for path, _layout in record.iter_run_areas(tmp_path, **kwargs)
+            }
+
+        # No list: `bare` is not project-shaped, so by shape alone its task
+        # tree is nobody's scope-out and is walked. Today's answer.
+        assert areas() == {
+            "bare/develop/issue-12/runs",
+            "h/syseng/infra/runs",
+            "h/syseng/infra/ansible-roles/caddy/runs",
+        }
+
+        # The layout walk's list as the runner hands it down: `bare` by its
+        # registry entry, `infra` by its shape, `caddy` never (nothing below
+        # a project is a second project). Both spellings a caller may pass —
+        # a ProjectDir and a plain path — are accepted.
+        projects = (
+            walk.ProjectDir(path=bare, rel="bare", name="bare", kind=walk.REGISTERED, form=None),
+            infra,
+        )
+        assert areas(projects=projects) == {
+            "h/syseng/infra/runs",
+            "h/syseng/infra/ansible-roles/caddy/runs",
+        }
+        report = Report(Form.LEGACY)
+        record.check_record(tmp_path, report, now=NOW, projects=projects)
+        assert _codes(report) == BROKEN_CODES
+        assert all(
+            f.path.startswith("h/syseng/infra/ansible-roles/caddy/runs/")
+            for f in report.findings
+        )
 
     def test_the_projects_own_run_area_beside_it_is_still_checked(self, tmp_path):
         # The converse, and the reason this prune is written by shape: the

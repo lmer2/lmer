@@ -399,10 +399,10 @@ def _check_sources(report, manifest, plexus_repo_url) -> None:
             _unknown_key(report, where)
             continue
         # Per NAME: `ref:` is taskdef's alone (SCHEMA.md sources table), and
-        # `load_sources` refuses it under any other name at start. The
-        # manifest tier is declared-only until its loader lands (issue #370),
-        # so an unwarned `sources.napkin.ref` does nothing at all today and
-        # refuses to start the day it does.
+        # `load_sources` refuses it under any other name at start — at the
+        # manifest tier too, since its loader landed (issue #370): a
+        # `sources.napkin.ref` here is a tree that refuses to start, so this
+        # warning is the operator's advance notice.
         _unknown_entry_keys(report, where, entry, core.source_entry_keys(name))
 
         repo = entry.get("repo")

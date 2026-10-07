@@ -1,5 +1,7 @@
 """Tests for repository URL parsing functions."""
 
+import os
+
 import pytest
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
@@ -9,6 +11,37 @@ from lmer_cli.container.clone_and_exec import (
     sanitize_task_target as _container_sanitize_task_target,
 )
 from work_repo.utils import sanitize_task_target as _utils_sanitize_task_target
+
+#: A token in the shape a host token has, and the variable the host-specific
+#: lookup reads it from.
+HOST_TOKEN = "glpat-not-a-real-token-000"
+TOKEN_ENV = "GITLAB_TOKEN_gitlab_example_com"
+
+#: #391: an id-less list page. ``LMER_REPO_PROJECT`` read ``group/project/-/issues``.
+LIST_PAGE = "https://gitlab.example.com/group/project/-/issues"
+#: #523: a document inside the repository. Derived nothing, so the document
+#: URL itself was handed to the clone.
+DOCUMENT_URL = "https://gitlab.example.com/group/project/-/blob/main/docs/guide.md"
+
+
+@pytest.fixture
+def no_host_tokens(monkeypatch):
+    """No token for any host: the derivation answers in SSH shape.
+
+    Ambient ``GITLAB_TOKEN*`` is not an ``LMER_`` name, so nothing strips it
+    for a developer machine that has one — a test about the token-less
+    spelling has to say so.
+    """
+    for name in list(os.environ):
+        if name.startswith(("GITLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def host_token(monkeypatch, no_host_tokens):
+    """Exactly one host token, for gitlab.example.com."""
+    monkeypatch.setenv(TOKEN_ENV, HOST_TOKEN)
+    return HOST_TOKEN
 
 
 class TestParseRepoUrl:
@@ -109,6 +142,63 @@ class TestParseRepoUrl:
         )
         assert host == "gitlab.example.com"
         assert project == "group/project"
+
+
+class TestParseRepoUrlOfAResourceUrl:
+    """``_parse_repo_url`` parses ``repository_of(url) or url`` (spec §2).
+
+    So ``LMER_REPO_PROJECT`` — the run directory, the memory dir, the log path
+    — never contains a ``/-/`` route (#391) or a ``/pull/N`` tail, whichever
+    forge URL the launch was given. The repository-URL cases above are
+    unchanged: a repository is its own answer.
+    """
+
+    @pytest.mark.parametrize("url", [
+        LIST_PAGE,
+        f"{LIST_PAGE}/",
+        f"{LIST_PAGE}/?label_name=bug",
+        "https://gitlab.example.com/group/project/-/merge_requests",
+        "https://gitlab.example.com/group/project/-/work_items",
+    ])
+    def test_a_list_page_parses_to_the_project(self, url):
+        assert _parse_repo_url(url) == ("gitlab.example.com", "group/project")
+
+    @pytest.mark.parametrize("url", [
+        DOCUMENT_URL,
+        "https://gitlab.example.com/group/project/-/tree/main",
+        "https://gitlab.example.com/group/project/-/wikis/home",
+        "https://gitlab.example.com/group/project/-/commits/main",
+    ])
+    def test_a_document_url_parses_to_the_project(self, url):
+        assert _parse_repo_url(url) == ("gitlab.example.com", "group/project")
+
+    def test_a_work_item_url_parses_to_the_project(self):
+        assert _parse_repo_url(
+            "https://gitlab.example.com/group/project/-/issues/141"
+        ) == ("gitlab.example.com", "group/project")
+
+    @pytest.mark.parametrize("url", [
+        "https://github.com/owner/repo/pull/9",
+        "https://github.com/owner/repo/issues",
+        "https://github.com/owner/repo/blob/main/README.md",
+        "https://github.com/owner/repo/tree/main/docs",
+    ])
+    def test_a_github_route_parses_to_owner_repo(self, url):
+        assert _parse_repo_url(url) == ("github.com", "owner/repo")
+
+    def test_nested_groups_port_and_credentials_in_a_resource_url(self):
+        assert _parse_repo_url(
+            f"https://oauth2:{HOST_TOKEN}@gitlab.example.com:8443/group/subgroup/project/-/issues/12"
+        ) == ("gitlab.example.com", "group/subgroup/project")
+
+    def test_the_verify_line(self):
+        """The two calls the task's verify step makes, pinned here as well."""
+        assert _parse_repo_url("https://gitlab.example.com/g/p/-/issues") == (
+            "gitlab.example.com", "g/p",
+        )
+        assert _parse_repo_url("https://gitlab.example.com/g/p/-/blob/main/x.md") == (
+            "gitlab.example.com", "g/p",
+        )
 
 
 # Project names whose last character is one of `.`, `g`, `i`, `t`. The SSH branch
@@ -261,6 +351,87 @@ class TestDeriveRepoUrlFromWorkItems:
         """
         assert derive("https://gitlab.example.com/group/work_items") is None
         assert derive("https://gitlab.example.com/group/work_items_tracker") is None
+
+
+@pytest.mark.parametrize(
+    "derive",
+    [
+        pytest.param(_derive_repo_url_from_task_target, id="cli"),
+        pytest.param(_derive_repo_url_container, id="container"),
+    ],
+)
+class TestDeriveRepoUrlFromReferenceUrls:
+    """A list page (#391) and a document URL (#523) derive the repository they
+    belong to, in today's two shapes, from both copies of the helper.
+
+    The shape is decided as before: a GitLab ``/-/`` URL answers in HTTPS with
+    the host token when there is one and in SSH form otherwise; the GitHub
+    shape is always SSH and never looks a token up.
+    """
+
+    def test_list_page_without_a_token(self, derive, no_host_tokens):
+        assert derive(LIST_PAGE) == "git@gitlab.example.com:group/project"
+
+    def test_document_url_without_a_token(self, derive, no_host_tokens):
+        assert derive(DOCUMENT_URL) == "git@gitlab.example.com:group/project"
+
+    def test_list_page_with_a_host_token(self, derive, host_token):
+        assert derive(LIST_PAGE) == (
+            f"https://oauth2:{host_token}@gitlab.example.com/group/project.git"
+        )
+
+    def test_document_url_with_a_host_token(self, derive, host_token):
+        assert derive(DOCUMENT_URL) == (
+            f"https://oauth2:{host_token}@gitlab.example.com/group/project.git"
+        )
+
+    def test_a_reference_derives_what_the_work_item_does(self, derive, host_token):
+        base = "https://gitlab.example.com/group/project"
+        assert derive(f"{base}/-/blob/main/docs/guide.md") == derive(f"{base}/-/issues/141")
+        assert derive(f"{base}/-/issues") == derive(f"{base}/-/issues/141")
+
+    def test_github_document_url(self, derive, no_host_tokens):
+        assert derive("https://github.com/owner/repo/blob/main/README.md") == (
+            "git@github.com:owner/repo"
+        )
+
+    def test_github_shape_never_looks_a_token_up(self, derive, monkeypatch, no_host_tokens):
+        """Today's GitHub answer, kept: ``_get_gitlab_token`` would read
+        ``GH_TOKEN`` for github.com and refuse a generic ``GITLAB_TOKEN`` with
+        a notice — neither of which this helper has ever done."""
+        monkeypatch.setenv("GH_TOKEN", "ghp-not-a-real-token")
+        monkeypatch.setenv("GITLAB_TOKEN_github_com", "glpat-not-for-github")
+        assert derive("https://github.com/owner/repo/pull/9") == "git@github.com:owner/repo"
+        assert derive("https://github.com/owner/repo/tree/main") == "git@github.com:owner/repo"
+
+    @pytest.mark.parametrize("url", [
+        "https://gitlab.example.com/group/project",
+        "https://gitlab.example.com/group/project.git",
+        "git@gitlab.example.com:group/project.git",
+        "ssh://git@gitlab.example.com/group/project.git",
+        "https://github.com/owner/repo",
+    ])
+    def test_a_repository_url_still_derives_nothing(self, derive, url, host_token):
+        """The fallback contract: spawn, clone_secondary_mr and
+        _resolve_clone_url use the target itself as the clone URL."""
+        assert derive(url) is None
+
+    @pytest.mark.parametrize("url", [
+        "https://gitlab.example.com/group/project/-/pipelines/1691",
+        "https://docs.example.com/guide/getting-started",
+        "https://myworkspace.slack.com/archives/C0123ABCDEF/p1700000000123456",
+        "feature/some-branch",
+        "",
+    ])
+    def test_nothing_else_derives(self, derive, url, host_token):
+        assert derive(url) is None
+
+    def test_the_derived_url_parses_to_what_parse_repo_url_reads_from_the_target(
+        self, derive, host_token
+    ):
+        """One identity: the clone URL and ``LMER_REPO_PROJECT`` agree."""
+        for url in (LIST_PAGE, DOCUMENT_URL):
+            assert _parse_repo_url(derive(url)) == _parse_repo_url(url)
 
 
 # Both copies of sanitize_task_target (work_repo.utils and the container

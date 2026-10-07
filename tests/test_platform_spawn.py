@@ -735,15 +735,26 @@ PLAIN_REPO_TARGETS = [
     "ssh://git@gitlab.example.com/agents/global.git",
 ]
 
-#: URL-shaped targets that are not repository roots. Before #255 these remained
-#: untracked and produced the actionable warning; recognising repo targets must
-#: not turn web pages or unsupported transports into persistent clone records.
-NON_REPO_URL_TARGETS = [
+#: Content inside a repository — a tree, a file, a wiki page (#523; a
+#: ``reference`` to the classifier). Not a clone URL and not a work item, but
+#: the repository it belongs to is in the URL and the shared helper reads it
+#: out (``repository_of``), so these identify the run exactly as
+#: DERIVABLE_TARGETS do — and, like them, record no repository: the derived
+#: URL is a reconstruction, not evidence. Until A1-wave0.repository-of these
+#: were NON_REPO_URL_TARGETS and stayed untracked.
+REFERENCE_TARGETS = [
     "https://gitlab.example.com/agents/global/-/tree/main",
-    "https://gitlab.example.com/agents/global/-/pipelines/1691",
     "https://gitlab.example.com/agents/global/-/blob/main/README.md",
     "https://gitlab.example.com/agents/global/-/wikis/home",
     "https://github.com/owner/repo/tree/main",
+]
+
+#: URL-shaped targets that are neither repository roots nor content inside
+#: one. Before #255 these remained untracked and produced the actionable
+#: warning; recognising repo targets must not turn web pages or unsupported
+#: transports into persistent clone records.
+NON_REPO_URL_TARGETS = [
+    "https://gitlab.example.com/agents/global/-/pipelines/1691",
     "https://docs.example.com/guide/getting-started",
     "ftp://gitlab.example.com/group/project",
 ]
@@ -847,6 +858,50 @@ def test_the_entry_records_a_plain_repo_url_target(config, monkeypatch):
         assert runs.get_tracked(
             result.host, result.project, result.slug
         ).repo == target
+    finally:
+        os.kill(result.pid, 9)
+
+
+@pytest.mark.parametrize("target", REFERENCE_TARGETS)
+@pytest.mark.parametrize("tokens", ["with a host token", "without one"])
+def test_a_reference_target_identifies_the_run_as_lmer_will_export_it(
+    config, monkeypatch, target, tokens, no_host_tokens
+):
+    """#523, from the platform's side: a document URL carries its repository.
+
+    The DERIVABLE_TARGETS contract, on a third shape of target: the identity is
+    the one ``lmer`` exports (parity, under both token states, because the
+    helper answers in a different spelling for each), and nothing is recorded as
+    the repository of record — the derived URL is a reconstruction.
+    """
+    if tokens == "with a host token":
+        monkeypatch.setenv(TOKEN_ENV, HOST_TOKEN)
+    request = request_for(repo_url=None, target=target)
+
+    recorded, identity = spawn._repo_urls(request)
+    host, project, _slug = spawn.derive_run_identity(request, identity)
+
+    assert recorded is None
+    assert (host, project) != (None, None)
+    assert (host, project) == lmer_would_export(target), (
+        "the platform predicted a run directory the container will not create"
+    )
+
+
+@pytest.mark.parametrize("target", REFERENCE_TARGETS)
+def test_a_reference_target_tracks_the_run_and_records_no_repo(
+    config, monkeypatch, target
+):
+    """And spawned for real: tracked under that identity, repo-less everywhere."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        assert (result.host, result.project) == lmer_would_export(target)
+        tracked = runs.get_tracked(result.host, result.project, result.slug)
+        assert tracked is not None
+        assert tracked.source == "spawned"
+        assert tracked.repo is None
+        assert registry.read_session(result.session_id)["task"]["repo"] is None
     finally:
         os.kill(result.pid, 9)
 

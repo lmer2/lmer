@@ -10,6 +10,11 @@ sources.py must be loadable two ways (see its module docstring):
 Plus the PyYAML guard (spec N5): the module imports cleanly without PyYAML,
 and load_sources() on an *existing* sources.yaml without PyYAML raises the
 refuse-start error instead of silently skipping.
+
+Plus the manifest tier (issue #370): a tiered load_sources() call takes the
+manifest's ``sources:`` as a dict the caller already parsed, so it needs
+neither lmer_schema (the one manifest parser) nor PyYAML — the standalone
+copy resolves it with both absent and imports nothing new.
 """
 
 import subprocess
@@ -122,6 +127,56 @@ def test_standalone_load_survives_missing_pyyaml(tmp_path):
         # None in sys.modules makes any later `import yaml` raise
         # ImportError, simulating an interpreter without PyYAML.
         prelude="import sys\nsys.modules['yaml'] = None\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_standalone_manifest_tier_call_needs_neither_lmer_schema_nor_pyyaml(tmp_path):
+    """A manifest-tier call resolves standalone with lmer_schema and PyYAML absent."""
+    result = _run_standalone(
+        """
+        assert mod.yaml is None, "yaml import should have been blocked"
+        work_url = "https://git.example.com/20c/worklog.git"
+        manifest = dict(taskdef=dict(repo="https://git.example.com/agents/taskdefs.git", ref="main"))
+        cfg, warnings = mod.load_sources(
+            {missing!r},
+            work_repo_url=work_url,
+            manifest_sources=manifest,
+            manifest_path="/work/_plexus.yaml",
+        )
+        assert warnings == [], warnings
+        assert cfg["sources"] == dict(taskdef=dict(repo="https://git.example.com/agents/taskdefs.git", ref="main")), cfg
+        assert cfg["tiers"] == dict(taskdef=mod.TIER_MANIFEST), cfg
+        assert mod.declared_origin_label(mod.TIER_MANIFEST) == "declared (manifest)"
+        assert mod.declared_origin_label(mod.TIER_LEGACY) == "declared (sources.yaml)"
+        # The trust rules fire through the same standalone path.
+        try:
+            mod.load_sources(
+                {missing!r},
+                work_repo_url=work_url,
+                manifest_sources=dict(napkin=dict(repo="https://evil.example.org/20c/napkin.git")),
+                manifest_path="/work/_plexus.yaml",
+            )
+        except mod.SourcesConfigError as exc:
+            assert "LMER_NAPKIN_REPO" in str(exc), exc
+        else:
+            raise AssertionError("manifest-tier trust rule did not fire")
+        # Nothing new was imported: not the manifest parser, not the package,
+        # not PyYAML (the None sentinels planted by the prelude are blocks,
+        # not imports).
+        loaded = sorted(
+            name
+            for name, module in sys.modules.items()
+            if name.split(".")[0] in ("lmer_schema", "lmer_cli", "yaml") and module is not None
+        )
+        assert loaded == [], loaded
+        print("OK")
+        """.format(missing=str(tmp_path / "no-such-sources.yaml")),
+        cwd=tmp_path,
+        # None in sys.modules makes any later import of the name raise
+        # ImportError: an interpreter with neither PyYAML nor lmer_schema.
+        prelude="import sys\nsys.modules['yaml'] = None\nsys.modules['lmer_schema'] = None\n",
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout

@@ -19,8 +19,9 @@ those):
 - the FORM-OVERRIDE trap: a host bucket's contents are checked at the legacy
   tier's severities even inside a schema-form tree. The project-list modules
   carry that with the list (each ``ProjectDir`` states the form its contents
-  are checked at, !256 discussion 5); ``record`` walks by NAME and is handed
-  no list, so the runner pins ITS tier by path;
+  are checked at, !256 discussion 5); ``record`` walks by NAME — it is handed
+  the same list, but only to place one prune (#379), never to read a form
+  from — so the runner pins ITS tier by path;
 - CRASH SAFETY: a check that raises becomes one error finding attributed to
   that check and the remaining checks still run, and the exception's text is
   redacted of the tree's own path — of the spellings that CARRY one, which a
@@ -464,6 +465,23 @@ class TestWalkOnce:
         assert _one(report, "agents.memory-entry-without-file").path.startswith(BUCKET_REL)
         assert _one(report, "index.dangling-link").path.startswith(BUCKET_REL)
 
+    def test_the_project_list_reaches_the_record_walk(self, schema_plexus, monkeypatch):
+        # #379: the record walk is handed the layout's list too — not to
+        # discover areas (it walks by name) but to place the legacy task-tree
+        # prune by position instead of re-running the marker test.
+        handed = []
+        real = record_checks.iter_run_areas
+
+        def spy(root, **kwargs):
+            handed.append(kwargs.get("projects"))
+            return real(root, **kwargs)
+
+        monkeypatch.setattr(record_checks, "iter_run_areas", spy)
+        context = Context(root=schema_plexus.root, report=Report(Form.SCHEMA), now=NOW)
+        run.run_checks(context)
+        assert context.project_dirs is not None
+        assert handed == [context.project_dirs]
+
 
 # ---------------------------------------------------------------------------
 # The form-override trap: a bucket's contents are legacy-tier
@@ -521,9 +539,11 @@ class TestBucketTier:
         self, schema_plexus, monkeypatch
     ):
         """`record` finds run areas by NAME (it must work on a bare root) and
-        is handed no project list to read a form from, so the runner pins ITS
-        tier by path. The two project-list modules carry the tier with the
-        list and get the report itself — the view can only get in their way.
+        reads no form from the project list it is handed — the list places
+        the legacy task-tree prune (#379) and nothing else — so the runner
+        pins ITS tier by path. The two project-list modules carry the tier
+        with the list and get the report itself — the view can only get in
+        their way.
         The wiring stopped being latent in !261: `record` now emits the
         index mechanic's `index.dangling-link` for a session-dir artifact
         symlink, and that code IS tier-sensitive — so the test below exercises
@@ -881,15 +901,18 @@ class _Recorder:
 class _Traps:
     """What :func:`_booby_trap` planted: the ``bundle`` root, the scope-out
     ``roots`` nothing may read or report, the run ``areas`` planted inside
-    them (the placement that can be reached at all), and every ``file``
-    planted (so a typo in the planter cannot make a scope-out test pass
-    vacuously)."""
+    them (the placement that can be reached at all), every ``file`` planted
+    (so a typo in the planter cannot make a scope-out test pass vacuously),
+    and the ``positional`` areas among them — the ones only the project list
+    keeps the walk out of (empty when the tree has no registry to list a
+    marker-less project by)."""
 
-    def __init__(self, bundle, roots, areas, files):
+    def __init__(self, bundle, roots, areas, files, positional=()):
         self.bundle = bundle
         self.roots = roots
         self.areas = areas
         self.files = files
+        self.positional = positional
 
 
 #: What a trap is made of: each of these would be a ``record.*`` ERROR if any
@@ -903,6 +926,10 @@ BAD_EVENTS = "not a json object\n"
 #: whichever layout the walk would apply, it finds a corrupt record.
 TRAP_SLUG = "demo"
 TRAP_SESSION_ID = "20260824-101500-1-1"
+
+#: A registered project that has not grown a §1 marker — the one place the
+#: legacy task-tree prune fires by POSITION alone (:func:`_booby_trap`).
+BARE_PROJECT = "bare"
 
 
 def _trap_run_areas(base):
@@ -986,19 +1013,41 @@ def _booby_trap(tree):
     areas.extend(_trap_run_areas(task_tree))
     scope_outs.append(tree.project_dir / "develop")
 
+    # The same legacy layout under a project the registry names but that has
+    # not grown a single §1 marker: by shape it sits in no project, so only
+    # the layout walk's list — the positional half of the prune, #379 —
+    # keeps the record walk out of it. A legacy tree has no registry to name
+    # a marker-less directory by, so it has no such trap.
+    positional = []
+    if tree.manifest is not None:
+        _edit_manifest(
+            tree,
+            lambda doc: doc["projects"].__setitem__(
+                BARE_PROJECT, {"description": "registered, no area yet"}
+            ),
+        )
+        bare_tree = tree.root / BARE_PROJECT / "develop" / "issue-12"
+        _write(bare_tree / "log.yaml", CORRUPT_YAML)
+        positional.extend(_trap_run_areas(bare_tree))
+        areas.extend(positional)
+        scope_outs.append(tree.root / BARE_PROJECT / "develop")
+
     planted = sorted(
         path
         for base in scope_outs
         for path in base.rglob("*")
         if path.is_file()
     )
-    return _Traps(bundle, scope_outs, tuple(areas), planted)
+    return _Traps(bundle, scope_outs, tuple(areas), planted, tuple(positional))
 
 
 #: Every module-level set the record walk's scope-out boundary is made of:
 #: the three area-name sets and the ``{target}`` marker set that the legacy
-#: task tree is recognised by. Emptying all four is "the walk without its
-#: boundary", the negative control the guarantee tests are measured against.
+#: task tree is recognised by. The boundary has one more half that is not a
+#: set: the layout walk's project list, which places the legacy task-tree
+#: prune by POSITION (#379) and is simply withheld to switch it off. Emptying
+#: all four AND withholding the list is "the walk without its boundary", the
+#: negative control the guarantee tests are measured against.
 _PRUNE_SETS = (
     "OPAQUE_AREAS",
     "LEGACY_INSTANCE_AREAS",
@@ -1011,7 +1060,8 @@ def _run_areas_without_the_boundary(root, monkeypatch):
     """Every run area the record walk finds with its scope-out boundary
     switched OFF — that is, everywhere a plain by-name walk could reach.
 
-    The boundary is ``record.py``'s four prune sets; emptying them turns
+    The boundary is ``record.py``'s four prune sets plus the project list the
+    runner hands down; emptying the sets and passing no list turns
     :func:`~lmer_schema.checks.record.iter_run_areas` back into the walk it
     would be without them. If that boundary is ever re-expressed some other
     way this stops finding the trapped areas, and the reachability assertions
@@ -1020,7 +1070,29 @@ def _run_areas_without_the_boundary(root, monkeypatch):
     with monkeypatch.context() as without:
         for name in _PRUNE_SETS:
             without.setattr(record_checks, name, frozenset())
-        return {area for area, _layout in record_checks.iter_run_areas(root)}
+        return {
+            area for area, _layout in record_checks.iter_run_areas(root, projects=None)
+        }
+
+
+def _checks_without_the_project_list():
+    """:data:`CHECK_ORDER` with the record adapter replaced by one that
+    withholds the layout walk's list — the positional half of the boundary
+    switched off on the runner's own path, everything else as shipped."""
+
+    def record_without_the_list(context):
+        record_checks.check_record(
+            context.root,
+            context.tiered(),
+            now=context.now,
+            stale_after=context.stale_after,
+            manifest=context.manifest,
+        )
+
+    return tuple(
+        Check(check.module, record_without_the_list) if check.name == "record" else check
+        for check in CHECK_ORDER
+    )
 
 
 class TestScopeOuts:
@@ -1045,8 +1117,14 @@ class TestScopeOuts:
 
     Every scope-out here carries the run-area placement, the legacy
     ``{task_type}/{target}/`` tree included: it was the last one the record
-    walk entered (issue #379), and it is pruned by SHAPE rather than by name
-    because ``{task_type}`` is an open set.
+    walk entered (issue #379). ``{task_type}`` is an open set, so it is not
+    pruned by name: it is pruned by POSITION — directly inside a project the
+    layout walk listed, the list the runner hands every per-project module —
+    composed with the SHAPE of what sits in it (the legacy writers' output
+    marks a ``{target}``, and nothing else separates one from a nested
+    project the list never names). The planter carries one task tree under
+    a project-shaped directory and one under a registered directory with no
+    marker at all; the second is silent for the list's sake alone.
     """
 
     def _run(self, tree, **kwargs):
@@ -1079,20 +1157,38 @@ class TestScopeOuts:
         self, fixture, request, monkeypatch
     ):
         # The negative control, and the !257 reproduction kept as a test: with
-        # the record walk's boundary switched off, each trapped record under
-        # an opaque or free-form tier is opened, parsed and reported, and an
-        # otherwise conforming tree exits 1. With the boundary as shipped (the
-        # two tests below) the same files are silent.
+        # the record walk's boundary switched off — the four sets emptied and
+        # the project list withheld — each trapped record under an opaque or
+        # free-form tier is opened, parsed and reported, and an otherwise
+        # conforming tree exits 1. With the boundary as shipped (the two tests
+        # below) the same files are silent.
         tree = request.getfixturevalue(fixture)
         traps = _booby_trap(tree)
         for name in _PRUNE_SETS:
             monkeypatch.setattr(record_checks, name, frozenset())
-        report = _validate(tree)
+        report = _validate(tree, checks=_checks_without_the_project_list())
         reported = {finding.path for finding in _by_code(report, "record.state-unparseable")}
         for area in traps.areas:
             rel = area.relative_to(tree.root).as_posix()
             assert any(path.startswith(f"{rel}/") for path in reported), (rel, reported)
         assert report.exit_code == 1
+
+    def test_without_the_project_list_the_positional_trap_is_an_error(self, schema_plexus):
+        # The positional leg's own negative control: the four prune sets stay
+        # as shipped and only the layout walk's list is withheld from the
+        # record check. The trap under a registered-but-marker-less project is
+        # then reached — by shape alone it sits in no project — while the
+        # shaped project's task tree beside it stays silent, so the list is
+        # doing exactly one job and nothing else is doing it.
+        traps = _booby_trap(schema_plexus)
+        assert traps.positional
+        report = _validate(schema_plexus, checks=_checks_without_the_project_list())
+        reported = {finding.path for finding in _by_code(report, "record.state-unparseable")}
+        for area in traps.positional:
+            rel = area.relative_to(schema_plexus.root).as_posix()
+            assert any(path.startswith(f"{rel}/") for path in reported), (rel, reported)
+        shaped = (schema_plexus.project_dir / "develop").relative_to(schema_plexus.root).as_posix()
+        assert not any(path.startswith(f"{shaped}/") for path in reported)
 
     @pytest.mark.parametrize("fixture", ["schema_plexus", "legacy_plexus"])
     def test_nothing_inside_a_scope_out_is_ever_read(self, fixture, request):

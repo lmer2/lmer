@@ -120,6 +120,7 @@ import yaml
 from . import specs_index
 from .transactions import mutation_transaction, work_transaction
 from .utils import (
+    is_work_item,
     project_area,
     redact_secrets,
     sanitize_task_target,
@@ -236,6 +237,21 @@ def current_session_id() -> str:
 def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> str:
     """Deterministic run slug: same taskdef + target => same slug (spec §4.5).
 
+    The env fallback resolves first — ``LMER_TASK`` for the taskdef,
+    ``LMER_TASK_TARGET`` for a target of ``None`` — and the value found is
+    then classified (run-identity spec §3, review S1): **no work item means
+    the bare taskdef**. No target, a filesystem path (``.``), a bare
+    repository URL (``…/project.git``) and a document URL all derive
+    ``<taskdef>``, so a plain session never carries a ``.`` or a repository
+    basename in its slug and every plain chat on a project shares ONE group
+    (#311, #81). A work item — an issue, an MR, a branch, a SHA, or a thread
+    permalink the handler owns (``special``, :func:`utils.is_work_item`) —
+    keeps the slug the rest of this function derives. A legacy record whose
+    slug came from a non-work-item target (``chat-project.git``, ``chat-.``)
+    no longer derives from its recorded target: that cost is accepted for
+    schema-1 trees (spec §14.2) and ``work migrate`` folds such records into
+    the bare group.
+
     A bare full 40-hex commit SHA is truncated to its 12-char short form —
     a slug-only concern (readable dir names, issue #87 D4); the legacy
     ``{task_type}/{target}/`` path builders keep the full form so read-side
@@ -245,10 +261,17 @@ def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> 
     re-slug successor fallback does not weaken that — it matches addresses a
     run RECORDS having vacated (``reslugged_from``), which a legacy run never
     has, rather than re-deriving identity through this function.
+
+    ``lmer_cli/container/clone_and_exec._derive_run_slug`` mirrors this
+    function minus the env fallback (its caller reads the env); the §9.1
+    derive-slug table in ``tests/test_clone_and_exec_session_dir.py`` pins
+    the two copies equal.
     """
     taskdef = taskdef or os.environ.get("LMER_TASK", "default")
     if target is None:
         target = os.environ.get("LMER_TASK_TARGET", "")
+    if not is_work_item(target):
+        return taskdef
     if target and _FULL_SHA_RE.fullmatch(target):
         return f"{taskdef}-{target[:12].lower()}"
     safe = sanitize_task_target(target) if target else "default"

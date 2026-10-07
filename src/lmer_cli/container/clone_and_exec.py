@@ -62,7 +62,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # Git config that disables the LFS smudge/process filters and marks them
 # non-required. Used when git-lfs is not installed so a target repo that
@@ -1408,6 +1408,322 @@ def sanitize_task_target(task_target: str) -> str:
     return sanitized if sanitized else "default"
 
 
+# ---------------------------------------------------------------------------
+# The target classifier — standalone copy of work_repo.utils (spec §2, D2)
+# ---------------------------------------------------------------------------
+# NOTE: verbatim copy of the classifier block in ``work_repo.utils`` (same
+# reason as the ``sanitize_task_target`` copy above: this module runs without
+# the package). Edit both or neither — ``tests/test_work_repo_classify_target.py``
+# holds the two copies AST-identical and runs the §2 table against both.
+
+#: Row 3 of the §2 table — a URL naming ONE work item inside a forge
+#: repository — as ``(segment, id)`` pairs. ``segment`` is the path segment as
+#: both forges spell it, bare: ``issues`` reads GitLab's ``/-/issues/N`` and
+#: GitHub's ``/issues/N`` through one entry, because the ``/-/`` is GitLab's
+#: project/route separator and not part of the route. ``id`` is the regex the
+#: NEXT segment must match, and one is always required: this is the indicator
+#: set ``_derive_repo_url_from_task_target`` reads today made id-aware — the
+#: id-less list pages are :data:`REFERENCE_INDICATORS`. Tickets take a number;
+#: a commit or a compare range takes any one segment (``/-/commit/main`` names
+#: a commit by ref and derives a repository today, so it stays a work item
+#: rather than falling to ``other``). The segment is matched anywhere in the
+#: path, which is today's reach (every URL that derives a repository today
+#: stays derivable).
+#:
+#: The shape is chosen so ONE definition can serve its three readers: the
+#: classifier (the regex below), the repository derivation (membership of a
+#: path segment, exactly the test it makes on its literal tuple today) and the
+#: web run card's vocabulary seam (``web/src/format.js`` ``TARGET_KINDS`` is
+#: keyed by the bare segment and ``tests/test_platform_web_runcard.py`` reads
+#: the Python list). Rewiring those readers is a later task: the literal
+#: ``indicators = (…)`` tuples in ``lmer_cli.cli`` and ``clone_and_exec`` stay
+#: in place until then.
+WORK_ITEM_INDICATORS = (
+    ("merge_requests", r"\d+"),
+    ("issues", r"\d+"),
+    ("work_items", r"\d+"),
+    ("pull", r"\d+"),
+    ("pulls", r"\d+"),
+    ("commit", r"[^/]+"),
+    ("compare", r"[^/]+"),
+)
+
+#: Row 4 — content inside a forge repository (#523, #391). GitLab's ``/-/``
+#: routes match anywhere in the path, with or without a tail, so the id-less
+#: list pages ``/-/issues``, ``/-/work_items`` and ``/-/merge_requests`` land
+#: here once row 3 has passed on them. GitHub's routes match only in GitHub's
+#: ``/<owner>/<repo>/<route>`` position, so a MediaWiki ``/wiki/`` page or a
+#: docs site's ``/tree/`` is not read as forge content. ``commits`` (GitLab
+#: ``/-/commits/<ref>``, GitHub ``/commits/<ref>``) is a reference and not a
+#: work item: it names a listing the way ``/tree/`` does, and it derives a
+#: repository today, so it may not fall to ``other``.
+REFERENCE_INDICATORS = (
+    "-/blob", "-/tree", "-/raw", "-/wikis", "-/commits",
+    "-/issues", "-/work_items", "-/merge_requests",
+    "blob", "tree", "wiki", "commits", "issues", "pulls",
+)
+
+_WORK_ITEM_RE = re.compile(
+    "/(?:"
+    + "|".join(f"{re.escape(segment)}/(?:{id_re})" for segment, id_re in WORK_ITEM_INDICATORS)
+    + ")(?:/|$)",
+    re.IGNORECASE,
+)
+_REFERENCE_RE = re.compile(
+    "|".join(
+        f"/{re.escape(route)}(?:/|$)"
+        if route.startswith("-/")
+        else f"^/[^/]+/[^/]+/{re.escape(route)}(?:/|$)"
+        for route in REFERENCE_INDICATORS
+    ),
+    re.IGNORECASE,
+)
+
+#: A scheme URL (``scheme://…``) and git's scp form (``[user@]host:path``,
+#: with the user required here — the userless form is indistinguishable from
+#: free text with a colon in it).
+_TARGET_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_TARGET_RE = re.compile(r"^(?P<user>[^/@\s]+)@(?P<host>[^/:@\s]+):(?P<path>\S*)$")
+
+#: ``lmer_platform.spawn``'s forge rules, carried over: hosts on which a
+#: suffix-less HTTP project URL is unambiguous, by allowlist or first label.
+_KNOWN_HTTP_FORGES = frozenset({"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"})
+_FORGE_FIRST_LABELS = frozenset({"git", "gitlab", "github", "bitbucket", "codeberg"})
+
+#: The handlers' claims, re-encoded (``slack_chat.permalink`` and
+#: ``matrix_chat.permalink``): the Slack ``p<TS>`` token needs seven
+#: characters after the ``p`` (the length check the handler makes — it does
+#: not test that they are digits); a Matrix room is ``!id:server`` or
+#: ``#alias:server`` and an event ``$…``, read from the fragment.
+_SLACK_MIN_TS_DIGITS = 7
+_MATRIX_ROOM_RE = re.compile(r"^[!#][^/\s]+:[^/\s]+$")
+_MATRIX_EVENT_RE = re.compile(r"^\$[^/\s?#]+$")
+
+
+def _slack_thread_target(parsed) -> bool:
+    """``slack_chat.permalink.is_slack_thread_url`` on an already-parsed URL."""
+    if parsed.scheme != "https" or not parsed.netloc.endswith(".slack.com"):
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) < 2 or segments[0] != "archives":
+        return False
+    if "thread_ts" in parse_qs(parsed.query):
+        return True
+    if len(segments) < 3 or not segments[2].startswith("p"):
+        return False
+    return len(segments[2]) - 1 >= _SLACK_MIN_TS_DIGITS
+
+
+def _matrix_thread_target(parsed) -> bool:
+    """``matrix_chat.permalink.parse_matrix_permalink`` on an already-parsed URL:
+    the matrix.to form and the Element ``https://<host>/#/room/…`` form alike."""
+    if parsed.scheme not in ("https", "http") or not parsed.fragment:
+        return False
+    fragment = parsed.fragment.split("?", 1)[0]
+    parts = [unquote(part) for part in fragment.strip("/").split("/") if part]
+    if parts and parts[0] == "room":
+        parts = parts[1:]
+    return (
+        len(parts) == 2
+        and _MATRIX_ROOM_RE.match(parts[0]) is not None
+        and _MATRIX_EVENT_RE.match(parts[1]) is not None
+    )
+
+
+def _known_http_forge(host: str) -> bool:
+    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
+    host = host.lower()
+    return host in _KNOWN_HTTP_FORGES or host.split(".", 1)[0] in _FORGE_FIRST_LABELS
+
+
+def _github_http_forge(host: str) -> bool:
+    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
+    host = host.lower()
+    return host == "github.com" or host.split(".", 1)[0] == "github"
+
+
+def _repository_url_target(parsed) -> bool:
+    """Row 5 for a scheme URL: ``spawn._plain_repo_url_from_target``'s rules
+    with §2's deltas (``.git`` first, ``file://`` and ``git://`` accepted)."""
+    if parsed.query or parsed.fragment or "/-/" in parsed.path:
+        return False
+    scheme = parsed.scheme.lower()
+    project = parsed.path.strip("/").removesuffix(".git")
+    if scheme == "file":
+        return bool(project)
+    if not parsed.hostname or not project:
+        return False
+    if scheme in ("http", "https"):
+        if parsed.path.rstrip("/").endswith(".git"):
+            return True
+        if _github_http_forge(parsed.hostname):
+            return len(project.split("/")) == 2
+        return _known_http_forge(parsed.hostname)
+    if scheme in ("ssh", "git"):
+        return parsed.password is None
+    return False
+
+
+def classify_target(target: str | None) -> str:
+    """Sort a task target into exactly one of six classes (spec §2, D2).
+
+    Pure — no filesystem, no environment. The host CLI resolves local
+    checkouts BEFORE calling this (a positional naming a checkout is the
+    repository and never reaches here); the platform, which has no
+    filesystem, classifies the raw string. Rows are tested in the table's
+    order and the first match wins:
+
+    ``none``        ``None``, ``""``, whitespace.
+    ``special``     a URL a ``TargetHandler`` claims — the handlers' own
+                    claims re-encoded (:func:`_slack_thread_target`: https,
+                    a host ending in ``.slack.com``, ``/archives/<channel>/``
+                    then either ``?thread_ts=`` or a ``p``-token;
+                    :func:`_matrix_thread_target`: http or https on ANY
+                    host, a fragment ``#/[room/]<!id|#alias>:<server>/
+                    $<event>`` read after percent-decoding, so the Element
+                    ``https://<host>/#/room/…`` form as much as matrix.to).
+                    The handler owns it; never a repository.
+    ``work-item``   an http(s) URL with an id-bearing indicator
+                    (:data:`WORK_ITEM_INDICATORS`) anywhere in its path.
+    ``reference``   an http(s) URL naming content inside a forge repository
+                    (:data:`REFERENCE_INDICATORS`) — #523, #391.
+    ``repository``  a clone source: ``spawn._plain_repo_url_from_target``'s
+                    rules carried over (the ``_KNOWN_HTTP_FORGES`` allowlist
+                    and the first-label heuristic; exactly two path segments
+                    on a GitHub-shaped host; no query, fragment or ``/-/``)
+                    with §2's three deltas — ``.git`` is tested first, so
+                    ``github.com/a/b/c.git`` is a repository; ``file:///path``
+                    is accepted; ``git://`` is accepted — plus scp form
+                    ``git@host:path`` (the one scp user spawn and
+                    ``resolve.is_likely_url`` know), ``ssh://host/path``,
+                    and anything beginning with ``/`` or ``.`` (a path; git
+                    refuses ref names starting with either, so no branch is
+                    lost).
+    ``other``       any other URL: a non-forge host, a forge URL with a
+                    query or an unknown route (``/discussions/5``,
+                    ``/-/pipelines/1691``), an unsupported transport.
+    ``work-item``   anything else — a commit SHA, a branch name, an
+                    ``mr-N``/``pr-N``/``issue-N`` shorthand, free text.
+
+    Decisions recorded here (A1-wave0.classifier):
+
+    - The indicator constant's shape: ``(segment, id)`` pairs with bare
+      segments and an id always required — see :data:`WORK_ITEM_INDICATORS`.
+    - GitHub ``/commits/<ref>`` joins the reference row beside GitLab's
+      ``/-/commits/`` — see :data:`REFERENCE_INDICATORS`.
+    - An embedded credential on a non-HTTP transport
+      (``ssh://user:secret@host/path``, ``user:secret@host:path``) is
+      ``other``: spawn refuses it as a plain repository and the container's
+      no-secrets rule (``sources.url_has_embedded_credential``) refuses it at
+      start, so it never becomes a repository of record and — ``other``
+      never reaching a slug — never a directory name either. An HTTP(S)
+      credential is transport material spawn already scrubs, so that URL
+      stays a repository; the scrub is the consumer's job, not this one's.
+    - A scp-form string with any user but ``git`` (``deploy@host:path``) or
+      with no path (``git@host:``) is ``other`` as well: spawn and
+      ``is_likely_url`` agree it is not a repository URL, and it is not a
+      work item.
+
+    Mirrored verbatim in ``lmer_cli/container/clone_and_exec.py``, which runs
+    without this package; ``tests/test_work_repo_classify_target.py`` holds
+    the two copies AST-identical and runs the §2 table against both.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "none"
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (_slack_thread_target(parsed) or _matrix_thread_target(parsed)):
+        return "special"
+    if _TARGET_URL_RE.match(text):
+        if parsed is None:
+            return "other"
+        if parsed.scheme.lower() in ("http", "https"):
+            if _WORK_ITEM_RE.search(parsed.path):
+                return "work-item"
+            if _REFERENCE_RE.search(parsed.path):
+                return "reference"
+        return "repository" if _repository_url_target(parsed) else "other"
+    scp = _SCP_TARGET_RE.match(text)
+    if scp is not None:
+        if scp.group("user") == "git" and scp.group("path"):
+            return "repository"
+        return "other"
+    if text.startswith(("/", ".")):
+        return "repository"
+    return "work-item"
+
+
+def is_work_item(target: str | None) -> bool:
+    """Whether *target* names a work unit: ``work-item`` or ``special`` (§2).
+
+    A thread permalink counts — the handler-owned chat IS the work, and its
+    slug is derived from the permalink as today.
+    """
+    return classify_target(target) in ("work-item", "special")
+
+
+def repository_of(url: str | None) -> str | None:
+    """The repository a ``work-item``, ``reference`` or ``repository`` URL
+    belongs to, as a URL — ``None`` when there is none (spec §2).
+
+    One answer behind every reader of "which repository is this": the clone
+    URL (``_derive_repo_url_from_task_target``, both copies), the identity
+    ``LMER_REPO_HOST``/``LMER_REPO_PROJECT`` are parsed from
+    (``lmer_cli.cli._parse_repo_url`` parses ``repository_of(url) or url``)
+    and, in A2, the platform's repository of record and its identity
+    prediction. So ``LMER_REPO_PROJECT`` never contains a ``/-/`` route or a
+    ``/pull/N`` tail (#391), and a document URL names the repository its
+    clone comes from (#523). By class (:func:`classify_target`):
+
+    ``work-item``, ``reference``
+        A derived answer. GitLab-shaped (a ``/-/`` route in the path):
+        ``<scheme>://<host[:port]>/<the path before /-/>``. Otherwise the
+        GitHub shape: ``<scheme>://<host[:port]>/<owner>/<repo>``, a
+        ``.git`` on the repo segment dropped (what the derivation did).
+        The host and port are the target's — the port is part of the
+        address; userinfo is NOT carried over: this answer is read into run
+        identities and platform logs, and a credential in a work-item link
+        is transport material that belongs to whoever clones. The query and
+        the fragment go with the route. A non-URL work item (a SHA, a
+        branch, ``mr-7``, free text) names no repository: ``None``. So does
+        a route with no project before it (``https://host/-/issues/5``).
+    ``repository``
+        Itself, as given (whitespace aside): the clone source in the
+        spelling the caller chose, a path included. A credential embedded
+        in it is the consumer's to scrub, as the classifier records.
+    ``none``, ``special``, ``other``
+        ``None`` — a thread permalink is the handler's; ``other`` is context
+        only when ``--repo`` names the repository.
+
+    Never adds a credential: no token lookup, no environment. Pure, like the
+    classifier, and mirrored with it in ``lmer_cli/container/clone_and_exec.py``
+    under the same AST guard.
+    """
+    text = (url or "").strip()
+    klass = classify_target(text)
+    if klass == "repository":
+        return text
+    if klass not in ("work-item", "reference") or not _TARGET_URL_RE.match(text):
+        return None
+    parsed = urlparse(text)
+    netloc = parsed.netloc.rpartition("@")[2]
+    if not netloc:
+        return None
+    if "/-/" in parsed.path:
+        project = parsed.path.split("/-/", 1)[0].strip("/")
+    else:
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if len(segments) < 2:
+            return None
+        project = f"{segments[0]}/{segments[1].removesuffix('.git')}"
+    if not project:
+        return None
+    return f"{parsed.scheme}://{netloc}/{project}"
+
+
 #: Refusal notices already printed by _get_gitlab_token — see the identical
 #: set in lmer_cli/tokens.py.
 _warned: set[str] = set()
@@ -1513,64 +1829,50 @@ def _get_gitlab_token(host: str) -> str | None:
 def _derive_repo_url_from_task_target(target: str) -> str | None:
     """
     Best-effort derivation of a base repository URL from a task target URL
-    such as PR/MR/issue links.
+    such as PR/MR/issue links — and, since A1-wave0.repository-of, from a
+    reference URL inside a repository (a file, a tree, a wiki page, a commit
+    listing, an id-less list page), so a document target derives the
+    repository its clone comes from (#523).
 
     For GitLab hosts with available API tokens, returns HTTPS URL with token auth.
-    Otherwise returns SSH-format URL for git cloning.
+    Otherwise returns SSH-format URL for git cloning. A repository URL, a thread
+    permalink, a non-forge URL and a non-URL target derive None.
 
     Supports:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
     - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project.git (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
     - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
+    - GitLab: https://gitlab.com/group/project/-/blob/main/docs/x.md -> same as /-/issues/ (#523)
+    - GitLab: https://gitlab.com/group/project/-/issues (a list page) -> same as /-/issues/N (#391)
     """
-    try:
-        parsed = urlparse(target)
-    except Exception:
+    # The repository is repository_of's answer — the one definition behind
+    # this helper in both its copies and behind _parse_repo_url (#391) — for
+    # a work item or a reference and for nothing else. A repository URL
+    # derives None on purpose: spawn._plain_repo_url_from_target,
+    # clone_secondary_mr and _resolve_clone_url fall back to the target
+    # itself as the clone URL: the one class repository_of answers for that
+    # this helper must not, hence the class check ahead of it.
+    if classify_target(target) not in ("work-item", "reference"):
         return None
-
-    if not parsed.scheme or not parsed.netloc or not parsed.path:
+    repository = repository_of(target)
+    if repository is None:
         return None
-
+    parsed = urlparse(repository)
     host = parsed.hostname
-    if not host:
+    project_path = parsed.path.strip("/")
+    if not host or not project_path:
         return None
 
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if len(path_parts) < 2:
-        return None
-
-    # Heuristics: only attempt derive when a known resource path is present.
-    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
-    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
-    # match so a repo merely named 'work_items' isn't misread as a resource link.
-    lowered = '/'.join(path_parts).lower()
-    indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
-    )
-    if not any(tok in lowered for tok in indicators):
-        return None
-
-    # GitLab URLs use /-/ separator: group/project/-/merge_requests/123
-    # Find the /-/ separator and extract everything before it
-    if '/-/' in parsed.path:
-        # Split on /-/ and take everything before it
-        project_path = parsed.path.split('/-/')[0].strip('/')
-        if project_path:
-            # Check if we have a GitLab token for this host
-            token = _get_gitlab_token(host)
-            if token:
-                return f"https://oauth2:{token}@{host}/{project_path}.git"
-            return f"git@{host}:{project_path}"
-
-    # GitHub and simple URLs: owner/repo/pull/123 or owner/repo/issues/123
-    owner = path_parts[0]
-    repo = path_parts[1]
-
-    # Strip trailing .git if present in repo segment from some URLs
-    repo = re.sub(r"\.git$", "", repo)
-
-    return f"git@{host}:{owner}/{repo}"
+    # GitLab-shaped (a /-/ route): HTTPS with the host's token when there is
+    # one, SSH otherwise. The GitHub shape never looks a token up — it never
+    # did, and _get_gitlab_token reads GH_TOKEN for github.com and refuses a
+    # generic GITLAB_TOKEN with a notice, both of which would be new.
+    if "/-/" in urlparse(target).path:
+        token = _get_gitlab_token(host)
+        if token:
+            return f"https://oauth2:{token}@{host}/{project_path}.git"
+    return f"git@{host}:{project_path}"
 
 
 def _parse_gitlab_mr_url(target: str) -> tuple[str | None, str | None, str | None]:
@@ -1876,11 +2178,24 @@ def _derive_run_slug(task_type: str | None, task_target: str | None) -> str:
 
     Standalone mirror of ``work_repo.run_state.derive_slug`` (same reason as
     the ``sanitize_task_target`` copy above: this module runs without the
-    package). The two must agree exactly or container start prepares a
-    different group than the one ``work seed`` writes into — pinned by
+    package), minus that function's env fallback — the caller already read
+    ``LMER_TASK`` / ``LMER_TASK_TARGET``. The two must agree exactly or
+    container start prepares a different group than the one ``work seed``
+    writes into — pinned equal over the §9.1 derive-slug table by
     ``tests/test_clone_and_exec_session_dir.py``.
+
+    **No work item means the bare taskdef** (run-identity spec §3): a target
+    that is nothing, a path, a bare repository URL or a document URL derives
+    ``<taskdef>`` — the container classifies the value it is given, so a
+    lagging host that still exports ``.`` or the clone URL lands in the bare
+    group anyway, and two plain chats on one project are two records in ONE
+    group (#311, #81). A work item, a thread permalink included (``special``,
+    :func:`is_work_item`), keeps the slug the full-SHA truncation and
+    :func:`sanitize_task_target` derive below.
     """
     taskdef = task_type or "default"
+    if not is_work_item(task_target):
+        return taskdef
     if task_target and _FULL_SHA_RE.fullmatch(task_target):
         return f"{taskdef}-{task_target[:12].lower()}"
     safe = sanitize_task_target(task_target) if task_target else "default"

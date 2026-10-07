@@ -78,10 +78,12 @@ What each test keeps, and why losing it is silent:
   directions, because a second copy of it in a component is how the row and the
   detail header start disagreeing;
 - the ref in the row is the ticket number, parsed from the target with the same
-  vocabulary ``lmer_cli.cli._derive_repo_url_from_task_target`` uses. That
-  function cannot be imported into a browser, so its indicator list is read here
-  and compared against the JS map: a resource kind added there arrives as a
-  failing test rather than as a row that stops naming what it points at. And the
+  vocabulary the CLI's target classifier uses (``work_repo.utils``
+  ``WORK_ITEM_INDICATORS``, the one constant behind
+  ``_derive_repo_url_from_task_target`` in both its copies). It cannot be
+  imported into a browser, so the constant is read here and compared against
+  the JS map: a resource kind added there arrives as a failing test rather than
+  as a row that stops naming what it points at. And the
   parse stays clear of ``_parse_repo_url``, whose SSH branch is the
   character-class ``rstrip(".git")`` bug T28 found and T48 is fixing — a second
   copy of that grammar is how it comes back.
@@ -91,7 +93,6 @@ line reads as quiet rather than as clutter, are verified by building the bundle
 and by live test LT3 on a real phone.
 """
 
-import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -327,19 +328,34 @@ def _resource_icons():
 
 
 def _cli_indicators():
-    """The resource paths ``lmer_cli``'s target parser recognises, from its source.
+    """The path segments the CLI reads a work item out of, from the shared constant.
 
-    Read off the imported function rather than the file, so the comparison is
-    against the grammar that actually ships.
+    ``work_repo.utils.WORK_ITEM_INDICATORS`` is the one definition behind the
+    classifier and both copies of ``_derive_repo_url_from_task_target``
+    (A1-wave0.repository-of), keyed by the bare segment as ``TARGET_KINDS`` is;
+    the id each pair requires is the CLI's business, not the card's.
     """
-    from lmer_cli.cli import _derive_repo_url_from_task_target
+    from work_repo.utils import WORK_ITEM_INDICATORS
 
-    source = inspect.getsource(_derive_repo_url_from_task_target)
-    block = re.search(r"indicators = \((.*?)\)", source, re.S)
-    assert block, "the CLI's target grammar no longer lists the paths it accepts"
-    found = {token.strip("/") for token in re.findall(r"'([^']+)'", block.group(1))}
-    assert found, "the CLI's indicator list is empty"
+    found = {segment for segment, _id in WORK_ITEM_INDICATORS}
+    assert found, "the CLI's work-item indicator list is empty"
     return found
+
+
+def _cli_reference_routes():
+    """The routes the CLI reads a *reference* out of, in the card's bare spelling.
+
+    ``REFERENCE_INDICATORS`` names content inside a repository — a tree, a file,
+    a wiki page, a commit listing, an id-less list page — in GitLab's ``-/``
+    spelling and GitHub's bare one; the prefix is dropped because the card keys
+    by the bare segment. A reference never names a number, so the card has no
+    reason to list one — but ``commits`` is listed, with a ``null`` verdict,
+    from when the derivation's flat tuple carried it beside ``commit``, and a
+    reference route the card does list can only ever be ``null``.
+    """
+    from work_repo.utils import REFERENCE_INDICATORS
+
+    return {route.removeprefix("-/") for route in REFERENCE_INDICATORS}
 
 
 def _probe(body):
@@ -828,10 +844,13 @@ def test_the_target_grammar_knows_every_resource_the_cli_derives_from():
     ``_derive_repo_url_from_task_target`` reads a task target for the *repo*; the
     row reads it for the *number*. Same GitHub PR and issue URLs, same GitLab MR,
     ``issues`` and ``work_items`` forms, same subgroup paths. It cannot be
-    imported into a browser, so this is the seam: its indicator list is the
-    vocabulary, and each entry must be classified in ``TARGET_KINDS`` — either as
-    a resource with a word, or explicitly as ``null`` for a list page or a diff
-    range that has no single number to name.
+    imported into a browser, so this is the seam: the work-item segments
+    (``WORK_ITEM_INDICATORS``) are the vocabulary, and each must be classified
+    in ``TARGET_KINDS`` — either as a resource with a word, or explicitly as
+    ``null`` for a diff range or a commit that has no single number to name.
+    A segment the card lists must be one the CLI reads: a work-item segment,
+    or a reference route (``REFERENCE_INDICATORS``) — a listing or a file,
+    which names no number, so its only verdict is ``null`` (``commits``).
 
     A kind added on either side therefore arrives as a failing test, and somebody
     decides which bucket it is in, instead of a row quietly stopping naming what
@@ -839,17 +858,23 @@ def test_the_target_grammar_knows_every_resource_the_cli_derives_from():
     """
     kinds = _target_kinds()
     indicators = _cli_indicators()
+    references = _cli_reference_routes()
 
     for indicator in indicators:
         assert indicator in kinds, (
             f"lmer_cli derives a repo from {indicator!r} targets and format.js "
             "has no verdict on them — the row would call such a target unnamed"
         )
-    for segment in kinds:
-        assert segment in indicators, (
+    for segment, body in kinds.items():
+        assert segment in indicators or segment in references, (
             f"format.js reads {segment!r} out of a target that lmer_cli does not "
             "recognise as a resource path at all; one of the two is wrong"
         )
+        if segment not in indicators:
+            assert body is None, (
+                f"format.js names a number in {segment!r}, a reference route "
+                "that has none"
+            )
     # The three the row actually names, spelled out: a map that classified
     # everything as null would satisfy the two loops above and name nothing.
     assert _kind_names() == {"issue", "mr", "pr"}, (
