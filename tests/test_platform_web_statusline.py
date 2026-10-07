@@ -337,6 +337,15 @@ class TestTheCallSites:
         assert ':status="status.statusline"' in source
         assert "compact" not in _status_strip_tag(source)
 
+    def test_only_the_chat_pane_is_orange_and_hideable(self):
+        """#507: the assistant pane's meters take its accent and its strip can
+        be hidden; the run view and run list keep the neutral, always-shown strip."""
+        tag = _status_strip_tag(CHAT_PANE.read_text())
+        assert 'meter-color="primary"' in tag and "hideable" in tag
+        for path in (RUN_CARD, RUN_DETAIL):
+            other = _status_strip_tag(path.read_text())
+            assert "meter-color" not in other and "hideable" not in other, path.name
+
     def test_every_call_site_hands_it_the_shells_clock(self):
         """A component reading Date.now() itself drifts from the ages beside
         it, which is why every dated thing in this app takes `now`."""

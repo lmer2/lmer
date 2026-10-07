@@ -1,0 +1,10 @@
+added:
+- "uber lmer's chat header shows a badge counting its open questions to you; tapping it opens them in its run view"
+- "`LMER_PLATFORM_STATUS_STRIP=0` turns the status strip, and the context-rotation reminder reading it, off fleet-wide; uber lmer's pane can hide its strip"
+changed:
+- "Platform digests in uber lmer's chat are compact, collapsible lmer platform rows that link to their run"
+- "uber lmer settings are grouped with readable labels and persistent hints; uber lmer's status meters use its orange accent"
+fixed:
+- "A successful retry of a blocked-request release clears the earlier error banner"
+- "A late older-history page no longer rewinds the chat's tail cursor and replays old rows"
+- "The daemon's startup notice now names where the bind address and port actually came from, including command-line overrides"

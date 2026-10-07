@@ -70,6 +70,8 @@ const TICK_FIELDS = [
     api: 'checkin_window_seconds',
     min: 0,
     label: 'Check-in window (seconds)',
+    unit: 'seconds',
+    singular: 'second',
     hint: 'How long a run may go unlooked-at before it is named in a digest. 0 turns check-ins off.',
   },
   {
@@ -79,6 +81,8 @@ const TICK_FIELDS = [
     api: 'nudge_after_seconds',
     min: 0,
     label: 'Digest reminder after (seconds)',
+    unit: 'seconds',
+    singular: 'second',
     hint: 'How long unretrieved digests wait, beside a quiet session, before one reminder is typed into it. 0 turns reminders off.',
   },
   {
@@ -87,7 +91,9 @@ const TICK_FIELDS = [
     key: 'pending_threshold',
     api: 'nudge_pending_threshold',
     min: 1,
-    label: 'Digest reminder threshold',
+    label: 'Digest reminder threshold (digests)',
+    unit: 'digests',
+    singular: 'digest',
     hint: 'How many digests it takes. At least 1 — use the interval above to turn reminders off.',
   },
 ]
@@ -108,12 +114,19 @@ const TICK_SOURCES = {
   ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.api, [spec.group, spec.key]])),
   rotation_context_threshold: ['rotation', 'context_threshold'],
 }
+const SETTING_LABELS = {
+  model: 'Model',
+  harness: 'Harness',
+  preset: 'Preset',
+  agents: 'Fan-out presets',
+  threads: 'Chat threads',
+}
 const SETTING_HINTS = {
-  model: 'the model the session runs, handed to the harness verbatim',
-  harness: 'agent harness (e.g. claude, codex, pi)',
-  preset: 'named startup preset from the host’s presets file',
-  agents: 'comma-separated preset names the session may fan out to',
-  threads: 'Slack or matrix thread permalinks, one per line',
+  model: 'The model the session runs, handed to the harness verbatim.',
+  harness: 'Agent harness, for example claude, codex or pi.',
+  preset: 'A named startup preset from the host’s presets file.',
+  agents: 'Comma-separated preset names the session may fan out to.',
+  threads: 'Slack or matrix thread permalinks, one per line.',
 }
 
 const reply = ref(null)
@@ -354,103 +367,118 @@ onBeforeUnmount(() => {
         </div>
 
         <template v-else-if="reply">
-          <div v-for="key in SETTING_KEYS" :key="key" class="mb-2">
-            <v-textarea
-              v-if="key === 'threads'"
-              v-model="fields.threads"
-              label="threads"
-              :hint="SETTING_HINTS.threads"
-              persistent-hint
-              rows="3"
-              density="compact"
-              variant="outlined"
-              clearable
-              :disabled="saving"
-            />
-            <v-text-field
-              v-else
-              v-model="fields[key]"
-              :label="key"
-              :hint="SETTING_HINTS[key]"
-              density="compact"
-              variant="outlined"
-              clearable
-              :disabled="saving"
-            />
-            <!-- The provenance line, per field: what will actually run and which
-                 layer decided it. An emptied field falls back to whatever the
-                 layer below says, so "unset" here means lmer's own resolution
-                 (environment, preset, harness default) — not a platform value. -->
-            <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
-              <template v-if="key === 'threads'">
-                next incarnation connects to {{ (reply.settings[key]?.value || []).length }} threads
-                <template v-if="runningDiffers(key)">
-                  · running now: {{ (props.runningSettings?.threads || []).join(', ') || 'none' }}
-                </template>
-              </template>
-              <template v-else-if="reply.settings[key].source === 'env'">
-                ⚠️ an exported environment variable pins this to
-                “{{ reply.settings[key].value }}” — what you save here is
-                persisted but has no effect until that export is removed.
-              </template>
-              <template v-else-if="reply.settings[key].value">
-                next incarnation runs “{{ reply.settings[key].value }}”
-                (from {{ reply.settings[key].source }})
-              </template>
-              <template v-else>
-                unset — the session decides (harness default)
-              </template>
-              <template v-if="key !== 'threads' && runningDiffers(key)">
-                · running now:
-                {{ props.runningSettings?.[key] || 'unset' }}
-              </template>
+          <!-- Three groups, each with its own scope line, because they apply at
+               three different moments: the next incarnation, now, and the
+               daemon's next check. -->
+          <section class="settings-group" aria-labelledby="settings-launch">
+            <h3 id="settings-launch" class="text-title-small mb-1">Session launch</h3>
+            <p class="text-body-small text-medium-emphasis mb-3">
+              Applies to the next incarnation. Empty fields fall back to lmer's own
+              resolution: environment, preset, then harness default.
             </p>
-          </div>
+            <div v-for="key in SETTING_KEYS" :key="key" class="settings-field">
+              <v-textarea
+                v-if="key === 'threads'"
+                v-model="fields.threads"
+                :label="SETTING_LABELS.threads"
+                :hint="SETTING_HINTS.threads"
+                persistent-hint
+                rows="3"
+                auto-grow
+                density="compact"
+                variant="outlined"
+                clearable
+                :disabled="saving"
+              />
+              <v-text-field
+                v-else
+                v-model="fields[key]"
+                :label="SETTING_LABELS[key]"
+                :hint="SETTING_HINTS[key]"
+                persistent-hint
+                density="compact"
+                variant="outlined"
+                clearable
+                :disabled="saving"
+              />
+              <!-- The provenance line, per field: what will actually run and which
+                   layer decided it. -->
+              <p class="text-body-small text-medium-emphasis setting-source">
+                <template v-if="key === 'threads'">
+                  Next incarnation: connects to {{ (reply.settings[key]?.value || []).length }} threads
+                  <template v-if="runningDiffers(key)">
+                    · running now: {{ (props.runningSettings?.threads || []).join(', ') || 'none' }}
+                  </template>
+                </template>
+                <template v-else-if="reply.settings[key].source === 'env'">
+                  ⚠️ an exported environment variable pins this to
+                  “{{ reply.settings[key].value }}” — what you save here is
+                  persisted but has no effect until that export is removed.
+                </template>
+                <template v-else-if="reply.settings[key].value">
+                  Next incarnation: “{{ reply.settings[key].value }}”
+                  (from {{ reply.settings[key].source }})
+                </template>
+                <template v-else>
+                  Next incarnation: unset — the session decides (harness default)
+                </template>
+                <template v-if="key !== 'threads' && runningDiffers(key)">
+                  · running now:
+                  {{ props.runningSettings?.[key] || 'unset' }}
+                </template>
+              </p>
+            </div>
+          </section>
 
-          <v-text-field
-            v-model="fields.chatKeepLast"
-            label="Operator chat: keep last"
-            type="number"
-            min="0"
-            step="1"
-            hint="Keep the newest N entries. 0 turns auto-clear off. Applies to the pane now; history is kept."
-            persistent-hint
-            density="compact"
-            variant="outlined"
-            :disabled="saving"
-          />
+          <section class="settings-group" aria-labelledby="settings-conversation">
+            <h3 id="settings-conversation" class="text-title-small mb-1">Conversation</h3>
+            <p class="text-body-small text-medium-emphasis mb-3">
+              Applies now, to this pane; other open browsers follow within a poll.
+            </p>
+            <div class="settings-field">
+              <v-text-field
+                v-model="fields.chatKeepLast"
+                label="Keep last (entries)"
+                type="number"
+                min="0"
+                step="1"
+                hint="Keep the newest N entries in the operator chat. 0 turns auto-clear off. History is kept."
+                persistent-hint
+                density="compact"
+                variant="outlined"
+                :disabled="saving"
+              />
+            </div>
 
-          <!-- The uber lmer pane's one view switch (issue 488). Platform state,
-               not this browser's: the operator debugging a stuck session from a
-               phone should find it where they left it on the desktop. -->
-          <v-switch
-            v-model="fields.showTranscript"
-            color="primary"
-            density="compact"
-            hide-details
-            :disabled="saving"
-            label="Show uber lmer's working transcript in the chat"
-          />
-          <p class="text-body-small text-medium-emphasis mt-n1 mb-2">
-            Off, the chat is the conversation only: your messages, and what uber
-            lmer posted, asked and answered. On, its tool calls, watch events, hook
-            re-prompts and unposted working notes appear muted beside them.
-            Applies now; other open browsers follow within a poll.
-          </p>
+            <!-- The uber lmer pane's one view switch (issue 488). Platform state,
+                 not this browser's: the operator debugging a stuck session from a
+                 phone should find it where they left it on the desktop. -->
+            <div class="settings-field">
+              <v-switch
+                v-model="fields.showTranscript"
+                color="primary"
+                density="compact"
+                hide-details
+                :disabled="saving"
+                label="Show uber lmer's working transcript in the chat"
+              />
+              <p class="text-body-small text-medium-emphasis setting-source">
+                Off, the chat is the conversation only: your messages, and what uber
+                lmer posted, asked and answered. On, its tool calls, watch events, hook
+                re-prompts and unposted working notes appear muted beside them.
+              </p>
+            </div>
+          </section>
 
-          <!-- The daemon's own reminders. Their own block with their own scope
-               line: everything above applies to the next incarnation, and every
-               one of these applies on the next detection tick — so an operator
-               reading the dialog's opening sentence would otherwise expect a
-               restart these do not need. -->
-          <div class="mt-4 mb-2">
-            <p class="text-body-small text-medium-emphasis mb-2">
+          <section class="settings-group" aria-labelledby="settings-reminders">
+            <h3 id="settings-reminders" class="text-title-small mb-1">Reminders</h3>
+            <p class="text-body-small text-medium-emphasis mb-3">
               Reminders the daemon types into the chat. These apply on its next
               check, in about half a minute — no restart, and the running session
               keeps its context window.
             </p>
 
-            <div v-for="spec in TICK_FIELDS" :key="spec.api" class="mb-2">
+            <div v-for="spec in TICK_FIELDS" :key="spec.api" class="settings-field">
               <v-text-field
                 v-model="fields[spec.field]"
                 :label="spec.label"
@@ -464,14 +492,19 @@ onBeforeUnmount(() => {
                 clearable
                 :disabled="saving"
               />
-              <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
+              <p class="text-body-small text-medium-emphasis setting-source">
                 <template v-if="tickSetting(spec)?.source === 'env'">
                   ⚠️ an exported environment variable pins this to
                   “{{ tickSetting(spec).value }}” — what you save here is
                   persisted but has no effect until that export is removed.
                 </template>
                 <template v-else>
-                  in effect now: {{ tickSetting(spec)?.value }}
+                  <!-- min 0 is exactly the fields whose 0 is the off switch. -->
+                  <template v-if="spec.min === 0 && tickSetting(spec)?.value === 0">In effect now: off</template>
+                  <template v-else>
+                    In effect now: {{ tickSetting(spec)?.value }}
+                    {{ tickSetting(spec)?.value === 1 ? spec.singular : spec.unit }}
+                  </template>
                   (from {{ tickSetting(spec)?.source }})
                 </template>
               </p>
@@ -481,47 +514,53 @@ onBeforeUnmount(() => {
                  0 on it: the API's off-switch is the value 0, and a slider whose
                  lowest position means "never" reads as "always" to everyone who
                  has ever used one. -->
-            <v-switch
-              v-model="fields.rotationOn"
-              color="primary"
-              density="compact"
-              hide-details
-              :disabled="saving"
-              label="Recommend a rotation when the context window fills"
-            />
-            <v-slider
-              v-model="fields.rotationPercent"
-              :min="1"
-              :max="100"
-              :step="1"
-              :disabled="saving || !fields.rotationOn"
-              thumb-label
-              density="compact"
-              class="mt-2"
-            >
-              <template #append>
-                <span class="text-body-small">{{ fields.rotationPercent }}%</span>
-              </template>
-            </v-slider>
-            <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
-              <template v-if="reply.rotation?.context_threshold?.source === 'env'">
-                ⚠️ an exported environment variable pins this to
-                “{{ reply.rotation.context_threshold.value }}” — what you save
-                here is persisted but has no effect until that export is removed.
-              </template>
-              <template v-else-if="reply.rotation?.context_threshold?.value">
-                in effect now: at
-                {{ reply.rotation.context_threshold.value }}% of the context
-                window used, uber lmer is told once — and again at most every
-                fifteen minutes while it stays there — to rotate itself at its
-                next breakpoint. It decides when; nothing here ends a session.
-              </template>
-              <template v-else>
-                off — uber lmer is never told its context window is filling.
-                Needs a harness that publishes the reading on its status line.
-              </template>
-            </p>
-          </div>
+            <div class="settings-field">
+              <v-switch
+                v-model="fields.rotationOn"
+                color="primary"
+                density="compact"
+                hide-details
+                :disabled="saving"
+                label="Recommend a rotation when the context window fills"
+              />
+              <v-slider
+                v-model="fields.rotationPercent"
+                :min="1"
+                :max="100"
+                :step="1"
+                :disabled="saving || !fields.rotationOn"
+                label="Context used"
+                thumb-label
+                hide-details
+                density="compact"
+                class="mt-2"
+              >
+                <template #append>
+                  <span class="text-body-small">{{ fields.rotationPercent }}%</span>
+                </template>
+              </v-slider>
+              <p class="text-body-small text-medium-emphasis setting-source">
+                <template v-if="reply.rotation?.context_threshold?.source === 'env'">
+                  ⚠️ an exported environment variable pins this to
+                  “{{ reply.rotation.context_threshold.value }}” — what you save
+                  here is persisted but has no effect until that export is removed.
+                </template>
+                <template v-else-if="reply.rotation?.context_threshold?.value">
+                  In effect now: at
+                  {{ reply.rotation.context_threshold.value }}% of the context
+                  window used, uber lmer is told once — and again at most every
+                  fifteen minutes while it stays there — to rotate itself at its
+                  next breakpoint. It decides when; nothing here ends a session.
+                  Needs the status strip, which LMER_PLATFORM_STATUS_STRIP=0 turns off.
+                </template>
+                <template v-else>
+                  In effect now: off — uber lmer is never told its context window is filling.
+                  Needs a harness that publishes the reading on its status line, and the
+                  status strip left on.
+                </template>
+              </p>
+            </div>
+          </section>
 
           <!-- Two banners, because a save has two truths: the shadowed one must
                not offer a restart that provably runs the exported value again —
@@ -587,3 +626,18 @@ onBeforeUnmount(() => {
     </v-card>
   </v-dialog>
 </template>
+
+<style scoped>
+.settings-group + .settings-group {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.settings-field {
+  margin-bottom: 12px;
+}
+.setting-source {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+</style>

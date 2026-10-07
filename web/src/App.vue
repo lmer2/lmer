@@ -641,6 +641,7 @@ async function doPrune() {
 function open(run) {
   activeProject.value = run.workspace_id || ''
   selectedKey.value = keyOf(run)
+  questionsFocus.value = null
   view.value = 'detail'
   // On a phone the drawer is an overlay sitting on top of the run it was just
   // used to open.
@@ -656,6 +657,25 @@ function open(run) {
 // instead.
 const runRefNotice = ref(null)
 let stopRunRefs = null
+
+// uber lmer's question badge (issue 507): open its own fleet row and point the run
+// view at the ask dock. A nonce, so a second tap on the same run focuses again.
+const questionsFocus = ref(null)
+let questionsNonce = 0
+
+function openAssistantQuestions(sessionId) {
+  const run = (state.value?.runs || []).find((candidate) => candidate.orchestrator
+    && sessionId && (candidate.session?.id === sessionId || candidate.last_session_id === sessionId))
+  if (!run) {
+    runRefNotice.value = 'uber lmer\'s session is not in the fleet view yet — its questions will be answerable there once it is'
+    return
+  }
+  runRefNotice.value = null
+  open(run)
+  questionsNonce += 1
+  questionsFocus.value = { key: keyOf(run), nonce: questionsNonce }
+  if (mobile.value) uberOpen.value = false
+}
 
 function openRunRef(ref) {
   const run = (state.value?.runs || []).find((candidate) => keyOf(candidate) === ref.key)
@@ -831,7 +851,8 @@ onUnmounted(() => {
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
       <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject">
         <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
-          @settings="activeProject = project.id; view = 'project-settings'" @close="uberOpen = false" />
+          @settings="activeProject = project.id; view = 'project-settings'" @close="uberOpen = false"
+          @questions="openAssistantQuestions" />
       </div>
       <p v-if="!chatWorkspace || chatWorkspace.archived" class="pa-4">Choose an active project to open its assistant chat.</p>
     </v-navigation-drawer>
@@ -887,6 +908,7 @@ onUnmounted(() => {
           :slots="slots"
           :now="now"
           :projects="projects"
+          :focus-questions="questionsFocus?.key === selectedKey ? questionsFocus.nonce : 0"
           @close="view = 'fleet'"
           @changed="load"
           @open="open"

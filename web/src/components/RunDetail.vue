@@ -1,5 +1,5 @@
 <script setup>
-import { computed, defineAsyncComponent, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import {
   mdiRobot, mdiClipboardTextOutline, mdiClockAlertOutline,
   mdiClockOutline, mdiCommentQuestionOutline, mdiConsole, mdiExitRun,
@@ -52,6 +52,9 @@ const props = defineProps({
   run: { type: Object, required: true },
   identifiedWorkspaceId: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
+  // Non-zero, and changed, when the shell asks for this run's open questions
+  // (uber lmer's header badge, issue 507).
+  focusQuestions: { type: Number, default: 0 },
 })
 
 // `open` is forwarded from the related-runs switcher at the bottom of the page
@@ -279,8 +282,36 @@ const { count: operatorCount, unread: operatorUnread } = useOperatorChat(
 )
 watch(terminalSession, () => { operatorEntries.value = [] })
 
+// The badge and this dock read different polls, so the question can arrive
+// after the request: it stays pending until the dock has a reply box to focus,
+// for about one poll of each, so a much later question does not steal focus.
+const FOCUS_WAIT_MS = 15000
+const askDock = ref(null)
+let focusPending = false
+let focusUntil = 0
+
+function focusAskDock() {
+  if (!focusPending || Date.now() > focusUntil) return
+  const dock = askDock.value?.$el
+  if (!(dock instanceof Element)) return
+  dock.scrollIntoView?.({ block: 'start' })
+  const reply = dock.querySelector('textarea')
+  if (!reply) return
+  reply.focus({ preventScroll: true })
+  focusPending = false
+}
+
+watch(() => props.focusQuestions, async (nonce) => {
+  if (!nonce) return
+  focusPending = true
+  focusUntil = Date.now() + FOCUS_WAIT_MS
+  await nextTick()
+  focusAskDock()
+}, { immediate: true })
+
 function receiveOperatorEntries(page) {
   if (page.sessionId === terminalSession.value) operatorEntries.value = page.entries
+  if (focusPending) nextTick(focusAskDock)
 }
 
 // A run stopped on a question has no session to type into, and answering it is a
@@ -789,6 +820,7 @@ async function forget() {
          run, so the tabs sit where they always did until a session posts. -->
     <AskChannel
       v-if="terminalSession"
+      ref="askDock"
       :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
       :live="!!run.live"

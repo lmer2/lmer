@@ -114,6 +114,7 @@ import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
 import { readDraft, storeDraft } from '../projects.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
+import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -625,6 +626,7 @@ function threadLink(message) {
 // the operator's own channel, which is still "you". An agent record keeps the
 // agent's label; its kind is a chip in the header, not a speaker.
 function speaker(message) {
+  if (message.digest) return SPEAKERS.platform
   const source = message.source
   if (source && source.channel && source.channel !== 'agent') {
     if (source.channel === 'platform' && (!source.author || source.author === 'operator')) {
@@ -634,6 +636,29 @@ function speaker(message) {
   }
   if (message.role === 'assistant') return props.agentLabel
   return SPEAKERS[message.role] || OTHER_SPEAKER
+}
+
+// A digest is the platform's record of something a run did (issue 507): drawn
+// as one line naming the run, with the full text on demand.
+function digestRef(message) {
+  const run = message.digest?.run
+  return run ? parseRunRef(`lmer://run/${runKey(run)}`) : null
+}
+
+function digestPreview(message) {
+  const run = message.digest?.run
+  let text = String(message.text || '')
+  const prefix = run ? `${runKey(run)} ` : null
+  if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length)
+  return text.split('\n', 1)[0]
+}
+
+const openDigests = ref(new Set())
+
+function toggleDigest(message) {
+  const next = new Set(openDigests.value)
+  if (!next.delete(message.id)) next.add(message.id)
+  openDigests.value = next
 }
 
 function stale(mine) {
@@ -856,7 +881,9 @@ function absorb(page, mode = 'append') {
   if (follow) nextTick(stickToBottom)
 }
 
-function absorbHistory(page) {
+// `older`: a `before` page. Its `total` was read when it was requested and can
+// predate what polling has since seen, so it must not move the tail cursor.
+function absorbHistory(page, { older = false } = {}) {
   const conversation = page.history?.conversation
   if (historyConversation && conversation !== historyConversation) {
     messages.value = []
@@ -866,7 +893,10 @@ function absorbHistory(page) {
   messages.value = mergeHistory(messages.value, page)
   const previous = historyGenerations.value.get(page.session)
   historyGenerations.value = new Map(historyGenerations.value).set(page.session, {
-    ...page.history, cursor: Math.min(page.total, Math.max(previous?.cursor || 0, page.cursor)),
+    ...page.history,
+    cursor: older && previous
+      ? previous.cursor
+      : Math.min(page.total, Math.max(previous?.cursor || 0, page.cursor)),
   })
   const sources = new Map(sessions.value.map((source) => [`${source.session}:${source.id}`, source]))
   for (const source of page.sessions || []) sources.set(`${source.session}:${source.id}`, source)
@@ -895,7 +925,7 @@ async function loadRecentHistory(mine) {
       ...request, since: -remaining, limit: remaining, view: props.view,
     })
     if (stale(mine)) return
-    absorbHistory(previous)
+    absorbHistory(previous, { older: !!request.before })
   }
 }
 
@@ -1022,7 +1052,7 @@ async function loadEarlier() {
     earlierLoading = true
     try {
       const page = await fetchAssistantHistory(request.session, { ...request, limit: PAGE, view: props.view })
-      if (!stale(mine)) absorbHistory(page)
+      if (!stale(mine)) absorbHistory(page, { older: !!request.before })
     } catch (exc) {
       if (!stale(mine)) problem.value = exc.message
     } finally {
@@ -1358,7 +1388,7 @@ watch(rendererLoaded, () => {
           v-for="message in visible"
           :key="message.id ?? message.seq"
           class="turn"
-          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation' }]"
+          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation', 'turn-digest': !!message.digest }]"
         >
           <div class="d-flex align-center ga-2 text-body-small text-medium-emphasis">
             <span>{{ speaker(message) }}</span>
@@ -1377,6 +1407,17 @@ watch(rendererLoaded, () => {
                  (a note, a milestone, a question, an answer — a late one says
                  so), beside who said it. A plain message carries no chip. -->
             <span v-if="message.comms_kind">· {{ message.comms_kind }}</span>
+            <template v-if="message.digest?.run">
+              <span>·</span>
+              <button
+                v-if="digestRef(message)"
+                type="button"
+                class="digest-run"
+                :title="digestRef(message).key"
+                @click="dispatchRunRef(digestRef(message))"
+              >{{ message.digest.run.label || message.digest.run.slug }}</button>
+              <span v-else>{{ message.digest.run.label || message.digest.run.slug }}</span>
+            </template>
             <!-- A terminal line rebuilt from keystrokes, not read: it is a
                  prediction of what the human typed, and an edited or completed
                  line can differ from it. Marked so the people reading the
@@ -1423,11 +1464,19 @@ watch(rendererLoaded, () => {
           >
             … earlier part of this message trimmed — the terminal has all of it
           </p>
+          <button
+            v-if="message.text && message.digest"
+            type="button"
+            class="digest-toggle text-body-small"
+            :aria-expanded="openDigests.has(message.id)"
+            @click="toggleDigest(message)"
+          >{{ openDigests.has(message.id) ? 'hide details' : digestPreview(message) }}</button>
           <p
             v-if="message.text && (
               message.role === 'user' || message.role === 'platform'
             )"
             class="text-body-medium said plain"
+            v-show="!message.digest || openDigests.has(message.id)"
           >{{ message.text }}</p>
           <!-- A watch firing: the condition it was armed on and the line that
                fired it, which the server has already dug out of the harness's
@@ -1740,6 +1789,39 @@ watch(rendererLoaded, () => {
 .turn-rotation {
   border-block: 1px solid rgba(var(--v-theme-on-surface), 0.25);
   padding-block: 1rem;
+}
+.digest-run,
+.digest-toggle {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  text-align: start;
+}
+.digest-run {
+  text-decoration: underline;
+}
+/* Wrap between the header's parts, never inside one: a run label beside the
+   kind chip otherwise squeezes "lmer platform" onto two lines. */
+.turn-digest > .d-flex {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.turn-digest > .d-flex > span {
+  white-space: nowrap;
+}
+.turn-digest > .d-flex > .v-spacer {
+  display: none;
+}
+.turn-digest > .d-flex > :last-child {
+  margin-inline-start: auto;
+}
+.digest-toggle {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 /* A conversation is a column of turns, not a table: the only layout decisions
    here are the gap between them and which side a turn leans to.

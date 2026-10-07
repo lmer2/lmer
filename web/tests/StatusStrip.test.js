@@ -142,3 +142,33 @@ it('keeps unknown and future source dates visible in the single caption', () => 
   copy.context.age_seconds = -1
   expect(statusAge(copy)).toBe('clock ahead')
 })
+
+it('lets the assistant pane hide its strip, remembers it, and leaves other strips shown', async () => {
+  const buttonNamed = (wrapper, text) => wrapper.findAll('button').find((item) => item.text() === text)
+  const pane = mountPane(StatusStrip, { status, hideable: true, meterColor: 'primary' })
+  const run = mountPane(StatusStrip, { status })
+  expect(pane.text()).toContain('44%')
+  expect(pane.findAllComponents({ name: 'VProgressLinear' }).map((meter) => meter.props('color'))).toEqual(['primary', 'primary'])
+  expect(run.findAllComponents({ name: 'VProgressLinear' }).map((meter) => meter.props('color'))).toEqual(['tone-idle', 'tone-idle'])
+  expect(buttonNamed(run, 'hide')).toBeUndefined()
+  await buttonNamed(pane, 'hide').trigger('click')
+  expect(pane.text()).not.toContain('44%')
+  expect(buttonNamed(pane, 'show status')).toBeDefined()
+  expect(run.text()).toContain('44%')
+  expect(window.localStorage.getItem('lmer:assistant-status-strip')).toBe('on')
+  pane.unmount()
+  vi.resetModules()
+  StatusStrip = (await import('../src/components/StatusStrip.vue')).default
+  const reopened = mountPane(StatusStrip, { status, hideable: true })
+  expect(reopened.text()).not.toContain('44%')
+  expect(mountPane(StatusStrip, { status }).text()).toContain('44%')
+  await buttonNamed(reopened, 'show status').trigger('click')
+  expect(reopened.text()).toContain('44%')
+  expect(window.localStorage.getItem('lmer:assistant-status-strip')).toBe('off')
+})
+
+it('shows the assistant strip by default and when storage refuses access', () => {
+  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked') })
+  expect(mountPane(StatusStrip, { status, hideable: true }).text()).toContain('44%')
+  vi.restoreAllMocks()
+})
