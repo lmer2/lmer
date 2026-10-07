@@ -36,7 +36,13 @@ by default; the apply is `--apply`.
    checkout's directory name, and the ONE-line notice that this flips the
    whole tree is printed by the dry run too: the first adoption in an
    instance is a bigger step than the tenth.
-4. APPLY — under the mutation lock: the clean-tree re-check, the §1.6
+4. APPLY — the mutation lock is taken FIRST and held from planning through
+   publication: the whole plan (steps 1–3, the record enumeration, the fix
+   list) is built inside it, never carried in from before. A session can
+   create and commit a live record in the bucket while an adoption plans
+   or waits for the lock; the tree is clean in git, yet a plan from before
+   never lists that record and the move would relocate it underneath its
+   writer. Then, still under the lock: the clean-tree check, the §1.6
    preflight (:func:`work_repo.migrate.preflight_no_live_records` over
    every record under the bucket; any line refuses with nothing changed),
    the registry entry through the writer FIRST (the step that can still be
@@ -47,7 +53,8 @@ by default; the apply is `--apply`.
    depth-matched symlink at the old path (the §4 "symlink = INFO" form),
    the namespace levels the move emptied removed, and ONE commit through
    :func:`git_ops.commit_work_path` — the existing commit → rebase → push
-   helper — with both paths staged so the move lands as a move.
+   helper — with both paths staged so the move lands as a move. The dry run
+   plans without the lock: it is read-only and serializes nothing.
 5. RECORD — inside a session, one :data:`ADOPT_EVENT` (name + repo) and a
    run-log line in the CALLER's own record, staged with the commit;
    outside, only the commit, whose message carries the same facts. Adopt is
@@ -132,8 +139,9 @@ class Plan:
     plain rename), `link` the relative symlink target left at the old path
     with `--compat-link`, `fix_list` the schema-tier findings, `records` the
     record dirs that move (the preflight's input). Git cleanliness is not
-    stored here — the dry run reports it and the apply re-checks it under
-    the lock, since it can change in between.
+    stored here — the dry run reports it and the apply checks it under the
+    lock, right after planning there. A dry run's plan is never the apply's:
+    the apply builds its own inside the lock (module docstring, step 4).
     """
 
     root: Path
@@ -361,9 +369,11 @@ def plan_adoption(
     compat_link: bool = False,
     force: bool = False,
 ) -> Plan:
-    """The plan for adopting *bucket* as *name*, after every check that
-    needs no lock (module docstring, steps 1–3). Raises :class:`AdoptError`
-    on each refusal, with the remedy in the text."""
+    """The plan for adopting *bucket* as *name*, after every check that is
+    the plan's (module docstring, steps 1–3). Read-only. The dry run calls
+    it bare; the apply calls it inside the mutation lock, so what it
+    enumerates is what the apply moves. Raises :class:`AdoptError` on each
+    refusal, with the remedy in the text."""
     root = Path(root) if root is not None else work_repo_root()
     try:
         from lmer_cli.container.sources import scrub_credentials
@@ -583,15 +593,33 @@ def _dirty_paths(root: Path, rels: list) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -> int:
-    """Under the mutation lock: re-check the tree, run the preflight, write
-    the registry entry, move, link, record, commit once. Returns the exit
-    code."""
+def _apply(
+    bucket,
+    name,
+    *,
+    root: Path,
+    remotes: Iterable[str],
+    description: Optional[str],
+    compat_link: bool,
+    force: bool,
+    out: Callable[[str], None],
+    err: Callable[[str], None],
+) -> int:
+    """Under the mutation lock, from planning through publication: build the
+    plan, check the tree, run the preflight, write the registry entry, move,
+    link, record, commit once. Returns the exit code.
+
+    The plan is built INSIDE the lock, not handed in (module docstring, step
+    4): a record created and committed while the apply planned or waited is
+    clean in git, and only a plan made under the lock lists it for the
+    preflight. The planner's own refusals — a taken name, a bucket that is
+    no longer a real directory — are the re-checks; nothing is checked
+    against a snapshot older than the lock.
+    """
     ManifestError = core_module("manifest").ManifestError
     writer_api = core_module("writer")
     create, load_for_write = writer_api.create, writer_api.load_for_write
 
-    root = plan.root
     configured = work_repo_root()
     if _resolved(root) != _resolved(configured):
         raise AdoptError(
@@ -599,11 +627,11 @@ def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -
             f"into ({root}): the commit helper is bound to the configured checkout"
         )
     with work_mutation(root):
+        plan = plan_adoption(
+            bucket, name, root=root, remotes=remotes, description=description,
+            compat_link=compat_link, force=force,
+        )
         problems = list(plan.blockers())
-        if os.path.lexists(root / plan.name):
-            problems.append(f"`{plan.name}/` now exists at the top level of {root}")
-        if plan.bucket_dir.is_symlink() or not plan.bucket_dir.is_dir():
-            problems.append(f"`{plan.bucket}` is no longer a real directory")
         problems += [f"dirty in git: {line}" for line in _dirty_paths(root, plan.git_paths())]
         problems += preflight_no_live_records(plan.records)
         if problems:
@@ -678,7 +706,13 @@ def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -
 
         # 5. The caller's record, then ONE commit with both paths staged.
         paths = plan.git_paths() + _record_in_caller(plan, out)
-        return git_ops.commit_work_path(paths, plan.commit_message())
+        rc = git_ops.commit_work_path(paths, plan.commit_message())
+        if rc == 0:
+            out(
+                f"✅ work adopt {plan.name}: `{plan.bucket}/` is `{plan.name}/` and "
+                "registered, in one commit"
+            )
+        return rc
 
 
 def _resolved(path: Path) -> Path:
@@ -752,34 +786,35 @@ def adopt_project(
 ) -> int:
     """`work adopt <host>/<project> <shortname> [...]` as a library call.
 
-    Plans (printing the plan through *out* on a dry run), applies when
-    asked, and reports every refusal through *err* (stderr by default) with
-    exit code 1.
+    A dry run plans without the lock and prints the plan through *out*; the
+    apply plans and acts under the mutation lock (:func:`_apply`). Every
+    refusal is reported through *err* (stderr by default) with exit code 1.
     """
     if err is None:
         err = lambda line: print(line, file=sys.stderr)  # noqa: E731
     if isinstance(remotes, str):
         remotes = (remotes,)
+    root = Path(root) if root is not None else work_repo_root()
     try:
-        plan = plan_adoption(
-            bucket, name, root=root, remotes=remotes, description=description,
-            compat_link=compat_link, force=force,
-        )
         if not apply:
+            plan = plan_adoption(
+                bucket, name, root=root, remotes=remotes, description=description,
+                compat_link=compat_link, force=force,
+            )
             out(plan.render())
-            dirty = _dirty_paths(plan.root, plan.git_paths())
+            dirty = _dirty_paths(root, plan.git_paths())
             if dirty:
                 out("dirty in git (the apply refuses until these are clean):")
                 for line in dirty:
                     out(f"  {line}")
             return 0
-        rc = _apply(plan, out, err)
+        return _apply(
+            bucket, name, root=root, remotes=remotes, description=description,
+            compat_link=compat_link, force=force, out=out, err=err,
+        )
     except AdoptError as exc:
         err(f"❌ {exc}")
         return 1
-    if rc == 0:
-        out(f"✅ work adopt {name}: `{plan.bucket}/` is `{name}/` and registered, in one commit")
-    return rc
 
 
 def cmd_adopt(args) -> int:

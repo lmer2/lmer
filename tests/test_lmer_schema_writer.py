@@ -27,6 +27,13 @@ neither grows YAML dump code of its own. These tests pin its contract:
   (``tests/test_lmer_schema_manifest_roundtrip.py``) holds THROUGH this
   API on ``tests/fixtures/plexus_manifest/commented.yaml``, byte for byte,
   including the case the spike left open — an entry with no keys;
+- two keys that share ONE node through a YAML anchor/alias (MR !380
+  review: ``taskdef: &common {...}`` / ``napkin: *common``, where updating
+  ``taskdef`` alone used to persist BOTH at the old value) are written out
+  as independent mappings — the persisted, re-parsed file holds the
+  requested two-source result, alias syntax dropped, every comment once;
+  a merge key (``<<: *common``) is refused before any write; a document
+  that shares nothing is not affected;
 - ``import lmer_schema`` never loads ruamel (the writer imports it lazily),
   and the writer imports the relocation rule from nowhere — least of all
   from the test module that measured it.
@@ -869,6 +876,210 @@ class TestEntryWithNoKeys:
         load_for_write(path).remove_project("two")
         assert path.read_text(encoding="utf-8") == "schema: 1\nname: edge\nprojects:\n  bare: null\n"
         assert _assert_clean(path).projects == {"bare": {}}
+
+
+# ---------------------------------------------------------------------------
+# Anchors and aliases — one slot, one node (MR !380 review)
+# ---------------------------------------------------------------------------
+
+SHARED = "https://git.example.com/g/shared.git"
+TASKS = "https://git.example.com/g/tasks.git"
+
+#: The review's document: ``taskdef`` and ``napkin`` are ONE ruamel node.
+ALIASED_FLOW = (
+    "schema: 1\nname: edge\nprojects:\n  one:\n    repo: h/one\n"
+    f"sources:\n  taskdef: &common {{repo: {SHARED}}}\n  napkin: *common\n"
+)
+#: The same sharing in block style, with a comment in every position ruamel
+#: treats specially around an anchor or alias: on the anchored key's line,
+#: after the shared scalar, above the alias, on the alias line, after it.
+ALIASED_BLOCK = (
+    "schema: 1\nname: edge\nprojects:\n  one:\n    repo: h/one\n"
+    "sources:\n"
+    "  taskdef: &common  # anchored\n"
+    f"    repo: {SHARED}  # eol\n"
+    "  # napkin shares it\n"
+    "  napkin: *common  # alias eol\n"
+    "\n"
+    "# tail\n"
+    "housekeeping:\n  plans: {archive_after: null}\n"
+)
+#: The review's request: ``taskdef`` moves, ``napkin`` stays.
+TWO_SOURCES = {"taskdef": {"repo": TASKS}, "napkin": {"repo": SHARED}}
+#: What the writer emits for each: independent mappings, alias syntax
+#: dropped, each key line's comment back on its line at the column it had.
+TWO_SOURCES_FLOW = (
+    "schema: 1\nname: edge\nprojects:\n  one:\n    repo: h/one\n"
+    f"sources:\n  taskdef: {{repo: {TASKS}}}\n  napkin: {{repo: {SHARED}}}\n"
+)
+TWO_SOURCES_BLOCK = (
+    "schema: 1\nname: edge\nprojects:\n  one:\n    repo: h/one\n"
+    "sources:\n"
+    "  taskdef:          # anchored\n"
+    f"    repo: {TASKS}   # eol\n"
+    "  # napkin shares it\n"
+    "  napkin:          # alias eol\n"
+    f"    repo: {SHARED}\n"
+    "\n"
+    "# tail\n"
+    "housekeeping:\n  plans: {archive_after: null}\n"
+)
+
+
+class TestAnchorsAndAliases:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [(ALIASED_FLOW, TWO_SOURCES_FLOW), (ALIASED_BLOCK, TWO_SOURCES_BLOCK)],
+        ids=["flow", "block"],
+    )
+    def test_updating_one_of_two_aliased_sources_persists_both_values(
+        self, tmp_path, text, expected
+    ):
+        """The review's case. Both keys referenced one mapping; updating it
+        through ``taskdef`` and then "keeping" it through ``napkin`` undid
+        the first update, and the call returned ``True`` with the PERSISTED
+        file pointing both at ``shared.git``. Pinned on the re-parsed file,
+        not the handle."""
+        path = _write(tmp_path, text)
+        writer = load_for_write(path)
+        assert writer.set_sources(TWO_SOURCES) is True
+        out = path.read_text(encoding="utf-8")
+        persisted = parse_manifest(out, path=path)
+        assert persisted.sources == TWO_SOURCES
+        assert persisted.sources["taskdef"]["repo"] == TASKS
+        assert persisted.sources["napkin"]["repo"] == SHARED
+        assert yaml.safe_load(out)["sources"] == TWO_SOURCES
+        assert writer.manifest.sources == TWO_SOURCES
+        assert _assert_clean(path).sources == TWO_SOURCES
+        assert "&common" not in out and "*common" not in out
+        _assert_text(expected, out)
+
+    def test_block_alias_document_prints_every_comment_once_in_order(self, tmp_path):
+        """ruamel mirrors the anchored key's comment onto the alias key by
+        identity and hangs what follows the alias line on the shared node;
+        detached, nothing prints twice and nothing moves out of order."""
+        path = _write(tmp_path, ALIASED_BLOCK)
+        load_for_write(path).set_sources(TWO_SOURCES)
+        out = path.read_text(encoding="utf-8")
+        comments = ["# anchored", "# eol", "# napkin shares it", "# alias eol", "# tail"]
+        for comment in comments:
+            assert out.count(comment) == 1, out
+        positions = [out.index(comment) for comment in comments]
+        assert positions == sorted(positions), out
+        _assert_clean(path)
+
+    def test_aliased_entries_set_to_what_they_hold_write_nothing(self, tmp_path):
+        """A no-op stays a no-op: the detach happens in memory on load, and
+        a file nothing was written to keeps its alias syntax."""
+        path = _write(tmp_path, ALIASED_FLOW)
+        before = path.read_bytes()
+        writer = load_for_write(path)
+        assert writer.set_sources({"taskdef": {"repo": SHARED}, "napkin": {"repo": SHARED}}) is False
+        assert path.read_bytes() == before
+        assert b"*common" in before
+
+    def test_load_gives_each_slot_its_own_node_and_leaves_a_shared_nothing_alone(self):
+        """Unit view of the rule: after ``_load`` the two keys hold two equal
+        but distinct nodes, and a document with no sharing — the spike's
+        fixture — still round-trips byte for byte."""
+        from lmer_schema import writer as module
+
+        section = module._load(ALIASED_FLOW)["sources"]
+        assert section["taskdef"] is not section["napkin"]
+        assert section["taskdef"] == section["napkin"] == {"repo": SHARED}
+        text = FIXTURE.read_text(encoding="utf-8")
+        assert module._dump(module._load(text)) == text
+
+    def test_an_anchored_key_line_comment_stays_on_its_line(self, tmp_path):
+        """No alias at all: an anchor between the key and its comment made
+        ruamel park the comment where the fold printed it on a line of its
+        own. It is the key line's comment and stays there, column kept."""
+        path = _write(
+            tmp_path,
+            "schema: 1\nname: edge\nsources:\n  taskdef: &common  # note\n"
+            f"    repo: {SHARED}\n    ref: main\n",
+        )
+        load_for_write(path).set_sources({"taskdef": {"repo": SHARED, "ref": "v2"}})
+        _assert_text(
+            f"schema: 1\nname: edge\nsources:\n  taskdef:          # note\n"
+            f"    repo: {SHARED}\n    ref: v2\n",
+            path.read_text(encoding="utf-8"),
+        )
+        _assert_clean(path)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "projects:\n  one: &p {repo: https://git.example.com/acme/one.git}\n  two: *p\n",
+            "projects:\n  one: {repo: h/one, remotes: &r [github.com/acme/one]}\n"
+            "  two: {repo: h/two, remotes: *r}\n",
+        ],
+        ids=["entry", "remotes"],
+    )
+    def test_projects_sharing_a_node_with_a_remote_are_refused_before_the_writer_opens(
+        self, tmp_path, text
+    ):
+        """The one in-place rewrite of a ``projects:`` entry is
+        ``canonicalize_project``, and the only nodes it rewrites — ``repo``
+        and ``remotes`` — are identities the registry lets ONE entry hold:
+        shared, they are refused at ``load_for_write`` (never make a broken
+        manifest worse), so no mutation can reach them."""
+        text = "schema: 1\nname: edge\n" + text
+        path = _write(tmp_path, text)
+        with pytest.raises(RegistryError) as excinfo:
+            load_for_write(path)
+        assert "claimed by both" in str(excinfo.value)
+        assert path.read_text(encoding="utf-8") == text
+
+    def test_projects_sharing_a_description_are_written_out_independently(self, tmp_path):
+        """What the registry DOES let two entries share — a description —
+        is detached like any other node: a write that touches a neighbour
+        emits two independent entries holding the same values, and the
+        pair survives a rename."""
+        path = _write(
+            tmp_path,
+            "schema: 1\nname: edge\nprojects:\n"
+            "  ops: &weekly {description: Weekly review}\n"
+            "  review: *weekly\n"
+            "  one:\n    repo: https://git.example.com/acme/one.git\n",
+        )
+        writer = load_for_write(path)
+        assert writer.canonicalize_project("one") is True
+        manifest = _assert_clean(path)
+        assert manifest.projects["ops"] == manifest.projects["review"] == {"description": "Weekly review"}
+        assert manifest.projects["one"] == {"repo": "git.example.com/acme/one"}
+        out = path.read_text(encoding="utf-8")
+        assert "&weekly" not in out and "*weekly" not in out
+        assert "  ops: {description: Weekly review}\n  review: {description: Weekly review}\n" in out
+        assert writer.rename_project("review", "weekly") is True
+        manifest = _assert_clean(path)
+        assert list(manifest.projects) == ["ops", "weekly", "one"]
+        assert manifest.projects["weekly"] == {"description": "Weekly review"}
+
+    def test_set_sources_refuses_an_entry_assembled_with_a_merge_key(self, tmp_path):
+        """``napkin: {<<: *common}`` is its own node whose ``repo`` READS
+        THROUGH to ``taskdef``'s: updated key by key, a successful call left
+        ``napkin`` reading ``taskdef``'s new value. Refused before any write,
+        naming the entry; what the section already holds is still a no-op;
+        the handle stays usable and the merge syntax survives a write that
+        does not touch ``sources:``."""
+        text = ALIASED_FLOW.replace("napkin: *common", "napkin: {<<: *common}")
+        held = {"taskdef": {"repo": SHARED}, "napkin": {"repo": SHARED}}
+        path = _write(tmp_path, text)
+        writer = load_for_write(path)
+        assert writer.manifest.sources == held
+        assert writer.set_sources(held) is False
+        with pytest.raises(WriterError) as excinfo:
+            writer.set_sources(TWO_SOURCES)
+        message = str(excinfo.value)
+        assert "`sources.napkin`" in message and "merge key" in message
+        assert "sources.taskdef" not in message
+        assert path.read_text(encoding="utf-8") == text
+        assert _only_manifest(tmp_path)
+        assert writer.add_project("two", repo="h/two") is True
+        out = path.read_text(encoding="utf-8")
+        assert "napkin: {<<: *common}" in out
+        assert _assert_clean(path).sources == held
 
 
 # ---------------------------------------------------------------------------

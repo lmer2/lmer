@@ -332,9 +332,10 @@ def sanitize_task_target(task_target: str) -> str:
 #: id-less list pages are :data:`REFERENCE_INDICATORS`. Tickets take a number;
 #: a commit or a compare range takes any one segment (``/-/commit/main`` names
 #: a commit by ref and derives a repository today, so it stays a work item
-#: rather than falling to ``other``). The segment is matched anywhere in the
-#: path, which is today's reach (every URL that derives a repository today
-#: stays derivable).
+#: rather than falling to ``other``). The segment is read in the forge's ROUTE
+#: position only (:func:`_forge_route`: the first segment after GitLab's
+#: ``/-/``, the third on GitHub's shape) — never later in the path, where
+#: ``issues/123`` is a filename (astra, !380).
 #:
 #: The shape is chosen so ONE definition can serve its three readers: the
 #: classifier (the regex below), the repository derivation (membership of a
@@ -354,35 +355,34 @@ WORK_ITEM_INDICATORS = (
     ("compare", r"[^/]+"),
 )
 
-#: Row 4 — content inside a forge repository (#523, #391). GitLab's ``/-/``
-#: routes match anywhere in the path, with or without a tail, so the id-less
-#: list pages ``/-/issues``, ``/-/work_items`` and ``/-/merge_requests`` land
-#: here once row 3 has passed on them. GitHub's routes match only in GitHub's
-#: ``/<owner>/<repo>/<route>`` position, so a MediaWiki ``/wiki/`` page or a
-#: docs site's ``/tree/`` is not read as forge content. ``commits`` (GitLab
-#: ``/-/commits/<ref>``, GitHub ``/commits/<ref>``) is a reference and not a
-#: work item: it names a listing the way ``/tree/`` does, and it derives a
-#: repository today, so it may not fall to ``other``.
+#: Row 4 — content inside a forge repository (#523, #391), read in the same
+#: route position as row 3. GitLab's ``-/`` spellings are the route after
+#: ``/-/``, with or without a tail, so the id-less list pages ``/-/issues``,
+#: ``/-/work_items`` and ``/-/merge_requests`` land here once row 3 has passed
+#: on them; the ``/-/`` is the forge's own marker, so they need no host rule.
+#: GitHub's bare spellings are the route in GitHub's ``/<owner>/<repo>/<route>``
+#: position AND need a known forge host (:func:`_known_http_forge`), so a
+#: MediaWiki ``/wiki/`` page or a docs site's ``/a/b/tree/x`` is not read as
+#: forge content and ``repository_of`` invents no clone URL for it. ``commits``
+#: (GitLab ``/-/commits/<ref>``, GitHub ``/commits/<ref>``) is a reference and
+#: not a work item: it names a listing the way ``/tree/`` does, and it derives
+#: a repository today, so it may not fall to ``other``.
 REFERENCE_INDICATORS = (
     "-/blob", "-/tree", "-/raw", "-/wikis", "-/commits",
     "-/issues", "-/work_items", "-/merge_requests",
     "blob", "tree", "wiki", "commits", "issues", "pulls",
 )
 
-_WORK_ITEM_RE = re.compile(
-    "/(?:"
-    + "|".join(f"{re.escape(segment)}/(?:{id_re})" for segment, id_re in WORK_ITEM_INDICATORS)
-    + ")(?:/|$)",
-    re.IGNORECASE,
+#: The two sets as the classifier reads them, by route: the id regex each
+#: work-item route requires of the segment after it, and the reference routes
+#: by forge shape — GitLab's after its ``/-/`` (the ``-/`` prefix dropped),
+#: GitHub's bare.
+_WORK_ITEM_IDS = {segment: re.compile(id_re) for segment, id_re in WORK_ITEM_INDICATORS}
+_GITLAB_REFERENCE_ROUTES = frozenset(
+    route.removeprefix("-/") for route in REFERENCE_INDICATORS if route.startswith("-/")
 )
-_REFERENCE_RE = re.compile(
-    "|".join(
-        f"/{re.escape(route)}(?:/|$)"
-        if route.startswith("-/")
-        else f"^/[^/]+/[^/]+/{re.escape(route)}(?:/|$)"
-        for route in REFERENCE_INDICATORS
-    ),
-    re.IGNORECASE,
+_GITHUB_REFERENCE_ROUTES = frozenset(
+    route for route in REFERENCE_INDICATORS if not route.startswith("-/")
 )
 
 #: A scheme URL (``scheme://…``) and git's scp form (``[user@]host:path``,
@@ -448,6 +448,29 @@ def _github_http_forge(host: str) -> bool:
     return host == "github.com" or host.split(".", 1)[0] == "github"
 
 
+def _forge_route(path: str) -> tuple[bool, str, list[str]] | None:
+    """Split a http(s) URL's *path* at the forge's route boundary.
+
+    GitLab's is the first ``/-/``: the project is everything before it and
+    the route the segment after it. Without one, GitHub's shape puts the
+    route in the fixed ``/<owner>/<repo>/<route>`` position. Returns
+    ``(gitlab, route, payload)`` — which boundary was read, the route
+    lowercased, the segments after it — or ``None`` for a path with no route
+    (a project root, a bare ``/-/``). The payload is the route's own (an id,
+    a ref, a file path), so a work-item spelling inside it
+    (``/blob/main/issues/123``) is a filename and never a route (astra, !380).
+    """
+    if "/-/" in path:
+        gitlab, tail = True, path.split("/-/", 1)[1]
+        segments = [segment for segment in tail.split("/") if segment]
+    else:
+        gitlab = False
+        segments = [segment for segment in path.split("/") if segment][2:]
+    if not segments:
+        return None
+    return gitlab, segments[0].lower(), segments[1:]
+
+
 def _repository_url_target(parsed) -> bool:
     """Row 5 for a scheme URL: ``spawn._plain_repo_url_from_target``'s rules
     with §2's deltas (``.git`` first, ``file://`` and ``git://`` accepted)."""
@@ -489,10 +512,14 @@ def classify_target(target: str | None) -> str:
                     $<event>`` read after percent-decoding, so the Element
                     ``https://<host>/#/room/…`` form as much as matrix.to).
                     The handler owns it; never a repository.
-    ``work-item``   an http(s) URL with an id-bearing indicator
-                    (:data:`WORK_ITEM_INDICATORS`) anywhere in its path.
-    ``reference``   an http(s) URL naming content inside a forge repository
-                    (:data:`REFERENCE_INDICATORS`) — #523, #391.
+    ``work-item``   an http(s) URL whose forge ROUTE (:func:`_forge_route`:
+                    the first segment after GitLab's ``/-/``, the third on
+                    GitHub's shape) is an id-bearing indicator
+                    (:data:`WORK_ITEM_INDICATORS`) followed by its id.
+    ``reference``   an http(s) URL whose route names content inside a forge
+                    repository (:data:`REFERENCE_INDICATORS`): a GitLab
+                    ``-/`` route on any host, a GitHub-position route on a
+                    known forge host — #523, #391.
     ``repository``  a clone source: ``spawn._plain_repo_url_from_target``'s
                     rules carried over (the ``_KNOWN_HTTP_FORGES`` allowlist
                     and the first-label heuristic; exactly two path segments
@@ -507,7 +534,9 @@ def classify_target(target: str | None) -> str:
                     lost).
     ``other``       any other URL: a non-forge host, a forge URL with a
                     query or an unknown route (``/discussions/5``,
-                    ``/-/pipelines/1691``), an unsupported transport.
+                    ``/-/pipelines/1691``), a GitHub-position reference
+                    route off the forges (``docs.example.com/a/b/tree/x``),
+                    an unsupported transport.
     ``work-item``   anything else — a commit SHA, a branch name, an
                     ``mr-N``/``pr-N``/``issue-N`` shorthand, free text.
 
@@ -529,6 +558,23 @@ def classify_target(target: str | None) -> str:
       with no path (``git@host:``) is ``other`` as well: spawn and
       ``is_likely_url`` agree it is not a repository URL, and it is not a
       work item.
+    - The route decides, by position (astra, !380): the path is split at the
+      forge's route boundary — GitLab's ``/-/``, or GitHub's fixed
+      ``/<owner>/<repo>/<route>`` — and only that segment, with the id rule
+      on the one after it, sorts work item from reference. Nothing later in
+      the path can: ``/blob/main/issues/123`` and
+      ``/-/blob/main/compare/result.md`` name files and are references, not
+      work items sharing a group with the issue they happen to spell.
+    - A GitHub-position reference route (``tree``, ``blob``, ``wiki``,
+      ``commits``, the ``issues``/``pulls`` list pages) reads as forge
+      content on a known forge host only (:func:`_known_http_forge`), so
+      ``https://docs.example.com/a/b/tree/x`` is ``other`` and
+      :func:`repository_of` never invents a clone URL for a docs site.
+      GitLab's ``/-/`` is the forge's own marker and needs no host rule. An
+      id-bearing route in GitHub's position stays host-agnostic — codeberg
+      and every Gitea spell ``/o/r/issues/5`` that way, and an unknown
+      host's ``/pull/9`` derived a repository before this rule — so
+      ``https://x/org/p/pull/9`` is still a work item.
 
     Mirrored verbatim in ``lmer_cli/container/clone_and_exec.py``, which runs
     without this package; ``tests/test_work_repo_classify_target.py`` holds
@@ -547,10 +593,20 @@ def classify_target(target: str | None) -> str:
         if parsed is None:
             return "other"
         if parsed.scheme.lower() in ("http", "https"):
-            if _WORK_ITEM_RE.search(parsed.path):
-                return "work-item"
-            if _REFERENCE_RE.search(parsed.path):
-                return "reference"
+            route = _forge_route(parsed.path)
+            if route is not None:
+                gitlab, name, payload = route
+                id_re = _WORK_ITEM_IDS.get(name)
+                if id_re is not None and payload and id_re.fullmatch(payload[0]):
+                    return "work-item"
+                if gitlab and name in _GITLAB_REFERENCE_ROUTES:
+                    return "reference"
+                if (
+                    not gitlab
+                    and name in _GITHUB_REFERENCE_ROUTES
+                    and _known_http_forge(parsed.hostname or "")
+                ):
+                    return "reference"
         return "repository" if _repository_url_target(parsed) else "other"
     scp = _SCP_TARGET_RE.match(text)
     if scp is not None:

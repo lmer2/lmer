@@ -28,6 +28,7 @@ What these tests pin:
 
 import os
 import subprocess
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -425,6 +426,45 @@ class TestMemoryLift:
             + "- [Dashboard](reference_dashboard.md) — grafana.\n"
         )
         assert (instance / "other.md").read_text(encoding="utf-8") == _memory_text("other", "user")
+
+    def test_an_instance_index_updated_while_waiting_for_the_lock_is_kept(self, work, commits, monkeypatch):
+        """The interleaving astra's probe found on the index: another
+        session's persist commits a new instance entry between the plan and
+        the lock. The tree is clean in git, so only an index text composed
+        INSIDE the lock carries it — a text planned before would overwrite
+        the entry away."""
+        instance = work / "_agents" / "memory"
+        instance.mkdir(parents=True)
+        (instance / "before.md").write_text(_memory_text("before", "user"), encoding="utf-8")
+        existing = "# instance memory\n\n- [Before](before.md) — from another project.\n"
+        (instance / "MEMORY.md").write_text(existing, encoding="utf-8")
+        _commit_all(work, "an instance scope another project's migration left")
+        concurrent = "- [Concurrent](concurrent.md) — persisted while the migration planned.\n"
+        real_mutation = migrate.work_mutation
+
+        @contextmanager
+        def mutation(tree=None):
+            with real_mutation(tree):
+                (instance / "concurrent.md").write_text(_memory_text("concurrent", "user"), encoding="utf-8")
+                (instance / "MEMORY.md").write_text(existing + concurrent, encoding="utf-8")
+                _commit_all(work, "another session persisted an instance memory")
+                yield
+
+        monkeypatch.setattr(migrate, "work_mutation", mutation)
+        rc, text = _render(work, apply=True)
+        assert rc == 0, text
+        assert (instance / "MEMORY.md").read_text(encoding="utf-8") == (
+            existing
+            + concurrent
+            + "# lmer memory\n"
+            + "- [Terse](user_terse.md) — short answers.\n"
+            + "- [Show output](feedback_show_output.md) — paste output.\n"
+            + "- [Dashboard](reference_dashboard.md) — grafana.\n"
+        )
+        assert (work / PROJECT / "_agents" / "memory" / "MEMORY.md").read_text(encoding="utf-8") == PROJECT_INDEX
+        assert (instance / "concurrent.md").is_file() and (instance / "before.md").is_file()
+        clean, status = _staged_clean(work)
+        assert clean, status
 
     def test_a_taken_instance_destination_is_a_blocker(self, work, commits):
         instance = work / "_agents" / "memory"

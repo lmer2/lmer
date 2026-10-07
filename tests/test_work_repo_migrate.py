@@ -31,6 +31,7 @@ import ast
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -418,6 +419,16 @@ class TestPlan:
         assert rc == 1
         assert _git(work, "status", "--porcelain") == ""
 
+    def test_the_dry_run_takes_no_lock(self, work, monkeypatch):
+        """Read-only means lock-free: a dry run never serializes the checkout."""
+        def refuse(tree=None):
+            raise AssertionError(f"the dry run took work_mutation({tree})")
+
+        monkeypatch.setattr(migrate, "work_mutation", refuse)
+        rc, text = _render(work)
+        assert rc == 0, text
+        assert "dry run" in text
+
 
 # ---------------------------------------------------------------------------
 # Preconditions
@@ -626,6 +637,81 @@ class TestPreflightThroughApply:
             work, commits, "run from an operator shell or against another project"
         )
 
+    def test_a_record_committed_while_waiting_for_the_lock_refuses(self, work, commits, monkeypatch):
+        """The interleaving astra's probe found: a session creates and
+        commits a live record under `runs/` between the plan and the lock.
+        The tree is clean in git, so only a plan built INSIDE the lock lists
+        it — a plan from before would move the area out from under it."""
+        real_mutation = migrate.work_mutation
+        live = work / PROJECT / "runs" / "develop-issue-20"
+
+        @contextmanager
+        def mutation(tree=None):
+            with real_mutation(tree):
+                # Another process got in first: by the time the apply holds
+                # the lock, `runs/` has a live record, committed.
+                _write_record(live, "develop-issue-20", _signed_out_events(SID_TWO)[:2], status="in-progress")
+                _commit_all(work, "a session started while the migration planned")
+                yield
+
+        monkeypatch.setattr(migrate, "work_mutation", mutation)
+        rc, text = _render(work, apply=True)
+        assert rc == 1, text
+        assert "live" in text and "develop-issue-20" in text and "nothing was changed" in text
+        assert live.is_dir() and (work / PROJECT / "runs" / "develop-issue-12").is_dir()  # nothing moved
+        assert not os.path.lexists(work / PROJECT / "_runs")
+        assert _git(work, "status", "--porcelain") == ""
+        assert commits == []
+
+    def test_the_plan_and_the_checks_run_inside_the_lock_before_the_first_move(self, work, commits, monkeypatch):
+        """Lock → plan → clean-tree check → preflight → the first `git mv`:
+        every snapshot the apply acts on is taken under the one lock."""
+        order = []
+        real_plan = migrate.plan_project
+        real_dirty = migrate._dirty_paths
+        real_preflight = migrate.preflight_no_live_records
+        real_git = git_ops.run_git_command
+
+        class _Lock:
+            def __enter__(self):
+                order.append("lock")
+
+            def __exit__(self, *exc):
+                order.append("unlock")
+
+        def mutation(tree=None):
+            return _Lock()
+
+        def plan(*args, **kwargs):
+            order.append("plan")
+            return real_plan(*args, **kwargs)
+
+        def dirty(root, rels):
+            order.append("dirty")
+            return real_dirty(root, rels)
+
+        def preflight(records):
+            order.append("preflight")
+            assert (work / PROJECT / "runs" / "develop-issue-12").is_dir()
+            assert not os.path.lexists(work / PROJECT / "_runs")
+            return real_preflight(records)
+
+        def git(cmd, cwd, **kwargs):
+            if cmd and cmd[0] == "mv":
+                order.append("git mv")
+            return real_git(cmd, cwd, **kwargs)
+
+        monkeypatch.setattr(migrate, "work_mutation", mutation)
+        monkeypatch.setattr(migrate, "plan_project", plan)
+        monkeypatch.setattr(migrate, "_dirty_paths", dirty)
+        monkeypatch.setattr(migrate, "preflight_no_live_records", preflight)
+        monkeypatch.setattr(git_ops, "run_git_command", git)
+        rc, text = _render(work, apply=True)
+        assert rc == 0, text
+        assert order[:5] == ["lock", "plan", "dirty", "preflight", "git mv"]
+        assert order[-1] == "unlock"
+        assert order.count("git mv") == 8 and order.count("plan") == 1
+
 
 # ---------------------------------------------------------------------------
 # Apply
@@ -756,6 +842,25 @@ class TestApply:
         assert rc == 0
         assert "commit message lists the moves" in text
         assert commits[0].message.count("git mv ") == 8
+
+    def test_compat_links_leave_their_own_event_in_the_callers_record(self, work, commits, monkeypatch):
+        """A compat link is an applied change like any other: one event, with
+        the link's path and its relative target."""
+        caller = work / "other" / "_runs" / "chat" / SID_TWO
+        _write_record(caller, "chat", _signed_out_events(SID_TWO)[:2], status="in-progress")
+        _commit_all(work, "the caller's own record, in another project")
+        monkeypatch.setattr(run_state, "run_dir", lambda *a, **k: caller)
+        monkeypatch.setattr(run_state, "run_rel_path_candidates", lambda *a, **k: ["other/_runs/chat"])
+        rc, _text = _render(work, apply=True, compat_link=True)
+        assert rc == 0
+        events = [e for e in run_state.read_events(caller, last_n=0) if e.get("type") == migrate.MOVE_EVENT]
+        links = [e for e in events if e["data"]["kind"] == migrate.LINK]
+        assert len(events) == 9 + 8  # 8 renames + 1 re-point, then one per link
+        assert {"project": PROJECT, "kind": migrate.LINK, "path": f"{PROJECT}/runs/develop-issue-12",
+                "to": f"../_runs/develop-issue-12/{SID_ONE}"} in [e["data"] for e in links]
+        assert {"project": PROJECT, "kind": migrate.LINK, "path": f"{PROJECT}/specs",
+                "to": "_specs"} in [e["data"] for e in links]
+        assert all(f"{PROJECT}/" in e["note"] and " -> " in e["note"] for e in links)
 
 
 # ---------------------------------------------------------------------------

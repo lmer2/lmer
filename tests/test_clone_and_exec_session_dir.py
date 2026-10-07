@@ -106,6 +106,15 @@ BARE_TARGETS = [
     pytest.param("https://h/g/p", id="bare-url"),
     pytest.param("https://h/g/p.git", id="bare-url-dot-git"),
     pytest.param("https://h/g/p/-/blob/main/x.md", id="document-url"),
+    # astra, !380: a work-item spelling inside a file path is a filename — the
+    # route decides, so these are documents and land in the bare group too
+    pytest.param(
+        "https://github.com/acme/widget/blob/main/issues/123", id="document-url-spelling-an-issue"
+    ),
+    pytest.param(
+        "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
+        id="document-url-spelling-a-compare",
+    ),
     pytest.param(f"https://{PRIMARY_REPO}.git", id="issue-81-clone-url"),
     pytest.param("https://docs.python.org/3/library/os.html", id="off-forge-document"),
 ]

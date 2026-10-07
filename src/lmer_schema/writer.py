@@ -54,8 +54,9 @@ raises the loader's own ``ManifestError``/``RegistryError`` with the file
 untouched, and the handle rolls its document back so it stays usable.
 :class:`WriterError` (a ``ManifestError``) is reserved for the writer's own
 refusals: an unknown or duplicate project name, a malformed or credentialed
-source entry, a missing or pre-existing file, a file changed on disk since
-it was loaded, a failed write.
+source entry, a source entry assembled with a YAML merge key, a missing or
+pre-existing file, a file changed on disk since it was loaded, a failed
+write.
 
 The write
 =========
@@ -103,8 +104,12 @@ Two things the spike left to this module:
    first block child land on that key's fourth slot. :func:`_fold_comments`
    runs once on load and folds both placements into the post-value token
    of the preceding leaf, so the rule above has ONE representation to work
-   on. The fold is dump-neutral: an unchanged document still round-trips
-   byte for byte.
+   on. One token in those lists is not a full line: a key line's
+   end-of-line comment, which ruamel parks there when an anchor or alias
+   sits between the key and the comment (``taskdef: &common  # note``);
+   :func:`_fold_eol` recognizes it by its source line and puts it back on
+   that key's slot, column kept. The fold is dump-neutral: an unchanged
+   document still round-trips byte for byte.
 2. **An entry with no keys** (``name: {}`` — a D19 project registered by
    name alone — or a hand-written ``name:``) has no inner leaf. Decision:
    the entry's own key slot IS its leaf. :func:`_last_leaf` descends only
@@ -125,10 +130,52 @@ section is updated scalar by scalar in place (its comments survive), a new
 one is appended, one absent from the mapping is removed with its own
 comments, and the section's existing key order wins over the mapping's.
 Setting the section to exactly what it holds is a no-op.
+
+Anchors and aliases — one slot, one node
+========================================
+YAML lets one node answer to two keys — ``taskdef: &common {repo: ...}``
+and ``napkin: *common`` — and ruamel's round trip keeps that as ONE
+Python object reachable from both. Every in-place update above would then
+reach the other key too: ``set_sources`` moving ``taskdef`` to a new
+``repo`` while ``napkin`` keeps the old one mutated the shared mapping
+twice, the second update undid the first, and the call returned ``True``
+with BOTH sources persisted at the old value (MR !380 review of this
+module). The comment fold had the same blind spot: it walked the shared
+node once per key and :func:`_last_leaf` descended into it through the
+alias, so the lines after ``napkin: *common`` were relocated under
+``taskdef``.
+
+Decision: DETACH, never refuse — a configuration change must take effect.
+:func:`_load` runs :func:`_detach_aliases` before the fold: the first slot
+in document order keeps the node; every later slot that reaches the same
+mapping or sequence gets its own comment-free deep copy (same values, same
+flow/block style; the key-line comment ruamel mirrors onto the alias key
+is dropped there so it prints once). From then on one slot is one node,
+for the fold, the relocation rule and every mutation alike. The emitted
+document therefore carries INDEPENDENT mappings: the ``&anchor``/``*alias``
+syntax is dropped for those entries the first time anything is written
+(ruamel writes an anchor only for a node still referenced twice). A
+mutation that changes nothing still writes nothing, so an untouched file
+keeps its aliases; a document that shares nothing is not affected at all
+(the round trips above stay byte for byte). Anchored SCALARS are left
+alone: a scalar is reassigned, never mutated, so sharing one cannot leak
+an update.
+
+Merge keys are the other way a document shares an entry — ``napkin: {<<:
+*common}`` — and the one this module REFUSES: ``napkin`` is its own node
+whose ``repo`` READS THROUGH to ``taskdef``'s, so an update written key by
+key cannot keep the two apart (the probe behind this section left
+``napkin`` reading ``taskdef``'s new value, again with ``True`` returned).
+``set_sources`` raises :class:`WriterError` naming the merged entries
+before any write, unless the mapping is exactly what the section already
+holds (still a no-op). A ``projects:`` entry can only merge what the
+registry lets two entries share — a ``description`` — which no mutation
+rewrites in place, so no rule is needed there.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import os
 import tempfile
@@ -185,7 +232,8 @@ def _ruamel() -> types.SimpleNamespace:
     global _LIB
     if _LIB is None:
         from ruamel.yaml import YAML
-        from ruamel.yaml.comments import CommentedMap, CommentedSeq
+        from ruamel.yaml.anchor import Anchor
+        from ruamel.yaml.comments import Comment, CommentedMap, CommentedSeq, merge_attrib
         from ruamel.yaml.error import CommentMark
         from ruamel.yaml.representer import RoundTripRepresenter
         from ruamel.yaml.tokens import CommentToken
@@ -207,6 +255,11 @@ def _ruamel() -> types.SimpleNamespace:
             Mark=CommentMark,
             Token=CommentToken,
             Representer=_Representer,
+            # The instance attributes behind a node's lazy ``.ca``, ``.anchor``
+            # and merge list: deleting one resets it (``_detached_copy``).
+            CommentAttrib=Comment.attrib,
+            AnchorAttrib=Anchor.attrib,
+            MergeAttrib=merge_attrib,
         )
     return _LIB
 
@@ -228,11 +281,13 @@ def _yaml():
 
 
 def _load(text: str):
-    """*text* as a round-trip document with its comments folded into the one
-    placement the relocation rule works on (module docstring)."""
+    """*text* as a round-trip document with every alias given its own node
+    and its comments folded into the one placement the relocation rule
+    works on (module docstring). Detach FIRST: the fold must walk a tree."""
     doc = _yaml().load(text)
     if not isinstance(doc, _ruamel().Map):  # parse_manifest already refused it
         raise TypeError(f"{MANIFEST_NAME} is not a mapping document")
+    _detach_aliases(doc)
     _fold_comments(None, doc)
     return doc
 
@@ -254,6 +309,80 @@ def _to_node(value):
     if isinstance(value, (list, tuple)):
         return lib.Seq(_to_node(item) for item in value)
     return value
+
+
+# ---------------------------------------------------------------------------
+# Anchors and aliases — one slot, one node
+# ---------------------------------------------------------------------------
+
+
+def _has_merge(node) -> bool:
+    """*node* is a mapping assembled with a YAML merge key (``<<: *x``)."""
+    lib = _ruamel()
+    return isinstance(node, lib.Map) and bool(getattr(node, lib.MergeAttrib, None))
+
+
+def _own_keys(node) -> list:
+    """The keys *node* holds itself. A merged key reads through to another
+    mapping's node, which is that mapping's slot to keep or detach."""
+    if _has_merge(node):
+        return [key for key, _ in node.non_merged_items()]
+    return _keys(node)
+
+
+def _detached_copy(node):
+    """A deep copy of *node* carrying its values and flow/block style and
+    nothing the first slot already prints: no comments, no anchor."""
+    lib = _ruamel()
+    duplicate = copy.deepcopy(node)
+    pending = [duplicate]
+    while pending:
+        current = pending.pop()
+        for attrib in (lib.CommentAttrib, lib.AnchorAttrib):
+            if hasattr(current, attrib):
+                delattr(current, attrib)
+        pending.extend(
+            child for child in (current[key] for key in _own_keys(current)) if _is_collection(child)
+        )
+    return duplicate
+
+
+def _drop_mirrored_tokens(anchor_slot, alias_slot) -> None:
+    """ruamel records a block mapping's key-line comment on the anchor's key
+    slot AND on every alias's, as one list object. Detached, each slot
+    prints its own, so the alias's copy of the shared token goes."""
+    anchor = anchor_slot[0].ca.items.get(anchor_slot[1])
+    alias = alias_slot[0].ca.items.get(alias_slot[1])
+    if not anchor or not alias:
+        return
+    if alias is anchor:
+        alias_slot[0].ca.items[alias_slot[1]] = [None] * len(anchor)
+        return
+    for index, token in enumerate(alias):
+        if token is not None and index < len(anchor) and anchor[index] is token:
+            alias[index] = None
+
+
+def _detach_aliases(node, first: Optional[dict] = None) -> None:
+    """Give every alias its own node (module docstring, "Anchors and
+    aliases"). Walks *node* in document order: the first slot that reaches
+    a mapping or sequence keeps it; every later slot reaching the SAME
+    object gets a :func:`_detached_copy` in its place. Scalars, and the
+    keys a mapping only merges in, are not touched."""
+    if first is None:
+        first = {}
+    for key in _own_keys(node):
+        child = node[key]
+        if not _is_collection(child):
+            continue
+        anchor_slot = first.get(id(child))
+        if anchor_slot is None:
+            first[id(child)] = (node, key)
+        else:
+            child = _detached_copy(child)
+            node[key] = child
+            _drop_mirrored_tokens(anchor_slot, (node, key))
+        _detach_aliases(child, first)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +485,54 @@ def _token_lines(tokens) -> str:
     )
 
 
+def _key_line(node, key) -> Optional[int]:
+    """The 0-based source line *key* was read from; ``None`` for a key with
+    no position (a node built by the writer, not loaded)."""
+    try:
+        return (node.lc.key(key) if isinstance(node, _ruamel().Map) else node.lc.item(key))[0]
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return None
+
+
+def _eol_slot(container, key, line):
+    """The slot on the :func:`_last_leaf` path from ``container[key]`` whose
+    key was read from *line*, or ``None``: a comment token that starts on a
+    key's own line is that key's end-of-line comment."""
+    while True:
+        if _key_line(container, key) == line:
+            return container, key
+        child = container[key]
+        if not _is_block(child):
+            return None
+        container, key = child, _keys(child)[-1]
+
+
+def _fold_eol(container, key, tokens: list) -> list:
+    """Peel a leading token that starts on the line of a key on the path
+    below ``container[key]`` onto that key's own post-value slot, column
+    kept. ruamel parks a key line's end-of-line comment in another slot
+    when an anchor or alias sits between the key and the comment; folded
+    as full lines it would print on a line of its own. What followed the
+    comment on later lines goes where the rule puts it. Returns the tokens
+    left for the caller."""
+    if not tokens or tokens[0] is None:
+        return tokens
+    slot = _eol_slot(container, key, tokens[0].start_mark.line)
+    if slot is None or _post_token(slot) is not None:
+        return tokens
+    token = tokens[0]
+    eol, remainder = _split(token.value)
+    token.value = eol
+    slot[0].ca.items.setdefault(slot[1], [None, None, None, None])[_post_index(slot[0])] = token
+    if remainder:
+        _append_remainder(_last_leaf(*slot), remainder)
+    return tokens[1:]
+
+
+def _as_tokens(value) -> list:
+    return value if isinstance(value, list) else [value]
+
+
 def _fold_comments(parent_slot, node) -> None:
     """Fold ruamel's two other comment placements into post-value tokens
     (module docstring, "Two things the spike left to this module", 1).
@@ -364,22 +541,31 @@ def _fold_comments(parent_slot, node) -> None:
     to the preceding leaf's token — the previous key's last leaf, or the
     parent slot for the first key. The comments between a key line and its
     first block child (slot 3, mirrored on the child's ``ca.comment``) move
-    to that key's own token. Dump-neutral by construction: the lines come
-    out exactly where they went in.
+    to that key's own token. In both lists a token that starts on a key's
+    own line is that key's end-of-line comment and goes back onto its slot
+    (:func:`_fold_eol`). Dump-neutral by construction: the lines come out
+    exactly where they went in.
     """
-    for index, key in enumerate(_keys(node)):
+    keys = _keys(node)
+    for index, key in enumerate(keys):
         item = node.ca.items.get(key)
         if item is not None and item[1]:
             target = _preceding_slot(parent_slot, node, index)
             if target is not None:
-                lines, item[1] = _token_lines(item[1]), None
-                _append_remainder(target, lines)
+                tokens, item[1] = _as_tokens(item[1]), None
+                if index > 0:
+                    tokens = _fold_eol(node, keys[index - 1], tokens)
+                lines = _token_lines(tokens)
+                if lines:
+                    _append_remainder(target, lines)
         child = node[key]
         if item is not None and len(item) > 3 and item[3]:
-            lines, item[3] = _token_lines(item[3]), None
+            tokens, item[3] = _as_tokens(item[3]), None
             if _is_collection(child):
                 child.ca.comment = None
-            _append_remainder((node, key), lines)
+            lines = _token_lines(_fold_eol(node, key, tokens))
+            if lines:
+                _append_remainder((node, key), lines)
         if _is_block(child):
             _fold_comments((node, key), child)
 
@@ -601,6 +787,12 @@ class ManifestWriter:
         normalizer is never applied (module docstring). Refuses an entry
         that is not a mapping, has no non-empty string ``repo``, or embeds a
         credential (never echoed). Trust rules are the caller's.
+
+        An entry aliased to another (``napkin: *common``) is written out
+        as its own mapping, alias syntax dropped; one assembled with a
+        merge key (``napkin: {<<: *common}``) is refused unless *mapping*
+        is exactly what the section holds (module docstring, "Anchors and
+        aliases").
         """
         entries = self._check_sources(mapping)
 
@@ -608,6 +800,7 @@ class ManifestWriter:
             section = self._section("sources", create=bool(entries))
             if section is None:
                 return False
+            self._refuse_merged(section, entries)
             section_slot = (self._doc, "sources")
             changed = False
             for key in _keys(section):
@@ -704,6 +897,32 @@ class ManifestWriter:
                 )
             entries[key] = dict(entry)
         return entries
+
+    def _refuse_merged(self, section, entries: dict) -> None:
+        """Raise for a ``sources:`` entry built with a merge key when
+        *entries* would change the section (module docstring, "Anchors and
+        aliases"). Called by ``mutate`` so :meth:`_apply` rolls back."""
+        merged = [key for key in _keys(section) if _has_merge(section[key])]
+        if not merged:
+            return
+        held = {
+            key: (
+                {field: entry[field] for field in _keys(entry)}
+                if isinstance(entry, _ruamel().Map)
+                else entry
+            )
+            for key, entry in ((key, section[key]) for key in _keys(section))
+        }
+        if held == entries:
+            return
+        names = ", ".join(f"`sources.{key}`" for key in merged)
+        raise WriterError(
+            self.path,
+            f"{names} {'is' if len(merged) == 1 else 'are'} assembled with a YAML "
+            "merge key (`<<: *anchor`); a merged key reads through to another "
+            "entry's node, so an update written key by key cannot keep the two "
+            "apart — spell the entry out in full, then repeat the mutation.",
+        )
 
     def _update_entry(self, section_slot, section, key, new: Mapping) -> bool:
         """Bring the existing ``sources.<key>`` to *new* scalar by scalar,

@@ -10,6 +10,12 @@ is pinned here, in the order the module decides it:
   names plus the decisions the task recorded in the docstring (GitHub
   ``/commits/<ref>`` is a reference; a credential on a non-HTTP transport is
   ``other``; the indicator constant's shape);
+- the route rule (astra, !380): a path is split at the forge's route
+  boundary — ``/-/`` on GitLab, the ``owner/repo/<route>`` position on
+  GitHub's shape — and only that route decides, so a work-item spelling
+  inside a file path (``/blob/main/issues/123``) is a filename; every
+  reference row is re-run with each id-bearing spelling spliced into its
+  payload, and a GitHub-position reference route needs a known forge host;
 - ``is_work_item`` over the same rows;
 - ``repository_of`` (A1-wave0.repository-of): a table of its own over both
   copies — GitLab ``/-/`` URLs with nested groups, a port and userinfo;
@@ -62,7 +68,7 @@ COPIES = [
 
 CLASSES = ("none", "special", "work-item", "reference", "repository", "other")
 
-GL = "https://gitlab.example.com/agents/global"
+GL = "https://gitlab.example.com/group/project"
 GH = "https://github.com/owner/repo"
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -103,6 +109,14 @@ TABLE = [
     (f"{GH}/commit/{FULL_SHA}", "work-item"),
     (f"{GH}/commit/abc1234", "work-item"),
     (f"{GH}/compare/main...feature", "work-item"),
+    # work-item — the route decides, by position (astra, !380): the review's
+    # controls; GitHub's position on a known forge that is not GitHub-shaped;
+    # an id-bearing route off the forges (today's reach — host-agnostic)
+    ("https://gitlab.example.com/g/p/-/issues/12", "work-item"),
+    (f"https://gitlab.example.com/g/p/-/commit/{FULL_SHA}", "work-item"),
+    ("https://github.com/o/r/pull/9", "work-item"),
+    ("https://codeberg.org/o/r/issues/5", "work-item"),
+    ("https://x/org/p/pull/9", "work-item"),
     # work-item — the non-URL tail of the table
     (FULL_SHA, "work-item"),
     ("abc1234", "work-item"),
@@ -130,25 +144,31 @@ TABLE = [
     (f"{GH}/commits/main", "reference"),  # decision: joins the reference row
     (f"{GH}/issues", "reference"),
     (f"{GH}/pulls", "reference"),
+    # reference — a work-item spelling in the route's payload is a filename,
+    # not a route (astra, !380): the review's two probes, then each shape
+    ("https://github.com/acme/widget/blob/main/issues/123", "reference"),
+    ("https://gitlab.example.com/team/widget/-/blob/main/compare/result.md", "reference"),
+    (f"{GL}/-/tree/main/issues/5", "reference"),
+    (f"{GH}/tree/main/pull/9", "reference"),
     # repository — forge roots, the deltas, transports, paths
     (GL, "repository"),
     (f"{GL}.git", "repository"),
     (f"{GL}/", "repository"),
-    ("https://git.example.com/agents/global", "repository"),  # first label
+    ("https://git.example.com/group/project", "repository"),  # first label
     ("http://gitlab.com/group/project", "repository"),
     ("https://github.com/a/b", "repository"),
     ("https://github.com/a/b.git", "repository"),
     ("https://github.com/a/b/c.git", "repository"),  # delta: .git tested first
     ("https://example.com/a/b.git", "repository"),  # unknown host, .git suffix
-    ("git@gitlab.example.com:agents/global.git", "repository"),
+    ("git@gitlab.example.com:group/project.git", "repository"),
     ("git@github.com:owner/repo", "repository"),
-    ("ssh://git@gitlab.example.com/agents/global.git", "repository"),
-    ("ssh://git@gitlab.example.com:2222/agents/global.git", "repository"),
-    ("git://git.example.com/agents/global.git", "repository"),  # delta: git://
+    ("ssh://git@gitlab.example.com/group/project.git", "repository"),
+    ("ssh://git@gitlab.example.com:2222/group/project.git", "repository"),
+    ("git://git.example.com/group/project.git", "repository"),  # delta: git://
     ("file:///srv/git/global.git", "repository"),  # delta: file:///path
     ("file:///path", "repository"),
     # decision: an HTTP(S) credential is transport material spawn scrubs
-    ("https://oauth2:glpat-not-a-real-token-000@gitlab.example.com/agents/global.git", "repository"),
+    ("https://oauth2:glpat-not-a-real-token-000@gitlab.example.com/group/project.git", "repository"),
     (".", "repository"),
     ("./x", "repository"),
     ("../x", "repository"),
@@ -167,10 +187,15 @@ TABLE = [
     ("https://example.com/a/b", "other"),  # unknown host, no .git
     ("https://en.wikipedia.org/wiki/Git", "other"),  # /wiki/ off the forge position
     ("https://docs.example.com/guide/tree/main", "other"),  # /tree/ likewise
+    # decision: a GitHub-position reference route reads as forge content on a
+    # known forge host only — a docs site never derives a clone URL
+    ("https://docs.example.com/a/b/tree/x", "other"),
+    ("https://docs.example.com/a/b/blob/main/x.md", "other"),
+    ("https://docs.example.com/a/b/issues", "other"),
     # decision: a credential on a non-HTTP transport is never a repository
-    ("ssh://deploy:not-a-real-secret@gitlab.example.com/agents/global.git", "other"),
-    ("deploy:not-a-real-secret@gitlab.example.com:agents/global.git", "other"),
-    ("deploy@gitlab.example.com:agents/global.git", "other"),  # scp, not git@
+    ("ssh://deploy:not-a-real-secret@gitlab.example.com/group/project.git", "other"),
+    ("deploy:not-a-real-secret@gitlab.example.com:group/project.git", "other"),
+    ("deploy@gitlab.example.com:group/project.git", "other"),  # scp, not git@
     ("git@gitlab.example.com:", "other"),  # scp with no path
 ]
 
@@ -205,10 +230,10 @@ REPOSITORY_OF = [
     (f"{GL_NESTED}/-/issues/12", GL_NESTED),
     (f"{GL_NESTED}/-/merge_requests/3/diffs", GL_NESTED),
     (f"{GL_PORT}/-/merge_requests/55", GL_PORT),  # the port is part of the address
-    (f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/agents/global/-/issues/1", GL),
+    (f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/group/project/-/issues/1", GL),
     (f"https://user:pw@gitlab.example.com:8443/group/project/-/issues/1", GL_PORT),
-    (f"https://{HOST_TOKEN}@gitlab.example.com/agents/global/-/blob/main/x.md", GL),
-    ("http://gitlab.example.com/agents/global/-/issues/1", "http://gitlab.example.com/agents/global"),
+    (f"https://{HOST_TOKEN}@gitlab.example.com/group/project/-/blob/main/x.md", GL),
+    ("http://gitlab.example.com/group/project/-/issues/1", "http://gitlab.example.com/group/project"),
     # GitLab: the reference routes (#523) and the id-less list pages (#391)
     (f"{GL}/-/blob/main/README.md", GL),
     (f"{GL}/-/tree/main", GL),
@@ -240,20 +265,27 @@ REPOSITORY_OF = [
     ("https://github.com/owner/repo.git/pull/9", GH),  # today's derivation drops it
     ("https://ghp-not-a-real-token@github.com/owner/repo/pull/9", GH),
     ("https://github.example.com:8443/owner/repo/pull/9", "https://github.example.com:8443/owner/repo"),
+    # the route decides (astra, !380): a work-item spelling in the payload is
+    # a filename, and the repository is still the one before the route
+    ("https://github.com/acme/widget/blob/main/issues/123", "https://github.com/acme/widget"),
+    (
+        "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
+        "https://gitlab.example.com/team/widget",
+    ),
     # a repository: itself, as given — a credential in it is the consumer's
     (GL, GL),
     (f"{GL}.git", f"{GL}.git"),
     (f"{GL}/", f"{GL}/"),
     ("https://github.com/a/b", "https://github.com/a/b"),
     ("https://github.com/a/b/c.git", "https://github.com/a/b/c.git"),
-    ("git@gitlab.example.com:agents/global.git", "git@gitlab.example.com:agents/global.git"),
+    ("git@gitlab.example.com:group/project.git", "git@gitlab.example.com:group/project.git"),
     ("git@github.com:owner/repo", "git@github.com:owner/repo"),
-    ("ssh://git@gitlab.example.com:2222/agents/global.git", "ssh://git@gitlab.example.com:2222/agents/global.git"),
-    ("git://git.example.com/agents/global.git", "git://git.example.com/agents/global.git"),
+    ("ssh://git@gitlab.example.com:2222/group/project.git", "ssh://git@gitlab.example.com:2222/group/project.git"),
+    ("git://git.example.com/group/project.git", "git://git.example.com/group/project.git"),
     ("file:///srv/git/global.git", "file:///srv/git/global.git"),
     (
-        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/agents/global.git",
-        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/agents/global.git",
+        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/group/project.git",
+        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/group/project.git",
     ),
     (f"  {GL}  ", GL),  # as given, whitespace aside
     (".", "."),
@@ -267,12 +299,13 @@ REPOSITORY_OF = [
     (MATRIX, None),
     ("https://docs.python.org/3/library/os.html", None),
     ("https://docs.example.com/guide/tree/main", None),
+    ("https://docs.example.com/a/b/tree/x", None),  # a reference route off the forges: no clone URL
     (f"{GL}?ref=main", None),
     (f"{GL}/-/pipelines/1691", None),
     (f"{GH}/discussions/5", None),
     ("ftp://gitlab.example.com/group/project", None),
-    ("ssh://deploy:not-a-real-secret@gitlab.example.com/agents/global.git", None),
-    ("deploy@gitlab.example.com:agents/global.git", None),
+    ("ssh://deploy:not-a-real-secret@gitlab.example.com/group/project.git", None),
+    ("deploy@gitlab.example.com:group/project.git", None),
     ("https://gitlab.example.com/-/issues/5", None),  # a route with no project before it
     (FULL_SHA, None),
     ("abc1234", None),
@@ -356,6 +389,107 @@ class TestTheTable:
             assert id_re  # an id is always required
         assert "-/commits" in utils.REFERENCE_INDICATORS
         assert "commits" in utils.REFERENCE_INDICATORS
+        # The route-keyed readers derived from the two constants
+        assert set(utils._WORK_ITEM_IDS) == set(segments)
+        assert utils._GITLAB_REFERENCE_ROUTES == {
+            "blob", "tree", "raw", "wikis", "commits", "issues", "work_items", "merge_requests",
+        }
+        assert utils._GITHUB_REFERENCE_ROUTES == {"blob", "tree", "wiki", "commits", "issues", "pulls"}
+
+
+# ---------------------------------------------------------------------------
+# The route decides, by position (astra, !380)
+# ---------------------------------------------------------------------------
+
+
+#: ``_forge_route``: ``(path, (gitlab, route, payload))`` — the split at the
+#: forge's route boundary, or ``None`` for a path with no route.
+FORGE_ROUTES = [
+    ("/group/project/-/issues/141", (True, "issues", ["141"])),
+    ("/group/project/-/issues", (True, "issues", [])),
+    ("/group/project/-/Issues/5", (True, "issues", ["5"])),  # the route is lowercased
+    ("/group/subgroup/project/-/merge_requests/7/diffs", (True, "merge_requests", ["7", "diffs"])),
+    ("/team/widget/-/blob/main/compare/result.md", (True, "blob", ["main", "compare", "result.md"])),
+    ("/-/issues/5", (True, "issues", ["5"])),  # a route with no project before it
+    ("/owner/repo/pull/9/files", (False, "pull", ["9", "files"])),
+    ("/owner/repo.git/pull/9", (False, "pull", ["9"])),
+    ("/acme/widget/blob/main/issues/123", (False, "blob", ["main", "issues", "123"])),
+    ("/owner/repo/issues", (False, "issues", [])),
+    ("/owner/repo", None),
+    ("/owner/repo/", None),
+    ("/owner", None),
+    ("/", None),
+    ("", None),
+    ("/group/project/-/", None),  # a bare /-/ names no route
+]
+
+#: An id-bearing spelling as each forge writes it, to splice into a reference
+#: URL's payload: none of them may promote the reference to a work item.
+WORK_ITEM_SPELLINGS = (
+    "issues/123",
+    "merge_requests/7",
+    "work_items/3",
+    "pull/9",
+    "pulls/9",
+    f"commit/{FULL_SHA}",
+    "compare/main...feature",
+)
+
+
+def _spliced(target, spelling):
+    """*target* with *spelling* appended to its path, query and fragment kept."""
+    parsed = urlparse(target)
+    return parsed._replace(path=f"{parsed.path.rstrip('/')}/{spelling}").geturl()
+
+
+class TestTheRouteDecides:
+    @pytest.mark.parametrize("mod", COPIES)
+    @pytest.mark.parametrize("row", FORGE_ROUTES, ids=lambda row: repr(row[0]))
+    def test_the_split_at_the_route_boundary(self, mod, row):
+        path, expected = row
+        assert mod._forge_route(path) == expected
+
+    @pytest.mark.parametrize("mod", COPIES)
+    @pytest.mark.parametrize("spelling", WORK_ITEM_SPELLINGS)
+    @pytest.mark.parametrize("row", [row for row in TABLE if row[1] == "reference"], ids=_row_id)
+    def test_nothing_in_the_payload_promotes_a_reference(self, mod, row, spelling):
+        """The finding (!380): a reference URL stays a reference, and names the
+        same repository, whatever work-item spelling its ref/file payload
+        carries — a filename is not a route."""
+        target, _ = row
+        spliced = _spliced(target, spelling)
+        assert mod.classify_target(spliced) == "reference"
+        assert mod.repository_of(spliced) == mod.repository_of(target)
+
+    @pytest.mark.parametrize("mod", COPIES)
+    @pytest.mark.parametrize("route", sorted(utils._GITLAB_REFERENCE_ROUTES))
+    def test_a_gitlab_route_is_the_forges_own_marker(self, mod, route):
+        """``/-/`` is GitLab's and needs no host rule: the route after it reads
+        on any host, as the derivation always has."""
+        assert mod.classify_target(f"https://h/g/p/-/{route}/x") == "reference"
+        assert mod.repository_of(f"https://h/g/p/-/{route}/x") == "https://h/g/p"
+
+    @pytest.mark.parametrize("mod", COPIES)
+    @pytest.mark.parametrize("route", sorted(utils._GITHUB_REFERENCE_ROUTES))
+    def test_a_github_position_reference_route_needs_a_known_forge(self, mod, route):
+        """The MINOR settled with the finding: ``tree``, ``blob``, ``wiki``,
+        ``commits`` and the list pages read as forge content on a known forge
+        host only, so a docs site's ``/a/b/tree/x`` is ``other`` and
+        ``repository_of`` never invents a clone URL for it."""
+        assert mod.classify_target(f"https://github.com/o/r/{route}/x") == "reference"
+        assert mod.classify_target(f"https://codeberg.org/o/r/{route}/x") == "reference"
+        assert mod.classify_target(f"https://git.example.com/o/r/{route}/x") == "reference"
+        assert mod.classify_target(f"https://docs.example.com/a/b/{route}/x") == "other"
+        assert mod.repository_of(f"https://docs.example.com/a/b/{route}/x") is None
+
+    @pytest.mark.parametrize("mod", COPIES)
+    def test_an_id_bearing_route_in_github_position_is_host_agnostic(self, mod):
+        """Recorded with it: the work-item row keeps today's reach — codeberg
+        and every Gitea spell ``/o/r/issues/5`` in GitHub's position, and an
+        unknown host's ``/pull/9`` derived a repository before this rule."""
+        assert mod.classify_target("https://x/org/p/pull/9") == "work-item"
+        assert mod.repository_of("https://x/org/p/pull/9") == "https://x/org/p"
+        assert mod.classify_target("https://x/org/p/pulls") == "other"
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +652,8 @@ SPAWN_FIXTURES = [
     *spawn_fixtures.UNDERIVABLE_TARGETS,
     # Embedded credentials, by transport: HTTP(S) is scrubbed and accepted,
     # anything else is refused — on both sides.
-    "https://oauth2:glpat-not-a-real-token-000@gitlab.example.com/agents/global.git",
-    "ssh://deploy:not-a-real-secret@gitlab.example.com/agents/global.git",
+    "https://oauth2:glpat-not-a-real-token-000@gitlab.example.com/group/project.git",
+    "ssh://deploy:not-a-real-secret@gitlab.example.com/group/project.git",
 ]
 
 #: §2's three deltas from spawn's rules, each a repository to the classifier.
@@ -528,7 +662,7 @@ SPAWN_FIXTURES = [
 SPAWN_DELTAS = [
     pytest.param("https://github.com/a/b/c.git", False, id="dot-git-before-the-github-rule"),
     pytest.param("file:///srv/git/global.git", False, id="file-url"),
-    pytest.param("git://git.example.com/agents/global.git", True, id="git-url"),
+    pytest.param("git://git.example.com/group/project.git", True, id="git-url"),
 ]
 
 
@@ -557,8 +691,9 @@ class TestSpawnParity:
 MIRRORED_CONSTANTS = (
     "WORK_ITEM_INDICATORS",
     "REFERENCE_INDICATORS",
-    "_WORK_ITEM_RE",
-    "_REFERENCE_RE",
+    "_WORK_ITEM_IDS",
+    "_GITLAB_REFERENCE_ROUTES",
+    "_GITHUB_REFERENCE_ROUTES",
     "_TARGET_URL_RE",
     "_SCP_TARGET_RE",
     "_KNOWN_HTTP_FORGES",
@@ -572,6 +707,7 @@ MIRRORED_FUNCTIONS = (
     "_matrix_thread_target",
     "_known_http_forge",
     "_github_http_forge",
+    "_forge_route",
     "_repository_url_target",
     "classify_target",
     "is_work_item",

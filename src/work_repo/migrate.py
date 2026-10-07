@@ -75,7 +75,7 @@ Preconditions, in the order they are checked
 - the project is registered and has a directory
   (:func:`lmer_schema.checks.walk.project_dirs`, the ONE project walk);
 - every path a move touches is clean in git — the dry run reports it, the
-  apply re-checks under the lock. A clean tree is NOT evidence that a
+  apply checks it under the lock. A clean tree is NOT evidence that a
   writer stopped, which is what the next check is for;
 - NO record whose address changes is live (§1.6, astra PR3):
   :func:`preflight_no_live_records`, the ONE read-only lifecycle preflight
@@ -83,17 +83,27 @@ Preconditions, in the order they are checked
   mutation lock immediately before the first move; a refusal makes no
   filesystem, index or manifest change.
 
+Under `--apply` the mutation lock is taken FIRST and held from planning
+through publication: the plan — the record enumeration, every destination
+test, the index texts — is built inside it, never carried in from before. A
+session can create and commit a record under `runs/`, or persist a new
+entry into the instance `MEMORY.md`, while a migration plans or waits for
+the lock; both are clean in git, yet a plan from before would move the area
+out from under the one and overwrite the other with an older index text.
+The dry run plans without the lock: it is read-only and serializes nothing.
+
 The plan is data
 ================
 :class:`Plan` is an ordered tuple of :class:`Move`s — records, archive,
 areas, the memory lift — plus the re-points, the memory routing tables with
 the index writes they imply (:class:`MemoryLift`), the compat links, notes
 and blockers. The dry run renders it (`git mv` lines, the two routing
-tables, `ln -sfn` lines, `ln -s` lines, notes); the apply replays it with
-`git mv` (history preserved; a plain rename only for an empty, untracked
-directory git cannot move), writes the two indexes, re-points the links and
-lands ONE commit through :func:`git_ops.commit_work_path`, the existing
-commit → rebase → push helper. Later rules add their own kinds without
+tables, `ln -sfn` lines, `ln -s` lines, notes); the apply builds its own
+under the lock and replays it with `git mv` (history preserved; a plain
+rename only for an empty, untracked directory git cannot move), writes the
+two indexes, re-points the links and lands ONE commit through
+:func:`git_ops.commit_work_path`, the existing commit → rebase → push
+helper. Later rules add their own kinds without
 changing this shape: the plain-session fold (B.fold), `--instance`
 (B.instance-floor). A migrated project plans zero moves and the command says
 so.
@@ -243,13 +253,16 @@ class Move:
     def event(self, prefix: str) -> tuple:
         """`(note, data)` for the :data:`MOVE_EVENT` this change leaves in
         the caller's record: addresses for a rename, targets (and the link's
-        path) for a re-point."""
+        path) for a re-point and a compat link."""
         if self.kind == REPOINT:
             path = _join(prefix, self.src)
             return (
                 f"{path}: {self.was} -> {self.dst}",
                 {"kind": self.kind, "from": self.was, "to": self.dst, "path": path},
             )
+        if self.kind == LINK:
+            path = _join(prefix, self.src)
+            return f"{path} -> {self.dst}", {"kind": self.kind, "to": self.dst, "path": path}
         src, dst = _join(prefix, self.src), _join(prefix, self.dst)
         return f"{src} -> {dst}", {"kind": self.kind, "from": src, "to": dst}
 
@@ -324,8 +337,9 @@ class Plan:
     should know; `blockers` what stops the apply (a taken destination, two
     legacy dirs mapping to one session dir, a bare and a schema area both
     present). Git cleanliness is not stored here — the dry run reports it
-    and the apply re-checks it under the lock, since it can change in
-    between.
+    and the apply checks it under the lock, right after planning there. A
+    dry run's plan is never the apply's: the apply builds its own inside
+    the lock (module docstring, "Preconditions").
     """
 
     root: Path
@@ -614,9 +628,11 @@ def _caller_record() -> Optional[Path]:
 
 
 def plan_project(project: str, *, root: Optional[Path] = None, compat_link: bool = False) -> Plan:
-    """The plan for *project*, after the preconditions that need no lock.
-    Raises :class:`MigrateError` on a missing manifest, the version floor,
-    the writer's refusal, or an unregistered project."""
+    """The plan for *project*, after the preconditions that are the plan's.
+    Read-only. The dry run calls it bare; the apply calls it inside the
+    mutation lock, so what it enumerates is what the apply moves. Raises
+    :class:`MigrateError` on a missing manifest, the version floor, the
+    writer's refusal, or an unregistered project."""
     root = Path(root) if root is not None else work_repo_root()
     project_dir = _resolve_project_dir(root, project)
     rel = project_dir.relative_to(root).as_posix()
@@ -1045,10 +1061,27 @@ def _dirty_paths(root: Path, rels: list) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -> int:
-    """Under the mutation lock: re-check the tree, run the preflight, replay
-    the plan, record it, commit once. Returns the exit code."""
-    root = plan.root
+def _apply(
+    project: str,
+    *,
+    root: Path,
+    compat_link: bool,
+    out: Callable[[str], None],
+    err: Callable[[str], None],
+) -> int:
+    """Under the mutation lock, from planning through publication: build the
+    plan, check the tree, run the preflight, replay the plan, record it,
+    commit once. Returns the exit code; a migrated project is a no-op that
+    says so.
+
+    The plan is built INSIDE the lock, not handed in (module docstring,
+    "Preconditions"): a record committed or an instance index updated while
+    the apply planned or waited is clean in git, and only a plan made under
+    the lock lists the one and merges the other. The planner's destination
+    tests (`lexists(dst)`, a bare and a schema area both present) are the
+    blockers, taken under the same lock; nothing is checked against a
+    snapshot older than it.
+    """
     configured = work_repo_root()
     if _resolved(root) != _resolved(configured):
         raise MigrateError(
@@ -1056,6 +1089,10 @@ def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -
             f"({root}): the commit helper is bound to the configured checkout"
         )
     with work_mutation(root):
+        plan = plan_project(project, root=root, compat_link=compat_link)
+        if plan.is_noop:
+            out(plan.render())
+            return 0
         problems = list(plan.blockers)
         problems += [f"dirty in git: {line}" for line in _dirty_paths(root, plan.git_paths())]
         problems += preflight_no_live_records(plan.record_dirs())
@@ -1107,6 +1144,7 @@ def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -
             if rc != 0:
                 return rc
             out(link.render(plan.rel))
+            applied.append(link)
         for rel in plan.cleanups():
             try:
                 os.rmdir(root / plan.rel_of(rel))
@@ -1115,7 +1153,10 @@ def _apply(plan: Plan, out: Callable[[str], None], err: Callable[[str], None]) -
                 out(f"⚠️  {plan.rel_of(rel)} not removed: {exc}")
 
         paths = plan.git_paths() + _record_in_caller(plan, applied, out)
-        return git_ops.commit_work_path(paths, plan.commit_message())
+        rc = git_ops.commit_work_path(paths, plan.commit_message())
+        if rc == 0:
+            out(f"✅ work migrate {project}: {plan.summary()} applied in one commit")
+        return rc
 
 
 def _stage(root: Path, rel: str, err: Callable[[str], None]) -> int:
@@ -1192,30 +1233,29 @@ def migrate_project(
 ) -> int:
     """`work migrate <project> [--apply] [--compat-link]` as a library call.
 
-    Plans (printing the plan through *out* on a dry run), applies when
-    asked, and reports every refusal through *err* (stderr by default) with
-    exit code 1. A migrated project is a no-op that says so, in both modes.
+    A dry run plans without the lock and prints the plan through *out*; the
+    apply plans and acts under the mutation lock (:func:`_apply`). Every
+    refusal is reported through *err* (stderr by default) with exit code 1.
+    A migrated project is a no-op that says so, in both modes.
     """
     if err is None:
         err = lambda line: print(line, file=sys.stderr)  # noqa: E731
+    root = Path(root) if root is not None else work_repo_root()
     try:
-        plan = plan_project(project, root=root, compat_link=compat_link)
-        if plan.is_noop or not apply:
+        if not apply:
+            plan = plan_project(project, root=root, compat_link=compat_link)
             out(plan.render())
             if not plan.is_noop:
-                dirty = _dirty_paths(plan.root, plan.git_paths())
+                dirty = _dirty_paths(root, plan.git_paths())
                 if dirty:
                     out("dirty in git (the apply refuses until these are clean):")
                     for line in dirty:
                         out(f"  {line}")
             return 0
-        rc = _apply(plan, out, err)
+        return _apply(project, root=root, compat_link=compat_link, out=out, err=err)
     except MigrateError as exc:
         err(f"❌ {exc}")
         return 1
-    if rc == 0:
-        out(f"✅ work migrate {project}: {plan.summary()} applied in one commit")
-    return rc
 
 
 def cmd_migrate(args) -> int:

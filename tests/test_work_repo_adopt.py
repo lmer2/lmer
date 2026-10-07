@@ -34,6 +34,7 @@ import ast
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -326,6 +327,16 @@ class TestPlan:
         plan = adopt.plan_adoption(BUCKET, NAME, root=work)
         assert plan.records == (rdir,)
         assert "records under the bucket: 1" in plan.render()
+
+    def test_the_dry_run_takes_no_lock(self, work, monkeypatch):
+        """Read-only means lock-free: a dry run never serializes the checkout."""
+        def refuse(tree=None):
+            raise AssertionError(f"the dry run took work_mutation({tree})")
+
+        monkeypatch.setattr(adopt, "work_mutation", refuse)
+        rc, text = _render(work)
+        assert rc == 0, text
+        assert "dry run" in text
 
 
 # ---------------------------------------------------------------------------
@@ -649,10 +660,40 @@ class TestRefusals:
             work, commits, "run from an operator shell or against another project"
         )
 
-    def test_the_preflight_runs_inside_the_lock_before_the_first_change(self, work, commits, monkeypatch):
+    def test_a_record_committed_while_waiting_for_the_lock_refuses(self, work, commits, monkeypatch):
+        """The interleaving astra's probe found: a session creates and
+        commits a live record in the bucket between the plan and the lock.
+        The tree is clean in git, so only a plan built INSIDE the lock lists
+        it — a plan from before would move it out from under its writer."""
+        real_mutation = adopt.work_mutation
+        rdir = work / BUCKET / "_runs" / "develop-issue-3" / SID
+
+        @contextmanager
+        def mutation(tree=None):
+            with real_mutation(tree):
+                # Another process got in first: by the time the apply holds
+                # the lock, the bucket has a live record, committed.
+                _write_record(
+                    rdir, "develop-issue-3", _signed_out_events(SID)[:2], status="in-progress",
+                )
+                _commit_all(work, "a session started in the bucket while the adoption planned")
+                yield
+
+        monkeypatch.setattr(adopt, "work_mutation", mutation)
+        rc, text = _render(work, apply=True)
+        assert rc == 1, text
+        assert "live" in text and "develop-issue-3" in text and "nothing was changed" in text
+        assert rdir.is_dir() and (work / BUCKET).is_dir()  # nothing moved
+        assert not os.path.lexists(work / NAME)
+        assert load_manifest(work).projects.get(NAME) is None
+        assert _git(work, "status", "--porcelain") == ""
+        assert commits == []
+
+    def test_the_plan_and_the_preflight_run_inside_the_lock_before_the_first_change(self, work, commits, monkeypatch):
         from work_repo import migrate
 
         order = []
+        real_plan = adopt.plan_adoption
         real_preflight = migrate.preflight_no_live_records
 
         class _Lock:
@@ -665,6 +706,10 @@ class TestRefusals:
         def mutation(tree=None):
             return _Lock()
 
+        def plan(*args, **kwargs):
+            order.append("plan")
+            return real_plan(*args, **kwargs)
+
         def preflight(records):
             order.append("preflight")
             assert (work / BUCKET).is_dir() and not os.path.lexists(work / NAME)
@@ -672,10 +717,11 @@ class TestRefusals:
             return real_preflight(records)
 
         monkeypatch.setattr(adopt, "work_mutation", mutation)
+        monkeypatch.setattr(adopt, "plan_adoption", plan)
         monkeypatch.setattr(adopt, "preflight_no_live_records", preflight)
         rc, _text = _render(work, apply=True)
         assert rc == 0
-        assert order == ["lock", "preflight", "unlock"]
+        assert order == ["lock", "plan", "preflight", "unlock"]
 
     # -- the checks before anything moves -----------------------------------
 

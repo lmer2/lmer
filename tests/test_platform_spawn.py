@@ -754,7 +754,7 @@ REFERENCE_TARGETS = [
 #: warning; recognising repo targets must not turn web pages or unsupported
 #: transports into persistent clone records.
 NON_REPO_URL_TARGETS = [
-    "https://gitlab.example.com/agents/global/-/pipelines/1691",
+    "https://gitlab.example.com/group/project/-/pipelines/1691",
     "https://docs.example.com/guide/getting-started",
     "ftp://gitlab.example.com/group/project",
 ]
