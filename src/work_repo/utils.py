@@ -5,17 +5,21 @@ work repo's FORM (spec D20, issue #353). :func:`work_repo_layout` answers
 "which form is this tree written in, and where is this session's project
 dir"; every path helper here is built on it, and sibling modules
 (``run_state``, ``specs_index``, ``memory``) route through it rather than
-naming ``_plexus.yaml`` or an ``_``-prefixed area themselves. One module
+naming ``_plexus.yaml`` or an ``_``-prefixed area themselves. The tooling
+verbs that need the core's API itself (``adopt``, ``migrate``) get it from
+:func:`core_module`, so the core import is spelled here alone too. One module
 knowing the second set of names is the point: two would drift, and a drifted
 pair writes half a session's record at the legacy names and half at the
 schema ones — the split tree the validator flags ERROR.
 """
 
+import importlib
 import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
@@ -797,6 +801,54 @@ def work_repo_manifest_problem() -> Optional[str]:
     :class:`WorkRepoLayout` for the two cases.
     """
     return work_repo_layout().problem
+
+
+#: The core API's package, spelled here and nowhere else in the work CLI
+#: (see :func:`core_module`).
+CORE_PACKAGE = "lmer_schema"
+
+
+class CoreUnavailableError(ImportError):
+    """The lmer-schema core API cannot be imported in this build.
+
+    The ONE error :func:`core_module` raises. An ``ImportError`` so that
+    ``str(exc)`` is the loader's own text — the version-floor refusals in
+    ``adopt``/``migrate`` quote it verbatim — and so that an
+    ``except ImportError`` written for a direct core import still catches
+    it. Not :class:`SchemaContextError`: that one is about the TREE (a
+    manifest this writer cannot safely use); this one is about the BUILD.
+    """
+
+
+def core_module(name: str) -> ModuleType:
+    """Import and return ``lmer_schema.<name>`` — THE core import for tooling.
+
+    The tooling verbs — ``adopt``, ``migrate``, and later ``housekeep`` and
+    ``knowledge`` — reach the core ONLY through this accessor
+    (``core_module("writer").load_for_write``, ``core_module("checks.walk")``,
+    *name* a dotted path under the package) and never spell the core's
+    import or the manifest's name themselves; one module knowing the second
+    set of names is the point (D20, and the source guard in
+    tests/test_work_repo_schema_base.py pins it). The accessor is an import
+    and nothing more: it never reads the manifest and never decides the
+    tree's form — that stays :func:`work_repo_layout` / :func:`project_area`.
+
+    Raises :class:`CoreUnavailableError` — one type, whatever failed — when
+    the core is absent, half-installed, or *name* is not a module of it. The
+    same reading :func:`_core_missing` gives a direct import: an
+    ``ImportError`` cannot tell "no core" from "a core with something broken
+    under it", and the accessor does not try; the message and the chained
+    cause carry the loader's detail. Callers that must never raise (a
+    journal seam, a hook path) catch it and fall back, exactly as they did
+    for ``ImportError``; mutating verbs turn it into their own refusal.
+
+    Lazy by design: call it inside the verb, never at module level, so
+    ``import work_repo.adopt`` still succeeds on a build without the core.
+    """
+    try:
+        return importlib.import_module(f"{CORE_PACKAGE}.{name}")
+    except ImportError as exc:
+        raise CoreUnavailableError(str(exc), name=exc.name, path=exc.path) from exc
 
 
 def _schema_layout(root, repo_host, repo_project, legacy_base):
