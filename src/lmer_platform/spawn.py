@@ -130,6 +130,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -175,6 +176,7 @@ from .config import (
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from .thread_targets import validate_thread_targets
 from . import store
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.spawn")
 
@@ -693,6 +695,7 @@ class SpawnRequest:
     #: (issue #414): ``[{"permalink", "title"?}, …]``. Unlike ``targets`` these
     #: reach no launch argument — the run is told about them once its bus is up.
     references: Optional[list] = None
+    workspace_id: Optional[str] = None
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -2513,28 +2516,7 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
 
 
 def _live_worker_count() -> int:
-    """How many *worker* sessions are up — what ``max_concurrent_sessions`` bounds.
-
-    The orchestrating assistant is excluded, which is the whole of the operator's
-    decision that it "gets its own slot" (T75): the platform starts one for itself
-    at boot (:class:`lmer_platform.assistant.Supervisor`), so counting it would
-    silently turn a host configured for four sessions into a host that runs three
-    workers and a chat window. The cap is about how much *work* this host can bear;
-    the assistant is the thing that routes the work, and it is one container
-    whether the cap is set to 1 or 40.
-
-    The exclusion is by ``kind`` and therefore runs in both directions, which is
-    what keeps it one rule rather than two: a worker spawn does not see the
-    assistant in the count, and an assistant spawn does not see a previous
-    incarnation whose entry is still live. What stops a *second* assistant is
-    :func:`lmer_platform.assistant.start`, on the strength of the registry (D11),
-    and that is where the refusal belongs — a cap on workers rejecting an
-    assistant would be the same setting meaning two things.
-
-    Read through :data:`lmer_platform.registry.ASSISTANT_KIND` rather than a
-    literal, and from there rather than from :mod:`lmer_platform.assistant`: this
-    module is what spawns the assistant, so importing it would be a cycle.
-    """
+    """Count live workers, including legacy entries without a recorded kind."""
     return sum(
         1 for entry in registry.list_sessions(live_only=True)
         if entry.get("kind") != registry.ASSISTANT_KIND
@@ -2954,6 +2936,8 @@ def _claim_slot(
     launch cannot pass this occupancy check before the claim becomes visible.
     """
     if request.slot is None:
+        if projects.enabled():
+            return _claim_equivalent_slots(with_stored_slots(config), request)
         return request, None, None, None
 
     # The file, not the boot-time config (#256): a slot created through the UI
@@ -2970,6 +2954,9 @@ def _claim_slot(
                 if declared else " — this host declares no service slots"
             )
         )
+    applicability = status.definition.applicability_reason(request.workspace_id)
+    if applicability:
+        raise SpawnError(f"service slot {request.slot!r}: {applicability}")
     if status.unusable_reason is not None:
         raise SpawnError(
             f"service slot {request.slot!r} is not usable: "
@@ -3016,12 +3003,38 @@ def _claim_slot(
 
     # ``validate`` has already refused a request naming both, so the preset
     # field is empty and this fills it.
+    if projects.enabled():
+        resolved = replace(request, preset=status.definition.preset)
+        try:
+            actual_service, actual_group, _, _ = slots.equivalent_slots(config, resolved)
+        except ServiceError as exc:
+            raise SpawnError(str(exc)) from exc
+        if (actual_service, actual_group) != (status.service, status.service_group):
+            raise SpawnError("A named slot cannot be redirected to another service by extra arguments.")
     return (
         replace(request, preset=status.definition.preset),
         status.service,
         status.service_group,
         members,
     )
+
+
+def _claim_equivalent_slots(config, request):
+    try:
+        service, group, members, matching = slots.equivalent_slots(config, request)
+    except (ValueError, ServiceError) as exc:
+        raise SpawnError(f"Could not resolve service admission: {exc}") from exc
+    for status in matching:
+        reason = status.definition.applicability_reason(request.workspace_id) or status.unusable_reason
+        if reason:
+            raise SpawnError(f"service slot {status.definition.name!r}: {reason}")
+        if status.occupant or status.service_occupants:
+            raise SlotOccupied(f"service slot {status.definition.name!r} is already held")
+        if status.service_down_reason:
+            raise SpawnError(f"service slot {status.definition.name!r}: {status.service_down_reason}")
+    if matching:
+        request = replace(request, slot=matching[0].definition.name)
+    return request, service, group, members
 
 
 _LAUNCH_LOCK = threading.Lock()
@@ -3089,11 +3102,9 @@ def spawn_session(
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
-    Raises :class:`CapacityError` when the configured concurrency cap is already
-    met — enforced here rather than in the caller so every spawn path (the API, the
-    assistant's own start) is bounded by the same check. The queue that makes
-    waiting graceful is still unbuilt; until then a spawn over cap is simply
-    refused with the numbers in the message.
+    Raises :class:`CapacityError` when a worker launch would exceed the configured
+    worker cap. Enforced here for every worker entry point, including answer and
+    resume; assistant launches use reserved capacity beside that cap.
 
     Raises :class:`SlotOccupied` — or a bare :class:`SpawnError` for a slot that
     is unknown or unusable — when ``request.slot`` names a service slot this
@@ -3114,7 +3125,7 @@ def spawn_session(
     still comes up (:func:`lmer_platform.assistant.start`).
     """
     # Launch checks and publication must be exclusive, including the Popen gap.
-    with _LAUNCH_LOCK:
+    with projects.operation(), _LAUNCH_LOCK, project_context.bound(request.workspace_id or project_context.current()):
         _cleanup_failed_publications()
         return _spawn_session(
             config, request, kind=kind, publish_registration=publish_registration,
@@ -3130,16 +3141,31 @@ def _spawn_session(
     publish_registration: Optional[Callable[[Callable[[], None], str, int], None]],
     refuse_held_targets: bool,
 ) -> SpawnResult:
+    from . import project_requests, project_threads
+
     request = request.validate()
     if kind not in registry.SESSION_KINDS:
         raise SpawnError(f"invalid session kind {kind!r}")
+    workspace_id = request.workspace_id or project_context.current()
+    if projects.enabled():
+        try:
+            projects.get(workspace_id, active=True)
+            if request.targets:
+                for target in request.targets:
+                    project_threads.authorize(target, workspace_id)
+            if kind == registry.ASSISTANT_KIND:
+                projects.require_admission(workspace_id)
+        except projects.ProjectError as exc:
+            raise SpawnError(str(exc)) from exc
 
-    live = _live_worker_count()
-    if live >= config.max_concurrent_sessions:
-        raise CapacityError(
-            f"concurrency cap reached: {live}/{config.max_concurrent_sessions} "
-            "worker sessions already running"
-        )
+    if kind == registry.WORKER_KIND:
+        live = _live_worker_count()
+        worker_cap = projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions
+        if live >= worker_cap:
+            raise CapacityError(
+                f"concurrency cap reached: {live}/{worker_cap} "
+                "worker sessions already running"
+            )
 
     # After the cap, so a host that is simply full says so rather than blaming
     # the slot.
@@ -3149,6 +3175,8 @@ def _spawn_session(
     # derived from" are separable claims — only the first is recorded anywhere.
     repo_url, identity_url = _repo_urls(request)
     host, project, slug = derive_run_identity(request, identity_url, config)
+    if projects.enabled() and host and project and slug:
+        projects.check_home(runs.run_key(host, project, slug), workspace_id)
     # As early as the identity allows, and before the command is built: a spawn
     # refused for a run that is already running leaves nothing behind — no argv, no
     # port drawn, no directory made.
@@ -3191,6 +3219,7 @@ def _spawn_session(
     # the orchestrator, which is why it is set here and only here: a session
     # spawned without a usable channel directory must not claim to have one.
     invocation_env = {
+        "LMER_WORKSPACE_ID": workspace_id or "",
         "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
@@ -3224,16 +3253,26 @@ def _spawn_session(
     child_env = env_with_overrides(invocation_env)
 
     master_fd, slave_fd = pty.openpty()
+    launch_pipe = os.pipe() if projects.enabled() and kind == registry.ASSISTANT_KIND else None
+    launch_error_pipe = os.pipe() if launch_pipe else None
+    child_command = ([sys.executable, str(Path(__file__).with_name("launch_guard.py")),
+                      str(launch_pipe[0]), str(launch_error_pipe[1]), *command]
+                     if launch_pipe else command)
     try:
+        project_requests.effect()
         process = subprocess.Popen(
-            command,
+            child_command,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             env=child_env,
             start_new_session=True,
+            **({"pass_fds": (launch_pipe[0], launch_error_pipe[1])} if launch_pipe else {}),
         )
     except (OSError, ValueError) as exc:
+        if launch_pipe:
+            os.close(launch_pipe[1])
+            os.close(launch_error_pipe[0])
         os.close(master_fd)
         os.close(slave_fd)
         # The token was minted for a process that does not exist; nothing will
@@ -3241,8 +3280,13 @@ def _spawn_session(
         # credential does not get left lying around.
         with _suppress_oserror():
             token_file.unlink()
+        if isinstance(exc, projects.ProjectError):
+            raise
         raise SpawnError(f"cannot start {command[0]} ({exc})")
     finally:
+        if launch_pipe:
+            os.close(launch_pipe[0])
+            os.close(launch_error_pipe[1])
         # The child holds its own copy of the slave end.
         with _suppress_oserror():
             os.close(slave_fd)
@@ -3311,6 +3355,12 @@ def _spawn_session(
             uploads=uploads.registry_pointer(channels.upload_dir),
             started_at=utc_now_iso(),
         )
+        if projects.enabled():
+            projects.bind_session(session_id, workspace_id,
+                                  runs.run_key(host, project, slug) if host and project and slug else None)
+            if host and project and slug:
+                projects.bind_run(runs.run_key(host, project, slug), workspace_id)
+                projects.remember_launch(runs.run_key(host, project, slug), request.slot, request.preset)
 
     # Most sessions publish only their registry entry. The assistant also has a
     # lifecycle-state pointer that must become visible with that entry, so it
@@ -3322,12 +3372,21 @@ def _spawn_session(
             register()
         else:
             publish_registration(register, session_id, process.pid)
+        if launch_pipe:
+            os.write(launch_pipe[1], b"1")
+            error = os.read(launch_error_pipe[0], 4096)
+            if error:
+                raise SpawnError(f"cannot start {command[0]} ({error.decode(errors='replace')})")
     except BaseException:
         _FAILED_PUBLICATIONS[session_id] = _UnpublishedLaunch(
             process, master_fd, token_file, session_id,
         )
         _cleanup_failed_publications()
         raise
+    finally:
+        if launch_pipe:
+            os.close(launch_pipe[1])
+            os.close(launch_error_pipe[0])
 
     # The launch's thread targets become connections like any other, so the fleet
     # payload, the routes and the UI see one kind of thing and the reconcile loop
@@ -3339,9 +3398,7 @@ def _spawn_session(
 
         component = thread_connectors.get_connectors()
         if component is not None:
-            component.adopt_launch_targets(
-                session_id, request.targets, by="operator",
-            )
+            project_requests.attach_spawned(component, session_id, request.targets)
 
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed

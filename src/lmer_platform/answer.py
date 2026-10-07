@@ -85,6 +85,7 @@ to withhold it.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
@@ -174,6 +175,10 @@ class AnswerRequest:
     slug: str
     answer: str
     allow_unsigned_source: Optional[str] = None
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "AnswerRequest":
         """Return a normalised copy, or raise :class:`AnswerError`.
@@ -222,6 +227,10 @@ class AnswerRequest:
             self,
             answer=answer,
             allow_unsigned_source=acknowledgement,
+            workspace_id=_clean_optional_text("workspace_id", self.workspace_id),
+            home_revision=_clean_optional_int("home_revision", self.home_revision),
+            confirm_project=_clean_flag("confirm_project", self.confirm_project),
+            slot=_clean_optional_text("slot", self.slot),
             **fields,
         )
 
@@ -302,6 +311,46 @@ def _reject_traversal(fields: dict) -> None:
             raise AnswerError(f"{name} must not contain a path separator: {value!r}")
         if any(segment in _UNSAFE_SEGMENTS for segment in segments):
             raise AnswerError(f"{name} is not a usable path: {value!r}")
+
+
+def _clean_optional_text(name: str, value) -> Optional[str]:
+    """A stripped optional string, ``None`` when absent or blank.
+
+    The project fields beside ``answer`` come off the same HTTP body, so they get
+    the same treatment: a blank selection means "I did not say", not a value with
+    surrounding whitespace for the project layer to match against.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AnswerError(f"{name} must be a string, got {type(value).__name__}")
+    return value.strip() or None
+
+
+def _clean_optional_int(name: str, value) -> Optional[int]:
+    """An optional non-negative integer, refused rather than coerced.
+
+    ``home_revision`` is compared for equality against the revision recorded for
+    the run, so a string would never match and would read as "the project moved";
+    and ``bool`` is an ``int`` in Python, so ``True`` must not pass as 1.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AnswerError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _clean_flag(name: str, value) -> bool:
+    """An optional boolean, refused rather than truthy-coerced.
+
+    The route already spells this ``is True``; the only way a non-bool arrives is
+    a caller that built the request directly, and ``bool("false")`` is ``True`` —
+    exactly the wrong answer for a confirmation flag.
+    """
+    if not isinstance(value, bool):
+        raise AnswerError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
 
 
 def _require_tracked(request: AnswerRequest) -> runs.TrackedRun:
@@ -548,6 +597,7 @@ def _identity_repo_url(request: AnswerRequest) -> str:
     return f"https://{request.host}/{request.project}"
 
 
+@run_operation
 def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     """Answer a question-blocked run by respawning it with the answer attached.
 
@@ -583,6 +633,7 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             # Recorded only if the run actually has one — an adopted run that has

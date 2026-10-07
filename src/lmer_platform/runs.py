@@ -83,12 +83,14 @@ from . import registry
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
 )
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.runs")
 
 __all__ = [
     "RUNS_FILE", "SOURCES", "TrackedRun", "RunIndexError", "run_key",
     "load_index", "list_tracked", "get_tracked", "track", "forget",
+    "forgotten_keys", "filter_forgotten",
     "note_session", "run_for_session", "run_key_of_entry",
 ]
 
@@ -226,23 +228,77 @@ def _references():
     return references
 
 
-def load_index() -> dict:
-    """Raw ``{key: entry}`` mapping. Empty when nothing is tracked yet."""
+def _snapshot() -> dict:
+    """The whole index file: ``{"runs": {...}, "forgotten": [[...], ...]}``.
+
+    Run entries and forgotten-run tombstones share one file and one writer, so
+    a forget cannot half-apply. ``forgotten`` holds ``[host, project, slug]``
+    parts — the composed key is derived, never stored, so a spelling change in
+    :func:`run_key` cannot strand a tombstone.
+    """
     try:
         stored = read_json(_index_path())
     except StoreError as exc:
         # A corrupt index would otherwise make the whole fleet vanish; the bad
         # bytes have already been moved aside for post-mortem.
         logger.error("platform_run_index_unreadable error=%s — treating as empty", exc)
-        return {}
-    if not stored:
-        return {}
+        return {"runs": {}, "forgotten": []}
+    if not isinstance(stored, dict):
+        return {"runs": {}, "forgotten": []}
     runs = stored.get("runs")
-    return runs if isinstance(runs, dict) else {}
+    forgotten = stored.get("forgotten")
+    return {
+        "runs": runs if isinstance(runs, dict) else {},
+        "forgotten": [list(parts) for parts in forgotten
+                      if isinstance(parts, (list, tuple)) and len(parts) == 3
+                      and all(isinstance(part, str) and part for part in parts)]
+        if isinstance(forgotten, list) else [],
+    }
 
 
-def _save_index(runs: dict) -> None:
-    write_json(_index_path(), {"runs": runs})
+def load_index() -> dict:
+    """Raw ``{key: entry}`` mapping. Empty when nothing is tracked yet."""
+    return _snapshot()["runs"]
+
+
+def _save_index(runs: dict, forgotten: Iterable = ()) -> None:
+    payload = {"runs": runs}
+    tombstones = [list(parts) for parts in sorted({tuple(part) for part in forgotten})]
+    if tombstones:
+        payload["forgotten"] = tombstones
+    write_json(_index_path(), payload)
+
+
+def forgotten_keys() -> set:
+    """Composed run keys the operator has forgotten.
+
+    ``forget`` drops the index entry, but a run's retained registry sessions are
+    evidence and stay on disk. This set lets the fleet view leave those sessions
+    out without deleting them (#527).
+    """
+    return {run_key(*parts) for parts in _snapshot()["forgotten"]}
+
+
+def filter_forgotten(sessions: Iterable[dict]) -> list:
+    """*sessions* minus a forgotten run's retained (dead) entries.
+
+    A live session is kept: forgetting says the operator is done tracking the
+    run, not that they want a running container to vanish from the fleet view.
+    Once that session dies its retained entry is dropped by the same rule.
+    """
+    forgotten = forgotten_keys()
+    if not forgotten:
+        return list(sessions)
+    kept = []
+    for entry in sessions:
+        parts = run_key_of_entry(entry)
+        live = entry.get("live")
+        if live is None:
+            live = registry.is_live(entry)
+        if parts and not live and run_key(*parts) in forgotten:
+            continue
+        kept.append(entry)
+    return kept
 
 
 def list_tracked() -> list:
@@ -299,8 +355,13 @@ def track(
     # here is a run that never appears in the fleet view while its container is
     # running, and that `resume` and `answer` then refuse as `run_not_tracked`.
     # Every route that gets here is a sync def in Starlette's threadpool.
-    with mutating(_index_path()):
-        runs = load_index()
+    with projects.operation(), mutating(_index_path()):
+        if projects.enabled():
+            home = projects.run_home(key)
+            projects.bind_run(key, project_context.current() or (home or {}).get("project_id"))
+        snapshot = _snapshot()
+        runs = snapshot["runs"]
+        forgotten = {tuple(parts) for parts in snapshot["forgotten"]}
         existing = runs.get(key) if isinstance(runs.get(key), dict) else {}
         now = utc_now_iso()
 
@@ -322,7 +383,9 @@ def track(
             "note": note if note is not None else existing.get("note"),
         }
         runs[key] = entry
-        _save_index(runs)
+        # Re-tracking clears a forget: the operator asked for the run again.
+        forgotten.discard((host.strip(), project.strip(), slug.strip()))
+        _save_index(runs, forgotten)
     logger.info("platform_run_tracked key=%s source=%s", key, entry["source"])
     return TrackedRun.from_dict(key, entry)
 
@@ -405,11 +468,14 @@ def forget(host: str, project: str, slug: str) -> bool:
     """
     key = run_key(host, project, slug)
     with mutating(_index_path()):
-        runs = load_index()
+        snapshot = _snapshot()
+        runs = snapshot["runs"]
         if key not in runs:
             return False
         runs.pop(key)
-        _save_index(runs)
+        forgotten = {tuple(parts) for parts in snapshot["forgotten"]}
+        forgotten.add((host.strip(), project.strip(), slug.strip()))
+        _save_index(runs, forgotten)
     # Best effort, and deliberately after the index write — and outside the lock,
     # because ``meta.drop`` takes its own file's: the run *is* forgotten
     # by the time this runs, so raising here would report a failure of something

@@ -16,13 +16,14 @@ import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
-import { forgetRun, resumeRun } from '../api.js'
+import { forgetRun, resumeRun, moveRun } from '../api.js'
 import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
   targetLink, targetRef, toneColor,
 } from '../format.js'
 import { rememberChoice, storedChoice } from '../preferences.js'
+import { projectColor } from '../projects.js'
 import { runKey as composeRunKey } from '../runref.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
@@ -46,7 +47,10 @@ const Terminal = defineAsyncComponent(() => import('./Terminal.vue'))
 const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 
 const props = defineProps({
+  projects: { type: Array, default: () => [] },
+  slots: { type: Array, default: () => [] },
   run: { type: Object, required: true },
+  identifiedWorkspaceId: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -56,7 +60,22 @@ const props = defineProps({
 // to reach around it, and this component is built for exactly one run.
 const emit = defineEmits(['close', 'changed', 'open'])
 
+const moveDestination = ref(null)
+const projectConfirmed = ref(false)
+const selectedSlot = ref(null)
+async function transferRun() {
+  if (!moveDestination.value) return
+  busy.value = true
+  moveError.value = null
+  try { await moveRun(props.run, moveDestination.value); emit('changed'); emit('close') }
+  catch (exc) { moveError.value = exc.message }
+  finally { busy.value = false }
+}
 const busy = ref(false)
+// The move control sits on the identity line and the forget control in the exit
+// tab, so one shared error ref would report a move failure at the bottom of a tab
+// nobody is looking at — the hidden refusal this fix exists to remove.
+const moveError = ref(null)
 const error = ref(null)
 
 // --- which view of a run this operator likes (T49) ---------------------------
@@ -383,7 +402,7 @@ async function postVerb(verb, body) {
       credentials: 'same-origin',
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body || {}),
+      body: JSON.stringify({ ...body, workspace_id: props.run.workspace_id, home_revision: props.run.home_revision }),
     },
   )
   const payload = await response.json().catch(() => null)
@@ -485,7 +504,8 @@ const canResume = computed(() => !props.run.live)
 // seconds and this section goes with it, and a second tap in the gap would only
 // earn the daemon's "already has a live session" refusal.
 const resumeHandedOff = computed(() => !!resumeStarted.value)
-const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value)
+const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value
+  && (!props.run.confirm_project || projectConfirmed.value))
 
 // Both are refusals; only one of them is a problem. Being asked for the repository
 // URL is the designed path — the platform will not invent that field — and painting
@@ -523,6 +543,8 @@ async function submitResume(allowUnsignedSource = null) {
       repoUrl: resumeRepoUrl.value,
       direction: resumeDirection.value,
       allowUnsignedSource,
+      confirmProject: projectConfirmed.value,
+      slot: selectedSlot.value,
     })
     resumeNeeds.value = null
     unsignedSource.value = null
@@ -574,6 +596,18 @@ async function forget() {
 
 <template>
   <div>
+    <div class="d-flex flex-wrap ga-2 align-center mb-3">
+      <v-chip v-if="!run.workspace_id || run.workspace_id !== identifiedWorkspaceId"
+        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
+      <template v-if="!run.live && !run.orchestrator">
+        <v-select v-model="moveDestination" :items="projects.filter(project => !project.archived && project.id !== run.workspace_id)"
+          item-title="name" item-value="id" label="Move to project" hide-details density="compact" style="min-width: 180px" />
+        <v-btn :disabled="!moveDestination || busy" @click="transferRun">Move run</v-btn>
+      </template>
+    </div>
+    <v-alert v-if="moveError" type="error" density="compact" class="mb-3">
+      {{ moveError }}
+    </v-alert>
     <!-- The run's identity, and the reason it is asking for you. Both sit above
          the tabs on purpose: which panel is showing is the operator's remembered
          choice now, so this view no longer decides what they land on — and
@@ -631,6 +665,7 @@ async function forget() {
            disagree about what is connected. -->
       <ThreadLinks
         :session-id="run.session?.id"
+        :workspace-id="run.workspace_id"
         :threads="run.threads"
         :references="run.references || []"
         :live="run.live"
@@ -764,7 +799,7 @@ async function forget() {
          with the box that clears the question one tap out of sight. -->
     <template v-if="questionPending">
       <div class="section-title">answer</div>
-      <AnswerBox :run="run" @answered="emit('changed')" />
+      <AnswerBox :run="run" :slots="slots" @answered="emit('changed')" />
     </template>
 
     <!-- The session's own channel, docked here for the same reason and one of its
@@ -779,6 +814,7 @@ async function forget() {
     <AskChannel
       v-if="terminalSession"
       :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
       :live="!!run.live"
       :initial="run.questions || []"
       @entries="receiveOperatorEntries"
@@ -959,6 +995,10 @@ async function forget() {
                    asking for something only the operator has. Shown in the daemon's
                    own words, which say both what is missing and what supplying it
                    will do. -->
+              <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
+          item-title="name" item-value="name" label="Service slot" clearable
+          hint="Leave empty to reuse this run's remembered slot. Choose an applicable slot if its assignment changed." persistent-hint />
+      <v-checkbox v-if="run.confirm_project" v-model="projectConfirmed" :label="`Continue this run in ${run.workspace_name} with its current project settings`" />
               <v-alert
                 v-if="resumeError"
                 :type="resumeAsksForAField ? 'warning' : 'error'"
@@ -1213,6 +1253,7 @@ async function forget() {
             <v-tabs-window-item value="conversation" class="pt-3">
               <Chat
                 :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
                 :question-pending="questionPending"
                 :ask-pending="askPending"
                 :now="now"
@@ -1220,7 +1261,8 @@ async function forget() {
             </v-tabs-window-item>
 
             <v-tabs-window-item value="terminal" class="pt-3">
-              <Terminal :session-id="terminalSession" :harness="run.harness" />
+              <Terminal :session-id="terminalSession"
+                :workspace-id="run.workspace_id" :harness="run.harness" />
             </v-tabs-window-item>
 
             <v-tabs-window-item value="chat" class="pt-3">
@@ -1237,6 +1279,7 @@ async function forget() {
               <AskHistory
                 :keep-last="chatKeepLast"
                 :session-id="terminalSession"
+                :workspace-id="run.workspace_id"
                 :live="!!run.live"
                 :now="now"
               />

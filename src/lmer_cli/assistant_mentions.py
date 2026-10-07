@@ -56,3 +56,24 @@ def forward(transport: str, conversation: str, event: dict) -> dict:
             "and restart the daemon and listeners"
         )
     return result
+
+
+def _matrix_mention(event, bot_id):
+    from matrix_chat.listener import is_assistant_mention
+
+    return is_assistant_mention(event, bot_id)
+
+
+def route_connected_mention(transport, conversation, event, *, bot_id):
+    """A mention targets the supervisor while ordinary worker replies stay connected."""
+    if not Settings.from_env().enabled:
+        return False
+    if transport == "slack":
+        mentioned = bool(bot_id and f"<@{bot_id}>" in str(event.get("text") or ""))
+        event = {**event, "type": "app_mention", "channel": conversation}
+    else:
+        mentioned = _matrix_mention(event, bot_id)
+    if not mentioned:
+        return False
+    forward(transport, conversation, event)
+    return True

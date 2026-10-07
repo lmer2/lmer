@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -136,7 +137,7 @@ class TestTheVerbs:
         assert code == 0, out.err
         thread = json.loads(out.out)["thread"]
         assert thread["permalink"] == (
-            "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+            "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
         )
         assert slack.opened[0][0] == "#a-channel"
 
@@ -253,6 +254,40 @@ class TestTheThreadVerbs:
         assert posted.call(posted) == ctl.Call(
             "POST", "/api/comms/thread", body={"permalink": SLACK_LINK, "text": "done"},
         )
+
+    def test_reading_a_saved_post_response_does_not_route_a_later_turn(
+        self, platform, capsys, monkeypatch, tmp_path, routing_call,
+    ):
+        from hooks.slack_reply_guard import evaluate, owed_reply_chars
+        from lmer_cli import thread_access
+        from tests.test_lmer_thread_access import FakeSlack
+        from tests.test_slack_reply_guard import (
+            _assistant_bash, _assistant_text, _tool_result, _user_text,
+        )
+
+        slack = FakeSlack()
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: slack)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        routing_call("prior-post")
+        prior = [_user_text("Send the earlier reply."),
+                 _assistant_bash("lmer-ctl thread post ...", tool_id="prior-post")]
+        code, output = run(platform, capsys, ["thread", "post", SLACK_LINK, "Earlier reply"])
+        assert code == 0, output.err
+        prior.append(_tool_result(output.out, tool_use_id="prior-post"))
+        assert evaluate(prior + [_assistant_text("x" * 79)]) is None
+        routing_call("read-this-turn")
+        saved = tmp_path / "previous-post.json"
+        saved.write_text(output.out)
+        replay = subprocess.check_output(["cat", str(saved)], text=True, timeout=30)
+        text = "This later answer has not been sent to the operator and must trigger the guard."
+        events = prior + [_user_text("Explain the earlier send."),
+                          _assistant_bash(f"cat {saved}", tool_id="read-this-turn"),
+                          _tool_result(replay, tool_use_id="read-this-turn"),
+                          _assistant_text(text)]
+
+        assert len(slack.posted) == 1
+        assert owed_reply_chars(events) == len(text)
+        assert evaluate(events) is not None
 
 
 class TestSpawnReferences:

@@ -3166,6 +3166,7 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_TASK": task_id if not ns.no_task else None,
         "LMER_TASK_TARGET": primary_target if not ns.no_task else None,
         "LMER_SESSION_KIND": os.environ.get("LMER_SESSION_KIND"),
+        "LMER_WORKSPACE_ID": os.environ.get("LMER_WORKSPACE_ID"),
         "LMER_SECONDARY_TARGETS": ",".join(secondary_targets) if secondary_targets else None,
         "LMER_CORE_TASKS": ",".join(sorted(known_tasks)) if (known_tasks and not ns.no_task) else None,
         # Container paths for task definitions (remapped from host paths).

@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from lmer_cli import thread_requests as _threads
+from lmer_cli.routing_receipts import emit as routing_receipt
 
 from . import bus
 from .args import (
@@ -348,6 +349,7 @@ def _cmd_post(args: argparse.Namespace, client: bus.BusClient) -> int:
     if getattr(args, "thread", None):
         return _post_into_thread(args, client, text, staged)
     result = client.post(KIND_MESSAGE, text, attachments=staged)
+    routing_receipt("post", result["message"].get("id"))
     print(format_id(result["message"]))
     return 0
 
@@ -371,6 +373,7 @@ def _post_into_thread(
     thread = delivered.get("thread") or {}
     where = thread.get("label") or args.thread
     posted = delivered.get("posted") or {}
+    routing_receipt("post", posted.get("ref"))
     if posted.get("clipped"):
         print(
             f"posted into {where}, clipped to what one message carries — the "
@@ -427,6 +430,7 @@ def _cmd_dm(args: argparse.Namespace, client: bus.BusClient) -> int:
     who = conversation.get("recipient") or args.recipient
     where = conversation.get("channel") or ""
     posted = delivered.get("posted") or {}
+    routing_receipt("dm", posted.get("ref"))
     if posted.get("clipped"):
         print(
             f"sent to {who}, clipped to what one message carries — and the whole "
@@ -574,6 +578,7 @@ def _cmd_ask(args: argparse.Namespace, client: bus.BusClient) -> int:
         wait=None if args.no_wait else _claim_ttl(args),
     )
     question = result["message"]
+    routing_receipt("ask", question.get("id"))
     if args.no_wait:
         print(format_id(question))
         return 0

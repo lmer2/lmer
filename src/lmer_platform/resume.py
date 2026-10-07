@@ -160,6 +160,7 @@ argv in :mod:`lmer_platform.spawn`.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
@@ -387,6 +388,10 @@ class ResumeRequest:
     direction: Optional[str] = None
     session_id: Optional[str] = None
     allow_unsigned_source: Optional[str] = None
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "ResumeRequest":
         """Return a normalised copy, or raise :class:`ResumeError`.
@@ -415,6 +420,10 @@ class ResumeRequest:
             direction=_clean_direction(self.direction),
             session_id=_clean_session_id(self.session_id),
             allow_unsigned_source=_clean_session_id(self.allow_unsigned_source),
+            workspace_id=_clean_text("workspace_id", self.workspace_id),
+            home_revision=_clean_optional_int("home_revision", self.home_revision),
+            confirm_project=_clean_flag("confirm_project", self.confirm_project),
+            slot=_clean_text("slot", self.slot),
             **fields,
         )
 
@@ -617,6 +626,32 @@ def _clean_direction(value: Optional[str]) -> Optional[str]:
             "command-line argument, and a longer one fails the spawn itself"
         )
     return direction
+
+
+def _clean_optional_int(name: str, value) -> Optional[int]:
+    """An optional non-negative integer, refused rather than coerced.
+
+    ``home_revision`` is compared for equality against the revision recorded for
+    the run, so a string would never match and would read as "the project moved";
+    and ``bool`` is an ``int`` in Python, so ``True`` must not pass as 1.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResumeError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _clean_flag(name: str, value) -> bool:
+    """An optional boolean, refused rather than truthy-coerced.
+
+    The route already spells this ``is True``; the only way a non-bool arrives is
+    a caller that built the request directly, and ``bool("false")`` is ``True`` —
+    exactly the wrong answer for a confirmation flag.
+    """
+    if not isinstance(value, bool):
+        raise ResumeError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
 
 
 def _require_tracked(request: ResumeRequest) -> runs.TrackedRun:
@@ -1148,6 +1183,7 @@ def _schema_two_source(
     return source_uid, acknowledgement
 
 
+@run_operation
 def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     """Continue a tracked run by starting its next session.
 
@@ -1191,6 +1227,7 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             repo_url=repo_url,

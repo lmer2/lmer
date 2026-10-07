@@ -229,13 +229,13 @@ class TestTheListenersOwnTheirAck:
             "LMER_MATRIX_HOMESERVER": "https://hs",
             "LMER_MATRIX_USER_ID": "@bot:example.org",
             "LMER_MATRIX_ACCESS_TOKEN": "syt",
-            "LMER_MATRIX_ALLOWED_USERS": "@vegu:example.org",
+            "LMER_MATRIX_ALLOWED_USERS": "@tester:example.org",
         })
         watcher = matrix_listener.Listener(config, Sessions(), matrix=object())
         watcher._say = lambda room, root, text: _record(said, text)
 
         asyncio.run(watcher.handle("!room:example.org", {
-            "event_id": "$m1", "sender": "@vegu:example.org",
+            "event_id": "$m1", "sender": "@tester:example.org",
             "content": {"body": "@bot start", "msgtype": "m.text"},
         }))
 

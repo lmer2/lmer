@@ -2,24 +2,76 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AssistantSettings from '../src/components/AssistantSettings.vue'
 import { fetchAssistantConfig, setAssistantConfig } from '../src/api.js'
-import { chatKeepLast, applyChatSettings } from '../src/operatorChat.js'
+import { chatKeepLast, chatShowTranscript, applyChatSettings } from '../src/operatorChat.js'
 import { mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ fetchAssistantConfig: vi.fn(), setAssistantConfig: vi.fn() }))
-const config = (value = 0, changed = []) => ({
+const config = (value = 0, changed = [], shown = false) => ({
   settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'threads'].map((key) => [
     key, { value: null, stored: null, source: 'default' },
   ])),
-  chat: { keep_last: { value, stored: value, source: 'config.json' } }, changed,
+  chat: {
+    keep_last: { value, stored: value, source: 'config.json' },
+    show_transcript: {
+      value: shown, stored: shown ? true : null, source: shown ? 'config.json' : 'default',
+    },
+  },
+  changed,
 })
 const button = (label) => [...document.querySelectorAll('.v-dialog button')]
   .find((node) => node.textContent.trim() === label)
+const transcriptSwitch = () => {
+  const control = [...document.querySelectorAll('.v-dialog .v-switch')]
+    .find((node) => node.textContent.includes('working transcript'))
+  expect(control).toBeDefined()
+  return control.querySelector('input')
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
   applyChatSettings(config())
   fetchAssistantConfig.mockResolvedValue(config(25))
-  setAssistantConfig.mockImplementation(async ({ chat_keep_last }) => config(chat_keep_last, ['chat_keep_last']))
+  setAssistantConfig.mockImplementation(async (named) => config(
+    named.chat_keep_last ?? 25, Object.keys(named), named.chat_show_transcript ?? false,
+  ))
+})
+
+// The uber lmer pane's transcript switch (issue #488): stored through the same
+// config route as retention, applied to the drawer the moment the save lands.
+it('turns the working transcript on through the config route and applies it at once', async () => {
+  await open()
+  expect(chatShowTranscript.value).toBe(false)
+  const input = transcriptSwitch()
+  expect(input.checked).toBe(false)
+  input.click()
+  await flushPromises()
+  button('save').click()
+  await flushPromises()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_show_transcript: true })
+  expect(chatShowTranscript.value).toBe(true)
+  expect(document.body.textContent).toContain('applies now')
+  expect(button('restart')).toBeUndefined()
+})
+
+it('prefills the switch from the stored setting and sends nothing when it is unchanged', async () => {
+  fetchAssistantConfig.mockResolvedValue(config(25, [], true))
+  await open()
+  expect(transcriptSwitch().checked).toBe(true)
+  expect(chatShowTranscript.value).toBe(true)
+  button('save').click()
+  await flushPromises()
+  expect(setAssistantConfig).not.toHaveBeenCalled()
+})
+
+it('turns the working transcript off again with an explicit false', async () => {
+  fetchAssistantConfig.mockResolvedValue(config(25, [], true))
+  await open()
+  transcriptSwitch().click()
+  await flushPromises()
+  button('save').click()
+  await flushPromises()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_show_transcript: false })
+  expect(chatShowTranscript.value).toBe(false)
 })
 
 async function open() {

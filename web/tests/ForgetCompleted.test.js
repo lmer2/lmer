@@ -2,11 +2,12 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
 import ForgetCompleted from '../src/components/ForgetCompleted.vue'
-import { fetchRunRelations, fetchState, forgetRun } from '../src/api.js'
+import { fetchProjects, fetchRunRelations, fetchState, forgetRun } from '../src/api.js'
 import { mountPane, deferred } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
   fetchState: vi.fn(),
+  fetchProjects: vi.fn().mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] }),
   // The shell reads relations for the map when the payload carries none.
   fetchRunRelations: vi.fn().mockResolvedValue({ run: {}, relations: [] }),
   forgetRun: vi.fn(),
@@ -14,7 +15,7 @@ vi.mock('../src/api.js', () => ({
   rescan: vi.fn(),
 }))
 const run = (slug, extra = {}) => ({
-  host: 'gitlab.example.com', project: 'acme/widget', slug, label: slug,
+  host: 'gitlab.example.com', project: 'acme/widget', slug, label: slug, workspace_id: 'general',
   state: 'complete', live: false, ...extra,
 })
 const dialogButton = (text) => [...document.querySelectorAll('.v-dialog button')]
@@ -22,6 +23,8 @@ const dialogButton = (text) => [...document.querySelectorAll('.v-dialog button')
 
 beforeEach(() => {
   vi.clearAllMocks()
+  fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] })
+  window.history.replaceState({}, '', '/?workspace=general')
   forgetRun.mockResolvedValue({ forgotten: true })
   fetchRunRelations.mockResolvedValue({ run: {}, relations: [] })
 })
@@ -108,6 +111,8 @@ it('selects completed runs outside the listing search and removes only successfu
   forgetRun.mockRejectedValueOnce(new Error('Request refused'))
   const wrapper = mountPane(App, {}, { global: { stubs: { RunCard: true, RunNav: true } } })
   await flushPromises()
+  await wrapper.get('[role=tab][value=general]').trigger('click')
+  await flushPromises()
   const search = wrapper.get('input[placeholder="name, taskdef, project, state, ticket…"]')
   await search.setValue('no matching runs')
   const choose = wrapper.findAll('button').find((button) => button.text().trim() === 'Forget all completed')
@@ -121,4 +126,48 @@ it('selects completed runs outside the listing search and removes only successfu
   const cards = wrapper.findAllComponents({ name: 'RunCard' })
   expect(cards.map((card) => card.props('run').slug)).toEqual(['first'])
   expect(wrapper.text()).toContain('first: Request refused')
+})
+
+
+it('forgets both project scopes from All projects while preserving active and held runs', async () => {
+  const beta = { id: 'beta', name: 'Example Beta', color: 'Teal', assistant: { lifecycle: 'stopped' } }
+  fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General' }, beta] })
+  const rows = [run('general-done'), run('beta-done', { workspace_id: 'beta' }),
+    run('active', { live: true }), run('held', { state: 'held' })]
+  fetchState.mockResolvedValue({ runs: rows, attention: [], totals: {}, relations: [] })
+  const wrapper = mountPane(App, {}, { global: { stubs: { RunCard: true } } })
+  await flushPromises()
+  await wrapper.findAll('[role="tab"]').find(tab => tab.text() === 'All projects').trigger('click')
+  await flushPromises()
+  await wrapper.getComponent(ForgetCompleted).get('button').trigger('click')
+  await flushPromises()
+  expect(document.body.textContent).toContain('Forget 2 completed runs?')
+  expect(forgetRun).not.toHaveBeenCalled()
+  dialogButton('Forget 2 runs').click()
+  await flushPromises()
+  expect(forgetRun.mock.calls.map(([row]) => [row.workspace_id, row.slug])).toEqual([
+    ['general', 'general-done'], ['beta', 'beta-done'],
+  ])
+  expect(wrapper.get('main').text()).not.toContain('general-done')
+  expect(wrapper.get('main').text()).not.toContain('beta-done')
+  expect(wrapper.get('main').text()).toContain('active')
+  expect(wrapper.get('main').text()).toContain('held')
+})
+
+it('disposes a completed-run confirmation when the project scope changes', async () => {
+  fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General' }, { id: 'beta', name: 'Example Beta' }] })
+  fetchState.mockResolvedValue({ runs: [run('one'), run('two', { workspace_id: 'beta' })], attention: [], totals: {}, relations: [] })
+  const wrapper = mountPane(App, {}, { global: { stubs: { RunCard: true } } })
+  await flushPromises()
+  await wrapper.getComponent(ForgetCompleted).get('button').trigger('click')
+  await flushPromises()
+  const oldConfirm = dialogButton('Forget 1 run')
+  await wrapper.findAll('[role="tab"]').find(tab => tab.text() === 'All projects').trigger('click')
+  await flushPromises()
+  oldConfirm.click()
+  await flushPromises()
+  expect(forgetRun).not.toHaveBeenCalled()
+  await wrapper.getComponent(ForgetCompleted).get('button').trigger('click')
+  await flushPromises()
+  expect(document.body.textContent).toContain('Forget 2 completed runs?')
 })

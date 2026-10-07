@@ -1,2 +1,0 @@
-added:
-- "gpg-agent forwarding for `ansible`-taskdef sessions: sign and decrypt with the host key, which never enters the container"

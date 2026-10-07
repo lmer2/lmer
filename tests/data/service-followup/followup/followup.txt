@@ -1,0 +1,10 @@
+{% include 'service-checkout.jinja2' %}
+{% include 'commit-workflow.jinja2' %}
+
+Check if your MR has been reviewed since your last push.
+
+If it has, evaluate the review for valid, actionable concerns and apply fixes to address any issues.
+
+Do not blindly accept the critique — an LLM may have written it, and there may be false positives.
+
+If you find that part of the review is incorrect or not applicable, address it with a follow-up comment rather than silently ignoring it.

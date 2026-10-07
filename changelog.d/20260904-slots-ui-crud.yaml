@@ -1,7 +1,0 @@
-added:
-- "Service slots can be created, edited and removed from the fleet view, with the same validation the rows report"
-- "The fleet view says when config.json could not be read, instead of showing a host with no service slots"
-changed:
-- "Service slot definitions take effect on the next poll instead of needing a daemon restart"
-fixed:
-- "A platform settings write no longer replaces config.json when the file exists but cannot be read"

@@ -108,7 +108,7 @@ def test_the_shell_registers_a_resolver_and_reports_an_untracked_run():
     # Against the fleet this shell already holds, not by a fetch of its own.
     resolver = text[text.index("function openRunRef"):]
     resolver = resolver[:resolver.index("\n}")]
-    assert "runs.value.find" in resolver
+    assert "state.value?.runs || []).find" in resolver
     assert "open(run)" in resolver
 
 

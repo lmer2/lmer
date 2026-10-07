@@ -63,6 +63,9 @@ class Slack:
     def workspace(self):
         return {"host": "example.slack.com", "scopes": ["chat:write", "users:read"]}
 
+    def auth_test(self):
+        return "UBOT"
+
     def history_before(self, conversation, before, limit):
         self.history_calls.append((conversation, before, limit))
         return [{"ts": f"170000000{i}.000000", "user": SLACK_USER, "text": f"before {i}"}
@@ -633,11 +636,15 @@ def test_slack_handle_cannot_impersonate_id_entry(client, monkeypatch, transport
     assert submit(client, request)["status"] == "ignored"
 
 
-def test_slack_failed_handle_lookup_denies(client, monkeypatch, transports):
+def test_slack_failed_handle_lookup_is_retryable_without_admission(client, monkeypatch, transports):
     remember("slack")
     monkeypatch.setenv("LMER_SLACK_DM_ALLOWED_USERS", "operator")
     transports["slack"]._request = MagicMock(side_effect=SlackError("lookup unavailable"))
-    assert submit(client, body("slack", threaded=True, dm=True))["status"] == "ignored"
+    response = client.post("/api/assistant/requests", json=body("slack", threaded=True, dm=True), headers=AUTH)
+    assert response.status_code == 502
+    assert "lookup unavailable" in response.json()["detail"]
+    assert pending(client) == []
+    assert transports["slack"].posts == []
 
 
 @pytest.mark.parametrize("kind,task,expected", [("assistant", "orchestrate", True),

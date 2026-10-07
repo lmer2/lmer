@@ -57,10 +57,10 @@ class FakeSlack:
         self.fail_post = False
         self.attempts = 0
         self.reactions = []
-        self.names = {"U1": {"display_name": "vegu"}}
+        self.names = {"U1": {"display_name": "tester"}}
 
     def workspace(self):
-        return {"host": "20c.slack.com"}
+        return {"host": "example.slack.com"}
 
     def add_reaction(self, channel, timestamp, name):
         reaction = (channel, timestamp, name)
@@ -217,11 +217,11 @@ class TestRendering:
         answer = self._record("answer", "prep", channel="matrix", author="@a:x", in_reply_to="q1")
         text = connector.render_outbound(answer, {"q1": question})
         assert text == "✅ answered to “branch?” from matrix · @a:x: prep"
-        late = self._record("answer", "main", channel="platform", author="vegu", in_reply_to="q1", meta={"late": True})
+        late = self._record("answer", "main", channel="platform", author="tester", in_reply_to="q1", meta={"late": True})
         assert connector.render_outbound(late, {"q1": question}).startswith("↩️ late answer")
 
     def test_slacks_own_records_are_skipped(self):
-        assert connector.render_outbound(self._record("message", "hi", channel="slack", author="vegu")) is None
+        assert connector.render_outbound(self._record("message", "hi", channel="slack", author="tester")) is None
 
     def test_the_agents_message_is_plain_and_other_channels_are_tagged(self):
         assert connector.render_outbound(self._record("message", "done")) == "done"
@@ -266,6 +266,14 @@ class TestRendering:
 
 
 class TestOutbound:
+    def test_peer_ul_records_never_post_but_worker_messages_still_do(self, rig):
+        record = {"id": "sess-1/peer", "kind": "message", "text": "Private native coordination",
+                  "source": {"channel": "peer-ul", "author": "Example Alpha"}, "meta": {}}
+        rig.connector._send_record(record)
+        assert rig.slack.posted == []
+        rig.connector._send_record({**record, "id": "sess-1/worker", "source": {"channel": "uber-lmer"}})
+        assert len(rig.slack.posted) == 1
+
     def test_agent_records_reach_the_thread_and_the_cursor_is_acked(self, rig):
         rig.connector.start()
         rig.agent("note", "working on it")
@@ -279,7 +287,7 @@ class TestOutbound:
 
     def test_a_slack_record_is_not_posted_back(self, rig):
         rig.connector.start()
-        rig.log.append(kind="message", text="from slack", source=comms.Source("slack", author="vegu", ref="t9"))
+        rig.log.append(kind="message", text="from slack", source=comms.Source("slack", author="tester", ref="t9"))
         rig.agent("message", "after")
         rig.wait_until(lambda: len(rig.slack.posted) >= 1)
         assert [p[2] for p in rig.slack.posted] == ["after"]
@@ -457,14 +465,14 @@ class TestAttachNotice:
         assert record.text == (
             "[replay notice] the slack thread C1:1699999999.000000 has 3 earlier messages "
             "(2023-11-14T22:13:19Z .. 2023-11-14T22:30:01Z). Read them with: "
-            "lmer-signal read https://20c.slack.com/archives/C1/p1699999999000000 --limit 3"
+            "lmer-signal read https://example.slack.com/archives/C1/p1699999999000000 --limit 3"
         )
         assert not record.attachments and list(store.iterdir()) == []
         download.assert_not_called()
         rig.slack.human_says("after the attach", files=[PNG_FILE])
         assert rig.connector._poll_thread() == 1
         live = rig.log.read_since(record.seq)[0][-1]
-        assert live.text.startswith("after the attach") and live.source.author == "vegu"
+        assert live.text.startswith("after the attach") and live.source.author == "tester"
         assert len(live.attachments) == 1 and download.call_count == 1
         rig.connector.stop()
 
@@ -609,7 +617,7 @@ class TestPostsFromOtherRuns:
         rig.slack.human_says("and one from me")
         assert rig.connector._poll_thread() == 2
         authors = [record.source.author for record in rig.log.read_since(1)[0]]
-        assert authors == ["lmer chat-mr-288", "vegu"]
+        assert authors == ["lmer chat-mr-288", "tester"]
         assert [record.source.channel for record in rig.log.read_since(1)[0]] == ["slack"] * 2
 
     def test_it_is_not_mirrored_straight_back_into_the_thread(self, rig):
@@ -999,7 +1007,7 @@ def test_assistant_reply_reaches_slack_and_human_reply_reaches_its_pty(rig):
         rig.wait_until(lambda: any("[uber lmer] hello from the assistant" in text for _, _, text in rig.slack.posted))
         rig.slack.human_says("hello back")
         rig.wait_until(lambda: b"hello back" in b"".join(rig.sink))
-        assert b"[slack \xc2\xb7 vegu] hello back" in b"".join(rig.sink)
+        assert b"[slack \xc2\xb7 tester] hello back" in b"".join(rig.sink)
         assert b"hello from the assistant" not in b"".join(rig.sink)
         assert [r.source.channel for r in rig.log.read_since(0)[0] if r.text == "hello from the assistant"] == ["uber-lmer"]
     finally:

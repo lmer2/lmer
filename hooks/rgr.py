@@ -152,7 +152,7 @@ def main():
         module = rule_module.lower()
         if module in ['git']:
             print("  - NEVER push without permission (check allow list)")
-            print("  - NEVER commit without review and explicit approval")
+            print("  - Use required gates for authorized routine commits; respect explicit user holds")
             print("  - ALWAYS use gate commands (gate-check, gate-commit) — bare, not bin/gate-*")
         elif module in ['test', 'testing']:
             print("  - ALWAYS use pytest (never unittest)")
@@ -181,7 +181,7 @@ def main():
     else:
         # General reminders for global rules
         print("  - NEVER push without permission (check allow list)")
-        print("  - NEVER commit without review and explicit approval")
+        print("  - Use required gates for authorized routine commits; respect explicit user holds")
         print("  - ALWAYS show your work (paste command outputs)")
         print("  - ALWAYS run tests and pre-commit before committing")
 

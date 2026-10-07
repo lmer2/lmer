@@ -837,7 +837,9 @@ class TestTheRecordShape:
         threads = component(platform_root)
         live = threads.connect("s-1", SLACK_LINK, by="operator")
         launched = threads.adopt_launch_targets("s-2", [SLACK_LINK], by="operator")[0]
-        assert set(live) - {"running", "since", "last_exit", "detail"} == set(launched)
+        runtime = {"running", "since", "last_exit", "detail", "attention", "delivery_health"}
+        assert set(live) - runtime == set(launched)
+        assert all(not runtime.intersection(record) for records in threads.sessions().values() for record in records)
         assert live["origin"] == "live" and launched["origin"] == "launch"
 
 
@@ -1023,6 +1025,7 @@ class TestDisconnectNotices:
         assert disconnect_notices == [("s-1", {
             "kind": "message", "channel": "platform",
             "text": "thread disconnected: " + connected["label"],
+            "meta": {"notification_class": "connector_health"},
         })]
         with pytest.raises(connectors.ThreadError):
             threads.disconnect("s-1", connected["id"])

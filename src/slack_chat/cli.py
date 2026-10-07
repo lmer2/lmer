@@ -498,6 +498,9 @@ def _cmd_post(args: argparse.Namespace, client: SlackClient) -> int:
 
     text = _resolve_post_text(args)
     new_ts = client.post_message(channel, thread_ts, text)
+    from lmer_cli.routing_receipts import emit
+
+    emit("post", new_ts)
     print(new_ts)
 
     return 0
@@ -532,6 +535,7 @@ def _cmd_post_shim(args: argparse.Namespace) -> int:
     bus_error: Optional[Exception] = None
     try:
         result = signal_cli._client().post("message", text)
+        signal_cli.routing_receipt("post", result["message"].get("id"))
         print(f"{int(result['message']['seq']):06d}")
     except _bus.NoChannel as exc:
         bus_error = exc
@@ -543,7 +547,9 @@ def _cmd_post_shim(args: argparse.Namespace) -> int:
         try:
             channel, thread_ts = _resolve_channel_thread(args)
             slack = SlackClient()
-            print(slack.post_message(channel, thread_ts, text))
+            posted = slack.post_message(channel, thread_ts, text)
+            signal_cli.routing_receipt("post", posted)
+            print(posted)
         except SlackError as exc:
             print(f"Slack error: {exc}", file=sys.stderr)
             return 1 if bus_error is not None else 0

@@ -77,16 +77,16 @@ class TestSlackResolvesAUsername:
 
     def test_a_handle_resolves_to_one_user(self):
         client = slack_client({"users.list": self._members([
-            {"id": "U1", "name": "vegu", "profile": {"display_name": "Stefan"}},
+            {"id": "U1", "name": "tester", "profile": {"display_name": "Example"}},
             {"id": "U2", "name": "someone", "profile": {"display_name": "Someone"}},
         ])})
-        assert client.find_user("vegu") == [{"id": "U1", "name": "vegu"}]
+        assert client.find_user("tester") == [{"id": "U1", "name": "tester"}]
 
     def test_a_display_name_resolves_too_and_ignores_case_and_at(self):
         client = slack_client({"users.list": self._members([
-            {"id": "U1", "name": "vegu", "profile": {"display_name": "Stefan"}},
+            {"id": "U1", "name": "tester", "profile": {"display_name": "Example"}},
         ])})
-        assert client.find_user("@STEFAN") == [{"id": "U1", "name": "vegu"}]
+        assert client.find_user("@EXAMPLE") == [{"id": "U1", "name": "tester"}]
 
     def test_two_people_with_one_name_both_come_back(self):
         """The caller has to be able to refuse ambiguity; it cannot if the
@@ -98,27 +98,27 @@ class TestSlackResolvesAUsername:
         assert [item["id"] for item in client.find_user("sam")] == ["U1", "U2"]
 
     def test_nobody_is_an_empty_list_not_an_error(self):
-        client = slack_client({"users.list": self._members([{"id": "U1", "name": "vegu", "profile": {}}])})
+        client = slack_client({"users.list": self._members([{"id": "U1", "name": "tester", "profile": {}}])})
         assert client.find_user("nobody") == []
 
     def test_a_deactivated_account_is_not_a_match(self):
         client = slack_client({"users.list": self._members([
-            {"id": "U1", "name": "vegu", "profile": {}, "deleted": True},
+            {"id": "U1", "name": "tester", "profile": {}, "deleted": True},
         ])})
-        assert client.find_user("vegu") == []
+        assert client.find_user("tester") == []
 
     def test_every_page_is_read(self):
         pages = [
             self._members([{"id": "U1", "name": "first", "profile": {}}], cursor="next"),
-            self._members([{"id": "U2", "name": "vegu", "profile": {}}]),
+            self._members([{"id": "U2", "name": "tester", "profile": {}}]),
         ]
         client = slack_client({"users.list": lambda call: pages[call - 1]})
-        assert client.find_user("vegu") == [{"id": "U2", "name": "vegu"}]
+        assert client.find_user("tester") == [{"id": "U2", "name": "tester"}]
 
     def test_a_missing_scope_is_slack_s_own_error(self):
         client = slack_client({"users.list": {"ok": False, "error": "missing_scope"}})
         with pytest.raises(SlackError) as caught:
-            client.find_user("vegu")
+            client.find_user("tester")
         assert caught.value.code == "missing_scope"
 
 

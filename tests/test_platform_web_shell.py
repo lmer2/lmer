@@ -162,8 +162,8 @@ def test_the_run_list_is_reachable_without_going_back_to_the_fleet():
     app = _read(APP)
     assert RUN_NAV.is_file()
     assert "<RunNav" in app, "the drawer holds no run list"
-    assert ':runs="runs"' in app, "the navigator is not given the fleet"
-    assert ':attention="attention"' in app, (
+    assert ':runs="projectRuns(project.id)"' in app, "the navigator is not given the fleet"
+    assert ':attention="projectAttention(project.id)"' in app, (
         "the navigator is not given the priority-ordered attention list, so it "
         "would have to invent an order the fleet view does not use"
     )
@@ -217,7 +217,8 @@ def test_the_whole_app_can_be_held_in_a_band_in_the_middle_of_the_screen():
     nothing moves, which is exactly what the first cut of this measured.
     """
     app = _read(APP)
-    assert 'class="{ \'app-narrow\': narrow }"' in app.replace(':class', 'class'), (
+    root = re.search(r'<v-app\b[^>]*>', app).group(0)
+    assert re.search(r':class="\{[^}]*\'app-narrow\': narrow\b[^}]*\}"', root), (
         "the band is not a class on the app root, so it cannot reach the fixed "
         "elements that sit against the window's edges"
     )
@@ -292,7 +293,8 @@ def test_the_band_is_a_remembered_preference_with_a_control_that_does_something(
             toggle = match.group(0)
             break
     assert toggle, "nothing in the shell turns the band on"
-    assert 'v-if="!mobile"' in toggle, (
+    wrapper = next(block for block in re.findall(r"<v-tooltip\b.*?</v-tooltip>", app, re.S) if toggle in block)
+    assert 'v-if="!mobile"' in wrapper, (
         "the toggle is offered on a phone, where there is no width to give back"
     )
     assert "aria-label" in toggle, "an icon-only button needs a name"
@@ -397,7 +399,8 @@ def test_a_phone_can_open_the_drawer_and_it_gets_out_of_the_way_after():
     app = _read(APP)
     nav_icon = re.search(r"<v-app-bar-nav-icon\b[^>]*>", app, re.S)
     assert nav_icon, "nothing opens the drawer on a phone"
-    assert 'v-if="mobile"' in nav_icon.group(0), (
+    wrapper = next(block for block in re.findall(r"<v-tooltip\b.*?</v-tooltip>", app, re.S) if nav_icon.group(0) in block)
+    assert 'v-if="mobile"' in wrapper, (
         "a toggle is offered where the drawer is permanent and cannot be closed"
     )
     assert "aria-label" in nav_icon.group(0), "an icon-only button needs a name"
@@ -529,7 +532,7 @@ def test_a_run_that_needs_a_human_says_so_even_when_its_state_looks_calm():
     )
 
     sections = _function_body(text, "const sections = computed")
-    assert sections.index("'needs you'") < sections.index("'everything else'"), (
+    assert sections.index("runs: urgent") < sections.index("runs: calm"), (
         "the fleet view's order is not kept, so urgent runs sort in anywhere"
     )
 
@@ -548,8 +551,8 @@ def test_the_navigator_shows_where_you_are():
     assert "aria-current" in nav, "the mark is colour only, so it is not announced"
 
     app = _read(APP)
-    assert ':current-key="view === \'detail\' ? selectedKey : null"' in app, (
-        "a row stays marked as open on a view that is not showing it"
+    assert ':current-key="view === \'detail\' && selected?.workspace_id === project.id ? selectedKey : null"' in app, (
+        "selection must identify both the displayed run and its actual project"
     )
 
 
@@ -578,7 +581,7 @@ def test_an_empty_fleet_leaves_the_navigator_saying_so():
     The fleet view's empty state explains the scope rule at length; the drawer
     only has to admit that the emptiness is the truth rather than a failed load.
     """
-    assert 'v-if="!runs.length"' in _read(RUN_NAV)
+    assert 'v-if="!sections.length"' in _read(RUN_NAV)
     assert "nothing tracked yet" in _read(RUN_NAV)
 
 

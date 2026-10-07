@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, mergeProps, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useDisplay, useTheme } from 'vuetify'
 import {
   mdiRobot,
@@ -8,6 +8,7 @@ import {
   mdiArrowCollapseHorizontal,
   mdiArrowExpandHorizontal,
   mdiBroom,
+  mdiCogOutline,
   mdiMagnify,
   mdiMapOutline,
   mdiPlus,
@@ -26,9 +27,12 @@ import { orchestratorOf, pairsFromReplies } from './fleetMap.js'
 import RunCard from './components/RunCard.vue'
 import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
-import SlotEditor from './components/SlotEditor.vue'
-import SlotRow from './components/SlotRow.vue'
-import { fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
+import ProjectNav from './components/ProjectNav.vue'
+import PlatformSettings from './components/PlatformSettings.vue'
+import ProjectSlots from './components/ProjectSlots.vue'
+import ProjectSettings from './components/ProjectSettings.vue'
+import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
+import { projectColor } from './projects.js'
 import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef, toneColor,
 } from './format.js'
@@ -116,6 +120,60 @@ const busy = ref(false)
 const now = ref(Date.now())
 const view = ref('fleet')
 const selectedKey = ref(null)
+const projects = ref([])
+const activeProject = ref(new URLSearchParams(window.location.search).get('workspace') || '')
+const workspace = computed(() => projects.value.find(project => project.id === activeProject.value))
+const projectGroups = computed(() => projects.value.filter(project => !project.archived))
+const projectDialog = ref(false)
+const projectName = ref('')
+const projectError = ref(null)
+const creatingProject = ref(false)
+const platformSection = ref(null)
+const seenChats = ref([])
+const chatProject = ref(activeProject.value)
+const chatWorkspace = computed(() => projects.value.find(project => project.id === chatProject.value))
+const openedChats = computed(() => projects.value.filter(project => seenChats.value.includes(project.id) && !project.archived))
+
+function chooseProject(id) { activeProject.value = id; view.value = 'fleet' }
+function showProjectChat(project) {
+  activeProject.value = project.id
+  chatProject.value = project.id
+  uberOpen.value = true
+  rememberChat(project.id)
+  if (mobile.value) navOpen.value = false
+}
+function showPlatformSettings(section = null) {
+  platformSection.value = section === 'slots' ? 'slots' : null
+  view.value = 'platform-settings'
+  if (mobile.value) { uberOpen.value = false; navOpen.value = false }
+}
+function openProjectChat(id) {
+  const project = projects.value.find(candidate => candidate.id === id && !candidate.archived)
+  if (project) showProjectChat(project)
+  else { chatProject.value = id || null; uberOpen.value = true }
+}
+function toggleProjectChat() {
+  if (uberOpen.value) uberOpen.value = false
+  else openProjectChat(activeProject.value || chatProject.value)
+}
+function rememberChat(id) { if (id && !seenChats.value.includes(id)) seenChats.value.push(id) }
+function projectRuns(id) { return (state.value?.runs || []).filter(run => run.workspace_id === id && !hiddenKeys.value.includes(keyOf(run))) }
+function projectAttention(id) { return (state.value?.attention || []).filter(run => run.workspace_id === id) }
+const unassignedRuns = computed(() => projectRuns(null))
+const unassignedAttention = computed(() => projectAttention(null))
+
+async function newProject() {
+  if (creatingProject.value) return
+  creatingProject.value = true
+  projectError.value = null
+  try {
+    const project = await createProject(projectName.value)
+    await load()
+    projectDialog.value = false
+    projectName.value = ''
+    showProjectChat(project)
+  } catch (exc) { projectError.value = exc.message } finally { creatingProject.value = false }
+}
 
 // Vuetify's own breakpoint rather than a media query of ours: the drawer below
 // reads the same `mobile` the framework uses to decide overlay-versus-inline, so
@@ -207,10 +265,22 @@ const uberOpen = ref(narrow.value && !mobile.value)
 const uberSeen = ref(uberOpen.value)
 watch(uberOpen, (open) => {
   if (open) uberSeen.value = true
+  if (open) rememberChat(chatProject.value)
+})
+watch(activeProject, (id) => {
+  const url = new URL(window.location.href)
+  if (id) url.searchParams.set('workspace', id)
+  else url.searchParams.delete('workspace')
+  window.history.replaceState({}, '', url)
+  if (id && uberOpen.value) { chatProject.value = id; rememberChat(id) }
 })
 
 let poll = null
 let tick = null
+
+const widthHint = computed(() => narrow.value
+  ? 'use the whole width of the screen'
+  : 'hold the app in a band in the middle of the screen')
 
 const keyOf = runKey
 
@@ -218,8 +288,8 @@ const fleetOnline = ref(false)
 const browserTitle = computed(() => fleetTitle(state.value, fleetOnline.value))
 watch(browserTitle, (value) => { document.title = value }, { immediate: true })
 
-const attention = computed(() => state.value?.attention || [])
-const runs = computed(() => state.value?.runs || [])
+const attention = computed(() => (state.value?.attention || []).filter(run => !activeProject.value || run.workspace_id === activeProject.value))
+const runs = computed(() => (state.value?.runs || []).filter(run => !activeProject.value || run.workspace_id === activeProject.value))
 // Every relation in the fleet, carried on the payload so the map draws its edges
 // without a request per run. Empty from a daemon older than this bundle, which
 // renders as a map with no lines rather than as an error.
@@ -306,38 +376,10 @@ const orchestratorHint = computed(() => {
 const fleetView = ref(storedFleetView())
 watch(fleetView, rememberFleetView)
 const calm = computed(() => runs.value.filter((run) => !run.attention))
-const totals = computed(() => state.value?.totals || { runs: 0, live: 0, attention: 0 })
+const totals = computed(() => ({ runs: runs.value.length, live: runs.value.filter(run => run.live).length, attention: attention.value.length }))
 const mirror = computed(() => state.value?.mirror || null)
-// Service slots (#245). Empty on a host that declares none, and the section
-// below then says so in a line rather than disappearing (#254): a feature that
-// renders nothing on the hosts that have not got it yet is one the operator
-// cannot ask the assistant to set up, because they never learn it is there.
 const slots = computed(() => state.value?.slots || [])
-// Why the list is empty, when it is empty for a reason. Empty slots otherwise
-// reads as "this host declares none", and a `config.json` saved mid-edit would
-// make that claim on every poll (#256).
-const slotsProblem = computed(() => state.value?.slots_problem || null)
-// Filtered here rather than in the dialog, so the row's wording and the
-// dialog's list come from one predicate.
 const freeSlots = computed(() => slots.value.filter(slotIsFree))
-
-// The slot editor (#256). `editingSlot` is null for "declare a new one".
-//
-// It stays a computed over the payload deliberately — the dialog has to be able
-// to see that the row moved under it — but the editor snapshots what it needs at
-// open and saves against that snapshot. Handing it a live prop to save from is
-// what would give the etag check away: the poll would refresh the version every
-// ten seconds, so a concurrent hand edit would be accepted rather than refused.
-const slotEditorOpen = ref(false)
-const editingSlotName = ref(null)
-const editingSlot = computed(
-  () => slots.value.find((row) => row.name === editingSlotName.value) || null,
-)
-
-function editSlot(row) {
-  editingSlotName.value = row?.name || null
-  slotEditorOpen.value = true
-}
 
 // Staleness must be visible rather than silently wrong (spec R20): a fleet view
 // confidently showing week-old phases is worse than one admitting it can't tell.
@@ -536,13 +578,15 @@ function load() {
   inFlight = (async () => {
     try {
       state.value = await fetchState()
+      projects.value = (await fetchProjects()).projects
+      if (uberOpen.value) rememberChat(chatProject.value)
       fleetOnline.value = true
       error.value = null
       // Rows the daemon no longer reports are forgotten for real, so the key has
       // nothing left to hide; keeping them would grow this list for the life of
       // the tab. A row still inside its undo window is still in the payload.
       hiddenKeys.value = hiddenKeys.value.filter(
-        (key) => runs.value.some((run) => keyOf(run) === key),
+        (key) => (state.value?.runs || []).some((run) => keyOf(run) === key),
       )
     } catch (exc) {
       fleetOnline.value = false
@@ -595,6 +639,7 @@ async function doPrune() {
 }
 
 function open(run) {
+  activeProject.value = run.workspace_id || ''
   selectedKey.value = keyOf(run)
   view.value = 'detail'
   // On a phone the drawer is an overlay sitting on top of the run it was just
@@ -613,7 +658,7 @@ const runRefNotice = ref(null)
 let stopRunRefs = null
 
 function openRunRef(ref) {
-  const run = runs.value.find((candidate) => keyOf(candidate) === ref.key)
+  const run = (state.value?.runs || []).find((candidate) => keyOf(candidate) === ref.key)
   if (!run) {
     runRefNotice.value = `${ref.key} — ${NOT_TRACKED_HINT}`
     return
@@ -670,127 +715,78 @@ onUnmounted(() => {
        against the window's edges are the app bar and the two drawers — all three
        `position: fixed`, which no `max-width` on an ancestor can reach. The rules
        are at the bottom of this file. -->
-  <v-app :class="{ 'app-narrow': narrow }">
+  <v-app :class="{ 'app-narrow': narrow, 'app-mobile': mobile }">
     <v-app-bar :elevation="1" density="comfortable">
-      <!-- Only where the drawer is an overlay: where it is permanent there is
-           nothing to toggle, and a button that does nothing is worse than no
-           button. -->
-      <v-app-bar-nav-icon
-        v-if="mobile"
-        aria-label="show the run list"
-        @click="navOpen = !navOpen"
-      />
-      <v-btn
-        v-if="view !== 'fleet'"
-        :icon="mdiArrowLeft"
-        variant="text"
-        aria-label="back to the fleet"
-        @click="view = 'fleet'"
-      />
-      <v-app-bar-title class="text-title-medium">{{ title }}</v-app-bar-title>
-      <!-- The bar's control cluster, centred on a desktop (operator request: it
-           read as "tucked into the upper right"). Absolute against the bar rather
-           than a spacer sandwich, so it sits at the bar's true centre instead of
-           the centre of whatever the title leaves over. On a phone the cluster
-           stays in flow on the right: a 390px bar already carries the nav toggle
-           and the title on the left, and a centred cluster lands on top of them. -->
-      <div class="bar-cluster" :class="{ 'bar-cluster-centered': !mobile }">
-      <!-- In the bar on every view, and always in the same place: the supervisor
-           is the app's, not one run's, and "tell it to stop that" has to be one
-           tap from wherever you noticed. Icon-only because the bar already carries
-           four controls on a 390px screen — the words are in the drawer's own
-           header, which is what an operator reads before typing. -->
-      <!-- Painted from the orchestrator's own tone, and titled with what it is
-           doing. The map used to draw it as a node; it does not any more, so this
-           control is the only place the fleet says whether its supervisor is
-           running, stuck or waiting on someone. Unpainted when the fleet carries
-           no orchestrator row, which is not the same as one that is fine. -->
-      <v-btn
-        :icon="mdiRobot"
-        :color="orchestratorTone"
-        variant="text"
-        :aria-label="orchestratorHint"
-        :title="orchestratorHint"
-        @click="uberOpen = !uberOpen"
-      />
-      <!-- The band (#286), in the bar for the same reason the scheme picker is: it
-           is a property of the screen this app is being read on, not of any run.
-           Offered only on a desktop, where there is width to give back — on a phone
-           the window is already narrower than any band this could hold the app in,
-           so the control would do nothing. -->
-      <v-btn
-        v-if="!mobile"
-        :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
-        :variant="narrow ? 'tonal' : 'text'"
-        :aria-label="narrow
-          ? 'use the whole width of the screen'
-          : 'hold the app in a band in the middle of the screen'"
-        @click="narrow = !narrow"
-      />
-      <!-- In the bar because the scheme is the app's and not one run's: it stays
-           reachable from the fleet, a run and the spawn form alike.
-           A menu rather than three buttons in the bar: on a 390px screen the bar
-           already carries the drawer icon, the title and the fleet's two verbs,
-           and a permanent third of that width for a preference is the view paying
-           for it. The menu also lets each state say what it is in words — three
-           icons alone leave "which one is following the OS" to be guessed. -->
-      <v-menu location="bottom end">
-        <template #activator="{ props: picker }">
-          <v-btn
-            v-bind="picker"
-            :icon="THEME_ICONS[themeMode]"
-            variant="text"
-            :aria-label="`colour scheme: ${THEME_LABELS[themeMode]}`"
-          />
+      <v-tooltip v-if="mobile" text="show the run list" location="bottom" open-on-focus>
+        <template #activator="{ props: tooltip }">
+          <v-app-bar-nav-icon v-bind="tooltip" aria-label="show the run list" @click="navOpen = !navOpen" />
         </template>
-        <v-list :selected="[themeMode]" density="compact">
-          <v-list-item
-            v-for="mode in THEME_MODES"
-            :key="mode"
-            :value="mode"
-            :prepend-icon="THEME_ICONS[mode]"
-            :title="THEME_LABELS[mode]"
-            @click="themeMode = mode"
-          />
-        </v-list>
-      </v-menu>
-      <template v-if="view === 'fleet'">
-        <!-- Two ways to read the same fleet. An icon pair rather than a menu:
-             unlike the scheme picker this is a two-state choice whose states
-             are both obvious at a glance, and the fleet is where the operator
-             switches most. -->
-        <v-btn-toggle
-          v-model="fleetView"
-          class="me-1"
-          density="compact"
-          mandatory
-          variant="text"
-        >
-          <v-btn
-            value="list"
-            :icon="mdiViewListOutline"
-            aria-label="read the fleet as a list"
-          />
-          <v-btn
-            value="map"
-            :icon="mdiMapOutline"
-            aria-label="read the fleet as a constellation map"
-          />
-        </v-btn-toggle>
-        <v-btn
-          :icon="mdiRefresh"
-          :loading="busy"
-          variant="text"
-          aria-label="rescan now"
-          @click="doRescan"
-        />
-        <v-btn
-          class="me-2"
-          variant="tonal"
-          :prepend-icon="mdiPlus"
-          @click="view = 'add'"
-        >run</v-btn>
-      </template>
+      </v-tooltip>
+      <v-tooltip v-if="view !== 'fleet'" text="back to the fleet" location="bottom" open-on-focus>
+        <template #activator="{ props: tooltip }">
+          <v-btn v-bind="tooltip" :icon="mdiArrowLeft" variant="text" aria-label="back to the fleet" @click="view = 'fleet'" />
+        </template>
+      </v-tooltip>
+      <v-app-bar-title class="text-title-medium">{{ title }}</v-app-bar-title>
+      <div class="bar-cluster" :class="{ 'bar-cluster-centered': !mobile }">
+        <v-tooltip :text="orchestratorHint" location="bottom" open-on-focus>
+          <template #activator="{ props: tooltip }">
+            <v-btn v-bind="tooltip" :icon="mdiRobot" :color="orchestratorTone" variant="text"
+              :aria-label="orchestratorHint" @click="toggleProjectChat" />
+          </template>
+        </v-tooltip>
+        <v-tooltip v-if="!mobile" :text="widthHint" location="bottom" open-on-focus>
+          <template #activator="{ props: tooltip }">
+            <v-btn v-bind="tooltip" :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
+              :variant="narrow ? 'tonal' : 'text'" :aria-label="widthHint" @click="narrow = !narrow" />
+          </template>
+        </v-tooltip>
+        <v-menu location="bottom end">
+          <template #activator="{ props: picker }">
+            <v-tooltip :text="`colour scheme: ${THEME_LABELS[themeMode]}`" location="bottom" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn v-bind="mergeProps(picker, tooltip)" :icon="THEME_ICONS[themeMode]" variant="text"
+                  :aria-label="`colour scheme: ${THEME_LABELS[themeMode]}`" />
+              </template>
+            </v-tooltip>
+          </template>
+          <v-list :selected="[themeMode]" density="compact">
+            <v-list-item v-for="mode in THEME_MODES" :key="mode" :value="mode"
+              :prepend-icon="THEME_ICONS[mode]" :title="THEME_LABELS[mode]" @click="themeMode = mode" />
+          </v-list>
+        </v-menu>
+        <v-tooltip text="Platform settings" location="bottom" open-on-focus>
+          <template #activator="{ props: tooltip }">
+            <v-btn v-bind="tooltip" :icon="mdiCogOutline" variant="text" aria-label="Platform settings"
+              :aria-pressed="view === 'platform-settings'" @click="showPlatformSettings" />
+          </template>
+        </v-tooltip>
+        <template v-if="view === 'fleet'">
+          <v-btn-toggle v-model="fleetView" class="me-1" density="compact" mandatory variant="text">
+            <v-tooltip text="read the fleet as a list" location="bottom" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn v-bind="tooltip" value="list" :icon="mdiViewListOutline" aria-label="read the fleet as a list" />
+              </template>
+            </v-tooltip>
+            <v-tooltip text="read the fleet as a constellation map" location="bottom" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn v-bind="tooltip" value="map" :icon="mdiMapOutline" aria-label="read the fleet as a constellation map" />
+              </template>
+            </v-tooltip>
+          </v-btn-toggle>
+          <v-tooltip text="rescan now" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="mdiRefresh" :loading="busy" variant="text" aria-label="rescan now" @click="doRescan" />
+            </template>
+          </v-tooltip>
+          <v-tooltip text="spawn or adopt a run" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" class="me-2" variant="tonal" :icon="mobile ? mdiPlus : undefined"
+                :prepend-icon="mobile ? undefined : mdiPlus" aria-label="spawn or adopt a run" @click="view = 'add'"
+              ><v-icon v-if="mobile" :icon="mdiPlus" /><template v-else>run</template></v-btn>
+            </template>
+          </v-tooltip>
+        </template>
       </div>
     </v-app-bar>
 
@@ -807,13 +803,17 @@ onUnmounted(() => {
       location="left"
       width="280"
     >
-      <RunNav
-        :runs="runs"
-        :attention="attention"
-        :current-key="view === 'detail' ? selectedKey : null"
-        :now="now"
-        @open="open"
-      />
+      <div class="project-create pa-3">
+        <v-btn block variant="tonal" :prepend-icon="mdiPlus" @click="projectDialog = true">New project</v-btn>
+      </div>
+      <ProjectNav v-for="project in projectGroups" :key="project.id" :project="project"
+        :selected="project.id === activeProject" :runs="projectRuns(project.id)" :attention="projectAttention(project.id)"
+        :current-key="view === 'detail' && selected?.workspace_id === project.id ? selectedKey : null" :now="now" @open="open" @chat="showProjectChat" />
+      <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs">
+        <h2 class="text-title-small pa-3">Unassigned</h2>
+        <RunNav :runs="unassignedRuns" :attention="unassignedAttention"
+          :current-key="view === 'detail' && !selected?.workspace_id ? selectedKey : null" :now="now" @open="open" />
+      </section>
     </v-navigation-drawer>
 
     <!-- The supervisor's chat, on the right, and the side is the feature: the
@@ -829,33 +829,104 @@ onUnmounted(() => {
     <!-- Twice the navigator's width: this drawer holds a conversation, not a
          list, and prose in a 360px column wraps too hard to read. -->
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
-      <AssistantChat v-if="uberSeen" :now="now" @close="uberOpen = false" />
+      <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject">
+        <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
+          @settings="activeProject = project.id; view = 'project-settings'" @close="uberOpen = false" />
+      </div>
+      <p v-if="!chatWorkspace || chatWorkspace.archived" class="pa-4">Choose an active project to open its assistant chat.</p>
     </v-navigation-drawer>
 
     <v-main>
       <v-container max-width="900" class="pa-3">
+        <div class="project-identity d-flex flex-wrap align-center ga-2 mb-2">
+          <v-chip :color="workspace ? projectColor(workspace.color) : undefined" variant="flat">
+            {{ activeProject ? workspace?.name || 'Unavailable project' : 'All projects' }}
+          </v-chip>
+          <v-tooltip v-if="workspace && !workspace.archived" :text="`Chat with ${workspace.name}`" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="mdiRobot" size="40" variant="text"
+                :aria-label="`Chat with ${workspace.name}`" @click="showProjectChat(workspace)" />
+            </template>
+          </v-tooltip>
+          <v-tooltip v-if="workspace && !workspace.archived" :text="`Project settings for ${workspace.name}`" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="mdiCogOutline" size="40" variant="text"
+                :aria-label="`Project settings for ${workspace.name}`" @click="view = 'project-settings'" />
+            </template>
+          </v-tooltip>
+          <v-tooltip text="New project" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="mdiPlus" size="40" variant="text"
+                aria-label="New project" @click="projectDialog = true" />
+            </template>
+          </v-tooltip>
+        </div>
+        <v-tabs v-if="projects.length" :mandatory="true" :model-value="activeProject" show-arrows class="mb-3" @update:model-value="chooseProject">
+          <v-tab value="">All projects</v-tab>
+          <v-tab v-for="project in projects.filter(row => !row.archived)" :key="project.id" :value="project.id" :aria-label="project.name"
+            :style="{ borderBottom: `3px solid ${projectColor(project.color)}` }">
+            {{ project.name }} <v-badge v-if="projectAttention(project.id).length" :content="projectAttention(project.id).length" inline />
+          </v-tab>
+        </v-tabs>
+        <v-alert v-if="!loading && activeProject && (!workspace || workspace.archived)" type="warning" class="mb-3">
+          This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
+        </v-alert>
+        <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
+          :project="workspace" @changed="load" @close="view = 'fleet'" />
+        <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
+          :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail
              view over instead of reusing one that still holds the last run's
              error. The session views restart on their own (they watch the
              session id); this is about the state that has no watcher. -->
         <RunDetail
-          v-if="view === 'detail' && selected"
-          :key="selectedKey"
+          v-else-if="view === 'detail' && selected"
+          :key="`${selectedKey}:${selected?.workspace_id}`"
           :run="selected"
+          :identified-workspace-id="workspace?.id"
+          :slots="slots"
           :now="now"
+          :projects="projects"
           @close="view = 'fleet'"
           @changed="load"
           @open="open"
         />
         <AddRun
           v-else-if="view === 'add'"
+          :key="activeProject || 'choose-project'"
+          :workspace-id="activeProject || null"
+          :projects="projects"
           :free-slots="freeSlots"
           :slots="slots"
           @changed="load"
         />
 
+        <template v-else-if="!activeProject">
+          <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+          <ProjectSlots :slots="slots" :runs="state?.runs || []" :projects="projects" :loaded="!!state"
+            :problem="state?.slots_problem || (error ? 'Slot status could not be refreshed.' : null)" />
+          <ForgetCompleted
+            :key="activeProject || 'all'"
+            v-if="runs.length"
+            :runs="runs.filter((run) => !hiddenKeys.includes(keyOf(run)))"
+            @forgotten="(run) => { hiddenKeys = [...hiddenKeys, keyOf(run)] }"
+            @changed="load"
+          />
+          <section v-for="project in projectGroups" :key="project.id" class="mb-5">
+            <h2 class="text-title-medium project-name" :style="{ borderInlineStart: `4px solid ${projectColor(project.color)}`, paddingInlineStart: '12px' }">{{ project.name }}</h2>
+            <RunNav :runs="projectRuns(project.id)" :attention="projectAttention(project.id)" :now="now" @open="open" />
+          </section>
+          <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs mb-5">
+            <h2 class="text-title-medium">Unassigned</h2>
+            <RunNav :runs="unassignedRuns" :attention="unassignedAttention" :now="now" @open="open" />
+          </section>
+          <p v-if="!loading && !projects.length">Create a project to start.</p>
+        </template>
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+          <ProjectSlots v-if="workspace && !workspace.archived" :slots="slots" :runs="state?.runs || []" :projects="projects"
+            :project="workspace" :loaded="!!state" :problem="state?.slots_problem || (error ? 'Slot status could not be refreshed.' : null)"
+            @manage="showPlatformSettings('slots')" />
           <v-alert
             v-if="mirrorProblem"
             type="warning"
@@ -901,6 +972,7 @@ onUnmounted(() => {
           </div>
 
           <ForgetCompleted
+            :key="activeProject || 'all'"
             v-if="runs.length"
             :runs="runs.filter((run) => !hiddenKeys.includes(keyOf(run)))"
             @forgotten="(run) => { hiddenKeys = [...hiddenKeys, keyOf(run)] }"
@@ -932,6 +1004,7 @@ onUnmounted(() => {
               v-if="fleetView === 'map'"
               :runs="mapRows"
               :relations="relations"
+              :groups="state?.config?.fleet_groups || []"
               @open="open"
             />
 
@@ -953,7 +1026,7 @@ onUnmounted(() => {
                   :now="now"
                   @open="open"
                   @forget="forget"
-                  @open-chat="uberOpen = true"
+                  @open-chat="openProjectChat(run.workspace_id)"
                   @threads-changed="load"
                 />
               </template>
@@ -968,7 +1041,7 @@ onUnmounted(() => {
                 :now="now"
                 @open="open"
                 @forget="forget"
-                @open-chat="uberOpen = true"
+                @open-chat="openProjectChat(run.workspace_id)"
                 @threads-changed="load"
               />
             </template>
@@ -994,72 +1067,20 @@ onUnmounted(() => {
             </v-card>
           </template>
 
-          <!-- Under the runs and never among them (#245): interleaving would put
-               rows that can never ask for anything into the list whose whole job
-               is to say who is asking. Outside the runs/empty-state branch
-               above, because a fleet tracking nothing is the state you are most
-               likely to be about to spawn into a slot from. -->
-          <template v-if="!loading">
-            <div class="d-flex align-center ga-2">
-              <div class="section-title">service slots</div>
-              <v-spacer />
-              <!-- Beside the title rather than under the list: on a host that
-                   declares none the list is one muted line, and a button below
-                   it reads as belonging to that line. -->
-              <v-btn
-                :prepend-icon="mdiPlus"
-                size="small"
-                variant="text"
-                @click="editSlot(null)"
-              >add slot</v-btn>
-            </div>
-            <SlotRow
-              v-for="slot in slots"
-              :key="slot.name"
-              :row="slot"
-              :runs="runs"
-              @open="open"
-              @edit="editSlot"
-            />
-            <!-- A host that declares none says so (#254), quietly: the title and
-                 one muted line are what tell an operator the feature exists, and
-                 asking the assistant to set a slot up is the next step from here.
-                 Gated on `state` as well, because `slots` is empty both when the
-                 host declares none and when the payload was never read at all —
-                 a daemon that is down, or a 401 on the first load, leaves `state`
-                 null while `loading` clears in `finally`, and this line would
-                 then make a confident claim about a config it never saw, printed
-                 directly under the error alert. A *later* failed refresh keeps
-                 the previous payload, and saying so from stale-but-real data is
-                 how the rest of this page treats a refresh that did not land. -->
-            <!-- Before the empty-state line, and instead of it: the line is a
-                 claim about the host's configuration, and this is the case where
-                 nothing is known about it. -->
-            <v-alert
-              v-if="slotsProblem"
-              type="warning"
-              :icon="mdiAlertOutline"
-              density="compact"
-              class="mb-2"
-            >{{ slotsProblem }}</v-alert>
-            <p
-              v-else-if="!slots.length && state"
-              class="text-body-small text-medium-emphasis"
-            >No service slots configured.</p>
-
-            <!-- Keyed on the slot being edited so switching rows starts the
-                 dialog over rather than reusing one still holding the previous
-                 slot's fields and its refusal. -->
-            <SlotEditor
-              v-model="slotEditorOpen"
-              :key="editingSlotName || 'new'"
-              :row="editingSlot"
-              @changed="load"
-            />
-          </template>
         </template>
       </v-container>
     </v-main>
+
+    <v-dialog v-model="projectDialog" max-width="480">
+      <v-card title="New project">
+        <v-card-text>
+          <v-alert v-if="projectError" type="error" class="mb-2">{{ projectError }}</v-alert>
+          <v-text-field v-model="projectName" label="Project name" :disabled="creatingProject" autofocus @keydown.enter="newProject" />
+          <p>Its assistant starts when capacity is available.</p>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn @click="projectDialog = false">Cancel</v-btn><v-btn :loading="creatingProject" @click="newProject">Create project</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
 
 
     <!-- The undo window, made visible. It is not a report of something that
@@ -1110,6 +1131,16 @@ onUnmounted(() => {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
+}
+
+.project-create {
+  border-block-end: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  margin-block-end: 8px;
+}
+
+.app-mobile .bar-cluster :deep(.v-btn--icon) {
+  width: 36px;
+  height: 40px;
 }
 
 /* The band. What the mode does, and all it does: hold the whole app in a strip in

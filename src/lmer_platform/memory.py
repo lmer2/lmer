@@ -38,7 +38,8 @@ from lmer_cli.mounts import (
 from work_repo.memory import PERSIST_ENV_VAR
 
 from . import store
-from .store import append_event, platform_dir
+from .store import append_event
+from .project_context import assistant_dir
 
 logger = logging.getLogger("lmer_platform.memory")
 
@@ -93,7 +94,7 @@ class Measurement:
 
 def memory_dir() -> Path:
     """The host store: ``<platform state>/assistant-memory``."""
-    return platform_dir() / DIRNAME
+    return assistant_dir() / DIRNAME
 
 
 def prepare_memory_dir() -> Optional[Path]:
