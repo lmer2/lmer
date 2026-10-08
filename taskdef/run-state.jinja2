@@ -20,27 +20,21 @@ else.
 
 If the state shows a COMPLETED run (`status: complete` or `archived`), do
 NOT resume it or invent work — finished runs only reopen on explicit
-direction. The brief's direction contract is authoritative and names the
-route for this record's tree form:
+direction. The brief's direction contract above is authoritative and names
+the route for THIS record's tree form: on schema 2 it is a new execution
+(`lmer <taskdef> [<target>] --source-session <uid>`, or the platform's
+continue); on schema 1 it is a reopen. Follow the route the brief names,
+never the other one.
 
-{% if '--source-session' in run_state_brief %}
-This is a schema-2 record: it is never reopened in place. The brief shows
-the continuation route — `lmer <taskdef> [<target>] --source-session <uid>`
-(or the platform's continue). Start that new execution. A seed provided in
-the brief belongs to that new execution: record it as the new execution's
-goal, then proceed. With no seed, ask the user whether this is a new target
-or a continuation of this run.
-{% else %}
 - Seed provided (the brief shows a `Seed provided (LMER_START_PROMPT):`
-  line): record it as the goal (`work goal "<seed>"`), reopen with
-  `work state set --status=in-progress --stop-reason=none`, then proceed
-  on the seed.
+  line): on schema 2 the seed belongs to that new execution — record it as
+  the new execution's goal; on schema 1 record it as the goal
+  (`work goal "<seed>"`) and reopen with
+  `work state set --status=in-progress --stop-reason=none`.
 - No seed: ask the user whether this is a new target or a continuation of
-  this run.
-{% endif %}
-If the question goes unanswered, record it —
-`work state set --stop-reason=question --question "<the question>"` —
-and end the session — never proceed on a guess.
+  this run. If the question goes unanswered, record it —
+  `work state set --stop-reason=question --question "<the question>"` —
+  and end the session — never proceed on a guess.
 {% endif %}
 
 Ground rules — these come before any work:

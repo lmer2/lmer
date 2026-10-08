@@ -699,20 +699,31 @@ slug (no aliasing between the two forms).
 **Completed-run policy:** if the slug resolves to a run with
 `status: complete` or `archived` (an archived run still resolves until the
 external cleaner moves it under `runs/archive/`), the session does not
-re-seed — and it never silently resumes either (#96). `decide()` marks the decision with
-`completed_run: true` (carried into `work resume --json` for hooks), and
-the resume brief appends an explicit direction contract: with a seed
-(`LMER_START_PROMPT`, threaded into `format_brief` by
-`work session-start`/`work resume`) the session records it as the goal
-(`work goal "<seed>"`), reopens with `work state set --status=in-progress
---stop-reason=none`, and proceeds on the seed; without one it asks the
-user (new target vs continue this run), recording
-`work state set --stop-reason=question --question "<text>"` and ending
-the session if the question goes unanswered — never proceeding on a
-guess. The run-state
-taskdef fragment teaches the same contract. Runs the external cleaner has
-moved to `runs/archive/` no longer occupy the slug, so a genuinely new
-engagement seeds a fresh run.
+re-seed — and it never silently resumes either (#96). `decide()` marks the
+decision with `completed_run: true` and additively carries the record's
+`schema`, `session_uid`, `taskdef` and `target` (all carried into `work
+resume --json` for hooks), and the resume brief appends an explicit
+direction contract:
+
+- On **schema 2** (a `session_uid` is present) the record is never reopened
+  in place: the brief names the continuation route `lmer <taskdef>
+  [<target>] --source-session <uid>` (the target shell-quoted; or the
+  platform's continue). A seed (`LMER_START_PROMPT`, threaded into
+  `format_brief` by `work session-start`/`work resume`) belongs to that new
+  execution and is recorded as its goal; without one the session asks the
+  user (new target vs continue this run).
+- On **schema 1** the brief keeps the reopen contract: with a seed, record
+  it as the goal (`work goal "<seed>"`) and reopen with `work state set
+  --status=in-progress --stop-reason=none`; without one, ask.
+
+In both forms an unanswered question is recorded with `work state set
+--stop-reason=question --question "<text>"` and the session ends — never
+proceeding on a guess. The run-state taskdef fragment teaches the same
+contract tree-agnostically, deferring to the brief's direction. A writer
+refused because a schema-2 record belongs to another launch names the same
+`--source-session` route (`_require_record_writer`). Runs the external
+cleaner has moved to `runs/archive/` no longer occupy the slug, so a
+genuinely new engagement seeds a fresh run.
 
 ## 4. CLI verbs
 

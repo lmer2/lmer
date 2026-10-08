@@ -107,6 +107,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -653,11 +654,15 @@ def find_run_dir(
 
     Scans every record under the run area — `runs/*/state.yaml` in a legacy
     tree, `_runs/*/<session-id>/state.yaml` in schema form (:func:`_record_scan`
-    walks both) — for `state.slug == identifier`; with `match_names`, falls
-    back to `state.name == identifier` (a slug match always wins — names are
-    unique per project). Session-level resolution keeps `match_names` off so
-    a run *name* can never hijack another session's derived slug; explicit
-    lookups (e.g. `work seed`'s duplicate check) opt in. Dot-dirs (`.new-*`
+    walks both) — for `state.slug == identifier`; with `match_names` in a
+    LEGACY tree, falls back to `state.name == identifier` (a slug match
+    always wins — names are unique per project there). On a process record
+    (schema 2) names are labels, not addresses (D4): `match_names` is
+    ignored and a name never resolves a record, so two continuations of one
+    source can carry one label. Session-level resolution keeps `match_names`
+    off so a run *name* can never hijack another session's derived slug;
+    legacy explicit lookups (e.g. `work seed`'s duplicate check) opt in.
+    Dot-dirs (`.new-*`
     orphans), the archive/ subtree, and corrupt siblings are skipped, and any
     fs error during the scan resolves to "no match" — a broken runs/ tree
     must never raise out of a resolver that hook-facing always-exit-0
@@ -675,6 +680,9 @@ def find_run_dir(
         base = runs_base()
     if base is None:
         return None
+    # D4: on schema 2 a name is a label, never an address.
+    if is_process_record():
+        match_names = False
     name_match: Optional[Path] = None
     for _group, records in _record_scan(base):
         slug_hits, name_hits = [], []
@@ -1522,6 +1530,24 @@ def _seeding_launch_may_write(rdir: Path, state) -> bool:
     return launch is not None and metadata.get("seeded_by") == launch
 
 
+def continuation_route(
+    taskdef: Optional[str], target: Optional[str], uid: str
+) -> str:
+    """The shell command that continues a finished schema-2 record (D14):
+    ``lmer <taskdef> [<target>] --source-session <uid>``.
+
+    The ONE builder for every place that prints the route, so the target is
+    `shlex.quote`d once: a list-page or query target (`.../-/issues?x=1&y=2`)
+    pasted from the brief must not background the shell at `&`. A missing
+    taskdef reads ``<taskdef>``; an empty target is omitted.
+    """
+    parts = ["lmer", str(taskdef or "<taskdef>")]
+    if target:
+        parts.append(shlex.quote(str(target)))
+    parts.extend(["--source-session", uid])
+    return " ".join(parts)
+
+
 def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
     """Refuse writes to another execution's record before touching files."""
     process_records = is_process_record()
@@ -1555,15 +1581,10 @@ def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
         # A schema-2 record is continued as a NEW execution, never written in
         # place (D14): name that route with the record's own values. A legacy
         # record keeps the generic wording.
-        if process_records and state.get("schema", 1) >= 2:
-            uid = metadata.get("uid")
-            taskdef = state.get("taskdef") or "<taskdef>"
-            target = state.get("target") or ""
-            route = f"lmer {taskdef}"
-            if target:
-                route += f" {target}"
-            if uid:
-                route += f" --source-session {uid}"
+        if process_records and state.get("schema", 1) >= 2 and metadata.get("uid"):
+            route = continuation_route(
+                state.get("taskdef"), state.get("target"), metadata["uid"]
+            )
             raise RunStateError(
                 "a session may write only its own record; to continue it, start a "
                 f"new execution with `{route}`"
@@ -2923,12 +2944,9 @@ def format_brief(
         if session_uid:
             # Schema 2 (D14): the record is never reopened in place; it is
             # continued as a NEW execution addressed by its uid.
-            taskdef = decision.get("taskdef") or "<taskdef>"
-            target = decision.get("target") or ""
-            route = f"lmer {taskdef}"
-            if target:
-                route += f" {target}"
-            route += f" --source-session {session_uid}"
+            route = continuation_route(
+                decision.get("taskdef"), decision.get("target"), session_uid
+            )
             lines.append(
                 "This run is finished. Do NOT resume it in place or invent "
                 "work — continue it as a new execution."

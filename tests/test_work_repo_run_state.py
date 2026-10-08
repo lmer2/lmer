@@ -714,6 +714,37 @@ class TestFormatBrief:
             "Run: hunt the seg fault (slug: develop-issue-123, status: in-progress)"
         )
 
+    def test_a_dir_name_half_that_disagrees_with_the_name_is_shown(self):
+        """T19(1): a post-freeze `work name` leaves a stale `--<name>` suffix."""
+        d = run_state.decide(_state(name="new"), [], "s-1")
+        text = run_state.format_brief(d, dir_name="s-1--old")
+        assert text.splitlines()[0] == (
+            "Run: new (dir: s-1--old, slug: develop-issue-123, status: in-progress)"
+        )
+
+    def test_an_unsuffixed_unfrozen_dir_is_not_a_mismatch(self):
+        d = run_state.decide(_state(name="new"), [], "s-1")
+        text = run_state.format_brief(d, dir_name="s-1")
+        assert text.splitlines()[0] == (
+            "Run: new (slug: develop-issue-123, status: in-progress)"
+        )
+
+    def test_an_unnamed_legacy_brief_header_stays_byte_identical(self):
+        d = run_state.decide(_state(), [], "s-1")
+        text = run_state.format_brief(d, dir_name="develop-issue-123")
+        assert text.splitlines()[0] == "Run: develop-issue-123 (status: in-progress)"
+
+    def test_the_continuation_route_quotes_a_query_target(self):
+        """T18: a route printed from the brief must be pasteable, so a target
+        with `&` or `?` is shell-quoted."""
+        route = run_state.continuation_route(
+            "chat", "https://gitlab.example.com/g/p/-/issues?label_name=bug&state=opened", "ab" * 16
+        )
+        assert route == (
+            "lmer chat 'https://gitlab.example.com/g/p/-/issues?label_name=bug&state=opened' "
+            "--source-session " + "ab" * 16
+        )
+
     def test_brief_tolerates_non_dict_critical_error(self):
         state = _state(stop_reason="critical_error", critical_error="oops")
         d = run_state.decide(state, [], "s-1")

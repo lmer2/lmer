@@ -12,7 +12,9 @@ changed:
 - "existing schema-1 records under the old `chat-.` / `chat-<repo>.git` spellings stay where they are, but the platform no longer resumes or answers them and a host launch seeds the bare group beside them, until `work migrate` folds them at adoption (#368)"
 - "a `continues` link in the project README index resolves its source by session uid, so a folded, freeze-renamed or archived source still links (#536)"
 - "a launch `--name` replaces a default or inherited name on the call that opens a schema-2 record (#536)"
-- "on a schema-2 tree a finished record's resume brief names the continuation route (`lmer <taskdef> [<target>] --source-session <uid>`) instead of the schema-1 reopen, and the write refusal names the same route (#437)"
+- "on a schema-2 tree a finished record's resume brief names the continuation route (`lmer <taskdef> [<target>] --source-session <uid>`, target shell-quoted) instead of the schema-1 reopen, and the write refusal names the same route (#437)"
+- "a resume brief shows `(dir: <dir>)` when a post-freeze `work name` left the directory's `--<name>` suffix stale; `work name` on a frozen record says the directory will not be renamed; `run-state:` commit subjects carry the record's name label (#536)"
+- "on schema 2 a name is a label: two continuations of one source may carry the same label, and `work name`, `work seed --name` and a launch `--name` no longer refuse a label another record holds (#536)"
 - "`lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_plexus.yaml` is cached (#370)"
 fixed:
 - "`work commit` and `work session-end` now publish a record `work seed` wrote into another group; previously it was reported as a stray and left unpublished (#535)"

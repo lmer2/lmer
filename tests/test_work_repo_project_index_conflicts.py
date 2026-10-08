@@ -252,8 +252,11 @@ class TestReadmeOnlyRacesPublishBothWriters:
         _assert_clean_resolution(x_repo)
         assert git(x_repo, "rev-list", "--count", "origin/main..HEAD").stdout.strip() == "0"
         subjects = git(case.origin, "log", "--format=%s", "main").stdout.splitlines()
-        assert [s for s in subjects if s.startswith("run-state: chat phase=")] == [
-            "run-state: chat phase=design", "run-state: chat phase=plan", "run-state: chat phase=spec"]
+        # The record carries a default label now, so the subject is
+        # `run-state: chat <label> phase=…`; the phase suffix is the stable part.
+        assert [s.split()[-1] for s in subjects
+                if s.startswith("run-state: chat ") and "phase=" in s] == [
+            "phase=design", "phase=plan", "phase=spec"]
         published, rendered = case.origin_render(PROJECT, tmp_path / "oracle")
         assert published == rendered
         assert row_ids(published) == {uid_for(1)[:8], y_rdir.name[:8], x_rdir.name[:8]}
@@ -334,7 +337,7 @@ def _assert_aborted_like_before(case, repo: Path, captured, *, subject: str) -> 
     assert not rebase_state(repo)
     assert _unmerged(repo) == ""
     assert git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
-    assert git(repo, "log", "-1", "--format=%s").stdout.strip() == subject
+    assert git(repo, "log", "-1", "--format=%s").stdout.strip().endswith(subject)
 
 
 class TestOtherConflictsAbort:
@@ -433,7 +436,7 @@ class TestOtherConflictsAbort:
 
         assert cli.cmd_commit("retry") != 0
 
-        _assert_aborted_like_before(case, x_repo, capsys.readouterr(), subject="run-state: chat phase=design")
+        _assert_aborted_like_before(case, x_repo, capsys.readouterr(), subject="phase=design")
         assert git(x_repo, "rev-list", "--count", "origin/main..HEAD").stdout.strip() == "3"
         assert case.origin_file(README) == upstream
 

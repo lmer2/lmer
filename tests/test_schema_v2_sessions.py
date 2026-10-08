@@ -568,6 +568,44 @@ def test_the_writer_refusal_names_the_continuation_route(session_tree):
         run_state.write_state(group / uid, state)
 
 
+def test_two_continuations_carry_one_label_and_nothing_refuses(
+    session_tree, monkeypatch, capsys
+):
+    """D4: two continuations of one source become two records carrying one
+    label; the legacy uniqueness gate never refuses on schema 2."""
+    from work_repo import cli, session_record
+
+    _, source, source_state = seed_launch()
+    source_state["name"] = "carried"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "carried"
+    # `work name` accepts the same label on the second record.
+    assert cli.cmd_name("carried") == 0
+    # A second continuation of the same source also carries it.
+    monkeypatch.delenv("LMER_SOURCE_SESSION_ID", raising=False)
+    target2, state2 = _continue_from(source_state, monkeypatch)
+    assert target2 != target and state2["name"] == "carried"
+    assert "not applied" not in capsys.readouterr().out
+
+
+def test_work_name_and_seed_and_launch_name_all_accept_a_held_label(
+    session_tree, monkeypatch
+):
+    from work_repo import cli, session_record
+
+    _, holder, holder_state = seed_launch()
+    holder_state["name"] = "taken"
+    run_state.write_state(holder, holder_state)
+    session_record.start_launch()
+    rdir, state = run_state.ensure_run()
+    assert cli.cmd_name("taken") == 0
+    assert run_state.load_state(rdir)["name"] == "taken"
+    # `find_run_dir(name, match_names=True)` never resolves by name on schema 2.
+    assert run_state.find_run_dir("taken", match_names=True) is None
+
+
 def test_seeded_record_helpers_are_noops_on_a_legacy_tree(tmp_path, monkeypatch):
     from work_repo import run_state
 
@@ -951,28 +989,27 @@ def test_launch_name_and_goal_apply_once_on_the_opening_session_start(
     assert "not applied" not in capsys.readouterr().out
 
 
-def test_a_held_launch_name_warns_on_stdout_and_the_run_stays_unnamed(
+def test_a_launch_name_is_a_label_and_never_conflicts_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
+    """D4: on schema 2 a name is a label, so a launch name equal to another
+    record's label applies; the legacy uniqueness scan is never consulted."""
     from work_repo import cli, session_record
 
-    holder_uid, holder, holder_state = seed_launch()
+    _, holder, holder_state = seed_launch()
     holder_state["name"] = "taken"
     run_state.write_state(holder, holder_state)
     monkeypatch.setenv("LMER_RUN_NAME", "taken")
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert (
-        f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}' "
-        "(names are unique per project); this run stays unnamed"
-    ) in out
-    assert " owns " in out  # the brief still prints
+    assert "not applied" not in out
     directory = run_state.run_dir()
     assert directory != holder
-    # The refused launch name leaves the record's default label (D5) in place.
-    assert run_state.is_default_label(run_state.load_state(directory))
-    assert _events_of(directory, "run_named") == []
+    assert run_state.load_state(directory)["name"] == "taken"
+    named = _events_of(directory, "run_named")
+    assert len(named) == 1 and named[0]["note"] == "taken"
+    assert named[0]["data"]["source"] == "launch"
 
 
 def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
@@ -991,7 +1028,7 @@ def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
     assert _events_of(directory, "run_named") == []
 
 
-def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
+def test_name_conflict_is_never_scanned_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
     from work_repo import cli, session_record
@@ -1006,13 +1043,12 @@ def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert "⚠️  launch name/goal not applied (continuing): scan exploded" in out
-    assert " owns " in out
+    assert "scan exploded" not in out
     directory = run_state.run_dir()
     state = run_state.load_state(directory)
-    assert run_state.is_default_label(state)
-    assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
-    assert _events_of(directory, "run_named") == []
+    assert state["name"] == "fresh-run"
+    named = _events_of(directory, "run_named")
+    assert len(named) == 1 and named[0]["note"] == "fresh-run"
 
 
 def test_a_raising_state_write_is_a_warning_not_a_refusal(
@@ -1158,12 +1194,12 @@ def test_a_continuation_without_a_launch_goal_keeps_the_inherited_goal_current(
     assert not any(line.startswith("Predecessor goal") for line in lines)
 
 
-def test_a_held_launch_name_is_absent_from_the_launch_lines_but_the_goal_is_not(
+def test_a_launch_name_lands_beside_the_goal_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
     from work_repo import cli, session_record
 
-    holder_uid, holder, holder_state = seed_launch()
+    _, holder, holder_state = seed_launch()
     holder_state["name"] = "taken"
     run_state.write_state(holder, holder_state)
     monkeypatch.setenv("LMER_RUN_NAME", "taken")
@@ -1171,17 +1207,13 @@ def test_a_held_launch_name_is_absent_from_the_launch_lines_but_the_goal_is_not(
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     lines = capsys.readouterr().out.splitlines()
-    assert any(
-        line.startswith(f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}'")
-        for line in lines
-    )
     launch_at = lines.index(LAUNCH_HEADER)
-    assert lines[launch_at + 1] == "Goal: Finish the index"
-    assert not any(line.startswith("Run name:") for line in lines)
+    assert lines[launch_at + 1] == "Run name: taken"
+    assert lines[launch_at + 2] == "Goal: Finish the index"
     assert " owns " in lines[-1]
 
 
-def test_a_held_name_alone_prints_no_launch_lines(session_tree, monkeypatch, capsys):
+def test_a_launch_name_alone_prints_the_launch_lines(session_tree, monkeypatch, capsys):
     from work_repo import cli, session_record
 
     _, holder, holder_state = seed_launch()
@@ -1191,8 +1223,8 @@ def test_a_held_name_alone_prints_no_launch_lines(session_tree, monkeypatch, cap
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert "launch name 'taken' not applied" in out
-    assert LAUNCH_HEADER not in out
+    assert LAUNCH_HEADER in out
+    assert "Run name: taken" in out
 
 
 def test_a_continuation_of_a_dotted_source_lands_under_the_bare_taskdef(

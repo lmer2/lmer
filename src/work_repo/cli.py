@@ -1156,6 +1156,23 @@ def _require_run() -> tuple[Path, dict] | tuple[None, None]:
         return None, None
 
 
+def _run_state_subject(state: dict, detail: str = "") -> str:
+    """The `run-state:` commit subject for a record: `<slug> <name> <detail>`.
+
+    One helper for every `run-state: {slug} ...` site (D14): the record's
+    label (including a default label — it is what makes the subject unique
+    when two launches share a slug) rides beside the slug. An unnamed record
+    keeps today's `<slug> <detail>` byte for byte.
+    """
+    parts = [str(state.get("slug"))]
+    name = state.get("name")
+    if isinstance(name, str) and name.strip():
+        parts.append(name)
+    if detail:
+        parts.append(detail)
+    return "run-state: " + " ".join(parts)
+
+
 def _push_run_dir(
     state: dict,
     detail: str,
@@ -1172,7 +1189,7 @@ def _push_run_dir(
         old_rel = run_state.run_rel_for_dir_name(old_dir_name)
         if old_rel and old_rel not in rels:
             rels.append(old_rel)
-    rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
+    rc = commit_work_path(rels, _run_state_subject(state, detail))
     if rc != 0:
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
@@ -1711,7 +1728,11 @@ def cmd_name(value: str | None) -> int:
     if state.get("name") == name:
         print(f"✅ Name unchanged: {name}")
         return 0
-    holder = _name_conflict(rdir, name, state.get("slug"))
+    # D4: uniqueness is a LEGACY-tree rule. On a process record a name is a
+    # label, so two continuations of one source may carry the same label.
+    holder = None
+    if not run_state.is_process_record():
+        holder = _name_conflict(rdir, name, state.get("slug"))
     if holder is not None:
         print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
         return 1
@@ -1719,6 +1740,11 @@ def cmd_name(value: str | None) -> int:
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "run_named", note=name)
     print(f"✅ Run named: {name}")
+    if state.get("frozen"):
+        # The freeze took the one directory rename (or deliberately skipped
+        # it); a post-freeze name cannot move the dir, so say so (D14/§9.5).
+        old_rel = run_state.run_area_rel_name(rdir) or rdir.name
+        print(f"   directory frozen at `{old_rel}`; it will not be renamed")
     return 0
 
 
@@ -1783,7 +1809,7 @@ def cmd_ledger(args) -> int:
     # not at session end (non-fatal, like artifact writes).
     rc = commit_work_path(
         run_state.run_rel_path_candidates(),
-        f"run-state: {state['slug']} ledger {task_id}={args.status}",
+        _run_state_subject(state, f"ledger {task_id}={args.status}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (ledger saved locally)")
@@ -2706,7 +2732,7 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
         stage_paths.append(specs_index.specs_rel_path())
     rc = commit_work_path(
         stage_paths,
-        f"run-state: {state['slug']} artifact {name}",
+        _run_state_subject(state, f"artifact {name}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
@@ -2800,7 +2826,9 @@ def cmd_seed(args) -> int:
         name = _validate_name(args.name)
         if name is None:
             return 1
-        holder = _name_conflict(base / slug, name, slug)
+        holder = None
+        if not run_state.is_process_record():
+            holder = _name_conflict(base / slug, name, slug)
         if holder is not None:
             print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
             return 1
@@ -2843,11 +2871,11 @@ def cmd_seed(args) -> int:
 
     print(f"✅ Run seeded: {rdir}")
     if seeded is not None:
-        launch = f"lmer {args.taskdef}"
-        if args.target:
-            launch += f" {shlex.quote(args.target)}"
+        route = run_state.continuation_route(
+            args.taskdef, args.target, seeded["uid"]
+        )
         print(f"   uid: {seeded['uid']}")
-        print(f"   Pick it up with: {launch} --source-session {seeded['uid']}")
+        print(f"   Pick it up with: {route}")
     print("   Not pushed — run `work commit` to publish it.")
     return 0
 
@@ -3269,7 +3297,7 @@ def _shared_release_claim_locked(*, release=False, force=False, as_json=False):
         outcome, detail, _commit = publish_overlay_commit(
             root,
             base=base,
-            message=f"run-state: {state['slug']} release {action}",
+            message=_run_state_subject(state, f"release {action}"),
             blobs={claim_rel: release_claims.serialize_claim(claim)},
             subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
         )
@@ -3397,7 +3425,7 @@ def cmd_release_claim(as_json: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc), as_json)
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release claim", extra_rels
+            _run_state_subject(state, "release claim"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             action = {
@@ -3572,7 +3600,7 @@ def cmd_release_unclaim(force: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc))
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim"
+            _run_state_subject(state, "release unclaim")
         )
         if outcome == CLAIM_PUSH_WON:
             if holder != session:
@@ -3687,7 +3715,7 @@ def _shared_release_abort(*, reason: str | None, force: bool) -> int:
         outcome, detail, _commit = publish_overlay_commit(
             root,
             base=base,
-            message=f"run-state: {state['slug']} release abort",
+            message=_run_state_subject(state, "release abort"),
             blobs={claim_rel: release_claims.serialize_claim(claim)},
             subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
         )
@@ -3826,7 +3854,7 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release abort", extra_rels
+            _run_state_subject(state, "release abort"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             cleared = f" (claim cleared: session {holder})" if holder else ""
@@ -4107,14 +4135,20 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
         name_replaceable = existing_name is None or run_state.is_process_record()
         if name_text.strip() and name_replaceable:
             name = _validate_name(name_text)
+            keeps = ("this run keeps its label" if run_state.is_process_record()
+                     else "this run stays unnamed")
             if name is None:
                 print(f"⚠️  launch name '{name_text}' not applied: not a usable name; "
-                      "this run stays unnamed — work name <other>")
+                      f"{keeps} — work name <other>")
             else:
-                holder = _name_conflict(rdir, name, state.get("slug"))
+                # D4: the held-by check is a legacy rule; on a process record
+                # a label never conflicts.
+                holder = None
+                if not run_state.is_process_record():
+                    holder = _name_conflict(rdir, name, state.get("slug"))
                 if holder is not None:
                     print(f"⚠️  launch name '{name}' not applied: held by run '{holder}' "
-                          "(names are unique per project); this run stays unnamed — "
+                          f"(names are unique per project); {keeps} — "
                           "work name <other>")
                 else:
                     candidate["name"] = name
@@ -4411,7 +4445,7 @@ def _release_claim_at_session_end(rdir) -> None:
             print(f"⚠️  session-end claim release failed: {exc}")
             return
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim (session end)"
+            _run_state_subject(state, "release unclaim (session end)")
         )
         if outcome == CLAIM_PUSH_WON:
             print(f"✅ Release claim released at session end: {state.get('slug')}")
@@ -4487,7 +4521,9 @@ def cmd_session_end() -> int:
         # them — and a deferral here has no later commit to flush it.
         rc = commit_work_path(
             rels,
-            f"run-state: session end {state['slug']}",
+            "run-state: session end "
+            + str(state["slug"])
+            + (f" {state['name']}" if state.get("name") else ""),
             allow_during_gate=True,
         )
         if rc != 0:
