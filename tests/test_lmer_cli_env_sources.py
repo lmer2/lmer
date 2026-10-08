@@ -68,6 +68,13 @@ class TestCliEnvDictDeclaresNapkinTaskdef:
         source = CLI_PY.read_text()
         assert re.search(r"""["']LMER_NAPKIN_TOKEN["']\s*:\s*None""", source)
 
+    def test_container_runtime_seeded_none(self):
+        """LMER_CONTAINER_RUNTIME names the host's runtime; the session image
+        ships only the docker client, so .env and preset seeding must not
+        carry the host's value in."""
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_CONTAINER_RUNTIME["']\s*:\s*None""", source)
+
     def test_taskdef_token_seeded_none(self):
         source = CLI_PY.read_text()
         assert re.search(r"""["']LMER_TASKDEF_TOKEN["']\s*:\s*None""", source)

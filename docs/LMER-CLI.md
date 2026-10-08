@@ -131,7 +131,7 @@ The following environment variables control LMER behavior:
 
 - **`LMER_BRIDGE_RUN_ARGS`** - Companion to `LMER_BRIDGE_IMAGE`: extra arguments (shlex-split) appended to the container-run command of the shutdown test — the deployment's volumes, env files, and network flags, which are what let the bridge reach its running state inside the test container. Read only by that test.
 
-- **`LMER_BRIDGE_RUNTIME`** - Companion to `LMER_BRIDGE_IMAGE`: names the container runtime binary the shutdown test drives (`podman` or `docker`). When unset the test resolves the runtime the way lmer does (docker first) — set it on a host carrying both runtimes when the image lives in the other one's store. Read only by that test.
+- **`LMER_BRIDGE_RUNTIME`** - Companion to `LMER_BRIDGE_IMAGE`: names the container runtime binary the shutdown test drives (`podman` or `docker`). When unset the test resolves the runtime the way lmer does (`detect_runtime()`, so `LMER_CONTAINER_RUNTIME` applies, else docker first). Set it to point this test alone at the other runtime's store. Read only by that test.
 
 - **`LMER_RENDER_SOURCE`** - Test/CI-only switch for the render-matrix suite (`tests/test_taskdef_render_matrix.py`), not read by the CLI or the container runtime. When set, every taskdef directory found under the given path is rendered — honoring its root `taskdef.yaml` — against the *current checkout's* built-in base templates: `LMER_RENDER_SOURCE=<clone> uv run pytest tests/test_taskdef_render_matrix.py -q`. This is the contract an external taskdef content repo's CI uses to prove its bodies render against a pinned base (see docs/TASKDEFS.md).
 
@@ -144,6 +144,8 @@ The following environment variables control LMER behavior:
 - **`LMER_REGISTRY`** - Container registry to pull pre-built images from. Optional; defaults to `ghcr.io/lmer2/lmer` (the project's GHCR registry). Override to point at a self-hosted or mirrored registry. Empty-string values are treated the same as unset and fall back to the default.
 
 - **`LMER_NO_AUTO_BUILD`** - Disable automatic container image building. Accepted truthy values: `1`, `true`, `yes` (case-insensitive). When enabled, LMER will error if the image is not found locally instead of building it.
+
+- **`LMER_CONTAINER_RUNTIME`** - Selects the host's container runtime: `docker` or `podman`, trimmed and case-insensitive. Unset or empty, lmer uses docker if it is on `PATH`, else podman. Set it on a host with both installed to use podman; PATH cannot do this when both live in `/usr/bin`. Any other value (including a path), or a runtime that is not on `PATH`, is an error rather than a silent fallback, because the two runtimes get different run flags (`--userns=keep-id` for podman). Read by `lmer` (including `lmer build`), the platform daemon, the `Makefile`, `bin/lmer-reset` and `scripts/platform-container-run.sh` (where `--runtime` wins). Put it in `~/.lmer/.env`, which `lmer`, `lmer build` and the platform daemon load themselves, so it also holds for launches by a systemd-started daemon or listener, which never see a shell profile. The `Makefile` and the two shell scripts read only the process environment, so also export it in the shell you run them from. Host-only: lmer never forwards it into a session container, and the platform container helper sets it to `docker` inside, since both images ship only the docker client.
 
 - **`REPO_AUTH_PREFER_SSH`** - When set to a truthy value (`1`, `true`, `yes`), LMER will use SSH URLs for git operations instead of converting them to HTTPS with token authentication.
 
