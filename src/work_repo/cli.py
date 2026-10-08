@@ -248,6 +248,14 @@ Examples:
         "-m",
         help="Commit message (defaults to auto-generated)",
     )
+    memory_persist_parser.add_argument(
+        "--allow-unbaselined-delete",
+        action="store_true",
+        help=(
+            "With no restore baseline, delete the scope files the agent dir "
+            "no longer holds instead of only naming them"
+        ),
+    )
     for action in ("forget", "revive"):
         retirement_parser = memory_subparsers.add_parser(
             action, help=f"Explicitly {action} a scoped schema-2 memory"
@@ -977,7 +985,8 @@ def cmd_goal(
 
 @work_transaction
 def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser,
-               scoped_path: str | None = None) -> int:
+               scoped_path: str | None = None,
+               allow_unbaselined_delete: bool = False) -> int:
     """
     Execute memory command.
 
@@ -992,7 +1001,7 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     if action == "restore":
         return restore_memory()
     elif action == "persist":
-        return persist_memory(message)
+        return persist_memory(message, allow_unbaselined_delete)
     elif action in ("forget", "revive"):
         from .memory import (
             MemoryRetirementError, forget_memory, revive_memory, memory_retirement_paths,
@@ -4668,7 +4677,8 @@ def _dispatch(args, parser) -> int:
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
-                          getattr(args, "scoped_path", None))
+                          getattr(args, "scoped_path", None),
+                          getattr(args, "allow_unbaselined_delete", False))
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
