@@ -5,7 +5,7 @@ import AssistantSettings from './AssistantSettings.vue'
 import IngressStatus from './IngressStatus.vue'
 import SlotEditor from './SlotEditor.vue'
 import SlotRow from './SlotRow.vue'
-import { projectColor } from '../projects.js'
+import { projectColor, projectTextColor } from '../projects.js'
 
 const props = defineProps({ state: { type: Object, default: null }, loading: Boolean, projects: { type: Array, default: () => [] }, slots: { type: Array, default: () => [] },
   runs: { type: Array, default: () => [] }, now: { type: Number, default: () => Date.now() }, focusSection: { type: String, default: null } })
@@ -187,8 +187,9 @@ async function release() {
   <v-list><v-list-item v-for="project in projects.filter(row => row.archived)" :key="project.id"
     class="archived-project" :aria-label="`Archived project ${project.name}`"
     :style="{ borderInlineStartColor: projectColor(project.color) }">
-    <v-chip :color="projectColor(project.color)" variant="flat">{{ project.name }}</v-chip>
-    <template #append><v-btn :color="projectColor(project.color)" variant="flat" @click="restore(project)">Restore stopped</v-btn></template>
+    <v-chip :color="projectColor(project.color)" :style="{ color: projectTextColor(project.color) }" variant="flat">{{ project.name }}</v-chip>
+    <template #append><v-btn :color="projectColor(project.color)" :style="{ color: projectTextColor(project.color) }" variant="flat"
+      @click="restore(project)">Restore stopped</v-btn></template>
   </v-list-item></v-list>
   <div class="d-flex align-center mt-4"><h2 class="text-title-medium">Conversation requests needing attention</h2>
     <v-spacer /><v-btn :loading="requestsBusy" @click="refreshRequests">Refresh requests</v-btn></div>
@@ -239,7 +240,7 @@ async function release() {
 .fleet-group-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 2fr); gap: 0 16px; margin-bottom: 16px; }
 .fleet-group-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
 @media (max-width: 600px) { .fleet-group-row { grid-template-columns: minmax(0, 1fr); } }
-#platform-service-slots { scroll-margin-top: 80px; }
+#platform-service-slots { scroll-margin-top: calc(var(--v-layout-top, 64px) + 16px); }
 .capacity-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .capacity-limits > div { display: flex; flex-direction: column; }
 .capacity-limits .v-input { flex: 0 0 auto; }

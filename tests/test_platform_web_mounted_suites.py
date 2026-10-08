@@ -19,10 +19,12 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 SUITES = [
     "tests/AssistantHistory.test.js",
     "tests/AssistantSettings.test.js",
+    "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",
     "tests/Projects.test.js",
     "tests/RequestRecovery.test.js",
     "tests/StatusStrip.test.js",
+    "tests/UnassignedRuns.test.js",
 ]
 
 

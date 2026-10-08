@@ -8,7 +8,7 @@ import Chat from '../src/components/Chat.vue'
 import AskHistory from '../src/components/AskHistory.vue'
 import RunCard from '../src/components/RunCard.vue'
 import * as api from '../src/api.js'
-import { mountPane } from './mount.js'
+import { chooseProject, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', async importOriginal => ({
   ...await importOriginal(), fetchState: vi.fn(), fetchProjects: vi.fn(),
@@ -76,7 +76,7 @@ it.each(legacy)('opens and reads %s retained history after a project selection',
   expect(detail.props('identifiedWorkspaceId')).toBeNull()
   expect(detail.props('run').state).toBe('crashed')
   expect(detail.text()).toContain(id)
-  expect(wrapper.get('.project-identity').text()).toContain('All projects')
+  expect(wrapper.get('.project-switcher').text()).toContain('All projects')
   expect(group.findAll('[aria-current="true"]')).toHaveLength(1)
   await detail.findAll('[role="tab"]').find(tab => tab.text().trim() === 'lmer').trigger('click')
   await vi.waitFor(() => {
@@ -96,7 +96,7 @@ it.each(legacy)('opens and reads %s retained history after a project selection',
   })
   expect(fetch.mock.calls.some(([path]) => path.includes(`/sessions/${id}/messages`))).toBe(true)
   expect(fetch.mock.calls.some(([path]) => path.includes(`/sessions/${id}/ask`))).toBe(true)
-  await wrapper.get('[role="tab"][aria-label="Alpha"]').trigger('click')
+  await chooseProject(wrapper, 'Alpha')
   await flushPromises()
   expect(window.location.search).toBe(`?workspace=${fixture.alpha}`)
   expect(wrapper.findComponent(RunDetail).exists()).toBe(false)
@@ -110,7 +110,7 @@ it('keeps scoped failures and the live successor in their project after opening 
   await wrapper.get('main [aria-label="Unassigned"] .run-row').trigger('click')
   await flushPromises()
   expect(wrapper.findComponent(RunDetail).exists()).toBe(true)
-  await wrapper.get('[role="tab"][aria-label="Alpha"]').trigger('click')
+  await chooseProject(wrapper, 'Alpha')
   await flushPromises()
   expect(window.location.search).toBe(`?workspace=${fixture.alpha}`)
   expect(wrapper.findComponent(RunDetail).exists()).toBe(false)
