@@ -100,6 +100,13 @@ from .model_aliases import (
     expand_model_alias,
     load_model_aliases,
 )
+from .pi_providers import (
+    PROVIDERS_ENV,
+    ProviderConfigError,
+    container_provider_env,
+    load_providers,
+    validate_host_registry_file,
+)
 from .presets import (
     AGENTS_CONFIG_ENV,
     AGENTS_ENV,
@@ -2984,6 +2991,10 @@ def main(argv: list[str] | None = None) -> int:
         # which is exactly the ambient value the scoped pair exists to avoid.
         AGENTS_ENV: None,
         AGENTS_CONFIG_ENV: None,
+        # pi provider metadata (issue #490) is host-generated only: seed None so
+        # a .env value cannot inject a registry. The pi block below fills it in
+        # for a pi session; for every other harness it is dropped.
+        PROVIDERS_ENV: None,
         # DM permissions are decided by host-side listeners and servicers.
         # Block .env and preset seeding from carrying these lists into a run.
         "LMER_SLACK_DM_ALLOWED_USERS": None,
@@ -3337,6 +3348,26 @@ def main(argv: list[str] | None = None) -> int:
     port_rc = _apply_port_passthrough(ns, env, run)
     if port_rc is not None:
         return port_rc
+
+    # pi provider model discovery (issue #490). Only the pi harness reads these
+    # variables, so the definitions and the operator's key ride along whenever
+    # pi runs: the session harness itself, or a ``--agents`` child routed to pi
+    # (which execs the binary directly and cannot render its own registry). The
+    # host file is validated here — before the container starts — so an obvious
+    # apiKey placeholder aborts with the file named instead of producing a
+    # session that sends the placeholder as a bearer token.
+    pi_in_play = harness.name == "pi" or any(
+        child.name == "pi" for child in agent_extra_harnesses
+    )
+    if pi_in_play:
+        try:
+            # The key may be exported or live in a .env file; the exported
+            # value wins, matching the CLI's normal precedence.
+            env.update(container_provider_env(load_providers(), {**env, **os.environ}))
+            validate_host_registry_file(environ={**env, **os.environ})
+        except ProviderConfigError as exc:
+            error(f"❌ {exc}")
+            return 2
 
     # Container environment. Values ride a mode-0600 --env-file (plus bare
     # -e NAME inheritance markers for the few that a line-oriented file

@@ -186,12 +186,130 @@ variable:
 
 ### Custom models (pi)
 
-pi resolves model names against its built-in catalog plus the custom
-provider/model registry at `~/.pi/agent/models.json` — the mechanism for
-self-hosted endpoints such as a local llama.cpp `llama-server`. lmer mounts
-that file into the container when it exists on the host, so
-`LMER_LLM_NAME=<custom-id> lmer … --harness pi` works with host-registered
-models.
+pi resolves model names against its built-in catalog plus a custom
+provider/model registry. lmer **generates that registry at container start**
+from provider definitions you configure, discovering each provider's current
+model list from the provider itself (issue #490). You never hand-maintain a
+model list and never paste a key into a config file.
+
+#### Configure a provider
+
+Provider definitions live in `~/.lmer/pi-providers.json` (override the path
+with `LMER_PI_PROVIDERS_FILE`). Each entry names the provider, its base URL,
+the API flavour, and — for an authenticated endpoint — the environment
+variable its key lives in:
+
+```json
+{
+  "skynet": {
+    "name": "Skynet",
+    "baseUrl": "https://skynet.example/v1",
+    "api": "openai-completions",
+    "keyEnv": "SKYNET_KEY"
+  },
+  "llamacpp": {
+    "baseUrl": "http://192.168.1.50:8080/v1",
+    "api": "openai-completions",
+    "apiKey": "local"
+  }
+}
+```
+
+- `keyEnv` names an ordinary environment variable (exported, or in a `.env`
+  file) holding the provider key. lmer forwards its value into the container
+  under a fixed variable and the generated `models.json` references it as
+  `$<NAME>` — the secret never lands in a file. A `keyEnv` that is not set
+  leaves that provider out of the session; it aborts the launch only when
+  `LMER_LLM_NAME` names that provider (see below).
+- `apiKey` is a literal for an unauthenticated endpoint (a local server);
+  `"local"` is the conventional value. It is mutually exclusive with
+  `keyEnv`.
+- `models` is an optional explicit fallback for a provider that cannot be
+  queried. When discovery succeeds, the discovered list is used.
+
+At container start the pi runner queries each provider (`GET /models`, with
+the `/v1/models` variant as a fallback), writes `~/.pi/agent/models.json`,
+and only then starts pi. When the model list carries no context windows (a
+LiteLLM proxy's does not), the runner also asks LiteLLM's `/model/info` and
+writes each model's `max_input_tokens` as its `contextWindow`. A model with no
+`max_input_tokens` gets no window: LiteLLM's legacy `max_tokens` is the output
+cap whenever one is stated, so it is never read as the window. That lookup is
+best effort: a provider that is not LiteLLM, or a key that may not read
+`/model/info`, keeps the discovered models, and pi uses its default window.
+
+#### One provider down does not stop the others
+
+A provider that cannot be used right now — its endpoint is unreachable, its
+`keyEnv` is unset, it rejects the key, or a host-registry `$VAR`/`${VAR}`
+apiKey names an unset variable — is left out of the session's registry with a
+warning:
+
+```
+⚠️  pi provider 'llamacpp' skipped for this session: could not discover models for provider 'llamacpp': …
+```
+
+It aborts the launch only when `LMER_LLM_NAME` names it
+(`llamacpp/qwen3-coder`). A switched-off laptop llama.cpp server therefore
+does not block sessions on another provider. An unreachable host costs one
+connect timeout, not one per candidate URL.
+
+#### Which model names lmer checks
+
+pi owns model-name resolution: its built-in catalog (`sonnet`,
+`claude-sonnet-4-6`), fuzzy names (`deepseek`) and the `:<thinking>` suffix
+(`deepseek-v4-flash:high`). lmer checks `LMER_LLM_NAME` **only** when it has
+the form `<provider>/<model>` and `<provider>` is one lmer configured (in
+`pi-providers.json` or the host registry). Then `<model>` must be an id that
+provider currently offers, optionally with a `:<thinking>` suffix
+(`skynet/deepseek-v4-flash:high`); an id containing a colon (`qwen3:8b`)
+matches as written. Every other name goes to pi untouched, and pi reports a
+name it cannot resolve. Under a configured provider, use the exact id: a fuzzy
+`skynet/deepseek` is refused there.
+
+A provider pi ships itself (`anthropic`, `openai`, …) is never checked, even
+when the host registry or `pi-providers.json` has a block for it. pi merges
+such a block into its built-in catalog — `modelOverrides`, an added model, even
+a `baseUrl` — so `anthropic/claude-sonnet-4-6` stays valid beside a block that
+lists only `my-finetune`. The runner asks the installed pi
+(`pi auth check --provider <name>`, against an empty agent directory) only when
+a name would otherwise be refused; if pi cannot answer, the name is left to
+pi. A block without a `baseUrl` can only adjust a provider pi already has, so
+it is never checked either.
+
+#### Host registry is still honoured
+
+A hand-written `~/.pi/agent/models.json` is mounted read-only and **merged
+into the generated registry with host entries winning**, so existing setups
+keep working. It goes through the same validation as the generated file.
+
+#### Failure signatures
+
+A launch that cannot work now fails before pi starts, with the reason:
+
+- **Unknown model** — `model '…' is not offered by pi provider '…'.
+  Available: …`, for a `<provider>/<model>` name on a configured provider.
+  The provider replaced its models since your last session.
+- **Rejected key** — `pi provider '…': key variable <NAME> is set but the
+  provider rejected it (HTTP 401/403)`. The variable is named, never its
+  value.
+- **Placeholder apiKey** — `models.json: provider … apiKey is a placeholder
+  ('<redacted>'), not a $VAR reference`. This is the masked-copy failure from
+  the field note: a literal copied out of a rendering that hid the reference.
+- **Colliding provider names** — two provider names that normalize to the same
+  key variable (`cloud-a` and `cloud_a` both yield
+  `LMER_PROVIDER_KEY_CLOUD_A`) abort on the host before anything is
+  forwarded. Sharing the variable would send one provider's key to the
+  other's endpoint.
+- **Missing key** — `pi provider '…': key variable <NAME> is not set`.
+- **Unreachable provider** — `could not discover models for provider '…': …`.
+
+Rejected, missing-key and unreachable providers abort only when
+`LMER_LLM_NAME` names them (see above); an unrelated one is skipped with a
+warning. A
+placeholder apiKey is a config error in a file you edit, so it always aborts.
+
+The pi runner invokes `python -m lmer_cli.pi_providers render`; run it
+manually inside a session to see the discovered list.
 
 #### Example: pi against a local llama.cpp server
 
@@ -201,45 +319,18 @@ models.
    for setup; the relevant part here is that it exposes an OpenAI-compatible
    API on its port (default 8080).
 
-2. **Register the model** in `~/.pi/agent/models.json` on the host:
+2. **Add a provider entry** to `~/.lmer/pi-providers.json` (see the
+   `llamacpp` entry above). A local server that does not answer `/models`
+   needs an explicit `models` list, as in the provider config example.
 
-   ```json
-   {
-     "providers": {
-       "llamacpp": {
-         "baseUrl": "http://192.168.1.50:8080/v1",
-         "api": "openai-completions",
-         "apiKey": "dummy",
-         "models": [
-           {
-             "id": "my-local-model",
-             "name": "My local model",
-             "contextWindow": 64000,
-             "maxTokens": 32000,
-             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-           }
-         ]
-       }
-     }
-   }
-   ```
-
-   `apiKey` is required by the schema — any placeholder works for an
-   unauthenticated local server. See the
-   [pi docs](https://github.com/earendil-works/pi) for the full
-   `models.json` schema and the other supported `api` values.
-
-3. **Start the session** naming the registered model id. Custom model names
-   match no harness-autoselection hint, so select pi explicitly:
+3. **Start the session** naming the model id. Custom model names match no
+   harness-autoselection hint, so select pi explicitly:
 
    ```bash
    LMER_LLM_NAME=my-local-model lmer develop <target> --harness pi
    ```
 
    (or set `LMER_HARNESS=pi` alongside `LMER_LLM_NAME` in your `.env`).
-   The pi runner logs
-   `✅ pi custom model registry found at ~/.pi/agent/models.json` when the
-   mount is in place.
 
 **`baseUrl` is dialed from inside the container** — it must be an address
 the container can reach: a LAN/bridge IP as above, or
@@ -291,7 +382,12 @@ child's is dropped rather than handed to a cross-harness child as a foreign
 child's exit code (a signal death maps to `128+N`; 124 on `--timeout`
 expiry, which kills the child's whole process group — as does interrupting
 `spawn-harness` itself with SIGINT/SIGTERM, so a cancelled fan-out never
-leaves a detached child running). Liveness and failure
+leaves a detached child running). A pi child execs the binary directly, so
+`pi-runner.sh` — which renders the merged provider registry at session start
+— never runs for it; `spawn-harness` renders the registry itself before a pi
+child execs (skipped when the session harness is already pi, which rendered at
+launch), so a pi child of a Claude/Codex parent can read the host overlay and
+the session's discovered providers. Liveness and failure
 are observable without watching the exit code: a heartbeat line is printed
 to stderr while the child runs (`--heartbeat`, default 60s, 0 disables —
 harnesses buffer their final answer, so an empty output file says nothing

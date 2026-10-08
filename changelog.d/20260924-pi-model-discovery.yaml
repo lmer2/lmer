@@ -1,0 +1,7 @@
+added:
+- "pi providers are configured once in ~/.lmer/pi-providers.json; the model list is discovered from each provider at launch instead of hand-pinned, with context windows from LiteLLM's /model/info where the model list lacks them"
+- "`GET /api/spawn-options` / `lmer-ctl spawn-options` now list the models each configured pi provider currently advertises (probed in parallel under a short deadline and cached for a minute)"
+fixed:
+- "A pi session started on `<provider>/<model>` that the configured provider no longer offers, or whose key it rejects, now aborts before starting instead of running live and unable to act; built-in, fuzzy and `:<thinking>` names, and any model of a provider pi ships itself, are left to pi, and a provider that is down or has no key is skipped and aborts only launches that name it"
+- "A masked apiKey placeholder in ~/.pi/agent/models.json is refused at launch instead of being sent as a bearer token"
+- "Concurrent pi children no longer race on the shared registry: it is published atomically, so a launch never reads the empty or half-written file a truncating rewrite could leave behind"
