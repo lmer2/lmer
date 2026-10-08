@@ -493,6 +493,181 @@ class TestCommitWorkPathResilience:
                 assert "git.example.com/grp/proj/specs" in add_calls[0]
 
 
+def _git_config(clone: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "user.name", "t"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "user.email", "t@t"],
+        check=True, capture_output=True,
+    )
+
+
+class TestCommitWorkPathConflictCallback:
+    """D.conflict-api (#369 gap (b)): a rebase conflict hands both sides back.
+
+    Real bare origin, two clones: the sibling pushes first, so this clone's
+    commit cannot rebase. With ``on_conflict`` the paths and both versions are
+    captured before the abort, the local commit is dropped, and no rebase
+    state is left behind. Without a callback the local commit is kept, exactly
+    as before.
+    """
+
+    def _race(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        origin = tmp_path / "origin.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+            check=True, capture_output=True,
+        )
+        clone = tmp_path / "work"
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(clone)],
+            check=True, capture_output=True,
+        )
+        _git_config(clone)
+        (clone / "memory").mkdir()
+        (clone / "memory" / "note.md").write_text("base\n")
+        (clone / "other.txt").write_text("keep me\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-q", "-m", "seed")
+        _git(clone, "push", "-q", "-u", "origin", "main")
+
+        sibling = tmp_path / "sibling"
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(sibling)],
+            check=True, capture_output=True,
+        )
+        _git_config(sibling)
+        (sibling / "memory" / "note.md").write_text("theirs\n")
+        _git(sibling, "add", "-A")
+        _git(sibling, "commit", "-q", "-m", "theirs")
+        _git(sibling, "push", "-q", "origin", "main")
+
+        (clone / "memory" / "note.md").write_text("ours\n")
+        # A sibling's unrelated uncommitted edit must survive the autostash.
+        (clone / "other.txt").write_text("keep me\nsibling edit\n")
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+        return clone
+
+    def _subject(self, clone: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(clone), "log", "-1", "--format=%s"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+
+    def test_post_commit_race_reports_conflicting_paths(self, tmp_path, monkeypatch):
+        clone = self._race(tmp_path, monkeypatch)
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+        seen = []
+
+        rc = commit_work_path("memory", "ours", on_conflict=seen.append)
+
+        assert rc != 0
+        assert len(seen) == 1, seen
+        (conflict,) = seen[0]
+        assert conflict.path == "memory/note.md"
+        assert conflict.ours == "theirs\n"   # stage 2: the commit rebased ONTO
+        assert conflict.theirs == "ours\n"   # stage 3: this clone's commit
+        assert not (clone / ".git" / "rebase-merge").exists()
+        assert not (clone / ".git" / "rebase-apply").exists()
+        # The local commit is dropped, never left to replay into the same
+        # conflict: the checkout is back at its pre-commit bytes and history.
+        assert (clone / "memory" / "note.md").read_text() == "base\n"
+        assert self._subject(clone) == "seed\n"
+        # The sibling's unrelated uncommitted edit is untouched.
+        assert "sibling edit" in (clone / "other.txt").read_text()
+        # The shared checkout stays publishable: the next commit goes through.
+        assert commit_work_path("other.txt", "next writer") == 0
+        status = subprocess.run(
+            ["git", "-C", str(clone), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert status == "", status
+
+    def test_the_default_call_keeps_the_local_commit(self, tmp_path, monkeypatch):
+        clone = self._race(tmp_path, monkeypatch)
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+
+        rc = commit_work_path("memory", "ours")
+
+        assert rc != 0
+        assert not (clone / ".git" / "rebase-merge").exists()
+        assert not (clone / ".git" / "rebase-apply").exists()
+        # Today's behaviour: the local commit is retained, not reverted.
+        assert (clone / "memory" / "note.md").read_text() == "ours\n"
+        assert "Revert" not in self._subject(clone)
+
+    def test_an_autostash_restoration_failure_is_surfaced(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        clone = self._race(tmp_path, monkeypatch)
+        calls = {"n": 0}
+
+        def fake_stash_head(repo_path, label):
+            calls["n"] += 1
+            return (0, "") if calls["n"] == 1 else (0, "deadbeef")
+
+        monkeypatch.setattr(git_ops, "_stash_head", fake_stash_head)
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+
+        rc = commit_work_path("memory", "ours", on_conflict=lambda conflicts: None)
+
+        assert rc != 0
+        assert "autostash restoration" in capsys.readouterr().err
+
+
+class TestConflictDropIsConfinedToTheCallersCommit:
+    """The conflict drop takes back only what the calling commit changed under
+    its own paths; deferred sibling paths and older local commits survive."""
+
+    def test_a_deferred_sibling_path_in_the_dropped_commit_stays_and_publishes_next(
+        self, tmp_path, monkeypatch
+    ):
+        from work_repo import transactions
+
+        clone = TestCommitWorkPathConflictCallback()._race(tmp_path, monkeypatch)
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+        (clone / "sibling-record.md").write_text("sibling's deferred record\n")
+        transactions.queue_paths(clone, ["sibling-record.md"])
+        seen = []
+
+        assert commit_work_path("memory", "ours", on_conflict=seen.append) != 0
+
+        assert len(seen) == 1
+        assert (clone / "sibling-record.md").read_text() == "sibling's deferred record\n"
+        assert commit_work_path("other.txt", "next writer") == 0
+        published = subprocess.run(
+            ["git", "-C", str(clone), "show", "origin/main:sibling-record.md"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert published == "sibling's deferred record\n"
+
+    def test_publishing_pending_commits_never_drops_one(self, tmp_path, monkeypatch):
+        clone = TestCommitWorkPathConflictCallback()._race(tmp_path, monkeypatch)
+        monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+        assert commit_work_path("memory", "kept") != 0
+        (clone / "other.txt").write_text("keep me\nsibling edit\nlater\n")
+        subprocess.run(
+            ["git", "-C", str(clone), "commit", "-q", "-am", "later"],
+            check=True, capture_output=True,
+        )
+        seen = []
+
+        assert commit_work_path([], None, on_conflict=seen.append) != 0
+
+        assert seen == []
+        log = subprocess.run(
+            ["git", "-C", str(clone), "log", "--format=%s", "-2"],
+            check=True, capture_output=True, text=True,
+        ).stdout.split()
+        assert log == ["later", "kept"]
+        assert "later" in (clone / "other.txt").read_text()
+
+
 class TestReportUncommittedWorkItems:
     """report_uncommitted_work_items: the issue #85 stray-file reminder.
 

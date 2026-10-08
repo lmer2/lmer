@@ -476,12 +476,6 @@ class TestPresentBehaviourPinnedForR2:
 
 
 class TestGapABaselineKeyedBySession:
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (a): the restore manifest records no session id, so a "
-        "baseline recorded under another session is honoured",
-    )
     def test_a_manifest_recorded_under_another_session_id_deletes_nothing(self, plexus):
         alpha = plexus.enter(plexus.start("alpha"))
         assert memory.restore_memory() == 0
@@ -501,12 +495,6 @@ class TestGapABaselineKeyedBySession:
         assert (successor.clone / rel).is_file()
         assert plexus.published(rel) is not None
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (a): a manifest carrying no session id is honoured "
-        "against a set LMER_SESSION_ID",
-    )
     def test_a_manifest_with_no_session_id_against_a_set_id_deletes_nothing(self, plexus):
         alpha = plexus.enter(plexus.start("alpha"))
         assert memory.restore_memory() == 0
@@ -524,12 +512,6 @@ class TestGapABaselineKeyedBySession:
 
 
 class TestGapBMergeDelta:
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (b): no pull before the merge — a sibling clone's add "
-        "is first seen at the post-commit rebase, which conflicts on MEMORY.md",
-    )
     def test_a_concurrent_add_across_clones_keeps_both_memories_and_both_index_lines(
         self, plexus
     ):
@@ -555,13 +537,6 @@ class TestGapBMergeDelta:
         assert "(alpha_note.md)" in index and "(beta_note.md)" in index, index
         assert index == (plexus.scope(alpha) / memory.MEMORY_INDEX).read_text()
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (b): the digest check runs against the stale checkout, "
-        "so a local delete of an upstream-edited file is committed and the "
-        "rebase fails modify/delete",
-    )
     def test_an_upstream_change_followed_by_a_local_delete_keeps_the_upstream_bytes(
         self, plexus
     ):
@@ -586,12 +561,6 @@ class TestGapBMergeDelta:
         assert (alpha.clone / rel).read_text() == upstream
         assert plexus.published(rel) == upstream
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (b): a rebase conflict is aborted with the conflicting "
-        "commit left local; no .conflict-<sid> copy of this session's bytes is made",
-    )
     def test_a_forced_rebase_conflict_leaves_a_conflict_copy_and_no_rebase_state(
         self, plexus, monkeypatch
     ):
@@ -613,13 +582,13 @@ class TestGapBMergeDelta:
         real_commit = memory.commit_work_path
         raced = []
 
-        def commit_after_the_sibling_publishes(*args):
+        def commit_after_the_sibling_publishes(*args, **kwargs):
             if not raced:
                 raced.append(True)
                 plexus.enter(beta)
                 assert memory.persist_memory("beta") == 0
                 plexus.enter(alpha)
-            return real_commit(*args)
+            return real_commit(*args, **kwargs)
 
         monkeypatch.setattr(memory, "commit_work_path", commit_after_the_sibling_publishes)
         plexus.enter(alpha)
@@ -633,7 +602,153 @@ class TestGapBMergeDelta:
             if f".conflict-{alpha.sid}" in path.name
         ]
         assert copies, sorted(path.name for path in alpha.memory_dir.iterdir())
-        assert copies[0].read_text() == mine
+        # The copy is what the session has NOT seen — the sibling's published
+        # version; its own version is still its own file.
+        assert copies[0].read_text() == theirs
+        assert (alpha.memory_dir / PROJECT_MEMORY_FILE).read_text() == mine
+        # The local memory commit is reverted and dropped, so nothing of it
+        # is left to replay and the next publication from the shared checkout
+        # goes through, landing on upstream's bytes.
+        rel = f"{plexus.project_rel}/{PROJECT_MEMORY_FILE}"
+        unpublished = git(alpha.clone, "rev-list", "origin/main..HEAD").stdout
+        assert unpublished == "", unpublished
+        (alpha.clone / "after-conflict.txt").write_text("next writer\n")
+        assert real_commit("after-conflict.txt", "next writer") == 0
+        assert plexus.published("after-conflict.txt") == "next writer\n"
+        assert plexus.published(rel) == theirs
+        assert (alpha.clone / rel).read_text() == theirs
+
+
+class TestDroppedCommitRecovery:
+    """A dropped memory commit loses nothing: everything it carried that did
+    not conflict is published by the next persist, and the restore manifest
+    is rolled back so those adds are not mistaken for published ones."""
+
+    @staticmethod
+    def _race(plexus, monkeypatch, alpha, beta):
+        real_commit = memory.commit_work_path
+        raced = []
+
+        def commit_after_the_sibling_publishes(*args, **kwargs):
+            if not raced:
+                raced.append(True)
+                plexus.enter(beta)
+                assert memory.persist_memory("beta") == 0
+                plexus.enter(alpha)
+            return real_commit(*args, **kwargs)
+
+        monkeypatch.setattr(memory, "commit_work_path", commit_after_the_sibling_publishes)
+        plexus.enter(alpha)
+        rc = memory.persist_memory("alpha")
+        monkeypatch.setattr(memory, "commit_work_path", real_commit)
+        assert raced
+        return rc
+
+    def _restored_pair(self, plexus):
+        alpha, beta = plexus.start("alpha"), plexus.start("beta")
+        for session in (alpha, beta):
+            plexus.enter(session)
+            assert memory.restore_memory() == 0
+        return alpha, beta
+
+    def test_an_index_only_conflict_is_reported_and_the_retry_publishes_both(
+        self, plexus, monkeypatch, capsys
+    ):
+        alpha, beta = self._restored_pair(plexus)
+        _add(alpha, "alpha_new", "project")
+        _add(beta, "beta_new", "project")
+
+        assert self._race(plexus, monkeypatch, alpha, beta) != 0
+        assert "commit was dropped" in capsys.readouterr().err
+        assert memory.persist_memory("alpha retry") == 0
+
+        index = plexus.published(f"{plexus.project_rel}/{memory.MEMORY_INDEX}") or ""
+        for stem in ("alpha_new", "beta_new"):
+            assert plexus.published(f"{plexus.project_rel}/{stem}.md") is not None, stem
+            assert f"({stem}.md)" in index, index
+
+    def test_a_non_conflicting_memory_in_the_dropped_commit_is_published_on_retry(
+        self, plexus, monkeypatch
+    ):
+        alpha, beta = self._restored_pair(plexus)
+        theirs = _memory_file(PROJECT_MEMORY_NAME, "project", body="beta's version\n")
+        (beta.memory_dir / PROJECT_MEMORY_FILE).write_text(theirs)
+        (alpha.memory_dir / PROJECT_MEMORY_FILE).write_text(
+            _memory_file(PROJECT_MEMORY_NAME, "project", body="alpha's version\n")
+        )
+        _add(alpha, "alpha_new", "project")
+
+        assert self._race(plexus, monkeypatch, alpha, beta) != 0
+        # The agent reconciles from what persist left it — the copy of
+        # upstream's version, its only source for the sibling's edit.
+        (copy,) = [p for p in alpha.memory_dir.iterdir() if ".conflict-" in p.name]
+        assert copy.read_text() == theirs
+        (alpha.memory_dir / PROJECT_MEMORY_FILE).write_text(copy.read_text())
+        copy.unlink()
+        assert memory.persist_memory("alpha retry") == 0
+
+        assert plexus.published(f"{plexus.project_rel}/alpha_new.md") is not None
+        assert plexus.published(f"{plexus.project_rel}/{PROJECT_MEMORY_FILE}") == theirs
+
+    def test_a_fresh_start_baseline_is_a_baseline_and_the_flag_deletes_nothing_unseen(
+        self, plexus
+    ):
+        def wipe(clone: Path) -> None:
+            for rel in plexus.fixture_rels():
+                (clone / rel).unlink()
+            for rel in (plexus.project_rel, plexus.instance_rel):
+                if rel and (clone / rel / memory.MEMORY_INDEX).exists():
+                    (clone / rel / memory.MEMORY_INDEX).unlink()
+
+        plexus.publish(wipe, "wipe memory")
+        alpha, beta = self._restored_pair(plexus)
+        _add(beta, "beta_note", "project")
+        plexus.enter(beta)
+        assert memory.persist_memory("beta") == 0
+
+        plexus.enter(alpha)
+        assert memory.read_restore_baseline() == {}
+        _add(alpha, "alpha_note", "project")
+        assert memory.persist_memory("alpha", allow_unbaselined_delete=True) == 0
+        assert plexus.published(f"{plexus.project_rel}/beta_note.md") is not None
+
+    def test_the_copy_is_upstreams_version_and_every_uncopied_path_says_why(
+        self, plexus
+    ):
+        from work_repo.git_ops import ConflictedPath
+
+        alpha = plexus.enter(plexus.start("alpha"))
+        scope = plexus.project_rel
+        written, uncopied = memory._write_conflict_copies(
+            [
+                ConflictedPath(f"{scope}/edited.md", "upstream\n", "mine\n"),
+                ConflictedPath(f"{scope}/gone_upstream.md", None, "mine\n"),
+                ConflictedPath(f"{scope}/gone_here.md", "upstream\n", None),
+                ConflictedPath(f"{scope}/{memory.MEMORY_INDEX}", "a\n", "b\n"),
+                ConflictedPath("elsewhere/log.md", "a\n", "b\n"),
+            ],
+            [scope],
+        )
+        assert written == [f"edited.conflict-{alpha.sid}.md"]
+        assert (alpha.memory_dir / written[0]).read_text() == "upstream\n"
+        reasons = dict(uncopied)
+        assert reasons[f"{scope}/gone_upstream.md"] == "deleted upstream, edited by this session"
+        assert reasons[f"{scope}/gone_here.md"] == "deleted by this session, edited upstream"
+        assert f"{scope}/{memory.MEMORY_INDEX}" in reasons
+        assert reasons["elsewhere/log.md"] == "not a memory"
+
+        # A second conflict never overwrites an unreconciled copy.
+        again, _ = memory._write_conflict_copies(
+            [ConflictedPath(f"{scope}/edited.md", "newer\n", "mine\n")], [scope]
+        )
+        assert again == [f"edited.conflict-{alpha.sid}-2.md"]
+        assert (alpha.memory_dir / written[0]).read_text() == "upstream\n"
+
+    def test_only_conflict_copy_names_are_excluded_from_memories(self):
+        assert memory._is_conflict_copy(Path(f"note.conflict-{'a' * 32}.md"))
+        assert memory._is_conflict_copy(Path("note.conflict-20261007-101500-4242-11111-2.md"))
+        assert not memory._is_conflict_copy(Path("merge.conflict-notes.md"))
+        assert not memory._is_conflict_copy(Path(f"sub/note.conflict-{'a' * 32}.md"))
 
 
 class TestGapCNoBaselineRefusal:
@@ -649,12 +764,6 @@ class TestGapCNoBaselineRefusal:
             _add(alpha, "alpha_pref", "user")
         return alpha
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (c): a persist without a baseline deletes nothing but "
-        "never says which local absences it declined to propagate",
-    )
     def test_a_persist_without_a_baseline_deletes_nothing_and_names_the_absences(
         self, plexus, capsys
     ):
@@ -670,12 +779,13 @@ class TestGapCNoBaselineRefusal:
         output = out + err
         assert PROJECT_MEMORY_FILE in output, output
         assert USER_MEMORY_FILE in output, output
+        # This persist records a baseline, so a follow-up run with the flag
+        # would delete none of these: the hint must not advertise it, and
+        # names the explicit forget where the form has one.
+        assert "--allow-unbaselined-delete" not in output, output
+        if plexus.form == SCHEMA2:
+            assert "work memory forget" in output, output
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (c): `work memory persist` has no --allow-unbaselined-delete flag",
-    )
     def test_allow_unbaselined_delete_deletes_exactly_the_named_set(
         self, plexus, monkeypatch, capsys
     ):
@@ -699,14 +809,36 @@ class TestGapCNoBaselineRefusal:
         assert plexus.published(f"{plexus.project_rel}/alpha_note.md") is not None
         assert not _rebase_in_progress(alpha)
 
+    def test_a_persist_without_a_baseline_records_one_for_the_next_persist(
+        self, plexus
+    ):
+        """Decision (task 50): the manifest a baseline-less persist writes
+        itself IS a baseline for the next persist — it records what this
+        session now holds, so a later removal is a deletion it may carry."""
+        alpha = self._unbaselined(plexus)
+        assert memory.persist_memory("alpha") == 0
+        manifest = memory.read_restore_manifest()
+        assert memory.PROJECT_SCOPE in manifest, manifest
+        assert "alpha_note.md" in manifest[memory.PROJECT_SCOPE]["files"]
+
+        _remove(alpha, "alpha_note.md")
+        assert memory.persist_memory("alpha again") == 0
+
+        rel = f"{plexus.project_rel}/alpha_note.md"
+        assert not (alpha.clone / rel).exists(), rel
+        assert plexus.published(rel) is None, rel
+
+    def test_persist_parser_accepts_the_unbaselined_delete_flag(self):
+        parser = cli.create_parser()
+        assert parser.parse_args(
+            ["memory", "persist", "--allow-unbaselined-delete"]
+        ).allow_unbaselined_delete is True
+        assert parser.parse_args(
+            ["memory", "persist"]
+        ).allow_unbaselined_delete is False
+
 
 class TestGapDDeletionReporting:
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (d): every unlink in _write_scope is silent; persist "
-        "prints only the merged count",
-    )
     def test_persist_output_lists_every_deleted_path_with_the_count(
         self, schema2_plexus, capsys
     ):
