@@ -429,6 +429,8 @@ def _make_main_mocks(
     from contextlib import ExitStack
     from unittest.mock import MagicMock, patch
 
+    from lmer_cli.build import ImageReadiness
+
     from slack_chat import registry as _slack_registry
 
     stack = ExitStack()
@@ -446,7 +448,10 @@ def _make_main_mocks(
         patch("lmer_cli.cli.detect_runtime", return_value="podman")
     )
     stack.enter_context(
-        patch("lmer_cli.cli.ensure_image", return_value=True)
+        patch(
+            "lmer_cli.cli.ensure_image",
+            return_value=ImageReadiness(available=True, materialized=False),
+        )
     )
     stack.enter_context(
         patch("lmer_cli.cli.base_run_args", return_value=[])

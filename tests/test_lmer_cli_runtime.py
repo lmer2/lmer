@@ -288,6 +288,19 @@ class TestBaseRunArgs:
         assert "podman" in args
         assert "--userns=keep-id" in args
 
+    def test_base_args_podman_nonroot_numeric_user_includes_userns(self):
+        args = base_run_args("podman", False, "1000:1000")
+
+        assert "--userns=keep-id" in args
+
+    def test_base_args_podman_root_user_skips_userns(self):
+        """Root under the default rootless map already IS the host uid, so
+        keep-id (and its whole-rootfs chown, issue #351) is skipped."""
+        for user in ("0:0", "0", "root", "root:root"):
+            args = base_run_args("podman", False, user)
+            assert "--userns=keep-id" not in args, user
+            assert args[args.index("--user") + 1] == user
+
     def test_base_args_docker_no_userns(self):
         """Test Docker args don't include --userns=keep-id"""
         args = base_run_args("docker", False, "developer")

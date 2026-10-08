@@ -189,7 +189,30 @@ it('ignores a predecessor tail response after the history view changes', async (
   expect(wrapper.text()).toContain('Decision 2')
 })
 
-it('catches up large predecessor tails in bounded pages without starving the active generation', async () => {
+// A per-test budget rather than the 10s default, for this file only.
+//
+// This is the one case in the suite that renders 600 rows and then asserts on
+// all 608 of them, so it is minutes-of-CPU work measured against a wall clock —
+// and vitest runs these files with `maxWorkers: 1` on a host that is otherwise
+// busy. It passes at 3-4s on an idle machine and lands at 10.4-11.7s under
+// load, which is a stopwatch on the host rather than a property of the code:
+// nothing here races a real timer, since `useFakeTimers` means every clock the
+// component sees is advanced by the test itself.
+//
+// The bound is the default multiplied, not a free pass: the work is ~4s, so 30s
+// still refuses a genuine 10x regression. It is a per-test option rather than a
+// global `testTimeout` so every other case here keeps the tight default and a
+// slowdown in the paging logic still shows up as a failure.
+//
+// Worth saying plainly how this got here: the wrapper that runs these files from
+// pytest (`tests/test_platform_web_mounted_suites.py`) was added in the same
+// commit as this test, so it never ran in CI — it has only ever been seen by
+// whoever ran it by hand. Raising the budget is not a fix for a defect and none
+// is claimed; the assertions are unchanged, and a run of this file on an idle
+// host is the evidence to trust about the work itself.
+const CATCH_UP_TIMEOUT = 30000
+
+it('catches up large predecessor tails in bounded pages without starving the active generation', { timeout: CATCH_UP_TIMEOUT }, async () => {
   vi.useFakeTimers()
   const wrapper = await open()
   pages.set(2, [...data(2), ...Array.from({ length: 600 }, (_, i) => row(2, i + 3, `late backlog ${i}`))])

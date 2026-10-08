@@ -1,0 +1,4 @@
+changed:
+- "podman's multi-minute keep-id UID remap is now paid during `lmer build` (and any auto-build or pull) instead of at the first session start; LMER_NO_PREWARM=1 opts out"
+fixed:
+- "The keep-id UID remap notice now fires whenever the image has not been remapped yet, so a spawn after a separate `lmer build` no longer waits in silence"

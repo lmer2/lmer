@@ -26,7 +26,7 @@ from typing import Callable, List
 from dotenv import dotenv_values, load_dotenv
 
 from .log import warning
-from .util import env_name_segment
+from .util import env_name_segment, get_bool_env
 
 
 class InstallMode(Enum):
@@ -794,6 +794,75 @@ def _resource_limit_args(plan: "List[ResourceLimit]") -> List[str]:
     return [arg for limit in plan for arg in (limit.flag, limit.value)]
 
 
+def is_root_container_user(user: str) -> bool:
+    """Whether a --user spec (``name``, ``uid`` or ``uid:gid``) means uid 0."""
+    return user.split(":", 1)[0] in ("0", "root")
+
+
+#: The container user ``--root-userns`` selects: uid 0, which under the default
+#: rootless-podman map is the invoking host uid.
+ROOT_CONTAINER_USER = "0:0"
+
+
+def ambient_container_user() -> str:
+    """The container user a launch would resolve from the environment alone.
+
+    ``lmer build`` has no ``--user`` or ``--root-userns`` flag of its own, so
+    the env toggles are the only signal it has about whether the image it is
+    building will ever be run under keep-id — and pre-warming a mapping that
+    host has opted out of costs the very minutes this exists to remove
+    (!309 review). :func:`lmer_cli.cli._resolve_container_user` layers the
+    command-line flags on top of this.
+    """
+    if get_bool_env("LMER_ROOT_USERNS"):
+        return ROOT_CONTAINER_USER
+    return os.environ.get("LMER_CONTAINER_USER", "developer")
+
+
+def engine_is_rootless(runtime: str) -> bool | None:
+    """Whether the podman ENGINE that will run the container is rootless.
+
+    ``--root-userns``'s whole premise — container root IS the invoking host
+    uid — is a property of the engine, not of the client process. A non-root
+    client can be pointed at a **rootful** service (``CONTAINER_HOST``,
+    ``CONTAINER_CONNECTION``, ``--remote``, an ssh connection), where
+    container root is host root; a local euid check cannot see that
+    (!309 adversarial review, F1). ``podman info`` answers for whichever
+    engine the client is actually talking to, so ask it.
+
+    ``None`` means the question could not be answered — which a caller
+    gating a privilege opt-in must treat as "not established", never as yes.
+    """
+    try:
+        result = subprocess.run(
+            [runtime, "info", "--format", "{{.Host.Security.Rootless}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    answer = result.stdout.strip().lower()
+    if answer == "true":
+        return True
+    if answer == "false":
+        return False
+    return None
+
+
+def keep_id_applies(runtime: str, user: str) -> bool:
+    """Whether a launch with these settings pays podman's keep-id UID remap.
+
+    The single source of truth for the ``--userns=keep-id`` condition:
+    :func:`base_run_args` passes the flag on it and the launch notice fires on
+    it (issue #384), so the two cannot drift into warning about a remap that
+    will not happen, or staying silent about one that will.
+    """
+    return runtime == "podman" and not is_root_container_user(user)
+
+
 def base_run_args(
     runtime: str,
     exec_mode: bool,
@@ -843,9 +912,25 @@ def base_run_args(
     )
     if gpu is not None:
         args += list(gpu.args)
-    if runtime == "podman":
-        # Podman-specific: maintain user ID mapping for SSH agent and file permissions
+    if keep_id_applies(runtime, user):
+        # Podman-specific: maintain user ID mapping for SSH agent and file
+        # permissions. Only needed for a non-root container user: under the
+        # default rootless map container root already IS the invoking host
+        # uid, so bind-mount ownership lines up with no remap — and skipping
+        # keep-id avoids podman's whole-rootfs chown on a cold image
+        # (issue #351).
         args += ["--userns=keep-id"]
+    elif runtime == "podman":
+        # A root container user wants the *default* rootless map, and saying
+        # so has to be explicit: omitting --userns does not select the
+        # default, it defers to PODMAN_USERNS and then containers.conf's
+        # `userns` (podman-run(1), --userns). An ambient `keep-id` there
+        # would silently reinstate the whole-rootfs chown lmer has just
+        # announced it skipped, and map container root to a subordinate uid
+        # instead of the invoking one (!309 adversarial review, F2).
+        # `host` is podman's own name for that default, and a no-op under a
+        # rootful engine, which already runs in the host user namespace.
+        args += ["--userns=host"]
 
     # User and workdir
     args += ["--user", user, "-w", "/workspace"]

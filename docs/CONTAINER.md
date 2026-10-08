@@ -142,9 +142,12 @@ hashlib.md5(b'test').hexdigest()
 ### User Namespace
 
 **Podman**:
-- Adds `--userns=keep-id` flag when running containers (in `src/lmer_cli/runtime.py`)
+- Adds `--userns=keep-id` when the container user is non-root — the default `developer` case (in `src/lmer_cli/runtime.py`)
 - Maintains user ID mapping in rootless mode
 - Preserves file permissions and SSH agent access
+- A root container user (`--root-userns`, or an explicit `--user 0:0`) skips `--userns=keep-id`: under the default rootless map container root already IS the invoking host uid, and skipping the remap avoids podman's whole-rootfs chown on a cold image (issue #351)
+- That chown is pre-warmed after every build or pull — one throwaway keep-id container, so the minutes are spent in `lmer build` rather than in the first session start (`LMER_NO_PREWARM=1` opts out). Warmed images are recorded in `~/.lmer/remapped/<image-id>`, which is what lets a spawn tell a cold image from a warm one when a different process did the building (issue #384)
+- `--root-userns` (env: `LMER_ROOT_USERNS`) is the supported opt-in for that fast path; it requires rootless podman and is refused under docker or a root-run podman. See `docs/LMER-CLI.md` for the security trade
 
 **Docker**:
 - Runs without `--userns=keep-id`
@@ -254,10 +257,11 @@ The container is designed to match your host user ID to avoid permission issues 
   ```
 
 **Podman**:
-- Uses `--userns=keep-id` flag (in `src/lmer_cli/runtime.py`)
+- Uses `--userns=keep-id` for non-root container users — the default (in `src/lmer_cli/runtime.py`)
 - Automatically maps your host UID/GID to the container user
 - Works seamlessly even if container user has different IDs
 - Better permission handling out of the box
+- With a root container user (`--root-userns` opt-in) there is no keep-id remap at all: container root maps to your host uid under the default rootless namespace, so bind-mounted files land with the same host-side ownership
 
 #### Custom User IDs
 
