@@ -3131,7 +3131,13 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
         # corrupt state nor an index problem can fail the sync.
         for spec_file, link_name in spec_files:
             specs_index.upsert_spec_link(
-                spec_file, specs_index.run_label(rdir), alias=link_name
+                spec_file,
+                specs_index.run_label(rdir),
+                # A FIRST registration is dated by the record's own
+                # registration, not by this sync (#334); an existing entry's
+                # date always wins inside upsert_spec_link.
+                when=specs_index._registration_when(rdir, link_name, spec_file),
+                alias=link_name,
             )
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
