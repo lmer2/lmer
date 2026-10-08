@@ -671,6 +671,8 @@ class TestWriteIntentMapCoversTheParser:
         ("artifact", ["artifact", "spec.md", "--file", "x.md"], True),
         ("specs-index", ["specs-index"], False),
         ("specs-index", ["specs-index", "--rebuild"], True),
+        ("adopt", ["adopt", "git.example.com/group/project", "widgets"], False),
+        ("adopt", ["adopt", "git.example.com/group/project", "widgets", "--apply"], True),
         ("seed", ["seed", "develop", "some-target"], True),
         ("release", ["release", "status"], False),
         ("release", ["release", "claim-status"], False),
