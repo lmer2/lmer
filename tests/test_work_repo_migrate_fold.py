@@ -418,6 +418,31 @@ class TestRefusals:
         assert migrate.LIVE_REMEDY in text
         assert _snapshot(root) == before
 
+    def test_a_live_record_refuses_its_slug_only_rewrite(self, tmp_path, monkeypatch):
+        # An interrupted fold: the record already sits in its taskdef group
+        # and only `slug:` is left to rewrite. A live writer there would put
+        # the old slug back, so the preflight must see it.
+        root = tmp_path / "work"
+        tree = pf.build_schema_plexus(root)
+        pf.plant_plain_session_records(tree.project_dir, signed_out=False, status="in-progress")
+        runs = tree.project_dir / "_runs"
+        (runs / "chat").mkdir(exist_ok=True)
+        (runs / "chat-." / "20260901-100000-1-0").rename(runs / "chat" / "20260901-100000-1-0")
+        (runs / "chat-.").rmdir()
+        _git(root, "init", "-q", "-b", "main")
+        _git(root, "config", "user.email", "tests@example.test")
+        _git(root, "config", "user.name", "tests")
+        _commit_all(root)
+        _configure(monkeypatch, root, tmp_path)
+        plan = migrate.plan_project(PROJECT, root=root)
+        assert runs / "chat" / "20260901-100000-1-0" in plan.record_dirs()
+        before = _snapshot(root)
+        rc, text = _render(root, apply=True)
+        assert rc == 1
+        assert "_runs/chat/20260901-100000-1-0: live" in text
+        assert migrate.LIVE_REMEDY in text
+        assert _snapshot(root) == before
+
     def test_an_unreadable_sibling_in_a_folded_group_refuses(self, tmp_path, monkeypatch):
         root = tmp_path / "work"
         tree = pf.build_schema_plexus(root)

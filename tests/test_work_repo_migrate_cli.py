@@ -166,37 +166,73 @@ def test_apply_from_a_bare_shell_is_not_refused_by_the_uid_gate(
     assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
 
 
-def test_the_validator_runs_after_apply_and_its_exit_code_shows(
-    legacy_work, commits, monkeypatch, capsys
-):
+def _planted_validator(monkeypatch, paths):
+    """Swap the core's validator for one that reports a
+    `record.plain-session-slug` ERROR at each of *paths*; returns the call log."""
     from work_repo import migrate as migrate_module
 
-    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
-    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
-    capsys.readouterr()
     calls = []
 
-    def failing_validator(argv):
-        calls.append(argv)
-        print("ERROR  some.code  somewhere: planted")
-        return 1
+    def fake_validate(target, plexus_repo_url=None):
+        calls.append(target)
+        report = Report(Form.SCHEMA)
+        for path in paths:
+            report.add("record.plain-session-slug", path, "planted")
+        return report
 
     real_core_module = migrate_module.core_module
 
     def core_module(name):
-        if name == "cli":
-            return SimpleNamespace(main=failing_validator)
+        if name == "checks.runner":
+            return SimpleNamespace(validate=fake_validate)
         return real_core_module(name)
 
     monkeypatch.setattr(migrate_module, "core_module", core_module)
+    return calls
+
+
+def test_an_error_in_the_migrated_project_shows_in_the_exit_code(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    calls = _planted_validator(monkeypatch, [f"{NAME}/_runs/chat-."])
     rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
     out = capsys.readouterr().out
     assert rc == 1
-    assert calls == [["validate", str(legacy_work)]]
-    assert "planted" in out
+    assert calls == [str(legacy_work)]
+    assert "record.plain-session-slug" in out
     # The commit stands.
     assert len(commits) == 2
     assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def test_another_projects_errors_are_printed_but_not_counted(
+    legacy_work, commits, monkeypatch, capsys
+):
+    # Per-project rollout: a project still waiting its turn must not fail
+    # this project's migration.
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    _planted_validator(monkeypatch, ["q3-capacity/_runs/chat-.", f"{NAME}-other/_runs/chat-."])
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "q3-capacity/_runs/chat-." in out
+    assert "2 ERRORs outside what this run migrated" in out
+
+
+def test_the_real_validator_scopes_the_exit_code(tmp_path, capsys):
+    from work_repo import migrate as migrate_module
+
+    tree = pf.build_schema_plexus(tmp_path / "plexus")
+    pf.plant_plain_session_records(tree.project_dir)
+    project = tree.project_dir.relative_to(tree.root).as_posix()
+    assert migrate_module._validate_schema_tier(tree.root, [project]) == 1
+    assert migrate_module._validate_schema_tier(tree.root, ["elsewhere"]) == 0
+    assert "not counted in the exit code" in capsys.readouterr().out
 
 
 def test_after_compat_link_migration_the_validator_reports_info_only(

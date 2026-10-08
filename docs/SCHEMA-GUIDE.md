@@ -244,8 +244,10 @@ into the bare taskdef group: `_runs/<taskdef>/<session-id>[--<name>]`, with
 only its `slug:` scalar rewritten and every other byte identical; its `_specs/`
 entries are re-registered under the record's new label, dates kept. A record
 re-slugged on purpose (anything carrying `reslugged_from`, the release record)
-is never touched. A destination session dir that already exists is reported
-and skipped, never overwritten — merge the two by hand. The fold is refused
+is never touched. A destination session dir that already exists is never
+overwritten: in a schema-form `_runs/` the record is reported and skipped;
+while a legacy `runs/` dir is still being nested, it is a blocker that refuses
+the whole migration. Merge the two by hand, then re-run. The fold is refused
 while any session in the group is live (no final `session_end`, or an
 unreadable record): finish or sign out that session, or for a stale record
 that never signed out run `work housekeep --archive-stale`. The same predicate
@@ -269,8 +271,9 @@ work migrate --instance --apply
 ```
 
 After an applied `work migrate`, the validator runs at the schema tier and its
-result is printed; a non-zero validator exit shows in the command's exit code,
-but the commit stands.
+whole report is printed; only ERRORs under what this run migrated make the
+exit code non-zero (other projects awaiting their turn are reported, not
+counted), and the commit stands either way.
 
 **5. Validate, then start a session against the migrated tree.**
 
@@ -318,9 +321,9 @@ its own; the root block is yours to re-render, and commit the same way, when
 - `{host}/{project}/{task_type}/{target}/` — recognised legacy and a read-side
   fallback; informational, not required to move. (`runs/archive/` is not in
   this list: `work migrate` relocates it to `_archive/_runs/`.)
-- Instance `agent-files/`, `mirrors/`, `taskdef/` — dual-read, so
-  `work migrate --instance` can move them whenever you like once #370 is
-  deployed fleet-wide.
+- Instance `agent-files/` and `taskdef/` — dual-read — and `mirrors/` — an
+  opaque operator directory no runtime reads — so `work migrate --instance`
+  can move them whenever you like once #370 is deployed fleet-wide.
 - `<project>/README.md` text outside the markers is yours; the block is
   regenerated; edit the hand text in a separate clone while sessions push.
 

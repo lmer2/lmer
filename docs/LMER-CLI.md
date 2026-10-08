@@ -1567,8 +1567,11 @@ default** and print the full plan; `--apply` performs it in ONE commit. Exit
 codes: `0` success (or a dry run); `1` a refusal before anything changed, or a
 failed push after the commit was made locally (the message says which); `2` a
 usage error. After a successful `work migrate --apply` the schema-tier
-validator runs and its exit code becomes the command's (the commit stands
-regardless); `work adopt` does not run the validator.
+validator runs over the whole tree and prints its full report, but only
+ERRORs under the paths this run migrated (the project dir, or the instance
+surfaces and `_plexus.yaml`) make the exit code `1` — another project still
+awaiting its turn does not fail this one. The commit stands regardless;
+`work adopt` does not run the validator.
 
 **`work adopt <host>/<project> <shortname> [--apply] [--compat-link]
 [--description TEXT] [--remote URL]... [--force]`** names a host bucket and
@@ -1589,8 +1592,10 @@ and `_plans/` entries in place (keeping their dates), and folds the pre-A1
 plain-session groups (`chat-.`, `chat-<repo>`, `chat-<repo>.git`) into the
 bare taskdef group — only the `slug:` scalar is rewritten, and a folded
 record's `_specs/` entries are re-registered under its new label with their
-dates kept. A fold destination that already exists is reported and skipped,
-never overwritten. It is idempotent: a re-run is a no-op. The migration
+dates kept. A fold destination that already exists is never overwritten: in a
+schema-form `_runs/` it is reported and that record skipped; while a legacy
+`runs/` dir is still being nested, it is a blocker that refuses the whole
+migration. It is idempotent: a re-run is a no-op. The migration
 refuses while any record it would move is live: finish or sign out that
 session, or for a stale record that never signed out run `work housekeep
 --archive-stale`. `--compat-link` leaves a relative symlink at each old bare

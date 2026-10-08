@@ -188,6 +188,37 @@ AREA_RENAMES = (
     ("taskdef", "_taskdef"),
 )
 
+#: The instance surfaces and their schema twins (SCHEMA.md Appendix A).
+INSTANCE_RENAMES = (
+    ("agent-files/claude", "_agents/claude"),
+    ("mirrors", "_agents/mirrors"),
+    ("taskdef", "_taskdef"),
+)
+
+INSTANCE_SOURCES = "sources.yaml"
+
+#: The instance surface `--instance` deliberately leaves where it is: in
+#: subdir mode the runtime writes notes to `{work_repo}/napkin`
+#: (`lmer_cli.cli._resolve_napkin_path`) and nothing reads `_napkin/` yet, so
+#: moving it would split the notes (SCHEMA-GUIDE §2).
+INSTANCE_KEPT = (
+    ("napkin", "left in place: no lmer release reads `_napkin/` yet (subdir mode "
+               "writes `{work_repo}/napkin`), so moving it would split the notes"),
+)
+
+#: The rollout rule both the floor refusal and the dry run state: removing
+#: `sources.yaml` switches declared sources off on any host whose release
+#: does not read the manifest tier, and this install's probe proves nothing
+#: about the other hosts.
+INSTANCE_FLOOR = (
+    "version floor: the first lmer release carrying #370 (reads the manifest "
+    "`sources:` tier); deploy #370 fleet-wide before applying the instance fold"
+)
+
+#: A single directory name a taskdef group may take: no separators, no
+#: `.`/`..`, no `--` (the session-dir label separator).
+_SAFE_GROUP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 LEGACY_RUNS = "runs"
 SCHEMA_RUNS = "_runs"
 SCHEMA_SPECS = "_specs"
@@ -405,6 +436,14 @@ class Plan:
             for move in self.moves
             if move.kind in (RECORD, ARCHIVE)
         ]
+        # A slug-only rewrite (an interrupted fold) writes a record that does
+        # not move: it must be stopped too. A rewrite after a move targets a
+        # dir that does not exist yet; its source is already listed above.
+        dirs.extend(
+            (self.project_dir / move.src).parent
+            for move in self.moves
+            if move.kind == SLUG and (self.project_dir / move.src).parent.is_dir()
+        )
         for group_rel in self.emptied_groups:
             group = self.project_dir / group_rel
             if not group.is_dir() or group.is_symlink():
@@ -1229,33 +1268,6 @@ def _dirty_paths(root: Path, rels: list) -> list:
 # The instance form (`work migrate --instance`, #368, spec §10 rollout E→B)
 # ---------------------------------------------------------------------------
 
-#: The instance surfaces and their schema twins (SCHEMA.md Appendix A).
-INSTANCE_RENAMES = (
-    ("agent-files/claude", "_agents/claude"),
-    ("mirrors", "_agents/mirrors"),
-    ("taskdef", "_taskdef"),
-)
-
-INSTANCE_SOURCES = "sources.yaml"
-
-#: The instance surface `--instance` deliberately leaves where it is: in
-#: subdir mode the runtime writes notes to `{work_repo}/napkin`
-#: (`lmer_cli.cli._resolve_napkin_path`) and nothing reads `_napkin/` yet, so
-#: moving it would split the notes (SCHEMA-GUIDE §2).
-INSTANCE_KEPT = (
-    ("napkin", "left in place: no lmer release reads `_napkin/` yet (subdir mode "
-               "writes `{work_repo}/napkin`), so moving it would split the notes"),
-)
-
-#: The rollout rule both the floor refusal and the dry run state: removing
-#: `sources.yaml` switches declared sources off on any host whose release
-#: does not read the manifest tier, and this install's probe proves nothing
-#: about the other hosts.
-INSTANCE_FLOOR = (
-    "version floor: the first lmer release carrying #370 (reads the manifest "
-    "`sources:` tier); deploy #370 fleet-wide before applying the instance fold"
-)
-
 
 @dataclass(frozen=True)
 class InstancePlan:
@@ -1764,11 +1776,6 @@ def _slug_rewritten(text: str, new_slug: str) -> str:
     return after
 
 
-#: A single directory name a taskdef group may take: no separators, no
-#: `.`/`..`, no `--` (the session-dir label separator).
-_SAFE_GROUP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-
-
 def _is_safe_group(name) -> bool:
     return (
         isinstance(name, str)
@@ -1893,18 +1900,57 @@ def migrate_project(
         return 1
 
 
-def _validate_schema_tier(root: Path) -> int:
-    """Run the validator at the schema tier and print its fix-list, after an
-    applied migration. A non-zero validator exit shows in the exit code, but
-    the commit already stands (the operator asked for it; git history holds
-    the previous state). Fail-soft when the core is unavailable: the migration
-    itself already required it."""
+def _validate_schema_tier(root: Path, scope: Iterable[str]) -> int:
+    """Run the validator at the schema tier after an applied migration and
+    print its whole report; the exit code counts only the ERRORs under
+    *scope* (work-repo-relative paths this run touched), so one project's
+    migration is not failed by another project still waiting its turn
+    (SCHEMA-GUIDE §3: migrate project by project). An unusable tree still
+    fails. The commit stands either way. Fail-soft when the core is
+    unavailable: the migration itself already required it."""
     try:
         schema_cli = core_module("cli")
+        validate = core_module("checks.runner").validate
+        findings_api = core_module("checks.findings")
     except CoreUnavailableError as exc:  # pragma: no cover - the apply imported the core
         print(f"\u26a0\ufe0f  validator unavailable: {exc}", file=sys.stderr)
         return 0
-    return schema_cli.main(["validate", str(root)])
+    # The CLI's own rule: the work repo's URL arms the manifest's same-host
+    # `sources:` guard (the tree being migrated IS the configured work repo).
+    url = next((os.environ[v] for v in schema_cli.PLEXUS_URL_ENV if os.environ.get(v)), None)
+    report = validate(str(root), plexus_repo_url=url)
+    for line in schema_cli.render_text(report, str(root)):
+        print(line)
+    if report.exit_code == findings_api.EXIT_UNUSABLE:
+        return report.exit_code
+    scope = tuple(scope)
+    outside = 0
+    for finding in report.findings:
+        if finding.severity is not findings_api.Severity.ERROR:
+            continue
+        if any(finding.path == rel or finding.path.startswith(rel + "/") for rel in scope):
+            return findings_api.EXIT_ERRORS
+        outside += 1
+    if outside:
+        print(
+            f"\u2139\ufe0f  {_count(outside, 'ERROR')} outside what this run migrated "
+            "(another project or surface); not counted in the exit code"
+        )
+    return findings_api.EXIT_CLEAN
+
+
+def _validation_scope(root: Path, project: Optional[str], instance: bool) -> list:
+    """The work-repo-relative paths an applied run touched: the project dir
+    (plus the instance memory scope a memory lift writes into), or the
+    instance surfaces with the manifest and the folded-away file."""
+    if instance:
+        rels = [MANIFEST_NAME, INSTANCE_SOURCES]
+        rels.extend(dst for _src, dst in INSTANCE_RENAMES)
+        return rels
+    try:
+        return [_resolve_project_dir(root, project).relative_to(root).as_posix(), INSTANCE_MEMORY]
+    except (MigrateError, ValueError):
+        return [project, INSTANCE_MEMORY]
 
 
 def cmd_migrate(args) -> int:
@@ -1937,7 +1983,8 @@ def cmd_migrate(args) -> int:
         )
         return 2
     if rc == 0 and apply:
-        rc = _validate_schema_tier(work_repo_root())
+        root = work_repo_root()
+        rc = _validate_schema_tier(root, _validation_scope(root, project, instance))
     return rc
 
 
