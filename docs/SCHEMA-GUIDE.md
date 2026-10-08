@@ -80,7 +80,7 @@ renaming them makes them silently invisible.
 
 | path | written by | read by | dual-read | exercised by |
 |---|---|---|---|---|
-| `_plexus.yaml` | you, by hand (no `work adopt` ships yet) | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
+| `_plexus.yaml` | you, by hand, or `work adopt` | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
 | `<short-name>/` | your `git mv`; a session on first write | registry resolution | n/a | `work sessions` |
 | `_knowledge/` | humans and agents | humans and agents | n/a | nothing ships at schema 1 |
 | `_napkin/` | humans and agents | **nothing in this release — see below** | no | — |
@@ -154,6 +154,7 @@ command upgrades an already adopted schema-1 tree to schema 2 (§4); it does
 not move legacy directories. The form each tree takes is described in
 SCHEMA.md's [Legacy form](./SCHEMA.md#legacy-form) section and
 [Appendix A](./SCHEMA.md#appendix-a-legacy-mapping-informative).
+
 ### Prerequisites
 
 - An lmer release that supports the manifest version. Check
@@ -170,12 +171,14 @@ SCHEMA.md's [Legacy form](./SCHEMA.md#legacy-form) section and
 ### Dry run on a scratch clone — do this first, every time
 
 ```bash
-git clone "$LMER_WORK_REPO_PATH" /tmp/work-scratch
-git -C /tmp/work-scratch remote remove origin   # a stray push is unrecoverable
+# A local bare remote: every `--apply` pushes its one commit there, and a
+# stray push can never reach the real work repo.
+git clone --bare "$LMER_WORK_REPO_PATH" /tmp/work-scratch-remote.git
+git clone /tmp/work-scratch-remote.git /tmp/work-scratch
 PYTHONPATH=src python -m lmer_schema.cli validate /tmp/work-scratch
 ```
 
-Record the baseline counts. Everything below is measured as a delta from them.
+Keep that baseline validator output; compare each step's findings with it.
 Run the project steps inside a subshell whose work context points only at the
 scratch clone (replace the example identity with the project being migrated):
 
@@ -201,11 +204,9 @@ When using a source checkout instead of installed executables, give
 
 ### The steps, in order, for one project
 
-Each step is followed by what the validator said on one example: a scratch
-clone of one real work repo as of 2026-09-12 (371 run dirs, 194 memory files).
-Every number below — counts, run dirs, index entries — is from that snapshot
-and will differ on your tree; watch the deltas and the finding codes, not the
-absolute values. Counts are `errors / warnings / informational`.
+Every `--apply` lands ONE commit and pushes it; a failed push exits `1` with
+the commit already made locally. Re-run `lmer-schema validate` after each
+step and compare the finding codes with the baseline.
 
 **1. Adopt the bucket.** `work adopt` resolves `<host>/<project>`, checks the
 shortname, the registry and the schema-tier fix list, bootstraps `_plexus.yaml`
@@ -213,7 +214,8 @@ if the tree has none (one loud notice: that file flips the WHOLE tree to schema
 form), writes the registry entry through the writer, and `git mv`s the directory
 to `<short-name>/` in ONE commit. Dry run by default; `--compat-link` leaves a
 relative symlink at the old path (INFO), `--remote URL` adds a remote, and
-`--force` carries schema-tier ERRORs.
+`--force` adopts despite schema-tier ERRORs, carrying them into the new
+directory as they are.
 
 ```bash
 work adopt git.example.test/group/project example          # dry run
@@ -225,7 +227,8 @@ renames (`runs/` → `_runs/`, `specs/` → `_specs/`, `plans/` → `_plans/`,
 `info/` → `_info/`, `taskdef/` → `_taskdef/`), nests each legacy run dir under
 its first session id, lifts non-`project` memories to the instance scope,
 re-points the `_specs/`/`_plans/` entries in place (keeping their registration
-dates), folds the pre-A1 plain-session groups (step 3), and lands ONE commit.
+dates), folds the pre-A1 plain-session groups (step 3), and lands ONE commit,
+which also regenerates the project README's index block.
 Dry run by default and idempotent: a re-run is a no-op. `--compat-link` leaves
 a relative symlink at each old bare path. A legacy tree gets the nesting and
 the fold in one move.
@@ -238,17 +241,22 @@ work migrate example --apply    # one commit
 **3. The fold.** A record whose slug is the obsolete derivation of its own
 target — `chat-.`, `chat-<repo>`, `chat-<repo>.git`, `masterplan-.` — moves
 into the bare taskdef group: `_runs/<taskdef>/<session-id>[--<name>]`, with
-only its `slug:` scalar rewritten and every other byte identical. A record
+only its `slug:` scalar rewritten and every other byte identical; its `_specs/`
+entries are re-registered under the record's new label, dates kept. A record
 re-slugged on purpose (anything carrying `reslugged_from`, the release record)
-is never touched. The fold is refused while any session in the group is live
-(no final `session_end`, or an unreadable record): finish or sign out that
-session first. The same predicate is the validator's `record.plain-session-slug`
-ERROR and the `lmer-schema migrate` blocker. A platform row tracked under an old
-slug stops resolving and is forgotten by hand: `lmer platform forget <key>`.
+is never touched. A destination session dir that already exists is reported
+and skipped, never overwritten — merge the two by hand. The fold is refused
+while any session in the group is live (no final `session_end`, or an
+unreadable record): finish or sign out that session, or for a stale record
+that never signed out run `work housekeep --archive-stale`. The same predicate
+is the validator's `record.plain-session-slug` ERROR and the `lmer-schema
+migrate` blocker. A platform row tracked under an old slug stops resolving and
+is forgotten by hand: `lmer platform forget <host>/<project>/<old-slug>`.
 
 **4. The instance surfaces.** `work migrate --instance` moves
 `agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
-`napkin/` → `_napkin/` and `taskdef/` → `_taskdef/`, and folds a standalone
+and `taskdef/` → `_taskdef/` — it leaves `napkin/` in place (see *What to
+leave alone*) — and folds a standalone
 `sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
 file in the same commit. It REFUSES unless the running release reads the
 manifest `sources:` tier: deploy the release carrying #370 on every host first,
@@ -276,11 +284,11 @@ LMER_WORK_REPO_PATH=/tmp/work-scratch LMER_REPO_URL=https://<host>/<group>/<repo
 The record must land at
 `<short-name>/_runs/develop-issue-999/20260912-160000-9-4242/` holding
 `state.yaml` and `events.jsonl`. Confirm the old history came through:
-`work sessions` counted 371 records before this launch and 372 after, session
-ids and all.
+`work sessions` lists one more record after this launch than before, with the
+migrated records' session ids unchanged.
 
-**6. Roll back.** On a scratch clone, `git reset --hard HEAD && git clean -fd`
-returns the tree to the baseline counts exactly (`3 / 5 / 220` here). On the
+**6. Roll back.** On a scratch clone, `git reset --hard <baseline commit> &&
+git clean -fd` returns the tree to the baseline validator output exactly. On the
 real repo **do not use `git clean`** — it deletes untracked run state other
 sessions have written. Branch-switching the live checkout is not safe either:
 other sessions `work commit` into it. With a local migration branch that has no
@@ -305,11 +313,14 @@ its own; the root block is yours to re-render, and commit the same way, when
 
 ### What to leave alone
 
-- `napkin/` — no reader for `_napkin/` in this release (§2).
-- `runs/archive/` and `{host}/{project}/{task_type}/{target}/` — recognised
-  legacy and read-side fallback; both informational, neither required to move.
-- Instance `agent-files/`, `mirrors/`, `taskdef/` — dual-read, so they migrate
-  independently and whenever you like.
+- `napkin/` — no reader for `_napkin/` in this release (§2); `work migrate
+  --instance` leaves it in place and says so.
+- `{host}/{project}/{task_type}/{target}/` — recognised legacy and a read-side
+  fallback; informational, not required to move. (`runs/archive/` is not in
+  this list: `work migrate` relocates it to `_archive/_runs/`.)
+- Instance `agent-files/`, `mirrors/`, `taskdef/` — dual-read, so
+  `work migrate --instance` can move them whenever you like once #370 is
+  deployed fleet-wide.
 - `<project>/README.md` text outside the markers is yours; the block is
   regenerated; edit the hand text in a separate clone while sessions push.
 

@@ -1,8 +1,8 @@
 added:
-- "`work adopt <host>/<project> <shortname>` names a host-bucket tree and registers it in one commit, dry-run by default; `--compat-link` leaves a relative symlink at the old path"
-- "`work migrate <project>` moves a registered project's bare areas to their schema names, nests legacy run dirs under their first session id, lifts non-`project` memories to the instance scope, re-points the `_specs/`/`_plans/` entries in place, and folds pre-A1 plain-session groups (`chat-.`, `chat-<repo>.git`) by rewriting only their `slug:` scalar"
-- "`work migrate --instance` moves the instance surfaces and folds a standalone `sources.yaml` into `_plexus.yaml sources:`; it refuses unless the running release reads the manifest sources tier (#370)"
-- "validator check `record.plain-session-slug` (ERROR) and the matching `lmer-schema migrate` blocker name `work migrate <project>` for a record whose slug is the obsolete derivation of its own target"
-- "the registry writer rewrites `_plexus.yaml` with comments, blank lines and quoting preserved, canonical remotes and invariants checked before disk; `work adopt` and `work migrate` are its consumers"
+- "`work adopt <host>/<project> <shortname>` registers a host-bucket tree and moves it to its short name in one commit, dry-run by default"
+- "`work migrate <project>` moves a registered project's legacy areas to schema form in one commit, folding pre-A1 plain-session records (`chat-.`) into their taskdef group"
+- "`work migrate --instance` moves the instance surfaces and folds `sources.yaml` into `_plexus.yaml`; it refuses until the #370 release runs fleet-wide"
+- "Validator check `record.plain-session-slug` and a matching `lmer-schema migrate` blocker name `work migrate <project>` for obsolete plain-session slugs"
+- "The `_plexus.yaml` registry writer preserves comments and quoting and checks registry invariants before writing"
 changed:
-- "the positional legacy task tree prune (#379) keeps the legacy `{task_type}/{target}/` directories out of the schema-form run-area walk"
+- "The validator's legacy task-tree prune (#379) keeps legacy `{task_type}/{target}/` directories out of the schema-form run-area walk"

@@ -37,7 +37,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import adopt, goals, migrate, plan_index, release_run, run_state, specs_index, write_journal
+from . import goals, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
@@ -4585,8 +4585,10 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         specs_rel = specs_index.specs_rel_path()
         return [specs_rel] if specs_rel else []
     if command == "adopt":
+        from . import adopt
         return adopt.write_rel_paths(args)
     if command == "migrate":
+        from . import migrate
         return migrate.write_rel_paths(args)
     if command == "seed":
         try:
@@ -4773,8 +4775,10 @@ def _dispatch(args, parser) -> int:
     elif args.command == "specs-index":
         return cmd_specs_index(args.rebuild)
     elif args.command == "adopt":
+        from . import adopt
         return adopt.cmd_adopt(args)
     elif args.command == "migrate":
+        from . import migrate
         return migrate.cmd_migrate(args)
     elif args.command == "seed":
         return cmd_seed(args)

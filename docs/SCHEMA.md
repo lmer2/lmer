@@ -1068,12 +1068,13 @@ path is a `legacy`-tier row there, or a host bucket.
 | `{host}/{project}/` | `<short-name>/` | by registry entry; the old path survives only as a host bucket for unnamed work or as a compatibility symlink |
 | `{host}/{project}/runs/<slug>/` | `<project>/_runs/<slug>/<session-id>/` | a legacy run dir maps to its first session's id; the shared dir becomes one session dir |
 | `{host}/{project}/runs/<slug>--<name>/` | `<project>/_runs/<slug>/<session-id>--<name>/` | the name suffix moves onto the session dir |
+| `{host}/{project}/runs/chat-./`, `runs/chat-<repo>[.git]/` (a pre-A1 plain-session spelling) | `<project>/_runs/chat/<session-id>/` | the fold: the record joins its bare taskdef group with only `slug:` rewritten; `_runs/chat-./<session-id>/` in a schema-form tree folds the same way (`record.plain-session-slug`) |
 | `{host}/{project}/runs/.new-<session>-*/` | `<project>/_runs/.new-<session-id>-*/` | the seed directory, same lifecycle |
 | `runs/<slug>/{state.yaml,events.jsonl,ledger.yaml,release.yaml,log.yaml,plan.index.json,goals.md,reports/}` | `<session-dir>/` same names | shapes and writers unchanged; location only |
 | `runs/<slug>/masterplan/<mp-slug>/` | `<session-dir>/masterplan/` | the bundle de-nests: one bundle per session dir |
 | `runs/<slug>/<artifact>.md -> masterplan/<mp-slug>/<artifact>.md` | `<session-dir>/<artifact>.md -> masterplan/<artifact>.md` | the same well-known artifact links, targets one level shallower; the multi-bundle `<mp-slug>-<name>` prefix retires |
 | `{host}/{project}/runs/archive/<slug>/` | `<project>/_archive/_runs/<slug>/<session-id>/` | one archive home; legacy `runs/archive/` stays recognised in legacy trees |
-| `{host}/{project}/specs/YYYY-MM-DD-<runlabel>--<basename>.md` | `<project>/_specs/YYYY-MM-DD-<runlabel>--<basename>.md` | same symlink mechanics and the same entry grammar; targets re-pointed at `../_runs/<slug>/<session-dir>/…`, and `<runlabel>` gains its `-<session-id>` half because the one legacy run dir becomes one record per launch |
+| `{host}/{project}/specs/YYYY-MM-DD-<runlabel>--<basename>.md` | `<project>/_specs/YYYY-MM-DD-<runlabel>--<basename>.md` | same symlink mechanics and the same entry grammar; `work migrate` re-points each target in place at `../_runs/<slug>/<session-dir>/…` and keeps the entry's name and date (a legacy run dir is one record, so a migrated entry collides with nothing); entries registered after the migration carry the `-<session-id>` half of `<runlabel>` |
 | `{host}/{project}/info/` | `<project>/_info/` | unchanged contents |
 | `{host}/{project}/info/gate-check.yaml` | `<project>/_info/gate-check.yaml` | same shape, same consumer |
 | `{host}/{project}/memory/` | `<project>/_agents/memory/` and `_agents/memory/` | split by `metadata.type`: `project` stays, every other type lifts to instance scope |

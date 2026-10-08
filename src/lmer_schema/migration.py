@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 
 from .manifest import MANIFEST_NAME, ManifestError, load_manifest
-from .registry import RegistryError, build_registry, resolve_project_dir
+from .registry import RegistryError, build_registry, is_host_bucket_name, resolve_project_dir
 
 
 def _identity_blockers(root: Path, registry) -> list[str]:
@@ -34,11 +34,9 @@ def _identity_blockers(root: Path, registry) -> list[str]:
 
 
 def _is_bucket_area(root: Path, area: Path) -> bool:
-    """Whether a run area sits inside a host bucket (a dotted top-level
-    directory). A bucket never blocks (D9), so neither the blocker nor the
-    validator check fires there."""
-    first = area.relative_to(root).parts[0] if area != root else ""
-    return "." in first and not first.startswith((".", "_"))
+    """Whether a run area sits inside a host bucket. A bucket never blocks
+    (D9), so neither the blocker nor the validator check fires there."""
+    return area != root and is_host_bucket_name(area.relative_to(root).parts[0])
 
 
 def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
@@ -59,9 +57,9 @@ def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
     blockers = []
     moves = []
     seen = set()
+    folded = set()
     for area, _layout in iter_run_areas(root):
         bucket = _is_bucket_area(root, area)
-        area_rel = area.relative_to(root).as_posix()
         for record in run_state.iter_record_dirs(area):
             relative = record.relative_to(root).as_posix()
             try:
@@ -83,18 +81,25 @@ def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
                 if state.get("status") == "in-progress" and not session_record.signed_out(events):
                     blockers.append(f"{relative}: no recorded sign-out; resolve the prior session first")
                 if not bucket and is_legacy_plain_session_slug(state):
-                    slug, taskdef = state.get("slug"), state.get("taskdef")
-                    blockers.append(
-                        f"{relative}: " + plain_session_move_text(
-                            slug, taskdef, area=area.name
+                    # One blocker and one move per GROUP, named by where it
+                    # sits on disk: a legacy record dir is its own group.
+                    group = record if record.parent == area else record.parent
+                    if group not in folded:
+                        folded.add(group)
+                        slug, taskdef = state.get("slug"), state.get("taskdef")
+                        group_rel = group.relative_to(root).as_posix()
+                        blockers.append(
+                            f"{group_rel}: " + plain_session_move_text(
+                                slug, taskdef, area=area.name, group=group.name
+                            )
                         )
-                    )
-                    moves.append({
-                        "from": f"{area_rel}/{slug}",
-                        "to": f"{area_rel.rsplit('/', 1)[0]}/_runs/{taskdef}"
-                              if "/" in area_rel else f"_runs/{taskdef}",
-                        "slug": f"{slug} \u2192 {taskdef}",
-                    })
+                        project_rel = area.parent.relative_to(root).as_posix()
+                        moves.append({
+                            "from": group_rel,
+                            "to": f"_runs/{taskdef}" if project_rel == "."
+                                  else f"{project_rel}/_runs/{taskdef}",
+                            "slug": f"{slug} \u2192 {taskdef}",
+                        })
             except yaml.YAMLError:
                 # Parser messages include source lines, which can contain
                 # credentials in historical records.

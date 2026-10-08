@@ -151,8 +151,75 @@ def test_apply_from_a_bare_shell_is_not_refused_by_the_uid_gate(
 ):
     monkeypatch.delenv("LMER_SESSION_ID", raising=False)
     assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    # The gate only engages on a schema-2 tree; `adopt` bootstraps schema 1.
+    manifest = legacy_work / "_plexus.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("schema: 1", "schema: 2", 1),
+        encoding="utf-8",
+    )
+    _git(legacy_work, "commit", "-q", "-am", "cut over to schema 2")
     capsys.readouterr()
     rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
     captured = capsys.readouterr()
     assert "Session write refused" not in captured.err
     assert rc == 0, captured.out + captured.err
+    assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def test_the_validator_runs_after_apply_and_its_exit_code_shows(
+    legacy_work, commits, monkeypatch, capsys
+):
+    from work_repo import migrate as migrate_module
+
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    calls = []
+
+    def failing_validator(argv):
+        calls.append(argv)
+        print("ERROR  some.code  somewhere: planted")
+        return 1
+
+    real_core_module = migrate_module.core_module
+
+    def core_module(name):
+        if name == "cli":
+            return SimpleNamespace(main=failing_validator)
+        return real_core_module(name)
+
+    monkeypatch.setattr(migrate_module, "core_module", core_module)
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert calls == [["validate", str(legacy_work)]]
+    assert "planted" in out
+    # The commit stands.
+    assert len(commits) == 2
+    assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def test_after_compat_link_migration_the_validator_reports_info_only(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    assert _run_cli(monkeypatch, ["migrate", NAME, "--apply", "--compat-link"]) == 0
+    capsys.readouterr()
+    report = validate(legacy_work)
+    assert report.form is Form.SCHEMA
+    assert not [f for f in report.findings if f.severity is Severity.ERROR]
+    # Whatever stays above INFO is instance-level and is not the project
+    # migration's to repair: the schema-2 cutover and the `--instance` fold.
+    above_info = {f.code for f in report.findings if f.severity is not Severity.INFO}
+    assert above_info <= {"manifest.schema-older", "manifest.sources-legacy-file"}
+    project_findings = [
+        f for f in report.findings if f.path.split("/", 1)[0] in (NAME, *BUCKET.split("/")[:1])
+    ]
+    assert project_findings and all(f.severity is Severity.INFO for f in project_findings)
+
+
+def test_compat_link_is_refused_with_instance(monkeypatch, capsys, legacy_work):
+    rc = _run_cli(monkeypatch, ["migrate", "--instance", "--compat-link"])
+    assert rc == 2
+    assert "project form only" in capsys.readouterr().err

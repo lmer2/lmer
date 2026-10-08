@@ -199,7 +199,7 @@ import yaml
 
 from lmer_schema.checks.findings import Report, Severity, Tier, register
 from lmer_schema.checks import symlinks
-from lmer_schema.registry import PROJECT_MARKERS, is_project_shaped
+from lmer_schema.registry import PROJECT_MARKERS, is_host_bucket_name, is_project_shaped
 
 __all__ = [
     "EVENTS_FILE",
@@ -595,18 +595,25 @@ def _is_legacy_target(path: Path) -> bool:
     return any((path / marker).exists() for marker in LEGACY_TARGET_MARKERS)
 
 
-def plain_session_move_text(slug, taskdef, *, area=RUNS_DIR) -> str:
+def plain_session_move_text(slug, taskdef, *, area=RUNS_DIR, group=None) -> str:
     """The §7 move text for a plain-session leftover, shared verbatim.
 
     The validator check and the ``lmer-schema migrate`` blocker both carry
     this one string (B.port-check/B.port-blocker), so the finding and the
     refusal cannot drift on what to do or how. It names the move and the
-    ONE command that repairs it.
+    ONE command that repairs it. *group* is the directory's on-disk name
+    (default *slug*); in a legacy ``runs/`` area that directory IS the
+    record, so it moves whole under a session id rather than per ``<uid>``.
     """
+    group = slug if group is None else group
+    if area == LEGACY_RUNS_DIR:
+        move = f"`{area}/{group}/ \u2192 {RUNS_DIR}/{taskdef}/<session-id>/`"
+    else:
+        move = f"`{area}/{group}/<uid> \u2192 {RUNS_DIR}/{taskdef}/<uid>`"
     return (
-        f"`{area}/{slug}/` is a pre-A1 plain-session leftover: its `slug:` is "
+        f"`{area}/{group}/` is a pre-A1 plain-session leftover: its `slug:` is "
         f"the obsolete derivation of its own target. Fold it into the bare "
-        f"taskdef group (`{area}/{slug}/<uid> \u2192 {RUNS_DIR}/{taskdef}/<uid>`, "
+        f"taskdef group ({move}, "
         f"`slug: {slug} \u2192 {taskdef}`) with `work migrate <project>`."
     )
 
@@ -764,9 +771,8 @@ def _check_plain_session_group(root, group, report, *, area) -> None:
     legacy TREE is never walked here (`plain_session` is off without a
     manifest).
     """
-    first = _rel(root, group).split("/", 1)[0]
-    if "." in first and not first.startswith((".", "_")):
-        return  # a host bucket; D9: a bucket never blocks
+    if is_host_bucket_name(_rel(root, group).split("/", 1)[0]):
+        return  # D9: a bucket never blocks
     from work_repo.run_state import is_legacy_plain_session_slug
 
     candidates = []
@@ -782,7 +788,9 @@ def _check_plain_session_group(root, group, report, *, area) -> None:
             report.add(
                 "record.plain-session-slug",
                 _rel(root, group),
-                plain_session_move_text(data.get("slug"), data.get("taskdef"), area=area),
+                plain_session_move_text(
+                    data.get("slug"), data.get("taskdef"), area=area, group=group.name
+                ),
             )
             return
 

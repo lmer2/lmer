@@ -46,6 +46,25 @@ def test_legacy_derivation_table():
     # Empty target / 'default' derive the bare taskdef.
     assert legacy_derive_slug("release", "") == "release"
     assert legacy_derive_slug("release", None) == "release"
+    assert legacy_derive_slug("chat", "a" * 40) == "chat-aaaaaaaaaaaa"
+
+
+@pytest.mark.parametrize("state", [
+    {"taskdef": "chat", "target": "https://matrix.to/#/!r:example.org/$e"},
+    {"taskdef": "chat", "target": "https://x.slack.com/archives/C12345678/p1700000000123456"},
+    {"taskdef": "chat", "target": "https://h/acme/widgets/-/issues/12"},
+    {"taskdef": "chat", "target": "feature/login"},
+    {"taskdef": "chat", "target": "abc1234"},
+    {"taskdef": "chat", "target": "a" * 40},
+])
+def test_work_item_rows_are_refused_for_the_target_not_the_spelling(state):
+    # Each work-item NON_MATCHES row carries its own legacy spelling, so the
+    # refusal comes from the work-item exclusion, never a slug mismatch.
+    assert any(
+        row.get("slug") == legacy_derive_slug(state["taskdef"], state["target"])
+        and row.get("target") == state["target"]
+        for row in NON_MATCHES
+    )
 
 
 def _state(**overrides):
@@ -77,13 +96,17 @@ NON_MATCHES = [
     # Slack and Matrix permalinks are `special` work items.
     {"taskdef": "chat", "target": "https://x.slack.com/archives/C12345678/p1700000000123456",
      "slug": "chat-p1700000000123456"},
-    {"taskdef": "chat", "target": "https://matrix.to/#/!r:example.org/$e", "slug": "chat-e"},
+    {"taskdef": "chat", "target": "https://matrix.to/#/!r:example.org/$e", "slug": "chat-$e"},
+    # A full SHA: the legacy derivation truncates it to 12 hex.
+    {"taskdef": "chat", "target": "a" * 40, "slug": "chat-aaaaaaaaaaaa"},
     # A slug equal to the taskdef is not a plain-session spelling.
     {"taskdef": "chat", "target": ".", "slug": "chat"},
     # Missing keys and wrong types never match (review S9).
     {},
     {"taskdef": "chat"},
     {"slug": "chat-."},
+    {"taskdef": "chat", "target": "."},
+    {"target": ".", "slug": "chat-."},
     {"taskdef": "", "target": ".", "slug": "-."},
     {"taskdef": "chat", "target": ".", "slug": ""},
     {"taskdef": 1, "target": ".", "slug": "chat-."},

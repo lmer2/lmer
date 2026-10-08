@@ -122,22 +122,6 @@ Manifest ``sources.knowledge`` / ``sources.plans`` are declared but not
 mounted by this release (no clone, no env var, no runner wiring): warned
 about by name and left out of the result.
 
-Version floor (``MANIFEST_TIER_SUPPORTED``)
-===========================================
-``MANIFEST_TIER_SUPPORTED = True`` is the ONE importable capability marker
-``work migrate --instance`` checks before it folds a standalone
-``sources.yaml`` into the manifest. What it asserts: THIS lmer's container
-start, ``--show-env`` and doctor read the manifest ``sources:`` tier with
-env > manifest > legacy precedence. Who reads it: ``work migrate
---instance`` refuses when the marker is absent or false — absent means a
-pre-#370 release, and removing ``sources.yaml`` would silently switch a
-declared source off on that host. What it cannot prove: it covers only the
-install running ``work migrate``, while every host that launches against
-the work repo must run a release carrying it. Hence the fleet-wide order —
-deploy the manifest-tier release on every host before applying the
-instance fold. It is true only once the loader, the container seam and
-doctor all read the tier.
-
 PyYAML guard (spec N5)
 ======================
 ``import yaml`` is guarded so this module imports cleanly when PyYAML is
@@ -310,13 +294,6 @@ SOURCE_TIERS = (TIER_MANIFEST, TIER_LEGACY)
 # declared_origin_label, never by hand.
 ORIGIN_DECLARED = "declared"
 TIER_LABELS = {TIER_MANIFEST: "manifest", TIER_LEGACY: SOURCES_FILENAME}
-
-# The version floor `work migrate --instance` checks before it removes a
-# standalone sources.yaml (module docstring, "Version floor"; spec §10
-# rollout E -> B instance apply; astra R7). Read by B's --instance refusal,
-# importable under the package and the standalone -P load alike. True only
-# once the loader, the container seam and doctor all read the tier.
-MANIFEST_TIER_SUPPORTED = True
 
 # Manifest `sources:` names this release does not mount (#370 point 5
 # boundary: no clone destination, no env override, no runner wiring). A

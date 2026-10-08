@@ -30,8 +30,11 @@ MODULES = {
 #: Attribute names that would be a YAML dump.
 _DUMP_ATTRS = {"dump", "safe_dump", "dump_all", "safe_dump_all"}
 
-#: Attribute names that write a file directly.
-_FILE_WRITE_ATTRS = {"write_text", "write_bytes", "write"}
+#: Calls that write, replace or move a file directly.
+_FILE_WRITE_ATTRS = {
+    "write_text", "write_bytes", "write",
+    "replace", "rename", "copy", "copy2", "copyfile", "move",
+}
 
 #: The manifest's own names; a direct write touching one of these is a
 #: bypass of the writer.
@@ -52,6 +55,38 @@ def test_no_yaml_dump_and_no_ruamel(name):
             assert not any(a.name.startswith("ruamel") for a in node.names), ast.dump(node)
         if isinstance(node, ast.ImportFrom):
             assert not (node.module or "").startswith(("ruamel", "tests")), ast.dump(node)
+            assert not any(a.name in _DUMP_ATTRS for a in node.names), ast.dump(node)
+        if isinstance(node, ast.Name):
+            assert node.id not in _DUMP_ATTRS, ast.dump(node)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # `getattr(yaml, "dump")`, `import_module("ruamel.yaml")`.
+            assert node.value not in _DUMP_ATTRS, ast.dump(node)
+            assert not node.value.startswith("ruamel"), ast.dump(node)
+
+
+@pytest.mark.parametrize("bypass", [
+    "from yaml import safe_dump\nsafe_dump({})\n",
+    "import yaml\ngetattr(yaml, 'dump')({})\n",
+    "import importlib\nimportlib.import_module('ruamel.yaml')\n",
+])
+def test_the_dump_guard_sees_the_usual_bypasses(bypass, tmp_path, monkeypatch):
+    module = tmp_path / "bypass.py"
+    module.write_text(bypass, encoding="utf-8")
+    monkeypatch.setitem(MODULES, "bypass", module)
+    with pytest.raises(AssertionError):
+        test_no_yaml_dump_and_no_ruamel("bypass")
+
+
+@pytest.mark.parametrize("bypass", [
+    "import os\nos.replace(tmp, MANIFEST_NAME)\n",
+    "open(manifest_path, 'w')\n",
+])
+def test_the_write_guard_sees_the_usual_bypasses(bypass, tmp_path, monkeypatch):
+    module = tmp_path / "bypass.py"
+    module.write_text(bypass, encoding="utf-8")
+    monkeypatch.setitem(MODULES, "bypass", module)
+    with pytest.raises(AssertionError):
+        test_no_direct_manifest_write("bypass")
 
 
 @pytest.mark.parametrize("name", sorted(MODULES))

@@ -9,7 +9,11 @@ What these tests pin:
 - the folded tree has zero `record.plain-session-slug` findings and
   `lmer-schema migrate` lists no plain-session blocker or move;
 - a post-fold `derive_slug(taskdef, recorded target)` equals each new slug;
-- `_specs/` entries resolve at the new path with their original dates;
+- `_specs/` entries are re-registered at the new path under the record's
+  new label, with their original dates; the README index is regenerated in
+  the same ONE commit;
+- a taken destination is reported and skipped; a state file the slug
+  surgery cannot handle, or an unsafe taskdef, refuses before anything moves;
 - the fold refuses while a record in a folded group is live (no final
   `session_end`) or its lifecycle is unreadable, through the shared
   `preflight_no_live_records`, and never calls a record writer;
@@ -20,6 +24,7 @@ What these tests pin:
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,7 +36,7 @@ from lmer_schema.checks import record as record_checks
 from lmer_schema.migration import migrate as schema_migrate
 from tests import plexus_fixtures as pf
 from tests.conftest import strip_lmer_env
-from work_repo import git_ops, migrate, run_state
+from work_repo import git_ops, migrate, run_state, specs_index
 
 PROJECT = "lmer"
 MANIFEST = (
@@ -188,22 +193,122 @@ class TestSchemaForm:
             state = run_state._read_sibling_state(child)
             assert run_state.derive_slug(state["taskdef"], state.get("target")) == "chat"
 
-    def test_specs_entries_resolve_at_the_new_path_with_original_dates(self, schema_work, commits):
+    def test_specs_entries_are_reregistered_under_the_new_label_with_original_dates(
+        self, schema_work, commits
+    ):
         project = schema_work / PROJECT
         record_dir = project / "_runs" / "chat-." / "20260901-100000-1-0"
         (record_dir / "spec.md").write_text("# spec\n", encoding="utf-8")
         specs = project / "_specs"
-        entry = specs / "2026-09-01-chat-.--spec.md"
-        entry.symlink_to("../_runs/chat-./20260901-100000-1-0/spec.md")
+        old_entry = specs / "2026-09-01-chat-.-20260901-100000-1-0--spec.md"
+        old_entry.symlink_to("../_runs/chat-./20260901-100000-1-0/spec.md")
         _commit_all(schema_work, "specs entry")
         assert _render(schema_work, apply=True)[0] == 0
-        moved = specs / "2026-09-01-chat-.--spec.md"
-        assert moved.is_symlink()
-        assert moved.exists(), "the entry must resolve at the new path"
-        assert moved.resolve() == (
-            project / "_runs" / "chat" / "20260901-100000-1-0" / "spec.md"
-        ).resolve()
-        assert moved.name.startswith("2026-09-01-"), "the registration date is kept"
+        new_dir = project / "_runs" / "chat" / "20260901-100000-1-0"
+        expected = specs / specs_index._entry_name(
+            specs_index.run_label(new_dir), "spec.md",
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+        )
+        assert expected.name.startswith("2026-09-01-"), "the registration date is kept"
+        assert expected.is_symlink()
+        assert expected.resolve() == (new_dir / "spec.md").resolve()
+        assert not old_entry.is_symlink(), "the old-label entry is replaced, not duplicated"
+        assert [e.name for e in specs.iterdir() if e.name.endswith("--spec.md")] == [expected.name]
+        assert f"{PROJECT}/_specs" in commits[0].paths
+
+    def test_the_fold_lands_in_one_commit(self, schema_work, commits):
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 0
+        assert len(commits) == 1
+        assert "3 moves, 3 slug rewrites" in commits[0].message.splitlines()[0]
+
+    def test_compat_link_never_links_inside_runs(self, schema_work, commits):
+        rc, text = _render(schema_work, compat_link=True)
+        assert rc == 0
+        assert "ln -s" not in text
+        rc, _text = _render(schema_work, apply=True, compat_link=True)
+        assert rc == 0
+        assert not (schema_work / PROJECT / "_runs" / "chat-.").exists()
+        for path in (schema_work / PROJECT / "_runs").rglob("*"):
+            assert not path.is_symlink(), path
+
+    def test_a_state_yml_record_folds(self, schema_work, commits):
+        record_dir = schema_work / PROJECT / "_runs" / "chat-." / "20260901-100000-1-0"
+        (record_dir / "state.yaml").rename(record_dir / "state.yml")
+        _commit_all(schema_work, "legacy state.yml spelling")
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 0, text
+        new_state = schema_work / PROJECT / "_runs" / "chat" / "20260901-100000-1-0" / "state.yml"
+        assert "slug: chat\n" in new_state.read_text(encoding="utf-8")
+
+    def test_an_existing_destination_is_reported_and_skipped(self, schema_work, commits):
+        taken = schema_work / PROJECT / "_runs" / "chat" / "20260901-100000-1-0"
+        taken.mkdir(parents=True)
+        (taken / "state.yaml").write_text(
+            "schema: 1\ntaskdef: chat\ntarget: .\nslug: chat\nstatus: complete\n",
+            encoding="utf-8",
+        )
+        _commit_all(schema_work, "destination taken")
+        rc, text = _render(schema_work)
+        assert rc == 0
+        assert "already exists (skipped, never overwritten)" in text
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 0, text
+        # The skipped record stays where it was; the other groups fold.
+        assert (schema_work / PROJECT / "_runs" / "chat-." / "20260901-100000-1-0").is_dir()
+        assert (taken / "state.yaml").read_text(encoding="utf-8").endswith("status: complete\n")
+        assert not (schema_work / PROJECT / "_runs" / "chat-widgets").exists()
+        # With only the skipped record left, the no-op says so honestly.
+        rc, text = _render(schema_work)
+        assert "nothing this tool can move: 1 plain-session record" in text
+        assert "already in schema form" not in text
+
+    def test_an_interrupted_fold_gets_its_slug_rewrite_alone(self, schema_work, commits):
+        runs = schema_work / PROJECT / "_runs"
+        (runs / "chat").mkdir()
+        (runs / "chat-." / "20260901-100000-1-0").rename(runs / "chat" / "20260901-100000-1-0")
+        (runs / "chat-.").rmdir()
+        _commit_all(schema_work, "moved but not rewritten")
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 0, text
+        state = run_state._read_sibling_state(runs / "chat" / "20260901-100000-1-0")
+        assert state["slug"] == "chat"
+        assert _plain_session_findings(schema_work) == []
+
+    @pytest.mark.parametrize("mangle", [
+        lambda text: text + "slug: chat-.\n",  # a duplicate key
+        lambda text: "anchor: &a chat-.\n" + text.replace("slug: chat-.", "slug: *a"),
+    ])
+    def test_a_state_file_the_surgery_cannot_handle_refuses(self, schema_work, commits, mangle):
+        state_file = schema_work / PROJECT / "_runs" / "chat-." / "20260901-100000-1-0" / "state.yaml"
+        state_file.write_text(mangle(state_file.read_text(encoding="utf-8")), encoding="utf-8")
+        _commit_all(schema_work, "awkward state")
+        before = _snapshot(schema_work)
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 1
+        assert "slug" in text
+        assert _snapshot(schema_work) == before
+        assert commits == []
+
+    def test_an_unsafe_taskdef_refuses(self, schema_work, commits):
+        group = schema_work / PROJECT / "_runs" / "x-." / "20260901-100000-9-9"
+        group.mkdir(parents=True)
+        state = {"taskdef": "../x", "target": ".", "slug": run_state.legacy_derive_slug("../x", ".")}
+        assert run_state.is_legacy_plain_session_slug(state)
+        (group / "state.yaml").write_text(
+            f"schema: 1\ntaskdef: ../x\ntarget: .\nslug: {state['slug']}\nstatus: complete\n",
+            encoding="utf-8",
+        )
+        (group / "events.jsonl").write_text(
+            json.dumps({"ts": "2026-09-01T10:05:00Z", "type": "session_end"}) + "\n",
+            encoding="utf-8",
+        )
+        _commit_all(schema_work, "unsafe taskdef")
+        before = _snapshot(schema_work)
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 1
+        assert "not a single safe directory name" in text
+        assert _snapshot(schema_work) == before
 
     def test_the_release_record_is_untouched(self, schema_work, commits):
         before = _snapshot(schema_work)
@@ -241,6 +346,44 @@ class TestLegacyForm:
         assert state["slug"] == "chat"
         assert _plain_session_findings(legacy_work) == []
 
+    def test_the_legacy_fold_never_calls_a_record_writer(self, legacy_work, commits, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise AssertionError("the fold must not call a record writer")
+
+        monkeypatch.setattr(run_state, "write_state", boom)
+        monkeypatch.setattr(run_state, "append_event", boom)
+        monkeypatch.setattr(run_state, "freeze_run_dir", boom)
+        assert _render(legacy_work, apply=True)[0] == 0
+
+    def test_the_legacy_release_records_keep_their_bytes(self, legacy_work, commits):
+        before = {
+            release["slug"]: (legacy_work / PROJECT / "runs" / release["slug"] / "state.yaml").read_bytes()
+            for release in pf.RELEASE_RECORDS
+        }
+        assert _render(legacy_work, apply=True)[0] == 0
+        for slug, raw in before.items():
+            moved = list((legacy_work / PROJECT / "_runs" / slug).iterdir())
+            assert len(moved) == 1, "nested under its own slug group, never folded"
+            assert (moved[0] / "state.yaml").read_bytes() == raw
+
+
+class TestPublication:
+    def test_the_one_commit_carries_the_regenerated_readme(self, schema_work, tmp_path):
+        remote = tmp_path / "remote.git"
+        _git(tmp_path, "init", "-q", "--bare", str(remote))
+        _git(schema_work, "remote", "add", "origin", str(remote))
+        _git(schema_work, "push", "-q", "origin", "main")
+        _git(schema_work, "branch", "--set-upstream-to", "origin/main")
+        head = _git(schema_work, "rev-parse", "HEAD").strip()
+        rc, text = _render(schema_work, apply=True)
+        assert rc == 0, text
+        assert _git(schema_work, "rev-list", "--count", f"{head}..HEAD").strip() == "1"
+        changed = _git(schema_work, "show", "--name-only", "--format=", "HEAD").split()
+        assert f"{PROJECT}/README.md" in changed
+        readme = (schema_work / PROJECT / "README.md").read_text(encoding="utf-8")
+        assert "_runs/chat/20260901-100000-1-0/" in readme
+        assert "_runs/chat-./" not in readme
+
 
 class TestRefusals:
     def test_a_never_signed_out_record_refuses(self, tmp_path, monkeypatch):
@@ -256,6 +399,8 @@ class TestRefusals:
         rc, text = _render(root, apply=True)
         assert rc == 1
         assert "live" in text
+        assert migrate.LIVE_REMEDY in text
+        assert "work housekeep --archive-stale" in text
         assert _snapshot(root) == before
 
     def test_a_complete_but_not_signed_out_record_refuses(self, tmp_path, monkeypatch):
@@ -268,17 +413,18 @@ class TestRefusals:
         _commit_all(root)
         _configure(monkeypatch, root, tmp_path)
         before = _snapshot(root)
-        rc, _text = _render(root, apply=True)
+        rc, text = _render(root, apply=True)
         assert rc == 1
+        assert migrate.LIVE_REMEDY in text
         assert _snapshot(root) == before
 
     def test_an_unreadable_sibling_in_a_folded_group_refuses(self, tmp_path, monkeypatch):
         root = tmp_path / "work"
         tree = pf.build_schema_plexus(root)
         pf.plant_plain_session_records(tree.project_dir)
-        # A second, unreadable record in a group that IS being folded: the
-        # group dir is removed and the sibling moves with it, so its unknown
-        # lifecycle must stop the whole group.
+        # A second, unreadable record in a group that IS being folded: spec
+        # §7 refuses while any record in the group may be live, and unknown
+        # is not stopped.
         bad = tree.project_dir / "_runs" / "chat-." / "20260901-109999-9-9"
         bad.mkdir(parents=True)
         (bad / "state.yaml").write_text("state: [unclosed\n", encoding="utf-8")
@@ -292,4 +438,40 @@ class TestRefusals:
         rc, text = _render(root, apply=True)
         assert rc == 1
         assert "unreadable" in text
+        assert migrate.LIVE_REMEDY in text
         assert _snapshot(root) == before
+
+
+class TestSpecsRepointFromAnOperatorShell:
+    def test_an_entry_that_cannot_be_reregistered_is_kept(self, schema_work, capsys):
+        # No session env (stripped): the explicit areas are all it has. A
+        # target that does not exist cannot be re-registered, so the old
+        # entry must survive rather than be dropped silently.
+        project = schema_work / PROJECT
+        specs = project / "_specs"
+        entry = specs / "2026-09-01-chat-.--spec.md"
+        entry.symlink_to("../_runs/chat-./20260901-100000-1-0/spec.md")
+        specs_index.repoint_run_dir_entries(
+            "chat-./20260901-100000-1-0", "chat/20260901-100000-1-0", "chat",
+            project_dir=project, specs_directory=specs, run_area=project / "_runs",
+        )
+        assert entry.is_symlink()
+        assert "not re-pointed" in capsys.readouterr().out
+
+    def test_the_explicit_areas_reregister_without_a_session(self, schema_work):
+        project = schema_work / PROJECT
+        source = project / "_runs" / "chat-." / "20260901-100000-1-0"
+        (source / "spec.md").write_text("# spec\n", encoding="utf-8")
+        specs = project / "_specs"
+        entry = specs / "2026-09-01-chat-.--spec.md"
+        entry.symlink_to("../_runs/chat-./20260901-100000-1-0/spec.md")
+        moved = project / "_runs" / "chat" / "20260901-100000-1-0"
+        moved.parent.mkdir()
+        source.rename(moved)
+        specs_index.repoint_run_dir_entries(
+            "chat-./20260901-100000-1-0", "chat/20260901-100000-1-0", "chat-20260901-100000-1-0",
+            project_dir=project,
+        )
+        entries = [e for e in specs.iterdir() if e.name.endswith("--spec.md")]
+        assert [e.name for e in entries] == ["2026-09-01-chat-20260901-100000-1-0--spec.md"]
+        assert entries[0].resolve() == (moved / "spec.md").resolve()
