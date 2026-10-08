@@ -30,7 +30,7 @@ import re
 from typing import Iterable, Mapping
 from dotenv import dotenv_values
 from work_repo import session_record
-from work_repo.utils import classify_target, repository_of
+from work_repo.utils import classify_target, repository_of, strip_url_credentials
 
 from . import resolve
 from .clone_cache import (
@@ -609,6 +609,7 @@ def parse_args(
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
     parser.add_argument("--service-group", dest="service_group", help="Compose project whose running services this session may target (service-group mode); the agent retargets with the in-container target-switch")
     parser.add_argument("--checkout", dest="checkout", help="Path to existing local source checkout (mounted as /workspace)")
+    parser.add_argument("--repo", dest="repo", metavar="URL_OR_PATH", help="Explicit repository for this launch (URL or local path). It beats a repository derived from a work-item, reference or thread target; refused as 'two repositories named' beside a repository positional, and also beside --checkout, LMER_NO_REPO, --no-clone or --no-task. `lmer <taskdef> --repo <url>` with no positional is the plain project session, launched from anywhere. Nothing new reaches the container.")
     parser.add_argument("--user", dest="user", help="Container user (e.g., developer or 0:0)")
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
     parser.add_argument("--memory", dest="memory", help="Container memory cap for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__MEMORY, LMER_<TASK>_MEMORY, LMER_MEMORY). Same grammar as LMER_MEMORY — an integer with an optional b/k/m/g suffix, at least 6m. Unlike the environment tiers, an invalid value here aborts the run rather than falling through: an explicit request is not something to silently substitute.")
@@ -769,25 +770,29 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
 
 
 def container_task_target(
-    primary_target: str | None, host_repo_path: Path | None
-) -> str | None:
+    primary_target: str | None,
+    host_repo_path: Path | None,
+    klass: str,
+) -> str:
     """The ``LMER_TASK_TARGET`` a launch exports for its primary target.
 
-    A local filesystem path (``.``, ``./``, ``../x``, an absolute checkout
-    path) is a plain project session: the repository comes from the
-    checkout's git origin, and the path spelling carries no identity worth a
-    slug — it used to be forwarded verbatim and every slug copy filed the run
-    under ``chat-.`` instead of the bare taskdef ``chat``. So when
-    ``resolve.normalize_repo_url`` resolved a host path (``host_repo_path``
-    is not None) the exported target is the **empty string**, which every
-    container reader already treats as "no target", and it is exported
-    empty rather than dropped so the container cannot fall back to whatever
-    its environment holds. A URL target (``host_repo_path`` is None) is
-    exported exactly as given, and ``primary_target`` itself — the value
-    the GitLab MR parsing, the host-repo mount and the secondary-target
-    list read — is never touched. Pure: no filesystem, no environment.
+    The exported target is the session's *task context*, never its repository
+    (spec §4/§2, A1-wave0.host-export). A ``repository`` target — a local
+    filesystem path (``.``, ``./``, ``../x``, an absolute checkout path) or a
+    bare repository URL — is a plain project session: the repository comes
+    from the checkout's git origin or the URL, and the spelling carries no
+    identity worth a slug, so the export is the **empty string** (delivered
+    empty, never absent, because every container reader treats ``""`` as "no
+    target" while an absent variable falls back to whatever the environment
+    holds). ``none`` (no positional at all) is the same empty export. A
+    ``work-item``, ``reference`` or ``other`` target is exported verbatim: a
+    work item is the session's target, a document URL is context, and an
+    ``other`` URL reached here only because ``--repo`` named the repository.
+    ``primary_target`` itself — the value the GitLab MR parsing, the
+    host-repo mount and the secondary-target list read — is never touched.
+    Pure: no filesystem, no environment.
     """
-    if host_repo_path is not None:
+    if klass in ("repository", "none"):
         return ""
     return primary_target
 
@@ -1491,6 +1496,25 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     if ns.no_task and not ns.exec_mode:
         error("--no-task requires --exec mode")
         return 2
+    # --repo names the repository explicitly (A1-wave0.host-export). The
+    # refusals that need the positional classified ('two repositories named')
+    # live in main(), where the classifier runs; these need only the flags.
+    if ns.repo is not None:
+        if not ns.repo.strip():
+            error("--repo requires a non-empty URL or path")
+            return 2
+        if ns.checkout:
+            error("Cannot specify both --repo and --checkout")
+            return 2
+        if ns.no_clone:
+            error("Cannot specify both --repo and --no-clone")
+            return 2
+        if ns.no_task:
+            error("--repo needs a task and is refused with --no-task")
+            return 2
+        if get_bool_env("LMER_NO_REPO"):
+            error("Cannot specify both --repo and LMER_NO_REPO")
+            return 2
     if not ns.no_task and not ns.task and not ns.show_env:
         error("Task type is required unless --no-task is specified")
         return 2
@@ -2562,17 +2586,72 @@ def main(argv: list[str] | None = None) -> int:
     # targets whose handler allows repo-less mode for the selected task,
     # and no git origin can be inferred from cwd).
     no_repo_session = False
+    # What kind of target this session was given (spec §2, D2). `none` when
+    # there is no positional; a `special` target was partitioned out above.
+    target_class = classify_target(primary_target)
     if not skip_repo_resolve:
         cwd = Path.cwd()
 
-        # If task provides a PR/MR/issue URL, try to derive base repo URL
-        # Only use primary target for repo resolution
+        # A non-URL positional that names an existing local checkout is the
+        # repository, exactly as before. The probe is non-raising so anything
+        # else — a branch, a SHA, a shorthand, a document URL — reaches the
+        # classifier instead of failing as a missing path. A directory that
+        # exists but is not a checkout is refused, never read as a branch.
+        if primary_target and not resolve.is_likely_url(primary_target):
+            local_checkout = resolve.probe_local_repo(primary_target, cwd)
+            if local_checkout is not None:
+                target_class = "repository"
+            else:
+                candidate = (
+                    (cwd / primary_target).resolve()
+                    if not os.path.isabs(primary_target)
+                    else Path(primary_target).resolve()
+                )
+                if candidate.exists() and candidate.is_dir():
+                    error(
+                        "❌ not a git repository: "
+                        f"{strip_url_credentials(primary_target)} "
+                        f"({strip_url_credentials(str(candidate))})"
+                    )
+                    return 2
+
+        # --repo names the repository explicitly. It is refused beside a
+        # repository-class positional ('two repositories named'); the flag
+        # refusals that need no classification are in _validate_parsed_args.
+        if ns.repo and target_class == "repository":
+            error(
+                "❌ two repositories named: the positional "
+                f"{strip_url_credentials(primary_target)} and --repo "
+                f"{strip_url_credentials(ns.repo)}"
+            )
+            return 2
+
+        # `other` is a URL that is neither a repository, a work item nor a
+        # known thread. Without --repo there is nothing to clone; with it the
+        # URL stays the session's target as context.
+        if target_class == "other" and not ns.repo:
+            error(
+                "❌ not a repository, a work item or a known thread: "
+                f"{strip_url_credentials(primary_target)}. "
+                "Name its repository with --repo."
+            )
+            return 2
+
+        # If the task provides a PR/MR/issue URL, try to derive base repo URL.
+        # Only the primary target takes part in repo resolution.
         derived_repo_url = None
-        if primary_target and isinstance(primary_target, str):
+        if primary_target and target_class in ("work-item", "reference"):
             derived_repo_url = _derive_repo_url_from_task_target(primary_target)
 
         try:
-            target_to_resolve = derived_repo_url or (primary_target or "")
+            if ns.repo:
+                target_to_resolve = ns.repo
+            elif target_class == "repository":
+                target_to_resolve = primary_target or ""
+            elif target_class in ("work-item", "reference"):
+                target_to_resolve = derived_repo_url or ""
+            else:  # none
+                target_to_resolve = ""
             # With --checkout, target is optional (may not have a repo URL)
             if checkout_path and not target_to_resolve:
                 # No target and using checkout — resolve from the checkout's git remote
@@ -3208,7 +3287,9 @@ def main(argv: list[str] | None = None) -> int:
         # filesystem path target, so every slug copy derives the bare taskdef;
         # the URL spelling otherwise. `primary_target` itself is untouched.
         "LMER_TASK_TARGET": (
-            container_task_target(primary_target, host_repo_path) if not ns.no_task else None
+            container_task_target(primary_target, host_repo_path, target_class)
+            if not ns.no_task
+            else None
         ),
         "LMER_SESSION_KIND": os.environ.get("LMER_SESSION_KIND"),
         "LMER_WORKSPACE_ID": os.environ.get("LMER_WORKSPACE_ID"),

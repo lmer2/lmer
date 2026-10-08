@@ -156,6 +156,32 @@ def validate_local_repo(path: Path) -> None:
         raise ResolveError(f"Not a git repository: {path}")
 
 
+def probe_local_repo(target: str, cwd: Path) -> Optional[Path]:
+    """The resolved path when *target* names an existing git checkout, else None.
+
+    Non-raising counterpart of the local-path leg of :func:`normalize_repo_url`
+    (A1-wave0.host-export, spec §4/§2): a positional that names no checkout — a
+    branch, a commit SHA, an ``mr-N``/``issue-N`` shorthand, a document URL —
+    must reach the target classifier instead of failing with 'Local path does
+    not exist'. A path that exists but is not a git repository returns None as
+    well; the caller refuses that explicitly rather than silently treating a
+    directory as a branch name.
+    """
+    if not target or is_likely_url(target):
+        return None
+    try:
+        p = (cwd / target).resolve() if not os.path.isabs(target) else Path(target).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not p.exists() or not p.is_dir():
+        return None
+    try:
+        validate_local_repo(p)
+    except ResolveError:
+        return None
+    return p
+
+
 def normalize_repo_url(target: str, cwd: Path, remote_name: Optional[str] = None) -> Tuple[str, Optional[Path]]:
     """
     Normalize repository target to URL and optional local path.
