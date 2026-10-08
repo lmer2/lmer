@@ -176,7 +176,12 @@ def run_label(rdir: Path, state: Optional[dict] = None) -> str:
         state = run_state._read_sibling_state(rdir)
     label = None
     if isinstance(state, dict):
-        recorded = state.get("name") or state.get("slug")
+        if run_state.is_default_label(state):
+            # A default label is not a naming (D6): the entry is named under
+            # the slug, exactly as an unnamed record always was.
+            recorded = state.get("slug")
+        else:
+            recorded = state.get("name") or state.get("slug")
         if recorded:
             label = str(recorded)
     if label is None:

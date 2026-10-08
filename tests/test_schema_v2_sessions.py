@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -159,6 +160,68 @@ def test_fresh_record_retains_metadata_and_unknown_fields(session_tree, monkeypa
     assert run_state.load_state(rdir)["session"]["later_extension"] == [4, 5]
 
 
+def test_default_label_derivation_and_shape():
+    """D5: `<taskdef>-<yymmdd>-<uid[:4]>`, the date in UTC; the shape test
+    accepts an inherited default label for the record's own taskdef."""
+    uid = "abcd" * 8
+    assert run_state.derive_default_label(
+        "chat", "2026-10-07T23:30:00-02:00", uid
+    ) == "chat-261008-abcd"
+    state = {
+        "taskdef": "chat",
+        "name": "chat-261008-abcd",
+        "session": {"uid": uid, "started_at": "2026-10-07T23:30:00-02:00"},
+    }
+    assert run_state.is_default_label(state)
+    state["name"] = "chat-261007-3f9a"  # an inherited default label
+    assert run_state.is_default_label(state)
+    state["name"] = "tidy"
+    assert not run_state.is_default_label(state)
+    assert not run_state.is_default_label({"name": "x"})
+
+
+def test_a_freshly_seeded_record_carries_a_default_label_without_run_named(
+    session_tree, monkeypatch
+):
+    metadata, rdir, state = seed_launch()
+    assert state["name"] == run_state.derive_default_label(
+        "chat", state["session"]["started_at"], metadata["uid"]
+    )
+    assert run_state.is_default_label(state)
+    assert "run_named" not in [e["type"] for e in run_state.read_events(rdir, last_n=0)]
+
+
+def test_freeze_does_not_rename_a_default_labelled_record(session_tree):
+    _, rdir, state = seed_launch()
+    assert run_state.is_default_label(state)
+    frozen, old_name = run_state.freeze_run_dir(rdir, state)
+    assert frozen == rdir and old_name is None
+    assert state["frozen"] is not None
+
+
+def test_launch_name_replaces_a_default_label_on_the_opening_call(
+    session_tree, monkeypatch
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "tidy-index")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    state = run_state.load_state(run_state.run_dir())
+    assert state["name"] == "tidy-index"
+
+
+def test_specs_index_label_uses_the_slug_for_a_default_label(session_tree):
+    from work_repo import specs_index
+
+    _, rdir, state = seed_launch()
+    label = specs_index.run_label(rdir, state)
+    assert label.startswith(state["slug"])
+    assert run_state.is_default_label(state)
+    state["name"] = "tidy-index"
+    assert specs_index.run_label(rdir, state).startswith("tidy-index")
+
+
 def test_continuation_uses_fresh_record_and_preserves_source_bytes(session_tree, monkeypatch):
     old, source, source_state = seed_launch()
     source_state["goal"] = "Finish the existing work"
@@ -254,6 +317,85 @@ def test_future_record_version_refuses_every_writer(session_tree):
     with pytest.raises(run_state.RunStateError, match="newer"):
         run_state.write_state(directory, old_state)
     assert path.read_bytes() == before
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=test",
+         "-c", "user.email=test@example.com", *args],
+        check=True, capture_output=True,
+    )
+
+
+def _git_work_repo(session_tree):
+    """A bare origin plus a clone holding the manifest, as LMER_WORK_REPO_PATH."""
+    origin = session_tree.parent / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+    clone = session_tree.parent / "workrepo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+    (clone / "_plexus.yaml").write_text((session_tree / "_plexus.yaml").read_text())
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-q", "-m", "init")
+    _git(clone, "push", "-q", "-u", "origin", "main")
+    return clone, origin
+
+
+def _tracked(clone):
+    _git(clone, "fetch", "-q", "origin")
+    return subprocess.run(
+        ["git", "-C", str(clone), "ls-tree", "-r", "--name-only", "origin/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def test_work_commit_publishes_the_seeded_record(session_tree, monkeypatch):
+    """`work seed` into another group, then `work commit`, publishes both the
+    launch's own record and the seed (#535, spec §5.2)."""
+    from types import SimpleNamespace
+
+    from work_repo.cli import cmd_seed
+    from work_repo.git_ops import commit_work_changes
+
+    clone, _ = _git_work_repo(session_tree)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    _, own_rdir, _ = seed_launch()
+    rc = cmd_seed(SimpleNamespace(taskdef="develop", target="other-target", name=None, goal=None))
+    assert rc == 0
+    seeded = run_state.seeded_record_rel_paths()
+    assert len(seeded) == 1
+    assert commit_work_changes("publish the seed") == 0
+    tracked = _tracked(clone)
+    assert own_rdir.relative_to(clone).as_posix() in tracked
+    assert seeded[0] in tracked
+    # Nothing outside the two records is left behind.
+    assert subprocess.run(
+        ["git", "-C", str(clone), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == ""
+
+
+def test_a_removed_seeded_group_stages_nothing(session_tree, monkeypatch):
+    """A seed whose group was removed before the commit stages nothing and
+    does not fail the commit (#535)."""
+    import shutil
+
+    from work_repo.git_ops import commit_work_changes
+    from work_repo.session_record import seeded_session
+
+    clone, _ = _git_work_repo(session_tree)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    seed_launch()
+    # Seed directly, then remove the group before committing.
+    rdir, _ = run_state.seed_run_dir(
+        "develop-other-target", "develop", "other-target",
+        adopt_existing=False, seeded=seeded_session(),
+    )
+    run_state.note_seeded_record(rdir)
+    shutil.rmtree(rdir.parent)
+    assert commit_work_changes("seed gone") == 0
+
 
 def _seeded_state(uid, seeded_by):
     """The record `work seed` writes under D13: a fresh uid, the seeding
@@ -733,7 +875,8 @@ def test_a_held_launch_name_warns_on_stdout_and_the_run_stays_unnamed(
     assert " owns " in out  # the brief still prints
     directory = run_state.run_dir()
     assert directory != holder
-    assert run_state.load_state(directory)["name"] is None
+    # The refused launch name leaves the record's default label (D5) in place.
+    assert run_state.is_default_label(run_state.load_state(directory))
     assert _events_of(directory, "run_named") == []
 
 
@@ -749,7 +892,7 @@ def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
     assert "launch name '###' not applied" in out
     assert " owns " in out
     directory = run_state.run_dir()
-    assert run_state.load_state(directory)["name"] is None
+    assert run_state.is_default_label(run_state.load_state(directory))
     assert _events_of(directory, "run_named") == []
 
 
@@ -772,7 +915,7 @@ def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
     assert " owns " in out
     directory = run_state.run_dir()
     state = run_state.load_state(directory)
-    assert state["name"] is None
+    assert run_state.is_default_label(state)
     assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
     assert _events_of(directory, "run_named") == []
 
@@ -799,7 +942,7 @@ def test_a_raising_state_write_is_a_warning_not_a_refusal(
     assert " owns " in out
     directory = run_state.run_dir()
     state = run_state.load_state(directory)
-    assert state["name"] is None and state["goal"] is None
+    assert run_state.is_default_label(state) and state["goal"] is None
     assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
     assert _events_of(directory, "run_named") == []
     assert _events_of(directory, "goal_set") == []

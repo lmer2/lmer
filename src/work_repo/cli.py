@@ -1980,8 +1980,9 @@ def _cmd_goals_freeze(note: str | None) -> int:
 
     old_dir_name = None
     if not state.get("frozen"):
-        if not state.get("name"):
-            # A run can still be unnamed at spec approval, and the
+        if not state.get("name") or run_state.is_default_label(state):
+            # A run can still be unnamed at spec approval (or carry only a
+            # default label, D5), and the
             # frozen stamp would forfeit the one-shot name-bearing rename
             # forever ("no second chance") — leave the seam to the phase
             # gate, which fires at the first execution-family transition.
@@ -2352,6 +2353,7 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
 _STATE_BUCKETS = (
     ("active", "active"),
     ("stale", "stale"),
+    ("seeded", "seeded"),
     ("ended, not closed", "ended not closed"),
     ("waiting on question", "waiting on question"),
     ("closed", "closed"),
@@ -2822,6 +2824,14 @@ def cmd_seed(args) -> int:
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
+
+    # Remember the seed on the launch's own state, so `work commit` (which
+    # stages only the launch's own group) publishes it too (#535). Schema 2
+    # only; a no-op in a legacy tree.
+    try:
+        run_state.note_seeded_record(rdir)
+    except (run_state.RunStateError, OSError):
+        pass
 
     print(f"✅ Run seeded: {rdir}")
     if seeded is not None:
@@ -4077,7 +4087,14 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
             return {}
         candidate = dict(state)
         events: list[tuple[str, str]] = []
-        if name_text.strip() and state.get("name") is None:
+        # A schema-2 record may carry a default label (D5); a launch `--name`
+        # replaces it on the call that opens the record. A legacy/schema-1
+        # record keeps today's rule (only an absent name is filled).
+        existing_name = state.get("name")
+        name_replaceable = existing_name is None or (
+            run_state.is_process_record() and run_state.is_default_label(state)
+        )
+        if name_text.strip() and name_replaceable:
             name = _validate_name(name_text)
             if name is None:
                 print(f"⚠️  launch name '{name_text}' not applied: not a usable name; "
@@ -4441,6 +4458,11 @@ def cmd_session_end() -> int:
         if held:
             _release_claim_at_session_end(rdir)
         rels = run_state.run_rel_path_candidates()
+        # Records this launch seeded into another group (D13) — the last push
+        # of the session must carry them or they are stranded locally (#535).
+        for seeded_rel in run_state.seeded_record_rel_paths():
+            if seeded_rel not in rels:
+                rels.append(seeded_rel)
         # Masterplan-sync (and freeze-rename) specs-index entries ride along —
         # this is the last push of the session, so leaving them unstaged
         # strands them locally (review on !126).

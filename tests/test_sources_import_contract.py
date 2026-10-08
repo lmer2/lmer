@@ -189,6 +189,53 @@ def test_package_import_works():
     assert issubclass(sources.SourcesConfigError, Exception)
 
 
+def test_package_exposes_manifest_tier_marker():
+    """The version-floor capability marker (issue #370, plan task 60)."""
+    assert sources.MANIFEST_TIER_SUPPORTED is True
+
+
+def test_standalone_exposes_manifest_tier_marker(tmp_path):
+    """The marker is present under the -P standalone load too."""
+    result = _run_standalone(
+        """
+        assert mod.MANIFEST_TIER_SUPPORTED is True
+        print("OK")
+        """,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_the_marker_is_true_only_while_the_seam_reads_the_manifest(tmp_path):
+    """Honesty: the marker can never be True while clone_and_exec ignores
+    the manifest tier. On a manifest-only tree (no sources.yaml) the seam
+    plans the declared clone, so the assertion holds for the seam it names."""
+    from unittest.mock import patch
+
+    from lmer_cli.container import clone_and_exec
+
+    work_url = "https://git.example.com/org/work.git"
+    (tmp_path / clone_and_exec.PLEXUS_MANIFEST_NAME).write_text(
+        "schema: 2\nname: example\nsources:\n  taskdef:\n"
+        "    repo: https://git.example.com/org/taskdefs.git\n"
+    )
+    calls = []
+
+    def fake_clone(dest, url, branch, ref, *, manage_existing):
+        calls.append((str(dest), url, ref))
+
+    with patch.object(clone_and_exec, "ensure_clone", side_effect=fake_clone):
+        rc = clone_and_exec._resolve_declared_sources(
+            tmp_path, work_url,
+            env={"LMER_WORK_REPO_PATH": "/work"},
+            isatty=False, input_fn=lambda *a, **k: "",
+        )
+    assert rc == 0
+    assert calls and calls[0][0] == "/taskdef"
+    assert sources.MANIFEST_TIER_SUPPORTED is True
+
+
 def test_package_load_sources_absent_file_is_silent_legacy(tmp_path):
     cfg, warnings = sources.load_sources(tmp_path / "sources.yaml")
     assert cfg is None

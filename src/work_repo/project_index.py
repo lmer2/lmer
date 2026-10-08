@@ -62,7 +62,13 @@ from urllib.parse import quote
 import yaml
 
 from . import run_state
-from .session_record import STALE_AFTER_SECONDS, UID_RE, display_state, signed_out
+from .session_record import (
+    STALE_AFTER_SECONDS,
+    UID_RE,
+    display_state,
+    is_seeded,
+    signed_out,
+)
 from .utils import MANIFEST_NAME, redact_secrets
 
 __all__ = [
@@ -104,8 +110,9 @@ PROJECT_LEGEND = (
     "record's own `state.yaml`, `events.jsonl` and `log.yaml` on every work-repo push and by "
     f"`lmer-schema index --write` (lmer index format {FORMAT}). States: **closed** = status "
     "complete or archived · **waiting on question** = stopped on a recorded question · "
-    "**ended, not closed** = in progress with a recorded session end · **open** = in progress "
-    "with no sign-out recorded; the last-activity column is the date the record last changed. "
+    "**seeded** = a `work seed` record nobody has run in yet · **ended, not closed** = in "
+    "progress with a recorded session end · **open** = in progress with no sign-out recorded; "
+    "the last-activity column is the date the record last changed. "
     "Nothing here ever ends a run. Edit this file outside the markers only."
 )
 TABLE_HEADER = "| started (UTC) | run | state | last activity | record |\n|---|---|---|---|---|"
@@ -183,8 +190,9 @@ class RecordSummary:
     started_at: str | None  # session.started_at, else created — always a str (see _stamp)
     updated: str | None     # always a str
     signed_out: bool | None  # session_record.signed_out(events); None when no events could be read
+    seeded: bool            # session_record.is_seeded(state, events); D13
     source_uid: str | None  # session.source_session_uid
-    source_rel: str | None  # context.source_path from its first "_runs/" component onward
+    source_rel: str | None  # the source record's project-relative dir, resolved by uid
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +374,7 @@ def render_row(summary: RecordSummary) -> str:
     state = display_state(
         readable=True, status=summary.status, stop_reason=summary.stop_reason,
         signed_out=summary.signed_out, updated=summary.updated,
+        seeded=summary.seeded,
     )
     if summary.stop_reason in _STOP_REASON_SUFFIXES:
         state += f" ({summary.stop_reason})"
@@ -538,19 +547,33 @@ def _source_rel(source_path) -> str | None:
 
 
 def build_summary(*, dir_rel: str, dir_name: str, flat: bool, group: str, state,
-                  events: list[dict] | None, first_log: str | None) -> RecordSummary:
-    """A :class:`RecordSummary` from already-read inputs (pure)."""
+                  events: list[dict] | None, first_log: str | None,
+                  seeded: bool = False,
+                  source_map: Mapping[str, str] | None = None) -> RecordSummary:
+    """A :class:`RecordSummary` from already-read inputs (pure).
+
+    *source_map* is the reader-built ``uid -> project-relative dir`` index for
+    the project; a record's ``continues`` link is addressed by its source's
+    uid (:func:`_source_dir_map`), falling back to ``context.source_path``
+    when the uid is unknown.
+    """
     uid = None if flat else run_state.session_id_of(dir_name)
     if not isinstance(state, dict):
         return RecordSummary(
             dir_rel=dir_rel, dir_name=dir_name, uid=uid, readable=False, slug=group, name=None,
             goal_line=None, first_log=None, status=None, stop_reason=None, phase=None,
-            started_at=None, updated=None, signed_out=None, source_uid=None, source_rel=None,
+            started_at=None, updated=None, signed_out=None, seeded=False,
+            source_uid=None, source_rel=None,
         )
     session = state.get("session")
     session = session if isinstance(session, dict) else {}
     context = state.get("context")
     context = context if isinstance(context, dict) else {}
+    source_uid = _text(session.get("source_session_uid")) or None
+    if source_uid and source_map and source_uid in source_map:
+        source_rel = source_map[source_uid]
+    else:
+        source_rel = _source_rel(context.get("source_path"))
     return RecordSummary(
         dir_rel=dir_rel,
         dir_name=dir_name,
@@ -566,8 +589,9 @@ def build_summary(*, dir_rel: str, dir_name: str, flat: bool, group: str, state,
         started_at=_stamp(session.get("started_at")) or _stamp(state.get("created")),
         updated=_stamp(state.get("updated")),
         signed_out=None if events is None else signed_out(events),
-        source_uid=_text(session.get("source_session_uid")) or None,
-        source_rel=_source_rel(context.get("source_path")),
+        seeded=seeded,
+        source_uid=source_uid,
+        source_rel=source_rel,
     )
 
 
@@ -823,12 +847,15 @@ def _read_events(rdir: Path) -> list[dict] | None:
     return [event for event in events if isinstance(event.get("type"), str)]
 
 
-def summarize(rdir: Path, project_dir: Path) -> RecordSummary:
+def summarize(rdir: Path, project_dir: Path, *,
+              source_map: Mapping[str, str] | None = None) -> RecordSummary:
     """Read one record directory under *project_dir* into a :class:`RecordSummary`.
 
-    A reader surprise (an unreadable file, a YAML error, an OSError, a value
-    of a shape the kernel did not expect) is one unreadable row, never an
-    exception out of the scan.
+    *source_map* is the reader-built uid index for the project
+    (:func:`_source_dir_map`); it is how a ``continues`` link resolves a
+    folded, freeze-renamed or archived source. A reader surprise (an
+    unreadable file, a YAML error, an OSError, a value of a shape the kernel
+    did not expect) is one unreadable row, never an exception out of the scan.
     """
     rdir, project_dir = Path(rdir), Path(project_dir)
     runs = project_dir / RUNS_DIR
@@ -839,14 +866,18 @@ def summarize(rdir: Path, project_dir: Path) -> RecordSummary:
         state_path = run_state._state_path(rdir)
         state = None if state_path is None else read_state_fast(state_path)
         events = _read_events(rdir)
+        seeded = bool(isinstance(state, dict) and events is not None
+                      and is_seeded(state, events))
         first_log = None
         if isinstance(state, dict) and _name_of(state) is None and _goal_line_of(state) is None:
             first_log = _first_log_message(rdir)
         return build_summary(dir_rel=dir_rel, dir_name=rdir.name, flat=flat, group=group,
-                             state=state, events=events, first_log=first_log)
+                             state=state, events=events, first_log=first_log,
+                             seeded=seeded, source_map=source_map)
     except Exception:  # a reader surprise is one unreadable row, never a lost index
         return build_summary(dir_rel=dir_rel, dir_name=rdir.name, flat=flat, group=group,
-                             state=None, events=None, first_log=None)
+                             state=None, events=None, first_log=None,
+                             source_map=source_map)
 
 
 def _always(_rel: str) -> bool:
@@ -865,10 +896,17 @@ def tracked_record_filter(repo_root: Path, project_rel: str,
     is on disk rather than nothing.
     """
     project_rel = _clean_rel(project_rel)
-    pathspec = f"{project_rel}/{RUNS_DIR}" if project_rel else RUNS_DIR
+    # Both the live run area and C's archive home: the uid map resolves a
+    # `continues` source that housekeep archived, and an untracked archive dir
+    # must be filtered exactly as an untracked live one is (its link would
+    # dangle on the forge).
+    pathspecs = [
+        f"{project_rel}/{RUNS_DIR}" if project_rel else RUNS_DIR,
+        f"{project_rel}/_archive/{RUNS_DIR}" if project_rel else f"_archive/{RUNS_DIR}",
+    ]
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-z", "--", pathspec],
+            ["git", "ls-files", "-z", "--", *pathspecs],
             cwd=str(repo_root), capture_output=True, check=False,
             env={**os.environ, "LC_ALL": "C"}, timeout=GIT_TIMEOUT_SECONDS,
         )
@@ -889,6 +927,48 @@ def tracked_record_filter(repo_root: Path, project_rel: str,
     return include
 
 
+def _source_dir_map(project_dir: Path, *, include: Callable[[str], bool] | None = None,
+                    project_rel: str = "") -> dict[str, str]:
+    """``uid -> project-relative record dir`` for every record of the project.
+
+    A ``continues`` link is addressed by ``session.source_session_uid``
+    (A1-rest.index-labels), never by its old path: a folded
+    (``_runs/chat-./<uid>`` -> ``_runs/chat/<uid>``), freeze-renamed
+    (``<uid>`` -> ``<uid>--<name>``) or archived source still resolves. The
+    archive home (``_archive/_runs/<slug>/<uid>[--<name>]``) is walked too,
+    and honours *include* like the live area so a link to an untracked dir
+    never dangles on the forge. IO lives here so :func:`render_row` stays
+    pure; built once per scan.
+    """
+    project_dir = Path(project_dir)
+    project_rel = _clean_rel(project_rel)
+    found: dict[str, str] = {}
+
+    def _key(rel: str) -> str:
+        return f"{project_rel}/{rel}" if project_rel else rel
+
+    def _add(rdir: Path) -> None:
+        uid = run_state.session_id_of(rdir.name)
+        if not uid:
+            return
+        rel = rdir.relative_to(project_dir).as_posix()
+        if include is not None and not include(_key(rel)):
+            return
+        found.setdefault(uid, rel)
+
+    for rdir in run_state.iter_record_dirs(project_dir / RUNS_DIR):
+        _add(rdir)
+    archive = project_dir / "_archive" / RUNS_DIR
+    if archive.is_dir():
+        for group in sorted(archive.iterdir()):
+            if not group.is_dir():
+                continue
+            for rdir in sorted(group.iterdir()):
+                if rdir.is_dir():
+                    _add(rdir)
+    return found
+
+
 def scan_project(project_dir: Path, *, include: Callable[[str], bool] | None = None,
                  project_rel: str = "") -> list[RecordSummary]:
     """Every record the resolvers' own walk finds under ``<project>/_runs``,
@@ -897,12 +977,13 @@ def scan_project(project_dir: Path, *, include: Callable[[str], bool] | None = N
     slash or a ``./`` cannot build a key the tracked set never holds."""
     project_dir = Path(project_dir)
     project_rel = _clean_rel(project_rel)
+    source_map = _source_dir_map(project_dir, include=include, project_rel=project_rel)
     summaries = []
     for rdir in run_state.iter_record_dirs(project_dir / RUNS_DIR):
         dir_rel = rdir.relative_to(project_dir).as_posix()
         if include is not None and not include(f"{project_rel}/{dir_rel}" if project_rel else dir_rel):
             continue
-        summaries.append(summarize(rdir, project_dir))
+        summaries.append(summarize(rdir, project_dir, source_map=source_map))
     return summaries
 
 

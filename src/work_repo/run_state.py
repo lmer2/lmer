@@ -1102,6 +1102,110 @@ def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
     return rels
 
 
+def note_seeded_record(seeded_rdir: Path) -> None:
+    """Remember a record this launch seeded, on the launch's own state.
+
+    ``work seed`` writes into ANOTHER group (D13): the record carries a
+    fresh uid with this launch in ``session.seeded_by``, so
+    :func:`run_rel_path_candidates` — the launch's own address — never names
+    it and ``work commit`` would report it as a stray and leave it
+    unpublished (#535, spec §5.2). Recording its run-area-relative path here
+    lets ``work commit`` and ``work session-end`` stage it beside the
+    launch's own candidates.
+
+    Schema form only: a legacy tree's ``work seed`` and ``work commit`` stay
+    byte-identical (the legacy publication gap is not #535's). A launch with
+    no own record (an operator shell) records nothing.
+    """
+    if not is_process_record():
+        return
+    own = run_dir()
+    if own is None:
+        return
+    rel = run_area_rel_name(seeded_rdir)
+    if rel is None:
+        return
+    state = load_state(own)
+    if state is None:
+        return
+    seeded = [name for name in (state.get("seeded_records") or []) if isinstance(name, str)]
+    if rel not in seeded:
+        seeded.append(rel)
+    state["seeded_records"] = seeded
+    write_state(own, state)
+
+
+def seeded_record_rel_paths() -> list[str]:
+    """Work-repo-relative paths of records this launch seeded (schema form).
+
+    Read from the launch's own ``seeded_records`` list (D13); a path whose
+    group was removed before the commit resolves to nothing and stages
+    nothing. Empty on a legacy tree or with no own record.
+    """
+    if not is_process_record():
+        return []
+    own = run_dir()
+    if own is None:
+        return []
+    # Lock-free: this runs inside `commit_work_changes`, which a git hook can
+    # invoke while the work transaction is already held by the same process,
+    # so `load_state`'s mutation lock would deadlock. `read_state_fast` is the
+    # same reader `_nudge_unnamed` uses (project_index imports this module, so
+    # the import is local).
+    from . import project_index
+
+    path = _state_path(own)
+    if path is None:
+        return []
+    state = project_index.read_state_fast(path)
+    if not state:
+        return []
+    rels: list[str] = []
+    for name in state.get("seeded_records") or []:
+        if not isinstance(name, str):
+            continue
+        rel = run_rel_for_dir_name(name)
+        if rel and rel not in rels:
+            rels.append(rel)
+    return rels
+
+
+def derive_default_label(taskdef: str, started_at: str, uid: str) -> str:
+    """The default label for an unnamed schema-2 record (D5):
+    ``<taskdef>-<yymmdd>-<uid[:4]>`` with the date in UTC.
+
+    A label, not a name: it makes a record findable in a listing without
+    claiming the run was named (D5). ``started_at`` is the record's own
+    logged start (``session.started_at``); a value this kernel cannot parse
+    falls back to the current UTC day rather than refusing the seed.
+    """
+    try:
+        when = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        stamp = when.astimezone(timezone.utc).strftime("%y%m%d")
+    except (ValueError, TypeError, AttributeError):
+        stamp = datetime.now(timezone.utc).strftime("%y%m%d")
+    return f"{taskdef}-{stamp}-{uid[:4]}"
+
+
+def is_default_label(state: dict) -> bool:
+    """Whether *state*'s name is the default-label SHAPE (D5/D6).
+
+    The shape — ``<taskdef>-<6 digits>-<4 lowercase hex>`` for the record's
+    OWN taskdef — not a recomputation from this record's uid/started_at, so
+    a continuation that inherited a default label from an unnamed source is
+    still treated as unnamed by the freeze, the goals-freeze seam, the nudge
+    and the specs index. A human name that happens to match the shape is
+    accepted as that cost.
+    """
+    name = state.get("name")
+    taskdef = state.get("taskdef")
+    if not isinstance(name, str) or not isinstance(taskdef, str) or not taskdef:
+        return False
+    return re.fullmatch(rf"{re.escape(taskdef)}-\d{{6}}-[0-9a-f]{{4}}", name) is not None
+
+
 def seed_state(
     slug: str, taskdef: str, target: str, session: Optional[dict] = None
 ) -> dict:
@@ -1220,8 +1324,20 @@ def seed_run_dir(
             state["stop_reason"] = "question"
     if goal:
         state["goal"] = goal
-    if name:
-        state["name"] = name
+    # A name can be inherited from a continuation source, passed explicitly by
+    # `work seed --name`, or defaulted (D5): an unnamed schema-2 record gets a
+    # default label so it is findable in a listing without claiming a naming.
+    # A default label is NOT a naming — no `run_named` event (D5).
+    inherited_name = context["state"].get("name") if context is not None else None
+    resolved_name = inherited_name or name
+    if resolved_name is None and is_process_record():
+        session_meta = state.get("session") or {}
+        uid = session_meta.get("uid")
+        started_at = session_meta.get("started_at") or state.get("created")
+        if uid:
+            resolved_name = derive_default_label(taskdef, started_at, uid)
+    if resolved_name:
+        state["name"] = resolved_name
     if is_session_form() and seeded is None:
         # The chain starts with the launch that opened the record, so a
         # resumed dir reads as the lineage it is. A synthesized id names a
@@ -1585,6 +1701,7 @@ def list_sessions(
                     signed_out=row["signed_out"],
                     updated=state.get("updated"),
                     now=now,
+                    seeded=row["seeded"],
                 )
         rows.append(row)
     if any("session" in row for row in rows):
@@ -1648,7 +1765,9 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     state["frozen"] = utc_now_iso()
     name = state.get("name")
     slug = state.get("slug") or rdir.name
-    if not name:
+    # A default label is not a naming (D5): the freeze stamps `frozen` but
+    # does not rename, exactly as for a run unnamed at the freeze.
+    if not name or is_default_label(state):
         return rdir, None
     base = runs_base()
     group = rdir.parent
