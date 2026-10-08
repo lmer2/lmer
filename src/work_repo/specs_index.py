@@ -233,6 +233,9 @@ def upsert_spec_link(
     label: str,
     when: Optional[datetime] = None,
     alias: Optional[str] = None,
+    *,
+    specs_directory: Optional[Path] = None,
+    project_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Upsert one specs-index entry for a spec-class file. Fail-soft.
 
@@ -261,10 +264,14 @@ def upsert_spec_link(
     has schema-form entries under the old key, so there is nothing to sweep
     in practice — only a cost to pay if this function started guessing.
 
+    *specs_directory* and *project_dir* name the index and the project dir
+    explicitly, for a caller with no session env (the `work migrate` fold);
+    left out, both resolve from the session as always.
+
     Returns the entry path, or None when nothing was indexed.
     """
     try:
-        base = _work_repo_base()
+        base = Path(project_dir) if project_dir is not None else _work_repo_base()
         basename = alias or spec_path.name
         if base is None or not is_spec_artifact(basename):
             return None
@@ -274,7 +281,7 @@ def upsert_spec_link(
         # ends are under `base`, so `relpath` can only walk up as far as it.
         if not spec_path.is_file() or not spec_path.is_relative_to(base):
             return None
-        sdir = specs_dir()
+        sdir = Path(specs_directory) if specs_directory is not None else specs_dir()
         if sdir is None:
             return None
         sdir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +322,10 @@ def upsert_spec_link(
 
 @mutation_transaction
 def repoint_run_dir_entries(
-    old_name: str, new_name: str, new_label: str
+    old_name: str, new_name: str, new_label: str, *,
+    project_dir: Optional[Path] = None,
+    specs_directory: Optional[Path] = None,
+    run_area: Optional[Path] = None,
 ) -> None:
     """Re-point index entries after a record dir moved (the freeze's
     `<slug>/` → `<slug>--<name>/`, the re-slug's move to a new address).
@@ -338,11 +348,31 @@ def repoint_run_dir_entries(
     dir no longer exists by the time this runs — so the name is what both
     ends can still spell, and the one prefix rewrite below covers both forms
     because the run area itself is resolved rather than spelled.
+
+    *project_dir*, *specs_directory* and *run_area* name the project's areas
+    explicitly, for a caller with no session env (the `work migrate` fold);
+    left out, each resolves from the session exactly as before. The new
+    entry is written before the old one goes, so an entry that cannot be
+    re-registered is kept (and warned about) rather than silently dropped.
     """
     try:
         from . import run_state  # local: run_state imports this module
-        sdir = specs_dir()
-        runs = run_state.runs_base()
+        if project_dir is not None:
+            project_dir = Path(project_dir)
+        if specs_directory is not None:
+            sdir = Path(specs_directory)
+        elif project_dir is not None:
+            schema_specs = project_dir / SCHEMA_SPECS_DIR
+            sdir = schema_specs if schema_specs.is_dir() else project_dir / SPECS_DIR
+        else:
+            sdir = specs_dir()
+        if run_area is not None:
+            runs = Path(run_area)
+        elif project_dir is not None:
+            schema_runs = project_dir / "_runs"
+            runs = schema_runs if schema_runs.is_dir() else project_dir / "runs"
+        else:
+            runs = run_state.runs_base()
         if sdir is None or runs is None or old_name == new_name:
             return
         if not sdir.is_dir():
@@ -428,8 +458,14 @@ def repoint_run_dir_entries(
                     if rest.endswith(f"-{canonical_name}")
                     else rest
                 )
-            entry.unlink()
-            upsert_spec_link(new_target, new_label, when=when, alias=basename)
+            new_entry = upsert_spec_link(
+                new_target, new_label, when=when, alias=basename,
+                specs_directory=sdir, project_dir=project_dir,
+            )
+            if new_entry is None:
+                print(f"⚠️  specs index entry {entry.name} not re-pointed; left in place")
+            elif new_entry != entry and entry.is_symlink():
+                entry.unlink()
     except Exception as exc:
         print(f"⚠️  specs index re-point skipped: {exc}")
 

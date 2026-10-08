@@ -52,7 +52,8 @@ The identity model (§13.B)
 ==========================
 A moved record is renamed and nothing else: `name: null` stays null (no D5
 default label), no uid is minted for history, and its `state.yaml` /
-`events.jsonl` bytes are untouched. This module is not an execution writing a
+`events.jsonl` bytes are untouched — except a folded plain-session record
+(spec §7), whose one `slug:` scalar is rewritten in place. This module is not an execution writing a
 record (§1.6): it never calls `write_state`, `append_event` or
 `freeze_run_dir` on a record it moves. The only record it writes is the
 CALLER's own, when the command runs inside a session — one
@@ -115,13 +116,14 @@ import json
 import os
 import posixpath
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from . import git_ops, memory, run_state, session_record
+from . import git_ops, memory, run_state, session_record, specs_index
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, CoreUnavailableError, core_module, work_repo_root
 
@@ -132,6 +134,8 @@ __all__ = [
     "INDEX",
     "INDEX_AREAS",
     "INSTANCE_MEMORY",
+    "INSTANCE_RENAMES",
+    "InstancePlan",
     "LEGACY_MEMORY",
     "LINK",
     "MEMORY",
@@ -146,7 +150,9 @@ __all__ = [
     "Plan",
     "cmd_migrate",
     "legacy_session_id",
+    "migrate_instance",
     "migrate_project",
+    "plan_instance",
     "plan_project",
     "preflight_no_live_records",
     "write_rel_paths",
@@ -162,6 +168,15 @@ REPOINT = "repoint"
 LINK = "compat-link"
 #: The kind an :class:`IndexWrite` reports under.
 INDEX = "index"
+#: The fold's scalar rewrite (§7): `src` is a state file, `dst` the new
+#: `slug:` value, `was` the old one.
+SLUG = "slug"
+
+#: The way out the live-record refusal names (spec §7).
+LIVE_REMEDY = (
+    "a live record cannot move: finish or sign out that session, or for a stale "
+    "record that never signed out run `work housekeep --archive-stale`, then re-run"
+)
 
 #: The bare area names and their schema twins (SCHEMA.md Appendix A), in
 #: plan order. `memory/` is deliberately absent: its lift is routed by
@@ -173,8 +188,40 @@ AREA_RENAMES = (
     ("taskdef", "_taskdef"),
 )
 
+#: The instance surfaces and their schema twins (SCHEMA.md Appendix A).
+INSTANCE_RENAMES = (
+    ("agent-files/claude", "_agents/claude"),
+    ("mirrors", "_agents/mirrors"),
+    ("taskdef", "_taskdef"),
+)
+
+INSTANCE_SOURCES = "sources.yaml"
+
+#: The instance surface `--instance` deliberately leaves where it is: in
+#: subdir mode the runtime writes notes to `{work_repo}/napkin`
+#: (`lmer_cli.cli._resolve_napkin_path`) and nothing reads `_napkin/` yet, so
+#: moving it would split the notes (SCHEMA-GUIDE §2).
+INSTANCE_KEPT = (
+    ("napkin", "left in place: no lmer release reads `_napkin/` yet (subdir mode "
+               "writes `{work_repo}/napkin`), so moving it would split the notes"),
+)
+
+#: The rollout rule both the floor refusal and the dry run state: removing
+#: `sources.yaml` switches declared sources off on any host whose release
+#: does not read the manifest tier, and this install's probe proves nothing
+#: about the other hosts.
+INSTANCE_FLOOR = (
+    "version floor: the first lmer release carrying #370 (reads the manifest "
+    "`sources:` tier); deploy #370 fleet-wide before applying the instance fold"
+)
+
+#: A single directory name a taskdef group may take: no separators, no
+#: `.`/`..`, no `--` (the session-dir label separator).
+_SAFE_GROUP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 LEGACY_RUNS = "runs"
 SCHEMA_RUNS = "_runs"
+SCHEMA_SPECS = "_specs"
 ARCHIVE_HOME = "_archive"
 
 #: The memory scopes: the legacy project dir, its schema twin, and the
@@ -247,6 +294,8 @@ class Move:
             return f"ln -s {self.dst} {prefix}/{self.src}"
         if self.kind == REPOINT:
             return f"ln -sfn {self.dst} {_join(prefix, self.src)}"
+        if self.kind == SLUG:
+            return f"rewrite {_join(prefix, self.src)}: slug: {self.was} \u2192 {self.dst}"
         verb = "git mv" if self.tracked else "mv"
         return f"{verb} {_join(prefix, self.src)} {_join(prefix, self.dst)}"
 
@@ -263,6 +312,12 @@ class Move:
         if self.kind == LINK:
             path = _join(prefix, self.src)
             return f"{path} -> {self.dst}", {"kind": self.kind, "to": self.dst, "path": path}
+        if self.kind == SLUG:
+            path = _join(prefix, self.src)
+            return (
+                f"{path}: slug: {self.was} -> {self.dst}",
+                {"kind": self.kind, "from": self.was, "to": self.dst, "path": path},
+            )
         src, dst = _join(prefix, self.src), _join(prefix, self.dst)
         return f"{src} -> {dst}", {"kind": self.kind, "from": src, "to": dst}
 
@@ -351,6 +406,8 @@ class Plan:
     blockers: tuple
     repoints: tuple = ()
     memory_lift: Optional[MemoryLift] = None
+    emptied_groups: tuple = ()
+    leftovers: tuple = ()
 
     @property
     def rel(self) -> str:
@@ -369,19 +426,45 @@ class Plan:
         return _join(self.rel, project_rel)
 
     def record_dirs(self) -> list:
-        """The record dirs whose address changes — the preflight's input."""
-        return [
+        """The record dirs whose address changes — the preflight's input.
+
+        Every record in a group being folded is included, not only the ones
+        whose slug matched: spec §7 refuses the fold while ANY record in the
+        group is live, and an unreadable sibling's lifecycle is unknown."""
+        dirs = [
             self.project_dir / move.src
             for move in self.moves
             if move.kind in (RECORD, ARCHIVE)
         ]
+        # A slug-only rewrite (an interrupted fold) writes a record that does
+        # not move: it must be stopped too. A rewrite after a move targets a
+        # dir that does not exist yet; its source is already listed above.
+        dirs.extend(
+            (self.project_dir / move.src).parent
+            for move in self.moves
+            if move.kind == SLUG and (self.project_dir / move.src).parent.is_dir()
+        )
+        for group_rel in self.emptied_groups:
+            group = self.project_dir / group_rel
+            if not group.is_dir() or group.is_symlink():
+                continue
+            for child in sorted(group.iterdir()):
+                if child.is_dir() and not child.is_symlink() and run_state._state_path(child):
+                    dirs.append(child)
+        seen, unique = set(), []
+        for path in dirs:
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        return unique
 
     def git_paths(self) -> list:
         """Every work-repo-relative path a change touches, old and new, for
         the clean-tree check and for staging."""
         paths = []
         for move in (*self.moves, *self.repoints, *self.links):
-            rels = (move.src,) if move.kind in (LINK, REPOINT) else (move.src, move.dst)
+            rels = (move.src,) if move.kind in (LINK, REPOINT, SLUG) else (move.src, move.dst)
             for rel in rels:
                 rel = self.rel_of(rel)
                 if rel not in paths:
@@ -390,7 +473,18 @@ class Plan:
             rel = self.rel_of(write.path)
             if rel not in paths:
                 paths.append(rel)
+        if self.fold_moves and (self.project_dir / SCHEMA_SPECS).is_dir():
+            rel = self.rel_of(SCHEMA_SPECS)
+            if rel not in paths:
+                paths.append(rel)
         return paths
+
+    @property
+    def fold_moves(self) -> list:
+        """The schema-form fold's record moves (`_runs/<slug>/<sid>` →
+        `_runs/<taskdef>/<sid>`): their `_specs/` entries are re-registered
+        under the record's new label rather than re-pointed in place."""
+        return [m for m in self.moves if _is_fold_move(m)]
 
     def cleanups(self) -> list:
         """Legacy directories expected empty once the moves land (git tracks
@@ -400,7 +494,8 @@ class Plan:
         if self.links:
             return []
         out = []
-        for rel in (f"{LEGACY_RUNS}/{run_state.ARCHIVE_DIR}", LEGACY_RUNS):
+        for rel in (*self.emptied_groups,
+                    f"{LEGACY_RUNS}/{run_state.ARCHIVE_DIR}", LEGACY_RUNS):
             directory = self.project_dir / rel
             if not directory.is_dir() or directory.is_symlink():
                 continue
@@ -416,7 +511,11 @@ class Plan:
     def summary(self) -> str:
         """`N moves, N re-points, N index writes, N compat links` — the
         families that apply, counted."""
-        parts = [_count(len(self.moves), "move")]
+        renames = [m for m in self.moves if m.kind != SLUG]
+        parts = [_count(len(renames), "move")]
+        slugs = len(self.moves) - len(renames)
+        if slugs:
+            parts.append(_count(slugs, "slug rewrite"))
         if self.repoints:
             parts.append(_count(len(self.repoints), "re-point"))
         if self.index_writes:
@@ -428,10 +527,15 @@ class Plan:
     def render(self) -> str:
         """The dry-run text."""
         lines = [f"work migrate {self.project} — plan for `{self.rel}/`"]
-        if self.is_noop:
+        if self.is_noop and self.leftovers:
+            lines.append(
+                f"nothing this tool can move: {_count(len(self.leftovers), 'plain-session record')} "
+                "in `_runs/` cannot be folded automatically (see notes)"
+            )
+        elif self.is_noop:
             lines.append(
                 f"nothing to migrate: `{self.project}` is already in schema form "
-                "(no legacy run dirs, no bare areas)"
+                "(no legacy run dirs, no bare areas, no plain-session leftovers)"
             )
         for move in self.moves:
             lines.append(move.render(self.rel))
@@ -648,12 +752,15 @@ def plan_project(project: str, *, root: Optional[Path] = None, compat_link: bool
     planner.areas()
     instance_dir = root / INSTANCE_MEMORY
     planner.memory(instance_dir, os.path.relpath(instance_dir, project_dir).replace(os.sep, "/"))
+    planner.fold_plain_sessions()
     planner.index_links()
     links = tuple(_compat_links(moves)) if compat_link else ()
     return Plan(
         root=root, project=project, project_dir=project_dir,
         moves=tuple(moves), links=links, notes=tuple(notes), blockers=tuple(blockers),
         repoints=tuple(repoints), memory_lift=planner.memory_lift,
+        emptied_groups=tuple(dict.fromkeys(planner.emptied_groups)),
+        leftovers=tuple(planner.leftovers),
     )
 
 
@@ -734,6 +841,31 @@ class _Planner:
         self.notes, self.blockers = notes, blockers
         self.tracked = tracked
         self.memory_lift: Optional[MemoryLift] = None
+        self.emptied_groups: list = []
+        self.leftovers: list = []
+
+    def fold_slug(self, src_dir: Path, src: str, dst: str, state: dict) -> bool:
+        """Plan the fold's `slug:` rewrite for the record at *src_dir*
+        (project-relative *src*), landing at *dst*. The rewrite is computed
+        and checked HERE, so a state file the surgery cannot handle is a
+        blocker before anything moves, never a half-applied tree."""
+        taskdef = state.get("taskdef")
+        if not _is_safe_group(taskdef):
+            self.blockers.append(
+                f"{src}: taskdef {taskdef!r} is not a single safe directory name; "
+                "fold this record by hand"
+            )
+            return False
+        state_file = run_state._state_path(src_dir)
+        try:
+            _slug_rewritten(state_file.read_text(encoding="utf-8"), taskdef)
+        except (MigrateError, OSError, UnicodeDecodeError) as exc:
+            self.blockers.append(f"{src}: {exc}")
+            return False
+        self.moves.append(
+            Move(SLUG, f"{dst}/{state_file.name}", taskdef, was=state.get("slug"))
+        )
+        return True
 
     def run_dirs(self, area_rel: str, dst_prefix: str, kind: str) -> None:
         """Every record-shaped child of one legacy run area nests under its
@@ -764,7 +896,20 @@ class _Planner:
                 continue
             slug, _sep, label = name.partition("--")
             sid, source, starts = legacy_session_id(child)
-            dst = f"{dst_prefix}/{slug}/{sid}" + (f"--{label}" if label else "")
+            state = run_state._read_sibling_state(child) or {}
+            folded = kind == RECORD and run_state.is_legacy_plain_session_slug(state)
+            # A legacy record that is a pre-A1 plain-session leftover nests
+            # straight into the bare taskdef group: the nesting and the §7
+            # fold are ONE move here, and its `slug:` scalar is rewritten
+            # after it (B.fold).
+            if folded and not _is_safe_group(state.get("taskdef")):
+                folded = False
+                self.blockers.append(
+                    f"{src}: taskdef {state.get('taskdef')!r} is not a single safe "
+                    "directory name; fold this record by hand"
+                )
+            group = state.get("taskdef") if folded else slug
+            dst = f"{dst_prefix}/{group}/{sid}" + (f"--{label}" if label else "")
             remarks = []
             if starts > 1:
                 remarks.append(
@@ -783,6 +928,67 @@ class _Planner:
             self.moves.append(
                 Move(kind, src, dst, note="; ".join(remarks) or None, tracked=self.tracked(src))
             )
+            if folded:
+                self.fold_slug(child, src, dst, state)
+
+    def fold_plain_sessions(self) -> None:
+        """Spec §7's fold for a schema-form tree: a `_runs/<slug>/<sid>/`
+        whose state is a pre-A1 plain-session leftover moves into the bare
+        taskdef group, its `slug:` scalar rewritten (B.fold). A legacy tree
+        already folded its records into the nesting destination
+        (`run_dirs`), so this scans only `_runs/`. Idempotent: after the fold
+        nothing matches, so a re-run plans nothing.
+
+        A destination session dir that already exists is reported and
+        skipped — never overwritten, and never a reason to hold back the
+        other moves; the validator keeps naming the leftover until it is
+        merged by hand. A record already sitting in its bare taskdef group
+        with the obsolete slug (a fold interrupted between its move and its
+        rewrite) gets the rewrite alone."""
+        runs = self.project_dir / SCHEMA_RUNS
+        if not runs.is_dir() or runs.is_symlink():
+            return
+        destinations = {move.dst for move in self.moves}
+        for group in sorted(runs.iterdir()):
+            if not group.is_dir() or group.is_symlink() or group.name.startswith("."):
+                continue
+            folding, staying = False, []
+            for child in sorted(group.iterdir()):
+                if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+                    continue
+                if run_state._state_path(child) is None:
+                    continue
+                src = f"{SCHEMA_RUNS}/{group.name}/{child.name}"
+                state = run_state._read_sibling_state(child) or {}
+                if not run_state.is_legacy_plain_session_slug(state):
+                    staying.append(src)
+                    continue
+                taskdef = state["taskdef"]
+                if group.name == taskdef:
+                    self.fold_slug(child, src, src, state)
+                    continue
+                dst = f"{SCHEMA_RUNS}/{taskdef}/{child.name}"
+                if not _is_safe_group(taskdef):
+                    self.fold_slug(child, src, dst, state)  # records the blocker
+                    continue
+                if os.path.lexists(self.project_dir / dst) or dst in destinations:
+                    note = (
+                        f"{src}: not folded — {dst} already exists (skipped, never "
+                        "overwritten); merge the two session dirs by hand, then re-run"
+                    )
+                    self.notes.append(note)
+                    self.leftovers.append(note)
+                    continue
+                destinations.add(dst)
+                self.moves.append(Move(RECORD, src, dst, tracked=self.tracked(src)))
+                self.fold_slug(child, src, dst, state)
+                folding = True
+            if folding:
+                self.emptied_groups.append(f"{SCHEMA_RUNS}/{group.name}")
+                self.notes.extend(
+                    f"{rel}: not a plain-session leftover; stays in {SCHEMA_RUNS}/{group.name}/"
+                    for rel in staying
+                )
 
     def areas(self) -> None:
         for old, new in AREA_RENAMES:
@@ -853,7 +1059,7 @@ class _Planner:
         renames so far moves is re-pointed, in place, at the moved path. A
         link that already dangles, or an absolute one, is reported and left:
         not this tool's hygiene to fix, and never dropped."""
-        renames = list(self.moves)
+        renames = [m for m in self.moves if m.kind != SLUG and not _is_fold_move(m)]
         for area in INDEX_AREAS:
             directory = self.project_dir / area
             if directory.is_symlink() or not directory.is_dir():
@@ -1034,6 +1240,8 @@ def _compat_links(moves) -> list:
     for move in moves:
         if move.kind == MEMORY and move.src != LEGACY_MEMORY:
             continue
+        if move.kind == SLUG or _is_fold_move(move):
+            continue  # not an old path: a rewrite, or a move inside `_runs/`
         if move.kind in (AREA, MEMORY):
             target = move.dst
         else:
@@ -1054,6 +1262,343 @@ def _dirty_paths(root: Path, rels: list) -> list:
     if rc != 0:
         raise MigrateError(f"git status failed under {root}: {output}")
     return [line for line in output.splitlines() if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# The instance form (`work migrate --instance`, #368, spec §10 rollout E→B)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InstancePlan:
+    """What `work migrate --instance` would do, as data.
+
+    `moves` are the instance-surface renames; `sources` the full `sources:`
+    mapping the manifest should hold after folding the standalone file (None
+    when nothing changes); `sources_file` the file to remove (None when
+    absent); `source_warnings` the loader's forward-compat warnings;
+    `blockers` what stops the apply; `notes` what is left in place and why.
+    Git cleanliness is not stored here — the apply checks it under the lock,
+    right after planning there.
+    """
+
+    root: Path
+    moves: tuple
+    sources: Optional[dict]
+    sources_file: Optional[Path]
+    source_warnings: tuple
+    blockers: tuple
+    notes: tuple = ()
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.moves and self.sources is None and self.sources_file is None
+
+    def rel(self) -> str:
+        return "."
+
+    def git_paths(self) -> list:
+        paths = []
+        for move in self.moves:
+            for rel in (move.src, move.dst):
+                if rel not in paths:
+                    paths.append(rel)
+        if self.sources is not None and MANIFEST_NAME not in paths:
+            paths.append(MANIFEST_NAME)
+        if self.sources_file is not None and INSTANCE_SOURCES not in paths:
+            paths.append(INSTANCE_SOURCES)
+        return paths
+
+    def summary(self) -> str:
+        parts = [_count(len(self.moves), "move")]
+        if self.sources_file is not None:
+            parts.append(_count(len(self.sources or {}), "source"))
+        return ", ".join(parts)
+
+    def render(self) -> str:
+        lines = ["work migrate --instance — plan for the instance surfaces", f"# {INSTANCE_FLOOR}"]
+        if self.is_noop:
+            lines.append("nothing to migrate: the instance surfaces are already in schema form")
+        for move in self.moves:
+            lines.append(move.render("."))
+        if self.sources_file is not None:
+            lines.append(f"fold {INSTANCE_SOURCES} into {MANIFEST_NAME} sources:")
+            for name, entry in (self.sources or {}).items():
+                ref = f" (ref: {entry['ref']})" if entry.get("ref") else ""
+                lines.append(f"  {name}: {entry['repo']}{ref}")
+            lines.append(f"remove {INSTANCE_SOURCES}")
+        lines.extend(f"    # {warning}" for warning in self.source_warnings)
+        if self.notes:
+            lines.append("notes:")
+            lines.extend(f"  - {note}" for note in self.notes)
+        if self.blockers:
+            lines.append("blockers (the apply refuses until these are resolved):")
+            lines.extend(f"  - {blocker}" for blocker in self.blockers)
+        if not self.is_noop:
+            lines.append(f"{self.summary()}; dry run — add --apply to perform them in ONE commit")
+        return "\n".join(lines)
+
+    def commit_message(self) -> str:
+        subject = f"work migrate --instance: {self.summary()} to schema form"
+        body = [move.render(".") for move in self.moves]
+        if self.sources_file is not None:
+            body.append(f"fold {INSTANCE_SOURCES} into {MANIFEST_NAME} sources:")
+            body.extend(
+                f"  {name}: {entry['repo']}" for name, entry in (self.sources or {}).items()
+            )
+            body.append(f"remove {INSTANCE_SOURCES}")
+        return subject + "\n\n" + "\n".join(body) + "\n"
+
+
+def _instance_moves(root: Path) -> tuple:
+    moves, notes, blockers = [], [], []
+    for kept, why in INSTANCE_KEPT:
+        if os.path.lexists(root / kept):
+            notes.append(f"{kept}/: {why}")
+    for src, dst in INSTANCE_RENAMES:
+        src_path, dst_path = root / src, root / dst
+        if not os.path.lexists(src_path):
+            continue
+        if src_path.is_symlink():
+            notes.append(f"{src}: already a symlink -> {os.readlink(src_path)}, left in place")
+            continue
+        if not src_path.is_dir():
+            notes.append(f"{src}: a file, left in place")
+            continue
+        if os.path.lexists(dst_path):
+            blockers.append(f"{src}/ and {dst}/ both exist; merge them by hand, then re-run")
+            continue
+        moves.append(Move(AREA, src, dst, tracked=git_ops._has_tracked_files(root, src)))
+    return tuple(moves), tuple(notes), tuple(blockers)
+
+
+def _instance_sources(root: Path, work_repo_url) -> tuple:
+    """``(parsed, warnings, file, blockers)`` for the standalone
+    ``sources.yaml``, read by the container loader's own legacy tier
+    (``load_sources`` with no manifest section) so the fold carries exactly
+    what a launch would have resolved: the file-level rules, the per-entry
+    trust rule, the ignored names. Any refusal is a blocker in the loader's
+    own words. The transport spelling is carried as the loader hands it
+    over (never normalized to a registry identity)."""
+    legacy = root / INSTANCE_SOURCES
+    if not legacy.is_file():
+        return None, (), None, ()
+    from lmer_cli.container.sources import SourcesConfigError, load_sources
+
+    if not work_repo_url:
+        return None, (), legacy, (
+            f"{INSTANCE_SOURCES}: the work repo's URL is unknown, so the same-host "
+            "trust rule cannot be checked; set LMER_WORK_REPO or give the work "
+            "repo an `origin` remote",
+        )
+    try:
+        config, warnings = load_sources(legacy, work_repo_url)
+    except SourcesConfigError as exc:
+        return None, (), legacy, (str(exc),)
+    parsed = dict((config or {}).get("sources") or {})
+    return parsed, tuple(warnings), legacy, ()
+
+
+def _work_repo_url(root: Path) -> Optional[str]:
+    """The URL the trust rule checks against: the container's own input
+    (``LMER_WORK_REPO``), else the work repo's ``origin``. Never
+    ``LMER_REPO_URL`` — that is the session's target repo."""
+    url = os.environ.get("LMER_WORK_REPO")
+    if url:
+        return url
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _instance_probe() -> bool:
+    """E.probe's importable capability marker, fail-closed: absent, false or
+    unimportable all mean this release cannot read the manifest `sources:`
+    tier, so the fold must refuse (spec §10, astra R7)."""
+    try:
+        from lmer_cli.container import sources as sources_mod
+
+        return bool(getattr(sources_mod, "MANIFEST_TIER_SUPPORTED", False))
+    except Exception:
+        return False
+
+
+def plan_instance(*, root: Optional[Path] = None, work_repo_url=None) -> InstancePlan:
+    """The plan for `work migrate --instance`, after the version floor.
+    Read-only. Raises :class:`MigrateError` when the running release cannot
+    read the manifest tier (the fold would switch declared sources off)."""
+    root = Path(root) if root is not None else work_repo_root()
+    if not _instance_probe():
+        raise MigrateError(
+            "this lmer does not read the manifest `sources:` tier (no "
+            "MANIFEST_TIER_SUPPORTED). `work migrate --instance` removes "
+            f"{INSTANCE_SOURCES}, which would switch declared sources off on any "
+            f"host still running a pre-#370 release. {INSTANCE_FLOOR}."
+        )
+    manifest = root / MANIFEST_NAME
+    if not (manifest.is_symlink() or manifest.exists()):
+        raise MigrateError(
+            f"no {MANIFEST_NAME} at {root}: this is a legacy tree. Register the "
+            "project first — `work adopt <host>/<project> <name>` — then migrate it."
+        )
+    try:
+        writer = core_module("writer").load_for_write(manifest)
+    except CoreUnavailableError as exc:
+        raise MigrateError(
+            "this lmer build has no lmer-schema core and is below the version "
+            f"floor for a schema-form tree ({exc}); update lmer on this host first"
+        ) from exc
+    except Exception as exc:
+        raise MigrateError(f"`schema:` is not writable: {exc}") from exc
+
+    moves, notes, blockers = _instance_moves(root)
+    manifest_sources = dict(writer.manifest.sources or {})
+    legacy, warnings, legacy_file, source_blockers = _instance_sources(root, work_repo_url)
+    blockers = blockers + source_blockers
+    sources = None
+    if legacy is not None:
+        merged = dict(legacy)
+        for name, entry in manifest_sources.items():
+            if name in merged:
+                warnings = warnings + (
+                    f"`sources.{name}` is also declared in {MANIFEST_NAME}, which "
+                    f"takes precedence; the {INSTANCE_SOURCES} entry is dropped",
+                )
+            merged[name] = entry
+        if merged != manifest_sources:
+            sources = merged
+    return InstancePlan(
+        root=root, moves=moves, sources=sources, sources_file=legacy_file,
+        source_warnings=warnings, blockers=blockers, notes=notes,
+    )
+
+
+def _apply_instance(*, root: Path, work_repo_url, out: Callable[[str], None],
+                    err: Callable[[str], None]) -> int:
+    configured = work_repo_root()
+    if _resolved(root) != _resolved(configured):
+        raise MigrateError(
+            f"LMER_WORK_REPO_PATH ({configured}) must name the tree being migrated "
+            f"({root}): the commit helper is bound to the configured checkout"
+        )
+    with work_mutation(root):
+        plan = plan_instance(root=root, work_repo_url=work_repo_url)
+        if plan.is_noop:
+            out(plan.render())
+            return 0
+        for warning in plan.source_warnings:
+            out(f"    # {warning}")
+        problems = list(plan.blockers)
+        problems += [f"dirty in git: {line}" for line in _dirty_paths(root, plan.git_paths())]
+        if problems:
+            for problem in problems:
+                err(f"\u274c {problem}")
+            err("refused: nothing was changed")
+            return 1
+
+        applied = []
+        for move in plan.moves:
+            (root / move.dst).parent.mkdir(parents=True, exist_ok=True)
+            if move.tracked:
+                rc, output = git_ops.run_git_command(
+                    ["mv", move.src, move.dst], root, check=False
+                )
+                if rc != 0:
+                    err(f"\u274c git mv {move.src} {move.dst} failed: {output}")
+                    return rc
+            else:
+                os.rename(root / move.src, root / move.dst)
+            out(move.render("."))
+            applied.append(move)
+        if plan.sources is not None:
+            writer = core_module("writer").load_for_write(root / MANIFEST_NAME)
+            writer.set_sources(plan.sources)
+            rc = _stage(root, MANIFEST_NAME, err)
+            if rc != 0:
+                return rc
+            out(f"{MANIFEST_NAME}: sources folded in")
+        if plan.sources_file is not None:
+            os.unlink(plan.sources_file)
+            out(f"remove {INSTANCE_SOURCES}")
+
+        paths = plan.git_paths() + _record_instance_in_caller(plan, applied, out)
+        rc = git_ops.commit_work_path(paths, plan.commit_message())
+        if rc == 0:
+            out(f"\u2705 work migrate --instance: {plan.summary()} applied in one commit")
+        return rc
+
+
+def _record_instance_in_caller(plan: InstancePlan, applied: list,
+                               out: Callable[[str], None]) -> list:
+    """The project form's event/log rule, for the instance plan: one
+    :data:`MOVE_EVENT` per applied change plus a run-log line in the CALLER's
+    own record when there is one. From an operator shell the commit message
+    carries the list."""
+    caller = _caller_record()
+    if caller is None:
+        out("\u2139\ufe0f  no session record here; the commit message lists the moves")
+        return []
+    for change in applied:
+        note, data = change.event(plan.rel())
+        try:
+            run_state.append_event(
+                caller, MOVE_EVENT, note=note, data={"instance": True, **data},
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            out(f"\u26a0\ufe0f  {MOVE_EVENT} events not recorded in {caller}: {exc}")
+            break
+    try:
+        from .loggers import get_logger  # local: loggers imports run_state
+
+        get_logger(caller / "log.yaml").log(
+            f"work migrate --instance: applied {plan.summary()} to schema form"
+        )
+    except Exception as exc:
+        out(f"\u26a0\ufe0f  run-log line not recorded in {caller}: {exc}")
+    try:
+        return list(run_state.run_rel_path_candidates())
+    except Exception:
+        return []
+
+
+def migrate_instance(
+    *,
+    root: Optional[Path] = None,
+    apply: bool = False,
+    work_repo_url=None,
+    out: Callable[[str], None] = print,
+    err: Optional[Callable[[str], None]] = None,
+) -> int:
+    """`work migrate --instance [--apply]` as a library call."""
+    if err is None:
+        err = lambda line: print(line, file=sys.stderr)  # noqa: E731
+    root = Path(root) if root is not None else work_repo_root()
+    if work_repo_url is None:
+        work_repo_url = _work_repo_url(root)
+    try:
+        if not apply:
+            plan = plan_instance(root=root, work_repo_url=work_repo_url)
+            out(plan.render())
+            if not plan.is_noop:
+                dirty = _dirty_paths(root, plan.git_paths())
+                if dirty:
+                    out("dirty in git (the apply refuses until these are clean):")
+                    for line in dirty:
+                        out(f"  {line}")
+            return 0
+        return _apply_instance(
+            root=root, work_repo_url=work_repo_url, out=out, err=err
+        )
+    except MigrateError as exc:
+        err(f"\u274c {exc}")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1095,15 +1640,29 @@ def _apply(
             return 0
         problems = list(plan.blockers)
         problems += [f"dirty in git: {line}" for line in _dirty_paths(root, plan.git_paths())]
-        problems += preflight_no_live_records(plan.record_dirs())
+        live = preflight_no_live_records(plan.record_dirs())
+        problems += live
         if problems:
             for problem in problems:
                 err(f"❌ {problem}")
+            if live:
+                err(LIVE_REMEDY)
             err("refused: nothing was changed")
             return 1
 
         applied = []
         for move in plan.moves:
+            if move.kind == SLUG:
+                # The fold's one scalar: positional surgery on the moved
+                # state file, nothing else (spec §7, §1.6).
+                rel = plan.rel_of(move.src)
+                _rewrite_slug(root / rel, move.dst)
+                rc = _stage(root, rel, err)
+                if rc != 0:
+                    return rc
+                out(move.render(plan.rel))
+                applied.append(move)
+                continue
             src, dst = plan.rel_of(move.src), plan.rel_of(move.dst)
             (root / dst).parent.mkdir(parents=True, exist_ok=True)
             if move.tracked:
@@ -1137,6 +1696,11 @@ def _apply(
                 return rc
             out(repoint.render(plan.rel))
             applied.append(repoint)
+        if plan.fold_moves and (plan.project_dir / SCHEMA_SPECS).is_dir():
+            _reregister_fold_specs(plan, out)
+            rc = _stage(root, plan.rel_of(SCHEMA_SPECS), err)
+            if rc != 0:
+                return rc
         for link in plan.links:
             rel = plan.rel_of(link.src)
             os.symlink(link.dst, root / rel)
@@ -1165,6 +1729,84 @@ def _stage(root: Path, rel: str, err: Callable[[str], None]) -> int:
     if rc != 0:
         err(f"❌ git add {rel} failed: {output}")
     return rc
+
+
+def _rewrite_slug(path: Path, new_slug: str) -> None:
+    """Rewrite exactly the `slug:` scalar in a state file (the fold's ONE
+    write to a record), as :func:`_slug_rewritten` computes it."""
+    path.write_text(_slug_rewritten(path.read_text(encoding="utf-8"), new_slug), encoding="utf-8")
+
+
+def _slug_rewritten(text: str, new_slug: str) -> str:
+    """*text* with its one `slug:` scalar replaced by positional surgery —
+    the way `lmer_schema.migration` rewrites `schema:` — and every other
+    byte identical; no YAML dump (spec §7, §1.6). Raises
+    :class:`MigrateError` for anything the surgery cannot do safely: not a
+    mapping, no or several `slug:` keys, an alias or a non-scalar value, or
+    a result that parses to anything but the old record with the new slug."""
+    import yaml
+
+    try:
+        node = yaml.compose(text)
+        before = yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise MigrateError("state file is not valid YAML; cannot rewrite `slug:`") from None
+    if not isinstance(node, yaml.MappingNode) or not isinstance(before, dict):
+        raise MigrateError("state file is not a YAML mapping; cannot rewrite `slug:`")
+    pairs = [
+        (key, value) for key, value in node.value
+        if isinstance(key, yaml.ScalarNode) and key.value == "slug"
+    ]
+    if len(pairs) != 1:
+        raise MigrateError(
+            f"state file has {len(pairs)} `slug:` keys; exactly one can be rewritten"
+        )
+    key, value = pairs[0]
+    start, end = value.start_mark.index, value.end_mark.index
+    if not isinstance(value, yaml.ScalarNode) or text[key.end_mark.index:start].strip() != ":":
+        raise MigrateError("`slug:` is not a plain scalar (an alias or a collection); fold it by hand")
+    spelled = new_slug if yaml.safe_load(new_slug) == new_slug else json.dumps(new_slug)
+    after = text[:start] + spelled + text[end:]
+    try:
+        reread = yaml.safe_load(after)
+    except yaml.YAMLError:
+        reread = None
+    if reread != {**before, "slug": new_slug}:
+        raise MigrateError("rewriting `slug:` would change more than that scalar; fold it by hand")
+    return after
+
+
+def _is_safe_group(name) -> bool:
+    return (
+        isinstance(name, str)
+        and _SAFE_GROUP_RE.fullmatch(name) is not None
+        and "--" not in name
+    )
+
+
+def _is_fold_move(move) -> bool:
+    """A schema-form fold move: a record moving between two `_runs/` groups."""
+    return move.kind == RECORD and move.src.startswith(f"{SCHEMA_RUNS}/")
+
+
+def _reregister_fold_specs(plan: Plan, out: Callable[[str], None]) -> None:
+    """Each folded record's `_specs/` entries, re-registered at the moved
+    path under the record's NEW label with their registration dates kept —
+    `specs_index`'s own re-point, given the project's areas explicitly so
+    it runs from an operator shell (spec §7, §13.C)."""
+    specs = plan.project_dir / SCHEMA_SPECS
+    runs = plan.project_dir / SCHEMA_RUNS
+    for move in plan.fold_moves:
+        moved = plan.project_dir / move.dst
+        specs_index.repoint_run_dir_entries(
+            move.src[len(SCHEMA_RUNS) + 1:],
+            move.dst[len(SCHEMA_RUNS) + 1:],
+            specs_index.run_label(moved),
+            project_dir=plan.project_dir,
+            specs_directory=specs,
+            run_area=runs,
+        )
+    out(f"re-registered {plan.rel_of(SCHEMA_SPECS)}/ entries of {_count(len(plan.fold_moves), 'folded record')}")
 
 
 def _write_index(path: Path, text: str) -> None:
@@ -1258,22 +1900,97 @@ def migrate_project(
         return 1
 
 
-def cmd_migrate(args) -> int:
-    """The `work migrate` handler: `args.project`, `args.apply`,
-    `args.compat_link`. `--instance` is B.instance-floor's and is named,
-    not silently ignored."""
-    if getattr(args, "instance", False):
+def _validate_schema_tier(root: Path, scope: Iterable[str]) -> int:
+    """Run the validator at the schema tier after an applied migration and
+    print its whole report; the exit code counts the ERRORs under *scope*
+    (work-repo-relative paths this run touched) and the root-level ones
+    (``.``: a manifest finding, or a crashed check attributed to
+    ``runner.check-failed``), so one project's migration is not failed by
+    another project still waiting its turn (SCHEMA-GUIDE §3: migrate
+    project by project) while a tree-wide ERROR still fails it. An
+    unusable tree still fails. The commit stands either way. Fail-soft
+    when the core is unavailable: the migration itself already required
+    it."""
+    try:
+        schema_cli = core_module("cli")
+        validate = core_module("checks.runner").validate
+        findings_api = core_module("checks.findings")
+    except CoreUnavailableError as exc:  # pragma: no cover - the apply imported the core
+        print(f"\u26a0\ufe0f  validator unavailable: {exc}", file=sys.stderr)
+        return 0
+    # The CLI's own rule: the work repo's URL arms the manifest's same-host
+    # `sources:` guard (the tree being migrated IS the configured work repo).
+    url = next((os.environ[v] for v in schema_cli.PLEXUS_URL_ENV if os.environ.get(v)), None)
+    report = validate(str(root), plexus_repo_url=url)
+    for line in schema_cli.render_text(report, str(root)):
+        print(line)
+    if report.exit_code == findings_api.EXIT_UNUSABLE:
+        return report.exit_code
+    scope = tuple(scope)
+    outside = 0
+    for finding in report.findings:
+        if finding.severity is not findings_api.Severity.ERROR:
+            continue
+        if finding.path == "." or any(
+            finding.path == rel or finding.path.startswith(rel + "/") for rel in scope
+        ):
+            return findings_api.EXIT_ERRORS
+        outside += 1
+    if outside:
         print(
-            "❌ `work migrate --instance` is not in this release yet; "
-            "`work migrate <project>` migrates one registered project",
+            f"\u2139\ufe0f  {_count(outside, 'ERROR')} outside what this run migrated "
+            "(another project or surface); not counted in the exit code"
+        )
+    return findings_api.EXIT_CLEAN
+
+
+def _validation_scope(root: Path, project: Optional[str], instance: bool) -> list:
+    """The work-repo-relative paths an applied run touched: the project dir
+    (plus the instance memory scope a memory lift writes into), or the
+    instance surfaces with the manifest and the folded-away file."""
+    if instance:
+        rels = [MANIFEST_NAME, INSTANCE_SOURCES]
+        rels.extend(dst for _src, dst in INSTANCE_RENAMES)
+        return rels
+    try:
+        return [_resolve_project_dir(root, project).relative_to(root).as_posix(), INSTANCE_MEMORY]
+    except (MigrateError, ValueError):
+        return [project, INSTANCE_MEMORY]
+
+
+def cmd_migrate(args) -> int:
+    """The `work migrate` handler: `args.project` or `args.instance`,
+    `args.apply`, `args.compat_link`. After an applied migration the validator
+    runs at the schema tier; its exit code is surfaced, the commit stands."""
+    apply = bool(getattr(args, "apply", False))
+    instance = bool(getattr(args, "instance", False))
+    project = getattr(args, "project", None)
+    if instance:
+        if getattr(args, "compat_link", False):
+            print(
+                "\u274c --compat-link applies to the project form only; the "
+                "instance surfaces get no compatibility links",
+                file=sys.stderr,
+            )
+            return 2
+        rc = migrate_instance(apply=apply)
+    elif project:
+        rc = migrate_project(
+            project,
+            apply=apply,
+            compat_link=bool(getattr(args, "compat_link", False)),
+        )
+    else:
+        print(
+            "\u274c work migrate needs a project or --instance "
+            "(mutually exclusive)",
             file=sys.stderr,
         )
-        return 1
-    return migrate_project(
-        args.project,
-        apply=bool(getattr(args, "apply", False)),
-        compat_link=bool(getattr(args, "compat_link", False)),
-    )
+        return 2
+    if rc == 0 and apply:
+        root = work_repo_root()
+        rc = _validate_schema_tier(root, _validation_scope(root, project, instance))
+    return rc
 
 
 def write_rel_paths(args) -> Optional[list]:
@@ -1284,6 +2001,16 @@ def write_rel_paths(args) -> Optional[list]:
     plus the caller's own record when there is one. Never raises."""
     if not getattr(args, "apply", False):
         return None
+    if getattr(args, "instance", False):
+        # The instance surfaces, plus the manifest and the folded-away file.
+        rels = [MANIFEST_NAME, INSTANCE_SOURCES]
+        rels.extend(src for src, _dst in INSTANCE_RENAMES)
+        rels.extend(dst for _src, dst in INSTANCE_RENAMES)
+        try:
+            rels.extend(rel for rel in run_state.run_rel_path_candidates() if rel not in rels)
+        except Exception:
+            pass
+        return rels
     project = getattr(args, "project", None)
     rels = []
     try:

@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 
 from .manifest import MANIFEST_NAME, ManifestError, load_manifest
-from .registry import RegistryError, build_registry, resolve_project_dir
+from .registry import RegistryError, build_registry, is_host_bucket_name, resolve_project_dir
 
 
 def _identity_blockers(root: Path, registry) -> list[str]:
@@ -33,13 +33,33 @@ def _identity_blockers(root: Path, registry) -> list[str]:
     return list(dict.fromkeys(blockers))
 
 
-def _record_blockers(root: Path) -> list[str]:
-    from .checks.record import iter_run_areas
+def _is_bucket_area(root: Path, area: Path) -> bool:
+    """Whether a run area sits inside a host bucket. A bucket never blocks
+    (D9), so neither the blocker nor the validator check fires there."""
+    return area != root and is_host_bucket_name(area.relative_to(root).parts[0])
+
+
+def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
+    """``(blockers, moves)`` for the records a schema-1→2 cutover cannot
+    carry over.
+
+    The plain-session leftover (§7, D10) is one of them: its slug is the
+    obsolete derivation of its own target, and the fold belongs to
+    ``work migrate <project>``, so ``--apply`` refuses and the preview lists
+    the directory move. The predicate and the move text are the validator
+    check's, imported verbatim (``record.plain-session-slug``), never
+    re-derived here. A host bucket is skipped: a bucket never blocks (D9).
+    """
+    from .checks.record import iter_run_areas, plain_session_move_text
     from work_repo import run_state, session_record
+    from work_repo.run_state import is_legacy_plain_session_slug
 
     blockers = []
+    moves = []
     seen = set()
+    folded = set()
     for area, _layout in iter_run_areas(root):
+        bucket = _is_bucket_area(root, area)
         for record in run_state.iter_record_dirs(area):
             relative = record.relative_to(root).as_posix()
             try:
@@ -60,13 +80,33 @@ def _record_blockers(root: Path) -> list[str]:
                 events = run_state.read_events(record, last_n=0)
                 if state.get("status") == "in-progress" and not session_record.signed_out(events):
                     blockers.append(f"{relative}: no recorded sign-out; resolve the prior session first")
+                if not bucket and is_legacy_plain_session_slug(state):
+                    # One blocker and one move per GROUP, named by where it
+                    # sits on disk: a legacy record dir is its own group.
+                    group = record if record.parent == area else record.parent
+                    if group not in folded:
+                        folded.add(group)
+                        slug, taskdef = state.get("slug"), state.get("taskdef")
+                        group_rel = group.relative_to(root).as_posix()
+                        blockers.append(
+                            f"{group_rel}: " + plain_session_move_text(
+                                slug, taskdef, area=area.name, group=group.name
+                            )
+                        )
+                        project_rel = area.parent.relative_to(root).as_posix()
+                        moves.append({
+                            "from": group_rel,
+                            "to": f"_runs/{taskdef}" if project_rel == "."
+                                  else f"{project_rel}/_runs/{taskdef}",
+                            "slug": f"{slug} \u2192 {taskdef}",
+                        })
             except yaml.YAMLError:
                 # Parser messages include source lines, which can contain
                 # credentials in historical records.
                 blockers.append(f"{relative}: unreadable record (invalid YAML)")
             except (OSError, ValueError) as exc:
                 blockers.append(f"{relative}: unreadable record ({exc})")
-    return blockers
+    return blockers, moves
 
 
 def migrate(root: Path, *, apply: bool = False) -> dict:
@@ -105,7 +145,9 @@ def migrate(root: Path, *, apply: bool = False) -> dict:
     # Rebuild under both contracts; schema-2 identity must be unambiguous.
     build_registry(manifest)
     registry = build_registry(replace(manifest, schema=2))
-    result["blockers"] = _identity_blockers(root, registry) + _record_blockers(root)
+    record_blockers, moves = _record_blockers(root)
+    result["blockers"] = _identity_blockers(root, registry) + record_blockers
+    result["moves"] = moves
     if not apply or result["blockers"]:
         return result
     # Do not overwrite a manifest changed while preflight was reading records.
