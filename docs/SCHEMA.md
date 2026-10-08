@@ -477,6 +477,20 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
 - A bare `git clone` of any conforming plexus is readable markdown throughout
   and passes `lmer-schema validate` with no errors.
 
+### Tool writes
+
+The registry writer (`lmer_schema.writer`) is the ONE tool that rewrites
+`_plexus.yaml`. It writes canonical remotes (the same normalizer resolution
+uses), checks the registry's invariants BEFORE anything reaches disk (a
+non-canonical spelling is a WARN, a remote bound twice is an error, and an
+unusable manifest is refused with the file byte-identical), and replaces the
+file atomically. Comments, blank lines, quoting and indentation are preserved
+by a ruamel.yaml round trip, with the exact comment behaviour decided in
+[DEVELOPMENT.md](./DEVELOPMENT.md) (a rewritten scalar keeps its end-of-line
+comment on its original column; `null` spelling is normalized). Hand edits stay
+legal — the writer is a convenience, not a gate — and `writer.create()` is the
+one call that flips a tree's form, by adding the manifest.
+
 ## Archive and housekeeping
 
 - `_archive/` exists at instance level and, as needed, per project tree.
@@ -966,12 +980,13 @@ name (`runs/`, `specs/`, `info/`, `memory/`, `napkin/`, `taskdef/`,
 `agent-files/`, `mirrors/`, a standalone `sources.yaml`), and validates at the
 legacy tier.
 
-Migrating is never a prerequisite. Migration is incremental and per tree: a
-project tree migrates by gaining a registry entry, moving from
-`{host}/{project}/` to `<short-name>/`, renaming its bare areas to their `_`
-names and re-pointing its index symlinks — one commit, with an OPTIONAL
-compatibility symlink at the old path. The instance surfaces migrate
-independently of any project tree; memory migrates by lifting every
+Migrating is never a prerequisite. Migration is incremental and per tree, and
+it is tooling: `work adopt <host>/<project> <shortname>` gains the registry
+entry and moves `{host}/{project}/` to `<short-name>/` in one commit, then
+`work migrate <project>` renames the bare areas to their `_` names,
+nests the run dirs and re-points the index symlinks — one commit, with an
+OPTIONAL compatibility symlink at the old path. The instance surfaces migrate
+independently with `work migrate --instance`; memory migrates by lifting every
 non-`project`-type memory from `<project>/memory/` to `_agents/memory/`. The
 underscore and the flat short name make each tree's migration state visible
 in `ls`.

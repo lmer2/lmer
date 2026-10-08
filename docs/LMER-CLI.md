@@ -1555,6 +1555,47 @@ One related case is automatic. When a stopped run is relaunched with a pushed an
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
 
+### Adopting and migrating a work repo (`work adopt` / `work migrate`)
+
+Both verbs are **operator-shell** verbs: they run from a work-repo checkout
+with no session env, are exempt from the session-uid gate, and still declare
+their write scope to the write-attribution journal. Both are **dry runs by
+default** and print the full plan; `--apply` performs it in ONE commit. Exit
+codes: `0` clean, `1` a refusal (nothing changed), and after `--apply` the
+schema-tier validator's exit code (the commit stands regardless).
+
+**`work adopt <host>/<project> <shortname> [--apply] [--compat-link]
+[--description TEXT] [--remote URL]... [--force]`** names a host bucket and
+registers it. It resolves the bucket, checks the shortname and the registry,
+shows the SCHEMA-tier fix list (the tree is leaving the lenient legacy tier),
+bootstraps `_plexus.yaml` through the writer if the tree has none, writes the
+registry entry, and `git mv`s the directory to `<shortname>/`. `--compat-link`
+leaves a relative symlink at the old path (INFO); `--remote` may repeat;
+`--force` carries schema-tier ERRORs into the fix list. It does not rename the
+bare areas inside — that is `work migrate`.
+
+**`work migrate <project> [--apply] [--compat-link]`** moves one registered
+project's bare areas to their schema names (`runs/` → `_runs/`, `specs/` →
+`_specs/`, and the rest), nests each legacy run dir under its first session id,
+lifts non-`project` memories to the instance scope, re-points the `_specs/`
+and `_plans/` entries in place (keeping their dates), and folds the pre-A1
+plain-session groups (`chat-.`, `chat-<repo>.git` — only the `slug:` scalar is
+rewritten). It is idempotent: a re-run is a no-op. The fold refuses while any
+session in a group is live; finish or sign out that session first.
+
+**`work migrate --instance [--apply]`** moves the instance surfaces
+(`agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
+`napkin/` → `_napkin/`, `taskdef/` → `_taskdef/`) and folds a standalone
+`sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
+file in the same commit. It refuses unless the running release reads the
+manifest `sources:` tier: **deploy the release carrying #370 on every host
+first**, because removing `sources.yaml` switches declared sources off on a
+pre-#370 host. `--instance` and `<project>` are mutually exclusive.
+
+The `lmer-schema migrate` preview (schema 1 → 2) lists any plain-session
+groups it cannot carry over as `Directory move:` lines and as blockers, each
+naming `work migrate <project>`; `--apply` refuses while they remain.
+
 ### Troubleshooting
 
 #### Troubleshooting: containers hit the PID cap (cgroup-v1 pids leak)
