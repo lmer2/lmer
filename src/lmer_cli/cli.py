@@ -769,11 +769,7 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
     return host, path
 
 
-def container_task_target(
-    primary_target: str | None,
-    host_repo_path: Path | None,
-    klass: str,
-) -> str:
+def container_task_target(primary_target: str | None, klass: str) -> str:
     """The ``LMER_TASK_TARGET`` a launch exports for its primary target.
 
     The exported target is the session's *task context*, never its repository
@@ -2593,27 +2589,44 @@ def main(argv: list[str] | None = None) -> int:
         cwd = Path.cwd()
 
         # A non-URL positional that names an existing local checkout is the
-        # repository, exactly as before. The probe is non-raising so anything
-        # else — a branch, a SHA, a shorthand, a document URL — reaches the
-        # classifier instead of failing as a missing path. A directory that
-        # exists but is not a checkout is refused, never read as a branch.
+        # repository, exactly as before. The probe returns None for a target
+        # that names no filesystem entry, so a branch, a SHA, a shorthand or a
+        # document URL reaches the classifier instead of failing as a missing
+        # path; a target that names an existing entry which is not a checkout
+        # (a plain directory, a file) is refused, never read as a branch.
         if primary_target and not resolve.is_likely_url(primary_target):
-            local_checkout = resolve.probe_local_repo(primary_target, cwd)
+            try:
+                local_checkout = resolve.probe_local_repo(primary_target, cwd)
+            except resolve.NotACheckoutError as exc:
+                error(f"❌ {strip_url_credentials(str(exc))}")
+                return 2
             if local_checkout is not None:
                 target_class = "repository"
-            else:
-                candidate = (
-                    (cwd / primary_target).resolve()
-                    if not os.path.isabs(primary_target)
-                    else Path(primary_target).resolve()
-                )
-                if candidate.exists() and candidate.is_dir():
+
+        # --repo names the repository explicitly, so it must BE one: a local
+        # path goes through the same probe, anything else through the shared
+        # classifier, and a non-repository value is refused rather than used
+        # as a clone URL that fails inside the container.
+        if ns.repo:
+            if not resolve.is_likely_url(ns.repo):
+                try:
+                    repo_checkout = resolve.probe_local_repo(ns.repo, cwd)
+                except resolve.NotACheckoutError as exc:
+                    error(f"❌ --repo {strip_url_credentials(str(exc))}")
+                    return 2
+                if repo_checkout is None:
                     error(
-                        "❌ not a git repository: "
-                        f"{strip_url_credentials(primary_target)} "
-                        f"({strip_url_credentials(str(candidate))})"
+                        "❌ --repo "
+                        f"{strip_url_credentials(ns.repo)} names no existing "
+                        "path or repository URL"
                     )
                     return 2
+            elif classify_target(ns.repo) != "repository":
+                error(
+                    "❌ --repo "
+                    f"{strip_url_credentials(ns.repo)} is not a repository URL"
+                )
+                return 2
 
         # --repo names the repository explicitly. It is refused beside a
         # repository-class positional ('two repositories named'); the flag
@@ -2649,6 +2662,16 @@ def main(argv: list[str] | None = None) -> int:
             elif target_class == "repository":
                 target_to_resolve = primary_target or ""
             elif target_class in ("work-item", "reference"):
+                # The cwd-origin fallback is for a branch, a SHA or a shorthand
+                # (a non-URL work item). A URL that derives no repository is
+                # refused rather than silently cloning the cwd's origin.
+                if derived_repo_url is None and resolve.is_likely_url(primary_target):
+                    error(
+                        "❌ cannot derive a repository from "
+                        f"{strip_url_credentials(primary_target)}; "
+                        "name it with --repo"
+                    )
+                    return 2
                 target_to_resolve = derived_repo_url or ""
             else:  # none
                 target_to_resolve = ""
@@ -2664,6 +2687,11 @@ def main(argv: list[str] | None = None) -> int:
             if repo_url:
                 repo_url = _inject_gitlab_token_if_available(repo_url)
         except resolve.ResolveError as e:
+            if ns.repo:
+                # An explicit repository is never substituted: the repo-less
+                # fallback exists for an INFERRED repository, not a named one.
+                error(f"❌ {e}")
+                return 2
             if checkout_path:
                 # With --checkout, repo URL resolution failure is non-fatal
                 warning(f"⚠️  Could not resolve repo URL: {e}")
@@ -3283,11 +3311,13 @@ def main(argv: list[str] | None = None) -> int:
         **gpg_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
-        # Empty (delivered as `LMER_TASK_TARGET=`, never absent) for a local
-        # filesystem path target, so every slug copy derives the bare taskdef;
-        # the URL spelling otherwise. `primary_target` itself is untouched.
+        # Empty (delivered as `LMER_TASK_TARGET=`, never absent) for a
+        # repository target (a local path or a bare repository URL) and for no
+        # target at all, so every slug copy derives the bare taskdef; the
+        # work-item, reference or `other` URL spelling otherwise. The class is
+        # the shared classifier's answer; `primary_target` itself is untouched.
         "LMER_TASK_TARGET": (
-            container_task_target(primary_target, host_repo_path, target_class)
+            container_task_target(primary_target, target_class)
             if not ns.no_task
             else None
         ),

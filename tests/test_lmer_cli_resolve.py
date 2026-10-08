@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from lmer_cli.resolve import (
+    NotACheckoutError,
     ResolveError,
     _git,
     get_remote_url,
@@ -252,9 +253,15 @@ class TestProbeLocalRepo:
     def test_a_missing_path_is_none(self, tmp_path):
         assert probe_local_repo("mybranch", tmp_path) is None
 
-    def test_a_non_git_directory_is_none(self, tmp_path):
+    def test_a_non_git_directory_raises(self, tmp_path):
         (tmp_path / "plain").mkdir()
-        assert probe_local_repo("plain", tmp_path) is None
+        with pytest.raises(NotACheckoutError, match="not a git repository"):
+            probe_local_repo("plain", tmp_path)
+
+    def test_an_existing_file_raises(self, tmp_path):
+        (tmp_path / "README.md").write_text("hi\n")
+        with pytest.raises(NotACheckoutError):
+            probe_local_repo("README.md", tmp_path)
 
     def test_a_url_is_never_probed(self, tmp_path):
         assert probe_local_repo("https://gitlab.example.com/g/p", tmp_path) is None
