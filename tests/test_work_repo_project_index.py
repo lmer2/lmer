@@ -196,6 +196,42 @@ class TestContinuesResolvesByUid:
             source_path=f"{DEFAULT_PROJECT}/_runs/chat/{src}"))
         assert f"continues [{src[:8]}](_runs/chat/{src}/)" in _rows(_render(tree))[0]
 
+    def test_a_freeze_renamed_source_resolves_by_uid_not_a_stale_path(self, tree):
+        src, cont = uid_for(1), uid_for(2)
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            src, "chat", stamp(1), stamp(1, 11), name="first", dir_suffix="first"))
+        # The recorded path names the pre-rename dir; the uid map wins.
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            cont, "chat", stamp(2), stamp(2, 11), source_uid=src,
+            source_path=f"{DEFAULT_PROJECT}/_runs/chat/{src}"))
+        assert f"continues [{src[:8]}](_runs/chat/{src}--first/)" in _rows(_render(tree))[0]
+
+    def test_an_untracked_archive_source_is_filtered(self, tree):
+        src = uid_for(1)
+        tree.add(DEFAULT_PROJECT, RecordSpec(src, "chat", stamp(1), stamp(1, 11)))
+        self._move(tree, src, f"_archive/_runs/chat/{src}")
+        project_dir = tree.project_dir()
+        # The listing filter rejects the archive path, so the map must not
+        # resolve it (the link would dangle on the forge).
+        assert src not in pi._source_dir_map(
+            project_dir, include=lambda rel: "_archive" not in rel
+        )
+        assert pi._source_dir_map(project_dir).get(src) == f"_archive/_runs/chat/{src}"
+
+    def test_a_default_label_and_an_inherited_name_render_as_the_row_label(self, tree):
+        tree.add(DEFAULT_PROJECT,
+                 RecordSpec(uid_for(1), "chat", stamp(1), stamp(1, 11), name="chat-261009-abcd"),
+                 RecordSpec(uid_for(2), "chat", stamp(2), stamp(2, 11), name="tidy"))
+        rows = _rows(_render(tree))
+        assert any("chat-261009-abcd" in row for row in rows)
+        assert any("tidy" in row for row in rows)
+        assert all("_(unnamed)_" not in row for row in rows)
+
+    def test_unnamed_is_marked_only_when_name_is_null(self, tree):
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            uid_for(1), "chat", stamp(1), stamp(1, 11), goal="do it"))
+        assert "_(unnamed)_" in _rows(_render(tree))[0]
+
 
 class TestSeededRow:
     """A1-rest.index-labels: the `seeded` state word (D13)."""

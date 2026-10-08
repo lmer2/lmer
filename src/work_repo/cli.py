@@ -2561,6 +2561,7 @@ def cmd_resume(as_json: bool = False, session: str | None = None) -> int:
             # Web (tree) URL of the run dir (issue #104) — fail-soft None
             # keeps the brief byte-identical when no URL is derivable.
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     return 0
 
@@ -2830,8 +2831,15 @@ def cmd_seed(args) -> int:
     # only; a no-op in a legacy tree.
     try:
         run_state.note_seeded_record(rdir)
-    except (run_state.RunStateError, OSError):
-        pass
+    except (run_state.RunStateError, OSError) as exc:
+        # The seed is still written; only its publication record is lost, so
+        # `work commit` will report it as a stray. Say so rather than letting
+        # it disappear silently.
+        print(
+            f"⚠️  could not record the seed for publication ({exc}); "
+            "`work commit` may report it as a stray",
+            file=sys.stderr,
+        )
 
     print(f"✅ Run seeded: {rdir}")
     if seeded is not None:
@@ -4050,9 +4058,12 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
     naming or re-goaling the run again (the `LMER_ANSWER` consume-once idea,
     decided from the record rather than a marker file). The name goes through
     the same rules as `work name` (`_validate_name`, then `_name_conflict`
-    over the whole project) and lands only when the record has none; a held
-    or unusable name is a one-line stdout warning and the run stays unnamed,
-    because a cosmetic label must never refuse a session. The goal is
+    over the whole project). On a process record (schema 2) the launch name
+    always applies on the opening call (D5/§5.1: it replaces a default or an
+    inherited name); a legacy/schema-1 record keeps the old rule and is named
+    only when it has none. A held or unusable name is a one-line stdout
+    warning and the run keeps its default label (or stays unnamed), because a
+    cosmetic label must never refuse a session. The goal is
     redacted like every other free-text writer and replaces a goal inherited
     from a continuation source — an explicit launch goal outranks the
     predecessor's.
@@ -4087,13 +4098,13 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
             return {}
         candidate = dict(state)
         events: list[tuple[str, str]] = []
-        # A schema-2 record may carry a default label (D5); a launch `--name`
-        # replaces it on the call that opens the record. A legacy/schema-1
-        # record keeps today's rule (only an absent name is filled).
+        # On a process record a launch `--name` always applies on the opening
+        # call (D5/§5.1: it replaces a default OR an inherited name). A
+        # legacy/schema-1 record keeps today's rule (only an absent name is
+        # filled). `opened` already limits this to the call that opened the
+        # record.
         existing_name = state.get("name")
-        name_replaceable = existing_name is None or (
-            run_state.is_process_record() and run_state.is_default_label(state)
-        )
+        name_replaceable = existing_name is None or run_state.is_process_record()
         if name_text.strip() and name_replaceable:
             name = _validate_name(name_text)
             if name is None:
@@ -4312,6 +4323,7 @@ def cmd_session_start(session: str | None = None) -> int:
             seed=os.environ.get("LMER_START_PROMPT") or None,
             answered=answered,
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     except Exception as exc:  # never break a session (spec §6)
         print(f"⚠️  run-state session-start failed (continuing): {exc}")
@@ -4347,7 +4359,7 @@ def _start_process_record(source_session: str | None = None) -> int:
                 # to the launch lines below, labelled as replaced.
                 decision["goal"] = None
             print(f"Context from session {context['source_session_uid']} (read-only):")
-            print(run_state.format_brief(decision, answered=answered))
+            print(run_state.format_brief(decision, answered=answered, dir_name=rdir.name))
             warning = _source_slug_warning(context, state.get("slug"))
             if warning:
                 print(warning)

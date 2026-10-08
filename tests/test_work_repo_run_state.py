@@ -752,6 +752,39 @@ class TestFormatBrief:
         assert 'work state set --stop-reason=question --question "<text>"' in text
         assert "never proceed on a guess" in text
 
+    def test_schema_two_completed_brief_names_the_continuation_route(self):
+        """D14: a schema-2 finished record is continued as a new execution,
+        addressed by its uid — never reopened in place."""
+        uid = "ab" * 16
+        state = _state(status="complete", stop_reason="complete")
+        state["schema"] = 2
+        state["session"] = {"uid": uid}
+        state["taskdef"] = "chat"
+        state["target"] = ""
+        d = run_state.decide(state, [], "s-1")
+        assert d["session_uid"] == uid and d["schema"] == 2
+        text = run_state.format_brief(d, seed="go")
+        assert f"--source-session {uid}" in text
+        assert "work state set --status=in-progress" not in text
+        assert "Seed provided (LMER_START_PROMPT): go" in text
+
+    def test_schema_two_completed_brief_renders_a_nonempty_target(self):
+        uid = "cd" * 16
+        target = "https://gitlab.example.com/g/p/-/merge_requests/9"
+        state = _state(status="complete")
+        state["schema"] = 2
+        state["session"] = {"uid": uid}
+        state["taskdef"] = "review"
+        state["target"] = target
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        assert f"lmer review {target} --source-session {uid}" in text
+
+    def test_legacy_completed_brief_stays_byte_identical(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d, seed="go")
+        assert "work state set --status=in-progress --stop-reason=none" in text
+        assert "--source-session" not in text
+
     def test_in_progress_brief_has_no_completed_directive(self):
         d = run_state.decide(_state(), [], "s-1")
         text = run_state.format_brief(d, seed="a seed that must not surface")

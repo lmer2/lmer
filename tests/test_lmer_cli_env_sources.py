@@ -767,6 +767,19 @@ class TestSourcesManifestTier:
         )
         assert "stale" in output
 
+    def test_a_manifest_without_sources_is_not_reported_as_a_declaration(self, monkeypatch):
+        """A schema-2 repo always has `_plexus.yaml`; one without a
+        `sources:` section must read as no declaration, not as one."""
+        output = _render_sources_block(
+            monkeypatch, None,
+            env={"LMER_WORK_REPO": WORK_REPO},
+            reason=clone_cache.CACHE_FILE_ABSENT,
+            manifest="schema: 2\nname: example\n",
+        )
+        assert "declared: none" in output
+        assert "manifest from work-repo cache" not in output
+        assert output.count("unset-fallback") == 3
+
     def test_no_cached_manifest_output_is_unchanged(self, monkeypatch):
         output = _render_sources_block(
             monkeypatch, VALID_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}

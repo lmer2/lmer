@@ -1367,12 +1367,30 @@ def _display_sources_config_cli() -> None:
                     for w in raw_warnings
                 ]
                 manifest_tiered = manifest is not None
-                if manifest is not None and cached is not None:
+                tiers = set((config or {}).get("tiers", {}).values())
+                if config is None:
+                    # The loader found nothing declared in either tier (a
+                    # cached manifest without a `sources:` section, and no
+                    # legacy file): the same "none" wording the pre-#370
+                    # output used, never a manifest declaration that is not
+                    # there.
+                    if cached is not None:
+                        declared_status = "none (no sources declared in the work repo)"
+                    elif cache_reason == CACHE_FILE_ABSENT:
+                        declared_status = (
+                            f"none (no {container_sources.SOURCES_FILENAME} in the work repo)"
+                        )
+                    elif cache_reason == CACHE_ERROR:
+                        declared_status = "unknown (work-repo cache unreadable)"
+                    else:
+                        declared_status = "unknown (work repo not cached)"
+                elif (container_sources.TIER_MANIFEST in tiers
+                      and container_sources.TIER_LEGACY in tiers):
                     declared_status = (
                         "manifest and sources.yaml from work-repo cache "
                         "(cached, possibly stale)"
                     )
-                elif manifest is not None:
+                elif container_sources.TIER_MANIFEST in tiers:
                     declared_status = (
                         "manifest from work-repo cache (cached, possibly stale)"
                     )
@@ -1446,7 +1464,7 @@ def _display_sources_config_cli() -> None:
     name_width = max(len(r[0]) for r in rows)
     value_width = max(len(r[1]) for r in rows)
     print("---")
-    print("📚 Canonical Sources (sources.yaml):\n")
+    print("📚 Canonical Sources:\n")
     print(f"  declared: {declared_status}\n")
     for warning in load_warnings:
         # Scrub unconditionally, the same rule the rows below follow.

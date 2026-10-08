@@ -1507,11 +1507,12 @@ Sessions: 3 (1 active, 1 ended not closed, 1 closed)
 
 - **`closed`** — `status` is `complete` or `archived`.
 - **`waiting on question`** — `stop_reason` is `question`; a recorded question outranks a sign-out, the run is parked, not over.
+- **`seeded`** — a `work seed` record nobody has run in yet (`session.seeded_by` set, no `session_start`); listed, never running.
 - **`ended, not closed`** — in progress with a recorded final `session_end`.
 - **`active`** — in progress, no sign-out recorded, `updated` within the last 14 days (the validator's `record.session-stale` window).
 - **`stale`** — in progress, no sign-out recorded, quiet for longer than that. A reading of the record, not a verdict on the run: nothing here ever ends a run, and age or silence never means signed out.
 
-The two-word header buckets are spelled `ended not closed` and `waiting on question`. A schema-1 record that still sits in a schema-2 tree (one recorded before the migration) keeps its schema-1 row — no `state=` tail — and is not counted in the buckets. `⚠️  state unreadable` marks only a record whose state file really could not be parsed; it never appears on a readable schema-2 row. **`--running`** keeps its meaning — in progress with something live in it — which on schema 2 is "no sign-out recorded", i.e. the `active` and `stale` rows; the header stays `Running sessions: <n>`.
+The header buckets are spelled `seeded`, `ended not closed` and `waiting on question`. A schema-1 record that still sits in a schema-2 tree (one recorded before the migration) keeps its schema-1 row — no `state=` tail — and is not counted in the buckets. `⚠️  state unreadable` marks only a record whose state file really could not be parsed; it never appears on a readable schema-2 row. **`--running`** keeps its meaning — in progress with something live in it — which on schema 2 is "no sign-out recorded", i.e. the `active` and `stale` rows; the header stays `Running sessions: <n>`.
 
 **`--json`** emits `{"form": …, "count": N, "sessions": [...]}` on one line — `form` is `"schema"` or `"legacy"`, and with no run context the document carries `"detail"` with the reason and an empty list. Each session entry carries `id`, `dir_name`, `path` (absolute, in-container), `address` (`<slug>/<session-id>`, the run-area-relative name), `slug`, `name`, `status`, `stop_reason`, `phase`, `created`, `updated`, `owner` and `orphaned`; a schema-2 entry also carries `session` (the launch metadata block), `signed_out` and `state` — the same word the text row prints.
 

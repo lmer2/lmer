@@ -211,6 +211,75 @@ def test_launch_name_replaces_a_default_label_on_the_opening_call(
     assert state["name"] == "tidy-index"
 
 
+def _continue_from(source_state, monkeypatch):
+    from work_repo import session_record
+
+    session_record.start_launch()
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", source_state["session"]["uid"])
+    return run_state.ensure_run()
+
+
+def test_continuation_inherits_the_source_name(session_tree, monkeypatch):
+    _, source, source_state = seed_launch()
+    source_state["name"] = "tidy"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    _, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "tidy"
+
+
+def test_continuation_inherits_a_default_label_and_stays_unnamed_for_the_freeze(
+    session_tree, monkeypatch
+):
+    from work_repo import specs_index
+
+    _, source, source_state = seed_launch()
+    assert run_state.is_default_label(source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == source_state["name"]
+    assert run_state.is_default_label(state)
+    frozen, old_name = run_state.freeze_run_dir(target, state)
+    assert frozen == target and old_name is None
+    assert specs_index.run_label(target, state).startswith(state["slug"])
+
+
+def test_launch_name_replaces_an_inherited_name_on_the_opening_call(
+    session_tree, monkeypatch
+):
+    from work_repo import cli
+
+    _, source, source_state = seed_launch()
+    source_state["name"] = "tidy"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "tidy"
+    monkeypatch.setenv("LMER_RUN_NAME", "tidy-v2")
+    assert cli.cmd_session_start() == 0
+    state = run_state.load_state(target)
+    assert state["name"] == "tidy-v2"
+    events = run_state.read_events(target, last_n=0)
+    assert any(
+        e["type"] == "run_named" and (e.get("data") or {}).get("source") == "launch"
+        for e in events
+    )
+
+
+def test_goals_freeze_leaves_a_default_labelled_record_unnamed(session_tree, capsys):
+    from work_repo import cli
+
+    _, rdir, state = seed_launch()
+    assert run_state.is_default_label(state)
+    (rdir / "goals.md").write_text(
+        "## G1: ship it\nsignal: test\nevidence: tests/test_x.py\n"
+    )
+    assert cli._cmd_goals_freeze(None) == 0
+    assert "not named yet" in capsys.readouterr().out
+    assert run_state.load_state(rdir)["frozen"] is None
+    assert run_state.run_dir() == rdir
+
+
 def test_specs_index_label_uses_the_slug_for_a_default_label(session_tree):
     from work_repo import specs_index
 
@@ -482,6 +551,32 @@ def test_seeded_record_at_its_final_address_is_read_only_to_the_seeder(session_t
     with pytest.raises(run_state.RunStateError, match="own"):
         run_state.write_state(empty, _seeded_state("d" * 32, metadata["uid"]))
     assert list(empty.iterdir()) == []
+
+
+def test_the_writer_refusal_names_the_continuation_route(session_tree):
+    """D14: a schema-2 record another launch owns is continued as a new
+    execution, and the refusal names that route with the record's values."""
+    from work_repo import session_record
+
+    seeder, _, _ = seed_launch()
+    uid = "e" * 32
+    group = session_tree / "widgets" / "_runs" / "develop-other-target"
+    state = _seeded_state(uid, seeder["uid"])
+    _plant(group / uid, state)
+    session_record.start_launch()  # a different launch, owning no such record
+    with pytest.raises(run_state.RunStateError, match=f"--source-session {uid}"):
+        run_state.write_state(group / uid, state)
+
+
+def test_seeded_record_helpers_are_noops_on_a_legacy_tree(tmp_path, monkeypatch):
+    from work_repo import run_state
+
+    monkeypatch.setattr(run_state, "is_process_record", lambda: False)
+    rdir = tmp_path / "legacy-run"
+    rdir.mkdir()
+    run_state.note_seeded_record(rdir)
+    assert run_state.seeded_record_rel_paths() == []
+    assert not (rdir / "state.yaml").exists()
 
 
 def test_launcher_replaces_inherited_uid_once_after_schema_detection(session_tree, monkeypatch):

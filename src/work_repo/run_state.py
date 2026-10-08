@@ -1552,6 +1552,22 @@ def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
     if owner != launch_session_id() or not address_matches:
         if _seeding_launch_may_write(rdir, persisted if path is not None else state):
             return
+        # A schema-2 record is continued as a NEW execution, never written in
+        # place (D14): name that route with the record's own values. A legacy
+        # record keeps the generic wording.
+        if process_records and state.get("schema", 1) >= 2:
+            uid = metadata.get("uid")
+            taskdef = state.get("taskdef") or "<taskdef>"
+            target = state.get("target") or ""
+            route = f"lmer {taskdef}"
+            if target:
+                route += f" {target}"
+            if uid:
+                route += f" --source-session {uid}"
+            raise RunStateError(
+                "a session may write only its own record; to continue it, start a "
+                f"new execution with `{route}`"
+            )
         raise RunStateError("a session may write only its own record; use prior sessions as context")
 
 
@@ -2724,11 +2740,20 @@ def decide(
             # warning instead of breaking the session-start hook.
             release_info["error"] = str(exc)
             warnings.append(f"release record inconsistent: {exc}")
+    session = state.get("session")
+    session = session if isinstance(session, dict) else {}
     return {
         "kind": "run",
         "slug": state.get("slug"),
         "name": state.get("name"),
         "status": state.get("status"),
+        # The record's own identity, carried additively for the schema-2
+        # completed-run direction (`lmer <taskdef> [<target>] --source-session
+        # <uid>`, D14). Legacy records carry schema 1 and no session uid.
+        "schema": state.get("schema", 1),
+        "session_uid": session.get("uid"),
+        "taskdef": state.get("taskdef"),
+        "target": state.get("target"),
         # Structural signal for guard JSON / brief consumers (issue #96):
         # a finished run must never be silently resumed. `archived` counts —
         # until the external cleaner moves the dir under runs/archive/ the
@@ -2767,6 +2792,7 @@ def format_brief(
     seed: str | None = None,
     answered: Optional[dict] = None,
     run_dir_url: Optional[str] = None,
+    dir_name: Optional[str] = None,
 ) -> str:
     """Human-readable resume brief for prompt injection. `seed` is the
     launch prompt (LMER_START_PROMPT), passed in by the caller — it selects
@@ -2780,10 +2806,22 @@ def format_brief(
     if decision.get("kind") != "run":
         return "No run state found — this is a fresh run."
     if decision.get("name"):
-        header = (
-            f"Run: {decision['name']} "
-            f"(slug: {decision['slug']}, status: {decision['status']})"
-        )
+        # A post-freeze `work name` writes the name but cannot rename a frozen
+        # dir (D14/§9.5): when the dir's `--<name>` half disagrees with the
+        # stored name, name the directory too. An unsuffixed, not-yet-frozen
+        # dir is not a mismatch (the freeze is what adds the suffix).
+        suffix = dir_name.split("--", 1)[1] if dir_name and "--" in dir_name else None
+        if suffix is not None and suffix != decision["name"]:
+            header = (
+                f"Run: {decision['name']} "
+                f"(dir: {dir_name}, slug: {decision['slug']}, "
+                f"status: {decision['status']})"
+            )
+        else:
+            header = (
+                f"Run: {decision['name']} "
+                f"(slug: {decision['slug']}, status: {decision['status']})"
+            )
     else:
         header = f"Run: {decision['slug']} (status: {decision['status']})"
     lines = []
@@ -2881,24 +2919,56 @@ def format_brief(
     if decision.get("completed_run"):
         lines.append("")
         lines.append("⚠️  COMPLETED RUN — direction contract:")
-        lines.append("This run is finished. Do NOT resume it or invent work.")
-        if seed:
-            seed = " ".join(seed.split())  # keep the brief field one-line
-            excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
-                       else seed[:SEED_EXCERPT_MAX_LEN] + "…")
-            lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+        session_uid = decision.get("session_uid")
+        if session_uid:
+            # Schema 2 (D14): the record is never reopened in place; it is
+            # continued as a NEW execution addressed by its uid.
+            taskdef = decision.get("taskdef") or "<taskdef>"
+            target = decision.get("target") or ""
+            route = f"lmer {taskdef}"
+            if target:
+                route += f" {target}"
+            route += f" --source-session {session_uid}"
             lines.append(
-                'Record it as the goal (`work goal "<seed>"`), reopen with '
-                "`work state set --status=in-progress --stop-reason=none`, "
-                "then proceed on the seed."
+                "This run is finished. Do NOT resume it in place or invent "
+                "work — continue it as a new execution."
             )
+            lines.append(f"Continue with: {route} (or the platform's continue).")
+            if seed:
+                seed = " ".join(seed.split())  # keep the brief field one-line
+                excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                           else seed[:SEED_EXCERPT_MAX_LEN] + "…")
+                lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+                lines.append(
+                    "The seed belongs to that new execution: record it as the "
+                    "new execution's goal, then proceed."
+                )
+            else:
+                lines.append(
+                    "No seed — ask the user (new target vs continue this run). "
+                    "If the question goes unanswered, record "
+                    '`work state set --stop-reason=question --question "<text>"` '
+                    "and end the session — never proceed on a guess."
+                )
         else:
-            lines.append(
-                "No seed — ask the user (new target vs continue this run). "
-                "If the question goes unanswered, record "
-                '`work state set --stop-reason=question --question "<text>"` '
-                "and end the session — never proceed on a guess."
-            )
+            lines.append("This run is finished. Do NOT resume it or invent work.")
+            if seed:
+                seed = " ".join(seed.split())  # keep the brief field one-line
+                excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                           else seed[:SEED_EXCERPT_MAX_LEN] + "…")
+                lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+                lines.append(
+                    'Record it as the goal (`work goal "<seed>"`), reopen with '
+                    "`work state set --status=in-progress --stop-reason=none`, "
+                    "then proceed on the seed."
+                )
+            else:
+                lines.append(
+                    "No seed — ask the user (new target vs continue this run). "
+                    "If the question goes unanswered, record "
+                    '`work state set --stop-reason=question --question "<text>"` '
+                    "and end the session — never proceed on a guess."
+                )
     if run_dir_url:
         lines.append(f"Run dir: {run_dir_url}")
     return "\n".join(lines)
