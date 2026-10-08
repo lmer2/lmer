@@ -204,6 +204,82 @@ def signed_out(events: list[dict]) -> bool:
     return bool(lifecycle) and lifecycle[-1] == "session_end"
 
 
+#: How long an in-progress, not-signed-out record may stay untouched before a
+#: clock-aware listing calls it ``stale`` rather than ``active``. Pinned equal
+#: to ``lmer_schema.checks.record.STALE_AFTER_SECONDS`` (the validator's
+#: ``record.session-stale`` window) by a test, never imported from there: the
+#: dependency points from ``lmer_schema`` to this package, not back.
+STALE_AFTER_SECONDS = 14 * 24 * 60 * 60
+
+_CLOSED_STATUSES = frozenset({"complete", "archived"})
+
+
+def _instant(value) -> datetime | None:
+    """An aware UTC datetime from a datetime or an ISO string, else ``None`` —
+    also for a value whose UTC instant overflows the datetime range (year 1
+    with a positive offset, 9999 with a negative one): unparseable, not an
+    exception out of a listing."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        return None
+
+
+def display_state(
+    *,
+    readable: bool,
+    status,
+    stop_reason,
+    signed_out: bool | None,
+    updated,
+    now: datetime | str | None = None,
+    stale_after: int = STALE_AFTER_SECONDS,
+) -> str:
+    """The one word a human reads for a record, derived from the record alone.
+
+    Precedence: ``unreadable`` (the state file did not parse) → ``closed``
+    (status complete or archived) → ``waiting on question`` (a recorded
+    question outranks a sign-out: the run is parked, not over) → ``ended, not
+    closed`` (in progress with an observed final ``session_end``) → ``open``.
+
+    Without ``now`` the answer is a pure function of the record, which is what
+    a file committed to a shared repository must be (the README index).
+    With ``now`` — the `work sessions` listing, which already holds its own
+    clock — ``open`` splits into ``active`` and ``stale`` on whether
+    ``updated`` is more than ``stale_after`` seconds behind ``now``, the
+    validator's rule for ``record.session-stale``; an ``updated`` stamp that
+    cannot be parsed stays ``open``. Nothing here ends a run: age and silence
+    never mean signed out.
+    """
+    if not readable:
+        return "unreadable"
+    # A hand-edited record can put a list or a mapping where the status string
+    # belongs; an unhashable value is simply not a closed status.
+    if isinstance(status, str) and status in _CLOSED_STATUSES:
+        return "closed"
+    if stop_reason == "question":
+        return "waiting on question"
+    if signed_out is True:
+        return "ended, not closed"
+    if now is None:
+        return "open"
+    moment, last = _instant(now), _instant(updated)
+    if moment is None or last is None:
+        return "open"
+    return "stale" if (moment - last).total_seconds() > stale_after else "active"
+
+
 def is_seeded(state: dict, events: list[dict]) -> bool:
     """A record `work seed` left for a later launch and nobody has run in (D13).
 

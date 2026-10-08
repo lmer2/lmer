@@ -75,11 +75,19 @@ FIXED_NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
 #: probe that proves the record check read its state file.
 LATE_NOW = FIXED_NOW + timedelta(days=90)
 
-#: What a conformant schema-form plexus reports: ONE informational finding,
-#: for the host bucket the fixture carries on purpose (D9 — an unnamed repo's
-#: work, awaiting adoption, which never blocks). Anything else appearing here
-#: is a new statement about the form and belongs in a review, not in a diff.
-CLEAN_FINDINGS = (("manifest.schema-older", "WARN"), ("tree.host-bucket", "INFO"))
+#: What a conformant schema-form plexus reports: the schema-older warning,
+#: then two informational findings — the host bucket the fixture carries on
+#: purpose (D9 — an unnamed repo's work, awaiting adoption, which never
+#: blocks) and the project README the fixture does not write
+#: (`index.readme-missing`: `lmer/` holds run records and no generated index
+#: block; the project's next durability push or `lmer-schema index --write`
+#: creates it). Anything else appearing here is a new statement about the
+#: form and belongs in a review, not in a diff.
+CLEAN_FINDINGS = (
+    ("manifest.schema-older", "WARN"),
+    ("tree.host-bucket", "INFO"),
+    ("index.readme-missing", "INFO"),
+)
 
 #: One defect per check family: the family, the code it must produce and the
 #: repo-relative path it must be reported against. The tests below inject them

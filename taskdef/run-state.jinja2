@@ -48,9 +48,11 @@ Ground rules — these come before any work:
     judgment after the timeout.
 - **Once direction is clear, record it before starting:**
   `work goal "<one-line statement of the task>"`. A run with work happening
-  and no goal recorded is a contract violation, not a shortcut. Include an
-  estimate when you can size the work —
-  `work goal "..." --estimate-sessions 2 --estimate-time "3h"` — it is
+  and no goal recorded is a contract violation, not a shortcut. A goal
+  passed as `lmer --goal` is already recorded: the run state brief's
+  `Goal:` line is the current goal, and a predecessor's goal shown as
+  replaced is context only. Include an estimate when you can size the
+  work — `work goal "..." --estimate-sessions 2 --estimate-time "3h"` — it is
   compared against the actuals at completion. Re-recording the goal
   without the flags clears any prior estimate, so re-estimate when
   direction shifts.
@@ -58,8 +60,10 @@ Ground rules — these come before any work:
   kebab-case name from the task and record it with `work name <name>`.
   Do NOT ask the user to confirm the name — pick it yourself and move
   on (the user can rename at any time with `work name <new-name>`;
-  auto-slugs are unfindable later). Skip this if the resume brief
-  already shows a name.
+  auto-slugs are unfindable later). Skip this if the run state brief
+  already shows a name — a `Run: <name> (slug: …)` header, or a
+  `Run name:` line when `lmer --name` named the run at launch (already
+  recorded).
 - **HARD RULE — commit before every stop that awaits the human.** Every
   stop that awaits the human — a blocking question, a phasic yield, an
   approval gate — must be preceded by `work commit`: unpushed artifacts

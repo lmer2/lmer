@@ -32,23 +32,50 @@ D14 tier table gives each code:
 
 Every negative test injects its defect into ITS OWN fresh fixture tree; the
 shared builders in ``tests/plexus_fixtures.py`` are consumed read-only.
+
+The generated README index blocks (the legible-work-repo design) add two
+codes to this module, gated on the ``manifest`` the runner passes:
+``index.readme-missing`` (INFO: a project holding run records whose
+``README.md`` carries no generated block) and ``index.readme-stale`` (WARN:
+a block that no longer equals a fresh render of the records — or, at the
+root, of ``_plexus.yaml`` — malformed markers, or hand text holding a line
+git reads as a conflict marker). The freshness oracle is the kernel's own
+render compared byte for byte: no git, no clock, no write.
 """
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from tests import plexus_fixtures as pf
-from lmer_schema.checks import CHECKS, Form, Report, Severity
+from lmer_schema.checks import CHECKS, Form, Report, Severity, Tier
 from lmer_schema.checks import index_links as il
 from lmer_schema.checks import walk
 from lmer_schema.checks.index_links import check_index_links
+from lmer_schema.checks.runner import validate
+from lmer_schema.manifest import load_manifest
+from work_repo import project_index as pi
 
 DANGLING = "index.dangling-link"
 NOT_RELATIVE = "index.link-not-relative"
 ESCAPES = "index.link-escapes"
 ENTRY_WITHOUT_FILE = "index.entry-without-file"
 FILE_WITHOUT_ENTRY = "index.file-without-entry"
+README_MISSING = "index.readme-missing"
+README_STALE = "index.readme-stale"
+
+#: Inside the fixture's staleness window, and ninety days past it: the README
+#: codes must answer identically at both (they read no clock).
+FIXED_NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+LATE_NOW = FIXED_NOW + timedelta(days=90)
+
+#: The detail both README codes carry when a conflict-marker line in the hand
+#: text is what keeps the generator away from the file.
+MARKER_DETAIL = (
+    "hand text holds a conflict-marker line (seven = < > or |); the generator "
+    "skips this file — indent or lengthen the line"
+)
 
 
 def _run(tree, **kwargs):
@@ -541,3 +568,345 @@ class TestTheReviewersControl:
         self._demonstration(schema_plexus)
         entry = str(schema_plexus.specs_entries[0].relative_to(schema_plexus.root))
         assert entry not in [finding.path for finding in _run(schema_plexus).findings]
+
+
+# ---------------------------------------------------------------------------
+# The generated README index blocks: `index.readme-missing` / `index.readme-stale`
+# ---------------------------------------------------------------------------
+
+
+def _manifest_run(tree, **kwargs):
+    """Run the check the way the runner does: with the tree's manifest."""
+    return _run(tree, manifest=load_manifest(tree.root), **kwargs)
+
+
+def _readme_codes(report):
+    """The README-index findings only, as ``(code, path)`` pairs."""
+    return [
+        (finding.code, finding.path)
+        for finding in report.findings
+        if finding.code in (README_MISSING, README_STALE)
+    ]
+
+
+def _fresh_project_readme(tree, project_dir=None, heading=None):
+    """Write the project README exactly as the generator would render it."""
+    project_dir = tree.project_dir if project_dir is None else project_dir
+    heading = project_dir.name if heading is None else heading
+    path = project_dir / "README.md"
+    path.write_text(pi.render_project_readme(project_dir, heading=heading), encoding="utf-8")
+    return path
+
+
+def _fresh_root_readme(tree):
+    """Write the root README with the manifest's generated project block."""
+    path = tree.root / "README.md"
+    path.write_text(
+        pi.render_root_readme(tree.root, load_manifest(tree.root).document), encoding="utf-8"
+    )
+    return path
+
+
+def _write_record(run_dir, text="schema: 2\nslug: chat\nstatus: in-progress\n"):
+    """A minimal run record: a session dir carrying a state file."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.yaml").write_text(text, encoding="utf-8")
+    return run_dir
+
+
+def _snapshot(root):
+    """Every regular file under *root* with its bytes (symlinks by target)."""
+    out = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            out[rel] = ("link", str(path.readlink()))
+        elif path.is_file():
+            out[rel] = ("file", path.read_bytes())
+    return out
+
+
+class TestReadmeIndexCodes:
+    def test_both_codes_are_registered_at_their_severities(self):
+        assert CHECKS[README_MISSING].severity is Severity.INFO
+        assert CHECKS[README_STALE].severity is Severity.WARN
+
+    def test_both_codes_are_machine_tier_and_not_tier_sensitive(self):
+        for code in (README_MISSING, README_STALE):
+            entry = CHECKS[code]
+            assert entry.tier is Tier.MACHINE
+            assert not entry.tier_sensitive
+            for form in Form:
+                assert CHECKS.severity_for(code, form) is entry.severity
+
+    def test_both_codes_are_listed_among_the_modules_codes(self):
+        assert README_MISSING in il.CODES
+        assert README_STALE in il.CODES
+        assert list(il.CODES) == sorted(il.CODES), "CODES stays in code order"
+
+    def test_the_readme_name_is_the_kernels(self):
+        """The checker names the file the kernel writes; the two spellings
+        are pinned equal rather than imported, because the import direction
+        is ``work_repo -> lmer_schema`` and this module imports lazily."""
+        assert il.README_NAME == pi.README_NAME
+
+
+class TestReadmeIndexGate:
+    def test_without_a_manifest_the_check_says_nothing_about_readmes(self, schema_plexus):
+        """The fixture holds records and no project README, the very shape
+        that is INFO once a manifest is passed — a caller that passes none
+        (``TestCleanTrees``, a legacy tree) hears nothing."""
+        assert schema_plexus.session_dirs
+        assert not (schema_plexus.project_dir / "README.md").exists()
+        assert _readme_codes(_run(schema_plexus)) == []
+
+    def test_a_legacy_tree_says_nothing_about_readmes(self, legacy_plexus):
+        assert _readme_codes(_run(legacy_plexus)) == []
+        assert _readme_codes(validate(legacy_plexus.root, now=FIXED_NOW)) == []
+
+    def test_the_runner_passes_the_manifest_through(self, schema_plexus):
+        report = validate(schema_plexus.root, now=FIXED_NOW)
+        assert _readme_codes(report) == [(README_MISSING, f"{pf.PROJECT}/README.md")]
+        assert _one(report, README_MISSING).severity is Severity.INFO
+        assert report.exit_code == 0
+
+
+class TestProjectReadmeIndex:
+    def test_records_without_a_readme_are_informational(self, schema_plexus):
+        report = _manifest_run(schema_plexus)
+        finding = _one(report, README_MISSING)
+        assert finding.path == f"{pf.PROJECT}/README.md"
+        assert finding.severity is Severity.INFO
+        assert _readme_codes(report) == [(README_MISSING, f"{pf.PROJECT}/README.md")]
+
+    def test_a_readme_without_markers_is_missing_too(self, schema_plexus):
+        (schema_plexus.project_dir / "README.md").write_text(
+            "# lmer\n\nHand-written notes, no block yet.\n", encoding="utf-8"
+        )
+        report = _manifest_run(schema_plexus)
+        assert _readme_codes(report) == [(README_MISSING, f"{pf.PROJECT}/README.md")]
+        assert _one(report, README_MISSING).detail is None
+
+    def test_a_fresh_block_is_silent(self, schema_plexus):
+        _fresh_project_readme(schema_plexus)
+        assert _manifest_run(schema_plexus).findings == ()
+
+    def test_a_block_behind_the_records_is_stale_with_the_line_delta(self, schema_plexus):
+        _fresh_project_readme(schema_plexus)
+        _write_record(schema_plexus.runs_dir / "chat" / "20260901-090000-1-99999")
+        report = _manifest_run(schema_plexus)
+        finding = _one(report, README_STALE)
+        assert finding.severity is Severity.WARN
+        assert finding.path == f"{pf.PROJECT}/README.md"
+        assert finding.detail == (
+            "+1/-0 lines; lmer-schema index <root> --diff shows the change, --write applies it"
+        )
+        assert report.exit_code == 0
+
+    def test_an_edited_row_is_stale_with_a_replace_delta(self, schema_plexus):
+        path = _fresh_project_readme(schema_plexus)
+        text = path.read_text(encoding="utf-8")
+        assert "| closed " in text
+        path.write_text(text.replace("| closed ", "| open ", 1), encoding="utf-8")
+        finding = _one(_manifest_run(schema_plexus), README_STALE)
+        assert finding.detail.startswith("+1/-1 lines;")
+
+    def test_malformed_markers_are_stale(self, schema_plexus):
+        (schema_plexus.project_dir / "README.md").write_text(
+            f"# lmer\n\n{pi.START_MARKER}\n\nno end marker follows\n", encoding="utf-8"
+        )
+        finding = _one(_manifest_run(schema_plexus), README_STALE)
+        assert finding.severity is Severity.WARN
+        assert (finding.detail or "").startswith("markers malformed")
+
+    def test_a_zero_record_project_with_a_drifted_block_is_stale(self, schema_plexus):
+        """An existing block is compared whatever the record count: the
+        generator writes `_No run records yet._` and that is what must be
+        there."""
+        repoless = schema_plexus.repoless_dir
+        (repoless / "README.md").write_text(
+            f"# q3\n\n{pi.START_MARKER}\n\nstale body\n\n{pi.END_MARKER}\n", encoding="utf-8"
+        )
+        report = _manifest_run(schema_plexus)
+        stale = [f for f in report.findings if f.code == README_STALE]
+        assert [f.path for f in stale] == [f"{pf.REPOLESS_PROJECT}/README.md"]
+
+    def test_a_zero_record_project_without_a_readme_is_silent(self, schema_plexus):
+        assert not (schema_plexus.repoless_dir / "README.md").exists()
+        assert _readme_codes(_manifest_run(schema_plexus)) == [
+            (README_MISSING, f"{pf.PROJECT}/README.md")
+        ]
+
+    def test_a_zero_record_project_with_a_fresh_block_is_silent(self, schema_plexus):
+        _fresh_project_readme(schema_plexus, schema_plexus.repoless_dir)
+        assert not [
+            f for f in _manifest_run(schema_plexus).findings
+            if f.path.startswith(pf.REPOLESS_PROJECT)
+        ]
+
+    def test_a_marker_line_in_a_readme_without_a_block_is_missing_with_the_detail(
+        self, schema_plexus
+    ):
+        (schema_plexus.project_dir / "README.md").write_text(
+            "lmer\n=======\n\nA setext heading git reads as a conflict marker.\n",
+            encoding="utf-8",
+        )
+        finding = _one(_manifest_run(schema_plexus), README_MISSING)
+        assert finding.severity is Severity.INFO
+        assert finding.detail == MARKER_DETAIL
+
+    def test_a_marker_line_beside_a_fresh_block_is_stale_with_the_detail(self, schema_plexus):
+        """The block may be fresh today, but the choke point will never
+        refresh this file: the warning names the line, not the block."""
+        path = _fresh_project_readme(schema_plexus)
+        path.write_text(
+            "lmer\n=======\n\n" + path.read_text(encoding="utf-8").split("\n", 2)[2],
+            encoding="utf-8",
+        )
+        assert pi.extract_block(path.read_text(encoding="utf-8")) == pi.render_project_block(
+            pi.scan_project(schema_plexus.project_dir)
+        )
+        finding = _one(_manifest_run(schema_plexus), README_STALE)
+        assert finding.severity is Severity.WARN
+        assert finding.detail == MARKER_DETAIL
+
+    def test_a_marker_inside_the_generated_block_is_not_hand_text(self, schema_plexus):
+        """Only the text outside the markers is screened; a block is the
+        generator's and never holds one anyway."""
+        path = _fresh_project_readme(schema_plexus)
+        path.write_text("# lmer\n\nprose with ======= inside a sentence\n"
+                        + path.read_text(encoding="utf-8").split("\n", 2)[2], encoding="utf-8")
+        assert _readme_codes(_manifest_run(schema_plexus)) == []
+
+    def test_a_block_of_a_newer_format_is_left_alone(self, schema_plexus):
+        path = _fresh_project_readme(schema_plexus)
+        text = path.read_text(encoding="utf-8")
+        assert f"(lmer index format {pi.FORMAT})" in text
+        path.write_text(
+            text.replace(f"(lmer index format {pi.FORMAT})", f"(lmer index format {pi.FORMAT + 1})"),
+            encoding="utf-8",
+        )
+        assert _readme_codes(_manifest_run(schema_plexus)) == []
+
+    def test_a_block_of_an_older_or_tokenless_legend_is_compared(self, schema_plexus):
+        path = _fresh_project_readme(schema_plexus)
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace(f"(lmer index format {pi.FORMAT})", ""), encoding="utf-8")
+        assert _readme_codes(_manifest_run(schema_plexus)) == [
+            (README_STALE, f"{pf.PROJECT}/README.md")
+        ]
+
+    def test_a_bucket_project_gets_the_same_severities(self, schema_plexus):
+        bucket = schema_plexus.bucket_dir
+        bucket_rel = bucket.relative_to(schema_plexus.root).as_posix()
+        _write_record(bucket / "_runs" / "chat" / "20260901-090000-1-77777")
+        report = _manifest_run(schema_plexus)
+        missing = [f for f in report.findings if f.code == README_MISSING]
+        # Report order is by path: the bucket's host name sorts before `lmer/`.
+        assert [(f.path, f.severity) for f in missing] == [
+            (f"{bucket_rel}/README.md", Severity.INFO),
+            (f"{pf.PROJECT}/README.md", Severity.INFO),
+        ]
+        (bucket / "README.md").write_text(
+            f"# widget\n\n{pi.START_MARKER}\n\nstale\n\n{pi.END_MARKER}\n", encoding="utf-8"
+        )
+        report = _manifest_run(schema_plexus)
+        stale = [f for f in report.findings if f.code == README_STALE]
+        assert [(f.path, f.severity) for f in stale] == [
+            (f"{bucket_rel}/README.md", Severity.WARN)
+        ]
+
+    def test_caller_supplied_root_relative_projects_report_the_same_path(self, schema_plexus):
+        report = Report(schema_plexus.form)
+        check_index_links(
+            schema_plexus.root, report, projects=[Path(pf.PROJECT)],
+            manifest=load_manifest(schema_plexus.root),
+        )
+        assert _readme_codes(report) == [(README_MISSING, f"{pf.PROJECT}/README.md")]
+
+    def test_a_readme_that_is_a_directory_or_a_symlink_is_missing_with_why(
+        self, schema_plexus, tmp_path
+    ):
+        readme = schema_plexus.project_dir / "README.md"
+        readme.mkdir()
+        finding = _one(_manifest_run(schema_plexus), README_MISSING)
+        assert "directory" in (finding.detail or "")
+        readme.rmdir()
+        target = tmp_path / "elsewhere.md"
+        target.write_text("# elsewhere\n", encoding="utf-8")
+        readme.symlink_to(target)
+        finding = _one(_manifest_run(schema_plexus), README_MISSING)
+        assert "symlink" in (finding.detail or "")
+
+
+class TestRootReadmeIndex:
+    def test_the_fixtures_root_readme_without_markers_is_silent(self, schema_plexus):
+        root_readme = schema_plexus.root / "README.md"
+        assert root_readme.is_file()
+        assert pi.extract_block(root_readme.read_text(encoding="utf-8")) is None
+        assert ("README.md" not in [f.path for f in _manifest_run(schema_plexus).findings])
+
+    def test_a_fresh_root_block_is_silent(self, schema_plexus):
+        _fresh_root_readme(schema_plexus)
+        assert "README.md" not in [f.path for f in _manifest_run(schema_plexus).findings]
+
+    def test_a_drifted_root_block_is_stale_at_the_root(self, schema_plexus):
+        path = _fresh_root_readme(schema_plexus)
+        text = path.read_text(encoding="utf-8")
+        assert f"| [{pf.REPOLESS_PROJECT}]" in text
+        path.write_text(text.replace(f"| [{pf.REPOLESS_PROJECT}]", "| [renamed]"), encoding="utf-8")
+        report = _manifest_run(schema_plexus)
+        stale = [f for f in report.findings if f.code == README_STALE]
+        assert [(f.path, f.severity) for f in stale] == [("README.md", Severity.WARN)]
+        assert stale[0].detail.startswith("+1/-1 lines;")
+
+    def test_malformed_root_markers_are_stale(self, schema_plexus):
+        (schema_plexus.root / "README.md").write_text(
+            f"# plexus\n\n{pi.END_MARKER}\n\n{pi.START_MARKER}\n", encoding="utf-8"
+        )
+        stale = [f for f in _manifest_run(schema_plexus).findings if f.code == README_STALE]
+        assert [f.path for f in stale] == ["README.md"]
+        assert stale[0].detail.startswith("markers malformed")
+
+    def test_a_newer_root_block_is_left_alone(self, schema_plexus):
+        path = _fresh_root_readme(schema_plexus)
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace(f"(lmer index format {pi.FORMAT})", f"(lmer index format {pi.FORMAT + 1})"),
+            encoding="utf-8",
+        )
+        assert "README.md" not in [f.path for f in _manifest_run(schema_plexus).findings]
+
+    def test_a_missing_root_readme_is_never_a_finding(self, schema_plexus):
+        (schema_plexus.root / "README.md").unlink()
+        assert "README.md" not in [f.path for f in _manifest_run(schema_plexus).findings]
+
+
+class TestReadmeIndexIsClockFreeAndWriteFree:
+    def test_the_verdict_is_the_same_ninety_days_later(self, schema_plexus):
+        _fresh_project_readme(schema_plexus)
+        _write_record(schema_plexus.runs_dir / "chat" / "20260901-090000-1-99999")
+        early = validate(schema_plexus.root, now=FIXED_NOW)
+        late = validate(schema_plexus.root, now=LATE_NOW)
+        assert _readme_codes(early) == _readme_codes(late) == [
+            (README_STALE, f"{pf.PROJECT}/README.md")
+        ]
+        assert _one(early, README_STALE).detail == _one(late, README_STALE).detail
+
+    def test_a_fresh_block_stays_fresh_ninety_days_later(self, schema_plexus):
+        _fresh_project_readme(schema_plexus)
+        assert _readme_codes(validate(schema_plexus.root, now=LATE_NOW)) == []
+
+    @pytest.mark.parametrize("shape", ["missing", "stale", "malformed"])
+    def test_validate_leaves_the_tree_byte_identical(self, schema_plexus, shape):
+        if shape == "stale":
+            _fresh_project_readme(schema_plexus)
+            _write_record(schema_plexus.runs_dir / "chat" / "20260901-090000-1-99999")
+        elif shape == "malformed":
+            (schema_plexus.project_dir / "README.md").write_text(
+                f"{pi.START_MARKER}\n", encoding="utf-8"
+            )
+        before = _snapshot(schema_plexus.root)
+        report = validate(schema_plexus.root, now=FIXED_NOW)
+        assert _readme_codes(report), shape
+        assert _snapshot(schema_plexus.root) == before

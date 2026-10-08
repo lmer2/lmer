@@ -679,6 +679,342 @@ def test_a_bare_shell_answer_is_refused_and_names_the_platform_route(
     assert {p.name: p.read_bytes() for p in source.iterdir() if p.is_file()} == before
 
 
+# ---------------------------------------------------------------------------
+# lmer --name / --goal applied once at session start; local-path continuations
+# ---------------------------------------------------------------------------
+
+
+def _events_of(directory, kind):
+    return [e for e in run_state.read_events(directory, last_n=0) if e.get("type") == kind]
+
+
+def test_launch_name_and_goal_apply_once_on_the_opening_session_start(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "Fresh Run")
+    monkeypatch.setenv("LMER_RUN_GOAL", "Finish the index")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    directory = run_state.run_dir()
+    state = run_state.load_state(directory)
+    assert state["name"] == "fresh-run"
+    assert state["goal"] == "Finish the index"
+    (named,) = _events_of(directory, "run_named")
+    assert named["note"] == "fresh-run" and named["data"] == {"source": "launch"}
+    (goal_set,) = _events_of(directory, "goal_set")
+    assert goal_set["note"] == "Finish the index" and goal_set["data"] == {"source": "launch"}
+    assert "not applied" not in capsys.readouterr().out
+
+    # The same launch starting again applies nothing and warns nothing.
+    assert cli.cmd_session_start() == 0
+    assert len(_events_of(directory, "run_named")) == 1
+    assert len(_events_of(directory, "goal_set")) == 1
+    assert "not applied" not in capsys.readouterr().out
+
+
+def test_a_held_launch_name_warns_on_stdout_and_the_run_stays_unnamed(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    holder_uid, holder, holder_state = seed_launch()
+    holder_state["name"] = "taken"
+    run_state.write_state(holder, holder_state)
+    monkeypatch.setenv("LMER_RUN_NAME", "taken")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    assert (
+        f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}' "
+        "(names are unique per project); this run stays unnamed"
+    ) in out
+    assert " owns " in out  # the brief still prints
+    directory = run_state.run_dir()
+    assert directory != holder
+    assert run_state.load_state(directory)["name"] is None
+    assert _events_of(directory, "run_named") == []
+
+
+def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "###")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    assert "launch name '###' not applied" in out
+    assert " owns " in out
+    directory = run_state.run_dir()
+    assert run_state.load_state(directory)["name"] is None
+    assert _events_of(directory, "run_named") == []
+
+
+def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "fresh-run")
+    monkeypatch.setenv("LMER_RUN_GOAL", "Finish the index")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(cli, "_name_conflict", boom)
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    assert "⚠️  launch name/goal not applied (continuing): scan exploded" in out
+    assert " owns " in out
+    directory = run_state.run_dir()
+    state = run_state.load_state(directory)
+    assert state["name"] is None
+    assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
+    assert _events_of(directory, "run_named") == []
+
+
+def test_a_raising_state_write_is_a_warning_not_a_refusal(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "fresh-run")
+    monkeypatch.setenv("LMER_RUN_GOAL", "Finish the index")
+    real_write = run_state.write_state
+
+    def refuse_the_identity_write(rdir, state):
+        if state.get("name") == "fresh-run":
+            raise RuntimeError("disk said no")
+        real_write(rdir, state)
+
+    monkeypatch.setattr(run_state, "write_state", refuse_the_identity_write)
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    assert "⚠️  launch name/goal not applied (continuing): disk said no" in out
+    assert " owns " in out
+    directory = run_state.run_dir()
+    state = run_state.load_state(directory)
+    assert state["name"] is None and state["goal"] is None
+    assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
+    assert _events_of(directory, "run_named") == []
+    assert _events_of(directory, "goal_set") == []
+
+
+def test_a_continuation_inherits_the_source_goal_unless_a_launch_goal_is_given(
+    session_tree, monkeypatch
+):
+    from work_repo import cli, session_record
+
+    old, source, source_state = seed_launch()
+    source_state["goal"] = "Finish the existing work"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    inherited = run_state.run_dir()
+    assert run_state.load_state(inherited)["goal"] == "Finish the existing work"
+    assert _events_of(inherited, "goal_set") == []
+
+    monkeypatch.setenv("LMER_RUN_GOAL", "Take it somewhere else")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    replaced = run_state.run_dir()
+    assert replaced != inherited
+    assert run_state.load_state(replaced)["goal"] == "Take it somewhere else"
+    (goal_set,) = _events_of(replaced, "goal_set")
+    assert goal_set["note"] == "Take it somewhere else"
+    assert goal_set["data"] == {"source": "launch"}
+
+
+# What `hooks/start.py` hands the agent is session-start's STDOUT, so the
+# launch name and goal must be in it — persisting them to state.yaml alone
+# leaves the agent naming the run again or working from a predecessor's goal.
+LAUNCH_HEADER = "This launch (lmer --name/--goal, already recorded):"
+
+
+def test_a_fresh_launch_prints_its_launch_name_and_goal_for_the_hook(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "Fresh Run")
+    monkeypatch.setenv("LMER_RUN_GOAL", "Finish the index")
+    fresh = session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert not any(line.startswith("Context from session") for line in lines)
+    launch_at = lines.index(LAUNCH_HEADER)
+    assert lines[launch_at:launch_at + 3] == [
+        LAUNCH_HEADER, "Run name: fresh-run", "Goal: Finish the index",
+    ]
+    assert lines[launch_at + 3].startswith(f"Session {fresh['uid']} owns ")
+
+    # A later start of the same launch applied nothing, so it announces nothing.
+    assert cli.cmd_session_start() == 0
+    assert LAUNCH_HEADER not in capsys.readouterr().out
+
+
+def test_a_continuation_brief_makes_the_launch_goal_current(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    old, source, source_state = seed_launch()
+    source_state.update(goal="OLD goal", phase="build")
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+    monkeypatch.setenv("LMER_RUN_NAME", "elsewhere")
+    monkeypatch.setenv("LMER_RUN_GOAL", "NEW continuation goal")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    # The predecessor stays read-only context: its phase is still shown...
+    context_at = lines.index(f"Context from session {old['uid']} (read-only):")
+    assert any(line.startswith("Phase: build") for line in lines[context_at:])
+    # ...but its goal is never presented as the goal: the launch goal is the
+    # only `Goal:` line, and the old one survives only labelled as replaced.
+    assert [line for line in lines if line.startswith("Goal:")] == [
+        "Goal: NEW continuation goal"
+    ]
+    launch_at = lines.index(LAUNCH_HEADER)
+    assert launch_at > context_at
+    assert lines[launch_at:launch_at + 4] == [
+        LAUNCH_HEADER,
+        "Run name: elsewhere",
+        "Goal: NEW continuation goal",
+        "Predecessor goal (context only, replaced by the launch goal): OLD goal",
+    ]
+    assert " owns " in lines[-1]
+    state = run_state.load_state(run_state.run_dir())
+    assert state["goal"] == "NEW continuation goal"
+    assert state["name"] == "elsewhere"
+
+
+def test_a_continuation_without_a_launch_goal_keeps_the_inherited_goal_current(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    old, source, source_state = seed_launch()
+    source_state["goal"] = "OLD goal"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+    monkeypatch.setenv("LMER_RUN_NAME", "carried-on")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [line for line in lines if line.startswith("Goal:")] == ["Goal: OLD goal"]
+    launch_at = lines.index(LAUNCH_HEADER)
+    assert lines[launch_at + 1] == "Run name: carried-on"
+    assert not any(line.startswith("Predecessor goal") for line in lines)
+
+
+def test_a_held_launch_name_is_absent_from_the_launch_lines_but_the_goal_is_not(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    holder_uid, holder, holder_state = seed_launch()
+    holder_state["name"] = "taken"
+    run_state.write_state(holder, holder_state)
+    monkeypatch.setenv("LMER_RUN_NAME", "taken")
+    monkeypatch.setenv("LMER_RUN_GOAL", "Finish the index")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert any(
+        line.startswith(f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}'")
+        for line in lines
+    )
+    launch_at = lines.index(LAUNCH_HEADER)
+    assert lines[launch_at + 1] == "Goal: Finish the index"
+    assert not any(line.startswith("Run name:") for line in lines)
+    assert " owns " in lines[-1]
+
+
+def test_a_held_name_alone_prints_no_launch_lines(session_tree, monkeypatch, capsys):
+    from work_repo import cli, session_record
+
+    _, holder, holder_state = seed_launch()
+    holder_state["name"] = "taken"
+    run_state.write_state(holder, holder_state)
+    monkeypatch.setenv("LMER_RUN_NAME", "taken")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+    assert "launch name 'taken' not applied" in out
+    assert LAUNCH_HEADER not in out
+
+
+def test_a_continuation_of_a_dotted_source_lands_under_the_bare_taskdef(
+    session_tree, monkeypatch, capsys
+):
+    """A `chat-.` record (a local-path launch from a host that exported `.`,
+    filed before run-identity's A1 wave 0, when the derivation still spelled
+    it that way) is continued under `chat`: the new record keeps its
+    provenance into the old group, the old group is left exactly as it was,
+    and `work session-start` says what happened. The old record is planted
+    under its old spelling explicitly — the live derivation now files `.`
+    under the bare taskdef in both copies (spec §3)."""
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_TASK_TARGET", ".")
+    old = session_record.start_launch()
+    source, _ = run_state.ensure_run(slug="chat-.")
+    assert source.parent == session_tree / "widgets" / "_runs" / "chat-."
+    run_state.append_event(source, "session_end")
+    before = _snapshot_record(source)
+
+    monkeypatch.setenv("LMER_TASK_TARGET", "")
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+    fresh = session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    out = capsys.readouterr().out
+
+    destination = run_state.run_dir()
+    assert destination == session_tree / "widgets" / "_runs" / "chat" / fresh["uid"]
+    state = run_state.load_state(destination)
+    assert state["slug"] == "chat"
+    assert state["target"] == ""
+    assert state["session"]["source_session_uid"] == old["uid"]
+    assert state["context"]["source_path"] == f"widgets/_runs/chat-./{old['uid']}"
+    assert _snapshot_record(source) == before
+    assert (
+        f"⚠️  continuing session {old['uid']} recorded under slug 'chat-.'; "
+        "this execution is filed under 'chat' (the old group stays as history)"
+    ) in out
+
+
+def test_a_continuation_within_one_group_prints_no_slug_warning(
+    session_tree, monkeypatch, capsys
+):
+    from work_repo import cli, session_record
+
+    old, source, _ = seed_launch()
+    run_state.append_event(source, "session_end")
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", old["uid"])
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    assert "recorded under slug" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# `work seed` writes a fresh execution identity (#535) and a seeded record
+# nobody has run in is `seeded` (D13).
+# ---------------------------------------------------------------------------
+
+
 def _work(monkeypatch, *argv):
     import sys
 
