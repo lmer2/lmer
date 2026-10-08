@@ -373,15 +373,14 @@ before cutover; a clean validator does not prove that the fleet is stopped.
 Keep the legacy layout adoption in §3 separate from this version change.
 
 Upgrade every operator's host `lmer` as well, before the cut-over, not only
-the image: the host CLI alone exports `LMER_TASK_TARGET`, so a lagging host
-keeps filing local-path launches (`lmer chat .`) under `chat-.` beside the
-`chat` groups that current hosts create. The migration owner can detect a
-lagging host afterwards with one line — any `chat-.` record added after the
-cut-over names it in the commit's author:
-
-```bash
-git log --since=<cutover> --diff-filter=A --name-only -- '*/_runs/chat-./*' | grep -c state.yaml
-```
+the image: the host CLI alone exports `LMER_TASK_TARGET`. A current container
+classifies the target it is given (`work_repo.utils.classify_target`), so a
+lagging host's `.` lands in the bare-taskdef group anyway — but a host still
+exporting the raw spelling keeps filing local-path launches (`lmer chat .`)
+under `chat-.` beside the `chat` groups current hosts create. After the
+cut-over, a new `record.plain-session-slug` finding from `lmer-schema
+validate` names a lagging runtime; fold the group (below), then reinstall
+that host's CLI.
 
 On each operator host, from the checkout of the merged tree:
 
@@ -415,6 +414,16 @@ Retain the original manifest and record hashes for comparison. Keep its
 remote removed for layout tests, or point it only at a disposable local bare
 repository when testing publication.
 
+### Fold plain-session groups
+
+A schema-2 tree that already holds `chat-.`, `chat-<repo>` or
+`chat-<repo>.git` groups (filed by a pre-classifier host) folds them into the
+bare-taskdef group with `work migrate <project>`: dry run first, then
+`--apply`. It is idempotent, and it refuses while a session in the group is
+live. `lmer-schema migrate` lists a plain-session group as a blocker naming
+the same command, so `--apply` cannot land while one remains. See §3 for the
+adoption step that produces those groups.
+
 ### Preview, apply, and prove preservation
 
 With the v2-capable runtime selected:
@@ -429,7 +438,9 @@ lmer-schema migrate /path/to/scratch-plexus --apply --json
 The first call is read-only. Review `diff` and `blockers`; do not apply with
 blockers present. The first successful apply changes only the manifest's
 version scalar, preserving comments, unknown keys, historical IDs, record
-bytes and paths. The second apply reports `applied: false` with no changes.
+bytes and paths. A plain-session fold is a prerequisite the blocker names,
+not part of the manifest apply: it changes only the paths of the folded
+records and the one `slug:` scalar each carries. The second apply reports `applied: false` with no changes.
 A blocked migration exits 1; unusable input exits 2. Validate before and
 after as well: migration preflight is not a replacement for full validation.
 
