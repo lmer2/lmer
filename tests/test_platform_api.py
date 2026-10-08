@@ -8,6 +8,7 @@ crashed runs survive into the attention list.
 
 import asyncio
 import base64
+import json
 
 import pytest
 import yaml
@@ -1612,6 +1613,122 @@ def test_reading_the_taskdef_tiers_never_pulls_the_mirror(config, mirror, tmp_pa
         "develop"
     ]
     assert pulls == []
+
+
+@pytest.fixture
+def fresh_model_cache(monkeypatch):
+    """Each test starts from an empty provider-model cache."""
+    monkeypatch.setattr(api, "_model_discovery_cache", {})
+
+
+def test_spawn_options_lists_discovered_provider_models(
+    config, tmp_path, monkeypatch, fresh_model_cache
+):
+    """The spawn form can offer a model that actually exists (issue #490).
+
+    A provider the host can query contributes its live model ids; a provider
+    whose key is missing or whose endpoint is dead costs only its own row, not
+    the answer.
+    """
+    from lmer_cli import pi_providers as pp
+
+    providers_file = tmp_path / "pi-providers.json"
+    providers_file.write_text(json.dumps({
+        "skynet": {"baseUrl": "https://skynet.example/v1", "keyEnv": "SKYNET_KEY"},
+        "dead": {"baseUrl": "https://dead.example/v1", "keyEnv": "DEAD_KEY"},
+    }), encoding="utf-8")
+    monkeypatch.setenv(pp.PROVIDERS_FILE_ENV, str(providers_file))
+    monkeypatch.setenv("SKYNET_KEY", "sk-secret")
+    monkeypatch.delenv("DEAD_KEY", raising=False)
+
+    def fake_discover(provider, key=None, **kwargs):
+        if provider.name == "dead":
+            raise RuntimeError("connection refused")
+        return [{"id": "deepseek-v4-flash"}]
+
+    monkeypatch.setattr(pp, "discover_models", fake_discover)
+
+    options = api.discover_spawn_options(config, repo_url=REPO_URL)
+    assert options["models"] == {"skynet": ["deepseek-v4-flash"]}
+
+
+def _two_providers(tmp_path, monkeypatch):
+    from lmer_cli import pi_providers as pp
+
+    providers_file = tmp_path / "pi-providers.json"
+    providers_file.write_text(json.dumps({
+        "skynet": {"baseUrl": "https://skynet.example/v1", "apiKey": "local"},
+        "lan": {"baseUrl": "http://10.255.255.1:8080/v1", "apiKey": "local"},
+    }), encoding="utf-8")
+    monkeypatch.setenv(pp.PROVIDERS_FILE_ENV, str(providers_file))
+    return pp, providers_file
+
+
+def test_spawn_options_model_discovery_is_bounded(
+    tmp_path, monkeypatch, fresh_model_cache
+):
+    """An unreachable provider must not hold the spawn form for its full
+    timeout: providers are probed in parallel under one
+    deadline, and a provider still pending at the deadline costs its row."""
+    import threading
+    import time
+
+    pp, _ = _two_providers(tmp_path, monkeypatch)
+    release = threading.Event()
+    seen: dict = {}
+
+    def fake_discover(provider, key=None, **kwargs):
+        seen[provider.name] = kwargs
+        if provider.name == "lan":
+            release.wait(10)  # an unroutable host, stalled in connect
+            return [{"id": "never"}]
+        return [{"id": "deepseek-v4-flash"}]
+
+    monkeypatch.setattr(pp, "discover_models", fake_discover)
+    monkeypatch.setattr(api, "_MODEL_DISCOVERY_DEADLINE", 0.3)
+    try:
+        started = time.monotonic()
+        models = api._discovered_models()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert models == {"skynet": ["deepseek-v4-flash"]}
+    assert elapsed < 2.0
+    # The form needs ids only, and each probe's own timeout is short.
+    assert seen["skynet"]["context_windows"] is False
+    assert seen["skynet"]["timeout"] <= api._MODEL_DISCOVERY_TIMEOUT
+
+
+def test_spawn_options_model_discovery_is_cached(
+    tmp_path, monkeypatch, fresh_model_cache
+):
+    """Repeated form loads within the TTL do not re-probe; a changed provider
+    file does."""
+    pp, providers_file = _two_providers(tmp_path, monkeypatch)
+    calls: list = []
+
+    def fake_discover(provider, key=None, **kwargs):
+        calls.append(provider.name)
+        return [{"id": f"{provider.name}-model"}]
+
+    monkeypatch.setattr(pp, "discover_models", fake_discover)
+    first = api._discovered_models()
+    second = api._discovered_models()
+    assert first == second == {
+        "skynet": ["skynet-model"], "lan": ["lan-model"],
+    }
+    assert sorted(calls) == ["lan", "skynet"]
+
+    providers_file.write_text(json.dumps({
+        "skynet": {"baseUrl": "https://skynet.example/v1", "apiKey": "local"},
+    }), encoding="utf-8")
+    assert api._discovered_models() == {"skynet": ["skynet-model"]}
+    assert sorted(calls) == ["lan", "skynet", "skynet"]
+
+    # Past the TTL the answer is refreshed.
+    monkeypatch.setattr(api, "_MODEL_DISCOVERY_TTL", 0.0)
+    api._discovered_models()
+    assert calls.count("skynet") == 3
 
 
 # --- fleet-wide relations (the constellation map's edges) --------------------

@@ -52,11 +52,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import contextlib
 import json
 import logging
 import os
 import secrets as secrets_mod
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
@@ -1316,6 +1318,102 @@ def _discovered_presets() -> list:
         return []
 
 
+#: Per-request timeout for one provider probe from the spawn form.
+_MODEL_DISCOVERY_TIMEOUT = 2.0
+#: Wall-clock bound on the whole provider sweep: providers are probed in
+#: parallel, and one still pending at the deadline costs only its own row.
+_MODEL_DISCOVERY_DEADLINE = 3.0
+#: How long a sweep's answer is reused. A spawn form loads it on every open
+#: and ``lmer-ctl spawn-options`` on every call; the list changes only when a
+#: provider swaps models, so a minute-old answer is a fine suggestion.
+_MODEL_DISCOVERY_TTL = 60.0
+#: ``fingerprint -> (monotonic time, answer)``; the fingerprint is the provider
+#: config and which keys are present, so editing the file invalidates it.
+_model_discovery_cache: dict = {}
+
+
+def _discovered_models() -> dict:
+    """Models each configured pi provider currently advertises, by provider.
+
+    Never raises, and never blocks a spawn form on a provider: a missing key,
+    an unreachable endpoint or a malformed provider entry costs that provider's
+    row, not the answer. Reads the same host-side provider registry the pi
+    runner uses (issue #490) so the orchestrator can pick a model that exists.
+
+    Bounded: providers are probed in parallel with a short
+    timeout under one :data:`_MODEL_DISCOVERY_DEADLINE`, and the answer is
+    cached for :data:`_MODEL_DISCOVERY_TTL`, so an unreachable provider adds at
+    most the deadline to the first call in a window and nothing to the rest.
+    """
+    try:
+        from lmer_cli import pi_providers
+
+        providers = pi_providers.load_providers()
+    except Exception as exc:  # noqa: BLE001 - a menu is never worth a 500
+        logger.warning("platform_model_discovery_failed error=%r", exc)
+        return {}
+    if not providers:
+        return {}
+
+    keys: dict = {}
+    for name, provider in providers.items():
+        if provider.key_env:
+            key = (os.environ.get(provider.key_env) or "").strip() or None
+            if key is None:
+                continue
+            keys[name] = key
+        else:
+            keys[name] = None
+    fingerprint = repr((
+        sorted((name, repr(provider)) for name, provider in providers.items()),
+        sorted(keys),
+    ))
+    cached = _model_discovery_cache.get(fingerprint)
+    if cached is not None and time.monotonic() - cached[0] < _MODEL_DISCOVERY_TTL:
+        return dict(cached[1])
+
+    def probe(name: str) -> list:
+        return pi_providers.discover_models(
+            providers[name], keys[name],
+            timeout=_MODEL_DISCOVERY_TIMEOUT, context_windows=False,
+        )
+
+    discovered: dict = {}
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(keys) or 1, thread_name_prefix="model-discovery"
+    )
+    try:
+        futures = {pool.submit(probe, name): name for name in keys}
+        done, pending = concurrent.futures.wait(
+            futures, timeout=_MODEL_DISCOVERY_DEADLINE
+        )
+        for future in pending:
+            logger.warning(
+                "platform_model_discovery_provider_failed provider=%s "
+                "error='no answer within %.1fs'",
+                futures[future], _MODEL_DISCOVERY_DEADLINE,
+            )
+        for future in done:
+            name = futures[future]
+            try:
+                models = future.result()
+            except Exception as exc:  # noqa: BLE001 - one dead provider is not fatal
+                logger.warning(
+                    "platform_model_discovery_provider_failed provider=%s error=%r",
+                    name, exc,
+                )
+                continue
+            ids = [m.get("id") for m in models if isinstance(m, dict) and m.get("id")]
+            if ids:
+                discovered[name] = ids
+    finally:
+        # Do not wait for a stalled probe: it ends on its own timeout.
+        pool.shutdown(wait=False, cancel_futures=True)
+    _model_discovery_cache.clear()
+    _model_discovery_cache[fingerprint] = (time.monotonic(), dict(discovered))
+    return discovered
+
+
 def discover_spawn_options(
     config: Optional[PlatformConfig] = None,
     *,
@@ -1351,13 +1449,15 @@ def discover_spawn_options(
     return {
         "taskdefs": _discovered_taskdefs(config, target=target, repo_url=repo_url),
         "presets": _discovered_presets(),
+        "models": _discovered_models(),
         "repo_url": configured_repo_url(),
         "advisory": True,
         "note": (
             "suggestions, not a vocabulary: the work repo's taskdefs are read "
             "from this host's mirror, which may be stale or hold no tier for "
             "the project this spawn names, so any name may be typed. Presets "
-            "are names only — their env, checkout and service stay on the host."
+            "are names only — their env, checkout and service stay on the host. "
+            "Models are what each configured pi provider currently advertises."
         ),
     }
 
@@ -2307,10 +2407,14 @@ def create_app(
         target: str = Query(default=""),
         repo_url: Optional[str] = Query(default=None),
     ) -> dict:
-        """Taskdefs and presets this host can see, for the spawn form's selects.
+        """Taskdefs, presets and provider models this host can see, for the
+        spawn form's selects.
 
         Behind the guard like everything else: preset names are the operator's
         configuration, and the taskdef list is a description of this machine.
+        ``models`` maps each configured pi provider to the model ids it
+        currently advertises (issue #490), so a spawn form can offer a model
+        that exists; an unreachable provider costs only its own row.
 
         ``target`` and ``repo_url`` are the spawn being composed. They are what
         lets the work repo's *project* taskdef tier appear — it is filed under the
