@@ -280,6 +280,63 @@ def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> 
     return f"{taskdef}-{safe}"
 
 
+def legacy_derive_slug(taskdef: Optional[str], target: Optional[str]) -> str:
+    """The pre-A1 slug derivation, kept verbatim (run-identity spec §7).
+
+    ``derive_slug`` was rewritten by A1 to classify the target first: no work
+    item means the bare taskdef. This is the spelling the OLD derivation
+    produced, which is what the §7 predicate compares a record's stored
+    ``slug`` against — a leftover ``chat-.``/``chat-widgets.git`` group is
+    exactly a record whose slug equals this function's answer. Pure: unlike
+    the old ``derive_slug`` it takes both values and reads no environment
+    (the predicate always holds the record's recorded taskdef and target).
+    """
+    target = target or ""
+    if target and _FULL_SHA_RE.fullmatch(target):
+        return f"{taskdef}-{target[:12].lower()}"
+    safe = sanitize_task_target(target) if target else "default"
+    if safe == "default":
+        return taskdef
+    return f"{taskdef}-{safe}"
+
+
+def is_legacy_plain_session_slug(state) -> bool:
+    """Whether *state* is a pre-A1 plain-session leftover (spec §7, astra R1).
+
+    The ONE predicate the validator check ``record.plain-session-slug``, the
+    ``lmer-schema migrate`` blocker and the ``work migrate`` fold share. A
+    record matches only when its stored ``slug`` is the OBSOLETE DERIVED
+    spelling of its own recorded target: ``slug`` and ``taskdef`` are
+    non-empty strings, the recorded ``target`` (absent or null read as ``''``)
+    is not a work item, ``slug == legacy_derive_slug(taskdef, target)``, and
+    that derivation differs from the bare taskdef. So ``chat`` with target
+    ``.`` (``chat-.``), a bare repo URL (``chat-widgets``), its ``.git`` form
+    and ``masterplan-.`` match, while a re-slugged record — one carrying a
+    non-empty ``reslugged_from`` — never does, however it was named. A
+    non-mapping state, or a missing or non-string ``slug``/``taskdef``, never
+    matches (review S9): the predicate is about the stored spelling, and a
+    record that does not record one is not this leftover.
+    """
+    if not isinstance(state, dict):
+        return False
+    slug = state.get("slug")
+    taskdef = state.get("taskdef")
+    if not isinstance(slug, str) or not slug:
+        return False
+    if not isinstance(taskdef, str) or not taskdef:
+        return False
+    if vacated_slugs(state):
+        return False
+    target = state.get("target")
+    if target is not None and not isinstance(target, str):
+        return False
+    target = target or ""
+    if is_work_item(target):
+        return False
+    legacy = legacy_derive_slug(taskdef, target)
+    return slug == legacy and legacy != taskdef
+
+
 def runs_base() -> Optional[Path]:
     """The run area of this session's project dir: `<project>/runs` in a
     legacy tree, `<project>/_runs` in a schema-form one (issue #353 D20).
