@@ -1,0 +1,6 @@
+changed:
+- "a plain project session — no target, `.`, a checkout path, a bare repository URL or a document URL — now files its run under the bare taskdef group (`chat`) instead of `chat-.` or `chat-<repo>.git`; the slug is derived from one target classifier shared by the host CLI, the container and the work CLI (#536, #537)"
+- "existing schema-1 records under the old `chat-.` / `chat-<repo>.git` spellings stay where they are, but the platform no longer resumes or answers them and a host launch seeds the bare group beside them, until `work migrate` folds them at adoption (#368)"
+fixed:
+- "a document URL target — a file, tree or wiki page inside a repository — clones that repository instead of being refused or mis-derived (#523)"
+- "a list-page target such as `/-/issues` or `/-/merge_requests` no longer leaks the `/-/…` route into the work-repo project path (#391)"
