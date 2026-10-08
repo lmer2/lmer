@@ -233,6 +233,8 @@ def upsert_spec_link(
     label: str,
     when: Optional[datetime] = None,
     alias: Optional[str] = None,
+    *,
+    specs_directory: Optional[Path] = None,
 ) -> Optional[Path]:
     """Upsert one specs-index entry for a spec-class file. Fail-soft.
 
@@ -274,7 +276,9 @@ def upsert_spec_link(
         # ends are under `base`, so `relpath` can only walk up as far as it.
         if not spec_path.is_file() or not spec_path.is_relative_to(base):
             return None
-        sdir = specs_dir()
+        # An explicit directory lets an operator-shell caller (the fold) name
+        # the index without a session env; the default is unchanged.
+        sdir = Path(specs_directory) if specs_directory is not None else specs_dir()
         if sdir is None:
             return None
         sdir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +319,10 @@ def upsert_spec_link(
 
 @mutation_transaction
 def repoint_run_dir_entries(
-    old_name: str, new_name: str, new_label: str
+    old_name: str, new_name: str, new_label: str, *,
+    project_dir: Optional[Path] = None,
+    specs_directory: Optional[Path] = None,
+    run_area: Optional[Path] = None,
 ) -> None:
     """Re-point index entries after a record dir moved (the freeze's
     `<slug>/` → `<slug>--<name>/`, the re-slug's move to a new address).
@@ -341,8 +348,17 @@ def repoint_run_dir_entries(
     """
     try:
         from . import run_state  # local: run_state imports this module
-        sdir = specs_dir()
-        runs = run_state.runs_base()
+        # Explicit paths let an operator shell without a session env (the
+        # fold) call this; the default resolution is unchanged.
+        sdir = Path(specs_directory) if specs_directory is not None else specs_dir()
+        if run_area is not None:
+            runs = Path(run_area)
+        elif project_dir is not None:
+            project_dir = Path(project_dir)
+            schema_runs = project_dir / "_runs"
+            runs = schema_runs if schema_runs.is_dir() else project_dir / "runs"
+        else:
+            runs = run_state.runs_base()
         if sdir is None or runs is None or old_name == new_name:
             return
         if not sdir.is_dir():
@@ -429,7 +445,10 @@ def repoint_run_dir_entries(
                     else rest
                 )
             entry.unlink()
-            upsert_spec_link(new_target, new_label, when=when, alias=basename)
+            upsert_spec_link(
+                new_target, new_label, when=when, alias=basename,
+                specs_directory=sdir,
+            )
     except Exception as exc:
         print(f"⚠️  specs index re-point skipped: {exc}")
 

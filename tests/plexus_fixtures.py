@@ -530,7 +530,7 @@ RELEASE_RECORDS = (
 )
 
 
-def _plain_session_state_yaml(record) -> str:
+def _plain_session_state_yaml(record, *, status="complete", created="2026-09-01T10:00:00Z") -> str:
     """A schema-1 state file carrying exactly the predicate's inputs."""
     lines = [
         "schema: 1",
@@ -538,7 +538,7 @@ def _plain_session_state_yaml(record) -> str:
         "name: null",
         f"taskdef: {record['taskdef']}",
         f"target: {record.get('target', '')!r}",
-        "status: complete",
+        f"status: {status}",
         "phase: implement",
         "stop_reason: complete",
         "critical_error: null",
@@ -547,9 +547,9 @@ def _plain_session_state_yaml(record) -> str:
         "estimate: null",
         "artifacts: {}",
         "owner: null",
-        "frozen: '2026-09-01T10:00:00Z'",
-        "created: '2026-09-01T10:00:00Z'",
-        "updated: '2026-09-01T10:00:00Z'",
+        f"frozen: '{created}'",
+        f"created: '{created}'",
+        f"updated: '{created}'",
     ]
     reslugged = record.get("reslugged_from")
     if reslugged:
@@ -559,7 +559,8 @@ def _plain_session_state_yaml(record) -> str:
 
 
 def plant_plain_session_records(project_dir, *, area="_runs", nested=True,
-                                session_id=None):
+                                session_id=None, signed_out=True, readable=True,
+                                status="complete"):
     """Plant §7's plain-session groups and R1's release record under
     *project_dir*, returning ``{slug: [state.yaml, ...]}``.
 
@@ -567,8 +568,11 @@ def plant_plain_session_records(project_dir, *, area="_runs", nested=True,
     legacy one) and *nested* whether each group holds a session directory
     (schema form) or the state file sits directly in the group (legacy form).
     The three obsolete spellings must be folded; R1's release record must
-    never be touched in either state. The existing builders and
-    ``tests/test_lmer_schema_fixtures.py`` are left untouched.
+    never be touched in either state. *signed_out* writes a final
+    ``session_end`` (the fold's preflight requires a stopped record);
+    *readable=False* writes a torn state file (lifecycle unknown). The
+    existing builders and ``tests/test_lmer_schema_fixtures.py`` are left
+    untouched.
     """
     planted = {}
     records = [
@@ -583,8 +587,18 @@ def plant_plain_session_records(project_dir, *, area="_runs", nested=True,
         group = Path(project_dir) / area / record["slug"]
         rdir = group / sid if nested else group
         rdir.mkdir(parents=True, exist_ok=True)
-        _write(rdir / "state.yaml", _plain_session_state_yaml(record))
-        _write(rdir / "events.jsonl", "")
+        if readable:
+            _write(rdir / "state.yaml", _plain_session_state_yaml(
+                record, status=status, created=f"2026-09-01T10:00:{index:02d}Z",
+            ))
+        else:
+            _write(rdir / "state.yaml", "state: [unclosed\n")
+        if signed_out:
+            _write(rdir / "events.jsonl", json.dumps({
+                "ts": "2026-09-01T10:05:00Z", "session": sid, "type": "session_end",
+            }) + "\n")
+        else:
+            _write(rdir / "events.jsonl", "")
         planted.setdefault(record["slug"], []).append(rdir / "state.yaml")
     return planted
 

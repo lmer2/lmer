@@ -166,6 +166,9 @@ REPOINT = "repoint"
 LINK = "compat-link"
 #: The kind an :class:`IndexWrite` reports under.
 INDEX = "index"
+#: The fold's scalar rewrite (§7): `src` is a state file, `dst` the new
+#: `slug:` value, `was` the old one.
+SLUG = "slug"
 
 #: The bare area names and their schema twins (SCHEMA.md Appendix A), in
 #: plan order. `memory/` is deliberately absent: its lift is routed by
@@ -251,6 +254,8 @@ class Move:
             return f"ln -s {self.dst} {prefix}/{self.src}"
         if self.kind == REPOINT:
             return f"ln -sfn {self.dst} {_join(prefix, self.src)}"
+        if self.kind == SLUG:
+            return f"rewrite {_join(prefix, self.src)}: slug: {self.was} \u2192 {self.dst}"
         verb = "git mv" if self.tracked else "mv"
         return f"{verb} {_join(prefix, self.src)} {_join(prefix, self.dst)}"
 
@@ -267,6 +272,12 @@ class Move:
         if self.kind == LINK:
             path = _join(prefix, self.src)
             return f"{path} -> {self.dst}", {"kind": self.kind, "to": self.dst, "path": path}
+        if self.kind == SLUG:
+            path = _join(prefix, self.src)
+            return (
+                f"{path}: slug: {self.was} -> {self.dst}",
+                {"kind": self.kind, "from": self.was, "to": self.dst, "path": path},
+            )
         src, dst = _join(prefix, self.src), _join(prefix, self.dst)
         return f"{src} -> {dst}", {"kind": self.kind, "from": src, "to": dst}
 
@@ -355,6 +366,7 @@ class Plan:
     blockers: tuple
     repoints: tuple = ()
     memory_lift: Optional[MemoryLift] = None
+    emptied_groups: tuple = ()
 
     @property
     def rel(self) -> str:
@@ -373,19 +385,38 @@ class Plan:
         return _join(self.rel, project_rel)
 
     def record_dirs(self) -> list:
-        """The record dirs whose address changes — the preflight's input."""
-        return [
+        """The record dirs whose address changes — the preflight's input.
+
+        Every record in a group being folded is included, not only the ones
+        whose slug matched: a live or unreadable sibling must stop the whole
+        group's move, because the group dir is removed and the sibling moves
+        with it (spec §7)."""
+        dirs = [
             self.project_dir / move.src
             for move in self.moves
             if move.kind in (RECORD, ARCHIVE)
         ]
+        for group_rel in self.emptied_groups:
+            group = self.project_dir / group_rel
+            if not group.is_dir() or group.is_symlink():
+                continue
+            for child in sorted(group.iterdir()):
+                if child.is_dir() and not child.is_symlink() and run_state._state_path(child):
+                    dirs.append(child)
+        seen, unique = set(), []
+        for path in dirs:
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        return unique
 
     def git_paths(self) -> list:
         """Every work-repo-relative path a change touches, old and new, for
         the clean-tree check and for staging."""
         paths = []
         for move in (*self.moves, *self.repoints, *self.links):
-            rels = (move.src,) if move.kind in (LINK, REPOINT) else (move.src, move.dst)
+            rels = (move.src,) if move.kind in (LINK, REPOINT, SLUG) else (move.src, move.dst)
             for rel in rels:
                 rel = self.rel_of(rel)
                 if rel not in paths:
@@ -404,7 +435,8 @@ class Plan:
         if self.links:
             return []
         out = []
-        for rel in (f"{LEGACY_RUNS}/{run_state.ARCHIVE_DIR}", LEGACY_RUNS):
+        for rel in (*self.emptied_groups,
+                    f"{LEGACY_RUNS}/{run_state.ARCHIVE_DIR}", LEGACY_RUNS):
             directory = self.project_dir / rel
             if not directory.is_dir() or directory.is_symlink():
                 continue
@@ -652,12 +684,14 @@ def plan_project(project: str, *, root: Optional[Path] = None, compat_link: bool
     planner.areas()
     instance_dir = root / INSTANCE_MEMORY
     planner.memory(instance_dir, os.path.relpath(instance_dir, project_dir).replace(os.sep, "/"))
+    planner.fold_plain_sessions()
     planner.index_links()
     links = tuple(_compat_links(moves)) if compat_link else ()
     return Plan(
         root=root, project=project, project_dir=project_dir,
         moves=tuple(moves), links=links, notes=tuple(notes), blockers=tuple(blockers),
         repoints=tuple(repoints), memory_lift=planner.memory_lift,
+        emptied_groups=tuple(dict.fromkeys(planner.emptied_groups)),
     )
 
 
@@ -738,6 +772,7 @@ class _Planner:
         self.notes, self.blockers = notes, blockers
         self.tracked = tracked
         self.memory_lift: Optional[MemoryLift] = None
+        self.emptied_groups: list = []
 
     def run_dirs(self, area_rel: str, dst_prefix: str, kind: str) -> None:
         """Every record-shaped child of one legacy run area nests under its
@@ -768,7 +803,14 @@ class _Planner:
                 continue
             slug, _sep, label = name.partition("--")
             sid, source, starts = legacy_session_id(child)
-            dst = f"{dst_prefix}/{slug}/{sid}" + (f"--{label}" if label else "")
+            state = run_state._read_sibling_state(child) or {}
+            folded = kind == RECORD and run_state.is_legacy_plain_session_slug(state)
+            # A legacy record that is a pre-A1 plain-session leftover nests
+            # straight into the bare taskdef group: the nesting and the §7
+            # fold are ONE move here, and its `slug:` scalar is rewritten
+            # after it (B.fold).
+            group = state.get("taskdef") if folded else slug
+            dst = f"{dst_prefix}/{group}/{sid}" + (f"--{label}" if label else "")
             remarks = []
             if starts > 1:
                 remarks.append(
@@ -787,6 +829,51 @@ class _Planner:
             self.moves.append(
                 Move(kind, src, dst, note="; ".join(remarks) or None, tracked=self.tracked(src))
             )
+            if folded:
+                self.moves.append(
+                    Move(SLUG, f"{dst}/{run_state.STATE_FILE}", state["taskdef"],
+                         was=state.get("slug"))
+                )
+
+    def fold_plain_sessions(self) -> None:
+        """Spec §7's fold for a schema-form tree: a `_runs/<slug>/<sid>/`
+        whose state is a pre-A1 plain-session leftover moves into the bare
+        taskdef group, its `slug:` scalar rewritten (B.fold). A legacy tree
+        already folded its records into the nesting destination
+        (`run_dirs`), so this scans only `_runs/`. Idempotent: after the fold
+        nothing matches, so a re-run plans nothing. A destination that
+        already exists is a blocker — reported and skipped, never
+        overwritten."""
+        runs = self.project_dir / SCHEMA_RUNS
+        if not runs.is_dir() or runs.is_symlink():
+            return
+        destinations = {move.dst for move in self.moves}
+        for group in sorted(runs.iterdir()):
+            if not group.is_dir() or group.is_symlink() or group.name.startswith("."):
+                continue
+            for child in sorted(group.iterdir()):
+                if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+                    continue
+                if run_state._state_path(child) is None:
+                    continue
+                state = run_state._read_sibling_state(child) or {}
+                if not run_state.is_legacy_plain_session_slug(state):
+                    continue
+                src = f"{SCHEMA_RUNS}/{group.name}/{child.name}"
+                dst = f"{SCHEMA_RUNS}/{state['taskdef']}/{child.name}"
+                if os.path.lexists(self.project_dir / dst) or dst in destinations:
+                    self.blockers.append(
+                        f"{dst} already exists; {src} cannot move there "
+                        "(reported and skipped, never overwritten)"
+                    )
+                    continue
+                destinations.add(dst)
+                self.moves.append(Move(RECORD, src, dst, tracked=self.tracked(src)))
+                self.moves.append(
+                    Move(SLUG, f"{dst}/{run_state.STATE_FILE}", state["taskdef"],
+                         was=state.get("slug"))
+                )
+                self.emptied_groups.append(f"{SCHEMA_RUNS}/{group.name}")
 
     def areas(self) -> None:
         for old, new in AREA_RENAMES:
@@ -1436,6 +1523,17 @@ def _apply(
 
         applied = []
         for move in plan.moves:
+            if move.kind == SLUG:
+                # The fold's one scalar: positional surgery on the moved
+                # state file, nothing else (spec §7, §1.6).
+                rel = plan.rel_of(move.src)
+                _rewrite_slug(root / rel, move.dst)
+                rc = _stage(root, rel, err)
+                if rc != 0:
+                    return rc
+                out(move.render(plan.rel))
+                applied.append(move)
+                continue
             src, dst = plan.rel_of(move.src), plan.rel_of(move.dst)
             (root / dst).parent.mkdir(parents=True, exist_ok=True)
             if move.tracked:
@@ -1497,6 +1595,26 @@ def _stage(root: Path, rel: str, err: Callable[[str], None]) -> int:
     if rc != 0:
         err(f"❌ git add {rel} failed: {output}")
     return rc
+
+
+def _rewrite_slug(path: Path, new_slug: str) -> None:
+    """Rewrite exactly the `slug:` scalar in a state file, by positional
+    scalar surgery — the way `lmer_schema.migration` rewrites `schema:`.
+    Every other byte stays identical; no YAML dump (spec §7, §1.6)."""
+    import yaml
+
+    text = path.read_text(encoding="utf-8")
+    node = yaml.compose(text)
+    if node is None or not isinstance(node, yaml.MappingNode):
+        raise MigrateError(f"{path}: not a YAML mapping; cannot rewrite `slug:`")
+    for key_node, value_node in node.value:
+        if key_node.value == "slug":
+            path.write_text(
+                text[:value_node.start_mark.index] + new_slug + text[value_node.end_mark.index:],
+                encoding="utf-8",
+            )
+            return
+    raise MigrateError(f"{path}: no `slug:` scalar to rewrite")
 
 
 def _write_index(path: Path, text: str) -> None:
