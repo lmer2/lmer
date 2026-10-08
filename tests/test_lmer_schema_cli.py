@@ -487,11 +487,12 @@ class TestTextOutput:
 
 
 class TestListChecks:
-    def test_the_inventory_has_sixty_one_rows(self, capsys):
+    def test_the_inventory_has_sixty_two_rows(self, capsys):
         # The count SCHEMA-GUIDE §5 quotes: 59 before the two README index
-        # codes (`index.readme-missing`, `index.readme-stale`), 61 with them.
+        # codes (`index.readme-missing`, `index.readme-stale`), 62 with them
+        # and `record.plain-session-slug`.
         _code, out, _err = _run(capsys, "--list-checks")
-        assert len([line for line in out.splitlines() if line.strip()]) == 61
+        assert len([line for line in out.splitlines() if line.strip()]) == 62
 
     def test_one_row_per_registered_code_in_code_order(self, capsys):
         code, out, err = _run(capsys, "--list-checks")

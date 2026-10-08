@@ -694,7 +694,7 @@ memory scope) but never shape findings.
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
 | `<project>/_runs/` | session (`work` CLI) creates it on first launch | directory of `<slug>/` grouping directories | optional | machine |
-| `<project>/_runs/<slug>/` | session (`work` CLI) creates it; nothing is written at this level | directory holding session directories only; a file or non-session directory here is a warning | optional | machine |
+| `<project>/_runs/<slug>/` | session (`work` CLI) creates it; nothing is written at this level | directory holding session directories only; a file or non-session directory here is a warning; a slug that is the obsolete derivation of its own target (`chat-.`, `chat-<repo>.git`) is `record.plain-session-slug` and `work migrate` folds it into the bare taskdef group | optional | machine |
 | `<project>/_runs/.new-<session-id>-*/` | session (`work` CLI) | seed directory of the run-dir lifecycle in [RUN-STATE.md](./RUN-STATE.md): written, then moved to `<session-dir>` by one atomic rename | transient | machine |
 | `<session-dir>/` | see [Session directory](#session-directory) | see Session directory (`<session-dir>/` row) | see Session directory | see Session directory |
 | `<project>/_specs/` | tooling: the specs index sync of `work artifact`, `work session-end` and `work specs-index --rebuild` | flat directory of dated relative symlinks `YYYY-MM-DD-<runlabel>--<basename>.md` into session directories (`../_runs/<slug>/<session-dir>/…`); `<runlabel>` is the RECORD's label, `<name-or-slug>-<session-id>` (see [Sessions and runs](#sessions-and-runs)), so one entry per (record, artifact) and a second launch of one target never unlinks the first launch's entry; the `--` is reserved as the label/basename boundary and a label never contains one; no index file; dangling is an error, non-relative or escaping is an error in every form | optional | machine |
@@ -869,6 +869,7 @@ tier: a corrupt state file is broken in every form.
 | `record.seed-dir-leftover` | WARN | | machine | a `.new-<session-id>-*` seed directory left behind by a crash — transient state the cleaner sweeps |
 | `record.session-stale` | INFO | | machine | an `in-progress` session untouched for longer than the staleness window: possibly orphaned, resumable, never auto-ended |
 | `record.masterplan-nested` | INFO | | opaque | a masterplan bundle in the pre-schema-1 nested `masterplan/<mp-slug>/` shape; reported for migration, never an error |
+| `record.plain-session-slug` | ERROR | | machine | a pre-A1 plain-session leftover: the slug is the obsolete derivation of the record's own target (`chat-.`, `chat-<repo>.git`); `work migrate <project>` folds it |
 
 #### `index.*` — the link mechanic of the indexes and the bundle, and the generated README index blocks
 

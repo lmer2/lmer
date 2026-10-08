@@ -57,6 +57,7 @@ import pytest
 from lmer_schema.checks import CHECKS, Form, Report, Severity, Tier
 from lmer_schema.checks import record
 from lmer_schema.checks import walk
+from tests import plexus_fixtures as pf
 from work_repo import run_state
 
 #: A fixed "now" one hour after the fixture record's last update: the fixture
@@ -102,6 +103,7 @@ RECORD_CODES = {
     "record.events-line-unparseable",
     "record.grouping-level-entry",
     "record.masterplan-nested",
+    "record.plain-session-slug",
     "record.seed-dir-leftover",
     "record.session-dir-without-state",
     "record.session-id-malformed",
@@ -148,6 +150,8 @@ class TestCodes:
         assert CHECKS["record.session-stale"].severity is Severity.INFO
         assert CHECKS["record.masterplan-nested"].severity is Severity.INFO
         assert CHECKS["record.masterplan-nested"].tier is Tier.OPAQUE
+        assert CHECKS["record.plain-session-slug"].severity is Severity.ERROR
+        assert CHECKS["record.plain-session-slug"].tier is Tier.MACHINE
 
     def test_the_enums_are_the_run_state_writers(self):
         # docs/RUN-STATE.md is the authority; the writer's own constants are
@@ -178,6 +182,60 @@ class TestCleanTrees:
         (_group_dir(schema_plexus) / "stray.txt").write_text("x", encoding="utf-8")
         finding = _report(schema_plexus).findings[0]
         assert finding.path == f"lmer/_runs/{schema_plexus.slug}/stray.txt"
+
+
+class TestPlainSessionSlug:
+    """`record.plain-session-slug` — the §7 fold's validator half (D10).
+
+    The predicate is shared with the migrate blocker and the fold; this check
+    only reports it, in schema form only, and never inside a host bucket (D9:
+    a bucket never blocks, and a `record.*` code has no legacy downgrade).
+    """
+
+    def test_one_finding_per_plain_session_group_in_schema_form(self, schema_plexus):
+        planted = pf.plant_plain_session_records(schema_plexus.project_dir)
+        report = _report(schema_plexus)
+        findings = _at(report, "record.plain-session-slug")
+        assert len(findings) == len(pf.PLAIN_SESSION_GROUPS)
+        assert {f.path for f in findings} == {
+            f"lmer/_runs/{slug}" for _taskdef, _target, slug in pf.PLAIN_SESSION_GROUPS
+        }
+        for finding in findings:
+            assert "work migrate <project>" in finding.message
+            assert "slug:" in finding.message
+        assert planted  # the planter wrote them where the walk looks
+
+    def test_the_release_record_is_never_flagged(self, schema_plexus):
+        pf.plant_plain_session_records(schema_plexus.project_dir)
+        paths = {f.path for f in _at(_report(schema_plexus), "record.plain-session-slug")}
+        for record_ in pf.RELEASE_RECORDS:
+            assert f"lmer/_runs/{record_['slug']}" not in paths
+
+    def test_a_legacy_tree_is_never_flagged(self, legacy_plexus):
+        # No manifest: the fold happens at adoption, inside `work migrate`.
+        pf.plant_plain_session_records(legacy_plexus.project_dir, area="runs", nested=False)
+        assert _at(_report(legacy_plexus), "record.plain-session-slug") == []
+
+    def test_a_host_bucket_never_blocks(self, schema_plexus):
+        pf.plant_plain_session_records(schema_plexus.bucket_dir)
+        assert _at(_report(schema_plexus), "record.plain-session-slug") == []
+
+    def test_a_bare_runs_area_in_a_schema_tree_is_flagged(self, schema_plexus):
+        # A registered project's bare `runs/` area: `work migrate <project>`
+        # nests and folds it, so the check names the same command.
+        pf.plant_plain_session_records(
+            schema_plexus.project_dir, area="runs", nested=False
+        )
+        findings = _at(_report(schema_plexus), "record.plain-session-slug")
+        assert len(findings) == len(pf.PLAIN_SESSION_GROUPS)
+        assert all(f.path.startswith("lmer/runs/") for f in findings)
+
+    def test_the_move_text_is_the_one_shared_formatter(self):
+        text = record.plain_session_move_text("chat-.", "chat")
+        assert "_runs/chat-./" in text
+        assert "_runs/chat/" in text
+        assert "slug: chat-. \u2192 chat" in text
+        assert "work migrate <project>" in text
 
 
 # ---------------------------------------------------------------------------
