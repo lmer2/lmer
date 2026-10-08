@@ -1,0 +1,4 @@
+added:
+- "`LMER_CONTAINER_RUNTIME=docker|podman` selects the host container runtime when both are installed, read by lmer (including `lmer build`), the Makefile, `bin/lmer-reset` and `scripts/platform-container-run.sh`. It stays on the host: it is never forwarded into session containers, and the platform image sets it to `docker` inside."
+changed:
+- "`scripts/platform-container-run.sh --runtime` now accepts only `docker` or `podman` (trimmed, any case); a path or any other name is rejected instead of being run."

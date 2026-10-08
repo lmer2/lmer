@@ -128,6 +128,7 @@ from .runtime import (
     MEMORY_HINT,
     repo_root_path,
     resource_limit_plan,
+    RUNTIME_ENV,
     _valid_cpus,
     _valid_memory,
 )
@@ -2058,6 +2059,9 @@ def _handle_build(argv: list[str]) -> int:
     if args.update_claude:
         update_harnesses.add("claude")
 
+    # The build runs before main()'s .env load, but must use the runtime (and
+    # so the image store) that sessions will run from.
+    apply_env_file_defaults(default_env_file_candidates(), only=(RUNTIME_ENV,))
     try:
         runtime = detect_runtime()
     except Exception as e:
@@ -2988,6 +2992,9 @@ def main(argv: list[str] | None = None) -> int:
         # Block .env and preset seeding from carrying these lists into a run.
         "LMER_SLACK_DM_ALLOWED_USERS": None,
         "LMER_MATRIX_ALLOWED_USERS": None,
+        # Names the *host's* runtime; the session image ships only the docker
+        # client. Seeded None so neither .env nor preset seeding forwards it.
+        "LMER_CONTAINER_RUNTIME": None,
         DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         # User-installed harnesses (issue #132): where the host mounted

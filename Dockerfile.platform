@@ -133,6 +133,13 @@ RUN pip install --no-cache-dir .
 ENV LMER_PLATFORM_UI_DIST=/opt/lmer/ui
 COPY --from=ui-builder /build/web/dist /opt/lmer/ui
 
+# The daemon drives the host's engine through the docker client on the mounted
+# socket, whatever that engine is. Image ENV is in os.environ before the daemon's
+# first-wins .env load, so a host-only LMER_CONTAINER_RUNTIME=podman in the
+# mounted ~/.lmer/.env cannot reach detect_runtime() here, however this
+# container is started.
+ENV LMER_CONTAINER_RUNTIME=docker
+
 # Bake build provenance so a running platform can answer "what commit is this
 # image?" — /opt/lmer has no .git. Placed after the heavy layers so a changing
 # commit does not bust their cache.

@@ -141,18 +141,44 @@ def _available_controllers() -> "set[str] | None":
         return None
 
 
+#: Names the runtime explicitly instead of detecting it. The only way to pick
+#: podman on a host that also has docker: both usually live in ``/usr/bin``, so
+#: PATH cannot hide one without hiding the other.
+RUNTIME_ENV = "LMER_CONTAINER_RUNTIME"
+
+_SUPPORTED_RUNTIMES = ("docker", "podman")
+
+
 def detect_runtime() -> str:
     """
     Detect available container runtime on the system.
 
-    Checks PATH for docker and podman binaries, in that order.
+    ``LMER_CONTAINER_RUNTIME`` (``docker`` or ``podman``) wins when set and
+    must name a binary on PATH; an invalid or missing choice is an error rather
+    than a silent fallback, because the two runtimes get different run flags
+    (``--userns=keep-id``) and a quiet swap would surface later as ownership
+    failures. Otherwise checks PATH for docker and podman binaries, in that
+    order.
 
     Returns:
         'docker' or 'podman'
 
     Raises:
-        RuntimeErrorDetect: If neither Docker nor Podman is found
+        RuntimeErrorDetect: If the override is invalid or not on PATH, or
+            neither Docker nor Podman is found
     """
+    override = (os.environ.get(RUNTIME_ENV) or "").strip().lower()
+    if override:
+        if override not in _SUPPORTED_RUNTIMES:
+            raise RuntimeErrorDetect(
+                f"{RUNTIME_ENV}={os.environ[RUNTIME_ENV]!r} is not supported; "
+                f"use one of: {', '.join(_SUPPORTED_RUNTIMES)}"
+            )
+        if not shutil.which(override):
+            raise RuntimeErrorDetect(
+                f"{RUNTIME_ENV}={override} but {override} is not on PATH"
+            )
+        return override
     if shutil.which("docker"):
         return "docker"
     if shutil.which("podman"):
@@ -241,6 +267,7 @@ def apply_env_file_defaults(
     candidates: "list[tuple[str, Path]]",
     *,
     references_from_environ: bool = False,
+    only: "tuple[str, ...] | None" = None,
 ) -> "dict[str, str]":
     """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
 
@@ -256,8 +283,13 @@ def apply_env_file_defaults(
     behaviour somebody depends on. The referenced variable itself obeys
     first-wins either way, so only composed values differ.
 
+    *only* limits the load to those names. ``load_dotenv`` cannot be limited,
+    so it cannot be combined with *references_from_environ*.
+
     Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
     """
+    if only is not None and references_from_environ:
+        raise ValueError("only= cannot be combined with references_from_environ=True")
     sources: "dict[str, str]" = {}
     for location, env_file in candidates:
         if not env_file.exists():
@@ -272,6 +304,8 @@ def apply_env_file_defaults(
                 sources[key] = f".env ({location})"
             continue
         for key, value in dotenv_values(dotenv_path=str(env_file)).items():
+            if only is not None and key not in only:
+                continue
             if key not in os.environ and value is not None:
                 os.environ[key] = value
                 sources[key] = f".env ({location})"
