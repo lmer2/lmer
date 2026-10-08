@@ -602,7 +602,10 @@ class TestGapBMergeDelta:
             if f".conflict-{alpha.sid}" in path.name
         ]
         assert copies, sorted(path.name for path in alpha.memory_dir.iterdir())
-        assert copies[0].read_text() == mine
+        # The copy is what the session has NOT seen — the sibling's published
+        # version; its own version is still its own file.
+        assert copies[0].read_text() == theirs
+        assert (alpha.memory_dir / PROJECT_MEMORY_FILE).read_text() == mine
         # The local memory commit is reverted and dropped, so nothing of it
         # is left to replay and the next publication from the shared checkout
         # goes through, landing on upstream's bytes.
@@ -676,11 +679,12 @@ class TestDroppedCommitRecovery:
         _add(alpha, "alpha_new", "project")
 
         assert self._race(plexus, monkeypatch, alpha, beta) != 0
-        # The agent reconciles: it adopts upstream's version, drops the copy.
-        for path in alpha.memory_dir.iterdir():
-            if ".conflict-" in path.name:
-                path.unlink()
-        (alpha.memory_dir / PROJECT_MEMORY_FILE).write_text(theirs)
+        # The agent reconciles from what persist left it — the copy of
+        # upstream's version, its only source for the sibling's edit.
+        (copy,) = [p for p in alpha.memory_dir.iterdir() if ".conflict-" in p.name]
+        assert copy.read_text() == theirs
+        (alpha.memory_dir / PROJECT_MEMORY_FILE).write_text(copy.read_text())
+        copy.unlink()
         assert memory.persist_memory("alpha retry") == 0
 
         assert plexus.published(f"{plexus.project_rel}/alpha_new.md") is not None
@@ -707,6 +711,38 @@ class TestDroppedCommitRecovery:
         _add(alpha, "alpha_note", "project")
         assert memory.persist_memory("alpha", allow_unbaselined_delete=True) == 0
         assert plexus.published(f"{plexus.project_rel}/beta_note.md") is not None
+
+    def test_the_copy_is_upstreams_version_and_every_uncopied_path_says_why(
+        self, plexus
+    ):
+        from work_repo.git_ops import ConflictedPath
+
+        alpha = plexus.enter(plexus.start("alpha"))
+        scope = plexus.project_rel
+        written, uncopied = memory._write_conflict_copies(
+            [
+                ConflictedPath(f"{scope}/edited.md", "upstream\n", "mine\n"),
+                ConflictedPath(f"{scope}/gone_upstream.md", None, "mine\n"),
+                ConflictedPath(f"{scope}/gone_here.md", "upstream\n", None),
+                ConflictedPath(f"{scope}/{memory.MEMORY_INDEX}", "a\n", "b\n"),
+                ConflictedPath("elsewhere/log.md", "a\n", "b\n"),
+            ],
+            [scope],
+        )
+        assert written == [f"edited.conflict-{alpha.sid}.md"]
+        assert (alpha.memory_dir / written[0]).read_text() == "upstream\n"
+        reasons = dict(uncopied)
+        assert reasons[f"{scope}/gone_upstream.md"] == "deleted upstream, edited by this session"
+        assert reasons[f"{scope}/gone_here.md"] == "deleted by this session, edited upstream"
+        assert f"{scope}/{memory.MEMORY_INDEX}" in reasons
+        assert reasons["elsewhere/log.md"] == "not a memory"
+
+        # A second conflict never overwrites an unreconciled copy.
+        again, _ = memory._write_conflict_copies(
+            [ConflictedPath(f"{scope}/edited.md", "newer\n", "mine\n")], [scope]
+        )
+        assert again == [f"edited.conflict-{alpha.sid}-2.md"]
+        assert (alpha.memory_dir / written[0]).read_text() == "upstream\n"
 
     def test_only_conflict_copy_names_are_excluded_from_memories(self):
         assert memory._is_conflict_copy(Path(f"note.conflict-{'a' * 32}.md"))
@@ -743,6 +779,12 @@ class TestGapCNoBaselineRefusal:
         output = out + err
         assert PROJECT_MEMORY_FILE in output, output
         assert USER_MEMORY_FILE in output, output
+        # This persist records a baseline, so a follow-up run with the flag
+        # would delete none of these: the hint must not advertise it, and
+        # names the explicit forget where the form has one.
+        assert "--allow-unbaselined-delete" not in output, output
+        if plexus.form == SCHEMA2:
+            assert "work memory forget" in output, output
 
     def test_allow_unbaselined_delete_deletes_exactly_the_named_set(
         self, plexus, monkeypatch, capsys

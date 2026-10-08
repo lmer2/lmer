@@ -1518,31 +1518,40 @@ def _is_conflict_copy(rel: Path) -> bool:
     return len(rel.parts) == 1 and _CONFLICT_COPY_RE.search(rel.name) is not None
 
 
-def _write_conflict_copies(conflicts, scope_rels: List[str]) -> tuple[List[str], List[str]]:
-    """Save this session's side of each conflicting memory as a copy.
+def _write_conflict_copies(
+    conflicts, scope_rels: List[str]
+) -> tuple[List[str], List[tuple]]:
+    """Save UPSTREAM's side of each conflicting memory beside the agent's own.
 
-    Returns ``(written, uncopied)``: the copy names, and the conflicting
-    paths that got none. ``theirs`` is index stage 3 — during a rebase that
-    is the commit being replayed, i.e. THIS session's version. A path with no
-    stage 3 is one this session deleted, so there is no version of its to
-    keep; the index (``MEMORY.md``) is not a memory; a path outside
-    *scope_rels* (the work-repo-relative memory scopes) is not a memory at
-    all. A copy never overwrites an earlier, unreconciled one.
+    Returns ``(written, uncopied)``: the copy names, and ``(path, reason)``
+    for each conflicting path that got none. The session's own version needs
+    no copy — it is still the agent's file. What the agent has not seen is
+    the version another session published, ``ours`` (index stage 2, the
+    commit being rebased ONTO); saving it is what gives the agent something
+    to reconcile before it persists again. No copy for the index
+    (``MEMORY.md``), for a path outside *scope_rels* (not a memory), for a
+    path this session deleted (no stage 3), or for one upstream deleted (no
+    stage 2). A copy never overwrites an earlier, unreconciled one.
     """
     sid = launch_session_id() or "unknown"
     dest = agent_memory_dir()
     written: List[str] = []
-    uncopied: List[str] = []
+    uncopied: List[tuple] = []
     for conflict in conflicts or []:
         name = Path(conflict.path).name
-        if (
-            name == MEMORY_INDEX
-            or conflict.theirs is None
-            or not any(
-                PurePosixPath(conflict.path).is_relative_to(rel) for rel in scope_rels
-            )
+        if not any(
+            PurePosixPath(conflict.path).is_relative_to(rel) for rel in scope_rels
         ):
-            uncopied.append(conflict.path)
+            uncopied.append((conflict.path, "not a memory"))
+            continue
+        if name == MEMORY_INDEX:
+            uncopied.append((conflict.path, "the index; merged again on the next persist"))
+            continue
+        if conflict.theirs is None:
+            uncopied.append((conflict.path, "deleted by this session, edited upstream"))
+            continue
+        if conflict.ours is None:
+            uncopied.append((conflict.path, "deleted upstream, edited by this session"))
             continue
         stem = Path(name).stem
         copy_name = f"{stem}.conflict-{sid}.md"
@@ -1553,13 +1562,13 @@ def _write_conflict_copies(conflicts, scope_rels: List[str]) -> tuple[List[str],
         target = dest / copy_name
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(conflict.theirs, encoding="utf-8")
+            target.write_text(conflict.ours, encoding="utf-8")
         except OSError as e:
             print(
                 f"⚠️  Could not save the conflicted memory copy {target}: {e}",
                 file=sys.stderr,
             )
-            uncopied.append(conflict.path)
+            uncopied.append((conflict.path, "the copy could not be written"))
             continue
         written.append(copy_name)
     return written, uncopied
@@ -1568,9 +1577,10 @@ def _write_conflict_copies(conflicts, scope_rels: List[str]) -> tuple[List[str],
 def _skip_pre_merge_pull(root: Path) -> Optional[str]:
     """The reason persist must NOT pull first, or ``None`` to pull.
 
-    Mirrors :func:`commit_work_path`'s deferral cases: an inherited Git
-    transaction and a live gate both mean a sibling process owns the checkout
-    and a pull would race it. A root that is not a Git work tree has nothing
+    A live gate means a sibling process owns the checkout and a pull would
+    race it, as :func:`commit_work_path` defers for. (Its other deferral, an
+    inherited Git transaction, cannot reach here: persist's checkout lock
+    refuses it first; the check stays as a guard for other callers.) A root that is not a Git work tree has nothing
     to pull — production never reaches it, because ``check_commit_ready``
     refuses a non-Git root first, but the plain-directory regression fixtures
     do.
@@ -1615,9 +1625,10 @@ def _publish_conflict(conflicts, scope_rels: List[str], manifest_before: Optiona
     what it was before this persist: it had already been moved forward to
     "what this session holds", and keeping that would make the next persist
     read the unpublished adds and edits as already published and skip them.
-    Each conflicting memory's version is saved beside the agent's memory, and
-    every outcome is said — recovery is the agent reconciling the copies and
-    persisting again.
+    Upstream's version of each conflicting memory is saved beside the agent's
+    own (:func:`_write_conflict_copies`), and every outcome is said —
+    recovery is the agent merging the copies into its files and persisting
+    again.
     """
     path = restore_manifest_path()
     try:
@@ -1634,10 +1645,14 @@ def _publish_conflict(conflicts, scope_rels: List[str], manifest_before: Optiona
         file=sys.stderr,
     )
     for name in copies:
-        print(f"   this session's version saved as {name}", file=sys.stderr)
-    for rel in uncopied:
-        print(f"   {rel}: conflicted, no copy (not a memory, or deleted here)", file=sys.stderr)
-    print("   Reconcile and run `work memory persist` again.", file=sys.stderr)
+        print(
+            f"   upstream's version saved as {name} — merge it into your own "
+            "file, then delete the copy",
+            file=sys.stderr,
+        )
+    for rel, reason in uncopied:
+        print(f"   {rel}: conflicted, no copy ({reason})", file=sys.stderr)
+    print("   Then run `work memory persist` again.", file=sys.stderr)
 
 
 @work_transaction
@@ -1763,7 +1778,7 @@ def persist_memory(
         print(f"❌ Invalid memory retirement state: {e}", file=sys.stderr)
         return 1
 
-    _report_deletions(deletions, declined)
+    _report_deletions(deletions, declined, _schema2_manifest(root) is not None)
 
     if not rel_paths:
         print("🧠 No agent memory to persist")
@@ -1790,7 +1805,7 @@ def persist_memory(
 
 
 def _report_deletions(
-    deletions: List[tuple], declined: List[tuple]
+    deletions: List[tuple], declined: List[tuple], can_forget: bool = False
 ) -> None:
     """Name every file persist removed, and every absence it declined to.
 
@@ -1803,9 +1818,17 @@ def _report_deletions(
         suffix = " (retirement-enforced)" if retired else ""
         print(f"🗑️  Deleted {rel} [{scope}]{suffix}")
     if declined:
+        # This persist records a baseline, so a later
+        # --allow-unbaselined-delete would delete none of these; only an
+        # explicit forget still can.
+        how = (
+            " — retire any you meant to remove with `work memory forget <path>`"
+            if can_forget
+            else ""
+        )
         print(
-            f"🗑️  Not deleting {len(declined)} file(s): no restore baseline "
-            "(pass --allow-unbaselined-delete to delete them):"
+            f"🗑️  Kept {len(declined)} file(s) this session does not hold: "
+            f"no restore baseline, so their absence is not a deletion{how}:"
         )
         for scope, rel in declined:
             print(f"   {rel} [{scope}]")

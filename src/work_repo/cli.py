@@ -252,8 +252,11 @@ Examples:
         "--allow-unbaselined-delete",
         action="store_true",
         help=(
-            "With no restore baseline, delete the scope files the agent dir "
-            "no longer holds instead of only naming them"
+            "On a persist with no restore baseline (a session that never "
+            "restored), also delete the scope files the agent dir does not "
+            "hold, listing each. Any persist records a baseline, so this "
+            "acts only on such a first persist; later, retire a memory with "
+            "`work memory forget`"
         ),
     )
     for action in ("forget", "revive"):
