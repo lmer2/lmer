@@ -132,6 +132,8 @@ __all__ = [
     "INDEX",
     "INDEX_AREAS",
     "INSTANCE_MEMORY",
+    "INSTANCE_RENAMES",
+    "InstancePlan",
     "LEGACY_MEMORY",
     "LINK",
     "MEMORY",
@@ -146,7 +148,9 @@ __all__ = [
     "Plan",
     "cmd_migrate",
     "legacy_session_id",
+    "migrate_instance",
     "migrate_project",
+    "plan_instance",
     "plan_project",
     "preflight_no_live_records",
     "write_rel_paths",
@@ -1057,6 +1061,334 @@ def _dirty_paths(root: Path, rels: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# The instance form (`work migrate --instance`, #368, spec §10 rollout E→B)
+# ---------------------------------------------------------------------------
+
+#: The instance surfaces and their schema twins (SCHEMA.md Appendix A).
+INSTANCE_RENAMES = (
+    ("agent-files/claude", "_agents/claude"),
+    ("mirrors", "_agents/mirrors"),
+    ("napkin", "_napkin"),
+    ("taskdef", "_taskdef"),
+)
+
+INSTANCE_SOURCES = "sources.yaml"
+
+
+@dataclass(frozen=True)
+class InstancePlan:
+    """What `work migrate --instance` would do, as data.
+
+    `moves` are the instance-surface renames; `sources` the full `sources:`
+    mapping the manifest should hold after folding the standalone file (None
+    when nothing changes); `sources_file` the file to remove (None when
+    absent); `source_warnings` the loader's forward-compat warnings;
+    `blockers` what stops the apply. Git cleanliness is not stored here —
+    the apply checks it under the lock, right after planning there.
+    """
+
+    root: Path
+    moves: tuple
+    sources: Optional[dict]
+    sources_file: Optional[Path]
+    source_warnings: tuple
+    blockers: tuple
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.moves and self.sources is None and self.sources_file is None
+
+    def rel(self) -> str:
+        return "."
+
+    def git_paths(self) -> list:
+        paths = []
+        for move in self.moves:
+            for rel in (move.src, move.dst):
+                if rel not in paths:
+                    paths.append(rel)
+        if self.sources is not None and MANIFEST_NAME not in paths:
+            paths.append(MANIFEST_NAME)
+        if self.sources_file is not None and INSTANCE_SOURCES not in paths:
+            paths.append(INSTANCE_SOURCES)
+        return paths
+
+    def summary(self) -> str:
+        parts = [_count(len(self.moves), "move")]
+        if self.sources_file is not None:
+            parts.append(_count(len(self.sources or {}), "source"))
+        return ", ".join(parts)
+
+    def render(self) -> str:
+        lines = ["work migrate --instance — plan for the instance surfaces"]
+        if self.is_noop:
+            lines.append("nothing to migrate: the instance surfaces are already in schema form")
+        for move in self.moves:
+            lines.append(move.render("."))
+        if self.sources_file is not None:
+            lines.append(f"fold {INSTANCE_SOURCES} into {MANIFEST_NAME} sources:")
+            for name, entry in (self.sources or {}).items():
+                ref = f" (ref: {entry['ref']})" if entry.get("ref") else ""
+                lines.append(f"  {name}: {entry['repo']}{ref}")
+            lines.append(f"remove {INSTANCE_SOURCES}")
+        lines.extend(f"    # {warning}" for warning in self.source_warnings)
+        if self.blockers:
+            lines.append("blockers (the apply refuses until these are resolved):")
+            lines.extend(f"  - {blocker}" for blocker in self.blockers)
+        if not self.is_noop:
+            lines.append(f"{self.summary()}; dry run — add --apply to perform them in ONE commit")
+        return "\n".join(lines)
+
+    def commit_message(self) -> str:
+        subject = f"work migrate --instance: {self.summary()} to schema form"
+        body = [move.render(".") for move in self.moves]
+        if self.sources_file is not None:
+            body.append(f"fold {INSTANCE_SOURCES} into {MANIFEST_NAME} sources:")
+            body.extend(
+                f"  {name}: {entry['repo']}" for name, entry in (self.sources or {}).items()
+            )
+            body.append(f"remove {INSTANCE_SOURCES}")
+        return subject + "\n\n" + "\n".join(body) + "\n"
+
+
+def _instance_moves(root: Path) -> tuple:
+    moves, notes, blockers = [], [], []
+    for src, dst in INSTANCE_RENAMES:
+        src_path, dst_path = root / src, root / dst
+        if not os.path.lexists(src_path):
+            continue
+        if src_path.is_symlink():
+            notes.append(f"{src}: already a symlink -> {os.readlink(src_path)}, left in place")
+            continue
+        if not src_path.is_dir():
+            notes.append(f"{src}: a file, left in place")
+            continue
+        if os.path.lexists(dst_path):
+            blockers.append(f"{src}/ and {dst}/ both exist; merge them by hand, then re-run")
+            continue
+        moves.append(Move(AREA, src, dst, tracked=git_ops._has_tracked_files(root, src)))
+    return tuple(moves), tuple(notes), tuple(blockers)
+
+
+def _instance_sources(root: Path, work_repo_url) -> tuple:
+    """``(parsed, warnings, file, blockers)`` for the standalone
+    ``sources.yaml`` — every entry through the loader's ONE per-entry rule,
+    refused with the loader's own message. The parsed entries carry the
+    transport spelling byte-for-byte (``validate_source_entry`` never
+    normalizes to a registry identity)."""
+    legacy = root / INSTANCE_SOURCES
+    if not legacy.is_file():
+        return None, (), None, ()
+    from lmer_cli.container.sources import SourcesConfigError, validate_source_entry
+
+    import yaml as _yaml
+
+    try:
+        raw = _yaml.safe_load(legacy.read_text(encoding="utf-8"))
+    except Exception as exc:  # unreadable input is a blocker, not a traceback
+        return None, (), legacy, (f"{INSTANCE_SOURCES}: unreadable ({exc})",)
+    entries = raw.get("sources") if isinstance(raw, dict) else None
+    if not isinstance(entries, dict):
+        return None, (), legacy, (f"{INSTANCE_SOURCES}: no `sources:` mapping",)
+    parsed, warnings, blockers = {}, [], []
+    for key, entry in entries.items():
+        try:
+            value, entry_warnings = validate_source_entry(
+                key, entry, work_repo_url=work_repo_url, origin=str(legacy)
+            )
+        except SourcesConfigError as exc:
+            blockers.append(str(exc))
+            continue
+        parsed[key] = value
+        warnings.extend(entry_warnings)
+    return parsed, tuple(warnings), legacy, tuple(blockers)
+
+
+def _instance_probe() -> bool:
+    """E.probe's importable capability marker, fail-closed: absent, false or
+    unimportable all mean this release cannot read the manifest `sources:`
+    tier, so the fold must refuse (spec §10, astra R7)."""
+    try:
+        from lmer_cli.container import sources as sources_mod
+
+        return bool(getattr(sources_mod, "MANIFEST_TIER_SUPPORTED", False))
+    except Exception:
+        return False
+
+
+def plan_instance(*, root: Optional[Path] = None, work_repo_url=None) -> InstancePlan:
+    """The plan for `work migrate --instance`, after the version floor.
+    Read-only. Raises :class:`MigrateError` when the running release cannot
+    read the manifest tier (the fold would switch declared sources off)."""
+    root = Path(root) if root is not None else work_repo_root()
+    if not _instance_probe():
+        raise MigrateError(
+            "version floor: this lmer does not read the manifest `sources:` tier "
+            "(no MANIFEST_TIER_SUPPORTED). `work migrate --instance` removes "
+            f"{INSTANCE_SOURCES}, which would switch declared sources off on any "
+            "host still running a pre-#370 release. Deploy a release carrying "
+            "#370 on every host before applying the instance fold."
+        )
+    manifest = root / MANIFEST_NAME
+    if not (manifest.is_symlink() or manifest.exists()):
+        raise MigrateError(
+            f"no {MANIFEST_NAME} at {root}: this is a legacy tree. Register the "
+            "project first — `work adopt <host>/<project> <name>` — then migrate it."
+        )
+    try:
+        writer = core_module("writer").load_for_write(manifest)
+    except CoreUnavailableError as exc:
+        raise MigrateError(
+            "this lmer build has no lmer-schema core and is below the version "
+            f"floor for a schema-form tree ({exc}); update lmer on this host first"
+        ) from exc
+    except Exception as exc:
+        raise MigrateError(f"`schema:` is not writable: {exc}") from exc
+
+    moves, notes, blockers = _instance_moves(root)
+    manifest_sources = dict(writer.manifest.sources or {})
+    legacy, warnings, legacy_file, source_blockers = _instance_sources(root, work_repo_url)
+    blockers = blockers + source_blockers
+    sources = None
+    if legacy is not None:
+        merged = dict(legacy)
+        for name, entry in manifest_sources.items():
+            if name in merged:
+                warnings = warnings + (
+                    f"`sources.{name}` is also declared in {MANIFEST_NAME}, which "
+                    f"takes precedence; the {INSTANCE_SOURCES} entry is dropped",
+                )
+            merged[name] = entry
+        if merged != manifest_sources:
+            sources = merged
+    return InstancePlan(
+        root=root, moves=moves, sources=sources, sources_file=legacy_file,
+        source_warnings=warnings, blockers=blockers,
+    )
+
+
+def _apply_instance(*, root: Path, work_repo_url, out: Callable[[str], None],
+                    err: Callable[[str], None]) -> int:
+    configured = work_repo_root()
+    if _resolved(root) != _resolved(configured):
+        raise MigrateError(
+            f"LMER_WORK_REPO_PATH ({configured}) must name the tree being migrated "
+            f"({root}): the commit helper is bound to the configured checkout"
+        )
+    with work_mutation(root):
+        plan = plan_instance(root=root, work_repo_url=work_repo_url)
+        if plan.is_noop:
+            out(plan.render())
+            return 0
+        for warning in plan.source_warnings:
+            out(f"    # {warning}")
+        problems = list(plan.blockers)
+        problems += [f"dirty in git: {line}" for line in _dirty_paths(root, plan.git_paths())]
+        if problems:
+            for problem in problems:
+                err(f"\u274c {problem}")
+            err("refused: nothing was changed")
+            return 1
+
+        applied = []
+        for move in plan.moves:
+            (root / move.dst).parent.mkdir(parents=True, exist_ok=True)
+            if move.tracked:
+                rc, output = git_ops.run_git_command(
+                    ["mv", move.src, move.dst], root, check=False
+                )
+                if rc != 0:
+                    err(f"\u274c git mv {move.src} {move.dst} failed: {output}")
+                    return rc
+            else:
+                os.rename(root / move.src, root / move.dst)
+            out(move.render("."))
+            applied.append(move)
+        if plan.sources is not None:
+            writer = core_module("writer").load_for_write(root / MANIFEST_NAME)
+            writer.set_sources(plan.sources)
+            rc = _stage(root, MANIFEST_NAME, err)
+            if rc != 0:
+                return rc
+            out(f"{MANIFEST_NAME}: sources folded in")
+        if plan.sources_file is not None:
+            os.unlink(plan.sources_file)
+            out(f"remove {INSTANCE_SOURCES}")
+
+        paths = plan.git_paths() + _record_instance_in_caller(plan, applied, out)
+        rc = git_ops.commit_work_path(paths, plan.commit_message())
+        if rc == 0:
+            out(f"\u2705 work migrate --instance: {plan.summary()} applied in one commit")
+        return rc
+
+
+def _record_instance_in_caller(plan: InstancePlan, applied: list,
+                               out: Callable[[str], None]) -> list:
+    """The project form's event/log rule, for the instance plan: one
+    :data:`MOVE_EVENT` per applied change plus a run-log line in the CALLER's
+    own record when there is one. From an operator shell the commit message
+    carries the list."""
+    caller = _caller_record()
+    if caller is None:
+        out("\u2139\ufe0f  no session record here; the commit message lists the moves")
+        return []
+    for change in applied:
+        note, data = change.event(plan.rel())
+        try:
+            run_state.append_event(
+                caller, MOVE_EVENT, note=note, data={"instance": True, **data},
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            out(f"\u26a0\ufe0f  {MOVE_EVENT} events not recorded in {caller}: {exc}")
+            break
+    try:
+        from .loggers import get_logger  # local: loggers imports run_state
+
+        get_logger(caller / "log.yaml").log(
+            f"work migrate --instance: applied {plan.summary()} to schema form"
+        )
+    except Exception as exc:
+        out(f"\u26a0\ufe0f  run-log line not recorded in {caller}: {exc}")
+    try:
+        return list(run_state.run_rel_path_candidates())
+    except Exception:
+        return []
+
+
+def migrate_instance(
+    *,
+    root: Optional[Path] = None,
+    apply: bool = False,
+    work_repo_url=None,
+    out: Callable[[str], None] = print,
+    err: Optional[Callable[[str], None]] = None,
+) -> int:
+    """`work migrate --instance [--apply]` as a library call."""
+    if err is None:
+        err = lambda line: print(line, file=sys.stderr)  # noqa: E731
+    root = Path(root) if root is not None else work_repo_root()
+    if work_repo_url is None:
+        work_repo_url = os.environ.get("LMER_REPO_URL")
+    try:
+        if not apply:
+            plan = plan_instance(root=root, work_repo_url=work_repo_url)
+            out(plan.render())
+            if not plan.is_noop:
+                dirty = _dirty_paths(root, plan.git_paths())
+                if dirty:
+                    out("dirty in git (the apply refuses until these are clean):")
+                    for line in dirty:
+                        out(f"  {line}")
+            return 0
+        return _apply_instance(
+            root=root, work_repo_url=work_repo_url, out=out, err=err
+        )
+    except MigrateError as exc:
+        err(f"\u274c {exc}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
 # Apply
 # ---------------------------------------------------------------------------
 
@@ -1259,16 +1591,10 @@ def migrate_project(
 
 
 def cmd_migrate(args) -> int:
-    """The `work migrate` handler: `args.project`, `args.apply`,
-    `args.compat_link`. `--instance` is B.instance-floor's and is named,
-    not silently ignored."""
+    """The `work migrate` handler: `args.project` or `args.instance`,
+    `args.apply`, `args.compat_link`."""
     if getattr(args, "instance", False):
-        print(
-            "❌ `work migrate --instance` is not in this release yet; "
-            "`work migrate <project>` migrates one registered project",
-            file=sys.stderr,
-        )
-        return 1
+        return migrate_instance(apply=bool(getattr(args, "apply", False)))
     return migrate_project(
         args.project,
         apply=bool(getattr(args, "apply", False)),
@@ -1284,6 +1610,16 @@ def write_rel_paths(args) -> Optional[list]:
     plus the caller's own record when there is one. Never raises."""
     if not getattr(args, "apply", False):
         return None
+    if getattr(args, "instance", False):
+        # The instance surfaces, plus the manifest and the folded-away file.
+        rels = [MANIFEST_NAME, INSTANCE_SOURCES]
+        rels.extend(src for src, _dst in INSTANCE_RENAMES)
+        rels.extend(dst for _src, dst in INSTANCE_RENAMES)
+        try:
+            rels.extend(rel for rel in run_state.run_rel_path_candidates() if rel not in rels)
+        except Exception:
+            pass
+        return rels
     project = getattr(args, "project", None)
     rels = []
     try:
