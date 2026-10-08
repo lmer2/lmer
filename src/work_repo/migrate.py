@@ -1590,16 +1590,45 @@ def migrate_project(
         return 1
 
 
+def _validate_schema_tier(root: Path) -> int:
+    """Run the validator at the schema tier and print its fix-list, after an
+    applied migration. A non-zero validator exit shows in the exit code, but
+    the commit already stands (the operator asked for it; git history holds
+    the previous state). Fail-soft when the core is unavailable: the migration
+    itself already required it."""
+    try:
+        from lmer_schema.cli import main as schema_main
+    except ImportError as exc:  # pragma: no cover - the apply imported the core
+        print(f"\u26a0\ufe0f  validator unavailable: {exc}", file=sys.stderr)
+        return 0
+    return schema_main(["validate", str(root)])
+
+
 def cmd_migrate(args) -> int:
     """The `work migrate` handler: `args.project` or `args.instance`,
-    `args.apply`, `args.compat_link`."""
-    if getattr(args, "instance", False):
-        return migrate_instance(apply=bool(getattr(args, "apply", False)))
-    return migrate_project(
-        args.project,
-        apply=bool(getattr(args, "apply", False)),
-        compat_link=bool(getattr(args, "compat_link", False)),
-    )
+    `args.apply`, `args.compat_link`. After an applied migration the validator
+    runs at the schema tier; its exit code is surfaced, the commit stands."""
+    apply = bool(getattr(args, "apply", False))
+    instance = bool(getattr(args, "instance", False))
+    project = getattr(args, "project", None)
+    if instance:
+        rc = migrate_instance(apply=apply)
+    elif project:
+        rc = migrate_project(
+            project,
+            apply=apply,
+            compat_link=bool(getattr(args, "compat_link", False)),
+        )
+    else:
+        print(
+            "\u274c work migrate needs a project or --instance "
+            "(mutually exclusive)",
+            file=sys.stderr,
+        )
+        return 2
+    if rc == 0 and apply:
+        rc = _validate_schema_tier(work_repo_root())
+    return rc
 
 
 def write_rel_paths(args) -> Optional[list]:

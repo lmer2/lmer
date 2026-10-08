@@ -37,7 +37,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import adopt, goals, plan_index, release_run, run_state, specs_index, write_journal
+from . import adopt, goals, migrate, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
@@ -500,6 +500,32 @@ Examples:
     adopt_parser.add_argument(
         "--force", action="store_true",
         help="adopt despite schema-tier ERRORs in the fix list",
+    )
+
+    # migrate command (issue #368 — bare-name to schema-form tree migration).
+    # An operator-shell verb like `adopt`: exempt from the session-uid gate,
+    # but still declaring its write scope.
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Migrate a registered project or the instance surfaces to schema form "
+             "(dry run by default)",
+    )
+    migrate_target = migrate_parser.add_mutually_exclusive_group()
+    migrate_target.add_argument(
+        "project", nargs="?",
+        help="a registered project's short name",
+    )
+    migrate_target.add_argument(
+        "--instance", action="store_true",
+        help="migrate the instance surfaces and fold a standalone sources.yaml",
+    )
+    migrate_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the migration; without it the command is a read-only dry run",
+    )
+    migrate_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at each old project path (project form only)",
     )
 
     # release command (single-flight release claim — RUN-STATE.md §7).
@@ -4560,6 +4586,8 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         return [specs_rel] if specs_rel else []
     if command == "adopt":
         return adopt.write_rel_paths(args)
+    if command == "migrate":
+        return migrate.write_rel_paths(args)
     if command == "seed":
         try:
             slug = run_state.derive_slug(args.taskdef, args.target)
@@ -4664,7 +4692,7 @@ def main() -> int:
 
     # Record-writing helpers inherit their execution's UID. Without one,
     # a read resolver may choose the latest record, but a writer must refuse.
-    if args.command not in ("memory", "specs-index", "adopt"):
+    if args.command not in ("memory", "specs-index", "adopt", "migrate"):
         from .utils import SchemaContextError
 
         try:
@@ -4746,6 +4774,8 @@ def _dispatch(args, parser) -> int:
         return cmd_specs_index(args.rebuild)
     elif args.command == "adopt":
         return adopt.cmd_adopt(args)
+    elif args.command == "migrate":
+        return migrate.cmd_migrate(args)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "release":
