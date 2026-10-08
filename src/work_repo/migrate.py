@@ -1715,11 +1715,11 @@ def _validate_schema_tier(root: Path) -> int:
     the previous state). Fail-soft when the core is unavailable: the migration
     itself already required it."""
     try:
-        from lmer_schema.cli import main as schema_main
-    except ImportError as exc:  # pragma: no cover - the apply imported the core
+        schema_cli = core_module("cli")
+    except CoreUnavailableError as exc:  # pragma: no cover - the apply imported the core
         print(f"\u26a0\ufe0f  validator unavailable: {exc}", file=sys.stderr)
         return 0
-    return schema_main(["validate", str(root)])
+    return schema_cli.main(["validate", str(root)])
 
 
 def cmd_migrate(args) -> int:
