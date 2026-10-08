@@ -166,9 +166,9 @@ def test_apply_from_a_bare_shell_is_not_refused_by_the_uid_gate(
     assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
 
 
-def _planted_validator(monkeypatch, paths):
-    """Swap the core's validator for one that reports a
-    `record.plain-session-slug` ERROR at each of *paths*; returns the call log."""
+def _planted_validator(monkeypatch, paths, code="record.plain-session-slug"):
+    """Swap the core's validator for one that reports a *code* ERROR at each
+    of *paths*; returns the call log."""
     from work_repo import migrate as migrate_module
 
     calls = []
@@ -177,7 +177,7 @@ def _planted_validator(monkeypatch, paths):
         calls.append(target)
         report = Report(Form.SCHEMA)
         for path in paths:
-            report.add("record.plain-session-slug", path, "planted")
+            report.add(code, path, "planted")
         return report
 
     real_core_module = migrate_module.core_module
@@ -206,6 +206,23 @@ def test_an_error_in_the_migrated_project_shows_in_the_exit_code(
     # The commit stands.
     assert len(commits) == 2
     assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def test_a_root_level_error_counts_in_the_exit_code(
+    legacy_work, commits, monkeypatch, capsys
+):
+    # A crashed check is reported at the plexus root (`.`), not under any
+    # one project. The report is incomplete, so it must fail the exit code
+    # even though it is outside what this run migrated.
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    _planted_validator(monkeypatch, ["."], code="runner.check-failed")
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "runner.check-failed" in out
+    assert "outside what this run migrated" not in out
 
 
 def test_another_projects_errors_are_printed_but_not_counted(

@@ -1902,12 +1902,15 @@ def migrate_project(
 
 def _validate_schema_tier(root: Path, scope: Iterable[str]) -> int:
     """Run the validator at the schema tier after an applied migration and
-    print its whole report; the exit code counts only the ERRORs under
-    *scope* (work-repo-relative paths this run touched), so one project's
-    migration is not failed by another project still waiting its turn
-    (SCHEMA-GUIDE §3: migrate project by project). An unusable tree still
-    fails. The commit stands either way. Fail-soft when the core is
-    unavailable: the migration itself already required it."""
+    print its whole report; the exit code counts the ERRORs under *scope*
+    (work-repo-relative paths this run touched) and the root-level ones
+    (``.``: a manifest finding, or a crashed check attributed to
+    ``runner.check-failed``), so one project's migration is not failed by
+    another project still waiting its turn (SCHEMA-GUIDE §3: migrate
+    project by project) while a tree-wide ERROR still fails it. An
+    unusable tree still fails. The commit stands either way. Fail-soft
+    when the core is unavailable: the migration itself already required
+    it."""
     try:
         schema_cli = core_module("cli")
         validate = core_module("checks.runner").validate
@@ -1928,7 +1931,9 @@ def _validate_schema_tier(root: Path, scope: Iterable[str]) -> int:
     for finding in report.findings:
         if finding.severity is not findings_api.Severity.ERROR:
             continue
-        if any(finding.path == rel or finding.path.startswith(rel + "/") for rel in scope):
+        if finding.path == "." or any(
+            finding.path == rel or finding.path.startswith(rel + "/") for rel in scope
+        ):
             return findings_api.EXIT_ERRORS
         outside += 1
     if outside:
