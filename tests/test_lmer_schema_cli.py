@@ -921,6 +921,19 @@ class TestMigrate:
         assert code == EXIT_UNUSABLE
         assert "Migration refused" in err
 
+    def test_the_preview_prints_each_directory_move_and_blocks(self, capsys, tmp_path):
+        from tests import plexus_fixtures as pf
+
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        pf.plant_plain_session_records(root / "widgets")
+        code, out, _err = _run(capsys, "migrate", str(root))
+        assert code == EXIT_ERRORS
+        assert out.count("Directory move:") == len(pf.PLAIN_SESSION_GROUPS)
+        for _taskdef, _target, slug in pf.PLAIN_SESSION_GROUPS:
+            assert slug in out
+        assert "Blocked:" in out and "work migrate" in out
+        assert "Directory moves: none" not in out
+
 
 # ---------------------------------------------------------------------------
 # `index`: the backfill of the generated README index blocks

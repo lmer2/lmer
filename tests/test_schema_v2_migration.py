@@ -35,6 +35,35 @@ def test_preview_then_apply_changes_only_version_token(schema_one):
     assert migrate(root, apply=True)["applied"] is False
 
 
+def test_plain_session_records_block_migrate_apply(schema_one):
+    from lmer_schema.migration import migrate
+    from tests import plexus_fixtures as pf
+
+    root, _record = schema_one
+    pf.plant_plain_session_records(root / "widgets")
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    result = migrate(root, apply=True)
+    assert result["applied"] is False
+    assert len(result["moves"]) == len(pf.PLAIN_SESSION_GROUPS)
+    fold_blockers = [item for item in result["blockers"] if "work migrate" in item]
+    assert len(fold_blockers) == len(pf.PLAIN_SESSION_GROUPS)
+    assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
+def test_the_release_record_is_never_a_plain_session_blocker(schema_one):
+    from lmer_schema.migration import migrate
+    from tests import plexus_fixtures as pf
+
+    root, _record = schema_one
+    pf.plant_plain_session_records(root / "widgets")
+    result = migrate(root)
+    fold_blockers = [item for item in result["blockers"] if "work migrate" in item]
+    for release in pf.RELEASE_RECORDS:
+        slug = release["slug"]
+        assert not any(move["from"].endswith(f"/{slug}") for move in result["moves"])
+        assert not any(slug in blocker for blocker in fold_blockers)
+
+
 def test_unsigned_active_record_blocks_cutover_without_mutation(schema_one):
     from lmer_schema.migration import migrate
 

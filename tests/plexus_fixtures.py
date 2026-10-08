@@ -576,8 +576,10 @@ def plant_plain_session_records(project_dir, *, area="_runs", nested=True,
         for taskdef, target, slug in PLAIN_SESSION_GROUPS
     ]
     records.extend(dict(record) for record in RELEASE_RECORDS)
-    sid = session_id or SESSION_IDS[0]
-    for record in records:
+    for index, record in enumerate(records):
+        # A distinct, valid session id per group: one shared id would add a
+        # `duplicate historical session ID` blocker on top of the fold ones.
+        sid = session_id or f"20260901-1000{index:02d}-1-{index}"
         group = Path(project_dir) / area / record["slug"]
         rdir = group / sid if nested else group
         rdir.mkdir(parents=True, exist_ok=True)
