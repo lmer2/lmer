@@ -134,10 +134,17 @@ from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
 import yaml
 
+from lmer_cli import gate_lock
 from lmer_cli.util import get_bool_env
 
-from .git_ops import check_commit_ready, commit_work_path
-from .transactions import checkout_lock, mutation_transaction, work_transaction
+from .git_ops import check_commit_ready, commit_work_path, fast_forward_upstream
+from .run_state import launch_session_id
+from .transactions import (
+    checkout_lock,
+    inherited_transaction,
+    mutation_transaction,
+    work_transaction,
+)
 from .utils import (
     load_work_manifest,
     instance_memory_dir,
@@ -185,8 +192,10 @@ RESTORE_MANIFEST_NAME = ".lmer-memory-restore.json"
 
 #: The manifest format. Bumped when the shape below stops being readable by
 #: the code that wrote the previous one; an unrecognised version reads as no
-#: manifest at all, which deletes nothing.
-RESTORE_MANIFEST_VERSION = 1
+#: manifest at all, which deletes nothing. Version 2 adds the `session` field
+#: (#369 gap (a)): a manifest recorded under another launch is not this
+#: session's baseline.
+RESTORE_MANIFEST_VERSION = 2
 
 #: Schema-2's durable, machine-readable retirement state at the plexus root.
 RETIREMENT_STATE_NAME = "_memory_retirements.json"
@@ -256,6 +265,13 @@ def _rel_to_root(path: Path, root: Path) -> Optional[str]:
         return Path(path).relative_to(root).as_posix()
     except ValueError:
         return None
+
+
+def _display_rel(path: Path, root: Path) -> str:
+    """The path to NAME in persist's deletion report: root-relative when it
+    lies under the work repo, absolute otherwise. Reporting never crashes on a
+    path the root does not enclose."""
+    return _rel_to_root(path, root) or str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -719,40 +735,65 @@ def restore_manifest_path() -> Path:
     return agent_memory_dir().parent / RESTORE_MANIFEST_NAME
 
 
-def read_restore_manifest() -> Dict[str, dict]:
-    """This session's restore manifest, as ``{scope: {files, index}}``.
+def read_restore_baseline() -> Optional[Dict[str, dict]]:
+    """This session's restore manifest, or ``None`` when it has none.
 
-    ``{}`` for every shape that is not a manifest this code wrote for THIS
-    memory dir — absent, unreadable, not JSON, a version or a memory dir that
-    does not match. That is the safe direction: an empty manifest says this
-    session restored nothing, so persist deletes nothing.
+    ``None`` for every shape that is not a manifest this code wrote for THIS
+    memory dir and launch — absent, unreadable, not JSON, a version, memory
+    dir or session that does not match. A valid manifest naming no scopes is
+    ``{}``: a baseline of nothing (a fresh start), which is not the same as
+    no baseline at all (#369 gap (c)).
     """
     path = restore_manifest_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return None
     except (OSError, UnicodeDecodeError, ValueError) as e:
         print(
             f"⚠️  Ignoring unreadable memory restore manifest {path}: {e} "
             f"(this persist will not delete anything)",
             file=sys.stderr,
         )
-        return {}
+        return None
     if not isinstance(data, dict):
-        return {}
+        return None
     if data.get("version") != RESTORE_MANIFEST_VERSION:
-        return {}
+        return None
     if data.get("memory_dir") != str(agent_memory_dir()):
-        return {}
+        return None
+    if data.get("session") != launch_session_id():
+        # A baseline recorded under another launch — or an older container's
+        # record with no session at all against a set one — is not this
+        # session's. Treating it as one would let a memory dir that outlives
+        # its session delete on a foreign record. Both ids absent counts as
+        # equal: the regression pins run with LMER_SESSION_ID stripped.
+        print(
+            f"⚠️  Memory restore manifest {path} was recorded under session "
+            f"{data.get('session')!r}, not this launch "
+            f"({launch_session_id()!r}) — no baseline, this persist deletes "
+            f"nothing",
+            file=sys.stderr,
+        )
+        return None
     scopes = data.get("scopes")
     if not isinstance(scopes, dict):
-        return {}
+        return None
     return {
         scope: entry
         for scope, entry in scopes.items()
         if isinstance(entry, dict)
     }
+
+
+def read_restore_manifest() -> Dict[str, dict]:
+    """This session's restore manifest, as ``{scope: {files, index}}``.
+
+    ``{}`` when there is no usable baseline (:func:`read_restore_baseline`).
+    That is the safe direction: an empty manifest says this session restored
+    nothing, so persist deletes nothing.
+    """
+    return read_restore_baseline() or {}
 
 
 @mutation_transaction
@@ -766,6 +807,7 @@ def write_restore_manifest(scopes: Dict[str, dict]) -> None:
     payload = {
         "version": RESTORE_MANIFEST_VERSION,
         "memory_dir": str(agent_memory_dir()),
+        "session": launch_session_id(),
         "scopes": scopes,
     }
     try:
@@ -1455,8 +1497,168 @@ def _union_of_scopes(
 # ---------------------------------------------------------------------------
 
 
+#: ``<stem>.conflict-<sid>[-<n>].md`` at the memory dir's root, where <sid> is
+#: a schema-2 uid or a schema-1 timestamp id: the only names
+#: :func:`_write_conflict_copies` writes, so a memory merely mentioning
+#: ``.conflict-`` in its name is still a memory.
+_CONFLICT_COPY_RE = re.compile(
+    r"\.conflict-(?:[0-9a-f]{32}|\d{8}-\d{6}-\d+-[0-9A-Za-z]+|unknown)(?:-\d+)?\.md$"
+)
+
+
+def _is_conflict_copy(rel: Path) -> bool:
+    """Whether *rel* is a ``.conflict-<sid>.md`` copy this module wrote.
+
+    These live in the agent's memory dir so the session's version of a
+    conflicted memory is not lost, but they are NOT memories: routing one
+    would persist a session id into a shared scope, and restoring one would
+    resurrect it as a real memory. They are skipped on the way out and cleared
+    by the restore mirror (which makes the work repo the truth again).
+    """
+    return len(rel.parts) == 1 and _CONFLICT_COPY_RE.search(rel.name) is not None
+
+
+def _write_conflict_copies(
+    conflicts, scope_rels: List[str]
+) -> tuple[List[str], List[tuple]]:
+    """Save UPSTREAM's side of each conflicting memory beside the agent's own.
+
+    Returns ``(written, uncopied)``: the copy names, and ``(path, reason)``
+    for each conflicting path that got none. The session's own version needs
+    no copy — it is still the agent's file. What the agent has not seen is
+    the version another session published, ``ours`` (index stage 2, the
+    commit being rebased ONTO); saving it is what gives the agent something
+    to reconcile before it persists again. No copy for the index
+    (``MEMORY.md``), for a path outside *scope_rels* (not a memory), for a
+    path this session deleted (no stage 3), or for one upstream deleted (no
+    stage 2). A copy never overwrites an earlier, unreconciled one.
+    """
+    sid = launch_session_id() or "unknown"
+    dest = agent_memory_dir()
+    written: List[str] = []
+    uncopied: List[tuple] = []
+    for conflict in conflicts or []:
+        name = Path(conflict.path).name
+        if not any(
+            PurePosixPath(conflict.path).is_relative_to(rel) for rel in scope_rels
+        ):
+            uncopied.append((conflict.path, "not a memory"))
+            continue
+        if name == MEMORY_INDEX:
+            uncopied.append((conflict.path, "the index; merged again on the next persist"))
+            continue
+        if conflict.theirs is None:
+            uncopied.append((conflict.path, "deleted by this session, edited upstream"))
+            continue
+        if conflict.ours is None:
+            uncopied.append((conflict.path, "deleted upstream, edited by this session"))
+            continue
+        stem = Path(name).stem
+        copy_name = f"{stem}.conflict-{sid}.md"
+        n = 1
+        while (dest / copy_name).exists():
+            n += 1
+            copy_name = f"{stem}.conflict-{sid}-{n}.md"
+        target = dest / copy_name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(conflict.ours, encoding="utf-8")
+        except OSError as e:
+            print(
+                f"⚠️  Could not save the conflicted memory copy {target}: {e}",
+                file=sys.stderr,
+            )
+            uncopied.append((conflict.path, "the copy could not be written"))
+            continue
+        written.append(copy_name)
+    return written, uncopied
+
+
+def _skip_pre_merge_pull(root: Path) -> Optional[str]:
+    """The reason persist must NOT pull first, or ``None`` to pull.
+
+    A live gate means a sibling process owns the checkout and a pull would
+    race it, as :func:`commit_work_path` defers for. (Its other deferral, an
+    inherited Git transaction, cannot reach here: persist's checkout lock
+    refuses it first; the check stays as a guard for other callers.) A root that is not a Git work tree has nothing
+    to pull — production never reaches it, because ``check_commit_ready``
+    refuses a non-Git root first, but the plain-directory regression fixtures
+    do.
+    """
+    if inherited_transaction(root):
+        return "a Git transaction is already in progress"
+    if gate_lock.active_gate() is not None:
+        return "a gate is in flight"
+    if not _is_git_work_tree(root):
+        return "the work-repo root is not a Git work tree"
+    return None
+
+
+def _is_git_work_tree(root: Path) -> bool:
+    return (root / ".git").exists()
+
+
+def _pull_before_merge(root: Path) -> None:
+    """Integrate the published branch before persist merges into it (#369 (b)).
+
+    The three-way merge in :func:`_write_scope` uses the checkout's CURRENT
+    bytes as the upstream side; without this pull that side is whatever the
+    last writer left locally, so a sibling's add or edit is invisible until it
+    collides at the post-commit rebase. A pull that cannot fast-forward
+    changes nothing and is reported; the merge then runs against the local
+    side and the post-commit rebase stays the backstop, as before.
+    """
+    skip = _skip_pre_merge_pull(root)
+    if skip is not None:
+        print(f"⚠️  Skipping the pre-merge memory pull: {skip}", file=sys.stderr)
+        return
+    rc, reason = fast_forward_upstream(root, "work repo")
+    if rc != 0:
+        print(f"⚠️  Pre-merge memory pull did not integrate: {reason}", file=sys.stderr)
+
+
+def _publish_conflict(conflicts, scope_rels: List[str], manifest_before: Optional[str]) -> None:
+    """The ``on_conflict`` handler for the post-commit rebase.
+
+    The shared checkout has aborted the rebase and taken this persist's
+    changes back, so it stays publishable. The restore manifest goes back to
+    what it was before this persist: it had already been moved forward to
+    "what this session holds", and keeping that would make the next persist
+    read the unpublished adds and edits as already published and skip them.
+    Upstream's version of each conflicting memory is saved beside the agent's
+    own (:func:`_write_conflict_copies`), and every outcome is said —
+    recovery is the agent merging the copies into its files and persisting
+    again.
+    """
+    path = restore_manifest_path()
+    try:
+        if manifest_before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(manifest_before, encoding="utf-8")
+    except OSError as e:
+        print(f"⚠️  Could not roll back the memory restore manifest {path}: {e}", file=sys.stderr)
+    copies, uncopied = _write_conflict_copies(conflicts, scope_rels)
+    print(
+        "❌ Memory publication conflicted; this persist's commit was dropped "
+        "and nothing of it was published",
+        file=sys.stderr,
+    )
+    for name in copies:
+        print(
+            f"   upstream's version saved as {name} — merge it into your own "
+            "file, then delete the copy",
+            file=sys.stderr,
+        )
+    for rel, reason in uncopied:
+        print(f"   {rel}: conflicted, no copy ({reason})", file=sys.stderr)
+    print("   Then run `work memory persist` again.", file=sys.stderr)
+
+
 @work_transaction
-def persist_memory(commit_message: str | None = None) -> int:
+def persist_memory(
+    commit_message: str | None = None, allow_unbaselined_delete: bool = False
+) -> int:
     """
     Persist Claude's current agent memory to the work repo and push it.
 
@@ -1471,6 +1673,12 @@ def persist_memory(commit_message: str | None = None) -> int:
     it and the only files removed from it are the ones this session restored
     and has since deleted (:func:`_write_scope`, issue #369). Everything else
     in the scope belongs to a session this one knows nothing about.
+
+    With no restore baseline at all, persist deletes nothing implicitly; it
+    names the scope files the agent dir no longer holds and declines to
+    propagate their absence. *allow_unbaselined_delete* deletes exactly that
+    named set. Retirement enforcement is unaffected: an explicit ``forget``
+    is durable state, not a baseline question.
 
     No-op (returns 0) unless ``LMER_PERSIST_AGENT_MEMORY`` is enabled.
 
@@ -1528,8 +1736,35 @@ def persist_memory(commit_message: str | None = None) -> int:
             if rc != 0:
                 return rc
 
+            # Integrate the published branch BEFORE merging into it, so the
+            # current side of the three-way merge is what upstream holds
+            # (#369 gap (b)).
+            _pull_before_merge(root)
+            # The pull may have brought in another session's forget.
+            retired = _retired_by_scope(scopes, _schema2_retired_keys(root), root)
+            scope_rels = [
+                rel
+                for rel in (_rel_to_root(path, root) for path in scopes.values())
+                if rel is not None
+            ]
+
             try:
-                copied, rel_paths = _persist_scopes(source, scopes, retired)
+                manifest_before = restore_manifest_path().read_text(encoding="utf-8")
+            except FileNotFoundError:
+                manifest_before = None
+            except (OSError, UnicodeDecodeError):
+                manifest_before = None
+            try:
+                # The default call keeps its pinned three-positional shape;
+                # the flag rides as a keyword only when it is set.
+                if allow_unbaselined_delete:
+                    copied, rel_paths, deletions, declined = _persist_scopes(
+                        source, scopes, retired, allow_unbaselined_delete=True
+                    )
+                else:
+                    copied, rel_paths, deletions, declined = _persist_scopes(
+                        source, scopes, retired
+                    )
             except MemoryPersistConflict as e:
                 print(f"❌ Agent memory persist conflict: {e}", file=sys.stderr)
                 return 1
@@ -1543,6 +1778,8 @@ def persist_memory(commit_message: str | None = None) -> int:
         print(f"❌ Invalid memory retirement state: {e}", file=sys.stderr)
         return 1
 
+    _report_deletions(deletions, declined, _schema2_manifest(root) is not None)
+
     if not rel_paths:
         print("🧠 No agent memory to persist")
         return commit_work_path([], commit_message)
@@ -1554,21 +1791,73 @@ def persist_memory(commit_message: str | None = None) -> int:
     # One scope is staged as the bare path it always was; the list shape
     # appears only when there is genuinely more than one scope to stage.
     target = rel_paths[0] if len(rel_paths) == 1 else rel_paths
-    return commit_work_path(target, commit_message)
+    if not _is_git_work_tree(root):
+        # Nothing to rebase, so nothing can conflict; the plain-tree pins
+        # stub commit_work_path with this exact positional shape.
+        return commit_work_path(target, commit_message)
+    return commit_work_path(
+        target,
+        commit_message,
+        on_conflict=lambda conflicts: _publish_conflict(
+            conflicts, scope_rels, manifest_before
+        ),
+    )
+
+
+def _report_deletions(
+    deletions: List[tuple], declined: List[tuple], can_forget: bool = False
+) -> None:
+    """Name every file persist removed, and every absence it declined to.
+
+    One line per deletion — the scope and the work-repo-relative path, with a
+    retirement-enforced unlink labelled because it carries out an explicit
+    ``forget`` rather than a session's own removal — then the total, which is
+    ``0`` when a persist without a baseline declined to delete (#369 gap (d)).
+    """
+    for scope, rel, retired in deletions:
+        suffix = " (retirement-enforced)" if retired else ""
+        print(f"🗑️  Deleted {rel} [{scope}]{suffix}")
+    if declined:
+        # This persist records a baseline, so a later
+        # --allow-unbaselined-delete would delete none of these; only an
+        # explicit forget still can.
+        how = (
+            " — retire any you meant to remove with `work memory forget <path>`"
+            if can_forget
+            else ""
+        )
+        print(
+            f"🗑️  Kept {len(declined)} file(s) this session does not hold: "
+            f"no restore baseline, so their absence is not a deletion{how}:"
+        )
+        for scope, rel in declined:
+            print(f"   {rel} [{scope}]")
+    if deletions or declined:
+        print(f"🗑️  Deleted {len(deletions)} file(s)")
 
 
 def _persist_scopes(
     source: Path,
     scopes: Dict[str, Path],
     retired: Optional[Dict[str, Set[Path]]] = None,
+    allow_unbaselined_delete: bool = False,
 ):
     """Write the agent's memory into the scopes it routes to.
 
-    Returns the number of files copied and the work-repo-relative path of
-    every scope written — the paths staged for commit, which are a subset of
-    the journalled scope (:func:`memory_write_rel_paths`).
+    Returns ``(copied, rel_paths, deletions, declined)``: the number of files
+    copied, the work-repo-relative path of every scope written (the paths
+    staged for commit, a subset of the journalled scope
+    :func:`memory_write_rel_paths`), the deletions as ``(scope, rel,
+    retired)`` triples, and the unbaselined absences as ``(scope, rel)`` pairs
+    this persist declined to propagate.
     """
-    manifest = read_restore_manifest()
+    baseline = read_restore_baseline()
+    # A whole-manifest absence or mismatch is "no baseline". A valid manifest
+    # naming no files — for one scope or for all, as a fresh start writes —
+    # is NOT: this session did restore, and its empty view is not licence to
+    # delete what it never saw.
+    unbaselined = baseline is None
+    manifest = baseline if baseline is not None else {}
     retired = retired or {scope: set() for scope in scopes}
 
     # Preflight every scope before deleting/filtering anything. In particular,
@@ -1597,9 +1886,13 @@ def _persist_scopes(
         # than written over, because one scope is still shared by every
         # session of this project (issue #369).
         dest = scopes[PROJECT_SCOPE]
-        files = _files_under(source)
+        files = {
+            rel: path
+            for rel, path in _files_under(source).items()
+            if not _is_conflict_copy(rel)
+        }
         index = files.pop(Path(MEMORY_INDEX), None)
-        copied = _write_scope(
+        copied, deleted, declined = _write_scope(
             PROJECT_SCOPE,
             files,
             # Absence and an empty statement are different answers here
@@ -1612,10 +1905,12 @@ def _persist_scopes(
             set(),
             manifest,
             retired.get(PROJECT_SCOPE, set()),
+            unbaselined=unbaselined,
+            allow_unbaselined_delete=allow_unbaselined_delete,
         )
         write_restore_manifest(manifest)
         rel = _rel_to_root(dest, work_repo_root())
-        return copied, ([rel] if rel is not None else [])
+        return copied, ([rel] if rel is not None else []), deleted, declined
 
     routed, scope_of = _route(source)
     unavailable = [scope for scope, rels in routed.items() if rels and scope not in scopes]
@@ -1653,6 +1948,8 @@ def _persist_scopes(
 
     copied = 0
     rel_paths = []
+    deletions: List[tuple] = []
+    declined: List[tuple] = []
     root = work_repo_root()
     for scope, dest in scopes.items():
         rels = routed[scope]
@@ -1691,7 +1988,7 @@ def _persist_scopes(
         # duplicated in both scopes forever, the project copy then pinning
         # itself over every later instance-side update.
         claimed = project_names if scope == INSTANCE_SCOPE else set()
-        copied += _write_scope(
+        scope_copied, scope_deleted, scope_declined = _write_scope(
             scope,
             {rel: source / rel for rel in rels},
             # An empty split is a STATEMENT ("I have no lines for this
@@ -1707,12 +2004,17 @@ def _persist_scopes(
             claimed,
             manifest,
             retired_here,
+            unbaselined=unbaselined,
+            allow_unbaselined_delete=allow_unbaselined_delete,
         )
+        copied += scope_copied
+        deletions.extend(scope_deleted)
+        declined.extend(scope_declined)
         rel = _rel_to_root(dest, root)
         if rel is not None:
             rel_paths.append(rel)
     write_restore_manifest(manifest)
-    return copied, rel_paths
+    return copied, rel_paths, deletions, declined
 
 
 def _write_scope(
@@ -1723,7 +2025,10 @@ def _write_scope(
     claimed: Set[str],
     manifest: Dict[str, dict],
     retired: Optional[Set[Path]] = None,
-) -> int:
+    *,
+    unbaselined: bool = False,
+    allow_unbaselined_delete: bool = False,
+) -> tuple[int, List[tuple], List[tuple]]:
     """Write one scope: delete what this session removed, copy, merge the index.
 
     The deletion set is :func:`_restored_then_removed` and nothing else, so a
@@ -1736,17 +2041,44 @@ def _write_scope(
     what it now holds, not what the scope now contains — so the next persist
     from the same session can still tell its own deletions from another
     session's additions.
+
+    With *unbaselined* (no restore baseline at all) a scope file the agent dir
+    no longer holds is a local absence, not a deletion: it is returned as
+    *declined* unless *allow_unbaselined_delete* is set, in which case exactly
+    that set is unlinked. *retired* enforcement is unconditional either way,
+    because it carries out an explicit ``forget``.
+
+    Returns ``(copied, deleted, declined)``, where *deleted* is ``(scope, rel,
+    retired)`` triples and *declined* is ``(scope, rel)`` pairs.
     """
     dest.mkdir(parents=True, exist_ok=True)
+    root = work_repo_root()
     held = set(files)
     keep = _shadowed(dest, held, claimed)
     restored = _manifest_files(manifest, scope)
+    deleted: List[tuple] = []
     for rel in retired or set():
         path = dest / rel
         if path.is_file():
             path.unlink()
+            deleted.append((scope, _display_rel(path, root), True))
     for rel in _restored_then_removed(dest, restored, held, keep):
-        (dest / rel).unlink()
+        path = dest / rel
+        path.unlink()
+        deleted.append((scope, _display_rel(path, root), False))
+
+    declined: List[tuple] = []
+    if unbaselined:
+        for rel in sorted(_files_under(dest)):
+            if rel in held or rel in keep:
+                continue
+            path = dest / rel
+            if allow_unbaselined_delete:
+                if path.is_file():
+                    path.unlink()
+                    deleted.append((scope, _display_rel(path, root), False))
+            else:
+                declined.append((scope, _display_rel(path, root)))
 
     copied = _copy_files(files, dest, restored)
 
@@ -1795,7 +2127,7 @@ def _write_scope(
         entry["index"] = _index_lines(index_text)
     else:
         entry.setdefault("index", [])
-    return copied
+    return copied, deleted, declined
 
 
 def _route(source: Path):
@@ -1811,7 +2143,7 @@ def _route(source: Path):
     routed: Dict[str, Set[Path]] = {PROJECT_SCOPE: set(), INSTANCE_SCOPE: set()}
     scope_of: Dict[str, str] = {}
     for rel in sorted(_files_under(source)):
-        if rel == Path(MEMORY_INDEX):
+        if rel == Path(MEMORY_INDEX) or _is_conflict_copy(rel):
             continue
         scope = scope_for_memory(_read_text(source / rel))
         if scope is None:
