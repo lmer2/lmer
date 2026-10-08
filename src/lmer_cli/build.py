@@ -5,18 +5,71 @@ Handles auto-building (developer mode) or pulling from a registry
 (installed mode) the container image when it doesn't exist locally.
 """
 
+import hashlib
 import importlib.metadata
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .harness import get_harness
+from .keep_id import image_id as resolve_image_id, prewarm
 from .log import error, success
+from .runtime import ambient_container_user, is_root_container_user
 
 DEFAULT_IMAGE = "lmer"
 DEFAULT_REGISTRY = "ghcr.io/lmer2/lmer"
+
+# Files whose content is baked into the image AND consumed at runtime without
+# a developer-mode bind mount shadowing them (build_global_mount covers
+# bin/src/hooks/Ctl/libexec and friends under /Agents/global, and find_runner
+# prefers the mounted libexec runner over the baked /home/developer copy).
+# The developer-mode image tag is a hash of exactly this set (issue #351):
+# a commit that touches none of these reuses the existing image and its
+# already-chowned keep-id layer instead of paying podman's whole-rootfs
+# remap again.
+DEV_IMAGE_BUILD_INPUTS = (
+    "Containerfile",
+    "pyproject.toml",
+    "uv.lock",
+    ".mise.toml",
+    ".mcp.json",
+    "Ctl/container/entrypoint.sh",
+    "Ctl/container/container-limits.sh",
+    "agent-files/codex/requirements.toml",
+)
+
+
+def dev_image_input_hash(repo_root: Path) -> str:
+    """Content hash of the declared developer-mode build inputs.
+
+    Deterministic for absent/unreadable entries (hashed as a marker) so a
+    checkout genuinely missing one resolves to a different, stable tag
+    rather than an error. A directory entry is walked file-by-file — a bare
+    absent-marker for it would contribute a constant and never move the
+    tag, silently reusing a stale image when the directory's contents
+    change (MR !249 review).
+    """
+    h = hashlib.sha256()
+
+    def add(rel: str, path: Path) -> None:
+        h.update(rel.encode())
+        h.update(b"\0")
+        try:
+            if path.is_dir():
+                for sub in sorted(p for p in path.rglob("*") if p.is_file()):
+                    add(f"{rel}/{sub.relative_to(path)}", sub)
+            else:
+                h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<absent>")
+        h.update(b"\0")
+
+    for rel in DEV_IMAGE_BUILD_INPUTS:
+        add(rel, repo_root / rel)
+    return h.hexdigest()[:12]
 
 
 def image_exists(runtime: str, image: str) -> bool:
@@ -135,12 +188,26 @@ def resolve_image_tag(repo_root: Path | None) -> str | None:
     """Derive a versioned image name based on install method.
 
     Resolution order:
-    1. Developer mode (git checkout): use git short SHA
-    2. Git install (PEP 610 direct_url.json): use commit SHA
-    3. PyPI/registry install: use package version
-    4. Returns None if version cannot be determined
+    1. Developer mode (git checkout with a Containerfile): hash of the
+       declared build inputs (DEV_IMAGE_BUILD_INPUTS) — NOT the commit, so
+       source-only commits keep reusing the existing image and its warmed
+       keep-id layer (issue #351)
+    2. Developer mode without a Containerfile: git short SHA (legacy)
+    3. Git install (PEP 610 direct_url.json): use commit SHA
+    4. PyPI/registry install: use package version
+    5. Returns None if version cannot be determined
     """
-    # 1. Developer mode: git short SHA from repo checkout
+    # 1. Developer mode with a buildable checkout: input-hash tag. Gated on
+    # the Containerfile because that is also ensure_image's condition for
+    # building locally — a .git dir alone doesn't make the hash meaningful.
+    if (
+        repo_root is not None
+        and (repo_root / ".git").exists()
+        and (repo_root / "Containerfile").exists()
+    ):
+        return f"{DEFAULT_IMAGE}:dev-{dev_image_input_hash(repo_root)}"
+
+    # 2. Developer mode without a Containerfile: git short SHA
     if repo_root is not None and (repo_root / ".git").exists():
         try:
             result = subprocess.run(
@@ -155,7 +222,7 @@ def resolve_image_tag(repo_root: Path | None) -> str | None:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
-    # 2. Git install: PEP 610 direct_url.json has commit SHA
+    # 3. Git install: PEP 610 direct_url.json has commit SHA
     try:
         dist = importlib.metadata.distribution("lmer")
         raw = dist.read_text("direct_url.json")
@@ -167,7 +234,7 @@ def resolve_image_tag(repo_root: Path | None) -> str | None:
     except Exception:
         pass
 
-    # 3. Version from package metadata (PyPI install)
+    # 4. Version from package metadata (PyPI install)
     try:
         version = importlib.metadata.version("lmer")
         return f"{DEFAULT_IMAGE}:{version}"
@@ -199,30 +266,55 @@ def pull_image(runtime: str, image: str, registry: str | None = None) -> int:
     return rc
 
 
+@dataclass(frozen=True)
+class ImageReadiness:
+    """Outcome of :func:`ensure_image`.
+
+    ``materialized`` records that THIS call created the local image (built or
+    pulled it). ``image_id`` is the image's content ID, which is what the
+    keep-id remap marker is keyed on (``lmer_cli.keep_id``) — a rebuild reuses
+    the tag but not the ID, so it is correctly cold again.
+
+    ``materialized`` deliberately no longer gates the launch notice: it answers
+    "did this call create the image", which is false for the slowest path there
+    is — ``lmer build`` followed by a separate spawn (issue #384).
+    """
+
+    available: bool
+    materialized: bool = False
+    image_id: str | None = None
+
+
 def ensure_image(
     runtime: str,
     image: str,
     repo_root: Path | None,
     skip_build: bool = False,
-) -> bool:
+    container_root: bool = False,
+) -> ImageReadiness:
     """
     Ensure the container image exists, building or pulling if necessary.
 
     Strategy:
     1. If image already exists locally, return immediately.
-    2. If auto-build is disabled, error and return False.
+    2. If auto-build is disabled, error and return unavailable.
     3. If repo checkout has a Containerfile, build locally (developer mode).
     4. Pull from registry: ``LMER_REGISTRY`` if set (and non-empty),
        otherwise fall back to ``DEFAULT_REGISTRY``.
 
-    Returns True if image is available, False if not.
+    Returns an :class:`ImageReadiness`: ``available`` says the image can be
+    run, ``materialized`` says this call is what put it there, ``image_id``
+    identifies it for the keep-id remap marker.
+
+    ``container_root`` says the launch will run as container root, which skips
+    keep-id entirely — there is then no remap to pre-warm.
     """
     if image_exists(runtime, image):
-        return True
+        return ImageReadiness(available=True, image_id=resolve_image_id(runtime, image))
 
     if skip_build or os.environ.get("LMER_NO_AUTO_BUILD", "").lower() in ("1", "true", "yes"):
         error(f"Image {image} not found and auto-build is disabled")
-        return False
+        return ImageReadiness(available=False)
 
     can_build_locally = repo_root is not None and (repo_root / "Containerfile").exists()
 
@@ -230,9 +322,11 @@ def ensure_image(
         rc = build_image_local(runtime, image, repo_root)
         if rc != 0:
             error(f"Image build failed with exit code {rc}")
-            return False
+            return ImageReadiness(available=False)
         success("Image built successfully")
-        return True
+        prewarm(runtime, image, container_root=container_root)
+        return ImageReadiness(available=True, materialized=True,
+                              image_id=resolve_image_id(runtime, image))
 
     # Pull from registry (defaults to the project's GHCR; LMER_REGISTRY overrides).
     # Treat empty-string the same as unset so a stray `LMER_REGISTRY=` in a .env
@@ -241,14 +335,16 @@ def ensure_image(
     rc = pull_image(runtime, image, registry)
     if rc == 0:
         success("Image pulled successfully")
-        return True
+        prewarm(runtime, image, container_root=container_root)
+        return ImageReadiness(available=True, materialized=True,
+                              image_id=resolve_image_id(runtime, image))
 
     error(f"Pull from {registry} failed (expected tag: {image}).")
     error("If the registry is unreachable or the tag is missing, build locally instead:")
     error("    git clone https://github.com/lmer2/lmer /tmp/lmer-src")
     error("    lmer build --local /tmp/lmer-src")
     error("Or override the registry with LMER_REGISTRY=<host>/<path>.")
-    return False
+    return ImageReadiness(available=False)
 
 
 def build_image(
@@ -293,6 +389,14 @@ def build_image(
             error(f"Image build failed with exit code {rc}")
             return False
         success("Image built successfully")
+        # The whole point of `lmer build`: pay the keep-id remap here, not at
+        # the first spawn (issue #351, napkin Part 3). This command has no
+        # --root-userns flag, so the env toggle is the only way it can know the
+        # host has opted out of keep-id entirely (!309 review).
+        prewarm(
+            runtime, image,
+            container_root=is_root_container_user(ambient_container_user()),
+        )
         return True
 
     error("No Containerfile found in repo root")

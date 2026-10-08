@@ -1,0 +1,2 @@
+fixed:
+- "A launch now re-resolves the image ID immediately before starting the container and uses that one ID for the keep-id notice, the container and the remap marker, so a rebuild retagging during session setup can no longer record a remap against an image podman never ran"
