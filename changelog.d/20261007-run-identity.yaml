@@ -1,5 +1,9 @@
+added:
+- "`lmer <taskdef> --repo <url-or-path>` names the repository explicitly, so a work-item, document or thread target can run against a chosen repository and `lmer chat --repo <url>` with no positional is the plain project session from anywhere (#536)"
 changed:
 - "a plain project session — no target, `.`, a checkout path, a bare repository URL or a document URL — now files its run under the bare taskdef group (`chat`) instead of `chat-.` or `chat-<repo>.git`; the slug is derived from one target classifier shared by the host CLI, the container and the work CLI (#536, #537)"
+- "a bare repository URL positional and no positional now export an empty `LMER_TASK_TARGET` (delivered empty, never absent), like a checkout path; a repository URL was previously exported verbatim (#536)"
+- "a positional that names a directory which is not a git checkout is refused (exit 2) instead of being read as a branch name; a branch, SHA or shorthand now reaches the classifier and resolves its repository from the cwd origin (#536)"
 - "existing schema-1 records under the old `chat-.` / `chat-<repo>.git` spellings stay where they are, but the platform no longer resumes or answers them and a host launch seeds the bare group beside them, until `work migrate` folds them at adoption (#368)"
 fixed:
 - "a document URL target — a file, tree or wiki page inside a repository — clones that repository instead of being refused or mis-derived (#523)"

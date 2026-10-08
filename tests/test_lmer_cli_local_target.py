@@ -42,7 +42,7 @@ from lmer_cli.container import clone_and_exec
 from lmer_cli.runtime import build_container_env
 from tests.schema2_fixtures import git
 from tests.test_container_env_transport import _parsed_env_file
-from tests.test_lmer_cli_slack_target import _BASE_ENV, _make_main_mocks
+from tests.test_lmer_cli_slack_target import SLACK_URL, _BASE_ENV, _make_main_mocks
 from work_repo import run_state
 
 ORIGIN = "https://gitlab.example.com/group/project"
@@ -116,21 +116,47 @@ def _delivered_launch(argv, *, cwd: Path, taskdefs: Path, host_env=None):
 
 
 class TestContainerTaskTarget:
-    """The one pure rule: a resolved host path means an empty exported target."""
+    """The one pure rule: a repository target (or none) exports an empty
+    target; a work-item, reference or other target is exported verbatim."""
 
     @pytest.mark.parametrize("target", [".", "./", "../x", "/abs/repo"])
-    def test_a_local_path_exports_an_empty_target(self, target, tmp_path):
-        assert container_task_target(target, tmp_path) == ""
+    def test_a_local_path_exports_an_empty_target(self, target):
+        assert container_task_target(target, "repository") == ""
 
-    @pytest.mark.parametrize("target", [ORIGIN, SSH_URL, ISSUE_URL, MR_URL])
-    def test_a_url_target_is_exported_unchanged(self, target):
-        assert container_task_target(target, None) == target
+    @pytest.mark.parametrize("target", [ORIGIN, SSH_URL])
+    def test_a_repository_url_exports_an_empty_target(self, target):
+        assert container_task_target(target, "repository") == ""
 
-    def test_no_target_stays_none(self):
-        assert container_task_target(None, None) is None
+    @pytest.mark.parametrize("target", [ISSUE_URL, MR_URL])
+    def test_a_work_item_url_is_exported_unchanged(self, target):
+        assert container_task_target(target, "work-item") == target
+
+    def test_a_reference_url_is_exported_unchanged(self):
+        doc = f"{ORIGIN}/-/blob/main/docs/x.md"
+        assert container_task_target(doc, "reference") == doc
+
+    def test_an_other_url_is_exported_verbatim(self):
+        assert container_task_target("https://example.com/x/y", "other") == "https://example.com/x/y"
+
+    def test_no_target_exports_empty_not_none(self):
+        assert container_task_target(None, "none") == ""
 
 
 class TestWhatALocalPathLaunchDelivers:
+    def test_a_bare_repository_url_exports_empty(self, host_checkout, stub_taskdefs):
+        rc, delivered, _ = _delivered_launch(
+            ["chat", ORIGIN], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == ""
+
+    def test_no_positional_exports_empty(self, host_checkout, stub_taskdefs):
+        rc, delivered, _ = _delivered_launch(
+            ["chat"], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == ""
+
     def test_the_target_is_delivered_empty_not_absent(self, host_checkout, stub_taskdefs):
         rc, delivered, marker = _delivered_launch(
             ["chat", "."], cwd=host_checkout, taskdefs=stub_taskdefs
@@ -157,6 +183,195 @@ class TestWhatALocalPathLaunchDelivers:
             ["chat", ISSUE_URL], cwd=host_checkout, taskdefs=stub_taskdefs
         )
         assert delivered["LMER_TASK_TARGET"] == ISSUE_URL
+
+
+class TestEveryLocalPathSpellingResolvesTheSameCheckout:
+    """R4 (plan §9.7): a bare-name checkout delivers identical env whichever
+    way it is spelled, from a parent cwd whose own origin differs."""
+
+    @pytest.fixture
+    def parent_with_checkouts(self, tmp_path):
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        git(parent, "init", "-q")
+        git(parent, "remote", "add", "origin", "https://gitlab.example.com/parent/other")
+        for rel in ("widgets", "subdir/widgets"):
+            checkout = parent / rel
+            checkout.mkdir(parents=True)
+            git(checkout, "init", "-q")
+            git(checkout, "remote", "add", "origin", ORIGIN)
+        return parent, parent / "widgets"
+
+    @pytest.mark.parametrize("spelling", ["widgets", "./widgets", "subdir/widgets"])
+    def test_the_spelling_delivers_the_checkouts_own_origin(
+        self, spelling, parent_with_checkouts, stub_taskdefs
+    ):
+        parent, _ = parent_with_checkouts
+        rc, delivered, _ = _delivered_launch(
+            ["chat", spelling], cwd=parent, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == ""
+        assert delivered["LMER_REPO_HOST"] == "gitlab.example.com"
+        assert delivered["LMER_REPO_PROJECT"] == "group/project"
+        assert "parent/other" not in str(delivered)
+
+    def test_the_absolute_path_matches_the_bare_name(
+        self, parent_with_checkouts, stub_taskdefs
+    ):
+        parent, widgets = parent_with_checkouts
+        _, bare, _ = _delivered_launch(["chat", "widgets"], cwd=parent, taskdefs=stub_taskdefs)
+        _, absolute, _ = _delivered_launch(
+            ["chat", str(widgets)], cwd=parent, taskdefs=stub_taskdefs
+        )
+        assert bare["LMER_REPO_HOST"] == absolute["LMER_REPO_HOST"]
+        assert bare["LMER_REPO_PROJECT"] == absolute["LMER_REPO_PROJECT"]
+        assert bare["LMER_TASK_TARGET"] == absolute["LMER_TASK_TARGET"] == ""
+
+
+class TestTheRepoFlag:
+    """`--repo` names the repository explicitly (spec §4, A1-wave0.host-export)."""
+
+    def test_repo_with_no_positional_is_the_plain_project_session(self, tmp_path, stub_taskdefs):
+        rc, delivered, _ = _delivered_launch(
+            ["chat", "--repo", ORIGIN], cwd=tmp_path, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == ""
+        assert delivered["LMER_REPO_HOST"] == "gitlab.example.com"
+        assert delivered["LMER_REPO_PROJECT"] == "group/project"
+
+    def test_repo_beats_a_repository_derived_from_a_work_item(self, host_checkout, stub_taskdefs):
+        other = "https://gitlab.example.com/other/project"
+        rc, delivered, _ = _delivered_launch(
+            ["chat", ISSUE_URL, "--repo", other], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == ISSUE_URL
+        assert delivered["LMER_REPO_PROJECT"] == "other/project"
+
+    def test_an_other_url_is_delivered_verbatim_with_repo(self, host_checkout, stub_taskdefs):
+        rc, delivered, _ = _delivered_launch(
+            ["chat", "https://example.com/x/y", "--repo", ORIGIN],
+            cwd=host_checkout, taskdefs=stub_taskdefs,
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == "https://example.com/x/y"
+
+    def test_an_other_url_without_repo_is_refused(self, host_checkout, stub_taskdefs, capsys):
+        rc, _, _ = _delivered_launch(
+            ["chat", "https://example.com/x/y"], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 2
+        assert "not a repository, a work item or a known thread" in capsys.readouterr().out
+
+    def test_two_repositories_named_is_refused(self, host_checkout, stub_taskdefs, capsys):
+        rc, _, _ = _delivered_launch(
+            ["chat", ORIGIN, "--repo", "https://gitlab.example.com/other/project"],
+            cwd=host_checkout, taskdefs=stub_taskdefs,
+        )
+        assert rc == 2
+        assert "two repositories named" in capsys.readouterr().out
+
+    def test_a_non_git_directory_is_refused_not_read_as_a_branch(self, tmp_path, stub_taskdefs, capsys):
+        not_a_repo = tmp_path / "plain-dir"
+        not_a_repo.mkdir()
+        rc, _, _ = _delivered_launch(
+            ["chat", "plain-dir"], cwd=tmp_path, taskdefs=stub_taskdefs
+        )
+        assert rc == 2
+        assert "not a git repository" in capsys.readouterr().out
+
+    def test_a_branch_reaches_the_classifier_and_resolves_from_cwd(self, host_checkout, stub_taskdefs):
+        rc, delivered, _ = _delivered_launch(
+            ["chat", "mybranch"], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == "mybranch"
+        assert delivered["LMER_REPO_PROJECT"] == "group/project"
+
+    def test_a_document_url_derives_the_repository_and_stays_the_target(self, host_checkout, stub_taskdefs):
+        doc = f"{ORIGIN}/-/blob/main/docs/x.md"
+        rc, delivered, _ = _delivered_launch(
+            ["chat", doc], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 0
+        assert delivered["LMER_TASK_TARGET"] == doc
+        assert delivered["LMER_REPO_PROJECT"] == "group/project"
+        assert "/-/" not in delivered["LMER_REPO_PROJECT"]
+
+    def test_repo_must_be_a_repository(self, host_checkout, stub_taskdefs, capsys):
+        rc, _, _ = _delivered_launch(
+            ["chat", "--repo", ISSUE_URL], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 2
+        assert "is not a repository URL" in capsys.readouterr().out
+
+    def test_a_missing_repo_path_is_refused(self, host_checkout, stub_taskdefs, capsys):
+        rc, _, _ = _delivered_launch(
+            ["chat", "--repo", "widgts"], cwd=host_checkout, taskdefs=stub_taskdefs
+        )
+        assert rc == 2
+        assert "names no existing" in capsys.readouterr().out
+
+    def test_a_repo_that_fails_to_resolve_is_fatal_beside_a_thread(
+        self, tmp_path, stub_taskdefs, capsys
+    ):
+        """A thread-only launch with an explicit but broken --repo must NOT
+        silently become a repo-less session (review !384 thread 1)."""
+        rc, _, _ = _delivered_launch(
+            ["chat", SLACK_URL, "--repo", "./widgts"],
+            cwd=tmp_path, taskdefs=stub_taskdefs,
+            host_env={"SLACK_BOT_TOKEN": "xoxb-test"},
+        )
+        assert rc == 2
+        out = capsys.readouterr().out
+        assert "not a git repository" in out or "names no existing" in out
+
+    def test_a_repo_checkout_with_no_remote_is_fatal(self, tmp_path, stub_taskdefs, capsys):
+        """The ResolveError branch specifically: a named checkout with no
+        remote is refused, never dropped for the repo-less fallback."""
+        bare = tmp_path / "remote-less"
+        bare.mkdir()
+        git(bare, "init", "-q")
+        rc, _, _ = _delivered_launch(
+            ["chat", SLACK_URL, "--repo", str(bare)],
+            cwd=tmp_path, taskdefs=stub_taskdefs,
+            host_env={"SLACK_BOT_TOKEN": "xoxb-test"},
+        )
+        assert rc == 2
+        assert "No git remote" in capsys.readouterr().out
+
+    def test_a_work_item_url_with_no_derivable_repo_is_refused(
+        self, host_checkout, stub_taskdefs, capsys
+    ):
+        """A URL work item that derives no repository must not fall back to
+        the cwd origin (review !384 thread 3)."""
+        rc, _, _ = _delivered_launch(
+            ["chat", "https://gitlab.com/-/issues/1"],
+            cwd=host_checkout, taskdefs=stub_taskdefs,
+        )
+        assert rc == 2
+        assert "cannot derive a repository" in capsys.readouterr().out
+
+    def test_repo_flag_refusals_are_exit_2(self, capsys, monkeypatch):
+        monkeypatch.setenv("LMER_NO_REPO", "1")
+        ns, _ = parse_args(["chat", "--repo", ORIGIN])
+        assert _validate_parsed_args(ns) == 2
+        assert "LMER_NO_REPO" in capsys.readouterr().out
+        monkeypatch.delenv("LMER_NO_REPO")
+        ns, _ = parse_args(["chat", "--repo", ORIGIN, "--checkout", "/tmp/x"])
+        assert _validate_parsed_args(ns) == 2
+        assert "--repo and --checkout" in capsys.readouterr().out
+        ns, _ = parse_args(["chat", "--repo", ORIGIN, "--no-clone", "--exec", "true"])
+        assert _validate_parsed_args(ns) == 2
+        assert "--repo and --no-clone" in capsys.readouterr().out
+        ns, _ = parse_args(["--no-task", "--exec", "--repo", ORIGIN, "true"])
+        assert _validate_parsed_args(ns) == 2
+        assert "--repo needs a task" in capsys.readouterr().out
+        ns, _ = parse_args(["chat", "--repo", ""])
+        assert _validate_parsed_args(ns) == 2
+        assert "non-empty" in capsys.readouterr().out
 
 
 class TestWhatTheNameAndGoalFlagsDeliver:

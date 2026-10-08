@@ -663,18 +663,28 @@ Per project (the `{host}/{project}/` prefix already namespaces):
 - Full 40-hex commit SHA → truncated to the 12-char short form
   (e.g. `review-2a418231d83e`)
 - Named branch, no issue/MR → `<taskdef>-<slugified-branch>`
-- No target (plain project session) → `<taskdef>` (e.g. `chat` — one
-  long-lived per-project run; events accumulate per session)
-- Local filesystem path (`.`, `./`, `../x`, an absolute checkout path — a
-  project session launched from a checkout) → the host exports an **empty**
-  target, so the slug is the bare `<taskdef>` and `state.target` is empty.
-  Groups created before this rule (`chat-.`) stay addressable by their
-  recorded slug, and a continuation of such a record lands under the bare
-  taskdef with `source_session_uid` provenance into the old group (`work
-  session-start` says so; nothing in the old group moves). Such records
-  are host-only through the platform — its resume and answer routes refuse
-  an empty recorded target — like every target-less run, until a follow-up
-  lands.
+- No work item → `<taskdef>` (e.g. `chat` — one long-lived per-project
+  run; events accumulate per session). "No work item" covers a filesystem
+  path, a bare repository URL, a document URL and no target at all: a path
+  (`.`, `./`, `../x`, an absolute checkout path) resolves its repository
+  from the checkout's git origin, a bare repository URL is its own
+  repository, a document URL (a file, tree or wiki page inside a
+  repository) derives the repository and stays the session's target as
+  context, and no target infers the cwd origin. `work_repo.utils.classify_target`
+  is the one place that decides the class — the host CLI, the container
+  and the work CLI all read its answer, so the slug copies cannot drift.
+  A Slack or Matrix thread permalink is claimed by its handler before
+  classification and keeps its slug. Groups created before this rule
+  (`chat-.`, `chat-<repo>.git`) stay addressable by their recorded slug,
+  and a continuation of such a record lands under the bare taskdef with
+  `source_session_uid` provenance into the old group (`work session-start`
+  says so; nothing in the old group moves). Such records are host-only
+  through the platform — its resume and answer routes refuse an empty
+  recorded target — like every target-less run, until a follow-up lands.
+- Legacy cost (§14.2): a schema-1 record whose slug came from a
+  non-work-item target (`chat-.`, `chat-<repo>.git`, `masterplan-.--<name>`)
+  no longer matches what its recorded target now derives, so platform
+  resume and answer refuse it until it is folded at adoption (#368).
 
 Same target + same taskdef ⇒ same slug ⇒ a fresh container lands on the
 existing run — the resolver matches the recorded `state.slug`, never the
