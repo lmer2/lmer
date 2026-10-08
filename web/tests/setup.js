@@ -10,6 +10,9 @@ globalThis.ResizeObserver = class {
   disconnect() {}
 }
 globalThis.visualViewport = undefined
+// jsdom returns null here too, but logs "not implemented" on every call; the
+// color picker's canvas paints from a frame callback that can outlive its test.
+HTMLCanvasElement.prototype.getContext = () => null
 window.matchMedia = (media) => ({
   media, matches: false, addEventListener() {}, removeEventListener() {},
 })

@@ -1,0 +1,3 @@
+added:
+- "Platform UI header now shows the selected project in its color with a project switcher, replacing the in-page project tabs."
+- "Project settings offer a color picker accepting any hex color, with the 20 named colors as swatches."

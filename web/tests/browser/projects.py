@@ -68,13 +68,26 @@ class Browser:
 
     async def click(self, label, selector="button"):
         target = f"[...document.querySelectorAll({json.dumps(selector)})].find(e => e.checkVisibility() && !e.closest('[inert]') && e.getBoundingClientRect().right > 0 && e.getBoundingClientRect().left < innerWidth && (e.getAttribute('aria-label') || e.textContent.trim()) === {json.dumps(label)})"
-        if 'tab' in selector:
-            await self.evaluate(target + ".focus()")
-            await self.call("Input.dispatchKeyEvent", type="keyDown", key="Enter", code="Enter", windowsVirtualKeyCode=13, text="\r", unmodifiedText="\r")
-            await self.call("Input.dispatchKeyEvent", type="keyUp", key="Enter", code="Enter", windowsVirtualKeyCode=13)
-            await asyncio.sleep(.3)
-        else:
-            await self.click_element(target)
+        await self.click_element(target)
+
+    # The app bar's project switcher: on desktop in the bar itself, on phones in
+    # the bar's extension row. Only one is rendered, but match the visible one.
+    SWITCHER = "[...document.querySelectorAll('.project-switcher')].find(e => e.checkVisibility())"
+    SWITCHER_LIST = "[...document.querySelectorAll('.project-switcher-list')].find(e => e.checkVisibility())"
+
+    async def switcher_entry(self, title):
+        """Open the switcher menu and pick the entry titled `title` with real pointer events."""
+        await self.wait(self.SWITCHER)
+        await self.click_element(self.SWITCHER)
+        entry = f"[...{self.SWITCHER_LIST}.querySelectorAll('.v-list-item')].find(e => e.querySelector('.v-list-item-title')?.textContent.trim() === {json.dumps(title)})"
+        await self.wait(f"{self.SWITCHER_LIST} && {entry}")
+        await self.click_element(entry)
+        await self.wait(f"!{self.SWITCHER_LIST}")
+
+    async def choose_project(self, name):
+        """Select a project (or "All projects") through the app bar's switcher."""
+        await self.switcher_entry(name)
+        await self.wait(f"{self.SWITCHER}?.textContent.trim() === {json.dumps(name)}")
 
     async def shot(self, output, name):
         reply = await self.call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
@@ -117,6 +130,15 @@ async def rotating_composer(browser, output, project, settings):
     await browser.shot(output, 'rotation-successor-attachment')
 
 
+async def sidebar_chat(browser, name):
+    """Open a project's chat from its sidebar button, opening the phone's run list first."""
+    sidebar = "document.querySelector('.v-navigation-drawer--left')"
+    if not await browser.evaluate(sidebar + ".classList.contains('v-navigation-drawer--active')"):
+        await browser.click("show the run list")
+    await browser.wait(sidebar + ".getBoundingClientRect().left >= 0")
+    await browser.click_element(f"document.querySelector('.project-assistant[aria-label^={json.dumps('Chat with ' + name)}]')")
+
+
 async def probe(chrome, output, url, secret, alpha, beta, settings):
     deadline = time.monotonic() + 20
     page = None
@@ -141,12 +163,11 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.shot(output, "all-projects-desktop")
         await browser.click_element("document.querySelector('.project-assistant[aria-label^=\"Chat with Alpha\"]')")
         await browser.wait("document.querySelector('.project-chat-title')?.textContent.includes('Alpha')")
-        await browser.click("All projects", '[role="tab"]')
-        await browser.wait("document.querySelector('.project-identity').textContent.includes('All projects')")
+        await browser.choose_project("All projects")
         assert await browser.evaluate("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Alpha'))")
         await browser.shot(output, "all-projects-bound-chat")
         await browser.evaluate("document.querySelector('[aria-label=\"close the uber lmer chat\"]').click()")
-        await browser.click("Beta", '[role="tab"]')
+        await browser.choose_project("Beta")
         await browser.click("talk to uber lmer")
         await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Beta'))")
         await browser.wait("document.body.textContent.includes('Waiting to start — assistant limit reached')")
@@ -167,18 +188,20 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.shot(output, "historical-draft-admitted")
         await rotating_composer(browser, output, beta, settings)
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
-        await browser.click("Project settings for Beta")
-        await browser.wait("document.querySelector('input[aria-label=\"Project color\"]') || document.body.textContent.includes('Project color')")
+        await browser.switcher_entry("Project settings for Beta")
+        swatches = "[...document.querySelectorAll('.project-color .v-color-picker-swatches__color')]"
+        await browser.wait(swatches + ".length === " + str(len(projects.COLORS)))
+        bar = "document.querySelector('header.v-app-bar')"
         contrasts = {}
-        for color in projects.COLORS:
-            await browser.click_element("[...document.querySelectorAll('.v-select')].find(e => e.textContent.includes('Project color')).querySelector('.v-field')")
-            await browser.wait(f"[...document.querySelectorAll('[role=option]')].some(e => e.querySelector('.v-list-item-title')?.textContent.trim() === {json.dumps(color)})")
-            await browser.click_element(f"[...document.querySelectorAll('[role=option]')].find(e => e.querySelector('.v-list-item-title')?.textContent.trim() === {json.dumps(color)})")
+        # The swatches are the presets in palette order, so swatch i is COLORS[i].
+        for index, color in enumerate(projects.COLORS):
+            await browser.click_element(swatches + f"[{index}]")
+            await browser.wait(f"document.querySelector('.project-color .v-chip')?.textContent.trim() === {json.dumps(color)}")
             await browser.click("Save project")
-            await browser.wait(f"!document.querySelector('.v-btn--loading') && document.querySelector('.project-identity').textContent.includes('Beta')")
+            await browser.wait(f"!document.querySelector('.v-btn--loading') && {browser.SWITCHER}?.textContent.trim() === 'Beta'")
             assert projects.get(beta["id"])["color"] == color
-            await browser.wait("getComputedStyle(document.querySelector('.project-identity .v-chip')).backgroundColor === getComputedStyle(document.querySelector('.v-select .v-field .v-chip')).backgroundColor")
-            colors = await browser.evaluate("(() => { const style = getComputedStyle(document.querySelector('.project-identity .v-chip')); return [style.color, style.backgroundColor]; })()")
+            await browser.wait(f"getComputedStyle({bar}).backgroundColor === getComputedStyle(document.querySelector('.project-color .v-chip')).backgroundColor")
+            colors = await browser.evaluate("(() => { const style = getComputedStyle(" + bar + "); return [style.color, style.backgroundColor]; })()")
             def luminance(value):
                 rgb = [int(number) / 255 for number in re.findall(r"\d+", value)[:3]]
                 rgb = [part / 12.92 if part <= .04045 else ((part + .055) / 1.055) ** 2.4 for part in rgb]
@@ -187,18 +210,18 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             contrasts[color] = (max(foreground, background) + .05) / (min(foreground, background) + .05)
             assert contrasts[color] >= 4.5, (color, colors, contrasts[color])
         await browser.call("Page.reload")
-        await browser.wait("document.querySelector('.project-identity')?.textContent.includes('Beta')")
+        await browser.wait(f"{browser.SWITCHER}?.textContent.trim() === 'Beta'")
         assert projects.get(beta["id"])["color"] == "Gray"
         await browser.call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await browser.wait("document.querySelector('[aria-label=\"show the run list\"]')")
-        await browser.click("Chat with Beta")
+        await sidebar_chat(browser, "Beta")
         await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Beta'))")
         overflow = await browser.evaluate("document.documentElement.scrollWidth > innerWidth")
         assert not overflow, "Page overflows the phone viewport"
         await browser.shot(output, "beta-phone")
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
-        await browser.click(alpha["name"], '[role="tab"]')
-        await browser.click("Chat with " + alpha["name"])
+        await browser.choose_project(alpha["name"])
+        await sidebar_chat(browser, alpha["name"])
         await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Alpha'))")
         await browser.shot(output, "long-name-phone")
         await browser.click("colour scheme: follow the system")
@@ -210,7 +233,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
         for name in ("Browser Gamma", "Browser Delta"):
-            await browser.click("New project")
+            await browser.switcher_entry("New project")
             await browser.wait("document.querySelector('.v-dialog input')")
             await browser.click_element("document.querySelector('.v-dialog input')")
             await browser.call("Input.insertText", text=name)
@@ -225,10 +248,10 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         (output / "browser-results.json").write_text(json.dumps({
             "result": "pass", "viewports": ["1440x1000", "390x844"], "colors_saved": list(projects.COLORS), "label_contrast": contrasts,
             "checks": ["project-local All projects groups", "actual chat identity while All projects selected",
-                       "durable waiting/cancel", "20 named swatches saved through UI", "URL/color reload",
-                       "close/switch/toolbar opens Beta", "queued historical draft survives admission", "staged attachment survives real rotation gap",
+                       "durable waiting/cancel", "20 preset color-picker swatches saved by name through UI", "URL/color reload",
+                       "close/switch/bar robot opens Beta", "queued historical draft survives admission", "staged attachment survives real rotation gap",
                        "phone overflow and long chat header", "dark theme identity", "name-only project creation opens own chat",
-                       "all project label contrasts >= 4.5", "no runtime exceptions"],
+                       "all project app bar text contrasts >= 4.5", "no runtime exceptions"],
             "limits": "Real Chromium and HTTP routes, fixture inventory and sleeping assistant processes; no external transports or live daemon.",
         }, indent=2) + "\n")
 

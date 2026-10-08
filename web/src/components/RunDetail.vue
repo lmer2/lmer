@@ -23,7 +23,7 @@ import {
   targetLink, targetRef, toneColor,
 } from '../format.js'
 import { rememberChoice, storedChoice } from '../preferences.js'
-import { projectColor } from '../projects.js'
+import { projectColor, projectTextColor } from '../projects.js'
 import { runKey as composeRunKey } from '../runref.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
@@ -605,7 +605,8 @@ async function forget() {
   <div>
     <div class="d-flex flex-wrap ga-2 align-center mb-3">
       <v-chip v-if="!run.workspace_id || run.workspace_id !== identifiedWorkspaceId"
-        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
+        class="run-project-identity" :color="projectColor(run.workspace_color)"
+        :style="{ color: projectTextColor(run.workspace_color) }" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
       <template v-if="!run.live && !run.orchestrator">
         <v-select v-model="moveDestination" :items="projects.filter(project => !project.archived && project.id !== run.workspace_id)"
           item-title="name" item-value="id" label="Move to project" hide-details density="compact" style="min-width: 180px" />

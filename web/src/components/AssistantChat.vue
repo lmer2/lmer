@@ -21,7 +21,7 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
-import { projectColor, readDraft, storeDraft } from '../projects.js'
+import { projectColor, projectTextColor, readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
 
@@ -144,7 +144,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <v-toolbar :color="projectColor(workspace.color)" density="comfortable" class="assistant-header">
+  <v-toolbar :color="projectColor(workspace.color)" :style="{ color: projectTextColor(workspace.color) }"
+    density="comfortable" class="assistant-header">
     <v-icon :icon="mdiRobot" class="ms-4 me-1" />
     <v-toolbar-title class="text-title-medium project-chat-title">{{ workspace.name }} · uber lmer</v-toolbar-title>
     <template v-if="status || problem">

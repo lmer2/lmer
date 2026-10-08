@@ -366,6 +366,13 @@ def test_project_settings_colors_archive_and_restore_through_http(client, fleet)
         projects.migrate()
         assert projects.get(identifier)["color"] == color
     assert client.patch(f"/api/projects/{identifier}", json={"color": "Random"}).status_code == 400
+    custom = client.patch(f"/api/projects/{identifier}", json={"color": "#FF69B4"})
+    assert custom.status_code == 200, custom.text
+    assert custom.json()["color"] == "#ff69b4"
+    assert projects.get(identifier)["color"] == "#ff69b4"
+    for malformed in ("#fff", "ff69b4", "#ff69b4ff", "#gg69b4", " #ff69b4", "#ff69b4\n", 0xff69b4, None):
+        assert client.patch(f"/api/projects/{identifier}", json={"color": malformed}).status_code == 400, malformed
+    assert projects.get(identifier)["color"] == "#ff69b4"
     renamed = client.patch(f"/api/projects/{identifier}", json={"name": "Renamed", "repositories": ["https://forge.test/repo"]})
     assert renamed.status_code == 200
     assert projects.status(identifier)["session_id"] == initial

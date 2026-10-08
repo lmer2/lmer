@@ -63,6 +63,11 @@ async def input_text(browser, expression, text):
     await browser.call("Input.insertText", text=text)
 
 
+# Move focus off the bar onto <main>. A bare blur() will not do: Vuetify keeps a
+# focus tooltip open when focus parks on the body (blur with no relatedTarget).
+PARK_FOCUS = "(() => { const main = document.querySelector('main'); main.tabIndex = -1; main.focus(); })()"
+
+
 async def tooltips(browser):
     buttons = "[...document.querySelectorAll('header button')].filter(e => e.checkVisibility())"
     labels = await browser.evaluate(buttons + ".map(e => e.getAttribute('aria-label'))")
@@ -71,7 +76,7 @@ async def tooltips(browser):
         target = buttons + f"[{index}]"
         position = await browser.evaluate("(() => { const r = " + target + ".getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()")
         assert 0 <= position["x"] <= await browser.evaluate("innerWidth"), (label, position)
-        await browser.evaluate("document.querySelector('[role=tab]').focus()")
+        await browser.evaluate(PARK_FOCUS)
         await browser.call("Input.dispatchMouseEvent", type="mouseMoved", **position)
         shown = "(() => { const b = " + target + "; const tip = document.getElementById(b.getAttribute('aria-describedby')); return tip?.classList.contains('v-overlay--active') && tip.textContent.trim() === " + json.dumps(label) + "; })()"
         await browser.wait(shown)
@@ -81,12 +86,12 @@ async def tooltips(browser):
         await key(browser, "Tab", "Tab", 9, "")
         await browser.evaluate(target + ".focus()")
         await browser.wait(shown)
-    await browser.evaluate("document.querySelector('[role=tab]').focus()")
+    await browser.evaluate(PARK_FOCUS)
     return labels
 
 
 async def settings_screens(browser, output, before, width, project_id):
-    await browser.click("Project settings for Example Beta")
+    await browser.switcher_entry("Project settings for Example Beta")
     await browser.wait("document.querySelector('main').textContent.includes('Standing instructions')")
     if not before:
         await browser.wait("document.querySelector('.v-expansion-panel-title')")
@@ -117,7 +122,7 @@ async def settings_screens(browser, output, before, width, project_id):
         await asyncio.sleep(.3)
         await browser.shot(output, f"project-settings-expanded-{width}")
         await browser.click("Close")
-        await browser.click("Project settings for Example Beta")
+        await browser.switcher_entry("Project settings for Example Beta")
         await browser.wait("document.querySelector('.v-expansion-panel-title')?.getAttribute('aria-expanded') === 'false'")
     await browser.click("Platform settings")
     await browser.wait("document.querySelector('h1')?.textContent === 'Platform settings'")
@@ -158,11 +163,11 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.call("Page.navigate", url=url)
         await browser.wait("document.querySelectorAll('.project-nav').length === 4")
-        await browser.click("Example Beta", '[role="tab"]')
+        await browser.choose_project("Example Beta")
         for name in ("Example Alpha", "Example Beta"):
             group = "document.querySelector('.project-nav[aria-label=" + json.dumps(name) + "]')"
             await browser.click_element("[..." + group + ".querySelectorAll('.run-row')].find(e => e.textContent.includes('orchestrate-fleet'))")
-            await browser.wait("document.querySelector('.project-identity .v-chip')?.textContent === " + json.dumps(name))
+            await browser.wait(browser.SWITCHER + "?.textContent.trim() === " + json.dumps(name))
             if not before:
                 assert await browser.evaluate("document.querySelectorAll('.project-nav [aria-current=true]').length") == 1
                 assert await browser.evaluate(group + ".querySelector('[aria-current=true]') !== null")
@@ -180,7 +185,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.click("back to the fleet")
         if not before:
             checked += await tooltips(browser)
-        await browser.click("All projects", '[role="tab"]')
+        await browser.choose_project("All projects")
         await browser.wait("document.querySelectorAll('main section').length === 4")
         await browser.shot(output, "all-projects-desktop")
         if not before:
@@ -195,7 +200,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             remaining = [row.slug for row in runs.list_tracked()]
             assert all(name in remaining for name in ("alpha-held", "beta-held", "alpha-active", "beta-active")), remaining
             assert not any(name.endswith('complete') for name in remaining), remaining
-        await browser.click("Example Beta", '[role="tab"]')
+        await browser.choose_project("Example Beta")
         await settings_screens(browser, output, before, 1440, beta["id"])
         for width in (390, 320):
             await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=844, deviceScaleFactor=1, mobile=True)
