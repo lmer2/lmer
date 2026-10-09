@@ -647,6 +647,8 @@ class TestWriteIntentMapCoversTheParser:
         ("goal", ["goal", "a stated goal"], True),
         ("memory", ["memory", "restore"], False),
         ("memory", ["memory", "persist"], True),
+        ("housekeep", ["housekeep"], False),
+        ("housekeep", ["housekeep", "--apply"], True),
         ("setup-workspace", ["setup-workspace", "https://x/y.git"], False),
         ("state", ["state"], False),
         ("state", ["state", "set", "--phase=x"], True),
