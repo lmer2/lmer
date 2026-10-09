@@ -1,0 +1,278 @@
+"""`work adopt` + `work migrate` CLI acceptance (#367/#368, spec §10).
+
+What these tests pin end to end, through the real `work` CLI on a git
+checkout of the legacy fixture:
+
+- `work adopt` bootstraps the manifest and moves the host bucket to the flat
+  short name; `work migrate <project> --apply` then moves the bare areas and
+  lands ONE commit, after which the validator reports no ERRORs;
+- a session launched afterwards resumes a migrated run by session id
+  (`work sessions` lists it, `work resume --session <id>` briefs it);
+- `work migrate --apply` is an operator-shell verb: a bare shell on a
+  schema-2 tree is not refused by the session-uid gate.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from lmer_cli import gate_lock
+from lmer_schema.checks import CHECKS, Form, Report, Severity
+from lmer_schema.checks.runner import validate
+from tests import plexus_fixtures as pf
+from tests.conftest import strip_lmer_env
+from work_repo import cli, git_ops
+
+BUCKET = pf.PRIMARY_REPO
+NAME = "lmer"
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    strip_lmer_env(monkeypatch)
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _init_checkout(root):
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "tests@example.test")
+    _git(root, "config", "user.name", "tests")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "fixture")
+
+
+@pytest.fixture
+def legacy_work(tmp_path, monkeypatch):
+    """The legacy fixture, committed, with its second session signed out so
+    the §1.6 preflight has nothing to refuse."""
+    tree = pf.build_legacy_plexus(tmp_path / "work")
+    events = tree.session_dirs[0] / "events.jsonl"
+    events.write_text(
+        events.read_text(encoding="utf-8")
+        + json.dumps({
+            "ts": "2026-08-24T11:50:00Z",
+            "session": pf.SESSION_IDS[1],
+            "type": "session_end",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    _init_checkout(tree.root)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
+    monkeypatch.setenv(gate_lock.LOCK_DIR_ENV, str(tmp_path / "gate-inflight"))
+    return tree.root
+
+
+@pytest.fixture
+def commits(monkeypatch):
+    """Stand in for commit → rebase → push: record the call and perform the
+    local commit (no network), so a chained adopt then migrate sees a clean
+    tree exactly as the real helper would leave it."""
+    calls = []
+
+    def record(paths, message=None, allow_during_gate=False):
+        calls.append(SimpleNamespace(paths=list(paths), message=message))
+        root = os.environ["LMER_WORK_REPO_PATH"]
+        subprocess.run(
+            ["git", "-C", root, "add", "--", *paths],
+            check=False, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", root, "commit", "-q", "-m", message or "commit"],
+            check=False, capture_output=True,
+        )
+        return 0
+
+    monkeypatch.setattr(git_ops, "commit_work_path", record)
+    return calls
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", ["work", *argv])
+    return cli.main()
+
+
+def _error_findings(root):
+    report = Report(Form.SCHEMA)
+    from lmer_schema.checks import record as record_checks
+
+    record_checks.check_record(root, report)
+    return [f for f in report.findings if f.severity is Severity.ERROR]
+
+
+def test_adopt_then_migrate_lands_one_commit_and_validates(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    assert len(commits) == 1
+    capsys.readouterr()
+    assert (legacy_work / NAME / "_runs").is_dir() or (legacy_work / NAME / "runs").is_dir()
+
+    assert _run_cli(monkeypatch, ["migrate", NAME, "--apply"]) == 0
+    assert len(commits) == 2, "the migration must land its own ONE commit"
+    capsys.readouterr()
+    assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+    assert _error_findings(legacy_work) == []
+
+
+def test_a_session_afterwards_resumes_a_migrated_run(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    assert _run_cli(monkeypatch, ["migrate", NAME, "--apply"]) == 0
+    capsys.readouterr()
+
+    monkeypatch.setenv("LMER_REPO_URL", f"https://{BUCKET}")
+    monkeypatch.setenv("LMER_REPO_HOST", pf.BUCKET_HOST)
+    monkeypatch.setenv("LMER_REPO_PROJECT", pf.PRIMARY_REPO.split("/", 1)[1])
+    rc = _run_cli(monkeypatch, ["sessions", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    document = json.loads(captured.out.strip().splitlines()[-1])
+    session_ids = {row["id"] for row in document["sessions"]}
+    assert pf.SESSION_IDS[0] in session_ids
+
+    rc = _run_cli(monkeypatch, ["resume", "--session", pf.SESSION_IDS[0]])
+    assert rc == 0, capsys.readouterr().out + capsys.readouterr().err
+
+
+def test_apply_from_a_bare_shell_is_not_refused_by_the_uid_gate(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    # The gate only engages on a schema-2 tree; `adopt` bootstraps schema 1.
+    manifest = legacy_work / "_plexus.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("schema: 1", "schema: 2", 1),
+        encoding="utf-8",
+    )
+    _git(legacy_work, "commit", "-q", "-am", "cut over to schema 2")
+    capsys.readouterr()
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    captured = capsys.readouterr()
+    assert "Session write refused" not in captured.err
+    assert rc == 0, captured.out + captured.err
+    assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def _planted_validator(monkeypatch, paths, code="record.plain-session-slug"):
+    """Swap the core's validator for one that reports a *code* ERROR at each
+    of *paths*; returns the call log."""
+    from work_repo import migrate as migrate_module
+
+    calls = []
+
+    def fake_validate(target, plexus_repo_url=None):
+        calls.append(target)
+        report = Report(Form.SCHEMA)
+        for path in paths:
+            report.add(code, path, "planted")
+        return report
+
+    real_core_module = migrate_module.core_module
+
+    def core_module(name):
+        if name == "checks.runner":
+            return SimpleNamespace(validate=fake_validate)
+        return real_core_module(name)
+
+    monkeypatch.setattr(migrate_module, "core_module", core_module)
+    return calls
+
+
+def test_an_error_in_the_migrated_project_shows_in_the_exit_code(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    calls = _planted_validator(monkeypatch, [f"{NAME}/_runs/chat-."])
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert calls == [str(legacy_work)]
+    assert "record.plain-session-slug" in out
+    # The commit stands.
+    assert len(commits) == 2
+    assert (legacy_work / NAME / "_runs" / pf.SLUG).is_dir()
+
+
+def test_a_root_level_error_counts_in_the_exit_code(
+    legacy_work, commits, monkeypatch, capsys
+):
+    # A crashed check is reported at the plexus root (`.`), not under any
+    # one project. The report is incomplete, so it must fail the exit code
+    # even though it is outside what this run migrated.
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    _planted_validator(monkeypatch, ["."], code="runner.check-failed")
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "runner.check-failed" in out
+    assert "outside what this run migrated" not in out
+
+
+def test_another_projects_errors_are_printed_but_not_counted(
+    legacy_work, commits, monkeypatch, capsys
+):
+    # Per-project rollout: a project still waiting its turn must not fail
+    # this project's migration.
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    capsys.readouterr()
+    _planted_validator(monkeypatch, ["q3-capacity/_runs/chat-.", f"{NAME}-other/_runs/chat-."])
+    rc = _run_cli(monkeypatch, ["migrate", NAME, "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "q3-capacity/_runs/chat-." in out
+    assert "2 ERRORs outside what this run migrated" in out
+
+
+def test_the_real_validator_scopes_the_exit_code(tmp_path, capsys):
+    from work_repo import migrate as migrate_module
+
+    tree = pf.build_schema_plexus(tmp_path / "plexus")
+    pf.plant_plain_session_records(tree.project_dir)
+    project = tree.project_dir.relative_to(tree.root).as_posix()
+    assert migrate_module._validate_schema_tier(tree.root, [project]) == 1
+    assert migrate_module._validate_schema_tier(tree.root, ["elsewhere"]) == 0
+    assert "not counted in the exit code" in capsys.readouterr().out
+
+
+def test_after_compat_link_migration_the_validator_reports_info_only(
+    legacy_work, commits, monkeypatch, capsys
+):
+    monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+    assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
+    assert _run_cli(monkeypatch, ["migrate", NAME, "--apply", "--compat-link"]) == 0
+    capsys.readouterr()
+    report = validate(legacy_work)
+    assert report.form is Form.SCHEMA
+    assert not [f for f in report.findings if f.severity is Severity.ERROR]
+    # Whatever stays above INFO is instance-level and is not the project
+    # migration's to repair: the schema-2 cutover and the `--instance` fold.
+    above_info = {f.code for f in report.findings if f.severity is not Severity.INFO}
+    assert above_info <= {"manifest.schema-older", "manifest.sources-legacy-file"}
+    project_findings = [
+        f for f in report.findings if f.path.split("/", 1)[0] in (NAME, *BUCKET.split("/")[:1])
+    ]
+    assert project_findings and all(f.severity is Severity.INFO for f in project_findings)
+
+
+def test_compat_link_is_refused_with_instance(monkeypatch, capsys, legacy_work):
+    rc = _run_cli(monkeypatch, ["migrate", "--instance", "--compat-link"])
+    assert rc == 2
+    assert "project form only" in capsys.readouterr().err

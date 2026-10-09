@@ -916,9 +916,12 @@ class TestThinConsumer:
         ``MEMORY.md`` indexes. memory.py owns that file but exposes no index
         writer without a session's restore baseline behind it, and routing
         the split through persist would hand it to D.index's reconcile, which
-        generates lines the migration must not. So the write is one function,
-        named here, and nothing else in the module may write a file."""
-        allowed = {"_write_index"}
+        generates lines the migration must not. The SECOND named exception is
+        ``_rewrite_slug``: the fold's positional scalar surgery on a moved
+        state file, which writes exactly one scalar and nothing else (§1.6).
+        So the writes are two functions, named here, and nothing else in the
+        module may write a file."""
+        allowed = {"_write_index", "_rewrite_slug"}
         functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         assert allowed <= functions, "the one index write must stay a named top-level function"
         for top in tree.body:

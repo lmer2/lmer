@@ -1618,6 +1618,68 @@ One related case is automatic. When a stopped run is relaunched with a pushed an
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
 
+### Adopting and migrating a work repo (`work adopt` / `work migrate`)
+
+Both verbs are **operator-shell** verbs: they run from a work-repo checkout
+with no session env, are exempt from the session-uid gate, and still declare
+their write scope to the write-attribution journal. Both are **dry runs by
+default** and print the full plan; `--apply` performs it in ONE commit. Exit
+codes: `0` success (or a dry run); `1` a refusal before anything changed, or a
+failed push after the commit was made locally (the message says which); `2` a
+usage error. After a successful `work migrate --apply` the schema-tier
+validator runs over the whole tree and prints its full report, but only
+ERRORs under the paths this run migrated (the project dir, or the instance
+surfaces and `_plexus.yaml`) make the exit code `1` — another project still
+awaiting its turn does not fail this one. The commit stands regardless;
+`work adopt` does not run the validator.
+
+**`work adopt <host>/<project> <shortname> [--apply] [--compat-link]
+[--description TEXT] [--remote URL]... [--force]`** names a host bucket and
+registers it. It resolves the bucket, checks the shortname and the registry,
+shows the SCHEMA-tier fix list (the tree is leaving the lenient legacy tier),
+bootstraps `_plexus.yaml` through the writer if the tree has none, writes the
+registry entry, and `git mv`s the directory to `<shortname>/`. `--compat-link`
+leaves a relative symlink at the old path (INFO); `--description` sets the
+registry entry's description; `--remote` may repeat; `--force` adopts despite
+schema-tier ERRORs in the fix list, carrying them into `<shortname>/` as they
+are. It does not rename the bare areas inside — that is `work migrate`.
+
+**`work migrate <project> [--apply] [--compat-link]`** moves one registered
+project's bare areas to their schema names (`runs/` → `_runs/`, `specs/` →
+`_specs/`, and the rest), nests each legacy run dir under its first session id,
+lifts non-`project` memories to the instance scope, re-points the `_specs/`
+and `_plans/` entries in place (keeping their dates), and folds the pre-A1
+plain-session groups (`chat-.`, `chat-<repo>`, `chat-<repo>.git`) into the
+bare taskdef group — only the `slug:` scalar is rewritten, and a folded
+record's `_specs/` entries are re-registered under its new label with their
+dates kept. A fold destination that already exists is never overwritten: in a
+schema-form `_runs/` it is reported and that record skipped; while a legacy
+`runs/` dir is still being nested, it is a blocker that refuses the whole
+migration. It is idempotent: a re-run is a no-op. The migration
+refuses while any record it would move is live: finish or sign out that
+session, or for a stale record that never signed out run `work housekeep
+--archive-stale`. `--compat-link` leaves a relative symlink at each old bare
+path (never inside `_runs/`) and is refused with `--instance`.
+
+**`work migrate --instance [--apply]`** moves the instance surfaces
+(`agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
+`taskdef/` → `_taskdef/`; `napkin/` stays where it is, with a note, because
+no release reads `_napkin/` yet) and folds a standalone
+`sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
+file in the same commit. Each legacy entry goes through the container
+loader's own rules (same-host trust rule against `LMER_WORK_REPO`, else the
+work repo's `origin`), keeping its transport spelling; a key the manifest
+already declares keeps the manifest entry, with one warning. The version
+floor is the first release carrying #370: both the dry run and the apply
+refuse unless the running release reads the manifest `sources:` tier.
+**Deploy #370 fleet-wide before applying the instance fold**, because removing
+`sources.yaml` switches declared sources off on any host still running a
+pre-#370 release. `--instance` and `<project>` are mutually exclusive.
+
+The `lmer-schema migrate` preview (schema 1 → 2) lists any plain-session
+groups it cannot carry over as `Directory move:` lines and as blockers, each
+naming `work migrate <project>`; `--apply` refuses while they remain.
+
 ### Troubleshooting
 
 #### Troubleshooting: containers hit the PID cap (cgroup-v1 pids leak)

@@ -511,6 +511,98 @@ def build_legacy_plexus(root) -> PlexusTree:
     )
 
 
+#: §7's obsolete derived spellings: ``(taskdef, target, slug)``. Each slug is
+#: the pre-A1 derivation of its own target, so each must be folded into the
+#: bare taskdef group by ``work migrate``.
+PLAIN_SESSION_GROUPS = (
+    ("chat", ".", "chat-."),
+    ("chat", "https://gitlab.example.com/acme/widgets", "chat-widgets"),
+    ("chat", "https://gitlab.example.com/acme/widgets.git", "chat-widgets.git"),
+)
+
+#: Astra R1's release record in both states: an empty target that derives the
+#: bare taskdef before version recording, and its re-slugged successor after.
+#: Neither is a plain-session leftover; neither may ever be flagged or moved.
+RELEASE_RECORDS = (
+    {"taskdef": "release", "target": "", "slug": "release"},
+    {"taskdef": "release", "target": "", "slug": "release-v0.10.2",
+     "reslugged_from": ["release"]},
+)
+
+
+def _plain_session_state_yaml(record, *, status="complete", created="2026-09-01T10:00:00Z") -> str:
+    """A schema-1 state file carrying exactly the predicate's inputs."""
+    lines = [
+        "schema: 1",
+        f"slug: {record['slug']}",
+        "name: null",
+        f"taskdef: {record['taskdef']}",
+        f"target: {record.get('target', '')!r}",
+        f"status: {status}",
+        "phase: implement",
+        "stop_reason: complete",
+        "critical_error: null",
+        "open_question: null",
+        "goal: fixture",
+        "estimate: null",
+        "artifacts: {}",
+        "owner: null",
+        f"frozen: '{created}'",
+        f"created: '{created}'",
+        f"updated: '{created}'",
+    ]
+    reslugged = record.get("reslugged_from")
+    if reslugged:
+        lines.append("reslugged_from:")
+        lines.extend(f"  - {slug}" for slug in reslugged)
+    return "\n".join(lines) + "\n"
+
+
+def plant_plain_session_records(project_dir, *, area="_runs", nested=True,
+                                session_id=None, signed_out=True, readable=True,
+                                status="complete"):
+    """Plant §7's plain-session groups and R1's release record under
+    *project_dir*, returning ``{slug: [state.yaml, ...]}``.
+
+    *area* is the run area's name (``_runs`` in schema form, ``runs`` in a
+    legacy one) and *nested* whether each group holds a session directory
+    (schema form) or the state file sits directly in the group (legacy form).
+    The three obsolete spellings must be folded; R1's release record must
+    never be touched in either state. *signed_out* writes a final
+    ``session_end`` (the fold's preflight requires a stopped record);
+    *readable=False* writes a torn state file (lifecycle unknown). The
+    existing builders and ``tests/test_lmer_schema_fixtures.py`` are left
+    untouched.
+    """
+    planted = {}
+    records = [
+        {"taskdef": taskdef, "target": target, "slug": slug}
+        for taskdef, target, slug in PLAIN_SESSION_GROUPS
+    ]
+    records.extend(dict(record) for record in RELEASE_RECORDS)
+    for index, record in enumerate(records):
+        # A distinct, valid session id per group: one shared id would add a
+        # `duplicate historical session ID` blocker on top of the fold ones.
+        sid = session_id or f"20260901-1000{index:02d}-1-{index}"
+        group = Path(project_dir) / area / record["slug"]
+        rdir = group / sid if nested else group
+        rdir.mkdir(parents=True, exist_ok=True)
+        if readable:
+            _write(rdir / "state.yaml", _plain_session_state_yaml(
+                record, status=status, created=f"2026-09-01T10:00:{index:02d}Z",
+            ))
+        else:
+            _write(rdir / "state.yaml", "state: [unclosed\n")
+        if signed_out:
+            _write(rdir / "events.jsonl", json.dumps({
+                "ts": "2026-09-01T10:05:00Z", "session": sid, "type": "session_end",
+            }) + "\n")
+        else:
+            _write(rdir / "events.jsonl", "")
+        planted.setdefault(record["slug"], []).append(rdir / "state.yaml")
+    return planted
+
+
 @pytest.fixture
 def schema_plexus(tmp_path) -> PlexusTree:
     """A fresh schema-form plexus (§2) under this test's tmp_path."""

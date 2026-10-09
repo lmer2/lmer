@@ -199,7 +199,7 @@ import yaml
 
 from lmer_schema.checks.findings import Report, Severity, Tier, register
 from lmer_schema.checks import symlinks
-from lmer_schema.registry import PROJECT_MARKERS, is_project_shaped
+from lmer_schema.registry import PROJECT_MARKERS, is_host_bucket_name, is_project_shaped
 
 __all__ = [
     "EVENTS_FILE",
@@ -224,6 +224,7 @@ __all__ = [
     "TASK_STATUSES",
     "check_record",
     "iter_run_areas",
+    "plain_session_move_text",
 ]
 
 #: The session-unit run area (D22) and its legacy, shared-dir twin (§3.5).
@@ -441,6 +442,15 @@ register(
         "shape; reported for migration, never an error"
     ),
 )
+register(
+    "record.plain-session-slug",
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary=(
+        "a pre-A1 plain-session leftover: the slug is the obsolete derivation "
+        "of the record's own target; `work migrate <project>` folds it"
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +595,29 @@ def _is_legacy_target(path: Path) -> bool:
     return any((path / marker).exists() for marker in LEGACY_TARGET_MARKERS)
 
 
+def plain_session_move_text(slug, taskdef, *, area=RUNS_DIR, group=None) -> str:
+    """The §7 move text for a plain-session leftover, shared verbatim.
+
+    The validator check and the ``lmer-schema migrate`` blocker both carry
+    this one string (B.port-check/B.port-blocker), so the finding and the
+    refusal cannot drift on what to do or how. It names the move and the
+    ONE command that repairs it. *group* is the directory's on-disk name
+    (default *slug*); in a legacy ``runs/`` area that directory IS the
+    record, so it moves whole under a session id rather than per ``<uid>``.
+    """
+    group = slug if group is None else group
+    if area == LEGACY_RUNS_DIR:
+        move = f"`{area}/{group}/ \u2192 {RUNS_DIR}/{taskdef}/<session-id>/`"
+    else:
+        move = f"`{area}/{group}/<uid> \u2192 {RUNS_DIR}/{taskdef}/<uid>`"
+    return (
+        f"`{area}/{group}/` is a pre-A1 plain-session leftover: its `slug:` is "
+        f"the obsolete derivation of its own target. Fold it into the bare "
+        f"taskdef group ({move}, "
+        f"`slug: {slug} \u2192 {taskdef}`) with `work migrate <project>`."
+    )
+
+
 def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECONDS,
                  manifest=..., projects=None) -> None:
     """Run every record-area check over the plexus at *root* into *report*.
@@ -618,11 +651,20 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
             except RunStateError:
                 report.add("record.release-claim", _rel(root, path),
                            "invalid shared release claim; arbitration must refuse")
+    # `record.plain-session-slug` is evaluated only in schema form: a legacy
+    # tree (no manifest) keeps validating green and folds its leftovers at
+    # adoption, inside `work migrate` (spec §7, review S3). A host bucket is
+    # skipped inside the check itself — a bucket never blocks (D9) and this
+    # `record.*` code has no legacy downgrade.
+    plain_session = manifest is not None
     for area, layout in iter_run_areas(root, projects=projects):
         if layout == SESSION_LAYOUT:
-            _check_session_area(root, area, report, now=now, stale_after=stale_after)
+            _check_session_area(
+                root, area, report, now=now, stale_after=stale_after,
+                plain_session=plain_session,
+            )
         else:
-            _check_legacy_area(root, area, report)
+            _check_legacy_area(root, area, report, plain_session=plain_session)
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +672,7 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
 # ---------------------------------------------------------------------------
 
 
-def _check_session_area(root, area, report, *, now, stale_after) -> None:
+def _check_session_area(root, area, report, *, now, stale_after, plain_session) -> None:
     """``<project>/_runs/`` — grouping dirs only, one per (taskdef, target)."""
     for child in _children(area):
         name = child.name
@@ -645,10 +687,13 @@ def _check_session_area(root, area, report, *, now, stale_after) -> None:
                 f"`{name}` is not one (D22: nothing is written at this level)",
             )
             continue
-        _check_slug_group(root, child, report, now=now, stale_after=stale_after)
+        _check_slug_group(
+            root, child, report, now=now, stale_after=stale_after,
+            plain_session=plain_session,
+        )
 
 
-def _check_slug_group(root, group, report, *, now, stale_after) -> None:
+def _check_slug_group(root, group, report, *, now, stale_after, plain_session) -> None:
     """``_runs/<slug>/`` — the grouping level: session dirs and nothing else."""
     for child in _children(group):
         name = child.name
@@ -691,9 +736,11 @@ def _check_slug_group(root, group, report, *, now, stale_after) -> None:
         _check_record_dir(
             root, child, report, layout=SESSION_LAYOUT, now=now, stale_after=stale_after
         )
+    if plain_session:
+        _check_plain_session_group(root, group, report, area=RUNS_DIR)
 
 
-def _check_legacy_area(root, area, report) -> None:
+def _check_legacy_area(root, area, report, *, plain_session) -> None:
     """``<project>/runs/`` — one shared dir per target, read in place (§3.5)."""
     for child in _children(area):
         name = child.name
@@ -707,6 +754,45 @@ def _check_legacy_area(root, area, report) -> None:
         if _state_file(child) is None:
             continue  # not a run dir: the resolver only matches state files
         _check_record_dir(root, child, report, layout=LEGACY_LAYOUT, now=None, stale_after=None)
+        if plain_session:
+            _check_plain_session_group(root, child, report, area=LEGACY_RUNS_DIR)
+
+
+def _check_plain_session_group(root, group, report, *, area) -> None:
+    """One `record.plain-session-slug` finding when *group* holds a pre-A1
+    plain-session record (spec §7, check `record.plain-session-slug`).
+
+    The predicate is `run_state.is_legacy_plain_session_slug`, the ONE shared
+    rule the migrate blocker and the fold use; this check never re-derives it.
+    A host bucket is skipped: D9 says a bucket never blocks, and a `record.*`
+    code carries no legacy downgrade, so the runner's tier pin could not
+    soften it. A group in a bare legacy `runs/` area inside a schema-form tree
+    is still checked — `work migrate <project>` nests and folds it — but a
+    legacy TREE is never walked here (`plain_session` is off without a
+    manifest).
+    """
+    if is_host_bucket_name(_rel(root, group).split("/", 1)[0]):
+        return  # D9: a bucket never blocks
+    from work_repo.run_state import is_legacy_plain_session_slug
+
+    candidates = []
+    if _state_file(group) is not None:
+        candidates.append(group)
+    candidates.extend(child for child in _children(group) if _state_file(child) is not None)
+    for rdir in candidates:
+        try:
+            data = yaml.safe_load(_state_file(rdir).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue  # the shape codes already report an unreadable state
+        if is_legacy_plain_session_slug(data):
+            report.add(
+                "record.plain-session-slug",
+                _rel(root, group),
+                plain_session_move_text(
+                    data.get("slug"), data.get("taskdef"), area=area, group=group.name
+                ),
+            )
+            return
 
 
 def _check_seed_dir(root, path, report) -> None:

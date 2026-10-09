@@ -387,6 +387,14 @@ def test_future_record_version_refuses_every_writer(session_tree):
         run_state.write_state(directory, old_state)
     assert path.read_bytes() == before
 
+def _set_git_identity(monkeypatch):
+    """Give the work-repo commits an explicit identity (CI has no gitconfig)."""
+    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(name, "test")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(name, "test@example.com")
+
+
 def _git(cwd, *args):
     subprocess.run(
         ["git", "-C", str(cwd), "-c", "user.name=test",
@@ -429,6 +437,7 @@ def test_work_commit_publishes_the_seeded_record(session_tree, monkeypatch):
 
     clone, _ = _git_work_repo(session_tree)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    _set_git_identity(monkeypatch)
     _, own_rdir, _ = seed_launch()
     rc = cmd_seed(SimpleNamespace(taskdef="develop", target="other-target", name=None, goal=None))
     assert rc == 0
@@ -455,6 +464,7 @@ def test_a_removed_seeded_group_stages_nothing(session_tree, monkeypatch):
 
     clone, _ = _git_work_repo(session_tree)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    _set_git_identity(monkeypatch)
     seed_launch()
     # Seed directly, then remove the group before committing.
     rdir, _ = run_state.seed_run_dir(

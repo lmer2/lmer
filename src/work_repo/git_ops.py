@@ -7,8 +7,9 @@ import subprocess
 import sys
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote, urlsplit
 
 # The host classification rule, not a second copy of it: this is the function
@@ -943,7 +944,9 @@ def _nudge_unnamed(rdir: Optional[Path]) -> None:
         pass
 
 
-def commit_work_path(target_path, commit_message=None, allow_during_gate=False) -> int:
+def commit_work_path(
+    target_path, commit_message=None, allow_during_gate=False, *, on_conflict=None
+) -> int:
     """Serialize publication and replay complete deferred transition paths.
 
     Includes deferred transitions from other sessions in this checkout: their
@@ -951,12 +954,19 @@ def commit_work_path(target_path, commit_message=None, allow_during_gate=False) 
     changes. Ordinary pre-stage refusals do not enroll unrelated paths for
     later retries; explicit transitions and actual deferrals retain their
     requests until verified publication.
+
+    *on_conflict* applies only to the commit this call makes, and only to
+    *target_path*: None keeps today's int contract and leaves a conflicted
+    local commit in place; a callback receives the conflicting paths once the
+    rebase is aborted and this call's own changes are taken back
+    (:func:`_drop_local_commit`). Any other conflict keeps the commit.
     """
     root = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
     if not root.exists():
         print(f"❌ Work repository not found at {root}", file=sys.stderr)
         return 1
     paths = [target_path] if isinstance(target_path, str) else list(target_path)
+    own = None if on_conflict is None else _OwnCommit(tuple(paths), on_conflict)
     try:
         if inherited_transaction(root):
             queue_paths(root, paths)
@@ -966,7 +976,9 @@ def commit_work_path(target_path, commit_message=None, allow_during_gate=False) 
         with checkout_lock(root):
             entries, deferred_paths = pending_paths(root)
             paths.extend(path for path in deferred_paths if path not in paths)
-            return _commit_work_path_locked(paths, commit_message, allow_during_gate, entries)
+            return _commit_work_path_locked(
+                paths, commit_message, allow_during_gate, entries, own
+            )
     except (OSError, ValueError) as exc:
         print(f"❌ Work-repo commit transaction failed: {exc}", file=sys.stderr)
         return 1
@@ -977,6 +989,7 @@ def _commit_work_path_locked(
     commit_message: Optional[str] = None,
     allow_during_gate: bool = False,
     pending_entries=(),
+    own: Optional["_OwnCommit"] = None,
 ) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
@@ -1065,7 +1078,10 @@ def _commit_work_path_locked(
     leftovers = _dirty_index_rels(work_repo_path)
     if not paths and not leftovers:
         print("No existing paths to commit in work repository")
-        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
+        return published_paths(
+            pending_entries,
+            _push_pending_commits(work_repo_path, "work repo"),
+        )
 
     # Parked deferrals land as events now, so this commit carries the trace of
     # the commits it is standing in for.
@@ -1087,7 +1103,10 @@ def _commit_work_path_locked(
         # an empty pathspec would hand `git add -A` the whole shared worktree
         # — every sibling's record and anything else lying around.
         print("No existing paths to commit in work repository")
-        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
+        return published_paths(
+            pending_entries,
+            _push_pending_commits(work_repo_path, "work repo"),
+        )
 
     print(f"➕ Staging {', '.join(paths)} in work repository...")
     rc, status_output = _stage_and_check(work_repo_path, paths, "work repo")
@@ -1098,7 +1117,10 @@ def _commit_work_path_locked(
         return rc
     if not status_output.strip():
         print("No new file changes to commit in work repository")
-        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
+        return published_paths(
+            pending_entries,
+            _push_pending_commits(work_repo_path, "work repo"),
+        )
 
     # 2. Commit
     if commit_message is None:
@@ -1112,7 +1134,7 @@ def _commit_work_path_locked(
     # 3. Integrate the remote and push, rebasing between attempts — many
     # sessions and host-side tools push here concurrently.
     print(f"📤 Pushing changes to work repository...")
-    rc = _push_with_rebase_retries(work_repo_path, "work repo")
+    rc = _push_with_rebase_retries(work_repo_path, "work repo", own=own)
     if rc == 0:
         print("✅ Successfully committed and pushed changes to work repository")
     return published_paths(pending_entries, rc)
@@ -1296,6 +1318,194 @@ def publish_overlay_commit(
     return CLAIM_PUSH_ERROR, output, commit
 
 
+@dataclass(frozen=True)
+class ConflictedPath:
+    """One path a rebase could not apply, with both sides' text.
+
+    ``ours`` is index stage 2 (the commit being rebased ONTO — upstream,
+    during a rebase), ``theirs`` is stage 3 (the local commit being replayed).
+    ``None`` means that stage is missing (a delete/modify conflict) or its
+    blob is not UTF-8 text. The names follow Git's rebase vocabulary, which
+    is the reverse of its merge vocabulary.
+    """
+
+    path: str
+    ours: Optional[str]
+    theirs: Optional[str]
+
+
+def _capture_conflicts(
+    repo_path: Path, label: str
+) -> Optional[List[ConflictedPath]]:
+    """The unmerged paths of a paused rebase and both sides' text.
+
+    Read BEFORE ``rebase --abort``: aborting throws the conflict away. Returns
+    ``None`` when the listing itself fails, so a caller can tell "capture
+    broke" from "nothing was conflicting".
+    """
+    rc, output = run_git_command(
+        ["diff", "--name-only", "-z", "--diff-filter=U"], repo_path, check=False
+    )
+    if rc != 0:
+        _git_failure("conflict path capture", label, rc, output)
+        return None
+    return [
+        ConflictedPath(rel, _index_stage(repo_path, 2, rel), _index_stage(repo_path, 3, rel))
+        for rel in (entry for entry in output.split("\0") if entry)
+    ]
+
+
+def _abort_rebase(repo_path: Path, label: str) -> bool:
+    """Abort a paused rebase and confirm no rebase state remains.
+
+    ``True`` only when a rebase was in progress, the abort succeeded, and
+    neither ``rebase-merge`` nor ``rebase-apply`` is left behind — a checkout
+    left mid-rebase is exactly what makes every later publication fail again.
+    """
+    git_dir = _git_directory(repo_path, label)
+    if git_dir is None or not any(
+        (git_dir / state).exists() for state in ("rebase-merge", "rebase-apply")
+    ):
+        return False
+    rc, detail = run_git_command(["rebase", "--abort"], repo_path, check=False)
+    if rc != 0:
+        _git_failure("git rebase --abort", label, rc, detail)
+        return False
+    if _rebase_in_progress(repo_path):
+        _git_failure(
+            "git rebase --abort", label, 1,
+            "rebase state remains after abort; resolve it manually before retrying.",
+        )
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class _OwnCommit:
+    """The commit a :func:`commit_work_path` call makes: its caller's paths
+    (never the deferred paths folded in beside them) and conflict callback."""
+
+    paths: tuple
+    on_conflict: object
+
+
+def _under(rel: str, roots) -> bool:
+    return any(rel == root.rstrip("/") or rel.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def _changed_paths(repo_path: Path, label: str, commit: str, roots) -> Optional[List[str]]:
+    rc, output = run_git_command(
+        ["diff", "--name-only", "-z", f"{commit}^", commit, "--", *roots],
+        repo_path, check=False,
+    )
+    if rc != 0:
+        _git_failure("git diff", label, rc, output)
+        return None
+    return [entry for entry in output.split("\0") if entry]
+
+
+def _owns_conflicts(repo_path: Path, label: str, commit: Optional[str], roots, conflicts) -> bool:
+    """Whether every conflict is in *commit*'s own changes under *roots*.
+
+    Only then does taking those changes back clear the conflict; a conflict
+    in a deferred sibling path or an older unpublished commit would recur,
+    so the commit is kept instead.
+    """
+    if not commit:
+        return False
+    rc, head = run_git_command(["rev-parse", "HEAD"], repo_path, check=False)
+    if rc != 0 or head.strip() != commit:
+        return False
+    changed = _changed_paths(repo_path, label, commit, roots)
+    if changed is None:
+        return False
+    return all(conflict.path in changed for conflict in conflicts)
+
+
+def _drop_local_commit(repo_path: Path, label: str, commit: str, roots) -> int:
+    """Take back *commit*'s own changes under *roots*, keeping everything else.
+
+    ``reset --soft`` drops the commit from unpublished history with its whole
+    tree still staged; then only the files it changed under *roots* go back to
+    the parent's bytes (an added file is removed). Any other path the commit
+    carried — a deferred sibling record, a swept leftover — stays staged for
+    the next commit, and unrelated worktree edits are untouched. A revert
+    alone is not enough: the next ``pull --rebase`` replays the original
+    commit and conflicts again. Never ``reset --hard``.
+    """
+    changed = _changed_paths(repo_path, label, commit, roots)
+    if changed is None:
+        return 1
+    rc, output = run_git_command(["ls-tree", "-r", "-z", "--name-only", f"{commit}^", "--", *changed], repo_path, check=False)
+    if rc != 0:
+        return _git_failure("git ls-tree", label, rc, output)
+    existed = {entry for entry in output.split("\0") if entry}
+    rc, output = run_git_command(["reset", "-q", "--soft", f"{commit}^"], repo_path, check=False)
+    if rc != 0:
+        return _git_failure("git reset --soft", label, rc, output)
+    restore = [rel for rel in changed if rel in existed]
+    added = [rel for rel in changed if rel not in existed]
+    if restore:
+        rc, output = run_git_command(
+            ["restore", f"--source={commit}^", "--staged", "--worktree", "--", *restore],
+            repo_path, check=False,
+        )
+        if rc != 0:
+            return _git_failure("git restore", label, rc, output)
+    if added:
+        rc, output = run_git_command(["rm", "-q", "-f", "--", *added], repo_path, check=False)
+        if rc != 0:
+            return _git_failure("git rm", label, rc, output)
+    return 0
+
+
+def _confirm_autostash(repo_path: Path, label: str, stash_before: str) -> int:
+    """0 only when the autostash came back; otherwise report it, never swallow.
+
+    Git can return zero even when applying the autostash failed, so the
+    before/after ``refs/stash`` comparison is the only proof.
+    """
+    rc, stash_after = _stash_head(repo_path, label)
+    if rc != 0:
+        return rc
+    if stash_after and stash_after != stash_before:
+        return _git_failure(
+            "autostash restoration", label, 1,
+            "refs/stash changed during pull; automatic restoration was not confirmed. "
+            f"Saved edits are available at {stash_after} (refs/stash). "
+            f"Inspect git status and git stash show -p {stash_after} before restoring. "
+            "Resolve any unmerged paths before retrying publication.",
+        )
+    return 0
+
+
+def fast_forward_upstream(repo_path: Path, label: str) -> tuple[int, str]:
+    """Fast-forward the checkout to its explicit upstream, or say why not.
+
+    The integration step a caller runs BEFORE merging its own view into a
+    shared checkout (memory persist, #369 gap (b)), so the current side of its
+    merge is the published one. Fast-forward only: it never stashes (a swept
+    leftover such as the generated README must not be), never rewrites a
+    local commit, and Git refuses it before touching anything when the branch
+    has diverged or a dirty file is in the way. Returns ``(0, "")`` when the
+    checkout now contains the upstream, ``(rc, reason)`` when it does not;
+    the caller decides whether to proceed on the stale side.
+    """
+    destination = _publication_destination(repo_path, label)
+    if destination is None:
+        return 1, "no publication upstream"
+    remote, ref = destination
+    rc, output = run_git_command(["fetch", remote, ref], repo_path, check=False)
+    if rc != 0:
+        return rc, f"git fetch failed: {_scrub_credentials(output).strip()}"
+    rc, output = run_git_command(
+        ["merge", "--ff-only", "--no-edit", "FETCH_HEAD"], repo_path, check=False
+    )
+    if rc != 0:
+        return rc, f"cannot fast-forward: {_scrub_credentials(output).strip()}"
+    return 0, ""
+
+
 def _stash_head(repo_path: Path, label: str) -> tuple[int, str]:
     rc, output = run_git_command(
         ["rev-parse", "--verify", "--quiet", "refs/stash"], repo_path, check=False
@@ -1420,11 +1630,20 @@ def _continue_past_index_conflicts(repo_path: Path, label: str) -> bool:
         return False
 
 
-def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
+def _push_with_rebase_retries(
+    repo_path: Path, label: str, *, own: Optional["_OwnCommit"] = None
+) -> int:
     """Publish existing commits for work, napkin, and pending-commit retries.
 
     Retain local commits on rebase failure. Return 0 only after fresh remote
     ancestry verification; otherwise return a nonzero Git or validation code.
+
+    *own* (keyword-only, default None) is the commit the caller just made at
+    HEAD. On a rebase conflict confined to its paths, with the autostash
+    confirmed back, its changes are taken back (:func:`_drop_local_commit`)
+    and its callback receives the ``ConflictedPath`` list; every other
+    conflict keeps the local commits, as without it. Either way no rebase
+    state is left behind.
     """
     destination = _publication_destination(repo_path, label)
     if destination is None:
@@ -1434,6 +1653,14 @@ def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
         rc = check_commit_ready(repo_path, label)
         if rc != 0:
             return rc
+        own_head = None
+        if own is not None:
+            # A rejected push rebases the caller's commit, so it is re-read
+            # each attempt: it is HEAD until this attempt's pull.
+            rc, own_head = run_git_command(["rev-parse", "HEAD"], repo_path, check=False)
+            if rc != 0:
+                return _git_failure("git rev-parse HEAD", label, rc, own_head)
+            own_head = own_head.strip()
         rc, stash_before = _stash_head(repo_path, label)
         if rc != 0:
             return rc
@@ -1448,31 +1675,27 @@ def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
                 print(INDEX_RESOLVED)
             else:
                 _git_failure("git pull --rebase", label, rc, output)
-                git_dir = _git_directory(repo_path, label)
-                if git_dir and any(
-                    (git_dir / p).exists() for p in ("rebase-merge", "rebase-apply")
-                ):
-                    arc, detail = run_git_command(["rebase", "--abort"], repo_path, check=False)
-                    if arc != 0:
-                        _git_failure("git rebase --abort", label, arc, detail)
-                    else:
-                        print(
-                            "Rebase aborted; local commits retained. "
-                            "Resolve the conflict before retrying.", file=sys.stderr,
-                        )
+                conflicts = _capture_conflicts(repo_path, label) if own is not None else None
+                if _abort_rebase(repo_path, label):
+                    restored = _confirm_autostash(repo_path, label, stash_before) == 0
+                    if (
+                        own is not None
+                        and restored
+                        and conflicts
+                        and _owns_conflicts(repo_path, label, own_head, own.paths, conflicts)
+                    ):
+                        if _drop_local_commit(repo_path, label, own_head, own.paths) != 0:
+                            return 1
+                        own.on_conflict(conflicts)
+                        return rc
+                    print(
+                        "Rebase aborted; local commits retained. "
+                        "Resolve the conflict before retrying.", file=sys.stderr,
+                    )
                 return rc
-        # Git can return zero even when applying the autostash failed.
-        rc, stash_after = _stash_head(repo_path, label)
+        rc = _confirm_autostash(repo_path, label, stash_before)
         if rc != 0:
             return rc
-        if stash_after and stash_after != stash_before:
-            return _git_failure(
-                "autostash restoration", label, 1,
-                "refs/stash changed during pull; automatic restoration was not confirmed. "
-                f"Saved edits are available at {stash_after} (refs/stash). "
-                f"Inspect git status and git stash show -p {stash_after} before restoring. "
-                "Resolve any unmerged paths before retrying publication.",
-            )
         rc = check_commit_ready(repo_path, label)
         if rc != 0:
             return rc

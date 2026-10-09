@@ -248,6 +248,17 @@ Examples:
         "-m",
         help="Commit message (defaults to auto-generated)",
     )
+    memory_persist_parser.add_argument(
+        "--allow-unbaselined-delete",
+        action="store_true",
+        help=(
+            "On a persist with no restore baseline (a session that never "
+            "restored), also delete the scope files the agent dir does not "
+            "hold, listing each. Any persist records a baseline, so this "
+            "acts only on such a first persist; later, retire a memory with "
+            "`work memory forget`"
+        ),
+    )
     for action in ("forget", "revive"):
         retirement_parser = memory_subparsers.add_parser(
             action, help=f"Explicitly {action} a scoped schema-2 memory"
@@ -490,6 +501,64 @@ Examples:
     specs_index_parser.add_argument(
         "--rebuild", action="store_true",
         help="Rebuild the index from runs/ (backfill for specs that predate it)",
+    )
+
+    # adopt command (issue #367 — name a host-bucket tree and register it).
+    # An operator-shell verb: it writes records it does not own and is
+    # exempt from the session-uid gate, but still declares its write scope.
+    adopt_parser = subparsers.add_parser(
+        "adopt",
+        help="Name a host-bucket tree and register it in one commit (dry run by default)",
+    )
+    adopt_parser.add_argument(
+        "bucket",
+        help="the host bucket, `<host>/<project>` relative to the work-repo root",
+    )
+    adopt_parser.add_argument("name", help="the short name the bucket moves to")
+    adopt_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the adoption; without it the command is a read-only dry run",
+    )
+    adopt_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at the old bucket path",
+    )
+    adopt_parser.add_argument(
+        "--description", help="registry description for the project",
+    )
+    adopt_parser.add_argument(
+        "--remote", action="append", default=None,
+        help="an additional remote for the project; may be repeated",
+    )
+    adopt_parser.add_argument(
+        "--force", action="store_true",
+        help="adopt despite schema-tier ERRORs in the fix list",
+    )
+
+    # migrate command (issue #368 — bare-name to schema-form tree migration).
+    # An operator-shell verb like `adopt`: exempt from the session-uid gate,
+    # but still declaring its write scope.
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Migrate a registered project or the instance surfaces to schema form "
+             "(dry run by default)",
+    )
+    migrate_target = migrate_parser.add_mutually_exclusive_group()
+    migrate_target.add_argument(
+        "project", nargs="?",
+        help="a registered project's short name",
+    )
+    migrate_target.add_argument(
+        "--instance", action="store_true",
+        help="migrate the instance surfaces and fold a standalone sources.yaml",
+    )
+    migrate_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the migration; without it the command is a read-only dry run",
+    )
+    migrate_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at each old project path (project form only)",
     )
 
     # release command (single-flight release claim — RUN-STATE.md §7).
@@ -999,7 +1068,8 @@ def cmd_goal(
 
 @work_transaction
 def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser,
-               scoped_path: str | None = None) -> int:
+               scoped_path: str | None = None,
+               allow_unbaselined_delete: bool = False) -> int:
     """
     Execute memory command.
 
@@ -1014,7 +1084,7 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     if action == "restore":
         return restore_memory()
     elif action == "persist":
-        return persist_memory(message)
+        return persist_memory(message, allow_unbaselined_delete)
     elif action in ("forget", "revive"):
         from .memory import (
             MemoryRetirementError, forget_memory, revive_memory, memory_retirement_paths,
@@ -4618,6 +4688,12 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return None
         specs_rel = specs_index.specs_rel_path()
         return [specs_rel] if specs_rel else []
+    if command == "adopt":
+        from . import adopt
+        return adopt.write_rel_paths(args)
+    if command == "migrate":
+        from . import migrate
+        return migrate.write_rel_paths(args)
     if command == "seed":
         try:
             slug = run_state.derive_slug(args.taskdef, args.target)
@@ -4730,7 +4806,9 @@ def main() -> int:
 
     # Record-writing helpers inherit their execution's UID. Without one,
     # a read resolver may choose the latest record, but a writer must refuse.
-    if args.command not in ("memory", "specs-index", "housekeep"):
+    if args.command not in (
+        "memory", "specs-index", "adopt", "migrate", "housekeep"
+    ):
         from .utils import SchemaContextError
 
         try:
@@ -4768,7 +4846,8 @@ def _dispatch(args, parser) -> int:
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
-                          getattr(args, "scoped_path", None))
+                          getattr(args, "scoped_path", None),
+                          getattr(args, "allow_unbaselined_delete", False))
     elif args.command == "housekeep":
         return housekeep.cmd_housekeep(args)
     elif args.command == "setup-workspace":
@@ -4812,6 +4891,12 @@ def _dispatch(args, parser) -> int:
         return cmd_artifact(args.name, args.file, args.sync)
     elif args.command == "specs-index":
         return cmd_specs_index(args.rebuild)
+    elif args.command == "adopt":
+        from . import adopt
+        return adopt.cmd_adopt(args)
+    elif args.command == "migrate":
+        from . import migrate
+        return migrate.cmd_migrate(args)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "release":
