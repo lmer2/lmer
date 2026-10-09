@@ -50,6 +50,7 @@ from fastapi.testclient import TestClient
 from lmer_platform import api, assistant, daemon, projects, registry, spawn, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import JOIN
 
 SECRET = "test-secret-value"
 
@@ -72,6 +73,40 @@ def _no_stray_supervisor(monkeypatch):
     directions so the teardown is not a thing a failing test can skip.
     """
     monkeypatch.setattr(assistant, "_SUPERVISOR", None)
+
+
+@pytest.fixture(autouse=True)
+def _supervision_ends_with_its_test(monkeypatch):
+    """Stop and join every loop a test started, before its platform dir is restored.
+
+    ``Supervisor.stop`` only sets an event, so a loop already past its check
+    respawns into whichever ``PLATFORM_DIR`` is current next — another test's,
+    where it wrote a foreign assistant and deadlocked a daemon's project lock (#524).
+    """
+    started = []
+    original = assistant.Supervisor.start
+
+    def start(self):
+        thread = original(self)
+        started.append((self, thread))
+        return thread
+
+    monkeypatch.setattr(assistant.Supervisor, "start", start)
+    yield
+    for supervisor, _ in started:
+        supervisor.stop()
+    for _, thread in started:
+        thread.join(JOIN)
+    live = assistant.status() if started else None
+    if live is not None and live.pid:
+        # After the joins: a loop mid-attempt may have respawned one. Its
+        # watcher records the exit against PLATFORM_DIR, so wait for that too.
+        kill(live.pid)
+        assert spawn.wait_for_exit_recorded(live.session_id, JOIN), (
+            f"the exit of {live.session_id} was not recorded before teardown"
+        )
+    survivors = [thread.name for _, thread in started if thread.is_alive()]
+    assert not survivors, f"assistant supervision outlived its test: {survivors}"
 
 
 @pytest.fixture
