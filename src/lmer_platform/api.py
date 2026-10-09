@@ -107,6 +107,7 @@ from . import references
 from . import reattach
 from . import relations
 from . import run_transition
+from . import schema_report
 from . import session_io
 from . import session_threads
 from . import statusline
@@ -193,6 +194,7 @@ from .ui_build import dist_dir
 from .workrepo import (
     fold_registry,
     folded_identity,
+    group_sessions,
     mirror_status,
     pull,
     resolve_run_dir,
@@ -988,6 +990,108 @@ def _run_files_reply(config: PlatformConfig, run: dict) -> dict:
     }
 
 
+_RUN_SESSIONS_NOTE = (
+    "the session records of this run's _runs/<slug>/ group in this daemon's "
+    "mirror, oldest start first. Each is one launch, addressed by its uid; "
+    "live, tracked and the project fields are this orchestrator's own. No pull "
+    "is forced, so a launch that pushed seconds ago can be missing for one "
+    "interval."
+)
+
+
+#: The per-row fields of ``GET /api/runs/sessions`` that come from this
+#: platform rather than the mirror: what a caller scoped to one project may not
+#: see on a sibling homed in another (:func:`_run_sessions_reply`).
+_RUN_SESSIONS_PLATFORM_FIELDS = (
+    "live", "live_session", "tracked", "workspace_id", "home_revision",
+    "confirm_project", "workspace_name", "workspace_color",
+)
+
+
+def _run_sessions_reply(
+    config: PlatformConfig, run: dict, parts: tuple, *, scope: Optional[str] = None
+) -> dict:
+    """``{run, form, group, sessions, note}`` for one ``_runs/<slug>/`` group (#374).
+
+    The records come from :func:`lmer_platform.workrepo.group_sessions` — mirror
+    facts only, in start order — and this adds what only the platform knows, per
+    ROW rather than per request:
+
+    - ``live`` / ``live_session``: a live registry entry filed under that row's
+      uid (:func:`lmer_platform.spawn.live_session_for_run`, spec §6.3);
+    - ``tracked``: whether that uid is tracked (:func:`get_tracked`);
+    - ``current``: the row the request addressed — its ``uid``, or the uid its
+      slug-keyed entry was bound to (:func:`_bound_uid`). A slug alone names
+      the group, not one launch, so then no row is current;
+    - ``workspace_id`` / ``home_revision`` / ``confirm_project`` (and the
+      project's name and colour): the row's OWN authorized project context,
+      read through :func:`lmer_platform.project_api.annotate` — exactly the
+      call that puts those fields on a fleet row for RunDetail's resume — keyed
+      by the child's own run key (astra PR6). A resume posted from a child row
+      therefore never borrows the parent row's home revision, which the
+      request binding would refuse as a stale one.
+
+    A row whose id is not a 32-hex uid (a timestamp-id launch of a schema-1
+    tree) answers ``live`` and ``tracked`` as ``None``: those are keyed by the
+    group's slug there, and a slug-level session cannot be attributed to one of
+    its launches. Its project context is the slug run's, which is its key.
+
+    *scope* is the one project a non-operator caller may see (projects on,
+    the request bound to it). A sibling row homed in ANOTHER project keeps its
+    mirror facts — the group is one target's, already addressed — but loses
+    every platform fact: its live session, tracking, workspace and revision
+    are that project's business, as ``/api/state`` hides them too.
+    """
+    # Imported here for the reason ``create_app`` does: ``project_api`` reaches
+    # back into the platform modules that import this one.
+    from . import project_api
+    from .spawn import live_session_for_run
+
+    host, project = parts[0], parts[1]
+    slug = run.get("slug") or None
+    found = group_sessions(config, host, project, slug, uid=run.get("uid") or None)
+    requested = _bound_uid(run) or None
+    # A row with no uid is keyed by its group's slug — the group directory's
+    # name, since a request by uid alone names no slug.
+    group_slug = slug or (found["group"].rsplit("/", 1)[-1] if found["group"] else None)
+    rows = []
+    for facts in found["sessions"]:
+        row_uid = facts["uid"]
+        by_uid = bool(UID_RE.fullmatch(row_uid or ""))
+        live = (
+            live_session_for_run(host, project, slug, uid=row_uid) if by_uid else None
+        )
+        tracked = (
+            get_tracked(host, project, uid=row_uid) is not None if by_uid else None
+        )
+        context = project_api.annotate({"sessions": [{
+            "host": host, "project": project, "slug": group_slug,
+            "uid": row_uid if by_uid else None,
+            "session": {"id": live.get("id")} if live else None,
+        }]})["sessions"][0]
+        rows.append({
+            **facts,
+            "live": (live is not None) if by_uid else None,
+            "live_session": live.get("id") if live else None,
+            "tracked": tracked,
+            "current": requested is not None and row_uid == requested,
+            "workspace_id": context.get("workspace_id"),
+            "home_revision": context.get("home_revision"),
+            "confirm_project": bool(context.get("confirm_project")),
+            "workspace_name": context.get("workspace_name"),
+            "workspace_color": context.get("workspace_color"),
+        })
+        if scope is not None and rows[-1]["workspace_id"] != scope:
+            rows[-1].update(dict.fromkeys(_RUN_SESSIONS_PLATFORM_FIELDS))
+    return {
+        "run": _run_echo(run),
+        "form": found["form"],
+        "group": found["group"],
+        "sessions": rows,
+        "note": _RUN_SESSIONS_NOTE,
+    }
+
+
 def _fold_checkins(payload: dict) -> None:
     """Put each row's check-in facts on the row, in place (issue #244).
 
@@ -1124,6 +1228,10 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     :mod:`lmer_platform.inventory`).
     """
     mirror = pull(config, force=force_pull).to_dict()
+    # The tree's form, so the UI can gate its schema views (#374): a presence
+    # test and no validation — the validator runs only behind
+    # GET /api/workrepo/schema, never on the poll.
+    mirror["form"] = schema_report.mirror_form(config)
     # Before the index and the registry are read: an entry a pre-A2 daemon keyed
     # by slug for a schema-2 group is bound to its record or marked unresolved
     # here, so it is never shown on "the newest record in the group", and a live
@@ -2344,6 +2452,20 @@ def create_app(
             "                              none), not a missing file; no pull is\n"
             "                              forced, so a just-pushed file can lag\n"
             "                              one interval\n"
+            "  GET  /api/runs/sessions     the session records of the run's\n"
+            "                              _runs/<slug>/ group in this daemon's\n"
+            "                              mirror ?host=&project=&slug=|uid=, in\n"
+            "                              start order, each with its uid, state,\n"
+            "                              live, tracked and its own project\n"
+            "                              context; a legacy tree or row answers\n"
+            "                              form: legacy and none. No pull\n"
+            "  GET  /api/workrepo/schema   lmer-schema validate --json over this\n"
+            "                              daemon's mirror, as the CLI prints it,\n"
+            "                              plus form, tier and the host buckets\n"
+            "                              awaiting `work adopt`. Cached per\n"
+            "                              revision for ten minutes; ?refresh=1\n"
+            "                              re-validates. A legacy tree has no\n"
+            "                              document. No pull\n"
             "  POST /api/runs/answer       answer a question-blocked run\n"
             "                              {host,project,slug,answer,repo_url?} —\n"
             "                              starts a fresh session carrying the\n"
@@ -4137,6 +4259,55 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _note_check(caller, run=parts)
         return _run_files_reply(config, run)
+
+    # --- the launches of one target (#374, spec §13.F) ------------------------
+    #
+    # Read when an operator opens "sessions per target", like the file list
+    # above and for its reason: a directory walk per group per fleet poll is the
+    # wrong cost for something one view renders. Keyed by query string like
+    # GET /api/runs/files, and like it never pulls.
+
+    @app.get("/api/runs/sessions", dependencies=guard)
+    def run_sessions(
+        host: str = "", project: str = "", slug: str = "", uid: str = "",
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Every session record of the run's ``_runs/<slug>/`` group, oldest first.
+
+        Each row is addressable by its uid, which is what a resume of that one
+        launch posts. A legacy tree or a legacy row answers ``form: "legacy"``
+        with no sessions; a group not yet in the mirror answers
+        ``form: "schema"`` with none. :func:`_run_sessions_reply` has the fields.
+
+        The parts default to empty strings so an omitted one gets
+        :func:`lmer_platform.runs.run_key`'s refusal, which names the field.
+        """
+        run = _query_run(host, project, slug, uid)
+        try:
+            parts = _run_parts(run)
+            run_key(*parts)
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        scope = (
+            project_scope.current()
+            if projects.enabled() and caller.kind != "operator" else None
+        )
+        return _run_sessions_reply(config, run, parts, scope=scope)
+
+    @app.get("/api/workrepo/schema", dependencies=guard)
+    def workrepo_schema(refresh: str = "") -> dict:
+        """The validator's view of the mirror: ``{form, tier, document, buckets, note}``.
+
+        ``document`` is exactly what ``lmer-schema validate <mirror> --json``
+        prints (:mod:`lmer_platform.schema_report` has the decisions: the guard
+        URL, the cache and its expiry). An unusable manifest is a 200 carrying
+        the document's ``unusable`` and exit code 2 — a verdict about the tree,
+        not a failure of this route. A legacy tree is never validated.
+        ``?refresh=1`` bypasses the cache; nothing here pulls.
+        """
+        return schema_report.workrepo_schema(
+            config, refresh=refresh.strip().lower() in ("1", "true", "yes"),
+        )
 
     # --- which runs belong together (T53) -------------------------------------
     #

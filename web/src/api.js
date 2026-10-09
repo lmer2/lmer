@@ -118,6 +118,19 @@ export function prune() {
   return request('api/prune', { method: 'POST' })
 }
 
+// The validator's view of the work repo (#374): `{form, tier, document, buckets,
+// note}`, where `document` is exactly what `lmer-schema validate --json` prints.
+// Fleet-wide, not a project's: the work repo is shared by every workspace, so
+// this carries no workspace and the daemon binds it to none.
+//
+// The daemon caches the document per mirror HEAD for a bounded time, because
+// staleness findings move with the clock at an unchanged HEAD (astra PR7).
+// `refresh` is the way round that cache — the explicit re-validate control —
+// and is sent only when asked for, so the ordinary read stays one cheap hit.
+export function fetchWorkRepoSchema({ refresh = false } = {}) {
+  return request(refresh ? 'api/workrepo/schema?refresh=1' : 'api/workrepo/schema')
+}
+
 export function fetchCandidates() {
   return request('api/runs/candidates')
 }
@@ -179,6 +192,20 @@ export function setRunMeta(run, { title, description }) {
 export function fetchRunRelations(run) {
   const query = runQuery(runFields(run))
   return request(`api/runs/relations?${query}`)
+}
+
+// Every launch of the run's `_runs/<slug>/` group (#374), in start order. Read
+// by query string for fetchRunMeta's reason, and with the same fields: the
+// project context binds the read the way it binds the run's other reads (#542).
+//
+// Each row in the reply carries its OWN `workspace_id`/`home_revision`/
+// `confirm_project`, which is what a resume of that launch must post — never the
+// row this was asked for, because two launches of one group can live in two
+// projects (astra PR6). A schema-1 row has no launches to list; the view that
+// calls this is not mounted for one, so a legacy fleet never sends it.
+export function fetchRunSessions(run) {
+  const query = runQuery(runFields(run))
+  return request(`api/runs/sessions?${query}`)
 }
 
 // Relating is symmetric and the daemon stores it once, so there is one call rather
