@@ -425,7 +425,7 @@ rules, same resolution against the environment overrides (see
 |---|---|---|
 | `taskdef` | `{repo, ref?}` | the shared task-definition repository |
 | `napkin` | `{repo}` | the napkin repository |
-| `knowledge`, `plans` | `{repo}` | reserved: mountable the same way when needed |
+| `knowledge`, `plans` | `{repo}` | declared and validated, but NOT mounted by this release (runner-side wiring pending): warned about by name and left unmounted — <https://git.20c.com/agents/global/-/issues/370> |
 
 - **The key set is the name's, not the section's.** `ref:` is `taskdef`'s
   alone — there is no `LMER_NAPKIN_REF` and nothing pins any other area to a
@@ -439,9 +439,11 @@ rules, same resolution against the environment overrides (see
   credential at clone time; the environment override for that source remains
   the operator-controlled escape hatch. Declarations MUST NOT contain
   credentials.
-- **Precedence:** environment overrides, then `_plexus.yaml sources:`, then a
-  legacy standalone `sources.yaml` (recognised with a warning; retires when
-  the tree migrates).
+- **Precedence:** the container reads all three tiers — environment
+  overrides, then `_plexus.yaml sources:`, then a legacy standalone
+  `sources.yaml` (recognised with a stale-legacy warning; retires when the
+  tree migrates). See the tier table in
+  [Canonical Source Declarations](./LMER-CLI.md#canonical-source-declarations-sourcesyaml).
 
 ### Housekeeping policy
 
@@ -543,6 +545,17 @@ self-contained; nothing about it is shared with any other launch.
 - **`--<name>`** is appended to the directory name when the session is named
   at its pre-execution freeze; the rename happens at most once. Index symlinks
   are re-pointed by the tool that renames.
+- **Names are labels, not addresses.** On a schema-2 record the name is a
+  label: two records may carry the same one, it is never a resolution key, and
+  a launch `--name` replaces a default or inherited label. An unnamed record
+  carries the default label `<taskdef>-<yymmdd>-<uid4>` (UTC date, the first
+  four uid hex digits); the project index and `work sessions` show it, and it
+  is not a naming. The `--<name>` directory suffix is added only for a
+  non-default name.
+- **Seeded records.** `work seed` writes a record of its own with
+  `session.seeded_by` set and no `session_start` logged. It is never started,
+  is read-only to the seeding launch, and is a valid continuation source that
+  needs no acknowledgement. `session.seeded_by` is provenance, never an owner.
 - **Independence and single writer.** Two launches on one target are two
   directories that never touch each other; there is nothing to merge, and a
   session writes only its own directory. The `owner` field in `state.yaml`
@@ -562,7 +575,8 @@ self-contained; nothing about it is shared with any other launch.
   never auto-ended.
 - `_specs/` and `_plans/` index into session directories with dated relative
   symlinks (`YYYY-MM-DD-<runlabel>--<artifact>.md`). `<runlabel>` names the
-  **record**, not the run: the launch's name when it has one, else the run's
+  **record**, not the run: the launch's name when it has one (a default label
+  counts as unnamed, so it uses the slug), else the run's
   slug, followed by `-<session-id>`. That is what guarantees **one entry per
   (record, artifact)** — two launches against one target are two complete
   records, so a run-keyed label would name both launches' entries identically

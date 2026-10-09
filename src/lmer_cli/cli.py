@@ -635,10 +635,10 @@ def parse_args(
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
-    parser.add_argument("--name", dest="run_name", help="kebab-case run name recorded at session start, exported to the container as LMER_RUN_NAME and applied once by `work session-start` (on the call that opens the record's session); names are unique per project — a held name is reported in the session's start output and the run stays unnamed. This flag is the only source: a host-exported or .env LMER_RUN_NAME is never forwarded. Refused with --no-task (no run context to record it in); with --exec it applies only if the command runs `work session-start`.")
+    parser.add_argument("--name", dest="run_name", help="kebab-case run name recorded at session start, exported to the container as LMER_RUN_NAME and applied once by `work session-start` (on the call that opens the record's session). A name is a LABEL: on schema 2 the launch name replaces a default or inherited name; only a legacy tree enforces per-project uniqueness, where a held name is reported in the session's start output and the run stays unnamed. This flag is the only source: a host-exported or .env LMER_RUN_NAME is never forwarded. Refused with --no-task (no run context to record it in); with --exec it applies only if the command runs `work session-start`.")
     parser.add_argument("--goal", dest="run_goal", help="Run goal recorded at session start, exported to the container as LMER_RUN_GOAL and applied once by `work session-start` (it replaces a goal inherited from a continuation source). This flag is the only source: a host-exported or .env LMER_RUN_GOAL is never forwarded. Refused with --no-task; with --exec it applies only if the command runs `work session-start`.")
-    parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
-    parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID.")
+    parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. The new execution inherits the source's name label; a never-started `work seed` record is a valid source and needs no --allow-unsigned-source. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
+    parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID and inherits the source's name label; a never-started `work seed` record is a valid source without --allow-unsigned-source.")
     parser.add_argument("--allow-unsigned-source", dest="allow_unsigned_source", metavar="SESSION_UID", help="Explicitly continue fresh when the selected schema-2 source has no final session_end. Must exactly equal --session, so the decision authorizes only that source; omit it to cancel/wait after a refusal.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
@@ -1292,13 +1292,42 @@ def _display_sources_config_cli() -> None:
     # `declared:` line on the one surface an operator uses to understand
     # what their declaration is doing (review finding).
     load_warnings: "list[str]" = []
+    # A cached `_plexus.yaml` names the tier of every declared row (issue
+    # #370 point 4): the manifest tier is read here from the same clone
+    # cache, through the ONE manifest parser, and handed to E.loader's
+    # tiered `load_sources` so precedence, the stale-legacy WARN and every
+    # trust rule are the container's, not a re-implementation.
+    manifest_tiered = False
     if not work_repo_url:
         declared_status = "unknown (LMER_WORK_REPO not set)"
     else:
         cached, cache_reason = read_cached_repo_file_status(
             work_repo_url, container_sources.SOURCES_FILENAME
         )
-        if cached is None:
+        cached_manifest, _manifest_reason = read_cached_repo_file_status(
+            work_repo_url, container_sources.MANIFEST_FILENAME
+        )
+        manifest = None
+        manifest_error: "Exception | None" = None
+        if cached_manifest is not None:
+            try:
+                # Guarded and lazy: a tree with no manifest never imports the
+                # core (the container's own rule). Display-only, so a broken
+                # import renders rather than raises.
+                from lmer_schema.manifest import parse_manifest
+
+                manifest = parse_manifest(
+                    cached_manifest, path=container_sources.MANIFEST_FILENAME
+                )
+            except Exception as exc:  # ManifestError, ImportError, ...
+                manifest_error = exc
+        if manifest_error is not None:
+            # Decision (c) over the manifest tier: render, never raise. The
+            # rows fall back to env-only/unset-fallback.
+            declared_status = (
+                f"invalid ({container_sources.scrub_credentials(str(manifest_error))})"
+            )
+        elif cached is None and manifest is None:
             if cache_reason == CACHE_FILE_ABSENT:
                 # Warm mirror, no declaration — the expected state for every
                 # work repo until the cutover lands, so it must not read as a
@@ -1315,12 +1344,20 @@ def _display_sources_config_cli() -> None:
             try:
                 # load_sources reads a file path; hand the cached bytes to it
                 # as a throwaway sources.yaml so schema/credential/trust-rule
-                # validation runs exactly as the container will run it.
+                # validation runs exactly as the container will run it. A miss
+                # on sources.yaml leaves the temp path unwritten — the legacy
+                # tier is then absent, exactly as on disk.
                 with tempfile.TemporaryDirectory() as td:
                     tmp = Path(td) / container_sources.SOURCES_FILENAME
-                    tmp.write_text(cached, encoding="utf-8")
+                    if cached is not None:
+                        tmp.write_text(cached, encoding="utf-8")
                     config, raw_warnings = container_sources.load_sources(
-                        tmp, work_repo_url=work_repo_url
+                        tmp,
+                        work_repo_url=work_repo_url,
+                        manifest_sources=(
+                            manifest.sources if manifest is not None else None
+                        ),
+                        manifest_path=container_sources.MANIFEST_FILENAME,
                     )
                 # Warnings name the file by the path load_sources was given
                 # — the throwaway copy. Rewrite it to the real filename, the
@@ -1329,7 +1366,38 @@ def _display_sources_config_cli() -> None:
                     w.replace(str(tmp), container_sources.SOURCES_FILENAME)
                     for w in raw_warnings
                 ]
-                declared_status = "sources.yaml from work-repo cache (cached, possibly stale)"
+                manifest_tiered = manifest is not None
+                tiers = set((config or {}).get("tiers", {}).values())
+                if config is None:
+                    # The loader found nothing declared in either tier (a
+                    # cached manifest without a `sources:` section, and no
+                    # legacy file): the same "none" wording the pre-#370
+                    # output used, never a manifest declaration that is not
+                    # there.
+                    if cached is not None:
+                        declared_status = "none (no sources declared in the work repo)"
+                    elif cache_reason == CACHE_FILE_ABSENT:
+                        declared_status = (
+                            f"none (no {container_sources.SOURCES_FILENAME} in the work repo)"
+                        )
+                    elif cache_reason == CACHE_ERROR:
+                        declared_status = "unknown (work-repo cache unreadable)"
+                    else:
+                        declared_status = "unknown (work repo not cached)"
+                elif (container_sources.TIER_MANIFEST in tiers
+                      and container_sources.TIER_LEGACY in tiers):
+                    declared_status = (
+                        "manifest and sources.yaml from work-repo cache "
+                        "(cached, possibly stale)"
+                    )
+                elif container_sources.TIER_MANIFEST in tiers:
+                    declared_status = (
+                        "manifest from work-repo cache (cached, possibly stale)"
+                    )
+                else:
+                    declared_status = (
+                        "sources.yaml from work-repo cache (cached, possibly stale)"
+                    )
             except container_sources.SourcesConfigError as exc:
                 # Decision (c): render, never raise. Strip the throwaway temp
                 # path so the message names the real file, and scrub before
@@ -1344,6 +1412,7 @@ def _display_sources_config_cli() -> None:
                 config = None
 
     declared_sources = (config or {}).get("sources") or {}
+    declared_tiers = (config or {}).get("tiers") or {}
     rows = []
     for label, name, key, env_var in (
         ("taskdef repo", "taskdef", "repo", "LMER_TASKDEF_REPO"),
@@ -1370,7 +1439,17 @@ def _display_sources_config_cli() -> None:
             else:
                 value, origin = env_value, "env-override"
         elif declared_value:
-            value, origin = declared_value, "declared (cached, possibly stale)"
+            value = declared_value
+            if manifest_tiered:
+                # The tier is named whenever a manifest is present (spec §8):
+                # the loader's ONE origin spelling, with the cache caveat.
+                origin = container_sources.declared_origin_label(
+                    declared_tiers.get(name, container_sources.TIER_LEGACY),
+                    "cached",
+                    "possibly stale",
+                )
+            else:
+                origin = "declared (cached, possibly stale)"
         elif env_value:
             value, origin = env_value, "env-only"
         else:
@@ -1385,7 +1464,7 @@ def _display_sources_config_cli() -> None:
     name_width = max(len(r[0]) for r in rows)
     value_width = max(len(r[1]) for r in rows)
     print("---")
-    print("📚 Canonical Sources (sources.yaml):\n")
+    print("📚 Canonical Sources:\n")
     print(f"  declared: {declared_status}\n")
     for warning in load_warnings:
         # Scrub unconditionally, the same rule the rows below follow.

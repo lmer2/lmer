@@ -38,8 +38,9 @@ ERROR-tier shape rules in every form (`index.link-not-relative`,
 ends of every target this module writes are resolved paths under the
 project dir and the link between them is `os.path.relpath`'s answer.
 One entry per (run, spec file): re-registering the same spec re-points
-the same day's link, and a later-day re-registration replaces the older
-dated entry rather than accumulating duplicates.
+the SAME link, and an existing entry's date always wins — a later-day
+re-registration (a later session start, a `work artifact` re-run) keeps
+the original date rather than re-dating the entry (#334).
 
 Spec-class predicate (is_spec_artifact): a Markdown file whose stem is
 exactly `spec`, starts with `spec` + separator, or ends with separator +
@@ -176,7 +177,12 @@ def run_label(rdir: Path, state: Optional[dict] = None) -> str:
         state = run_state._read_sibling_state(rdir)
     label = None
     if isinstance(state, dict):
-        recorded = state.get("name") or state.get("slug")
+        if run_state.is_default_label(state):
+            # A default label is not a naming (D6): the entry is named under
+            # the slug, exactly as an unnamed record always was.
+            recorded = state.get("slug")
+        else:
+            recorded = state.get("name") or state.get("slug")
         if recorded:
             label = str(recorded)
     if label is None:
@@ -285,24 +291,35 @@ def upsert_spec_link(
         if sdir is None:
             return None
         sdir.mkdir(parents=True, exist_ok=True)
-        entry = _entry_name(label, basename, when)
-        # One entry per (record, spec file): drop same-pair entries under
-        # other dates before (re-)pointing today's. Same-pair entries in
-        # the legacy pre-`--` name format are cleaned up too — but only
-        # when the legacy label is itself `--`-free, since a `--`-bearing
-        # legacy pattern could match a current-format entry of a DIFFERENT
-        # pair (`--rebuild` regenerates whatever this skips).
-        alternatives = [re.escape(entry[len("YYYY-MM-DD-"):])]
+        # One entry per (record, spec file), and an EXISTING entry's date
+        # always wins: `when` dates only a NEW entry (#334), so a later
+        # session start (or `work artifact` re-registration) re-points the
+        # entry in place instead of re-dating it. Same-pair entries in the
+        # legacy pre-`--` name format are matched too — but only when the
+        # legacy label is itself `--`-free, since a `--`-bearing legacy
+        # pattern could match a current-format entry of a DIFFERENT pair
+        # (`--rebuild` regenerates whatever this skips).
+        current_label = _entry_name(label, basename, None)[len("YYYY-MM-DD-"):]
+        alternatives = [re.escape(current_label)]
         legacy_label = _UNSAFE_LABEL_RE.sub("-", label).strip("-") or "run"
         if "--" not in legacy_label:
             alternatives.append(re.escape(f"{legacy_label}-{basename}"))
-        stale_re = re.compile(
-            rf"^\d{{4}}-\d{{2}}-\d{{2}}-(?:{'|'.join(alternatives)})$"
+        pair_re = re.compile(
+            rf"^(?P<date>\d{{4}}-\d{{2}}-\d{{2}})-(?:{'|'.join(alternatives)})$"
         )
-        for sibling in sdir.iterdir():
-            if sibling.name != entry and stale_re.match(sibling.name):
-                if sibling.is_symlink():
-                    sibling.unlink()
+        existing = sorted(
+            (sib for sib in sdir.iterdir() if sib.is_symlink() and pair_re.match(sib.name)),
+            key=lambda p: p.name,
+        )
+        if existing:
+            # The earliest same-pair entry's date wins (current or legacy
+            # format); the entry itself is written in the CURRENT format.
+            entry = f"{existing[0].name[:len('YYYY-MM-DD')]}-{current_label}"
+        else:
+            entry = _entry_name(label, basename, when)
+        for sibling in existing:
+            if sibling.name != entry:
+                sibling.unlink()
         target = os.path.relpath(spec_path, sdir)
         link = sdir / entry
         if link.is_symlink():

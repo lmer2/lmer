@@ -122,6 +122,20 @@ Manifest ``sources.knowledge`` / ``sources.plans`` are declared but not
 mounted by this release (no clone, no env var, no runner wiring): warned
 about by name and left out of the result.
 
+Capability marker (version floor)
+=================================
+``MANIFEST_TIER_SUPPORTED = True`` is a plain module constant and the ONE
+importable capability marker B's ``work migrate --instance`` checks as its
+version floor (spec §10 rollout E -> B; astra R7). What it asserts: this
+lmer's container start, ``--show-env`` and doctor read ``_plexus.yaml
+sources:`` with env > manifest > legacy precedence. Who reads it: the
+``--instance`` fold refuses when the marker is absent or false — absent
+means a pre-E release. What it cannot prove: it covers only the install
+running ``work migrate``, while every host that launches against that work
+repo must run a release carrying it. Hence the fleet-wide order: deploy E
+on every host before applying B's instance fold, because the fold removes
+``sources.yaml``.
+
 PyYAML guard (spec N5)
 ======================
 ``import yaml`` is guarded so this module imports cleanly when PyYAML is
@@ -294,6 +308,12 @@ SOURCE_TIERS = (TIER_MANIFEST, TIER_LEGACY)
 # declared_origin_label, never by hand.
 ORIGIN_DECLARED = "declared"
 TIER_LABELS = {TIER_MANIFEST: "manifest", TIER_LEGACY: SOURCES_FILENAME}
+
+#: The importable capability marker B's `work migrate --instance` checks as
+#: its version floor (issue #370, spec §10). Plain `True` — present and true
+#: only once the loader, the container seam and doctor all read the manifest
+#: tier. See the module docstring, "Capability marker".
+MANIFEST_TIER_SUPPORTED = True
 
 # Manifest `sources:` names this release does not mount (#370 point 5
 # boundary: no clone destination, no env override, no runner wiring). A

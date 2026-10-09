@@ -32,7 +32,15 @@ from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli import gate_lock
 
 from . import project_index, utils
-from .run_state import LEGACY_STATE_FILE, STATE_FILE, append_event, run_dir, run_rel_path_candidates
+from .run_state import (
+    LEGACY_STATE_FILE,
+    STATE_FILE,
+    append_event,
+    is_default_label,
+    run_dir,
+    run_rel_path_candidates,
+    seeded_record_rel_paths,
+)
 from .specs_index import specs_rel_path
 from .utils import no_run_context_error, task_target_dir, work_repo_layout
 from .transactions import (
@@ -61,7 +69,7 @@ INDEX_CONFLICT_ROUNDS = 10
 #: The index lines of the CLI surface (docs/WORK-REPO-SAFETY.md, the design spec).
 INDEX_NUDGE = (
     "💡 this run has no name yet — work name <kebab-case> (or launch with lmer --name); "
-    "the index lists it by its goal or first log line until then"
+    "the index lists it by its default label (or its goal or first log line) until then"
 )
 INDEX_SKIPPED = "⚠️  project index skipped: "
 INDEX_LEFTOVER_SKIPPED = "⚠️  project index leftover skipped: "
@@ -926,7 +934,11 @@ def _nudge_unnamed(rdir: Optional[Path]) -> None:
         if not isinstance(state, dict):
             return
         name = state.get("name")
-        if name is None or (isinstance(name, str) and not name.strip()):
+        if (
+            name is None
+            or (isinstance(name, str) and not name.strip())
+            or is_default_label(state)
+        ):
             print(INDEX_NUDGE)
     except Exception:
         pass
@@ -1843,6 +1855,14 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     # form the bare address is the `_runs/<slug>/` group, which holds every
     # session of the run.
     for rel in run_rel_path_candidates():
+        if rel not in paths:
+            paths.append(rel)
+
+    # Records this launch seeded into another group (D13): `work seed` writes
+    # a record whose own address is not this launch's, so without this the
+    # seed is reported as a stray and never pushed (#535). Schema form only;
+    # the helper returns [] elsewhere.
+    for rel in seeded_record_rel_paths():
         if rel not in paths:
             paths.append(rel)
 

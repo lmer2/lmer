@@ -155,6 +155,35 @@ class TestRunStateFragment:
         # The in-progress wording stays untouched beside it.
         assert "you are RESUMING it" in out
 
+    def test_completed_run_contract_is_tree_agnostic(self, monkeypatch):
+        """T18: the template must not pick a tree form by searching the brief's
+        free text. A schema-1 brief whose goal mentions `--source-session`
+        must still get the schema-1 reopen route, never a schema-2-only one."""
+        brief = (
+            "Run: develop-issue-123 (status: complete)\n"
+            "Goal: rerun with --source-session later"
+        )
+        out = self._render(monkeypatch, {
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "org/repo",
+            "run_state_brief": brief,
+        })
+        assert "work state set --status=in-progress --stop-reason=none" in out
+        assert "--source-session <uid>" in out
+        assert "Follow the route the brief names" in out
+
+    def test_completed_run_contract_names_the_schema_two_route(self, monkeypatch):
+        out = self._render(monkeypatch, {
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "org/repo",
+            "run_state_brief": (
+                "Run: chat (status: complete)\n"
+                "Continue with: lmer chat --source-session " + "ab" * 16
+            ),
+        })
+        assert "--source-session <uid>" in out
+        assert "Follow the route the brief names" in out
+
     def test_blocking_question_contract(self):
         """Issue #97: the contract teaches recording the question TEXT, then
         committing, then ending the session — no idle in-session waiting."""

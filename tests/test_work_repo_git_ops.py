@@ -1312,6 +1312,36 @@ class TestASchemaTreeStagesWhereItActuallyWrites:
             "_agents/memory",
         ]
 
+    def test_a_reslugged_record_completion_write_is_staged(
+        self, monkeypatch, tmp_path
+    ):
+        """#172: after a release re-slug (`reslugged_from` set), the record's
+        completion write is staged at its NEW address, so it is not stranded."""
+        import shutil
+
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        _launch(monkeypatch, tree)
+        rdir = run_state.run_dir()
+        # A single-record group, so old-slug resolution cannot match a sibling
+        # by content — it must find the moved record through reslugged_from.
+        for sibling in list(rdir.parent.iterdir()):
+            if sibling != rdir:
+                shutil.rmtree(sibling)
+        new_slug = f"{SLUG}-v1.2.3"
+        new_group = rdir.parent.parent / new_slug
+        new_group.mkdir()
+        moved = new_group / rdir.name
+        rdir.rename(moved)
+        state = run_state.load_state(moved)
+        state["slug"] = new_slug
+        state["reslugged_from"] = [SLUG]
+        run_state.write_state(moved, state)
+        rc, paths = _composed()
+        assert rc == 0
+        # The vacated address and the new one are both candidates.
+        assert f"{PROJECT}/_runs/{new_slug}/{moved.name}" in paths
+        assert f"{PROJECT}/_runs/{SLUG}" in paths
+
     def test_every_path_comes_from_the_helper_that_owns_it(
         self, monkeypatch, tmp_path
     ):

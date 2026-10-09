@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -159,6 +160,137 @@ def test_fresh_record_retains_metadata_and_unknown_fields(session_tree, monkeypa
     assert run_state.load_state(rdir)["session"]["later_extension"] == [4, 5]
 
 
+def test_default_label_derivation_and_shape():
+    """D5: `<taskdef>-<yymmdd>-<uid[:4]>`, the date in UTC; the shape test
+    accepts an inherited default label for the record's own taskdef."""
+    uid = "abcd" * 8
+    assert run_state.derive_default_label(
+        "chat", "2026-10-07T23:30:00-02:00", uid
+    ) == "chat-261008-abcd"
+    state = {
+        "taskdef": "chat",
+        "name": "chat-261008-abcd",
+        "session": {"uid": uid, "started_at": "2026-10-07T23:30:00-02:00"},
+    }
+    assert run_state.is_default_label(state)
+    state["name"] = "chat-261007-3f9a"  # an inherited default label
+    assert run_state.is_default_label(state)
+    state["name"] = "tidy"
+    assert not run_state.is_default_label(state)
+    assert not run_state.is_default_label({"name": "x"})
+
+
+def test_a_freshly_seeded_record_carries_a_default_label_without_run_named(
+    session_tree, monkeypatch
+):
+    metadata, rdir, state = seed_launch()
+    assert state["name"] == run_state.derive_default_label(
+        "chat", state["session"]["started_at"], metadata["uid"]
+    )
+    assert run_state.is_default_label(state)
+    assert "run_named" not in [e["type"] for e in run_state.read_events(rdir, last_n=0)]
+
+
+def test_freeze_does_not_rename_a_default_labelled_record(session_tree):
+    _, rdir, state = seed_launch()
+    assert run_state.is_default_label(state)
+    frozen, old_name = run_state.freeze_run_dir(rdir, state)
+    assert frozen == rdir and old_name is None
+    assert state["frozen"] is not None
+
+
+def test_launch_name_replaces_a_default_label_on_the_opening_call(
+    session_tree, monkeypatch
+):
+    from work_repo import cli, session_record
+
+    monkeypatch.setenv("LMER_RUN_NAME", "tidy-index")
+    session_record.start_launch()
+    assert cli.cmd_session_start() == 0
+    state = run_state.load_state(run_state.run_dir())
+    assert state["name"] == "tidy-index"
+
+
+def _continue_from(source_state, monkeypatch):
+    from work_repo import session_record
+
+    session_record.start_launch()
+    monkeypatch.setenv("LMER_SOURCE_SESSION_ID", source_state["session"]["uid"])
+    return run_state.ensure_run()
+
+
+def test_continuation_inherits_the_source_name(session_tree, monkeypatch):
+    _, source, source_state = seed_launch()
+    source_state["name"] = "tidy"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    _, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "tidy"
+
+
+def test_continuation_inherits_a_default_label_and_stays_unnamed_for_the_freeze(
+    session_tree, monkeypatch
+):
+    from work_repo import specs_index
+
+    _, source, source_state = seed_launch()
+    assert run_state.is_default_label(source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == source_state["name"]
+    assert run_state.is_default_label(state)
+    frozen, old_name = run_state.freeze_run_dir(target, state)
+    assert frozen == target and old_name is None
+    assert specs_index.run_label(target, state).startswith(state["slug"])
+
+
+def test_launch_name_replaces_an_inherited_name_on_the_opening_call(
+    session_tree, monkeypatch
+):
+    from work_repo import cli
+
+    _, source, source_state = seed_launch()
+    source_state["name"] = "tidy"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "tidy"
+    monkeypatch.setenv("LMER_RUN_NAME", "tidy-v2")
+    assert cli.cmd_session_start() == 0
+    state = run_state.load_state(target)
+    assert state["name"] == "tidy-v2"
+    events = run_state.read_events(target, last_n=0)
+    assert any(
+        e["type"] == "run_named" and (e.get("data") or {}).get("source") == "launch"
+        for e in events
+    )
+
+
+def test_goals_freeze_leaves_a_default_labelled_record_unnamed(session_tree, capsys):
+    from work_repo import cli
+
+    _, rdir, state = seed_launch()
+    assert run_state.is_default_label(state)
+    (rdir / "goals.md").write_text(
+        "## G1: ship it\nsignal: test\nevidence: tests/test_x.py\n"
+    )
+    assert cli._cmd_goals_freeze(None) == 0
+    assert "not named yet" in capsys.readouterr().out
+    assert run_state.load_state(rdir)["frozen"] is None
+    assert run_state.run_dir() == rdir
+
+
+def test_specs_index_label_uses_the_slug_for_a_default_label(session_tree):
+    from work_repo import specs_index
+
+    _, rdir, state = seed_launch()
+    label = specs_index.run_label(rdir, state)
+    assert label.startswith(state["slug"])
+    assert run_state.is_default_label(state)
+    state["name"] = "tidy-index"
+    assert specs_index.run_label(rdir, state).startswith("tidy-index")
+
+
 def test_continuation_uses_fresh_record_and_preserves_source_bytes(session_tree, monkeypatch):
     old, source, source_state = seed_launch()
     source_state["goal"] = "Finish the existing work"
@@ -255,6 +387,95 @@ def test_future_record_version_refuses_every_writer(session_tree):
         run_state.write_state(directory, old_state)
     assert path.read_bytes() == before
 
+def _set_git_identity(monkeypatch):
+    """Give the work-repo commits an explicit identity (CI has no gitconfig)."""
+    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(name, "test")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(name, "test@example.com")
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=test",
+         "-c", "user.email=test@example.com", *args],
+        check=True, capture_output=True,
+    )
+
+
+def _git_work_repo(session_tree):
+    """A bare origin plus a clone holding the manifest, as LMER_WORK_REPO_PATH."""
+    origin = session_tree.parent / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+    clone = session_tree.parent / "workrepo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+    (clone / "_plexus.yaml").write_text((session_tree / "_plexus.yaml").read_text())
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-q", "-m", "init")
+    _git(clone, "push", "-q", "-u", "origin", "main")
+    return clone, origin
+
+
+def _tracked(clone):
+    _git(clone, "fetch", "-q", "origin")
+    return subprocess.run(
+        ["git", "-C", str(clone), "ls-tree", "-r", "--name-only", "origin/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def test_work_commit_publishes_the_seeded_record(session_tree, monkeypatch):
+    """`work seed` into another group, then `work commit`, publishes both the
+    launch's own record and the seed (#535, spec §5.2)."""
+    from types import SimpleNamespace
+
+    from work_repo.cli import cmd_seed
+    from work_repo.git_ops import commit_work_changes
+
+    clone, _ = _git_work_repo(session_tree)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    _set_git_identity(monkeypatch)
+    _, own_rdir, _ = seed_launch()
+    rc = cmd_seed(SimpleNamespace(taskdef="develop", target="other-target", name=None, goal=None))
+    assert rc == 0
+    seeded = run_state.seeded_record_rel_paths()
+    assert len(seeded) == 1
+    assert commit_work_changes("publish the seed") == 0
+    tracked = _tracked(clone)
+    assert own_rdir.relative_to(clone).as_posix() in tracked
+    assert seeded[0] in tracked
+    # Nothing outside the two records is left behind.
+    assert subprocess.run(
+        ["git", "-C", str(clone), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == ""
+
+
+def test_a_removed_seeded_group_stages_nothing(session_tree, monkeypatch):
+    """A seed whose group was removed before the commit stages nothing and
+    does not fail the commit (#535)."""
+    import shutil
+
+    from work_repo.git_ops import commit_work_changes
+    from work_repo.session_record import seeded_session
+
+    clone, _ = _git_work_repo(session_tree)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    _set_git_identity(monkeypatch)
+    seed_launch()
+    # Seed directly, then remove the group before committing.
+    rdir, _ = run_state.seed_run_dir(
+        "develop-other-target", "develop", "other-target",
+        adopt_existing=False, seeded=seeded_session(),
+    )
+    run_state.note_seeded_record(rdir)
+    shutil.rmtree(rdir.parent)
+    assert commit_work_changes("seed gone") == 0
+
+
 def _seeded_state(uid, seeded_by):
     """The record `work seed` writes under D13: a fresh uid, the seeding
     launch in `seeded_by`, nothing run in it yet."""
@@ -340,6 +561,70 @@ def test_seeded_record_at_its_final_address_is_read_only_to_the_seeder(session_t
     with pytest.raises(run_state.RunStateError, match="own"):
         run_state.write_state(empty, _seeded_state("d" * 32, metadata["uid"]))
     assert list(empty.iterdir()) == []
+
+
+def test_the_writer_refusal_names_the_continuation_route(session_tree):
+    """D14: a schema-2 record another launch owns is continued as a new
+    execution, and the refusal names that route with the record's values."""
+    from work_repo import session_record
+
+    seeder, _, _ = seed_launch()
+    uid = "e" * 32
+    group = session_tree / "widgets" / "_runs" / "develop-other-target"
+    state = _seeded_state(uid, seeder["uid"])
+    _plant(group / uid, state)
+    session_record.start_launch()  # a different launch, owning no such record
+    with pytest.raises(run_state.RunStateError, match=f"--source-session {uid}"):
+        run_state.write_state(group / uid, state)
+
+
+def test_two_continuations_carry_one_label_and_nothing_refuses(
+    session_tree, monkeypatch, capsys
+):
+    """D4: two continuations of one source become two records carrying one
+    label; the legacy uniqueness gate never refuses on schema 2."""
+    from work_repo import cli, session_record
+
+    _, source, source_state = seed_launch()
+    source_state["name"] = "carried"
+    run_state.write_state(source, source_state)
+    run_state.append_event(source, "session_end")
+    target, state = _continue_from(source_state, monkeypatch)
+    assert state["name"] == "carried"
+    # `work name` accepts the same label on the second record.
+    assert cli.cmd_name("carried") == 0
+    # A second continuation of the same source also carries it.
+    monkeypatch.delenv("LMER_SOURCE_SESSION_ID", raising=False)
+    target2, state2 = _continue_from(source_state, monkeypatch)
+    assert target2 != target and state2["name"] == "carried"
+    assert "not applied" not in capsys.readouterr().out
+
+
+def test_work_name_and_seed_and_launch_name_all_accept_a_held_label(
+    session_tree, monkeypatch
+):
+    from work_repo import cli, session_record
+
+    _, holder, holder_state = seed_launch()
+    holder_state["name"] = "taken"
+    run_state.write_state(holder, holder_state)
+    session_record.start_launch()
+    rdir, state = run_state.ensure_run()
+    assert cli.cmd_name("taken") == 0
+    assert run_state.load_state(rdir)["name"] == "taken"
+    # `find_run_dir(name, match_names=True)` never resolves by name on schema 2.
+    assert run_state.find_run_dir("taken", match_names=True) is None
+
+
+def test_seeded_record_helpers_are_noops_on_a_legacy_tree(tmp_path, monkeypatch):
+    from work_repo import run_state
+
+    monkeypatch.setattr(run_state, "is_process_record", lambda: False)
+    rdir = tmp_path / "legacy-run"
+    rdir.mkdir()
+    run_state.note_seeded_record(rdir)
+    assert run_state.seeded_record_rel_paths() == []
+    assert not (rdir / "state.yaml").exists()
 
 
 def test_launcher_replaces_inherited_uid_once_after_schema_detection(session_tree, monkeypatch):
@@ -714,27 +999,27 @@ def test_launch_name_and_goal_apply_once_on_the_opening_session_start(
     assert "not applied" not in capsys.readouterr().out
 
 
-def test_a_held_launch_name_warns_on_stdout_and_the_run_stays_unnamed(
+def test_a_launch_name_is_a_label_and_never_conflicts_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
+    """D4: on schema 2 a name is a label, so a launch name equal to another
+    record's label applies; the legacy uniqueness scan is never consulted."""
     from work_repo import cli, session_record
 
-    holder_uid, holder, holder_state = seed_launch()
+    _, holder, holder_state = seed_launch()
     holder_state["name"] = "taken"
     run_state.write_state(holder, holder_state)
     monkeypatch.setenv("LMER_RUN_NAME", "taken")
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert (
-        f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}' "
-        "(names are unique per project); this run stays unnamed"
-    ) in out
-    assert " owns " in out  # the brief still prints
+    assert "not applied" not in out
     directory = run_state.run_dir()
     assert directory != holder
-    assert run_state.load_state(directory)["name"] is None
-    assert _events_of(directory, "run_named") == []
+    assert run_state.load_state(directory)["name"] == "taken"
+    named = _events_of(directory, "run_named")
+    assert len(named) == 1 and named[0]["note"] == "taken"
+    assert named[0]["data"]["source"] == "launch"
 
 
 def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
@@ -749,11 +1034,11 @@ def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
     assert "launch name '###' not applied" in out
     assert " owns " in out
     directory = run_state.run_dir()
-    assert run_state.load_state(directory)["name"] is None
+    assert run_state.is_default_label(run_state.load_state(directory))
     assert _events_of(directory, "run_named") == []
 
 
-def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
+def test_name_conflict_is_never_scanned_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
     from work_repo import cli, session_record
@@ -768,13 +1053,12 @@ def test_a_raising_name_conflict_scan_is_a_warning_not_a_refusal(
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert "⚠️  launch name/goal not applied (continuing): scan exploded" in out
-    assert " owns " in out
+    assert "scan exploded" not in out
     directory = run_state.run_dir()
     state = run_state.load_state(directory)
-    assert state["name"] is None
-    assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
-    assert _events_of(directory, "run_named") == []
+    assert state["name"] == "fresh-run"
+    named = _events_of(directory, "run_named")
+    assert len(named) == 1 and named[0]["note"] == "fresh-run"
 
 
 def test_a_raising_state_write_is_a_warning_not_a_refusal(
@@ -799,7 +1083,7 @@ def test_a_raising_state_write_is_a_warning_not_a_refusal(
     assert " owns " in out
     directory = run_state.run_dir()
     state = run_state.load_state(directory)
-    assert state["name"] is None and state["goal"] is None
+    assert run_state.is_default_label(state) and state["goal"] is None
     assert state["owner"]["session_id"] == os.environ["LMER_SESSION_ID"]
     assert _events_of(directory, "run_named") == []
     assert _events_of(directory, "goal_set") == []
@@ -920,12 +1204,12 @@ def test_a_continuation_without_a_launch_goal_keeps_the_inherited_goal_current(
     assert not any(line.startswith("Predecessor goal") for line in lines)
 
 
-def test_a_held_launch_name_is_absent_from_the_launch_lines_but_the_goal_is_not(
+def test_a_launch_name_lands_beside_the_goal_on_schema_two(
     session_tree, monkeypatch, capsys
 ):
     from work_repo import cli, session_record
 
-    holder_uid, holder, holder_state = seed_launch()
+    _, holder, holder_state = seed_launch()
     holder_state["name"] = "taken"
     run_state.write_state(holder, holder_state)
     monkeypatch.setenv("LMER_RUN_NAME", "taken")
@@ -933,17 +1217,13 @@ def test_a_held_launch_name_is_absent_from_the_launch_lines_but_the_goal_is_not(
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     lines = capsys.readouterr().out.splitlines()
-    assert any(
-        line.startswith(f"⚠️  launch name 'taken' not applied: held by run 'chat/{holder_uid['uid']}'")
-        for line in lines
-    )
     launch_at = lines.index(LAUNCH_HEADER)
-    assert lines[launch_at + 1] == "Goal: Finish the index"
-    assert not any(line.startswith("Run name:") for line in lines)
+    assert lines[launch_at + 1] == "Run name: taken"
+    assert lines[launch_at + 2] == "Goal: Finish the index"
     assert " owns " in lines[-1]
 
 
-def test_a_held_name_alone_prints_no_launch_lines(session_tree, monkeypatch, capsys):
+def test_a_launch_name_alone_prints_the_launch_lines(session_tree, monkeypatch, capsys):
     from work_repo import cli, session_record
 
     _, holder, holder_state = seed_launch()
@@ -953,8 +1233,8 @@ def test_a_held_name_alone_prints_no_launch_lines(session_tree, monkeypatch, cap
     session_record.start_launch()
     assert cli.cmd_session_start() == 0
     out = capsys.readouterr().out
-    assert "launch name 'taken' not applied" in out
-    assert LAUNCH_HEADER not in out
+    assert LAUNCH_HEADER in out
+    assert "Run name: taken" in out
 
 
 def test_a_continuation_of_a_dotted_source_lands_under_the_bare_taskdef(

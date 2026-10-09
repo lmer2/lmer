@@ -1,10 +1,22 @@
 added:
 - "`lmer <taskdef> --repo <url-or-path>` names the repository explicitly, so a work-item, document or thread target can run against a chosen repository and `lmer chat --repo <url>` with no positional is the plain project session from anywhere (#536)"
+- "an unnamed schema-2 record now stores a default label `<taskdef>-<yymmdd>-<uid4>`, shown by the project README index and `work sessions`; a continuation inherits its source's name, including a default label (#536)"
+- "`work sessions` and the project README index gain a `seeded` state for a `work seed` record nobody has run in (#535)"
+- "`lmer_cli.container.sources.MANIFEST_TIER_SUPPORTED` is the importable capability marker `work migrate --instance` checks as its version floor (#370)"
 changed:
 - "a plain project session — no target, `.`, a checkout path, a bare repository URL or a document URL — now files its run under the bare taskdef group (`chat`) instead of `chat-.` or `chat-<repo>.git`; the slug is derived from one target classifier shared by the host CLI, the container and the work CLI (#536, #537)"
 - "a bare repository URL positional and no positional now export an empty `LMER_TASK_TARGET` (delivered empty, never absent), like a checkout path; a repository URL was previously exported verbatim (#536)"
-- "a positional that names a directory which is not a git checkout is refused (exit 2) instead of being read as a branch name; a branch, SHA or shorthand now reaches the classifier and resolves its repository from the cwd origin (#536)"
+- "a positional that names an existing filesystem entry which is not a git checkout (a plain directory or a file) is refused (exit 2) instead of being read as a branch name; a branch, SHA or shorthand now reaches the classifier and resolves its repository from the cwd origin (#536)"
+- "`--repo` must name a repository: a path that is not a checkout, or a work-item, document or other URL, is refused (exit 2) rather than used as the clone URL (#536)"
+- "a work-item or reference URL that derives no repository is refused (exit 2) instead of silently cloning the cwd origin; the cwd fallback is kept only for a non-URL branch, SHA or shorthand (#536)"
 - "existing schema-1 records under the old `chat-.` / `chat-<repo>.git` spellings stay where they are, but the platform no longer resumes or answers them and a host launch seeds the bare group beside them, until `work migrate` folds them at adoption (#368)"
+- "a `continues` link in the project README index resolves its source by session uid, so a folded, freeze-renamed or archived source still links (#536)"
+- "a launch `--name` replaces a default or inherited name on the call that opens a schema-2 record (#536)"
+- "on a schema-2 tree a finished record's resume brief names the continuation route (`lmer <taskdef> [<target>] --source-session <uid>`, target shell-quoted) instead of the schema-1 reopen, and the write refusal names the same route (#437)"
+- "a resume brief shows `(dir: <dir>)` when a post-freeze `work name` left the directory's `--<name>` suffix stale; `work name` on a frozen record says the directory will not be renamed; `run-state:` commit subjects carry the record's name label (#536)"
+- "on schema 2 a name is a label: two continuations of one source may carry the same label, and `work name`, `work seed --name` and a launch `--name` no longer refuse a label another record holds (#536)"
+- "`lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_plexus.yaml` is cached (#370)"
 fixed:
+- "`work commit` and `work session-end` now publish a record `work seed` wrote into another group; previously it was reported as a stray and left unpublished (#535)"
 - "a document URL target — a file, tree or wiki page inside a repository — clones that repository instead of being refused or mis-derived (#523)"
 - "a list-page target such as `/-/issues` or `/-/merge_requests` no longer leaks the `/-/…` route into the work-repo project path (#391)"

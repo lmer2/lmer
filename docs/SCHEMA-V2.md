@@ -124,10 +124,14 @@ time is only a fallback for records without a usable timestamp.
 read-only context. The new record captures the source UID, a hash of the source
 state, its state snapshot, and recent events. It does not append lineage,
 answers, owner changes or sign-out events to the predecessor.
-Goal, phase, question and ledger/release checkpoints seed the new record.
+Goal, phase, question, the name label and ledger/release checkpoints seed the
+new record (a name inherited from the source is a label; a launch `--name`
+replaces it, as it replaces a default label).
 The context snapshot records their provenance; owner, claim and terminal
 status are not inherited. A launch goal (`lmer --goal`, applied once by
-`work session-start`) replaces the inherited one. A continuation whose source
+`work session-start`) replaces the inherited one. When the source's target
+derives no repository, name it explicitly with `lmer <taskdef> --repo
+<url-or-path>`; `--repo` must itself be a repository. A continuation whose source
 was filed under a different slug — a `chat-.` record from before local-path
 targets exported an empty target — lands under the current derivation
 (`chat`), keeps `source_session_uid` and `context.source_path` into the old
@@ -339,11 +343,14 @@ repository or lies inside a `_runs/` record is never written (the push skips
 it with a warning, the backfill reports it `refused`), so neither can reach
 outside the tree or into a historical record.
 
-**What a row says.** The label is the record's `name`, else the goal's first
-line, else the first `log.yaml` message (a derived label is marked
-`_(unnamed)_`); a continuation links its source record. The state cell uses
-four clock-free words — `closed` (status complete or archived),
-`waiting on question` (a recorded question outranks a sign-out),
+**What a row says.** The label is the record's `name` — an unnamed schema-2
+record carries the default label `<taskdef>-<yymmdd>-<uid4>`, and a
+continuation inherits its source's name — else the goal's first line, else
+the first `log.yaml` message (a derived label is marked `_(unnamed)_`, which
+now means only `name: null`); a continuation links its source record, by
+session uid. The state cell uses five clock-free words — `closed` (status
+complete or archived), `waiting on question` (a recorded question outranks a
+sign-out), `seeded` (a `work seed` record nobody has run in),
 `ended, not closed` (in progress with a recorded final `session_end`) and
 `open` (no sign-out recorded) — beside a last-activity column that is the
 date the record last changed. Nothing in the block ends a run; as everywhere

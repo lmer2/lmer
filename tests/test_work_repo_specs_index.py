@@ -179,9 +179,11 @@ class TestArtifactRegistrationIndexes:
 
 
 class TestUpsertSpecLink:
-    def test_later_day_reregistration_replaces_older_entry(
+    def test_later_day_reregistration_keeps_the_original_date(
         self, run_env, tmp_path
     ):
+        """#334: an existing entry's date always wins; `when` dates only a
+        NEW entry, so a later-day re-registration re-points it in place."""
         run_env.mkdir(parents=True)
         (run_env / "spec.md").write_text("# spec\n")
         old = specs_index.upsert_spec_link(
@@ -190,9 +192,8 @@ class TestUpsertSpecLink:
         )
         assert old is not None and old.name == "2026-07-01-issue-101--spec.md"
         new = specs_index.upsert_spec_link(run_env / "spec.md", "issue-101")
-        assert new.name == f"{_today()}-issue-101--spec.md"
-        assert not old.exists()  # one entry per (run, spec file) — no duplicates
-        assert [p.name for p in specs_index.list_entries()] == [new.name]
+        assert new.name == old.name  # the original date wins
+        assert [p.name for p in specs_index.list_entries()] == [old.name]
 
     def test_suffix_label_collision_not_deleted(self, run_env, tmp_path):
         # `my-run` entries must never be treated as stale entries of `run`.
@@ -245,7 +246,8 @@ class TestUpsertSpecLink:
         legacy = sdir / "2026-07-01-issue-101-spec.md"
         legacy.symlink_to("../runs/develop-issue-101/spec.md")
         new = specs_index.upsert_spec_link(run_env / "spec.md", "issue-101")
-        assert new.name == f"{_today()}-issue-101--spec.md"
+        # The legacy entry's date is kept, in the current `--` format (#334).
+        assert new.name == "2026-07-01-issue-101--spec.md"
         assert not legacy.exists()
         assert [p.name for p in specs_index.list_entries()] == [new.name]
 
@@ -332,6 +334,19 @@ class TestMasterplanSyncIndexes:
         assert os.readlink(entries[0]) == (
             "../runs/develop-issue-101/masterplan/mp-a/spec.md"
         )
+
+    def test_registration_date_survives_a_later_session_start(
+        self, run_env, tmp_path
+    ):
+        """#334: the next session start's sync keeps the entry's original
+        date instead of re-dating it under today."""
+        self._seed_run(run_env)
+        self._bundle(run_env, "mp-a", "spec.md")
+        run_state.sync_masterplan_artifacts(run_env)
+        original = specs_index.list_entries()[0].name
+        # A later session start runs the sync again; the date is unchanged.
+        run_state.sync_masterplan_artifacts(run_env)
+        assert [p.name for p in specs_index.list_entries()] == [original]
 
     def test_sync_idempotent_in_index(self, run_env, tmp_path):
         self._seed_run(run_env)
