@@ -96,6 +96,8 @@ tests:
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
     - tests/test_user_harnesses.py
+    # Reads the golden INDEX.md files under tests/fixtures/knowledge-index/.
+    - tests/test_work_repo_knowledge_index.py
     - tests/test_work_repo_release_run.py
     - tests/test_work_repo_run_state.py
     - tests/test_workrepo_isolation_guard.py

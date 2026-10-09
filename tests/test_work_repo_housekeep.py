@@ -8,7 +8,7 @@ import pytest
 
 from tests.conftest import strip_lmer_env
 from tests.plexus_fixtures import build_legacy_plexus, build_schema_plexus
-from tests.schema2_fixtures import uid_for
+from tests.schema2_fixtures import build_schema2_plexus, uid_for
 from work_repo import cli, housekeep, run_state
 
 
@@ -187,12 +187,15 @@ class TestRegistration:
         assert rels is not None
         assert "lmer" in rels  # a project dir, not just a root-level area
 
-    def test_a_schema_two_tree_without_a_session_is_not_refused_by_the_uid_gate(
+    def test_a_schema_two_apply_without_a_session_is_not_refused_by_the_uid_gate(
         self, tmp_path, monkeypatch, capsys
     ):
-        tree = build_schema_plexus(tmp_path / "plexus")
+        # A schema-2 tree and --apply: the write intent is non-None, so the
+        # gate would refuse were housekeep not exempt.
+        tree = build_schema2_plexus(tmp_path / "plexus")
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
-        monkeypatch.setattr(sys, "argv", ["work", "housekeep", "--area", "buckets"])
+        monkeypatch.setattr(
+            sys, "argv", ["work", "housekeep", "--apply", "--area", "buckets"])
         assert cli.main() == 0
         assert "Session write refused" not in capsys.readouterr().err
 

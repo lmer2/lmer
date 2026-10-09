@@ -233,9 +233,12 @@ def _stale_seconds() -> float:
     return STALE_AFTER_SECONDS
 
 
-def _links_under(project_dir: Path, src_rel: str) -> list[Path]:
-    """Dated symlinks in ``_specs``/``_plans`` whose target lies under *src_rel*."""
-    found = []
+def _links_under(project_dir: Path, src_rel: str) -> list[tuple[Path, str]]:
+    """``(link, sub-path)`` for dated symlinks in ``_specs``/``_plans`` whose
+    target lies under *src_rel*. ``sub-path`` is the target relative to the
+    moved dir, so the retarget keeps the FILE (``spec.md``), not just the dir."""
+    found: list[tuple[Path, str]] = []
+    old_dir = os.path.normpath(str(project_dir / src_rel))
     for index_name in ("_specs", "_plans"):
         index = project_dir / index_name
         if not index.is_dir():
@@ -244,10 +247,10 @@ def _links_under(project_dir: Path, src_rel: str) -> list[Path]:
             if not entry.is_symlink():
                 continue
             target = os.path.normpath(os.path.join(str(entry.parent), os.readlink(entry)))
-            if target == str(project_dir / src_rel) or target.startswith(
-                str(project_dir / src_rel) + os.sep
-            ):
-                found.append(entry)
+            if target == old_dir:
+                found.append((entry, "."))
+            elif target.startswith(old_dir + os.sep):
+                found.append((entry, os.path.relpath(target, old_dir)))
     return found
 
 
@@ -322,10 +325,11 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
             plan.add(Action("info", "runs", rel, detail=f"destination exists: {dst_rel.relative_to(root).as_posix()}"))
             continue
         plan.add(Action("move", "runs", rel, dst_rel.relative_to(root).as_posix(), f"{policy}d"))
-        for link in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
+        for link, sub in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
+            new_target = dst_rel if sub == "." else dst_rel / sub
             plan.add(Action(
                 "retarget", "runs", link.relative_to(root).as_posix(),
-                dst_rel.relative_to(root).as_posix(),
+                new_target.relative_to(root).as_posix(),
             ))
 
     # The one deletion housekeep makes: `.new-*` orphans older than the threshold.
@@ -552,4 +556,6 @@ def cmd_housekeep(args) -> int:
             rc = git_ops.commit_work_path(touched, _commit_message(lines))
         if failures:
             return 1
-        return rc if touched else (2 if refused_selected else 0)
+        if refused_selected:
+            return 2
+        return rc if touched else 0

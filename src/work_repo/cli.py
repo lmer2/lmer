@@ -37,7 +37,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, housekeep, plan_index, release_run, run_state, specs_index, write_journal
+from . import goals, housekeep, knowledge, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
@@ -265,6 +265,24 @@ Examples:
         )
         retirement_parser.add_argument("scoped_path", help="Work-repo-relative memory path")
         retirement_parser.add_argument("--message", "-m", help="Commit message")
+
+    # knowledge command (#372): generate `_knowledge/<org>/INDEX.md`.
+    knowledge_parser = subparsers.add_parser(
+        "knowledge", help="Generate knowledge-area indexes"
+    )
+    knowledge_subparsers = knowledge_parser.add_subparsers(
+        dest="knowledge_action", help="Knowledge action to perform"
+    )
+    knowledge_index_parser = knowledge_subparsers.add_parser(
+        "index", help="Generate (or check) `_knowledge/<org>/INDEX.md`"
+    )
+    knowledge_index_parser.add_argument(
+        "--check", action="store_true",
+        help="Write nothing; exit 1 when any generated index is out of date",
+    )
+    knowledge_index_parser.add_argument(
+        "--org", metavar="NAME", help="Limit the run to one organisation",
+    )
 
     # housekeep command (#371): dry-run-first archival and index maintenance.
     housekeep_parser = subparsers.add_parser(
@@ -4701,6 +4719,12 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return [rel] if rel else []
         except Exception:
             return []
+    if command == "knowledge":
+        if getattr(args, "knowledge_action", None) != "index":
+            return None
+        if getattr(args, "check", False):
+            return None  # --check writes nothing
+        return [knowledge.KNOWLEDGE_DIR]
     if command == "housekeep":
         if not getattr(args, "apply", False):
             return None  # dry run writes nothing
@@ -4814,7 +4838,7 @@ def main() -> int:
     # Record-writing helpers inherit their execution's UID. Without one,
     # a read resolver may choose the latest record, but a writer must refuse.
     if args.command not in (
-        "memory", "specs-index", "adopt", "migrate", "housekeep"
+        "memory", "specs-index", "adopt", "migrate", "housekeep", "knowledge"
     ):
         from .utils import SchemaContextError
 
@@ -4857,6 +4881,8 @@ def _dispatch(args, parser) -> int:
                           getattr(args, "allow_unbaselined_delete", False))
     elif args.command == "housekeep":
         return housekeep.cmd_housekeep(args)
+    elif args.command == "knowledge":
+        return knowledge.cmd_knowledge(args)
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
