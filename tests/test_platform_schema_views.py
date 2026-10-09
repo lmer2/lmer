@@ -432,3 +432,68 @@ def test_the_sessions_read_binds_like_the_runs_other_reads(mirror, pinned_clock,
     assert own.status_code == 200, own.text
     other = _run_read(client, path, uid=UID_FIRST, workspace_id=homed["id"])
     assert other.status_code == 409, other.text
+
+
+# --- review !392: timestamp-id rows and project scope -------------------------
+
+TIMESTAMP_ID = "20261007-120000-1234-abcd"
+
+
+def _plant_timestamp_record(mirror_root: Path) -> Path:
+    """A timestamp-id launch beside the two uid records of the group."""
+    group = next(Path(mirror_root).rglob(f"_runs/{SLUG}/{UID_FIRST}")).parent
+    record = group / TIMESTAMP_ID
+    record.mkdir()
+    (record / "state.yaml").write_text(
+        yaml.safe_dump({"slug": SLUG, "status": "in-progress",
+                        "created": stamp(0), "updated": stamp(0)}, sort_keys=False),
+        encoding="utf-8",
+    )
+    return record
+
+
+def test_a_timestamp_id_row_takes_the_slug_runs_project_context(mirror, pinned_clock, homed):
+    """Its key is the slug run's, so its home is the slug run's — never an
+    'Unassigned' row because a timestamp id was read as a malformed uid."""
+    _plant_timestamp_record(mirror)
+    projects.bind_run(_key(SLUG), projects.GENERAL)
+
+    rows = _sessions(_client(mirror), uid=UID_FIRST).json()["sessions"]
+
+    (row,) = [row for row in rows if row["uid"] == TIMESTAMP_ID]
+    assert row["workspace_id"] == projects.GENERAL
+    assert row["live"] is None and row["tracked"] is None
+
+
+def test_a_caller_scoped_to_one_project_sees_no_sibling_homed_elsewhere(
+    mirror, pinned_clock, homed
+):
+    """The second record lives in Alpha; a caller scoped to General keeps its
+    mirror facts but none of the platform's facts about it."""
+    config = cfg.load({"work_repo_mirror": str(mirror)})
+    run = {"host": HOST, "project": PROJECT, "slug": SLUG, "uid": UID_FIRST}
+    parts = (HOST, PROJECT, UID_FIRST)
+
+    scoped = api._run_sessions_reply(config, run, parts, scope=projects.GENERAL)
+    full = api._run_sessions_reply(config, run, parts)
+
+    by_uid = {row["uid"]: row for row in scoped["sessions"]}
+    sibling, own = by_uid[UID_SECOND], by_uid[UID_FIRST]
+    for field in api._RUN_SESSIONS_PLATFORM_FIELDS:
+        assert sibling[field] is None, field
+    assert sibling["status"] and sibling["started_at"], "mirror facts stay"
+    assert own["workspace_id"] == projects.GENERAL and own["tracked"] is True
+    full_sibling = {row["uid"]: row for row in full["sessions"]}[UID_SECOND]
+    assert full_sibling["workspace_id"] == homed["id"], "the operator sees it all"
+    assert full_sibling["live_session"] is not None
+
+
+def test_the_work_repo_schema_report_is_operator_only(mirror, homed):
+    """The document spans every project; an assistant is refused, not scoped."""
+    credential = cfg.mint_assistant_credential()
+
+    reply = _client(mirror).get(
+        "/api/workrepo/schema", headers={"Authorization": f"Bearer {credential}"}
+    )
+
+    assert reply.status_code == 403, reply.text

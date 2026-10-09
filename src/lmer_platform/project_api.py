@@ -63,6 +63,10 @@ def bind(request, caller, body):
         raise projects.ProjectError("Only an operator may release or park a conversation request.", status=403)
     if caller.kind != "operator" and path in ("/api/project-context", "/api/project-relay"):
         raise projects.ProjectError("Only an operator may explicitly share context between projects.", status=403)
+    # The validator's document spans every project in the work repo; the
+    # fleet panel that reads it is the operator's all-projects view.
+    if caller.kind != "operator" and path == "/api/workrepo/schema":
+        raise projects.ProjectError("Only an operator may read the whole work repo's validator report.", status=403)
     candidates = [value for value in (
         body.get("workspace_id"), query.get("workspace_id"),
         request.headers.get("x-lmer-workspace-id"), request.path_params.get("workspace_id"),

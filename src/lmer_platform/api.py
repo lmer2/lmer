@@ -999,7 +999,18 @@ _RUN_SESSIONS_NOTE = (
 )
 
 
-def _run_sessions_reply(config: PlatformConfig, run: dict, parts: tuple) -> dict:
+#: The per-row fields of ``GET /api/runs/sessions`` that come from this
+#: platform rather than the mirror: what a caller scoped to one project may not
+#: see on a sibling homed in another (:func:`_run_sessions_reply`).
+_RUN_SESSIONS_PLATFORM_FIELDS = (
+    "live", "live_session", "tracked", "workspace_id", "home_revision",
+    "confirm_project", "workspace_name", "workspace_color",
+)
+
+
+def _run_sessions_reply(
+    config: PlatformConfig, run: dict, parts: tuple, *, scope: Optional[str] = None
+) -> dict:
     """``{run, form, group, sessions, note}`` for one ``_runs/<slug>/`` group (#374).
 
     The records come from :func:`lmer_platform.workrepo.group_sessions` — mirror
@@ -1024,6 +1035,12 @@ def _run_sessions_reply(config: PlatformConfig, run: dict, parts: tuple) -> dict
     tree) answers ``live`` and ``tracked`` as ``None``: those are keyed by the
     group's slug there, and a slug-level session cannot be attributed to one of
     its launches. Its project context is the slug run's, which is its key.
+
+    *scope* is the one project a non-operator caller may see (projects on,
+    the request bound to it). A sibling row homed in ANOTHER project keeps its
+    mirror facts — the group is one target's, already addressed — but loses
+    every platform fact: its live session, tracking, workspace and revision
+    are that project's business, as ``/api/state`` hides them too.
     """
     # Imported here for the reason ``create_app`` does: ``project_api`` reaches
     # back into the platform modules that import this one.
@@ -1034,6 +1051,9 @@ def _run_sessions_reply(config: PlatformConfig, run: dict, parts: tuple) -> dict
     slug = run.get("slug") or None
     found = group_sessions(config, host, project, slug, uid=run.get("uid") or None)
     requested = _bound_uid(run) or None
+    # A row with no uid is keyed by its group's slug — the group directory's
+    # name, since a request by uid alone names no slug.
+    group_slug = slug or (found["group"].rsplit("/", 1)[-1] if found["group"] else None)
     rows = []
     for facts in found["sessions"]:
         row_uid = facts["uid"]
@@ -1045,7 +1065,8 @@ def _run_sessions_reply(config: PlatformConfig, run: dict, parts: tuple) -> dict
             get_tracked(host, project, uid=row_uid) is not None if by_uid else None
         )
         context = project_api.annotate({"sessions": [{
-            "host": host, "project": project, "slug": slug, "uid": row_uid,
+            "host": host, "project": project, "slug": group_slug,
+            "uid": row_uid if by_uid else None,
             "session": {"id": live.get("id")} if live else None,
         }]})["sessions"][0]
         rows.append({
@@ -1060,6 +1081,8 @@ def _run_sessions_reply(config: PlatformConfig, run: dict, parts: tuple) -> dict
             "workspace_name": context.get("workspace_name"),
             "workspace_color": context.get("workspace_color"),
         })
+        if scope is not None and rows[-1]["workspace_id"] != scope:
+            rows[-1].update(dict.fromkeys(_RUN_SESSIONS_PLATFORM_FIELDS))
     return {
         "run": _run_echo(run),
         "form": found["form"],
@@ -4247,6 +4270,7 @@ def create_app(
     @app.get("/api/runs/sessions", dependencies=guard)
     def run_sessions(
         host: str = "", project: str = "", slug: str = "", uid: str = "",
+        caller: Caller = Depends(require_secret),
     ) -> dict:
         """Every session record of the run's ``_runs/<slug>/`` group, oldest first.
 
@@ -4264,7 +4288,11 @@ def create_app(
             run_key(*parts)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _run_sessions_reply(config, run, parts)
+        scope = (
+            project_scope.current()
+            if projects.enabled() and caller.kind != "operator" else None
+        )
+        return _run_sessions_reply(config, run, parts, scope=scope)
 
     @app.get("/api/workrepo/schema", dependencies=guard)
     def workrepo_schema(refresh: str = "") -> dict:
