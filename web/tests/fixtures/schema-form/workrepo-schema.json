@@ -1,0 +1,40 @@
+{
+  "buckets": [
+    {
+      "adopt_command": "work adopt gitlab.example.com/unnamed/widget <short-name>",
+      "message": "host bucket `gitlab.example.com/unnamed/widget`: an unnamed repo's work, awaiting adoption (D9). Name it with one commit \u2014 `git mv` to `<short-name>/` plus a registry entry listing its remote.",
+      "path": "gitlab.example.com/unnamed/widget"
+    }
+  ],
+  "document": {
+    "counts": {
+      "error": 0,
+      "info": 2,
+      "warn": 0
+    },
+    "exit_code": 0,
+    "findings": [
+      {
+        "code": "tree.host-bucket",
+        "detail": null,
+        "message": "host bucket `gitlab.example.com/unnamed/widget`: an unnamed repo's work, awaiting adoption (D9). Name it with one commit \u2014 `git mv` to `<short-name>/` plus a registry entry listing its remote.",
+        "path": "gitlab.example.com/unnamed/widget",
+        "severity": "INFO"
+      },
+      {
+        "code": "index.readme-missing",
+        "detail": null,
+        "message": "project holds run records but its README.md carries no generated index block; the project's next durability push or `lmer-schema index --write` creates it",
+        "path": "widgets/README.md",
+        "severity": "INFO"
+      }
+    ],
+    "form": "schema",
+    "schema": 1,
+    "tool": "lmer-schema",
+    "unusable": null
+  },
+  "form": "schema",
+  "note": "lmer-schema validate --json over this daemon's mirror, exactly as the CLI prints it. Cached per mirror revision for up to ten minutes, because staleness findings move with the clock; ?refresh=1 re-validates now. No pull is forced. A host bucket is adopted with its `work adopt` line, after choosing the short name.",
+  "tier": "schema"
+}

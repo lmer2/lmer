@@ -63,6 +63,10 @@ def bind(request, caller, body):
         raise projects.ProjectError("Only an operator may release or park a conversation request.", status=403)
     if caller.kind != "operator" and path in ("/api/project-context", "/api/project-relay"):
         raise projects.ProjectError("Only an operator may explicitly share context between projects.", status=403)
+    # The validator's document spans every project in the work repo; the
+    # fleet panel that reads it is the operator's all-projects view.
+    if caller.kind != "operator" and path == "/api/workrepo/schema":
+        raise projects.ProjectError("Only an operator may read the whole work repo's validator report.", status=403)
     candidates = [value for value in (
         body.get("workspace_id"), query.get("workspace_id"),
         request.headers.get("x-lmer-workspace-id"), request.path_params.get("workspace_id"),
@@ -116,7 +120,7 @@ def bind(request, caller, body):
         "/api/state", "/api/rescan", "/api", "/", "/api/assistant/config",
         "/api/comms/feed", "/api/comms/questions", "/api/comms/connectors", "/api/spawn-options",
         "/api/prune", "/api/runs/forget",
-        "/api/assistant/peers",
+        "/api/assistant/peers", "/api/workrepo/schema",
     } or path.startswith(("/assets/", "/api/slots"))
     operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
         f"/api/sessions/{session}/messages", f"/api/sessions/{session}/log", f"/api/sessions/{session}/ask",

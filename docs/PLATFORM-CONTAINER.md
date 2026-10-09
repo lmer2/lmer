@@ -160,6 +160,11 @@ The table is the *default* install. What a config file can add to it is
 — `lmer_bin`, `secret_file`, `work_repo_mirror` — each of which has to be
 mounted path-identically or removed before this topology is honest.
 
+The control UI's validator panels (`GET /api/workrepo/schema`) run
+`lmer-schema validate` in-process in the daemon, against the work-repo mirror
+already under the state mount. The run is read-only, and there is nothing new
+to mount or configure.
+
 Credentials for git, incidentally, do not have to be mounted at all: the daemon
 loads `~/.lmer/.env` at startup (`_load_env_files`,
 `src/lmer_platform/daemon.py:584-601`, via `apply_env_file_defaults` in

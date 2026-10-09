@@ -362,6 +362,46 @@ consult relevant prior exchanges when context is missing.
   recommends a rotation at its next breakpoint. Off by default; it never rotates
   anything itself. Full behaviour in the section below.
 
+### Schema-form views
+
+Three views appear only when the work repo is in schema form (#374). The fleet
+payload's `state.mirror.form` says which form the mirror is in: `schema`,
+`legacy`, or `null` when there is no mirror. It is a presence test for the
+manifest and runs no validation. A legacy tree shows no change: nothing extra
+mounts and no extra request is sent.
+
+- **Sessions per target** — in a run's detail view, for a row that carries a
+  `uid`, the "launches of this target" panel lists every session record in the
+  run's `_runs/<slug>/` group, oldest start first. Each row shows the short uid
+  (with a copy button), the `--<name>` suffix, chips for "this run", `live`, and
+  the row's project when it differs from the run's, then the status, the record
+  state (`active`, `stale`, `seeded`, …) and when it started. **resume** opens a
+  form under that row (slot, direction, and project confirmation when needed) and
+  posts the row's own `uid`, so it continues that launch and no other. A row this
+  orchestrator does not track is read-only and says so; adopt it to continue it
+  from here. The data comes from
+  `GET /api/runs/sessions?host=&project=&slug=|uid=`, which reads the daemon's
+  mirror without pulling, so a launch that pushed seconds ago can be missing for
+  one interval.
+- **Work repo** — once, at the bottom of the all-projects fleet view, because the
+  work repo belongs to no single project. It holds the two panels below, both
+  read from `GET /api/workrepo/schema`, and a **re-validate** button. It reloads
+  when the mirror's HEAD changes.
+  - **Unnamed repos awaiting adoption** — built from the validator's
+    `tree.host-bucket` findings. Each bucket shows its path and a copyable
+    `work adopt <host>/<project> <short-name>` line. Replace `<short-name>` with
+    the name you want before you run it: the platform never derives a name, and
+    the panel has no adopt action.
+  - **Validator findings** — renders `lmer-schema validate --json` over the
+    mirror, exactly as the CLI prints it for that tree. A form/tier header comes
+    first, then a count summary, then each finding's severity, code, path and
+    message. Only errors affect conformance. An unusable manifest is shown as
+    the validator's verdict, not as an API failure.
+
+The validation is cached per mirror HEAD for up to ten minutes, because
+staleness findings move with the clock. **re-validate** (`?refresh=1`) runs it
+again now. Neither route ever pulls, and a legacy tree is never validated.
+
 ## Assistant mentions and DM replies
 
 The daemon owns Slack and Matrix ingress for the assistant. Enable
