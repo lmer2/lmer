@@ -87,6 +87,8 @@ def answer_recording_lmer(tmp_path):
         # getattr rather than ns.session so a suite run against a CLI without the
         # flag reports the missing *flag* rather than dying inside the stub.
         "           'session': getattr(ns, 'session', None),\n"
+        "           'repo': getattr(ns, 'repo', None),\n"
+        "           'launch_uid': getattr(ns, 'launch_uid', None),\n"
         "           'source_session': os.environ.get('LMER_SOURCE_SESSION_ID'),\n"
         "           'allow_unsigned': os.environ.get('LMER_ALLOW_UNSIGNED_SOURCE')}\n"
         f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
@@ -582,6 +584,409 @@ def test_a_legacy_tree_answer_carries_no_session_id(config, waiting_run,
     assert not any(
         arg.startswith(spawn.SESSION_FLAG) for arg in child_payload(dump)["argv"]
     )
+
+
+# --- schema 2: answering a record addressed by its uid (spec §6.4) -----------
+#
+# The answer path's half of resume's schema-2 section: a record carrying
+# ``session.uid`` is one execution, the answering session founds its own record
+# with it as read-only context, and the slug-era rules — the landing check, the
+# live refusal, ``note_session`` on the asking row, "records no target" — are
+# lifted for it. Legacy behaviour is pinned by every test above.
+
+UID = "0123456789abcdef" * 2
+OTHER_UID = "fedcba9876543210" * 2
+REPO = "https://gitlab.example.com/agents/global"
+
+
+def plant_schema_two_manifest(config):
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
+    )
+
+
+def plant_question_execution(config, uid=UID, *, taskdef=TASKDEF, target=TARGET):
+    """A signed-out schema-2 record stopped on a question."""
+    slug = run_state.derive_slug(taskdef, target or "")
+    path = config.mirror_path / HOST / PROJECT / "_runs" / slug / uid
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.yaml").write_text(
+        "\n".join([
+            "schema: 2",
+            "status: in-progress",
+            f"slug: {json.dumps(slug)}",
+            f"taskdef: {json.dumps(taskdef)}",
+            f"target: {json.dumps(target or '')}",
+            "stop_reason: question",
+            f"open_question: {json.dumps(QUESTION)}",
+            "session:",
+            f"  uid: {uid}",
+            "  operator: alice",
+            "  hostname: build.example",
+            "  started_at: 2026-09-17T12:00:00Z",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (path / "events.jsonl").write_text(
+        "".join(
+            json.dumps({"ts": "2026-09-17T12:00:00Z", "type": kind}) + "\n"
+            for kind in ("run_seeded", "session_start", "session_end")
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def track_execution(uid=UID, *, taskdef=TASKDEF, target=TARGET, repo=REPO,
+                    session_id=None, source="spawned"):
+    return runs.track(
+        HOST, PROJECT, run_state.derive_slug(taskdef, target or ""), uid=uid,
+        source=source, taskdef=taskdef, target=target or None, repo=repo,
+        session_id=session_id,
+    )
+
+
+def uid_answer(uid=UID, answer="yes — start empty.", **fields):
+    return answer_mod.AnswerRequest(
+        host=HOST, project=PROJECT, uid=uid, answer=answer, **fields
+    )
+
+
+def spawned_argv(dump):
+    """The recorded argv less the spawn's per-session ``--mount-dir`` pairs,
+    which are its own plumbing and not what an answer decides."""
+    argv, kept = child_payload(dump)["argv"], []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--mount-dir":
+            skip = True
+        else:
+            kept.append(arg)
+    return kept
+
+
+def answer_argv(*head, answer="yes — start empty.", repo=None, launch_uid):
+    argv = [*head, "--fastapi", spawn.NO_THREAD_CONNECTORS_FLAG]
+    if repo is not None:
+        argv.append(f"{spawn.REPO_FLAG}={repo}")
+    argv += [
+        f"{spawn.SOURCE_SESSION_FLAG}={UID}",
+        f"{answer_mod.ANSWER_FLAG}={answer}",
+        f"{spawn.LAUNCH_UID_FLAG}={launch_uid}",
+    ]
+    return argv
+
+
+def test_a_uid_addressed_answer_needs_no_slug(config, answer_recording_lmer):
+    _script, dump = answer_recording_lmer
+    plant_schema_two_manifest(config)
+    plant_question_execution(config)
+    tracked = track_execution()
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    new_uid = result.session.uid
+    assert new_uid and new_uid != UID
+    assert spawned_argv(dump) == answer_argv(TASKDEF, TARGET, launch_uid=new_uid)
+    payload = child_payload(dump)
+    assert payload["session"] is None, "session_id is never set for schema 2"
+    assert payload["source_session"] == UID
+    assert result.slug == tracked.slug
+    reply = result.to_dict()
+    assert reply["run"]["uid"] == UID
+    assert reply["started"]["uid"] == new_uid
+    assert "warning" in reply
+
+
+def test_a_record_whose_uid_is_not_its_directorys_is_refused(config):
+    """A copied record: ``--source-session`` would name the directory while the
+    reply and the event named the state's uid."""
+    plant_schema_two_manifest(config)
+    path = plant_question_execution(config)
+    state = path / "state.yaml"
+    state.write_text(state.read_text(encoding="utf-8").replace(
+        f"  uid: {UID}", f"  uid: {OTHER_UID}"), encoding="utf-8")
+    track_execution()
+
+    with pytest.raises(answer_mod.NotAnswerable, match=OTHER_UID) as caught:
+        answer_mod.answer_run(config, uid_answer())
+
+    assert UID in str(caught.value)
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_an_unmigrated_record_in_a_schema_two_mirror_gets_no_schema_two_keys(config):
+    """``run.uid``, ``warning`` and ``started`` together or not at all: a
+    record with no ``session.uid`` is answered as a legacy one, though the
+    schema-2 spawn mints the answering execution a uid."""
+    plant_schema_two_manifest(config)
+    path = plant_run(config, session_id=SESSION_ID)
+    (path / "events.jsonl").write_text("".join(
+        json.dumps({"ts": "2026-09-17T12:00:00Z", "type": kind}) + "\n"
+        for kind in ("run_seeded", "session_start", "session_end")
+    ), encoding="utf-8")
+    track_run()
+
+    result = answer_mod.answer_run(config, request_for())
+
+    reply = result.to_dict()
+    assert result.uid is None and result.session.uid, "precondition: a minted uid"
+    assert "warning" not in reply and "started" not in reply
+    assert "uid" not in reply["run"]
+
+
+@pytest.mark.parametrize("uid", ["A" * 32, "a" * 31, "g" * 32, 5])
+def test_an_answer_uid_that_is_not_32_lowercase_hex_is_refused(config, uid):
+    with pytest.raises(answer_mod.AnswerError, match="uid") as caught:
+        answer_mod.answer_run(config, uid_answer(uid=uid))
+    assert caught.value.status == 400
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_an_unresolved_entry_is_refused_with_its_candidates(config):
+    """Never "the newest record in the group": the row lists what to re-adopt."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, UID)
+    plant_question_execution(config, OTHER_UID)
+    tracked = track_run()
+    candidates = [
+        {"uid": UID, "started_at": "2026-09-17T12:00:00Z", "name": None},
+        {"uid": OTHER_UID, "started_at": "2026-09-18T12:00:00Z", "name": None},
+    ]
+    assert runs.mark_unresolved(tracked.key, candidates)
+
+    with pytest.raises(resume_mod.RunUnresolved) as caught:
+        answer_mod.answer_run(config, request_for())
+
+    assert (caught.value.status, caught.value.code) == (409, "run_unresolved")
+    assert caught.value.to_dict()["candidates"] == candidates
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_two_answers_to_one_source_both_start(
+    config, answer_recording_lmer, monkeypatch
+):
+    """A fork, not a duplicate: the second answer starts, and says who else is
+    on the project (spec §6.3)."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config)
+    track_execution()
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+
+    first = answer_mod.answer_run(config, uid_answer())
+    pids = [first.session.pid]
+    try:
+        assert wait_for(
+            lambda: registry.is_live(registry.read_session(first.session.session_id))
+        )
+        second = answer_mod.answer_run(config, uid_answer())
+        pids.append(second.session.pid)
+
+        assert first.to_dict()["warning"] is None
+        warning = second.to_dict()["warning"]
+        assert warning and first.session.session_id in warning
+        assert first.session.uid != second.session.uid
+    finally:
+        for pid in pids:
+            os.kill(pid, 9)
+
+
+def test_the_asking_row_keeps_its_session_and_the_answer_is_its_own_row(config):
+    """#229 for schema-2 rows."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config)
+    track_execution(session_id="s-asker")
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    assert runs.get_tracked(HOST, PROJECT, uid=UID).last_session_id == "s-asker"
+    answering = runs.get_tracked(HOST, PROJECT, uid=result.session.uid)
+    assert answering.last_session_id == result.session.session_id
+
+
+def test_an_empty_target_record_is_answered_with_the_transport_url(
+    config, answer_recording_lmer
+):
+    """#537: the caller's URL is the transport; the ``https://host/project``
+    reconstruction stays identity-only and is never what ``--repo`` names."""
+    _script, dump = answer_recording_lmer
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, taskdef="chat", target="")
+    track_execution(taskdef="chat", target="", repo=None, source="adopted")
+    supplied = "git@gitlab.example.com:agents/global.git"
+
+    result = answer_mod.answer_run(config, uid_answer(repo_url=supplied))
+
+    assert spawned_argv(dump) == answer_argv(
+        "chat", repo=supplied, launch_uid=result.session.uid
+    )
+    assert child_payload(dump)["repo"] == supplied
+
+
+def test_an_empty_target_record_with_no_transport_url_is_asked_for_one(config):
+    """No recorded and no supplied URL: the reconstruction would round-trip to
+    the identity, which is exactly why it is never a clone URL."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, taskdef="chat", target="")
+    track_execution(taskdef="chat", target="", repo=None, source="adopted")
+
+    with pytest.raises(resume_mod.RepoUrlRequired, match="with the answer"):
+        answer_mod.answer_run(config, uid_answer())
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_callers_repo_url_is_the_transport_over_the_recorded_one(
+    config, answer_recording_lmer
+):
+    """The request's ``repo_url`` is read: supplied beats recorded, as on resume
+    (the one transport rule, :func:`lmer_platform.resume._repo_url_for`)."""
+    _script, dump = answer_recording_lmer
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, taskdef="chat", target="")
+    track_execution(taskdef="chat", target="", repo=REPO)
+    supplied = "git@gitlab.example.com:agents/global.git"
+
+    result = answer_mod.answer_run(config, uid_answer(repo_url=supplied))
+
+    assert spawned_argv(dump) == answer_argv(
+        "chat", repo=supplied, launch_uid=result.session.uid
+    )
+
+
+def test_a_transport_url_naming_another_project_is_refused_and_scrubbed(config):
+    """Checked against the asking record's own project — and a transport URL
+    may carry a credential, which no refusal repeats."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, taskdef="chat", target="")
+    track_execution(taskdef="chat", target="", repo=None, source="adopted")
+
+    with pytest.raises(resume_mod.RepoUrlRequired, match="but the run is") as caught:
+        answer_mod.answer_run(config, uid_answer(
+            repo_url="https://oauth2:s3cr3t-token@gitlab.example.com/someone/else.git"
+        ))
+
+    assert "s3cr3t-token" not in str(caught.value)
+    assert "s3cr3t-token" not in json.dumps(caught.value.to_dict())
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_registrys_identity_spelling_is_refused_as_a_transport(config):
+    """Review !387 round 3, discussion 12: ``gitlab.example.com/agents/global``
+    folds to the run's own project through the registry, but nothing can
+    clone from it."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 2\nname: example-plexus\nprojects:\n  global:\n"
+        f"    repo: {HOST}/{PROJECT}\n",
+        encoding="utf-8",
+    )
+    path = plant_question_execution(config, taskdef="chat", target="")
+    moved = config.mirror_path / "global" / "_runs" / "chat" / UID
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    path.rename(moved)
+    track_execution(taskdef="chat", target="", repo=None, source="adopted")
+
+    with pytest.raises(resume_mod.RepoUrlRequired, match="not a clone URL"):
+        answer_mod.answer_run(config, uid_answer(repo_url=f"{HOST}/{PROJECT}"))
+    assert registry.list_sessions(live_only=False) == []
+    assert runs.get_tracked(HOST, PROJECT, uid=UID).repo is None
+
+
+#: A document inside the repository (``reference``) and a URL on no forge
+#: (``other``): neither carries the clone, so both launch on ``--repo``.
+DOC_TARGET = "https://gitlab.example.com/agents/global/-/blob/main/README.md"
+OTHER_TARGET = "https://docs.example.org/notes/42"
+
+
+@pytest.mark.parametrize("target", [DOC_TARGET, OTHER_TARGET], ids=["reference", "other"])
+def test_a_target_that_cannot_carry_the_clone_keeps_its_place_on_the_transport(
+    config, answer_recording_lmer, target
+):
+    _script, dump = answer_recording_lmer
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, taskdef="chat", target=target)
+    track_execution(taskdef="chat", target=target, repo=REPO)
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    assert spawned_argv(dump) == answer_argv(
+        "chat", target, repo=REPO, launch_uid=result.session.uid
+    )
+
+
+def test_a_uid_request_for_a_record_that_is_no_execution_still_checks_liveness(config):
+    """The live check a uid request skips up front, because only the record
+    says whether it is a schema-2 execution, runs once that record turns out
+    not to be one — an unmigrated record under a uid-named dir here."""
+    plant_schema_two_manifest(config)
+    path = plant_question_execution(config)
+    state = path / "state.yaml"
+    state.write_text(
+        "".join(line for line in state.read_text(encoding="utf-8").splitlines(True)
+                if not line.startswith("  uid:")),
+        encoding="utf-8",
+    )
+    tracked = track_execution()
+    registry.register(
+        "s-live", pid=os.getpid(),
+        run={"host": HOST, "project": PROJECT, "slug": tracked.slug},
+    )
+
+    with pytest.raises(answer_mod.NotAnswerable, match="already has a live session"):
+        answer_mod.answer_run(config, uid_answer())
+    assert len(registry.list_sessions(live_only=False)) == 1
+
+
+def test_a_legacy_answer_reply_keeps_its_exact_shape(config, waiting_run):
+    """``warning`` and ``started`` are schema-2 keys: a schema-1 reply is the
+    one clients were written against."""
+    result = answer_mod.answer_run(config, request_for())
+
+    reply = result.to_dict()
+    assert set(reply) == {"run", "question", "session", "note"}
+    assert set(reply["run"]) == {"host", "project", "slug"}
+
+
+def test_a_schema_two_answer_event_names_both_executions(config):
+    plant_schema_two_manifest(config)
+    plant_question_execution(config)
+    track_execution()
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    answered = [e for e in store.read_events() if e["type"] == "run_answered"][-1]
+    assert answered["data"]["run"]["uid"] == UID
+    assert answered["data"]["started"]["uid"] == result.session.uid
+
+
+def test_a_legacy_answer_event_keeps_its_shape(config, waiting_run):
+    answer_mod.answer_run(config, request_for())
+
+    answered = [e for e in store.read_events() if e["type"] == "run_answered"][-1]
+    assert set(answered["data"]) == {"run", "session", "answer_chars"}
+    assert set(answered["data"]["run"]) == {"host", "project", "slug"}
+
+
+def test_a_repository_target_record_is_answered(config, answer_recording_lmer):
+    """A record whose target is a bare clone URL (written before §6.5 moved
+    such a target into ``repo_url``) stays answerable."""
+    _script, dump = answer_recording_lmer
+    repo_target = "https://gitlab.example.com/agents/global.git"
+    plant_schema_two_manifest(config)
+    plant_question_execution(config, target=repo_target)
+    track_execution(target=repo_target)
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    assert result.session.uid
+    assert child_payload(dump)["task"] == TASKDEF
+    assert spawned_argv(dump) == answer_argv(
+        TASKDEF, repo=REPO, launch_uid=result.session.uid
+    ), "the repository is --repo alone, with no positional beside it"
+    assert not child_payload(dump)["target"]
 
 
 # --- the platform writes no run state (spec D3) ------------------------------

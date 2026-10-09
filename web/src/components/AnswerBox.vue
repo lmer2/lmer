@@ -55,6 +55,10 @@ const selectedSlot = ref(null)
 const busy = ref(false)
 const error = ref(null)
 const startedSession = ref(null)
+// The daemon accepted the answer and started a session, but has something to say
+// about it — the concurrency note (spec §6.3), the same key the resume reply
+// carries and RunDetail renders as `resumeStarted.warning`.
+const startedWarning = ref(null)
 const unsignedSource = ref(null)
 
 const note = computed(() => props.run.attention?.note || '')
@@ -86,6 +90,7 @@ async function submitWithDecision(allowUnsignedSource = null) {
       },
     )
     startedSession.value = result.session?.session_id || 'a new session'
+    startedWarning.value = result.warning || null
     draft.value = ''
     unsignedSource.value = null
     emit('answered')
@@ -173,6 +178,12 @@ function cancelUnsignedSource() {
         Answer handed to {{ startedSession }}. It records the answer and clears the
         question at session start, so this run stays listed as waiting for another
         moment.
+      </v-alert>
+
+      <!-- Accepted and still worth a second look: a success with a note attached,
+           rendered the way the resume reply's warning is in RunDetail. -->
+      <v-alert v-if="startedWarning" type="warning" density="compact" class="mt-3">
+        {{ startedWarning }}
       </v-alert>
 
       <!-- Send is a labelled control on its own row (`.send-row`, style.css),

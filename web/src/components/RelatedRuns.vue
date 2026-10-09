@@ -161,7 +161,10 @@ function switchTo(entry) {
   // Never for a run this fleet does not carry: the shell selects out of the fleet
   // list, so it would have nothing to show and would land on a blank page.
   if (!entry.tracked) return
-  emit('open', { host: entry.host, project: entry.project, slug: entry.slug })
+  // The uid too when the relation names a schema-2 run: the shell selects by
+  // `runKey`, and without it this would open whichever row of the group came first.
+  emit('open', { host: entry.host, project: entry.project, slug: entry.slug,
+    ...(entry.uid ? { uid: entry.uid } : {}) })
 }
 
 onMounted(load)

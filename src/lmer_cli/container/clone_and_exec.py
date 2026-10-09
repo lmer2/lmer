@@ -3270,6 +3270,42 @@ def mint_session_id(*, fresh: bool = False) -> None:
     )
 
 
+def _launch_uid_names_a_record(uid: str) -> bool:
+    """True when *uid* already names a record in this project's run area.
+
+    The check has to run BEFORE ``mint_session_id(fresh=True)``:
+    ``_record_address`` resolves by launch uid first, so a reused uid would
+    otherwise adopt the existing record instead of starting a new one.
+
+    A launch with no project run area — a repo-less thread chat, or
+    ``LMER_NO_REPO`` — holds no record: ``_record_address`` only ever adopts
+    from a resolved base, so a uid with nowhere to resolve cannot collide.
+    Otherwise it fails closed: "no record" is only an answer when the area was
+    read, so a base that exists and cannot be listed raises — inside main()'s
+    session-start try, that refuses the launch. A base that does not exist yet
+    is a project with no runs, which holds no record. A group inside a listed
+    base that cannot be read is still skipped by the shared walk
+    (``run_state._record_scan``), the same walk ``_record_address`` adopts by,
+    so a record it cannot see is one this launch could not adopt either.
+    """
+    from work_repo import run_state
+
+    base = run_state.runs_base()
+    if base is None or not base.exists():
+        return False
+    try:
+        next(iter(base.iterdir()), None)
+    except OSError as exc:
+        raise RuntimeError(
+            f"the run area {base} cannot be listed ({exc.strerror or exc}), so "
+            "whether the launch uid already names a record cannot be checked"
+        ) from exc
+    return any(
+        run_state.session_id_of(record.name) == uid
+        for record in run_state.iter_record_dirs(base)
+    )
+
+
 def dispatch_runner(runner) -> int:
     """Run the harness runner as a child (not execv) so post-session teardown
     can run while the container is still alive. Returns the runner's exit code.
@@ -3462,6 +3498,13 @@ def main(argv: list[str] | None = None) -> int:
 
             process_records = schema_version(work_repo_path) >= 2
             if process_records:
+                launch_uid = os.environ.get("LMER_LAUNCH_UID")
+                if launch_uid and _launch_uid_names_a_record(launch_uid):
+                    print(
+                        "Session start refused: launch uid already names a record",
+                        file=sys.stderr,
+                    )
+                    return 2
                 inherited_source = os.environ.pop("LMER_SESSION_ID", None)
                 if inherited_source and os.environ.get("LMER_SESSION_IS_SOURCE") == "1":
                     os.environ.setdefault("LMER_SOURCE_SESSION_ID", inherited_source)
@@ -3469,6 +3512,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"Session start refused: {_scrub_credentials(str(exc))}", file=sys.stderr)
             return 2
+    if not process_records:
+        # A schema-1 (or manifest-less) tree has no execution uid to record.
+        os.environ.pop("LMER_LAUNCH_UID", None)
 
     # Canonical source resolution (sources.yaml, issue #105; the manifest's
     # `sources:` tier, issue #370): runs here — after the work-repo clone

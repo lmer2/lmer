@@ -6,7 +6,7 @@ import inspect
 
 from fastapi.routing import APIRoute
 
-from . import project_context as scope, projects, runs
+from . import project_context as scope, projects
 from . import peers, project_requests, assistant, config
 
 _REQUEST = ContextVar("project_request", default=None)
@@ -43,9 +43,7 @@ class WorkspaceRoute(APIRoute):
 
 
 def _run(data):
-    if all(data.get(key) for key in ("host", "project", "slug")):
-        return runs.run_key(data["host"], data["project"], data["slug"])
-    return None
+    return projects.key_of(data)
 
 
 def receipted(path):

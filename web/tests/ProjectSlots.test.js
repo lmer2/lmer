@@ -90,3 +90,15 @@ it('distinguishes no configuration, no held slots, loading and failed reads', as
   expect(wrapper.text()).not.toContain('Available now')
   expect(wrapper.find('.project-slot').exists()).toBe(false)
 })
+
+it('names the holder of a uid row, never its sibling in the same group', () => {
+  // Two schema-2 launches of one group share host/project/slug; the second
+  // holds the slot. A slug match would name the first.
+  const uidRuns = [alpha, beta].map((project, i) => ({ host: 'forge.test', project: 'shared/repo', slug: 'chat',
+    uid: String(i + 1).repeat(32), workspace_id: project.id, workspace_name: project.name }))
+  const heldBySecond = { host: 'forge.test', project: 'shared/repo', slug: 'chat', uid: '2'.repeat(32) }
+  const wrapper = mountPane(ProjectSlots, {
+    slots: [slot('Chat held', { state: 'occupied', occupants: [heldBySecond] })], runs: uidRuns, projects, loaded: true,
+  })
+  expect(wrapper.get('[aria-label="Service slot Chat held"] .slot-holder .v-chip').text()).toBe('Example Beta')
+})

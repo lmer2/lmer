@@ -129,6 +129,35 @@ consult relevant prior exchanges when context is missing.
 - **Answer a question** — a run stopped on a question shows a reply box.
   Answering a *stopped* run starts a fresh session with the answer attached;
   replying to a *live* one is delivered into the waiting session.
+- **Schema-2 runs are keyed by uid** — on a schema-2 work repo every launch is
+  a record of its own, so the platform mints the launch's execution uid before
+  the container starts (it passes `lmer --launch-uid`) and keys the run
+  `host/project/<uid>`; the slug is only the group label every launch of it
+  shares. A schema-1 run keeps its `host/project/<slug>` key. The `uid` comes
+  back in the spawn reply's `run` and in the resume and answer replies' `run`
+  and `started`, fleet rows carry it, and every run-keyed route (`adopt`,
+  `forget`, `meta`, `relations`, `answer`, `resume`, `files`) takes `uid`
+  beside `{host, project, slug}` (body or `?uid=`). `lmer-ctl`'s
+  `host/project/<key>` argument reads a 32-hex last segment as a uid.
+  Resuming or answering such a run starts a fresh execution with the old
+  record as read-only context: a new row of its own, while the source keeps
+  the state it stopped in.
+- **A second session on a project is a warning, not a 409** — on schema 2 a
+  second chat (or a second continuation of one record) is a separate record,
+  so nothing refuses it. The spawn, resume and answer replies' `warning`
+  carries a concurrency note instead, `N live session(s) already on
+  host/project [for <target>]: <session ids>`, narrowed to the same work item
+  when the target is one; the UI shows it. Detected and said, never enforced.
+  A schema-1 run is still one run, one session.
+- **Target-less schema-2 records resume** — a schema-2 record with an empty
+  target, a document (reference) URL, or an `other` URL (one that is not a
+  repository, a work item or a known thread) can be resumed and answered: the
+  launch names its repository with `--repo`, from the request's `repo_url` or
+  else the clone URL recorded for the run. With neither, the call is refused
+  `repo_url_required` and asks for one; the platform will not invent a URL. A
+  schema-1 record with no target is still refused. A record whose target is a
+  bare repository URL resumes on `--repo` too, with that URL dropped as the
+  positional; it lands in the same run, whose slug is the taskdef either way.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
 - **Wound down, not crashed** — a dead session's leftover registry entry is
@@ -153,8 +182,9 @@ consult relevant prior exchanges when context is missing.
   drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
   remains available across rotations, reloads, and daemon restarts.
 - **Run references in chat** — the assistant writes a run's name as a link whose
-  href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
-  view. Details worth knowing:
+  href is `lmer://run/<host>/<project>/<slug>` (`<uid>` in place of the slug
+  for a schema-2 run), and tapping it opens that run's view. Details worth
+  knowing:
   - It is an **in-app dispatch, not navigation**: no history entry, no URL to
     paste or bookmark, nothing that survives a reload. Run views are deliberately
     not browser-addressable (issue #241).
