@@ -4707,6 +4707,13 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         # The scope the apply may write: the selected project dirs, the
         # archive area and the napkin area. Non-empty in a legacy tree too.
         rels = ["_archive", "_napkin", "napkin"]
+        try:
+            projects = housekeep.project_dirs(
+                _work_repo_root(), getattr(args, "project", None)
+            )
+            rels.extend(entry.rel for entry in projects)
+        except Exception:
+            pass  # an unknown --project exits 2 in main() before any write
         rels.extend(run_candidates())
         return pushing(rels)
     if command == "memory":
