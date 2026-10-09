@@ -78,7 +78,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .runs import get_tracked, run_key
+from .runs import get_tracked, holds_conflict, merge_values, run_key
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
 )
@@ -88,7 +88,7 @@ logger = logging.getLogger("lmer_platform.meta")
 __all__ = [
     "META_FILE", "MAX_TITLE_CHARS", "MAX_DESCRIPTION_CHARS", "LOCALITY_NOTE",
     "MetaError", "RunNotTracked", "RunMeta",
-    "load_all", "read", "write", "drop",
+    "load_all", "read", "write", "drop", "rekey",
 ]
 
 META_FILE = "run_meta.json"
@@ -317,12 +317,11 @@ def write(
     with mutating(_meta_path()):
         entries = load_all()
         current = RunMeta.from_dict(key, entries.get(key))
+        raw = entries.get(key) if isinstance(entries.get(key), dict) else {}
         record = {
-            "title": current.title if clean_title is None else clean_title,
-            "description": (
-                current.description
-                if clean_description is None
-                else clean_description
+            "title": _kept(raw, "title", current.title, clean_title),
+            "description": _kept(
+                raw, "description", current.description, clean_description
             ),
             "updated_at": utc_now_iso(),
         }
@@ -341,6 +340,66 @@ def write(
         key, len(record["title"]), len(record["description"]),
     )
     return RunMeta.from_dict(key, record)
+
+
+def _kept(raw: dict, field: str, current: str, supplied: Optional[str]):
+    """What *field* is written as when a caller supplied *supplied*.
+
+    A field the caller left alone keeps what is stored — including the
+    ``{"old": .., "new": ..}`` pair a :func:`rekey` collision left there, which
+    :meth:`RunMeta.from_dict` reads as empty. Writing that read back would drop
+    both values because somebody edited the *other* field.
+    """
+    if supplied is not None:
+        return supplied
+    stored = raw.get(field)
+    return stored if isinstance(stored, dict) else current
+
+
+def rekey(old_parts: tuple, new_parts: tuple) -> dict:
+    """Carry a run's metadata from one key to another (spec §6.1 transition).
+
+    *old_parts* and *new_parts* are ``(host, project, key segment)`` triples —
+    in practice a slug-keyed entry being bound to its schema-2 record's uid.
+
+    Returns ``{"moved": bool, "conflict": bool}``, the shape every store's
+    ``rekey`` returns (:mod:`lmer_platform.relations`,
+    :mod:`lmer_platform.checkin`, :mod:`lmer_platform.references`): ``moved``
+    is whether the old key held anything this call carried, ``conflict``
+    whether a field both keys held with different values was kept as both
+    (:func:`lmer_platform.runs.merge_values`). Nothing is ever dropped in lieu
+    of a conflict; the pair stays on disk until someone writes that field.
+
+    Idempotent — a second call finds nothing under the old key and returns
+    ``moved: False`` — and under the same lock as every other write here, so a
+    title set mid-transition is either carried or lands on the new key. A second
+    call still reports ``conflict`` while the new key holds a pair
+    (:func:`conflicted`): the first may have written it and crashed before the
+    transition recorded it.
+    """
+    old_key = run_key(*old_parts)
+    new_key = run_key(*new_parts)
+    if old_key == new_key:
+        return {"moved": False, "conflict": False}
+    with mutating(_meta_path()):
+        entries = load_all()
+        if old_key not in entries:
+            return {"moved": False, "conflict": holds_conflict(entries.get(new_key))}
+        merged, conflict = merge_values(entries.pop(old_key), entries.get(new_key))
+        conflict = conflict or holds_conflict(merged)
+        entries[new_key] = merged
+        _save(entries)
+    logger.info(
+        "platform_run_meta_rekeyed old=%s new=%s conflict=%s", old_key, new_key, conflict
+    )
+    return {"moved": True, "conflict": conflict}
+
+
+def conflicted(parts: tuple) -> bool:
+    """Whether the run *parts* names still holds a field :func:`rekey` kept two
+    values of. Writing that field (:func:`write` with an explicit value)
+    replaces the pair."""
+    return holds_conflict(load_all().get(run_key(*parts)))
 
 
 def drop(host: str, project: str, slug: str) -> bool:

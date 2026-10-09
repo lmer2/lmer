@@ -1337,7 +1337,7 @@ def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer
         assert status.running is True
         worker = spawn.spawn_session(
             config,
-            spawn.SpawnRequest(taskdef="develop", target="https://example.com/x"),
+            spawn.SpawnRequest(taskdef="develop", target="https://example.com/g/p/-/issues/1"),
         )
         try:
             assert worker.session_id, "the chat window took the host's only slot"

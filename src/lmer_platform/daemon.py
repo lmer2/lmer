@@ -49,10 +49,11 @@ from lmer_cli import comms as bus_comms
 from lmer_cli import runref
 from lmer_cli.tls import ensure_ca_bundle
 
-from .api import build_state, create_app
+from .api import adopt_run, build_state, create_app
 from .assistant import Supervisor, register_supervisor
 from .comms import CommsHub, register_hub
 from .connectors import ThreadConnectors, register_connectors
+from .ctl import segment_field
 from .thread_service import ThreadServices, register_services
 from .config import (
     connector_path,
@@ -67,7 +68,7 @@ from .detect import Detector
 from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
 from .resume import ResumeError, ResumeRequest, resume_run
-from .runs import forget, list_tracked, run_key, track
+from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
 from .store import StoreError, platform_dir
 from .ui_build import (
@@ -129,14 +130,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Instead list every run in the shared work repo (adoption picker)",
     )
 
-    adopt = sub.add_parser("adopt", help="Track an existing run: <host>/<project>/<slug>")
+    adopt = sub.add_parser(
+        "adopt", help="Track an existing run: <host>/<project>/<slug|uid>"
+    )
     adopt.add_argument(
         "run", help="e.g. gitlab.example.com/group/project/develop-issue-141"
     )
     adopt.add_argument("--note", help="Free-form note recorded with the entry")
 
     forget_cmd = sub.add_parser("forget", help="Stop tracking a run")
-    forget_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    forget_cmd.add_argument("run", help="<host>/<project>/<slug|uid>")
 
     setup_ui_cmd = sub.add_parser(
         "setup-ui", help="Fetch a pinned Node and build the control UI"
@@ -186,7 +189,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     resume_cmd = sub.add_parser(
         "resume", help="Continue a tracked run by starting its next session"
     )
-    resume_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    resume_cmd.add_argument("run", help="<host>/<project>/<slug|uid>")
     resume_cmd.add_argument("--slot")
     resume_cmd.add_argument("--home-revision", type=int)
     resume_cmd.add_argument("--confirm-project", action="store_true")
@@ -244,6 +247,23 @@ def _split_run_ref(raw: str) -> tuple:
             "contain slashes, but host and slug are one segment each"
         )
     return parts
+
+
+def _run_ref_fields(raw: str) -> tuple:
+    """``(host, project, slug, uid)`` for a run reference typed at the shell.
+
+    The last segment is the run's key segment (spec §6.1): 32 lowercase hex is a
+    schema-2 run's execution uid and is passed as ``uid`` with no slug — the
+    verbs read the group label off the tracked entry or the mirror — and
+    anything else is the slug, exactly as before uids. The same rule
+    ``lmer-ctl``'s ``_run_fields`` applies, and unambiguous for the reason it
+    gives: the spawn refuses a taskdef named like a uid — and it is that
+    function's rule, called (:func:`lmer_platform.ctl.segment_field`).
+    """
+    host, project, segment = _split_run_ref(raw)
+    if segment_field(segment) == "uid":
+        return host, project, None, segment
+    return host, project, segment, None
 
 
 def _overrides(args: argparse.Namespace) -> dict:
@@ -636,11 +656,15 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 
 def _cmd_adopt(args: argparse.Namespace) -> int:
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     config = load_config()
-    entry = track(host, project, slug, source="adopted", note=args.note)
+    try:
+        entry = adopt_run(config, host, project, slug, uid=uid, note=args.note)
+    except RunIndexError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
 
-    if resolve_run_dir(config, host, project, slug) is None:
+    if resolve_run_dir(config, host, project, entry.slug, uid=entry.uid) is None:
         print(
             f"⚠️  adopted {entry.key}, but no such run dir is in the mirror "
             "yet — it may not be pushed, or the mirror may be stale "
@@ -652,12 +676,23 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
 
 
 def _cmd_forget(args: argparse.Namespace) -> int:
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     # Echoed as the key the operator typed. These two lines used to compose
     # ``<host>/<project>/runs/<slug>``, which for a named run is a directory that
     # does not exist — and this verb touches no directory at all.
-    key = run_key(host, project, slug)
-    if forget(host, project, slug):
+    key = run_key(*key_parts({"host": host, "project": project, "slug": slug, "uid": uid}))
+    # Through the alias a key transition left, as ``POST /api/runs/forget``
+    # resolves it: after a bind the slug key the operator still holds is the
+    # uid entry's, and forgetting by it must reach that entry.
+    try:
+        entry = get_tracked(host, project, slug, uid=uid)
+    except RunIndexError:
+        entry = None
+    if entry is not None:
+        host, project, slug, uid, key = (
+            entry.host, entry.project, entry.slug, entry.uid, entry.key
+        )
+    if forget(host, project, slug, uid=uid):
         print(f"✅ no longer tracking {key}")
         return 0
     print(f"not tracked: {key}", file=sys.stderr)
@@ -733,12 +768,13 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     gives — it is the operator's content, and it is already in their shell history
     if they want it.
     """
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     config = load_config()
     request = ResumeRequest(
         host=host,
         project=project,
         slug=slug,
+        uid=uid,
         taskdef=args.taskdef,
         repo_url=args.repo_url,
         direction=args.direction,

@@ -725,11 +725,13 @@ SPAWN_FIXTURES = [
     "ssh://deploy:not-a-real-secret@gitlab.example.com/group/project.git",
 ]
 
-#: §2's three deltas from spawn's rules, each a repository to the classifier.
-#: ``git://`` is one only on paper (spawn's scheme set already carries it),
-#: so what is pinned is whether spawn agrees today.
+#: §2's three deltas from spawn's old rules, each a repository to the
+#: classifier. Since A2 made spawn a thin call into the classifier, the
+#: ``.git``-first rule is spawn's too; ``file://`` still records nothing
+#: because it names no host/project to file the run under. ``git://`` was
+#: one only on paper (spawn's scheme set already carried it).
 SPAWN_DELTAS = [
-    pytest.param("https://github.com/a/b/c.git", False, id="dot-git-before-the-github-rule"),
+    pytest.param("https://github.com/a/b/c.git", True, id="dot-git-before-the-github-rule"),
     pytest.param("file:///srv/git/global.git", False, id="file-url"),
     pytest.param("git://git.example.com/group/project.git", True, id="git-url"),
 ]

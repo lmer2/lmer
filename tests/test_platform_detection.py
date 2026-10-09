@@ -2454,3 +2454,45 @@ def test_a_confirm_failure_does_not_log_that_the_tick_was_skipped(
     assert said, "the confirm failure was not logged at all"
     assert not any("this tick is skipped" in message for message in said), said
     assert any("delivered unconfirmed" in message for message in said), said
+
+
+def plant_session_record(config, slug, uid, *, status):
+    """One schema-form launch record: ``_runs/<slug>/<uid>/state.yaml``."""
+    path = config.mirror_path / HOST / PROJECT / "_runs" / slug / uid
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.yaml").write_text(
+        "\n".join([
+            "schema: 1",
+            f"status: {json.dumps(status)}",
+            f"slug: {json.dumps(slug)}",
+            'taskdef: "develop"',
+            'target: "issue-141"',
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_uid_session_is_judged_by_its_own_record_not_its_group_s_newest(config):
+    """A dead uid launch whose group holds ANOTHER, finished launch stays put.
+
+    By slug the group answers with one record; by uid it answers with this
+    launch's. Sweeping on the neighbour's ``complete`` would clear the evidence
+    of a launch that never finished.
+    """
+    mine, other = "a" * 32, "f" * 32
+    plant_session_record(config, "develop-141", mine, status="in-progress")
+    finished = plant_session_record(config, "develop-141", other, status="complete")
+    by_slug = resolve_run_dir(config, HOST, PROJECT, "develop-141")
+    assert by_slug is not None and by_slug.path == finished.resolve(), (
+        "precondition: the slug lookup lands on the finished neighbour"
+    )
+    registry.register(
+        "s-uid-unwatched",
+        pid=DEAD_PID,
+        run={"host": HOST, "project": PROJECT, "slug": "develop-141", "uid": mine},
+        task={"taskdef": "develop", "target": "issue-141"},
+    )
+
+    assert detect.sweep_finished_sessions(config) == []
+    assert registry.read_session("s-uid-unwatched") is not None

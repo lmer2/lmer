@@ -145,6 +145,7 @@ class TestSessionFlag:
             "LMER_SESSION_IS_SOURCE": "1",
             "LMER_SOURCE_SESSION_ID": None,
             "LMER_ALLOW_UNSIGNED_SOURCE": None,
+            "LMER_LAUNCH_UID": None,
         }
 
     def test_unsigned_confirmation_is_bound_to_the_selected_session(self):
@@ -183,6 +184,7 @@ class TestSessionFlag:
             "LMER_SESSION_IS_SOURCE": None,
             "LMER_SOURCE_SESSION_ID": None,
             "LMER_ALLOW_UNSIGNED_SOURCE": None,
+            "LMER_LAUNCH_UID": None,
         }
 
     def test_host_env_session_id_is_not_forwarded(self):

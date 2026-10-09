@@ -106,6 +106,7 @@ from .ingress import Ingress
 from . import references
 from . import reattach
 from . import relations
+from . import run_transition
 from . import session_io
 from . import session_threads
 from . import statusline
@@ -152,7 +153,9 @@ from .registry import list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
-    RunIndexError, filter_forgotten, forget, list_tracked, run_for_session, run_key, track,
+    UID_RE, RunIndexError, TrackedRun, filter_forgotten, forget, get_tracked, key_parts,
+    key_parts_lenient, keys as tracked_keys_of, list_tracked, run_for_session,
+    run_of_session, run_key, track,
 )
 from .session_io import ControlPlaneError, SessionIOError
 # ``_repo_urls`` and ``derive_run_identity`` are the pair that predicts a run's
@@ -182,6 +185,7 @@ from .spawn import (
     _repo_urls,
     absorb_ports,
     derive_run_identity,
+    schema_two,
     spawn_session,
 )
 from .store import StoreError, utc_now_iso
@@ -357,7 +361,242 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
     }
 
 
-def _meta_reply(host: str, project: str, slug: str, record) -> dict:
+def _run_parts(mapping, *, field: Optional[str] = None) -> tuple:
+    """``(host, project, key segment)`` for the run a request names (spec §6.1).
+
+    Every run-keyed route takes ``uid`` beside ``{host, project, slug}``, on the
+    body for a write and on the query string for a read, and addresses the
+    record by it when it is present. The segment comes from
+    :func:`lmer_platform.runs.key_parts`, the one spelling of that rule.
+
+    Two cases are answered before ``key_parts`` on purpose. A ``uid`` that is
+    present but not 32 lowercase hex is refused here with the run it was about
+    named (``key_parts`` refuses it too, but without that context), so a
+    mistyped uid never reaches the group's slug-keyed entry. And a request ``key_parts``
+    refuses is handed through as its own three fields, so the store's
+    :func:`lmer_platform.runs.run_key` gives the refusal it always gave, naming
+    the field that is missing; a schema-1 request is answered byte for byte as
+    before uids existed. *field* prefixes the uid refusal with which run it was
+    about, for a body that names two.
+
+    A request with no uid is keyed by :func:`_bound_uid`, so a slug a client
+    held from before a key transition addresses the record its entry was bound
+    to rather than whatever the slug alone would reach.
+    """
+    uid = mapping.get("uid")
+    if uid is not None and uid != "" and not (isinstance(uid, str) and UID_RE.match(uid)):
+        prefix = f"{field}: " if field else ""
+        raise RunIndexError(f"{prefix}uid must be 32 lowercase hex, got {uid!r}")
+    try:
+        return key_parts({**mapping, "uid": _bound_uid(mapping)})
+    except RunIndexError:
+        return (mapping.get("host"), mapping.get("project"), mapping.get("slug"))
+
+
+def _bound_uid(mapping) -> Optional[str]:
+    """The uid a request addresses: its own, else its slug's bound entry's.
+
+    After a key transition the slug-keyed entry is gone and its key is an alias
+    of the uid-keyed one (:mod:`lmer_platform.run_transition`), so a client
+    still holding the slug reference reaches the bound entry through
+    :func:`lmer_platform.runs.get_tracked` — and that entry's uid is the record
+    it means. Keying the read by the slug instead resolves the GROUP, whose
+    newest record is another launch's whenever the bound one is not the newest;
+    keying a write by it re-creates the slug-keyed state the transition moved.
+
+    ``None`` for every schema-1 request: an unbound entry, an untracked run and
+    an incomplete identity carry no uid, and :func:`_run_parts` then keys by the
+    slug exactly as before uids.
+    """
+    uid = mapping.get("uid")
+    if uid:
+        return uid
+    try:
+        entry = get_tracked(mapping.get("host"), mapping.get("project"), mapping.get("slug"))
+    except RunIndexError:
+        return None
+    return entry.uid if entry is not None else None
+
+
+def _run_echo(mapping) -> dict:
+    """The run a request named, as the ``run`` object of its reply.
+
+    Echoed as sent rather than as :func:`_run_parts` normalised it, which is
+    what every reply here did before uids; ``uid`` appears only when the request
+    carried one, so a schema-1 reply keeps exactly the shape it had.
+
+    Beside a uid the ``slug`` is the tracked entry's group label, and ``None``
+    for a uid no entry holds: the uid decided which run the request was about,
+    so a slug the caller sent beside it — perhaps another group's — is not
+    repeated back as if it were this run's.
+    """
+    run = {"host": mapping.get("host"), "project": mapping.get("project"),
+           "slug": mapping.get("slug")}
+    if mapping.get("uid"):
+        run["uid"] = mapping["uid"]
+        try:
+            entry = get_tracked(run["host"], run["project"], uid=run["uid"])
+        except RunIndexError:
+            entry = None
+        run["slug"] = entry.slug if entry is not None else None
+    return run
+
+
+def _query_run(host: str, project: str, slug: str, uid: str) -> dict:
+    """A read route's query parameters as the mapping a body would be."""
+    return {"host": host, "project": project, "slug": slug, "uid": uid}
+
+
+def adopt_run(
+    config: PlatformConfig,
+    host: str,
+    project: str,
+    slug: Optional[str] = None,
+    *,
+    uid: Optional[str] = None,
+    note: Optional[str] = None,
+) -> TrackedRun:
+    """Track a run an operator names, by slug or by execution uid.
+
+    The one adoption path for ``POST /api/runs/adopt`` and ``lmer platform
+    adopt``, so the two cannot disagree about what naming a uid does.
+
+    By slug it is :func:`lmer_platform.runs.track`, exactly as before uids.
+
+    By uid (spec §6.1) there are three cases, tried in this order:
+
+    - the uid is already tracked: refreshed (the note), never re-sourced, and
+      its ``conflict`` mark rechecked (:func:`lmer_platform.run_transition.recheck_conflict`);
+    - a slug-keyed entry with no uid that the key transition left
+      **unresolved** with this uid among its candidates is **bound** to this
+      record through :func:`lmer_platform.run_transition.bind`, which carries
+      its meta, relations, marks, references and home under the new key. That
+      is the operator's answer to a ``re-adopt by uid`` row, and tracking a
+      second row beside the old one instead would leave the old row unresolved
+      forever. The entry is the one the body's ``slug`` names when it names
+      one, else the one of the record's own group;
+    - otherwise a new uid-keyed entry, labelled with the slug the mirror records
+      for that uid. A slug resolving to an entry already bound to another uid is
+      not a reason to re-key that launch: this uid is a row of its own.
+
+    Before any of that, each uid-less entry the adopt could bind is examined by
+    the transition itself (:func:`lmer_platform.run_transition.settle`), so an
+    entry no state build has looked at yet — the daemon CLI never builds
+    state, and an adopt can land before the first build after an upgrade —
+    gets the launcher proof every other bind gets. If that binds it to this
+    uid, the uid is tracked and is refreshed as above; if it binds it to
+    another launch, this uid becomes a row of its own beside it; if it leaves
+    it unresolved, the candidate check applies. Binding the unexamined entry
+    straight to the named uid instead would move another launch's title,
+    relations and home onto this one whenever its last session proves it was
+    that other launch. The one bind the slug alone justifies — the group's
+    only record is this uid and nothing contradicts it — is the transition's
+    own rule 2, so it is made there.
+
+    A uid the mirror does not know is tracked only when the caller supplies the
+    slug to label it with — adopting ahead of a push, as a slug adoption may.
+
+    Two refusals guard the bind, because it moves platform state that is not
+    the record's. The entry bound must hold the record — the transition listed
+    this uid among its candidates — or a body slug naming another run would
+    carry that run's title, relations and home onto a launch they never
+    described. And a uid is adopted only on a schema-2 mirror
+    (:func:`lmer_platform.spawn.schema_two`): a legacy work repo has no
+    execution records, so a uid there names nothing a container will ever
+    write.
+    """
+    if uid is None or uid == "":
+        return track(host, project, slug, source="adopted", note=note)
+    if not (isinstance(uid, str) and UID_RE.match(uid)):
+        raise RunIndexError(f"uid must be 32 lowercase hex, got {uid!r}")
+    run_key(host, project, uid)
+    try:
+        uid_keyed = schema_two(config)
+    except SpawnError as exc:
+        raise RunIndexError(str(exc)) from exc
+    if not uid_keyed:
+        raise RunIndexError(
+            f"cannot adopt {uid}: the work repo is not schema 2, so it has no "
+            "execution records to address by uid — adopt the run by its slug"
+        )
+    existing = get_tracked(host, project, uid=uid)
+    if existing is not None:
+        return _refresh_adopted(host, project, existing, note)
+    ref = resolve_run_dir(config, host, project, uid=uid)
+    labels = list(dict.fromkeys(
+        label for label in (slug, ref.slug if ref is not None else None) if label
+    ))
+    for label in labels:
+        run_transition.settle(config, host, project, label)
+    existing = get_tracked(host, project, uid=uid)
+    if existing is not None:
+        return _refresh_adopted(host, project, existing, note)
+    for label in labels:
+        entry = get_tracked(host, project, label)
+        if entry is not None and entry.uid is None:
+            if not _holds_record(entry, uid):
+                raise RunIndexError(
+                    f"run {entry.key} does not hold record {uid}, which "
+                    + (
+                        f"sits in group {ref.slug!r}" if ref is not None
+                        else "is not in the mirror"
+                    )
+                    + " — binding it would move that run's state onto another "
+                    "launch; name the record's own slug, or none"
+                )
+            bound = run_transition.bind(config, host, project, entry.slug, uid)
+            if note is None:
+                return bound
+            return track(host, project, bound.slug, uid=uid, source="adopted", note=note)
+    label = ref.slug if ref is not None else slug
+    if not label:
+        raise RunIndexError(
+            f"no record {uid} for {host}/{project} is in the mirror, so there is no "
+            "slug to track it under — supply the slug, or wait for the record to be "
+            "pushed and the mirror to pull it (POST /api/rescan)"
+        )
+    return track(host, project, label, uid=uid, source="adopted", note=note)
+
+
+def _refresh_adopted(host: str, project: str, existing: TrackedRun,
+                     note: Optional[str]) -> TrackedRun:
+    tracked = track(host, project, existing.slug, uid=existing.uid, source="adopted",
+                    note=note)
+    # Re-adopting is how an operator says a conflicting carry is resolved;
+    # the mark goes for every store whose pair has been written since
+    # (:func:`lmer_platform.runs.settle_conflict`).
+    run_transition.recheck_conflict(tracked.key)
+    return tracked
+
+
+def _holds_record(entry: TrackedRun, uid: str) -> bool:
+    """Whether the slug-keyed *entry* may be bound to the record *uid*.
+
+    Only when the key transition left it unresolved with *uid* among its
+    candidates — the transition's own word that this entry may be that launch.
+    :func:`adopt_run` has had the transition examine the entry first, so an
+    entry whose group alone proves the record is already bound by now, and a
+    group match is never a reason on its own: two records in one group are
+    exactly the case the launcher rule decides.
+    """
+    mark = run_transition.readopt_marks().get(entry.key) or {}
+    return any(
+        isinstance(candidate, dict) and candidate.get("uid") == uid
+        for candidate in mark.get("candidates") or []
+    )
+
+
+def _candidate_uid(ref) -> Optional[str]:
+    """The execution uid of the record a candidate row addresses, or ``None``.
+
+    :attr:`RunDirRef.uid`, which :func:`lmer_platform.workrepo.run_dirs` sets
+    for a schema-form session dir named by its uid and leaves ``None`` for a
+    legacy run dir and an unmigrated record.
+    """
+    return ref.uid or None
+
+
+def _meta_reply(run: dict, record) -> dict:
     """The body both metadata routes answer with (T52).
 
     One shape for the read and the write, so a client that just set a title does
@@ -372,7 +611,7 @@ def _meta_reply(host: str, project: str, slug: str, record) -> dict:
     the run — see :mod:`lmer_platform.meta`.
     """
     return {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "meta": record.to_dict(),
         "limits": {
             "title": meta.MAX_TITLE_CHARS,
@@ -383,15 +622,17 @@ def _meta_reply(host: str, project: str, slug: str, record) -> dict:
     }
 
 
-def _related_ref(body: dict) -> tuple:
-    """The *other* run named by a relate/unrelate body, as a triple.
+def _related_ref(body: dict) -> dict:
+    """The *other* run named by a relate/unrelate body, as the object it was sent as.
 
     One nested object rather than three more top-level fields, and that is the
     decision worth stating: the thing being related is a **run**, so it carries a
-    run's three field names — ``related_host``/``related_project``/``related_slug``
+    run's field names — ``related_host``/``related_project``/``related_slug``
     would be a second spelling of the identity every other route on this API
-    already has one spelling for. The refusal names the shape because the mistake
-    it catches (a bare string, or the composite key) is the natural one.
+    already has one spelling for, and the ``uid`` a schema-2 run is addressed by
+    (spec §6.1) rides in it the same way. The refusal names the shape because
+    the mistake it catches (a bare string, or the composite key) is the natural
+    one.
 
     Raises :class:`lmer_platform.relations.RelationError` rather than an
     ``HTTPException`` so the two routes keep one handler and one status source —
@@ -404,21 +645,10 @@ def _related_ref(body: dict) -> tuple:
             '"project": ..., "slug": ...}, the same three fields this body names '
             f"the first run with — got {type(related).__name__}"
         )
-    return related.get("host"), related.get("project"), related.get("slug")
+    return related
 
 
-def _run_ref_dict(run: tuple) -> dict:
-    """A ``(host, project, slug)`` triple as the object every reply names a run with.
-
-    Echoed back on a write so a caller reading the reply alone can see which two
-    runs it acted on, in the shape ``run`` already uses on the same body.
-    """
-    return {"host": run[0], "project": run[1], "slug": run[2]}
-
-
-def _relations_reply(
-    host: str, project: str, slug: str, extra: Optional[dict] = None
-) -> dict:
+def _relations_reply(run: dict, extra: Optional[dict] = None) -> dict:
     """The body all three relation routes answer with (T53).
 
     One shape for the read and both writes, for :func:`_meta_reply`'s reason: a
@@ -440,7 +670,7 @@ def _relations_reply(
     """
     titles = meta.load_all()
     payload = {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "relations": [
             {
                 **entry.to_dict(),
@@ -448,7 +678,7 @@ def _relations_reply(
                     entry.key, titles.get(entry.key)
                 ).title,
             }
-            for entry in relations.list_for(host, project, slug)
+            for entry in relations.list_for(*_run_parts(run))
         ],
         # The daemon's own cap, so a UI can say how many are left from the number
         # that will actually refuse the next one rather than from a copy of it.
@@ -668,9 +898,7 @@ def _run_dir_files(root: Path) -> tuple[list[str], bool]:
     return found[:_MAX_RUN_FILES], len(found) > _MAX_RUN_FILES
 
 
-def _run_files_reply(
-    config: PlatformConfig, host: str, project: str, slug: str
-) -> dict:
+def _run_files_reply(config: PlatformConfig, run: dict) -> dict:
     """One run's files and the forge URL of each (T66).
 
     The operator asked: "the detail view should have a list of run files, clicking
@@ -712,7 +940,10 @@ def _run_files_reply(
     other about a URL either could have built. The opt-out moved to the knob, where
     an operator who really is on something else can say ``none`` once.
     """
-    ref = resolve_run_dir(config, host, project, slug)
+    ref = resolve_run_dir(
+        config, run.get("host"), run.get("project"), run.get("slug") or None,
+        uid=_bound_uid(run) or None,
+    )
     base = _web_base_from_remote((config.work_repo_url or "").strip()) or ""
     branch = checkout_branch(config.mirror_path)
     forge = config.work_repo_forge
@@ -736,7 +967,7 @@ def _run_files_reply(
         ]
 
     return {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "rel_path": ref.rel_path if ref is not None else None,
         "present": ref is not None,
         "files": files,
@@ -825,10 +1056,9 @@ def _fold_relations(payload: dict) -> None:
         # (:class:`lmer_platform.inventory.RunView`), which is the same shape
         # ``runKey()`` composes from in the browser — so the client joins these
         # edges to its nodes without parsing anything.
-        try:
-            keys.add(run_key(row.get("host"), row.get("project"), row.get("slug")))
-        except Exception:
-            continue
+        parts = key_parts_lenient(row)
+        if parts is not None:
+            keys.add(run_key(*parts))
     payload["relations"] = [
         {"a": first, "b": second}
         for first, second in relations.all_pairs()
@@ -850,16 +1080,34 @@ def _fold_references(payload: dict) -> None:
     for row in (payload.get("runs") or []) + (payload.get("attention") or []):
         if not isinstance(row, dict):
             continue
-        run = row.get("run") if isinstance(row.get("run"), dict) else {}
-        try:
-            key = run_key(run.get("host"), run.get("project"), run.get("slug"))
-        except Exception:
+        # The flat fleet row, or a nested ``run`` block when the row has no flat
+        # identity, keyed by its uid when it carries one.
+        parts = key_parts_lenient(row)
+        if parts is None:
             continue
+        key = run_key(*parts)
         row["references"] = [
             item for item in (references.ThreadReference.from_dict(raw) for raw in stored.get(key) or [])
             if item is not None
         ]
         row["references"] = [item.to_dict() for item in row["references"]]
+
+
+def _fold_readopt(payload: dict, marks: dict) -> None:
+    """Put "re-adopt by uid" and its candidates on the rows that need it, in place.
+
+    *marks* is :func:`lmer_platform.run_transition.readopt_marks`: an entry left
+    unresolved by the key transition carries its candidate records, and one whose
+    carry kept two differing values names the stores that clashed (spec §6.1).
+    ``readopt`` is ``None`` on every other row. Both lists get it, like the
+    folds above.
+    """
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        parts = key_parts_lenient(row)
+        mark = marks.get(run_key(*parts)) if parts is not None else None
+        row["readopt"] = dict(mark) if mark else None
 
 
 def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
@@ -876,6 +1124,13 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     :mod:`lmer_platform.inventory`).
     """
     mirror = pull(config, force=force_pull).to_dict()
+    # Before the index and the registry are read: an entry a pre-A2 daemon keyed
+    # by slug for a schema-2 group is bound to its record or marked unresolved
+    # here, so it is never shown on "the newest record in the group", and a live
+    # session's registry entry it canonicalizes joins the bound row (spec §6.1).
+    # A read of the index and nothing else once every entry carries its uid.
+    run_transition.reconcile(config)
+    readopt = run_transition.readopt_marks()
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
     with assistant._PUBLICATION_LOCK:
@@ -885,11 +1140,20 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     sessions = filter_forgotten(sessions)
     sessions = absorb_ports(sessions)
     tracked = list_tracked()
+    # Each ref travels with the entry that resolved it, so the inventory keys the
+    # row by that entry — uid or slug (spec §6.1) — and never re-derives a key
+    # from the directory it found. A uid-keyed entry is resolved by its uid: the
+    # slug walk would hand back the group's newest record, which for the older
+    # of two launches is the other launch's.
     refs = [
-        ref
-        for ref in (
-            resolve_run_dir(config, entry.host, entry.project, entry.slug)
+        (entry, ref)
+        for entry, ref in (
+            (entry, resolve_run_dir(
+                config, entry.host, entry.project, entry.slug, uid=entry.uid,
+            ))
             for entry in tracked
+            # An unresolved entry names no record: any one would be a guess.
+            if "candidates" not in readopt.get(entry.key, {})
         )
         if ref is not None
     ]
@@ -947,6 +1211,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     _fold_threads(payload)
     _fold_references(payload)
     _fold_relations(payload)
+    _fold_readopt(payload, readopt)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -1751,12 +2016,53 @@ def _note_check(
     credential counts (a browser tab left open would otherwise suppress the
     reminders for the run on screen), and only routes naming **one** run stamp
     (``GET /api/state`` would mark the whole fleet checked at once).
+
+    *run* is ``(host, project, key segment)``. A slug that reaches a bound
+    entry through its alias (:mod:`lmer_platform.run_transition`) stamps the
+    entry's own key, for the reason :func:`lmer_platform.runs.note_session`
+    gives: stamping the slug would re-create the mark the transition moved.
     """
     if not caller.is_assistant:
         return
     identity = run or (run_for_session(session_id) if session_id else None)
-    if identity:
-        checkin.record_check(*identity)
+    if not identity:
+        return
+    try:
+        tracked = get_tracked(*identity)
+    except RunIndexError:
+        tracked = None
+    if tracked is not None:
+        identity = key_parts(tracked.to_dict())
+    checkin.record_check(*identity)
+
+
+def _note_check_started(caller: "Caller", result, body: dict) -> None:
+    """:func:`_note_check` for a verb whose session is already running.
+
+    The run is the one the verb validated and acted on — the result's
+    ``host``/``project``/``slug``/``uid`` — never the raw body, whose uid the
+    request may have stripped of padding; a result that carries none of them
+    falls back to a lenient read of the body. And nothing here may raise: the
+    container has started, so a 500 now would send the operator to answer or
+    resume again for a session that exists. A key that will not compose costs
+    one superfluous reminder, which is logged.
+    """
+    try:
+        fields = {
+            name: getattr(result, name, None)
+            for name in ("host", "project", "slug", "uid")
+        }
+        parts = (
+            key_parts(fields) if fields["host"] and fields["project"]
+            else key_parts_lenient(body)
+        )
+        if parts is not None:
+            _note_check(caller, run=parts)
+    except Exception as exc:
+        logger.warning(
+            "platform_checkin_skipped error=%s — the session is already "
+            "running; only the record of the look is missing", exc,
+        )
 
 
 def _presented_secret(authorization: Optional[str]) -> Optional[str]:
@@ -1993,9 +2299,16 @@ def create_app(
             "                              read off the mirror, no pull forced\n"
             "  POST /api/rescan            force a work-repo pull, then re-read\n"
             "  POST /api/prune             forget dead session entries\n"
-            "  GET  /api/runs/candidates   every run in the shared work repo\n"
+            "  GET  /api/runs/candidates   every run in the shared work repo, each\n"
+            "                              with its record's uid (null for a\n"
+            "                              legacy run)\n"
             "  POST /api/runs/adopt        track an existing run {host,project,slug}\n"
+            "                              or {host,project,uid}; a uid also binds\n"
+            "                              a row marked \"re-adopt by uid\"\n"
             "  POST /api/runs/forget       stop tracking a run\n"
+            "                              Every run-keyed route below, and both\n"
+            "                              above, take uid beside slug (body or\n"
+            "                              ?uid=) and address the record by it\n"
             "  GET  /api/runs/meta         what a run is about: this\n"
             "                              orchestrator's title and description\n"
             "                              for it ?host=&project=&slug=\n"
@@ -2032,8 +2345,9 @@ def create_app(
             "                              forced, so a just-pushed file can lag\n"
             "                              one interval\n"
             "  POST /api/runs/answer       answer a question-blocked run\n"
-            "                              {host,project,slug,answer} — starts a\n"
-            "                              fresh session carrying the answer\n"
+            "                              {host,project,slug,answer,repo_url?} —\n"
+            "                              starts a fresh session carrying the\n"
+            "                              answer\n"
             "  POST /api/runs/resume       continue a tracked run by starting its\n"
             "                              next session {host,project,slug,\n"
             "                              taskdef?,repo_url?,direction?,\n"
@@ -2223,7 +2537,10 @@ def create_app(
 
     @app.post("/api/runs/move", dependencies=guard)
     def move_run(body: dict) -> dict:
-        key = run_key(body.get("host") or "", body.get("project") or "", body.get("slug") or "")
+        try:
+            key = run_key(*_run_parts(body))
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return projects.move(key, body.get("destination_id"), expected_project=project_scope.current(),
                              expected_revision=body.get("home_revision"))
 
@@ -2231,7 +2548,7 @@ def create_app(
     def project_context(source_workspace_id: str) -> dict:
         source = projects.get(source_workspace_id)
         payload = project_api.annotate(builder(config), workspace_id=source_workspace_id)
-        fields = {"host", "project", "slug", "title", "label", "state", "status", "phase", "attention"}
+        fields = {"host", "project", "slug", "uid", "title", "label", "state", "status", "phase", "attention"}
         return {"source": {"id": source["id"], "name": source["name"]},
                 "runs": [{key: value for key, value in row.items() if key in fields}
                          for row in payload.get("runs", [])]}
@@ -3116,7 +3433,9 @@ def create_app(
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return {
-            "run": dict(zip(("host", "project", "slug"), identity)),
+            # Named as a run reply names one — ``slug`` the group label, ``uid``
+            # only for a schema-2 run — never the key segment in ``slug``.
+            "run": run_of_session(session_id) or dict(zip(("host", "project", "slug"), identity)),
             "references": references.listing(*identity),
             "local": True,
             "note": references.LOCALITY_NOTE,
@@ -3641,38 +3960,53 @@ def create_app(
         # Read the registry ONCE for the whole listing: every row and every
         # walked directory is folded, and re-parsing `_plexus.yaml` per fold
         # meant twenty-odd reads of one unchanging file to answer one question.
+        #
+        # Membership is by key segment (spec §6.1): a schema-2 record is tracked
+        # when its uid is, and a uid-keyed entry says nothing about the other
+        # launches of its group, which are separate rows to adopt.
         registry = fold_registry(config)
         tracked_keys = {
-            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
-            for e in list_tracked()
+            folded_identity(config, host, project, registry=registry) + (segment,)
+            for host, project, segment in tracked_keys_of(list_tracked())
         }
+        rows = []
+        for ref in run_dirs(config):
+            uid = _candidate_uid(ref)
+            _host, _project, segment = key_parts(
+                {"host": ref.host, "project": ref.project, "slug": ref.slug, "uid": uid}
+            )
+            rows.append({
+                "host": ref.host,
+                "project": ref.project,
+                "slug": ref.slug,
+                "uid": uid,
+                "rel_path": ref.rel_path,
+                "tracked": folded_identity(
+                    config, ref.host, ref.project, registry=registry
+                )
+                + (segment,)
+                in tracked_keys,
+            })
         return {
-            "candidates": [
-                {
-                    "host": ref.host,
-                    "project": ref.project,
-                    "slug": ref.slug,
-                    "rel_path": ref.rel_path,
-                    "tracked": folded_identity(
-                        config, ref.host, ref.project, registry=registry
-                    )
-                    + (ref.slug,)
-                    in tracked_keys,
-                }
-                for ref in run_dirs(config)
-            ],
+            "candidates": rows,
             "note": "every run in the shared work repo, including other people's",
         }
 
     @app.post("/api/runs/adopt", dependencies=guard)
     def adopt(body: dict) -> dict:
-        """Start tracking an existing run so it appears in the fleet view."""
+        """Start tracking an existing run so it appears in the fleet view.
+
+        ``uid`` beside ``{host, project}`` adopts one schema-2 execution, and
+        binds the slug-keyed entry the key transition left unresolved when
+        there is one — :func:`adopt_run` has the cases.
+        """
         try:
-            entry = track(
+            entry = adopt_run(
+                config,
                 body.get("host"),
                 body.get("project"),
                 body.get("slug"),
-                source="adopted",
+                uid=body.get("uid"),
                 note=body.get("note"),
             )
         except RunIndexError as exc:
@@ -3683,19 +4017,17 @@ def create_app(
     def forget_run(body: dict) -> dict:
         """Stop tracking a run. Its work-repo state is untouched."""
         try:
-            removed = forget(
-                body.get("host"), body.get("project"), body.get("slug")
-            )
+            parts = _run_parts(body)
+            removed = forget(*parts)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if removed:
             # Its chat-thread connections go with it (issue #412): a crashed
             # session's registry entry is kept on purpose as the crash signal, so
             # the reconcile's prune would leave the records of a run this
-            # orchestrator has been told to forget.
-            _require_connectors().drop_run(
-                (body.get("host"), body.get("project"), body.get("slug"))
-            )
+            # orchestrator has been told to forget. By key segment, because that
+            # is what ``runs.run_for_session`` names each session's run with.
+            _require_connectors().drop_run(parts)
         return {"forgotten": removed}
 
     # --- what a run is about (T52) -------------------------------------------
@@ -3711,7 +4043,9 @@ def create_app(
     # have to be escaped by every caller to survive the slash it contains.
 
     @app.get("/api/runs/meta", dependencies=guard)
-    def run_meta(host: str = "", project: str = "", slug: str = "") -> dict:
+    def run_meta(
+        host: str = "", project: str = "", slug: str = "", uid: str = ""
+    ) -> dict:
         """This orchestrator's title and description for one run.
 
         Empty for a run that has none, which is most of them, and empty rather
@@ -3724,11 +4058,12 @@ def create_app(
         which names the field — instead of a validation error in a different
         shape from every other refusal here.
         """
+        run = _query_run(host, project, slug, uid)
         try:
-            record = meta.read(host, project, slug)
+            record = meta.read(*_run_parts(run))
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _meta_reply(host, project, slug, record)
+        return _meta_reply(run, record)
 
     @app.post("/api/runs/meta", dependencies=guard)
     def set_run_meta(body: dict) -> dict:
@@ -3750,10 +4085,9 @@ def create_app(
         :class:`lmer_platform.meta.MetaError` so a refusal added later arrives
         with its own code instead of a 500.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             record = meta.write(
-                host, project, slug,
+                *_run_parts(body),
                 # Not coerced: a non-string keeps its own refusal rather than
                 # arriving as ``None`` and reading as "leave this field alone".
                 title=body.get("title"),
@@ -3763,7 +4097,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except MetaError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        return _meta_reply(host, project, slug, record)
+        return _meta_reply(body, record)
 
     # --- what a run wrote (T66) ----------------------------------------------
     #
@@ -3779,6 +4113,7 @@ def create_app(
         host: str = "",
         project: str = "",
         slug: str = "",
+        uid: str = "",
         caller: Caller = Depends(require_secret),
     ) -> dict:
         """The run's own files in the mirror, each with its forge URL.
@@ -3794,12 +4129,14 @@ def create_app(
         which names the field — instead of a validation error in a shape no other
         refusal here uses.
         """
+        run = _query_run(host, project, slug, uid)
         try:
-            run_key(host, project, slug)
+            parts = _run_parts(run)
+            run_key(*parts)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(host, project, slug))
-        return _run_files_reply(config, host, project, slug)
+        _note_check(caller, run=parts)
+        return _run_files_reply(config, run)
 
     # --- which runs belong together (T53) -------------------------------------
     #
@@ -3826,7 +4163,9 @@ def create_app(
     # would have to be escaped by every caller to survive the slash it contains.
 
     @app.get("/api/runs/relations", dependencies=guard)
-    def run_relations(host: str = "", project: str = "", slug: str = "") -> dict:
+    def run_relations(
+        host: str = "", project: str = "", slug: str = "", uid: str = ""
+    ) -> dict:
         """The runs this orchestrator considers related to this one.
 
         Empty for most runs, and empty rather than 404 for a run that is not
@@ -3847,7 +4186,7 @@ def create_app(
         refusal here.
         """
         try:
-            return _relations_reply(host, project, slug)
+            return _relations_reply(_query_run(host, project, slug, uid))
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3870,13 +4209,13 @@ def create_app(
         :class:`lmer_platform.relations.RelationError` so a refusal added later
         arrives with its own code instead of a 500.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             related = _related_ref(body)
-            created = relations.relate((host, project, slug), related)
+            created = relations.relate(
+                _run_parts(body), _run_parts(related, field="related")
+            )
             return _relations_reply(
-                host, project, slug,
-                {"related": _run_ref_dict(related), "created": created},
+                body, {"related": _run_echo(related), "created": created},
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3897,13 +4236,13 @@ def create_app(
         to clear a relation naming a run nobody tracks any more, which is why it
         requires no adoption.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             related = _related_ref(body)
-            removed = relations.unrelate((host, project, slug), related)
+            removed = relations.unrelate(
+                _run_parts(body), _run_parts(related, field="related")
+            )
             return _relations_reply(
-                host, project, slug,
-                {"related": _run_ref_dict(related), "removed": removed},
+                body, {"related": _run_echo(related), "removed": removed},
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3940,6 +4279,10 @@ def create_app(
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
+                # Verbatim: the request refuses a uid that is not 32 lowercase
+                # hex rather than reading it as absent.
+                uid=body.get("uid"),
+                repo_url=body.get("repo_url"),
                 # Not coerced: a non-string answer keeps its own refusal message
                 # rather than being reported as an empty one.
                 answer=body.get("answer") or "",
@@ -3962,7 +4305,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(request.host, request.project, request.slug))
+        _note_check_started(caller, result, body)
         return result.to_dict()
 
     @app.post("/api/runs/resume", dependencies=guard, status_code=202)
@@ -4012,6 +4355,7 @@ def create_app(
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
+                uid=body.get("uid"),
                 taskdef=body.get("taskdef"),
                 repo_url=body.get("repo_url"),
                 direction=body.get("direction"),
@@ -4040,7 +4384,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(request.host, request.project, request.slug))
+        _note_check_started(caller, result, body)
         return result.to_dict()
 
     # --- the orchestrating assistant (spec §8, T60) ---------------------------

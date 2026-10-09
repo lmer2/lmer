@@ -152,9 +152,14 @@ def start_launch() -> dict:
     defaults = _launch_fields()
     for key, value in defaults.items():
         metadata.setdefault(key, value)
+    # A pre-minted execution uid from the host (`--launch-uid`) is this launch's
+    # identity; it is consumed here (one-shot) so a child session spawned from
+    # this process mints its own rather than reusing ours.
+    requested = os.environ.pop("LMER_LAUNCH_UID", "")
+    uid = requested if UID_RE.fullmatch(requested or "") else uuid.uuid4().hex
     # PID/time describe this execution, never a predecessor's metadata.
     metadata.update(
-        uid=uuid.uuid4().hex,
+        uid=uid,
         pid=defaults["pid"],
         started_at=defaults["started_at"],
         execution_hostname=defaults["execution_hostname"],

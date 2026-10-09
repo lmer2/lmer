@@ -168,6 +168,9 @@ async function loadRunFiles() {
     const query = new URLSearchParams({
       host: props.run.host, project: props.run.project, slug: props.run.slug,
     })
+    // A schema-2 row's directory is named by its uid (spec §6.1); a row without
+    // one keeps the query it always sent.
+    if (props.run.uid) query.set('uid', props.run.uid)
     const response = await fetch(`api/runs/files?${query}`, {
       credentials: 'same-origin',
     })

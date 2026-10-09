@@ -639,6 +639,7 @@ def parse_args(
     parser.add_argument("--goal", dest="run_goal", help="Run goal recorded at session start, exported to the container as LMER_RUN_GOAL and applied once by `work session-start` (it replaces a goal inherited from a continuation source). This flag is the only source: a host-exported or .env LMER_RUN_GOAL is never forwarded. Refused with --no-task; with --exec it applies only if the command runs `work session-start`.")
     parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. The new execution inherits the source's name label; a never-started `work seed` record is a valid source and needs no --allow-unsigned-source. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
     parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID and inherits the source's name label; a never-started `work seed` record is a valid source without --allow-unsigned-source.")
+    parser.add_argument("--launch-uid", dest="launch_uid", metavar="UID", help="The fresh execution uid this launch records under; a caller that mints one never reuses it. Exported to the container as LMER_LAUNCH_UID, where a uid that already names a record is refused. This flag is the only source: a host-exported or .env LMER_LAUNCH_UID is never forwarded, and a child session mints its own.")
     parser.add_argument("--allow-unsigned-source", dest="allow_unsigned_source", metavar="SESSION_UID", help="Explicitly continue fresh when the selected schema-2 source has no final session_end. Must exactly equal --session, so the decision authorizes only that source; omit it to cancel/wait after a refusal.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
@@ -1533,6 +1534,10 @@ def _continuation_env(ns: argparse.Namespace) -> dict[str, str | None]:
         "LMER_ALLOW_UNSIGNED_SOURCE": (
             ns.allow_unsigned_source if ns.allow_unsigned_source else None
         ),
+        # A pre-minted execution uid, from the flag ONLY — the same flag-only
+        # rule as the entries above: a stale exported uid would make every
+        # launch of a container reuse one record's identity.
+        "LMER_LAUNCH_UID": getattr(ns, "launch_uid", None) or None,
     }
 
 
@@ -1662,6 +1667,19 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
                 "(<project>/_runs/<slug>/<session-id>), never a path or a "
                 "pattern — copy one from `work sessions` or from the fleet "
                 "view's row for the run."
+            )
+            return 2
+    if getattr(ns, "launch_uid", None) is not None:
+        if ns.session:
+            error(
+                "--launch-uid cannot be combined with --session: a schema-1 "
+                "continuation already names the record it writes"
+            )
+            return 2
+        if session_record.UID_RE.fullmatch(ns.launch_uid or "") is None:
+            error(
+                f"--launch-uid {ns.launch_uid!r} is not a usable execution uid: "
+                "it must be 32 lowercase hex characters"
             )
             return 2
     if ns.source_session is not None:

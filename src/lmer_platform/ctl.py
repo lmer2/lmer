@@ -76,7 +76,7 @@ The assistant's own state::
     rotate                          POST /api/assistant/handoff, then
                                     POST /api/assistant/rotate
 
-A run is named by one ``host/project/slug`` key — see :func:`_run_fields`.
+A run is named by one ``host/project/<slug|uid>`` key — see :func:`_run_fields`.
 
 Configuration
 -------------
@@ -163,6 +163,12 @@ ENV_PLATFORM_CREDENTIAL = "LMER_PLATFORM_SECRET"
 
 #: Why the host gave this container neither, in a sentence worth relaying.
 ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
+
+#: A schema-2 execution uid, the last segment of such a run's key (spec §6.1).
+#: Spelled here rather than imported from :mod:`lmer_platform.runs`, which pulls
+#: the registry and the projects database into a process an agent starts once
+#: per operation; ``tests/test_platform_ctl.py`` pins it against the index's.
+UID_RE = re.compile(r"^[0-9a-f]{32}\Z")
 
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
@@ -286,12 +292,20 @@ def _given(args: argparse.Namespace, names: Sequence[str]) -> dict:
 
 
 def _run_fields(key: str) -> dict:
-    """``host/project/slug`` as the three fields every run-keyed route names.
+    """``host/project/<slug|uid>`` as the fields every run-keyed route names.
 
     The inverse of :func:`lmer_platform.runs.run_key`, which is the string the
     platform's own state files use and therefore the one an operator has in front
     of them. A project is ``group/subgroup``, so the middle is whatever lies
     between the first segment and the last.
+
+    The last segment is the run's key segment (spec §6.1): a schema-2 run is
+    keyed by its execution uid, and every route takes ``uid`` beside ``slug``
+    and addresses the record by it. So a last segment of 32 lowercase hex is
+    sent as ``uid`` and anything else as ``slug``. That is unambiguous rather
+    than a guess because a slug cannot be 32 hex: a target-less run's slug is
+    its bare taskdef, which is the one way a slug could be, and the spawn
+    refuses a taskdef so named. Shape again, not validation.
 
     Splitting is argument shape and stops there: the parts are not checked for
     emptiness or existence, so a key naming no run reaches the daemon and comes
@@ -300,11 +314,21 @@ def _run_fields(key: str) -> dict:
     parts = runref.split(key)
     if parts is None:
         raise CtlError(
-            f"{key!r} is not a run key — a run is named host/project/slug, as "
-            "the fleet view names it (gitlab.example.com/group/project/develop-141)"
+            f"{key!r} is not a run key — a run is named host/project/slug (or "
+            "host/project/<uid> for a schema-2 run), as the fleet view names it "
+            "(gitlab.example.com/group/project/develop-141)"
         )
-    host, project, slug = parts
-    return {"host": host, "project": project, "slug": slug}
+    host, project, segment = parts
+    return {"host": host, "project": project, segment_field(segment): segment}
+
+
+def segment_field(segment: str) -> str:
+    """``"uid"`` or ``"slug"``: which field a run key's last segment is sent as.
+
+    The rule :func:`_run_fields` gives, in one place for both shells that type
+    run keys — this CLI and ``lmer platform`` (:mod:`lmer_platform.daemon`).
+    """
+    return "uid" if UID_RE.match(segment) else "slug"
 
 
 # --- the verbs: one route each ----------------------------------------------
@@ -661,7 +685,8 @@ def _handoff_note(args) -> Optional[str]:
 def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
     parser.add_argument(
         name,
-        help="A run, as host/project/slug — the key the fleet view names it by.",
+        help="A run, as host/project/<slug|uid> — the key the fleet view names "
+             "it by; a 32-hex last segment is a schema-2 run's uid.",
     )
 
 

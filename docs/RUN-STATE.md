@@ -686,9 +686,11 @@ Per project (the `{host}/{project}/` prefix already namespaces):
   (`chat-.`, `chat-<repo>.git`) stay addressable by their recorded slug,
   and a continuation of such a record lands under the bare taskdef with
   `source_session_uid` provenance into the old group (`work session-start`
-  says so; nothing in the old group moves). Such records are host-only
-  through the platform — its resume and answer routes refuse an empty
-  recorded target — like every target-less run, until a follow-up lands.
+  says so; nothing in the old group moves). The platform resumes and
+  answers a schema-2 record with an empty or document target by its uid,
+  naming the repository with `--repo` — the request's `repo_url`, else the
+  clone URL recorded for the run, else a `repo_url_required` refusal; a
+  schema-1 record with an empty target is still refused there.
 - Legacy cost (§14.2): a schema-1 record whose slug came from a
   non-work-item target (`chat-.`, `chat-<repo>.git`, `masterplan-.--<name>`)
   no longer matches what its recorded target now derives, so platform

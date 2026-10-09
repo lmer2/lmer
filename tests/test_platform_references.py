@@ -123,6 +123,26 @@ class TestTheRoutes:
             f"/api/sessions/{session}/references", headers=auth()
         ).json()["references"] == []
 
+    def test_the_reply_names_a_schema_two_run_by_slug_and_uid(self, client, platform_root):
+        """``run_for_session`` answers the key segment; the reply must not
+        report a uid as the run's slug (review !387)."""
+        uid = "a" * 32
+        runs.track(*RUN, uid=uid)
+        session = register("s-uid")
+        registry.update(session, run={"host": RUN[0], "project": RUN[1],
+                                      "slug": RUN[2], "uid": uid})
+
+        listed = client.get(f"/api/sessions/{session}/references", headers=auth()).json()
+
+        assert listed["run"] == {"host": RUN[0], "project": RUN[1], "slug": RUN[2], "uid": uid}
+
+    def test_the_reply_of_a_schema_one_run_keeps_its_shape(self, client, tracked):
+        session = register()
+
+        listed = client.get(f"/api/sessions/{session}/references", headers=auth()).json()
+
+        assert listed["run"] == {"host": RUN[0], "project": RUN[1], "slug": RUN[2]}
+
     def test_a_run_this_orchestrator_does_not_track_is_a_404_that_says_so(
         self, client, platform_root
     ):
@@ -277,3 +297,70 @@ class TestReferencesAtSpawn:
         )
         _write_run_references(request, *RUN)
         assert [item["channel"] for item in references.listing(*RUN)] == ["slack"]
+
+
+# --- carrying references to a run's new key (spec §6.1 transition) -----------
+
+NEW_RUN = (RUN[0], RUN[1], "a" * 32)
+OTHER_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000999"
+
+
+def _stored(parts):
+    return references.load_all().get(runs.run_key(*parts))
+
+
+def _plant(parts, items):
+    entries = references.load_all()
+    entries[runs.run_key(*parts)] = items
+    store.write_json(store.snapshot_path(references.REFERENCES_FILE), {"references": entries})
+
+
+class TestRekey:
+    def test_the_references_move(self, tracked):
+        added = references.add(*RUN, SLACK_LINK, title="the design thread")
+
+        assert references.rekey(RUN, NEW_RUN) == {"moved": True, "conflict": False}
+
+        assert _stored(RUN) is None
+        assert [item["id"] for item in references.listing(*NEW_RUN)] == [added.id]
+
+    def test_rekey_is_idempotent(self, tracked):
+        references.add(*RUN, SLACK_LINK)
+        references.rekey(RUN, NEW_RUN)
+        before = references.load_all()
+
+        assert references.rekey(RUN, NEW_RUN) == {"moved": False, "conflict": False}
+        assert references.load_all() == before
+
+    def test_an_absent_old_key_is_a_no_op(self, platform_root):
+        _plant(NEW_RUN, [{"id": "x", "permalink": SLACK_LINK, "title": "t"}])
+        before = references.load_all()
+
+        assert references.rekey(RUN, NEW_RUN) == {"moved": False, "conflict": False}
+        assert references.load_all() == before
+
+    def test_a_disjoint_collision_carries_every_reference_over(self, platform_root):
+        old_item = {"id": "one", "permalink": SLACK_LINK, "title": "old"}
+        new_item = {"id": "two", "permalink": OTHER_LINK, "title": "new"}
+        same = {"id": "three", "permalink": MATRIX_LINK, "title": "same"}
+        _plant(RUN, [old_item, same])
+        _plant(NEW_RUN, [new_item, same])
+
+        assert references.rekey(RUN, NEW_RUN) == {"moved": True, "conflict": False}
+
+        assert sorted(item["id"] for item in _stored(NEW_RUN)) == ["one", "three", "two"]
+        assert _stored(RUN) is None
+
+    def test_a_differing_reference_keeps_both_and_reports_it(self, platform_root):
+        old_item = {"id": "one", "permalink": SLACK_LINK, "title": "old title"}
+        new_item = {"id": "one", "permalink": SLACK_LINK, "title": "new title"}
+        _plant(RUN, [old_item])
+        _plant(NEW_RUN, [new_item])
+
+        assert references.rekey(RUN, NEW_RUN) == {"moved": True, "conflict": True}
+
+        stored = _stored(NEW_RUN)
+        assert old_item in stored and new_item in stored
+        assert sorted(item["title"] for item in references.listing(*NEW_RUN)) == [
+            "new title", "old title",
+        ]

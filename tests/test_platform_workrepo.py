@@ -2610,3 +2610,113 @@ def test_record_session_id_answers_a_dir_name_that_is_not_in_the_form(
 
     assert ref.dir_name == OUT_OF_FORM_DIR
     assert workrepo.record_session_id(ref) == OUT_OF_FORM_DIR
+
+
+# --- the execution-uid lookup (A2.workrepo-uid, spec §6.1, review N6) --------
+#
+# A schema-2 run is keyed by its execution uid, and the group directory is only
+# a label. So a uid row must resolve to ITS record — not to the newest record in
+# the group the uid's slug happens to name, and not to a record that a different
+# group holds.
+
+UID_A = "a" * 32
+UID_B = "b" * 32
+UID_C = "c" * 32
+#: A schema-2 project whose identity has no endpoint port, so FIXTURE_IDENTITY
+#: (which carries none) addresses it.
+UID_REPO = "ssh://git@gitlab.example.com/acme/widgets.git"
+
+
+def _plant_uid(config, project_dir, slug, uid, started_at, *, name=None):
+    dir_name = f"{uid}--{name}" if name else uid
+    return _plant_session_run(
+        config, project_dir, slug, dir_name,
+        extra={"schema": 2, "session": {"started_at": started_at}},
+    )
+
+
+def test_resolve_run_dir_by_uid_finds_each_record_of_one_group(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    first = _plant_uid(config, "widgets", "develop-2", UID_A, "2026-01-01T00:00:00+00:00")
+    second = _plant_uid(config, "widgets", "develop-2", UID_B, "2026-02-01T00:00:00+00:00")
+
+    ref_a = workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_A)
+    ref_b = workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_B)
+
+    assert ref_a is not None and ref_a.path == first
+    assert ref_b is not None and ref_b.path == second
+    assert ref_a.uid == UID_A and ref_b.uid == UID_B
+    assert ref_a.slug == ref_b.slug == "develop-2"
+
+
+def test_resolve_run_dir_by_uid_crosses_groups(config):
+    """A folded or reslugged record still resolves when only its uid is known."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    _plant_uid(config, "widgets", "develop-2", UID_A, "2026-01-01T00:00:00+00:00")
+    other_group = _plant_uid(config, "widgets", "develop-9", UID_B, "2026-02-01T00:00:00+00:00")
+
+    ref = workrepo.resolve_run_dir(
+        config, *FIXTURE_IDENTITY, "develop-2", uid=UID_B
+    )
+
+    assert ref is not None and ref.path == other_group
+    assert ref.slug == "develop-9"
+
+
+def test_resolve_run_dir_unknown_uid_never_falls_back(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    _plant_uid(config, "widgets", "develop-2", UID_A, "2026-01-01T00:00:00+00:00")
+
+    assert workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_C) is None
+
+
+def test_uid_lookup_scans_once_per_mirror_revision(config, monkeypatch):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    _plant_uid(config, "widgets", "develop-2", UID_A, "2026-01-01T00:00:00+00:00")
+    revision = {"sha": "a" * 40}
+    monkeypatch.setattr(
+        workrepo, "mirror_status",
+        lambda _config: workrepo.MirrorStatus(
+            present=True, last_pull_ok=True, head_sha=revision["sha"]
+        ),
+    )
+    original = workrepo._build_uid_index
+    builds = []
+
+    def counted(*args):
+        builds.append(revision["sha"])
+        return original(*args)
+
+    monkeypatch.setattr(workrepo, "_build_uid_index", counted)
+
+    assert workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_A) is not None
+    assert workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_A) is not None
+    revision["sha"] = "b" * 40
+    assert workrepo.resolve_run_dir(config, *FIXTURE_IDENTITY, uid=UID_A) is not None
+
+    assert builds == ["a" * 40, "b" * 40]
+
+
+def test_group_records_lists_a_group_in_start_order(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    # The lexically LARGER uid started EARLIER, so name order (UID_A first) and
+    # start order (UID_B first) disagree: a name-order sort fails here.
+    later = _plant_uid(config, "widgets", "develop-2", UID_A, "2026-02-01T00:00:00+00:00")
+    earlier = _plant_uid(config, "widgets", "develop-2", UID_B, "2026-01-01T00:00:00+00:00")
+    assert sorted([UID_A, UID_B]) == [UID_A, UID_B]
+
+    refs = workrepo.group_records(config, *FIXTURE_IDENTITY, "develop-2")
+
+    assert [ref.path for ref in refs] == [earlier, later]
+    assert [ref.uid for ref in refs] == [UID_B, UID_A]
+
+
+def test_group_records_empty_for_an_unknown_slug(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": UID_REPO}}, schema=2)
+    assert workrepo.group_records(config, *FIXTURE_IDENTITY, "nope") == []
