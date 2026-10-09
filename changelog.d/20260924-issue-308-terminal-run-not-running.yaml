@@ -1,2 +1,0 @@
-fixed:
-- "A finished run now reads `complete` in the fleet view even while its session is still up, instead of staying `running` and drawing check-ins."

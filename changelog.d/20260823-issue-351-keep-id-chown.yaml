@@ -1,4 +1,0 @@
-added:
-- "Added opt-in --root-userns / LMER_ROOT_USERNS: sub-second container start under rootless podman by skipping the keep-id UID remap (agent runs as container root)"
-changed:
-- "Developer-mode images are now tagged by build-input hash instead of commit SHA, so source-only commits reuse the existing image and skip podman's multi-minute UID remap"
