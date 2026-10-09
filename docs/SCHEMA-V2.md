@@ -160,6 +160,22 @@ retrying with `--allow-unsigned-source SOURCE_UID`. That value must match the
 selected source. Platform resume and answer calls carry these explicit flags
 through the host CLI. Ambient source/acknowledgement variables do not select
 context for a fresh host launch.
+
+The platform addresses a schema-2 record by its uid (`host/project/<uid>`;
+`uid` in the resume and answer requests) and mints the new execution's uid
+itself, so it can key the new row before the container starts. Resume and
+answer launch `lmer <taskdef> [<target>] [--repo <url>] --source-session
+SOURCE_UID --launch-uid NEW_UID`, never `--session`. `--repo` is added when
+the recorded target cannot carry the launch — empty, a document (reference)
+URL or an `other` URL — and names the request's `repo_url`, else the clone URL
+recorded for the run; with neither the call is refused for a `repo_url`. A
+resume of a record whose target is a bare repository URL drops that positional
+and names the repository with `--repo` the same way.
+`--launch-uid` is flag-only (a host-exported or `.env` `LMER_LAUNCH_UID` is
+never forwarded), must be 32 lowercase hex, is refused beside `--session`, and
+a uid that already names a record refuses the session start. A second
+continuation of one source is not refused: it is a fork, two rows with one
+label, and the reply's `warning` names the live sessions already on the project.
 The UI offers **Continue fresh** for the same decision; cancelling leaves
 both the source and launch state alone.
 

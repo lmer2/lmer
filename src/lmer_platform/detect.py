@@ -319,7 +319,7 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, teardown, transcripts,
+    ask, assistant, checkin, nudge, registry, rotation, runs, teardown, transcripts,
 )
 from .api import build_state
 from . import config as config_module
@@ -750,7 +750,16 @@ def _run_identity(entry: dict) -> Optional[tuple]:
     return (host, project, slug)
 
 
-def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
+def _run_uid(entry: dict) -> Optional[str]:
+    """The registry entry's execution uid, or ``None`` for a schema-1 launch."""
+    run = entry.get("run")
+    uid = run.get("uid") if isinstance(run, dict) else None
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
+
+
+def _committed_status(
+    config: PlatformConfig, identity: tuple, uid: Optional[str] = None
+) -> Optional[str]:
     """The ``status`` in the run's committed state, or ``None`` if not knowable.
 
     Read out of the mirror as it stands, with no pull: the sweep is a read on the
@@ -763,7 +772,9 @@ def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
     ``unreadable``), a state file with no status. The bar for removing the evidence
     of a possible crash is a run that says it finished, and nothing less.
     """
-    ref = resolve_run_dir(config, *identity)
+    # By uid when the launch has one: the slug lookup answers with the group's
+    # newest record, which for a schema-2 group may be another launch entirely.
+    ref = resolve_run_dir(config, *identity, uid=uid)
     if ref is None:
         return None
     try:
@@ -897,7 +908,7 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
         identity = _run_identity(entry)
         if identity is None:
             continue
-        status = _committed_status(config, identity)
+        status = _committed_status(config, identity, _run_uid(entry))
         finished = status in _TERMINAL_STATUSES
         if not finished and not _ended_as_asked(entry):
             continue

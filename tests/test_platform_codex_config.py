@@ -163,8 +163,8 @@ def test_concurrent_run_launches_allow_one_writer_and_later_replacement(live_api
     rendezvous = threading.Barrier(2)
     build = spawn._build_command
 
-    def overlap(*args):
-        command = build(*args)
+    def overlap(*args, **kwargs):
+        command = build(*args, **kwargs)
         # Force the old check/register gap; serialization leaves only one entrant.
         try:
             rendezvous.wait(timeout=10)

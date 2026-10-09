@@ -28,7 +28,7 @@ from typing import Optional
 from lmer_cli.threads import ThreadError, parse_thread
 
 from . import meta
-from .runs import get_tracked, run_key
+from .runs import get_tracked, holds_conflict, merge_values, run_key
 from .store import StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json
 
 logger = logging.getLogger("lmer_platform.references")
@@ -37,7 +37,7 @@ __all__ = [
     "REFERENCES_FILE", "MAX_TITLE_CHARS", "MAX_PER_RUN", "LOCALITY_NOTE",
     "ThreadReferenceError", "ReferenceRunNotTracked", "ThreadReference",
     "load_all", "listing", "add", "remove", "drop", "pending", "mark_announced",
-    "announcement",
+    "announcement", "rekey",
 ]
 
 REFERENCES_FILE = "run_references.json"
@@ -251,6 +251,103 @@ def drop(host: str, project: str, slug: str) -> int:
         if gone:
             _save(entries)
     return len(gone)
+
+
+def rekey(old_parts: tuple, new_parts: tuple) -> dict:
+    """Carry a run's references from one key to another (spec §6.1 transition).
+
+    *old_parts* and *new_parts* are ``(host, project, key segment)`` triples —
+    in practice a slug-keyed entry being bound to its schema-2 record's uid.
+
+    Returns ``{"moved": bool, "conflict": bool}``, the shape every store's
+    ``rekey`` returns (see :func:`lmer_platform.meta.rekey`). The stored value
+    is a *list*, so the lossless policy applies per reference, matched by id
+    (the link): one only the old key has is carried, an equal one is a no-op,
+    and one whose fields gain only what the new key's copy lacked is merged by
+    :func:`lmer_platform.runs.merge_values`. Two that *differ* are both kept as
+    whole entries, with ``conflict: True`` — a ``{"old", "new"}`` pair inside a
+    reference would not survive :meth:`ThreadReference.from_dict`, and the next
+    :func:`add` or :func:`mark_announced` would write the loss to disk. Carried
+    references come first, so the listing stays oldest first.
+
+    Not bound by :data:`MAX_PER_RUN`: that refuses a request, and refusing here
+    would drop a thread an operator attached. Idempotent, and under the same lock
+    as every other write here. A second call still reports ``conflict`` while
+    the new key keeps two copies of one thread (:func:`conflicted`), for the
+    reason :func:`lmer_platform.meta.rekey` gives.
+    """
+    old_key = run_key(*old_parts)
+    new_key = run_key(*new_parts)
+    if old_key == new_key:
+        return {"moved": False, "conflict": False}
+    with mutating(_path()):
+        entries = load_all()
+        if old_key not in entries:
+            return {"moved": False, "conflict": _conflicted(entries.get(new_key))}
+        carried = entries.pop(old_key)
+        merged, conflict = _merged_references(carried, entries.get(new_key))
+        conflict = conflict or _conflicted(merged)
+        entries[new_key] = merged
+        _save(entries)
+    logger.info(
+        "platform_run_references_rekeyed old=%s new=%s conflict=%s",
+        old_key, new_key, conflict,
+    )
+    return {"moved": True, "conflict": conflict}
+
+
+def conflicted(parts: tuple) -> bool:
+    """Whether the run *parts* names still keeps two differing copies of one
+    thread, the form :func:`rekey` keeps a reference collision in."""
+    return _conflicted(load_all().get(run_key(*parts)))
+
+
+def _conflicted(stored: object) -> bool:
+    if not isinstance(stored, list):
+        return holds_conflict(stored)
+    seen = set()
+    for item in stored:
+        ident = _identity_of(item)
+        if ident is None:
+            continue
+        if ident in seen:
+            return True
+        seen.add(ident)
+    return False
+
+
+def _identity_of(item: object) -> Optional[str]:
+    reference = ThreadReference.from_dict(item)
+    return reference.id if reference is not None else None
+
+
+def _merged_references(carried: object, existing: object) -> tuple:
+    """``(stored list, conflict)`` for one key's references landing on another's."""
+    if existing is None:
+        return carried, False
+    if not (isinstance(carried, list) and isinstance(existing, list)):
+        return merge_values(carried, existing)
+    result = list(existing)
+    by_id = {}
+    for index, item in enumerate(result):
+        ident = _identity_of(item)
+        if ident is not None:
+            by_id.setdefault(ident, index)
+    leading = []
+    conflict = False
+    for item in carried:
+        ident = _identity_of(item)
+        index = by_id.get(ident) if ident is not None else None
+        if index is None:
+            leading.append(item)
+            continue
+        merged, clash = merge_values(item, result[index])
+        if clash:
+            leading.append(item)
+            conflict = True
+        else:
+            result[index] = merged
+    return leading + result, conflict
 
 
 def pending(host: str, project: str, slug: str) -> list:

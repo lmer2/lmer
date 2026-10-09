@@ -84,7 +84,10 @@ def run_operation(function):
             return function(config, request)
 
         with operation():
-            key = runs.run_key(request.host, request.project, request.slug)
+            # The request's own fields are the body it was built from, so a
+            # request that carries a uid binds to the uid home and one that does
+            # not (or predates the field) to the slug home, by key_parts' rule.
+            key = runs.run_key(*runs.key_parts(vars(request)))
             home = run_home(key)
             chosen = request.workspace_id or scope.current() or (home or {}).get("project_id")
             get(chosen, active=True)
@@ -243,15 +246,20 @@ def migrate():
         history = store.platform_dir() / "assistant-history.sqlite3"
         if history.is_file():
             with closing(sqlite3.connect(history)) as old:
-                for (session,) in old.execute("SELECT session FROM generations"):
+                # The history writer creates its file before its tables
+                # (assistant_history._database), so a file with no
+                # ``generations`` yet holds no session to carry.
+                known = old.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='generations'"
+                ).fetchone()
+                for (session,) in old.execute("SELECT session FROM generations") if known else ():
                     db.execute("INSERT OR IGNORE INTO sessions VALUES (?,?,NULL)", (session, GENERAL))
         for event in store.read_events():
             if event.get("type") != "session_spawned":
                 continue
             data = event.get("data") or {}
-            run = data.get("run") or {}
-            if data.get("session") and all(run.get(field) for field in ("host", "project", "slug")):
-                key = runs.run_key(run["host"], run["project"], run["slug"])
+            key = key_of(data.get("run"))
+            if data.get("session") and key:
                 db.execute("INSERT OR IGNORE INTO sessions VALUES (?,?,?)", (data["session"], GENERAL, key))
         db.execute("INSERT INTO metadata VALUES ('migrated','1')")
 
@@ -429,11 +437,27 @@ def check_home(key, workspace_id, revision=None):
     return home
 
 
+def key_of(data):
+    """The run key a body, fleet row, event or registry block names, or ``None``.
+
+    Composed through :func:`lmer_platform.runs.key_parts`, so a mapping that
+    carries a uid binds to the uid key and one that does not to the slug key —
+    the same rule the tracked index keys by. ``None`` rather than a refusal for a
+    mapping that names no run: every caller here is asking "is this about a run",
+    and most of what reaches them is not.
+    """
+    try:
+        return runs.run_key(*runs.key_parts(data))
+    except runs.RunIndexError:
+        return None
+
+
 def destination(data):
     """Resolve a recorded run/session, without repository or UI inference."""
     data = data or {}
-    if all(data.get(key) for key in ("host", "project", "slug")):
-        home = run_home(runs.run_key(data["host"], data["project"], data["slug"]))
+    key = key_of(data)
+    if key:
+        home = run_home(key)
         if home:
             return home["project_id"]
     return session_home(data.get("session")) or data.get("workspace_id") or scope.current()
@@ -514,9 +538,8 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
             moved, retained = [], []
             for note in source.pending:
                 data = note.data or {}
-                parts = [data.get(field) for field in ("host", "project", "slug")]
                 session_run = db.execute("SELECT run_key FROM sessions WHERE session=?", (data.get("session"),)).fetchone()
-                belongs = (all(parts) and runs.run_key(*parts) == key or data.get("run_key") == key
+                belongs = (key_of(data) == key or data.get("run_key") == key
                            or session_run and session_run[0] == key)
                 (moved if belongs else retained).append(note)
             notice = assistant.PendingNote(
@@ -541,6 +564,101 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
         return run_home(key)
 
 
+def _present(row, *, skip):
+    """A row's columns as :func:`runs.merge_values` reads them: NULL is "lacks"."""
+    return {name: value for name, value in dict(row).items() if name not in skip and value is not None}
+
+
+def _carry(db, table, where, old_args, new_args, old, new, *, rename):
+    """Move one row of *table* to its new key, or merge it into the row already there.
+
+    *old* and *new* are the two rows' non-key columns (:func:`_present`); *new*
+    is ``None`` when nothing holds the new key, and the old row is then renamed
+    in place with *rename*. Otherwise the new row gains only the columns it
+    lacked, and the old row is removed only when nothing differed — a differing
+    column leaves both rows standing, which is how the lossless policy keeps
+    both values in a table whose key admits one row per run. A stamp column
+    (``revision``, :data:`runs.BOOKKEEPING_STAMPS`) is not a difference: the
+    new row takes the later one. Returns ``(moved, conflict)``.
+    """
+    if new is None:
+        columns = ",".join(f"{name}=?" for name in rename)
+        db.execute(f"UPDATE {table} SET {columns} WHERE {where}", (*rename.values(), *old_args))
+        return (True, False)
+    merged, conflict = runs.merge_values(old, new)
+    carried = [
+        name for name in merged
+        if name not in new
+        or (name in runs.BOOKKEEPING_STAMPS and merged[name] != new[name])
+    ]
+    for name in carried:
+        db.execute(f"UPDATE {table} SET {name}=? WHERE {where}", (merged[name], *new_args))
+    if not conflict:
+        db.execute(f"DELETE FROM {table} WHERE {where}", old_args)
+    return (bool(carried) or not conflict, conflict)
+
+
+def rekey(old_key, new_key):
+    """Carry a run's project ownership from *old_key* to *new_key* (spec §6.1).
+
+    The transition that binds a slug-keyed run to its uid calls this for the
+    ``projects`` and ``threads`` stores. It moves the ``homes`` row, the
+    ``sessions`` rows' ``run_key`` and the durable thread ownership
+    (``thread_owners.owner = run:<key>`` and ``thread_owners.run_key``) in one
+    ``database()`` transaction under :func:`operation`, so a crash leaves either
+    the old ownership or the new, never a home under one key with its sessions
+    and threads under the other.
+
+    Returns ``{"moved": bool, "conflict": bool}``. ``moved`` says whether this
+    call changed any row; ``conflict`` whether a row under *new_key* holds a
+    value that differs from the one under *old_key*. Both are ``False`` for a
+    repeat call after a clean move, so the call is idempotent.
+
+    Collisions follow :func:`runs.merge_values`. A column the new row lacks
+    (NULL) is carried over; an equal one is a no-op and the old row is removed;
+    a differing one is never dropped. For a home, a differing column (a
+    different project) means the two keys disagree
+    about who owns the run, so the old home stays in place with its sessions
+    and thread owners still pointing at it: moving them would cross a project
+    boundary that only :func:`move`, with its live-worker check and notices,
+    may cross. The new home still gains what it lacked. A differing thread
+    owner keeps both rows the same way. A conflict is reported again on every
+    repeat until an operator resolves it.
+    """
+    if not enabled() or old_key == new_key:
+        return {"moved": False, "conflict": False}
+    moved = conflict = False
+    with operation(), database() as db:
+        old = db.execute("SELECT * FROM homes WHERE run_key=?", (old_key,)).fetchone()
+        if old:
+            new = db.execute("SELECT * FROM homes WHERE run_key=?", (new_key,)).fetchone()
+            moved, conflict = _carry(db, "homes", "run_key=?", (old_key,), (new_key,),
+                                     _present(old, skip={"run_key"}),
+                                     _present(new, skip={"run_key"}) if new else None,
+                                     rename={"run_key": new_key})
+        if not conflict:
+            moved = bool(db.execute("UPDATE sessions SET run_key=? WHERE run_key=?",
+                                    (new_key, old_key)).rowcount) or moved
+            old_owner = f"run:{old_key}"
+            for row in db.execute("SELECT * FROM thread_owners WHERE owner=? OR run_key=?",
+                                  (old_owner, old_key)).fetchall():
+                owner = f"run:{new_key}" if row["owner"] == old_owner else row["owner"]
+                rekeyed = {**dict(row), "run_key": new_key if row["run_key"] == old_key else row["run_key"]}
+                # A row whose owner does not name the run (``project:<id>``) keeps
+                # its primary key, so it cannot collide with anything but itself.
+                target = None if owner == row["owner"] else db.execute(
+                    "SELECT * FROM thread_owners WHERE thread=? AND owner=?", (row["thread"], owner)).fetchone()
+                changed, clash = _carry(db, "thread_owners", "thread=? AND owner=?",
+                                        (row["thread"], row["owner"]), (row["thread"], owner),
+                                        _present(rekeyed, skip={"thread", "owner"}),
+                                        _present(target, skip={"thread", "owner"}) if target else None,
+                                        rename={"owner": owner, "run_key": rekeyed["run_key"]})
+                moved, conflict = moved or changed, conflict or clash
+    if moved or conflict:
+        logger.info("platform_run_rekeyed old=%s new=%s moved=%s conflict=%s", old_key, new_key, moved, conflict)
+    return {"moved": moved, "conflict": conflict}
+
+
 def archive(workspace_id, inventory):
     with operation():
         project = get(workspace_id, active=True)
@@ -558,8 +676,9 @@ def archive(workspace_id, inventory):
             raise ProjectError("Resolve pending requests and events before archiving.", status=409)
         rows = {}
         for item in inventory.get("runs", []):
-            if all(item.get(field) for field in ("host", "project", "slug")):
-                rows[runs.run_key(item["host"], item["project"], item["slug"])] = item
+            key = key_of(item)
+            if key:
+                rows[key] = item
         for run in runs.list_tracked():
             home = run_home(run.key)
             if home and home["project_id"] == workspace_id:

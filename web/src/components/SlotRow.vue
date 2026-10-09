@@ -14,6 +14,7 @@ import {
 } from '@mdi/js'
 
 import { slotMeta, toneColor } from '../format.js'
+import { runKey } from '../runref.js'
 
 const props = defineProps({
   row: { type: Object, required: true },
@@ -57,11 +58,9 @@ const holders = computed(() => [
   ...serviceOccupants.value.map(({ slot, ...held }) => ({ held, slot })),
 ].map((entry) => ({
   ...entry,
-  run: props.runs.find(
-    (run) => run.host === entry.held.host
-      && run.project === entry.held.project
-      && run.slug === entry.held.slug,
-  ) || null,
+  // The shell's own row key, not the slug: two uid rows of one group share a
+  // slug, and the occupant carries the uid that tells them apart.
+  run: props.runs.find((run) => runKey(run) === runKey(entry.held)) || null,
 })))
 </script>
 

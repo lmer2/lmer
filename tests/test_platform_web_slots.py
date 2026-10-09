@@ -277,11 +277,11 @@ def test_an_occupied_row_opens_the_run_holding_it():
     text = SLOT_ROW.read_text(encoding="utf-8")
 
     assert "emit('open', entry.run)" in text, "an occupied row opens nothing"
-    # Matched on the run identity, not on the session id: the shell's own key.
-    for field in ("host", "project", "slug"):
-        assert f"run.{field} === entry.held.{field}" in text, (
-            f"the holder is matched without {field}"
-        )
+    # Matched on the run identity, not on the session id: the shell's own key,
+    # host/project/<uid or slug>, so a uid holder never names its sibling.
+    assert "runKey(run) === runKey(entry.held)" in text, (
+        "the holder is not matched on the shell's row key"
+    )
 
 
 def test_an_untracked_holder_is_named_rather_than_linked():

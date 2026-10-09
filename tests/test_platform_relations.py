@@ -974,3 +974,138 @@ def test_all_pairs_does_not_depend_on_which_run_was_named_first(
 
     expected = tuple(sorted((runs.run_key(*DEVELOP), runs.run_key(*REVIEW))))
     assert pairs == [expected]
+
+
+# --- carrying relations to a run's new key (spec §6.1 transition) ------------
+#
+# When a slug-keyed run is bound to its schema-2 record its key becomes
+# host/project/<uid>. Every relation naming the old key must name the new one
+# afterwards — from either end, under a recomputed pair key — or the operator's
+# switch between the two runs silently disappears.
+
+NEW_DEVELOP = (HOST, PROJECT, "a" * 32)
+OTHER = (HOST, PROJECT, "fix-issue-9")
+
+
+def _pair(first, second):
+    return relations._pair_key(runs.run_key(*first), runs.run_key(*second))
+
+
+def test_rekey_moves_a_relation_to_the_new_key(tracked):
+    relations.relate(DEVELOP, REVIEW)
+
+    result = relations.rekey(DEVELOP, NEW_DEVELOP)
+
+    assert result == {"moved": True, "conflict": False}
+    entries = relations.load_all()
+    assert set(entries) == {_pair(NEW_DEVELOP, REVIEW)}
+    assert relations.list_for(*DEVELOP) == []
+    assert [r.key for r in relations.list_for(*NEW_DEVELOP)] == [runs.run_key(*REVIEW)]
+    assert [r.key for r in relations.list_for(*REVIEW)] == [runs.run_key(*NEW_DEVELOP)]
+    assert relations.all_pairs() == [
+        tuple(sorted((runs.run_key(*NEW_DEVELOP), runs.run_key(*REVIEW))))
+    ]
+
+
+def test_rekey_finds_the_old_key_at_either_end_of_a_pair(platform_root):
+    # The old key sorts first in one pair and second in the other.
+    early = (HOST, PROJECT, "aaa-first")
+    relations.relate(REVIEW, DEVELOP)
+    relations.relate(early, DEVELOP)
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": True, "conflict": False}
+
+    assert sorted(r.key for r in relations.list_for(*NEW_DEVELOP)) == sorted(
+        runs.run_key(*run) for run in (early, REVIEW)
+    )
+    assert set(relations.load_all()) == {
+        _pair(NEW_DEVELOP, REVIEW), _pair(NEW_DEVELOP, early),
+    }
+
+
+def test_rekey_is_idempotent(tracked):
+    relations.relate(DEVELOP, REVIEW)
+    relations.rekey(DEVELOP, NEW_DEVELOP)
+    before = relations.load_all()
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": False, "conflict": False}
+    assert relations.load_all() == before
+
+
+def test_rekey_of_a_key_no_relation_names_is_a_no_op(tracked):
+    relations.relate(REVIEW, OTHER)
+    before = relations.load_all()
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": False, "conflict": False}
+    assert relations.load_all() == before
+
+
+def test_rekey_onto_an_existing_relation_carries_over_what_it_lacks(platform_root):
+    relations.relate(DEVELOP, REVIEW)
+    relations.relate(NEW_DEVELOP, REVIEW)
+    entries = relations.load_all()
+    created = entries[_pair(DEVELOP, REVIEW)]["created_at"]
+    entries[_pair(NEW_DEVELOP, REVIEW)]["created_at"] = created
+    entries[_pair(DEVELOP, REVIEW)]["note"] = "carried"
+    store.write_json(store.snapshot_path(relations.RELATIONS_FILE), {"relations": entries})
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": True, "conflict": False}
+
+    entries = relations.load_all()
+    assert set(entries) == {_pair(NEW_DEVELOP, REVIEW)}
+    assert entries[_pair(NEW_DEVELOP, REVIEW)]["note"] == "carried"
+    assert [r.key for r in relations.list_for(*REVIEW)] == [runs.run_key(*NEW_DEVELOP)]
+
+
+def test_rekey_onto_a_relation_differing_only_in_its_stamp_keeps_the_earlier(platform_root):
+    """``created_at`` is a bookkeeping stamp (``runs.BOOKKEEPING_STAMPS``), not
+    a second answer to keep, and an origin stamp (``runs.ORIGIN_STAMPS``): the
+    relation began at the earlier of the two (review !387)."""
+    relations.relate(DEVELOP, REVIEW)
+    relations.relate(NEW_DEVELOP, REVIEW)
+    entries = relations.load_all()
+    entries[_pair(DEVELOP, REVIEW)]["created_at"] = "2026-02-01T00:00:00Z"
+    entries[_pair(NEW_DEVELOP, REVIEW)]["created_at"] = "2026-01-01T00:00:00Z"
+    store.write_json(store.snapshot_path(relations.RELATIONS_FILE), {"relations": entries})
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": True, "conflict": False}
+
+    entry = relations.load_all()[_pair(NEW_DEVELOP, REVIEW)]
+    assert entry["created_at"] == "2026-01-01T00:00:00Z"
+    assert [r.key for r in relations.list_for(*REVIEW)] == [runs.run_key(*NEW_DEVELOP)]
+
+
+def test_rekey_onto_a_differing_relation_keeps_both_and_reports_it(platform_root):
+    relations.relate(DEVELOP, REVIEW)
+    relations.relate(NEW_DEVELOP, REVIEW)
+    entries = relations.load_all()
+    entries[_pair(DEVELOP, REVIEW)]["label"] = "old"
+    entries[_pair(NEW_DEVELOP, REVIEW)]["label"] = "new"
+    store.write_json(store.snapshot_path(relations.RELATIONS_FILE), {"relations": entries})
+
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": True, "conflict": True}
+
+    entry = relations.load_all()[_pair(NEW_DEVELOP, REVIEW)]
+    assert entry["label"] == {"old": "old", "new": "new"}
+    # Still one usable relation, from both ends.
+    assert [r.key for r in relations.list_for(*REVIEW)] == [runs.run_key(*NEW_DEVELOP)]
+    # A re-run finds the old key gone and still reports the pair it left.
+    assert relations.rekey(DEVELOP, NEW_DEVELOP) == {"moved": False, "conflict": True}
+    assert relations.conflicted(NEW_DEVELOP) is True
+
+
+def test_a_relation_to_another_run_survives_under_the_new_key(tracked):
+    """The acceptance case: the rekeyed run and another run stay related, and
+    the other run's view of the pair follows the move."""
+    runs.track(*NEW_DEVELOP[:2], "develop-issue-141", uid=NEW_DEVELOP[2])
+    relations.relate(DEVELOP, REVIEW)
+    relations.relate(REVIEW, OTHER)
+
+    relations.rekey(DEVELOP, NEW_DEVELOP)
+
+    review_sees = {r.key: r.tracked for r in relations.list_for(*REVIEW)}
+    assert review_sees == {
+        runs.run_key(*NEW_DEVELOP): True, runs.run_key(*OTHER): False,
+    }
+    assert relations.unrelate(REVIEW, NEW_DEVELOP) is True
+    assert relations.load_all().keys() == {_pair(REVIEW, OTHER)}

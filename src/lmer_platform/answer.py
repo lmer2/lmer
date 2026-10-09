@@ -61,6 +61,7 @@ believing they answered it. In rough order of how surprising they are:
   D24): the mirror can still say "question" while a session is already working.
   Answering would start a second container for one run, and the two would fight
   over the run's owner claim. It also makes a double-tapped answer button harmless.
+  Legacy records only — see the schema-2 section below.
 - **A respawn that would land on a different run.** The container derives its own
   run dir from ``taskdef``/``target``, so the pair the platform respawns with has
   to reproduce the run's recorded slug. Otherwise the answer is applied to a
@@ -72,6 +73,22 @@ believing they answered it. In rough order of how surprising they are:
   ``LMER_ANSWER``, and the container strips before testing for content, so
   whitespace is as empty as "". The ceiling keeps a paste from becoming an opaque
   ``E2BIG`` from ``execve`` instead of a sentence.
+
+A schema-2 record is answered as a new execution
+------------------------------------------------
+A record that carries ``session.uid`` in a schema-2 tree is one execution,
+addressed by ``host/project/<uid>`` (:attr:`AnswerRequest.uid`), and it is never
+written in by another launch: the answering session founds its own record with
+the asking one as read-only context, exactly as :mod:`lmer_platform.resume`
+continues one — and the same rules are lifted for it. No landing-run check
+(the identity is the uid), no live-session refusal (two answers to one source
+are a fork; the spawn's concurrency note comes back as ``warning``), no
+``note_session`` on the asking row (the answer is a row of its own, #229), and
+an empty, ``reference`` or ``other`` target respawns on ``--repo`` with a
+transport URL — the caller's ``repo_url`` or the run's recorded clone URL,
+never :func:`_identity_repo_url`'s reconstruction. An entry the key transition
+left unresolved is refused with its candidates. Legacy records answer exactly as
+described above.
 
 What is deliberately **not** refused: a question stop that recorded no text
 (``stop_reason=question`` with no ``open_question``). That was a refusal until
@@ -168,17 +185,31 @@ class NotAnswerable(AnswerError):
 
 @dataclass(frozen=True)
 class AnswerRequest:
-    """Which run to answer, and with what."""
+    """Which run to answer, and with what.
+
+    ``uid`` addresses a schema-2 execution (32 lowercase hex; spec §6.4) and,
+    as for :class:`lmer_platform.resume.ResumeRequest`, makes ``slug``
+    optional: the group label comes from the tracked entry the uid resolves to.
+
+    ``repo_url`` is consulted for one case only: a schema-2 record whose target
+    cannot carry the respawn (empty, ``reference`` or ``other``), where it is the
+    TRANSPORT ``--repo`` clones from — checked against the run's own project
+    identity, and preferred over the run's recorded URL exactly as resume
+    prefers it (:func:`lmer_platform.resume._repo_url_for`). Everywhere else an
+    answer respawns from what the run recorded, as it always has.
+    """
 
     host: str
     project: str
-    slug: str
-    answer: str
+    slug: Optional[str] = None
+    answer: str = ""
     allow_unsigned_source: Optional[str] = None
     workspace_id: Optional[str] = None
     home_revision: Optional[int] = None
     confirm_project: bool = False
     slot: Optional[str] = None
+    uid: Optional[str] = None
+    repo_url: Optional[str] = None
 
     def validate(self) -> "AnswerRequest":
         """Return a normalised copy, or raise :class:`AnswerError`.
@@ -192,13 +223,21 @@ class AnswerRequest:
         applying, so the stripped text is what will be recorded, and it is what
         the length and emptiness checks must therefore be about.
         """
+        uid = _clean_uid(self.uid, AnswerError)
         fields = {}
         for name in ("host", "project", "slug"):
             value = getattr(self, name)
+            if name == "slug" and uid is not None and (
+                value is None or (isinstance(value, str) and not value.strip())
+            ):
+                fields[name] = None
+                continue
             if not isinstance(value, str) or not value.strip():
                 raise AnswerError(f"{name} is required")
             fields[name] = value.strip()
-        _reject_traversal(fields)
+        _reject_traversal(
+            {name: value for name, value in fields.items() if value is not None}
+        )
 
         if not isinstance(self.answer, str):
             raise AnswerError(
@@ -225,6 +264,8 @@ class AnswerRequest:
             acknowledgement = acknowledgement.strip() or None
         return replace(
             self,
+            uid=uid,
+            repo_url=_clean_optional_text("repo_url", self.repo_url),
             answer=answer,
             allow_unsigned_source=acknowledgement,
             workspace_id=_clean_optional_text("workspace_id", self.workspace_id),
@@ -247,8 +288,14 @@ class AnswerRequest:
         repeat, so it is what a refusal names. Once the real directory is known the
         message names *that* instead (:attr:`lmer_platform.workrepo.RunDirRef.
         rel_path`), which is a path because by then it has been found.
+
+        ``host/project/<uid>`` for a schema-2 execution, through
+        :func:`lmer_platform.runs.key_parts` — the one spelling of that rule.
         """
-        return runs.run_key(self.host, self.project, self.slug)
+        return runs.run_key(*runs.key_parts(
+            {"host": self.host, "project": self.project,
+             "slug": self.slug, "uid": self.uid}
+        ))
 
 
 @dataclass(frozen=True)
@@ -265,6 +312,9 @@ class AnswerResult:
     slug: str
     question: Optional[str]
     session: SpawnResult
+    #: The schema-2 execution answered, when the run is one; the execution the
+    #: answering session founds is ``session.uid``, a row of its own.
+    uid: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Wire form, deliberately **without** the spawn's ``command``.
@@ -275,9 +325,27 @@ class AnswerResult:
         body — same trade as keeping the control token in the environment rather
         than in argv. The *question* is echoed: the client already has it, and
         repeating it is what makes the reply readable in a log or a CLI.
+
+        ``warning`` is the spawn's, under the key ``POST /api/sessions`` and the
+        resume reply use: on a schema-2 record it carries the concurrency note
+        (spec §6.3), since a second answer to one source is a fork nothing
+        refuses. It, ``started`` and the ``uid`` keys appear only for a schema-2
+        execution, so a schema-1 reply keeps exactly the shape it had.
         """
+        payload = {"run": {"host": self.host, "project": self.project, "slug": self.slug}}
+        if self.uid is not None:
+            payload["run"]["uid"] = self.uid
+        if self.uid is not None and self.session.uid is not None:
+            payload["started"] = {
+                "host": self.host,
+                "project": self.project,
+                "slug": self.session.slug,
+                "uid": self.session.uid,
+            }
+        if self.uid is not None:
+            payload["warning"] = self.session.warning
         return {
-            "run": {"host": self.host, "project": self.project, "slug": self.slug},
+            **payload,
             "question": self.question,
             "session": {
                 "session_id": self.session.session_id,
@@ -311,6 +379,25 @@ def _reject_traversal(fields: dict) -> None:
             raise AnswerError(f"{name} must not contain a path separator: {value!r}")
         if any(segment in _UNSAFE_SEGMENTS for segment in segments):
             raise AnswerError(f"{name} is not a usable path: {value!r}")
+
+
+def _clean_uid(value, error) -> Optional[str]:
+    """A schema-2 execution uid — 32 lowercase hex — or ``None`` when absent.
+
+    Refused rather than normalised past stripping: the uid is an address, and
+    lower-casing an upper-case one would address a record the caller did not
+    spell. Shared with :mod:`lmer_platform.resume`, hence *error*.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise error(f"uid must be a string, got {type(value).__name__}")
+    uid = value.strip()
+    if not uid:
+        return None
+    if not runs.UID_RE.match(uid):
+        raise error(f"uid must be 32 lowercase hex characters, got {uid!r}")
+    return uid
 
 
 def _clean_optional_text(name: str, value) -> Optional[str]:
@@ -359,13 +446,24 @@ def _require_tracked(request: AnswerRequest) -> runs.TrackedRun:
     Scope is the local index (spec D25): a run this orchestrator neither spawned
     nor adopted may well be a colleague's, and starting a container for it is not
     a decision to make on their behalf.
+
+    Looked up by uid when the request carries one. An entry the key transition
+    left unresolved is refused with its candidates — the resume module's
+    :class:`~lmer_platform.resume.RunUnresolved`, which this route already
+    renders as ``{code, message}`` and which a picker needs to stay one shape.
     """
-    entry = runs.get_tracked(request.host, request.project, request.slug)
+    entry = runs.get_tracked(
+        request.host, request.project, request.slug, uid=request.uid
+    )
     if entry is None:
         raise RunNotTracked(
             f"{request.key} is not tracked by this orchestrator — adopt it "
             "first (POST /api/runs/adopt) so it is in scope, then answer it"
         )
+    # Imported here for the reason given at the other resume import below.
+    from .resume import refuse_if_unresolved
+
+    refuse_if_unresolved(entry, "answer")
     return entry
 
 
@@ -424,8 +522,13 @@ def _require_run_dir(config: PlatformConfig, request: AnswerRequest) -> RunDirRe
     Without it there is no way to tell whether a question is pending, and no way
     to recover the taskdef/target a respawn needs — so this is a refusal rather
     than a spawn made on assumptions.
+
+    By uid when the request has one: exactly that record, never the group's
+    newest (:func:`lmer_platform.workrepo.resolve_run_dir`).
     """
-    ref = resolve_run_dir(config, request.host, request.project, request.slug)
+    ref = resolve_run_dir(
+        config, request.host, request.project, request.slug, uid=request.uid
+    )
     if ref is None:
         raise NotAnswerable(
             f"{request.key} is not in the host mirror, so the platform cannot "
@@ -507,9 +610,15 @@ def _require_question_stop(state: dict, ref: RunDirRef) -> Optional[str]:
 
 
 def _respawn_inputs(
-    state: dict, tracked: runs.TrackedRun, ref: RunDirRef
+    state: dict,
+    tracked: runs.TrackedRun,
+    ref: RunDirRef,
+    *,
+    config: Optional[PlatformConfig] = None,
+    request: Optional[AnswerRequest] = None,
+    execution: Optional[str] = None,
 ) -> tuple:
-    """The ``(taskdef, target)`` a respawn has to carry, or refuse.
+    """The ``(taskdef, target, repo_url)`` a respawn has to carry, or refuse.
 
     The run's own state wins over the tracked index: ``run_state.seed_state``
     makes both immutable for the life of the run, and they are exactly what the
@@ -520,13 +629,37 @@ def _respawn_inputs(
     An absent target is a refusal rather than a bare ``lmer <taskdef>``: the slug
     of a target-less run is the taskdef alone, which any other target-less run of
     the same taskdef shares, and :meth:`SpawnRequest.validate` refuses one anyway.
+
+    Except on a schema-2 record (*execution* is its uid, spec §6.4, #537): that
+    record is addressed by its uid, so an empty, ``reference`` or ``other``
+    target is answerable given a TRANSPORT URL for ``--repo`` — the caller's
+    ``repo_url``, else the run's recorded clone URL, else
+    :class:`~lmer_platform.resume.RepoUrlRequired`, validated against the run's
+    identity by the one function resume uses for it. Elsewhere ``repo_url`` is
+    the run's recorded URL, which is what an answer always carried — ``None``
+    for an adopted run that has none, and :func:`_identity_repo_url` covers the
+    identity there without ever becoming a clone URL.
+
+    A schema-2 record whose target is itself a clone URL (written before spec
+    §6.5 moved such a target into ``repo_url``) launches the way resume
+    launches it: on ``--repo`` with no positional (:func:`lmer_platform.resume.
+    _launch_target`), so the answering execution records no repository-class
+    target either. Its URL is the transport rule's — the caller's, else the
+    recorded one — with the target itself as the recorded clone URL of a run
+    that has no other, validated against the run's identity the same way.
     """
+    from work_repo.utils import classify_target
+
+    from .resume import _repo_url_for, _target_needs_transport
+
     taskdef = state.get("taskdef") or tracked.taskdef
     target = state.get("target") or tracked.target
+    needs_transport = execution is not None and _target_needs_transport(target)
     missing = [
         name
         for name, value in (("taskdef", taskdef), ("target", target))
         if not (isinstance(value, str) and value.strip())
+        and not (name == "target" and needs_transport)
     ]
     if missing:
         raise NotAnswerable(
@@ -534,7 +667,13 @@ def _respawn_inputs(
             "cannot work out what to respawn — answer it from a shell with "
             '`lmer <taskdef> <target> --answer="…"`'
         )
-    return taskdef.strip(), target.strip()
+    target = target.strip() if isinstance(target, str) else ""
+    if needs_transport:
+        return taskdef.strip(), target, _repo_url_for(config, tracked, request, "answer")
+    if execution is not None and classify_target(target) == "repository":
+        recorded = replace(tracked, repo=tracked.repo or target)
+        return taskdef.strip(), target, _repo_url_for(config, recorded, request, "answer")
+    return taskdef.strip(), target, tracked.repo
 
 
 def _require_same_run(
@@ -606,25 +745,41 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     :class:`~lmer_platform.spawn.SpawnError` through unchanged — the concurrency
     cap belongs to the spawn path, and an answer is not a reason to exceed it.
     """
+    # Imported here to keep answer/resume's existing helper dependency acyclic.
+    # The schema-2 rule is shared: a prior launch is read-only context and an
+    # unsigned source needs a decision bound to that exact UID.
+    from .resume import (
+        _bind_to_tracked, _launch_target, _schema_two_source, schema_two_record,
+    )
+
     request = request.validate()
     tracked = _require_tracked(request)
-    _refuse_if_live(request, request.slug)
+    request = _bind_to_tracked(request, tracked)
+    if request.uid is None:
+        _refuse_if_live(request, request.slug)
     ref = _require_run_dir(config, request)
     state = _load_state(ref)
     _refuse_if_finished(state, ref)
     question = _require_question_stop(state, ref)
-    taskdef, target = _respawn_inputs(state, tracked, ref)
-    recorded_slug = _require_same_run(taskdef, target, state, ref)
-    if recorded_slug != request.slug:
-        # The run was renamed: it is tracked under its directory name while any
-        # session for it registers under the recorded slug, so the check above did
-        # not look at the identity the new session would take.
-        _refuse_if_live(request, recorded_slug)
-
-    # Imported here to keep answer/resume's existing helper dependency acyclic.
-    # The schema-2 rule is shared: a prior launch is read-only context and an
-    # unsigned source needs a decision bound to that exact UID.
-    from .resume import _schema_two_source
+    # A record with ``session.uid`` is one schema-2 execution (spec §6.4): the
+    # respawn founds its own record with this one as read-only context, so the
+    # slug-era landing check and the live refusal do not apply — a second answer
+    # to one source is a fork, reported by the spawn's concurrency note.
+    execution = schema_two_record(config, state, ref, NotAnswerable)
+    taskdef, target, repo_url = _respawn_inputs(
+        state, tracked, ref, config=config, request=request, execution=execution
+    )
+    if execution is None:
+        if request.uid is not None:
+            # The early check above is skipped for a uid request, whose record
+            # had to be read first to know whether it is a schema-2 one.
+            _refuse_if_live(request, request.slug)
+        recorded_slug = _require_same_run(taskdef, target, state, ref)
+        if recorded_slug != request.slug:
+            # The run was renamed: it is tracked under its directory name while
+            # any session for it registers under the recorded slug, so the check
+            # above did not look at the identity the new session would take.
+            _refuse_if_live(request, recorded_slug)
 
     source_session_id, unsigned_source_ack = _schema_two_source(
         config, request, ref, state
@@ -635,11 +790,16 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
         SpawnRequest(
             **resume_selection(request.key, request.slot),
             taskdef=taskdef,
-            target=target,
+            # Absent rather than "": an empty-target schema-2 record respawns on
+            # ``--repo`` and no positional, and so does one whose target is a
+            # clone URL; a legacy record keeps the positional it always had.
+            target=_launch_target(target) if execution is not None else (target or None),
             # Recorded only if the run actually has one — an adopted run that has
             # none keeps having none. The reconstruction beside it is for deriving
-            # the identity and is deliberately not written down.
-            repo_url=tracked.repo,
+            # the identity and is deliberately not written down. For a schema-2
+            # record whose target cannot carry the launch it is the transport
+            # URL ``_respawn_inputs`` resolved — never the reconstruction.
+            repo_url=repo_url,
             identity_repo_url=_identity_repo_url(request),
             # The typed field, not extra_args: see the module docstring — that
             # field is where a validated answer goes, and the flag is refused in
@@ -680,33 +840,47 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     # already has the answer, so a bookkeeping failure reported as a failed answer
     # would send the operator to answer again — which the live-session check would
     # then refuse. A stale ``last_session_id`` is a worse view, not a lost answer.
-    try:
-        runs.note_session(
-            request.host, request.project, request.slug, result.session_id
-        )
-    except StoreError as exc:
-        logger.warning(
-            "platform_answer_index_not_updated run=%s session=%s error=%s — the "
-            "answer is already on its way; the run's detail view will keep "
-            "pointing at the previous session",
-            request.key, result.session_id, exc,
-        )
+    #
+    # Never for a schema-2 record (#229): the answering execution is its own
+    # uid-keyed row, tracked by the spawn, and the row that asked keeps the
+    # session that wrote it.
+    if execution is None:
+        try:
+            runs.note_session(
+                request.host, request.project, request.slug, result.session_id
+            )
+        except StoreError as exc:
+            logger.warning(
+                "platform_answer_index_not_updated run=%s session=%s error=%s — the "
+                "answer is already on its way; the run's detail view will keep "
+                "pointing at the previous session",
+                request.key, result.session_id, exc,
+            )
 
     # Length, not text: the platform's history is a debugging artifact people read
     # and paste, and an answer is the operator's content.
-    append_event(
-        "run_answered",
-        note=request.key,
-        data={
-            "run": {
+    data = {
+        "run": {
+            "host": request.host,
+            "project": request.project,
+            "slug": request.slug,
+        },
+        "session": result.session_id,
+        "answer_chars": len(request.answer),
+    }
+    # Schema 2 only, so a legacy event keeps its shape: there the slug is a
+    # group label, and only the uids say which execution asked and which one
+    # the answering session founds — the reply's ``run`` and ``started``.
+    if execution is not None:
+        data["run"]["uid"] = execution
+        if result.uid is not None:
+            data["started"] = {
                 "host": request.host,
                 "project": request.project,
-                "slug": request.slug,
-            },
-            "session": result.session_id,
-            "answer_chars": len(request.answer),
-        },
-    )
+                "slug": result.slug,
+                "uid": result.uid,
+            }
+    append_event("run_answered", note=request.key, data=data)
     logger.info(
         "platform_run_answered run=%s session=%s answer_chars=%d",
         request.key, result.session_id, len(request.answer),
@@ -718,4 +892,5 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
         slug=request.slug,
         question=question,
         session=result,
+        uid=execution,
     )
