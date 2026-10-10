@@ -37,8 +37,10 @@ from . import git_ops, run_state
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, core_module, load_work_manifest, work_repo_root
 
-#: The areas the verb understands, in report order.
-AREAS = ("napkin", "plans", "runs", "index", "bundles", "buckets")
+#: The areas the verb understands, in EXECUTION order: `runs` last among the
+#: file-mutating areas, so a record archived there is flattened (bundles) and
+#: has its indexes swept first.
+AREAS = ("napkin", "plans", "bundles", "index", "runs", "buckets")
 
 #: Per-area ``archive_after`` defaults, in whole days, when the manifest does
 #: not say (the spec's example gives napkin 365d and plans null; runs defaults
@@ -327,11 +329,11 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
             plan.add(Action("info", "runs", rel, detail=f"destination exists: {dst_rel.relative_to(root).as_posix()}"))
             continue
         plan.add(Action("move", "runs", rel, dst_rel.relative_to(root).as_posix(), f"{policy}d"))
-        for link, sub in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
-            new_target = dst_rel if sub == "." else dst_rel / sub
+        for link, _sub in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
             plan.add(Action(
                 "retarget", "runs", link.relative_to(root).as_posix(),
-                new_target.relative_to(root).as_posix(),
+                dst=dst_rel.relative_to(root).as_posix(),
+                detail=rdir.relative_to(root).as_posix(),
             ))
 
     # The one deletion housekeep makes: `.new-*` orphans older than the threshold.
@@ -572,14 +574,14 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
                 continue
             target = os.path.normpath(os.path.join(str(link.parent), os.readlink(link)))
             if target.startswith(str(bundle) + os.sep):
-                new = mp / os.path.relpath(target, str(bundle))
                 plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
-                                new.relative_to(root).as_posix()))
+                                dst=mp.relative_to(root).as_posix(),
+                                detail=bundle.relative_to(root).as_posix()))
         # Every `_specs` entry that targets the nested path.
-        for link, sub in _links_under(project.path, bundle.relative_to(project.path).as_posix()):
-            new = mp / sub
+        for link, _sub in _links_under(project.path, bundle.relative_to(project.path).as_posix()):
             plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
-                            new.relative_to(root).as_posix()))
+                            dst=mp.relative_to(root).as_posix(),
+                            detail=bundle.relative_to(root).as_posix()))
         plan.add(Action("delete", "bundles", bundle.relative_to(root).as_posix(),
                         detail="emptied nested bundle dir"))
 
@@ -745,12 +747,23 @@ def _apply_move(root: Path, action: Action) -> bool:
 
 @applier("retarget")
 def _apply_retarget(root: Path, action: Action) -> bool:
+    """Re-point a symlink whose target is under `detail` to the `dst` prefix.
+
+    Computed at APPLY time from the link's current target, so a chain of
+    retargets (a bundle flattened inside a record that is then archived) each
+    see the previous one's result instead of a stale plan-time path.
+    """
     link = root / action.src
-    if not link.is_symlink() or not action.dst:
+    if not link.is_symlink() or not action.dst or not action.detail:
         return False
-    rel = os.path.relpath(root / action.dst, link.parent)
+    target = os.path.normpath(os.path.join(str(link.parent), os.readlink(link)))
+    old = os.path.normpath(str(root / action.detail))
+    if target != old and not target.startswith(old + os.sep):
+        return False
+    sub = os.path.relpath(target, old)
+    new = root / action.dst if sub == "." else root / action.dst / sub
     link.unlink()
-    link.symlink_to(rel)
+    link.symlink_to(os.path.relpath(new, link.parent))
     return True
 
 
