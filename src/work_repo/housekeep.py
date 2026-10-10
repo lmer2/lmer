@@ -75,10 +75,7 @@ class Plan:
     actions: list[Action] = field(default_factory=list)
 
     def add(self, action: Action) -> None:
-        # Dedupe: instance-level planners (napkin, the instance memory scope)
-        # run once per project, and the same action must not be applied twice.
-        if action not in self.actions:
-            self.actions.append(action)
+        self.actions.append(action)
 
     @property
     def changes(self) -> list[Action]:
@@ -404,8 +401,15 @@ def _done_plan_states(text: str) -> dict[str, str]:
             continue
         target = match.group(2).strip().split("#", 1)[0]
         name = os.path.basename(target)
-        words = re.findall(r"[A-Za-z]+", line[match.end():])
+        tail = line[match.end():]
+        words = re.findall(r"[A-Za-z]+", tail)
         if not words:
+            continue
+        # A digit, `%` or `/` in the state text is a residue (`50% complete`,
+        # `2/3 done`): ambiguous, never retired.
+        if re.search(r"[0-9%/]", tail):
+            if any(word.lower() in _DONE_PLAN_STATES for word in words):
+                result[name] = "ambiguous"
             continue
         if len(words) == 1 and words[0].lower() in _DONE_PLAN_STATES:
             result[name] = "done"
@@ -506,8 +510,6 @@ def _plan_napkin(plan, *, root, project, policy, now=None, **_):
     """
     if policy is None:
         return  # napkin: {archive_after: null} disables the area
-    if getattr(project, "kind", None) == "bucket":
-        return
     now = now or datetime.now(timezone.utc)
     napkin = root / "_napkin"
     if napkin.is_dir():
@@ -568,6 +570,12 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
         mp = rdir / "masterplan"
         if not mp.is_dir():
             continue
+        rel = rdir.relative_to(root).as_posix()
+        # If masterplan/ is ITSELF already a bundle (the artifacts directly at
+        # its top, the same first check `_check_masterplan` makes), it is flat:
+        # never flatten anything under it.
+        if any((mp / name).is_file() for name in run_state.MASTERPLAN_ARTIFACTS):
+            continue
         # A nested bundle is a subdir of masterplan/ that holds the masterplan
         # artifacts DIRECTLY (the legacy double-nested form). A flat D12 bundle
         # may carry its own opaque subdirs, so a subdir without the artifacts
@@ -579,7 +587,6 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
         )
         if not bundles:
             continue
-        rel = rdir.relative_to(root).as_posix()
         if len(bundles) > 1:
             plan.add(Action("info", "bundles", rel,
                             detail=f"{len(bundles)} nested bundles; a human decides"))
@@ -591,7 +598,20 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
                             detail="record is live; bundle left untouched"))
             continue
         bundle = bundles[0]
-        for child in sorted(bundle.iterdir()):
+        # All-or-nothing: a flatten must be able to move EVERY entry. A subdir
+        # would be left behind, and a destination collision would clobber a
+        # flat bundle's file. Either way, report and leave the bundle alone —
+        # never half-flatten.
+        entries = sorted(bundle.iterdir())
+        if any(entry.is_dir() and not entry.is_symlink() for entry in entries):
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"nested bundle {bundle.name} holds subdirs; left untouched"))
+            continue
+        if any((mp / entry.name).exists() for entry in entries):
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"nested bundle {bundle.name} has a destination collision; left untouched"))
+            continue
+        for child in entries:
             if child.is_file() or child.is_symlink():
                 plan.add(Action("move", "bundles", child.relative_to(root).as_posix(),
                                 (mp / child.name).relative_to(root).as_posix()))
@@ -639,12 +659,10 @@ def _plan_index(plan, *, root, project, policy, now=None, **_):
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
     manifest = load_work_manifest(root)
-    # Instance scope (schema form only), then the project's own scope at
-    # `<project>/_agents/memory/` (the project `memory/` dir is the LEGACY
-    # surface). `Plan.add` dedupes, so the instance scope is planned once
-    # however many projects the walk yields.
+    # The project's own scope at `<project>/_agents/memory/` (the project
+    # `memory/` dir is the LEGACY surface). The INSTANCE scope is planned once
+    # by `build_plan`, never per project.
     if manifest is not None:
-        _plan_memory_index(plan, root, root / "_agents" / "memory", manifest, date)
         _plan_memory_index(plan, root, project.path / "_agents" / "memory", manifest, date)
         _plan_plans_index(plan, root, project.path, date)
 
@@ -708,11 +726,24 @@ def build_plan(root: Path, projects, policy: Policy, areas: Sequence[str],
                *, archive_stale: bool = False, now: Optional[datetime] = None) -> Plan:
     """Run each selected area's planner over each project."""
     plan = Plan()
+    # Instance-level scopes are planned ONCE, never per project.
+    if "index" in areas and "index" not in policy.refused:
+        manifest = load_work_manifest(root)
+        if manifest is not None:
+            date = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+            _plan_memory_index(plan, root, root / "_agents" / "memory", manifest, date)
     for area in areas:
         if area in policy.refused:
             continue  # an invalid TTL refuses only its own area
         planner = PLANNERS.get(area)
         if planner is None:
+            continue
+        if area == "napkin":
+            # The root `_napkin/` is instance-level: one call, not one per
+            # project (the mount/bare reports are too).
+            planner(plan, root=root, project=None,
+                    policy=policy.archive_after.get(area), archive_stale=archive_stale,
+                    now=now)
             continue
         for entry in projects:
             planner(plan, root=root, project=entry,

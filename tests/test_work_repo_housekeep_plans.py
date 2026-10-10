@@ -93,8 +93,13 @@ def test_a_done_plan_within_the_ttl_stays(tmp_path):
     assert [a for a in _plan(tree).actions if a.kind == "move"] == []
 
 
-def test_prose_containing_a_done_word_is_not_archived(tmp_path):
-    tree = _build(tmp_path, line="done in 2024, kept for reference")
+@pytest.mark.parametrize("line", [
+    "done in 2024, kept for reference",
+    "50% complete",
+    "2/3 done",
+])
+def test_prose_or_a_residue_done_word_is_not_archived(tmp_path, line):
+    tree = _build(tmp_path, line=line)
     actions = _plan(tree).actions
     assert [a for a in actions if a.kind == "move"] == []
     assert any("ambiguous" in (a.detail or "") for a in actions)

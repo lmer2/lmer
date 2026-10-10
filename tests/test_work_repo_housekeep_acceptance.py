@@ -15,6 +15,8 @@ from work_repo import housekeep, run_state
 MANIFEST = (
     "schema: 2\nname: example\nprojects:\n  widgets:\n"
     "    repo: git.example.test/acme/widgets\n"
+    "  gadgets:\n"
+    "    repo: git.example.test/acme/gadgets\n"
     "housekeeping:\n"
     "  napkin:\n    archive_after: 365d\n"
     "  plans:\n    archive_after: 30d\n"
@@ -61,7 +63,9 @@ def _build(tmp_path):
     (instance / "MEMORY.md").write_text(
         "# Memory\n\n- [Gone](gone.md) — gone\n"
     )
-    # 5. host bucket
+    # 5. a second REGISTERED project (so the instance scope is not planned
+    #    per project) and a host bucket
+    (tree.root / "gadgets/_runs").mkdir(parents=True)
     (tree.root / "git.example.test/unnamed/widget/_runs").mkdir(parents=True)
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
@@ -100,6 +104,11 @@ def test_apply_makes_one_real_commit_and_the_tree_validates(tmp_path, monkeypatc
 
     tree, rdir = _build(tmp_path)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
+    # CI has no gitconfig; give the work-repo commit an explicit identity.
+    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(name, "test")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(name, "test@example.com")
     before = _git(tree.root, "rev-list", "--count", "HEAD").stdout.strip()
     assert housekeep.cmd_housekeep(_args(apply=True)) == 0
     after = _git(tree.root, "rev-list", "--count", "HEAD").stdout.strip()
@@ -118,6 +127,22 @@ def test_apply_makes_one_real_commit_and_the_tree_validates(tmp_path, monkeypatc
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_instance_scope_is_planned_once_with_two_projects(tmp_path, monkeypatch):
+    tree, _ = _build(tmp_path)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
+    policy = housekeep.resolve_policy(tree.root)
+    entries = housekeep.project_dirs(tree.root)
+    assert len([e for e in entries if e.kind == "registered"]) == 2
+    plan = housekeep.build_plan(tree.root, entries, policy, list(housekeep.AREAS))
+    napkin_moves = [a for a in plan.actions if a.kind == "move" and a.area == "napkin"]
+    assert len(napkin_moves) == 1
+    instance_tombstones = [
+        a for a in plan.actions
+        if a.kind == "tombstone" and a.src == "_agents/memory/MEMORY.md"
+    ]
+    assert len(instance_tombstones) == 1
 
 
 def test_a_second_apply_makes_no_commit(tmp_path, monkeypatch):

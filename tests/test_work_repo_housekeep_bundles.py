@@ -111,14 +111,40 @@ def test_a_failed_move_skips_the_rmdir(tmp_path):
     assert bundle.is_dir() and (bundle / "spec.md").is_file()
 
 
-def test_a_nested_dir_with_content_is_not_rmdir_ed(tmp_path):
+def test_a_bundle_with_a_subdir_is_not_half_flattened(tmp_path):
     tree = build_schema2_plexus(tmp_path / "plexus")
     rdir = _stopped_record(tree, uid_for(1))
     bundle = _bundle(rdir)
     (bundle / "extra").mkdir()
     (bundle / "extra" / "keep.md").write_text("keep\n")
-    _apply(tree, _plan(tree))
+    plan = _plan(tree)
+    assert [a for a in plan.actions if a.kind == "move"] == []
+    assert any("subdirs" in (a.detail or "") for a in plan.actions)
+    _apply(tree, plan)
+    assert (bundle / "spec.md").is_file()
     assert (bundle / "extra/keep.md").is_file()
+
+
+def test_a_destination_collision_leaves_the_bundle_untouched(tmp_path):
+    tree = build_schema2_plexus(tmp_path / "plexus")
+    rdir = _stopped_record(tree, uid_for(1))
+    bundle = _bundle(rdir)
+    (bundle / "notes.md").write_text("bundle notes\n")
+    (rdir / "masterplan/notes.md").write_text("flat notes\n")
+    plan = _plan(tree)
+    assert [a for a in plan.actions if a.kind == "move"] == []
+    assert any("collision" in (a.detail or "") for a in plan.actions)
+
+
+def test_masterplan_that_is_already_a_bundle_is_not_flattened(tmp_path):
+    tree = build_schema2_plexus(tmp_path / "plexus")
+    rdir = _stopped_record(tree, uid_for(1))
+    mp = rdir / "masterplan"
+    (mp / "old").mkdir(parents=True)
+    (mp / "spec.md").write_text("spec\n")
+    (mp / "old" / "plan.md").write_text("plan\n")
+    plan = _plan(tree)
+    assert [a for a in plan.actions if a.kind == "move"] == []
 
 
 def test_a_flat_bundle_with_subdirs_is_not_flattened(tmp_path):
