@@ -163,8 +163,9 @@ class TestSchemaTwoLiveness:
         retargets = [a for a in _plan(tree).actions if a.kind == "retarget"]
         assert len(retargets) == 1
         assert retargets[0].src.endswith("_specs/2026-01-01-chat--spec.md")
-        # The FILE is kept, not just the archived dir.
-        assert retargets[0].dst.endswith(f"_archive/_runs/chat/{uid}/spec.md")
+        # `dst` is the new prefix; the applier keeps the file's sub-path.
+        assert retargets[0].dst.endswith(f"_archive/_runs/chat/{uid}")
+        assert retargets[0].detail.endswith(f"_runs/chat/{uid}")
 
 
 class TestSecondRunIsANoop:

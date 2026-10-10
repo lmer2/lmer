@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -36,8 +37,10 @@ from . import git_ops, run_state
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, core_module, load_work_manifest, work_repo_root
 
-#: The areas the verb understands, in report order.
-AREAS = ("napkin", "plans", "runs", "index", "bundles", "buckets")
+#: The areas the verb understands, in EXECUTION order: `runs` last among the
+#: file-mutating areas, so a record archived there is flattened (bundles) and
+#: has its indexes swept first.
+AREAS = ("napkin", "plans", "bundles", "index", "runs", "buckets")
 
 #: Per-area ``archive_after`` defaults, in whole days, when the manifest does
 #: not say (the spec's example gives napkin 365d and plans null; runs defaults
@@ -62,6 +65,7 @@ class Action:
     dst: Optional[str] = None
     policy: str = ""
     detail: str = ""
+    date: str = ""     # tombstone date for the `archived <date>` form
 
 
 @dataclass
@@ -325,11 +329,11 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
             plan.add(Action("info", "runs", rel, detail=f"destination exists: {dst_rel.relative_to(root).as_posix()}"))
             continue
         plan.add(Action("move", "runs", rel, dst_rel.relative_to(root).as_posix(), f"{policy}d"))
-        for link, sub in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
-            new_target = dst_rel if sub == "." else dst_rel / sub
+        for link, _sub in _links_under(project_dir, rdir.relative_to(project_dir).as_posix()):
             plan.add(Action(
                 "retarget", "runs", link.relative_to(root).as_posix(),
-                new_target.relative_to(root).as_posix(),
+                dst=dst_rel.relative_to(root).as_posix(),
+                detail=rdir.relative_to(root).as_posix(),
             ))
 
     # The one deletion housekeep makes: `.new-*` orphans older than the threshold.
@@ -343,15 +347,403 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
             continue
 
 
+#: PLANS.md states housekeep recognises as "done". Conservative on purpose:
+#: a line whose state is not in this set is never retired. Tombstone words
+#: count too (the plan is already retired).
+_DONE_PLAN_STATES = frozenset(
+    {"done", "complete", "completed", "archived", "forgotten", "retired"}
+)
+_PLAN_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
+
+
+def _last_touches(root: Path, rels: Sequence[str]) -> dict[str, str]:
+    """``rel -> ISO date`` of the last commit touching it, from ONE git log.
+
+    The batched last-git-touch lookup the napkin area reuses. A path with no
+    history is absent from the map (never "untouched").
+    """
+    if not rels:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--format=%cs", "--name-only", "--", *rels],
+            cwd=str(root), capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return {}
+    found: dict[str, str] = {}
+    date = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", line):
+            date = line
+            continue
+        if date is not None:
+            found.setdefault(line, date)  # newest commit wins
+    return found
+
+
+def _done_plan_states(text: str) -> dict[str, str]:
+    """basename -> ``"done"`` or ``"ambiguous"`` for each PLANS.md line.
+
+    SCHEMA.md leaves the PLANS.md line grammar free (title, state, pointer),
+    so housekeep recognises a done state ONLY when the text after the link is
+    exactly one done word (after separators/whitespace). A done word buried in
+    prose is ``"ambiguous"``: reported INFO, never retired. This never
+    archives on prose.
+    """
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _PLAN_LINK_RE.search(line)
+        if not match:
+            continue
+        target = match.group(2).strip().split("#", 1)[0]
+        name = os.path.basename(target)
+        tail = line[match.end():]
+        words = re.findall(r"[A-Za-z]+", tail)
+        if not words:
+            continue
+        # A digit, `%` or `/` in the state text is a residue (`50% complete`,
+        # `2/3 done`): ambiguous, never retired.
+        if re.search(r"[0-9%/]", tail):
+            if any(word.lower() in _DONE_PLAN_STATES for word in words):
+                result[name] = "ambiguous"
+            continue
+        if len(words) == 1 and words[0].lower() in _DONE_PLAN_STATES:
+            result[name] = "done"
+        elif any(word.lower() in _DONE_PLAN_STATES for word in words):
+            result[name] = "ambiguous"
+    return result
+
+
+def _retarget_line(text: str, old_target: str, new_target: str) -> Optional[str]:
+    """The index text with the line linking *old_target* re-pointed at
+    *new_target* (relative to the index's own directory)."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        for match in _PLAN_LINK_RE.finditer(line):
+            target = match.group(2).strip().split("#", 1)[0]
+            if os.path.normpath(target) == os.path.normpath(old_target):
+                start, end = match.span(2)
+                lines[index] = line[:start] + new_target + line[end:]
+                return "".join(lines)
+    return None
+
+
+def _archive_links(text: str, old_target: str, date: str) -> Optional[str]:
+    """The index text with the *old_target* link replaced by `archived <date>`."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        for match in _PLAN_LINK_RE.finditer(line):
+            target = match.group(2).strip().split("#", 1)[0]
+            if os.path.normpath(target) == os.path.normpath(old_target):
+                start, end = match.span()
+                lines[index] = line[:start] + f"archived {date}" + line[end:]
+                return "".join(lines)
+    return None
+
+
+@register("plans")
+def _plan_plans(plan, *, root, project, policy, now=None, **_):
+    """The plans area: retire done plan files past their TTL (schema form)."""
+    if policy is None:
+        return  # plans: {archive_after: null} disables the area
+    if load_work_manifest(root) is None:
+        return  # a legacy tree has no _plans/
+    if getattr(project, "kind", None) == "bucket":
+        return
+    project_dir = project.path
+    plans_dir = project_dir / "_plans"
+    index = plans_dir / "PLANS.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    states = _done_plan_states(text)
+    files = {
+        p.name: p for p in sorted(plans_dir.glob("*.md"))
+        if p.name != "PLANS.md" and p.is_file()
+    }
+    touches = _last_touches(
+        root, [p.relative_to(root).as_posix() for p in files.values()]
+    )
+    now = now or datetime.now(timezone.utc)
+    for name, path in files.items():
+        state = states.get(name)
+        if state is None:
+            continue  # no state, or no done word: never retired
+        rel = path.relative_to(root).as_posix()
+        if state == "ambiguous":
+            plan.add(Action("info", "plans", rel,
+                            detail=f"ambiguous done state on {name}; not retired"))
+            continue
+        touched = touches.get(rel)
+        if touched is None:
+            continue  # no history: never "untouched"
+        age = _age_days(touched, now)
+        if age is None or age <= policy:
+            continue
+        dst = project_dir / "_archive/_plans" / name
+        if dst.exists():
+            plan.add(Action("info", "plans", rel,
+                            detail=f"destination exists: {dst.relative_to(root).as_posix()}"))
+            continue
+        plan.add(Action("move", "plans", rel, dst.relative_to(root).as_posix(), f"{policy}d"))
+        plan.add(Action(
+            "tombstone", "plans", index.relative_to(root).as_posix(),
+            dst=os.path.relpath(dst, plans_dir), detail=name,
+        ))
+
+
+@register("napkin")
+def _plan_napkin(plan, *, root, project, policy, now=None, **_):
+    """The napkin area: decay untouched notes under `_napkin/`.
+
+    The bare `napkin/` directory (where subdir-mode notes actually live today)
+    and a separately mounted napkin repository are REPORT-ONLY: the former has
+    no archive mirror at the work-repo root, and the latter's `_archive/` is at
+    its own root and would need its own commit, against the one-commit rule.
+    """
+    if policy is None:
+        return  # napkin: {archive_after: null} disables the area
+    now = now or datetime.now(timezone.utc)
+    napkin = root / "_napkin"
+    if napkin.is_dir():
+        files = [p for p in napkin.rglob("*.md") if p.is_file()]
+        touches = _last_touches(
+            root, [p.relative_to(root).as_posix() for p in files]
+        )
+        for path in files:
+            rel = path.relative_to(root).as_posix()
+            touched = touches.get(rel)
+            if touched is None:
+                continue  # no history: never decayed
+            age = _age_days(touched, now)
+            if age is None or age <= policy:
+                continue
+            dst = root / "_archive" / rel
+            if dst.exists():
+                plan.add(Action("info", "napkin", rel,
+                                detail=f"destination exists: {dst.relative_to(root).as_posix()}"))
+                continue
+            plan.add(Action("move", "napkin", rel, dst.relative_to(root).as_posix(), f"{policy}d"))
+    # Report-only: the bare `napkin/` directory.
+    bare = root / "napkin"
+    if bare.is_dir() and any(p.is_file() for p in bare.rglob("*.md")):
+        plan.add(Action("info", "napkin", "napkin",
+                        detail="bare napkin/ is report-only; move notes under _napkin/ to decay them"))
+    # Report-only: a separately mounted napkin repository.
+    mounted = os.environ.get("LMER_NAPKIN_PATH")
+    if mounted:
+        try:
+            outside = Path(mounted).resolve() != root.resolve() and not Path(mounted).resolve().is_relative_to(root.resolve())
+        except OSError:
+            outside = False
+        if outside:
+            plan.add(Action("info", "napkin", "napkin",
+                            detail="mounted napkin repository is report-only (its archive is its own commit)"))
+
+
+@register("bundles")
+def _plan_bundles(plan, *, root, project, policy, now=None, **_):
+    """The bundles area: flatten a legacy double-nested masterplan bundle.
+
+    Only a STOPPED record with exactly ONE nested bundle is relocated (D12);
+    a live record or a multi-bundle dir is reported and left untouched, and a
+    legacy run dir is never touched. `state.artifacts` names never change and
+    no state or event is written.
+    """
+    if getattr(project, "kind", None) == "bucket":
+        return
+    if load_work_manifest(root) is None:
+        return  # legacy run dirs are never touched
+    run_area = project.path / "_runs"
+    if not run_area.is_dir():
+        return
+    from .session_record import is_stopped
+
+    for rdir in run_state.iter_record_dirs(run_area):
+        mp = rdir / "masterplan"
+        if not mp.is_dir():
+            continue
+        rel = rdir.relative_to(root).as_posix()
+        # If masterplan/ is ITSELF already a bundle (the artifacts directly at
+        # its top, the same first check `_check_masterplan` makes), it is flat:
+        # never flatten anything under it.
+        if any((mp / name).is_file() for name in run_state.MASTERPLAN_ARTIFACTS):
+            continue
+        # A nested bundle is a subdir of masterplan/ that holds the masterplan
+        # artifacts DIRECTLY (the legacy double-nested form). A flat D12 bundle
+        # may carry its own opaque subdirs, so a subdir without the artifacts
+        # at its top is not a bundle and is left alone.
+        bundles = sorted(
+            p for p in mp.iterdir()
+            if p.is_dir()
+            and any((p / name).is_file() for name in run_state.MASTERPLAN_ARTIFACTS)
+        )
+        if not bundles:
+            continue
+        if len(bundles) > 1:
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"{len(bundles)} nested bundles; a human decides"))
+            continue
+        state = run_state._read_sibling_state(rdir)
+        events = _parse_events_strict(rdir)
+        if state is None or events is None or not is_stopped(state, events):
+            plan.add(Action("info", "bundles", rel,
+                            detail="record is live; bundle left untouched"))
+            continue
+        bundle = bundles[0]
+        # All-or-nothing: a flatten must be able to move EVERY entry. A subdir
+        # would be left behind, and a destination collision would clobber a
+        # flat bundle's file. Either way, report and leave the bundle alone —
+        # never half-flatten.
+        entries = sorted(bundle.iterdir())
+        if any(entry.is_dir() and not entry.is_symlink() for entry in entries):
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"nested bundle {bundle.name} holds subdirs; left untouched"))
+            continue
+        if any((mp / entry.name).exists() for entry in entries):
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"nested bundle {bundle.name} has a destination collision; left untouched"))
+            continue
+        for child in entries:
+            if child.is_file() or child.is_symlink():
+                plan.add(Action("move", "bundles", child.relative_to(root).as_posix(),
+                                (mp / child.name).relative_to(root).as_posix()))
+        # The record-root artifact links that point into the nested bundle.
+        for link in sorted(rdir.iterdir()):
+            if not link.is_symlink():
+                continue
+            target = os.path.normpath(os.path.join(str(link.parent), os.readlink(link)))
+            if target.startswith(str(bundle) + os.sep):
+                plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
+                                dst=mp.relative_to(root).as_posix(),
+                                detail=bundle.relative_to(root).as_posix()))
+        # Every `_specs` entry that targets the nested path.
+        for link, _sub in _links_under(project.path, bundle.relative_to(project.path).as_posix()):
+            plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
+                            dst=mp.relative_to(root).as_posix(),
+                            detail=bundle.relative_to(root).as_posix()))
+        # Remove the now-empty nested dir with rmdir (never rmtree): if any
+        # file or subdir is still in it, it stays put, so nothing is lost.
+        plan.add(Action("rmdir", "bundles", bundle.relative_to(root).as_posix(),
+                        detail="emptied nested bundle dir"))
+
+
+@register("buckets")
+def _plan_buckets(plan, *, root, project, policy, now=None, **_):
+    """The buckets area: list host buckets awaiting adoption (INFO only)."""
+    if getattr(project, "kind", None) != "bucket":
+        return
+    plan.add(Action("info", "buckets", project.rel,
+                    detail=f"work adopt {project.rel} <short-name>"))
+
+
+@register("index")
+def _plan_index(plan, *, root, project, policy, now=None, **_):
+    """The index area: tombstone dangling entries in MEMORY.md and PLANS.md.
+
+    No TTL: an entry whose file is gone is swept on every run. A generated
+    tombstone reads as a non-entry line to memory.py (so its index
+    regeneration keeps it) and to the validator.
+    """
+    if getattr(project, "kind", None) == "bucket":
+        return
+    from . import memory
+
+    now = now or datetime.now(timezone.utc)
+    date = now.strftime("%Y-%m-%d")
+    manifest = load_work_manifest(root)
+    # The project's own scope at `<project>/_agents/memory/` (the project
+    # `memory/` dir is the LEGACY surface). The INSTANCE scope is planned once
+    # by `build_plan`, never per project.
+    if manifest is not None:
+        _plan_memory_index(plan, root, project.path / "_agents" / "memory", manifest, date)
+        _plan_plans_index(plan, root, project.path, date)
+
+
+def _plan_memory_index(plan, root, scope_dir, manifest, date):
+    from . import memory
+
+    index = scope_dir / "MEMORY.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    scope_rel = scope_dir.relative_to(root).as_posix()
+    for line in text.splitlines():
+        if memory._is_tombstone(line):
+            continue
+        for target in memory._entry_targets(line):
+            if (scope_dir / target).exists():
+                continue  # the file is present: not dangling
+            key = f"{scope_rel}/{target}"
+            archive_rel = memory._retirement_archive_rel(key, manifest)
+            if (root / archive_rel).exists():
+                new_target = os.path.relpath(root / archive_rel, scope_dir)
+                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                                dst=new_target, detail=target))
+            else:
+                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                                detail=target, date=date))
+
+
+def _plan_plans_index(plan, root, project_dir, date):
+    index = project_dir / "_plans" / "PLANS.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    for line in text.splitlines():
+        match = _PLAN_LINK_RE.search(line)
+        if not match:
+            continue
+        target = match.group(2).strip().split("#", 1)[0]
+        if not target.lower().endswith(".md"):
+            continue
+        if (index.parent / target).exists():
+            continue
+        archive = project_dir / "_archive/_plans" / os.path.basename(target)
+        if archive.exists():
+            new_target = os.path.relpath(archive, index.parent)
+            plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                            dst=new_target, detail=target))
+        else:
+            plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                            detail=target, date=date))
+
+
 def build_plan(root: Path, projects, policy: Policy, areas: Sequence[str],
                *, archive_stale: bool = False, now: Optional[datetime] = None) -> Plan:
     """Run each selected area's planner over each project."""
     plan = Plan()
+    # Instance-level scopes are planned ONCE, never per project.
+    if "index" in areas and "index" not in policy.refused:
+        manifest = load_work_manifest(root)
+        if manifest is not None:
+            date = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+            _plan_memory_index(plan, root, root / "_agents" / "memory", manifest, date)
     for area in areas:
         if area in policy.refused:
             continue  # an invalid TTL refuses only its own area
         planner = PLANNERS.get(area)
         if planner is None:
+            continue
+        if area == "napkin":
+            # The root `_napkin/` is instance-level: one call, not one per
+            # project (the mount/bare reports are too).
+            planner(plan, root=root, project=None,
+                    policy=policy.archive_after.get(area), archive_stale=archive_stale,
+                    now=now)
             continue
         for entry in projects:
             planner(plan, root=root, project=entry,
@@ -418,12 +810,50 @@ def _apply_move(root: Path, action: Action) -> bool:
 
 @applier("retarget")
 def _apply_retarget(root: Path, action: Action) -> bool:
+    """Re-point a symlink whose target is under `detail` to the `dst` prefix.
+
+    Computed at APPLY time from the link's current target, so a chain of
+    retargets (a bundle flattened inside a record that is then archived) each
+    see the previous one's result instead of a stale plan-time path.
+    """
     link = root / action.src
-    if not link.is_symlink() or not action.dst:
+    if not link.is_symlink() or not action.dst or not action.detail:
         return False
-    rel = os.path.relpath(root / action.dst, link.parent)
+    target = os.path.normpath(os.path.join(str(link.parent), os.readlink(link)))
+    old = os.path.normpath(str(root / action.detail))
+    if target != old and not target.startswith(old + os.sep):
+        return False
+    sub = os.path.relpath(target, old)
+    new = root / action.dst if sub == "." else root / action.dst / sub
     link.unlink()
-    link.symlink_to(rel)
+    link.symlink_to(os.path.relpath(new, link.parent))
+    return True
+
+
+@applier("tombstone")
+def _apply_tombstone(root: Path, action: Action) -> bool:
+    index = root / action.src
+    if not action.detail:
+        return False
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if action.dst:
+        updated = _retarget_line(text, action.detail, action.dst)
+    elif action.date:
+        updated = _archive_links(text, action.detail, action.date)
+    else:
+        return False
+    if updated is None or updated == text:
+        return False
+    if index.name == "MEMORY.md":
+        from . import memory
+
+        with memory._memory_retirement_lock(root):
+            index.write_text(updated, encoding="utf-8")
+    else:
+        index.write_text(updated, encoding="utf-8")
     return True
 
 
@@ -434,6 +864,16 @@ def _apply_delete(root: Path, action: Action) -> bool:
     except OSError as exc:
         print(f"⚠️  could not remove {action.src}: {exc}", file=sys.stderr)
         return False
+    return True
+
+
+@applier("rmdir")
+def _apply_rmdir(root: Path, action: Action) -> bool:
+    """Remove a directory ONLY if it is empty (never rmtree)."""
+    try:
+        os.rmdir(root / action.src)
+    except OSError:
+        return False  # not empty, or already gone: leave it (no data loss)
     return True
 
 
@@ -457,11 +897,20 @@ def _change_line(action: Action) -> str:
 
 
 def _apply_changes(root: Path, plan: Plan) -> tuple[list[str], list[str], list[str]]:
-    """Apply every change; return ``(touched rels, lines, failures)``."""
+    """Apply every change; return ``(touched rels, lines, failures)``.
+
+    ``rmdir`` actions are deferred to the end and run only when every other
+    change succeeded, so a failed move never lets an emptied-dir cleanup run
+    over content still in the directory.
+    """
     touched: list[str] = []
     lines: list[str] = []
     failures: list[str] = []
+    deferred: list[Action] = []
     for action in plan.changes:
+        if action.kind == "rmdir":
+            deferred.append(action)
+            continue
         apply = APPLIERS.get(action.kind)
         if apply is None:
             failures.append(f"{action.kind} {action.src}")
@@ -475,6 +924,13 @@ def _apply_changes(root: Path, plan: Plan) -> tuple[list[str], list[str], list[s
             lines.append(_change_line(action))
         else:
             failures.append(f"{action.kind} {action.src}")
+    if not failures:
+        for action in deferred:
+            if _apply_rmdir(root, action):
+                touched.append(action.src)
+                lines.append(_change_line(action))
+            else:
+                print(f"ℹ️  kept non-empty dir {action.src}", file=sys.stderr)
     return touched, lines, failures
 
 

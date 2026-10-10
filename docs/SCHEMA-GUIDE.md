@@ -82,11 +82,11 @@ renaming them makes them silently invisible.
 |---|---|---|---|---|
 | `_plexus.yaml` | you, by hand, or `work adopt` | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
 | `<short-name>/` | your `git mv`; a session on first write | registry resolution | n/a | `work sessions` |
-| `_knowledge/` | humans and agents | humans and agents | n/a | nothing ships at schema 1 |
+| `_knowledge/` | humans and agents; `work knowledge index` generates each org's `INDEX.md` | humans and agents | n/a | `work knowledge index` |
 | `_napkin/` | humans and agents | **nothing in this release — see below** | no | — |
 | `_taskdef/` | you, or a mounted taskdef repo | `taskdef_search_dirs()` | yes (`_taskdef` then `taskdef`) | `lmer --task <name>` |
 | `_agents/` | see *Agent surface* | | yes | |
-| `_archive/` | housekeeping tooling | humans | n/a | nothing ships at schema 1 |
+| `_archive/` | `work housekeep` | humans | n/a | `work housekeep` |
 | `README.md` | you (outside the markers); `lmer-schema index --write` (the block) | humans on GitLab; the validator | n/a | `lmer-schema index .` |
 | any other top-level name | humans | the validator | n/a | `lmer-schema validate` — project-shaped with no registry entry: `tree.unregistered-project` WARN; dotted: `tree.host-bucket` INFO; a registered remote's old path as a real directory: `tree.bucket-collision` ERROR |
 
@@ -106,12 +106,12 @@ your notes in two and the validator will not say a word, because a bare
 | `<project>/_runs/.new-*` | `work` CLI (seed, then one atomic rename) | nobody | no | any first write in a run |
 | `<session-dir>/` | see *Session directory* | | no | |
 | `<project>/_specs/` | `work artifact`, `work session-end`, `work specs-index --rebuild` | humans; `work specs-index` | no | `work specs-index` |
-| `<project>/_plans/`, `PLANS.md`, run-plan links | no shipped writer at schema 1 | the validator | no | `lmer-schema validate` |
+| `<project>/_plans/`, `PLANS.md`, run-plan links | `work housekeep` (done-plan retirement; run-plan links have no shipped writer) | the validator | no | `work housekeep`; `lmer-schema validate` |
 | `<project>/_info/` | you | `work read-project-info` | **no** | `work read-project-info` |
 | `<project>/_info/gate-check.yaml` | you | `gate-check` (after `.lmer/gate-check.yaml`) | no | `gate-check` |
 | `<project>/_taskdef/` | you | `taskdef_search_dirs()` | yes | `lmer --task <name>` |
 | `<project>/_agents/` | see *Agent surface* | | no (memory) | |
-| `<project>/_archive/` | housekeeping; the session cleaner | humans | n/a | nothing ships at schema 1 |
+| `<project>/_archive/` | `work housekeep` | humans | n/a | `work housekeep` |
 | `<project>/README.md` | every durability push in the project (block); you (outside); `lmer-schema index --write` | humans on GitLab; the validator | no | `work commit` |
 
 ### Session directory

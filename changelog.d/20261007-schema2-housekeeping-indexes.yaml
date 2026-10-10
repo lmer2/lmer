@@ -1,0 +1,6 @@
+added:
+- "`work housekeep [--apply] [--area …] [--project …]` archives stale content and maintains the indexes — napkin decay, done-plan retirement, runs archiving, index tombstone sweeps, masterplan bundle flattening and host-bucket listing — dry-run by default with one commit on `--apply` (#371)"
+- "`work knowledge index [--check] [--org NAME]` generates `_knowledge/<org>/INDEX.md` from the pages beneath the org, grouped by topic with a last-git-touch date per page (#372)"
+- "the supported unattended housekeeping recipe: a weekly cron-run lmer session with a minimal `housekeep` taskdef, recorded in docs/RUN-STATE.md §6 (#373)"
+fixed:
+- "a specs-index entry keeps its first registration date across later session starts and re-registrations (#334)"

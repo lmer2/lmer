@@ -850,7 +850,20 @@ event's data — a goal without them behaves byte-for-byte as before.
 
 ## 6. External cleaner contract
 
-The cleaner is an external process (cron or host command, user-owned).
+`work housekeep` is the cleaner (`work housekeep --apply`; dry run by
+default). It archives by AREA — `napkin`, `plans`, `bundles`, `index`,
+`runs`, `buckets` — and the contract below stays valid for anyone running
+their own cleaner.
+
+Liveness comes from LIFECYCLE FACTS, never a display label: a schema-2
+record is STOPPED only with a recorded final `session_end`, or as a
+never-started `work seed` (`session.seeded_by` set, no `session_start`). An
+unknown or unreadable lifecycle is not stopped and is never moved; a
+started record past the staleness window is INFO 'possibly orphaned', and
+only the human-only `--archive-stale` moves it. The schema-form archive home
+is `<project>/_archive/_runs/<slug>/<uid>[--<name>]/`; the legacy home is
+`runs/archive/`. The `.new-*` sweep is the ONLY deletion housekeep makes.
+
 Contract it can rely on: single-writer state, append-only events, `status`
 enum, `updated` timestamps, `owner` claims. Actions:
 
@@ -859,9 +872,11 @@ enum, `updated` timestamps, `owner` claims. Actions:
   threshold. The archive subtree stays inside `runs/` — that is the tree
   the resolver's skip logic and the `work name` reservation guard — never
   a `runs/` sibling.
-- Sweep `runs/.new-*` orphans: a crash between run-dir create and rename
-  leaves one behind; any `.new-*` dir stale past an mtime threshold is
-  safe to delete (the resolver never matches dot-dirs).
+- Sweep `runs/.new-*` (or `_runs/.new-*`) orphans: a crash between run-dir
+  create and rename leaves one behind; any `.new-*` dir stale past an mtime
+  threshold is safe to delete (the resolver never matches dot-dirs). This is
+  the one deletion housekeep makes — everything else is archived, never
+  deleted.
 - Optionally migrate legacy `{task_type}/{target}/` log/report dirs into
   the matching run dir — the CLI only ever falls back to them on read and
   never moves them itself.
@@ -870,6 +885,41 @@ The cleaner does not refresh the generated `README.md` index blocks: the
 project's next durability push re-renders its block from the records that
 remain, and `lmer-schema index --write` backfills
 ([SCHEMA-V2.md](./SCHEMA-V2.md#project-index)).
+
+### Running the cleaner unattended (recipe)
+
+`work housekeep --apply` is the supported cleaner; §6's contract stays
+valid for anyone running their own. Schedule it as an lmer session on a
+host that already holds the work repo's credentials — the run's own session
+dir is the audit trail. First run it by hand WITHOUT `--apply` and read the
+move table before scheduling anything:
+
+```bash
+lmer housekeep <repo-url-or-path>
+```
+
+Then a minimal `housekeep` taskdef in the work repo's taskdef tier, at
+`taskdef/housekeep/instructions.txt`, shown in full:
+
+```text
+Run `work housekeep --apply`, then `work commit`, then stop.
+```
+
+A crontab line runs it weekly — enough for the 365-day TTLs — with
+`LMER_NONINTERACTIVE=1` so no gate waits for a person:
+
+```cron
+0 4 * * 0 LMER_NONINTERACTIVE=1 lmer housekeep <repo-url-or-path>
+```
+
+Scheduled runs never pass `--archive-stale`: it is human-only, and
+`work housekeep` refuses it under `LMER_NONINTERACTIVE=1`.
+
+**Decision (recorded 2026-10-10):** the session recipe above was chosen over
+a platform-daemon periodic job next to
+`lmer_platform.detect.sweep_finished_sessions`, because the daemon holds no
+work-repo credentials and a session does. The launch line uses only flags
+`lmer --help` lists at this head.
 
 ## 7. Single-flight release claim (`work release`)
 

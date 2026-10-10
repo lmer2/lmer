@@ -1621,6 +1621,41 @@ One related case is automatic. When a stopped run is relaunched with a pushed an
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
 
+### Housekeeping (`work housekeep`)
+
+`work housekeep [--apply] [--area napkin|plans|bundles|index|runs|buckets]
+[--project NAME] [--archive-stale]` archives stale content and maintains the
+indexes. It is a **dry run by default**; `--apply` performs the planned
+changes and makes ONE commit (through the normal gated push, which also
+refreshes each touched project's README). Areas run in execution order
+`napkin`, `plans`, `bundles`, `index`, `runs`, `buckets`.
+
+- **Areas and actions.** `napkin` decays untouched notes under `_napkin/`;
+  `plans` retires done plan files past their TTL and re-points their
+  `PLANS.md` line at the archive mirror; `bundles` flattens a legacy
+  double-nested masterplan bundle in a stopped session; `index` tombstones a
+  dangling `MEMORY.md`/`PLANS.md` entry in place (or re-points it at the
+  `_archive/` mirror); `runs` archives stopped records; `buckets` lists host
+  buckets awaiting adoption (INFO only).
+- **Policy** comes from `_plexus.yaml housekeeping:`, per area:
+  `napkin.archive_after` (default 365d), `plans.archive_after` (default
+  null), `runs.archive_after` (default 90d). `<N>d` means N days; `null`
+  disables the area. An invalid value refuses only that area.
+- **Liveness** is lifecycle facts: a schema-2 record is stopped only with a
+  final `session_end`, or as a never-started `work seed`. An unknown
+  lifecycle is never moved; a started record past the staleness window is
+  INFO `possibly orphaned`.
+- **`--archive-stale`** is human-only and moves such an unsigned record. It
+  is refused (exit 2) under `LMER_NONINTERACTIVE=1`, because scheduled runs
+  must never pass it. The only deletion is a stale `.new-*` orphan.
+- Inside a session every applied change is one event in the caller's own
+  record; from an operator shell the per-change lines go into the commit
+  body. See the unattended recipe in
+  [RUN-STATE.md](./RUN-STATE.md#running-the-cleaner-unattended-recipe).
+- **Napkin choices:** the bare `napkin/` directory and a separately mounted
+  napkin repository are report-only (the former has no mirror at the
+  work-repo root; the latter's archive is its own commit).
+
 ### Knowledge index (`work knowledge index`)
 
 `work knowledge index [--check] [--org NAME]` generates
