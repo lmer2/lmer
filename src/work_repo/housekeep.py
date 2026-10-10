@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -343,6 +344,122 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
             continue
 
 
+#: PLANS.md states housekeep recognises as "done". Conservative on purpose:
+#: a line whose state is not in this set is never retired. Tombstone words
+#: count too (the plan is already retired).
+_DONE_PLAN_STATES = frozenset(
+    {"done", "complete", "completed", "archived", "forgotten", "retired"}
+)
+_PLAN_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
+
+
+def _last_touches(root: Path, rels: Sequence[str]) -> dict[str, str]:
+    """``rel -> ISO date`` of the last commit touching it, from ONE git log.
+
+    The batched last-git-touch lookup the napkin area reuses. A path with no
+    history is absent from the map (never "untouched").
+    """
+    if not rels:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--format=%cs", "--name-only", "--", *rels],
+            cwd=str(root), capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return {}
+    found: dict[str, str] = {}
+    date = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", line):
+            date = line
+            continue
+        if date is not None:
+            found.setdefault(line, date)  # newest commit wins
+    return found
+
+
+def _done_plan_names(text: str) -> set[str]:
+    """The plan basenames whose PLANS.md line records a done state."""
+    done: set[str] = set()
+    for line in text.splitlines():
+        match = _PLAN_LINK_RE.search(line)
+        if not match:
+            continue
+        target = match.group(2).strip().split("#", 1)[0]
+        tail = line[match.end():]
+        state = re.findall(r"[A-Za-z]+", tail)
+        if any(word.lower() in _DONE_PLAN_STATES for word in state):
+            done.add(os.path.basename(target))
+    return done
+
+
+def _retarget_line(text: str, name: str, new_target: str) -> Optional[str]:
+    """The PLANS.md text with the line linking *name* re-pointed at
+    *new_target* (relative to the index's own directory)."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        for match in _PLAN_LINK_RE.finditer(line):
+            target = match.group(2).strip().split("#", 1)[0]
+            if os.path.basename(target) == name:
+                start, end = match.span(2)
+                lines[index] = line[:start] + new_target + line[end:]
+                return "".join(lines)
+    return None
+
+
+@register("plans")
+def _plan_plans(plan, *, root, project, policy, now=None, **_):
+    """The plans area: retire done plan files past their TTL (schema form)."""
+    if policy is None:
+        return  # plans: {archive_after: null} disables the area
+    if load_work_manifest(root) is None:
+        return  # a legacy tree has no _plans/
+    if getattr(project, "kind", None) == "bucket":
+        return
+    project_dir = project.path
+    plans_dir = project_dir / "_plans"
+    index = plans_dir / "PLANS.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    done = _done_plan_names(text)
+    files = {
+        p.name: p for p in sorted(plans_dir.glob("*.md"))
+        if p.name != "PLANS.md" and p.is_file()
+    }
+    touches = _last_touches(
+        root, [p.relative_to(root).as_posix() for p in files.values()]
+    )
+    now = now or datetime.now(timezone.utc)
+    for name, path in files.items():
+        if name not in done:
+            continue  # not recognisably done: never retired
+        rel = path.relative_to(root).as_posix()
+        touched = touches.get(rel)
+        if touched is None:
+            continue  # no history: never "untouched"
+        age = _age_days(touched, now)
+        if age is None or age <= policy:
+            continue
+        dst = project_dir / "_archive/_plans" / name
+        if dst.exists():
+            plan.add(Action("info", "plans", rel,
+                            detail=f"destination exists: {dst.relative_to(root).as_posix()}"))
+            continue
+        plan.add(Action("move", "plans", rel, dst.relative_to(root).as_posix(), f"{policy}d"))
+        plan.add(Action(
+            "tombstone", "plans", index.relative_to(root).as_posix(),
+            dst=os.path.relpath(dst, plans_dir), detail=name,
+        ))
+
+
 def build_plan(root: Path, projects, policy: Policy, areas: Sequence[str],
                *, archive_stale: bool = False, now: Optional[datetime] = None) -> Plan:
     """Run each selected area's planner over each project."""
@@ -424,6 +541,22 @@ def _apply_retarget(root: Path, action: Action) -> bool:
     rel = os.path.relpath(root / action.dst, link.parent)
     link.unlink()
     link.symlink_to(rel)
+    return True
+
+
+@applier("tombstone")
+def _apply_tombstone(root: Path, action: Action) -> bool:
+    index = root / action.src
+    if not action.dst or not action.detail:
+        return False
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    updated = _retarget_line(text, action.detail, action.dst)
+    if updated is None:
+        return False
+    index.write_text(updated, encoding="utf-8")
     return True
 
 
