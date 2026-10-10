@@ -75,7 +75,10 @@ class Plan:
     actions: list[Action] = field(default_factory=list)
 
     def add(self, action: Action) -> None:
-        self.actions.append(action)
+        # Dedupe: instance-level planners (napkin, the instance memory scope)
+        # run once per project, and the same action must not be applied twice.
+        if action not in self.actions:
+            self.actions.append(action)
 
     @property
     def changes(self) -> list[Action]:
@@ -385,19 +388,30 @@ def _last_touches(root: Path, rels: Sequence[str]) -> dict[str, str]:
     return found
 
 
-def _done_plan_names(text: str) -> set[str]:
-    """The plan basenames whose PLANS.md line records a done state."""
-    done: set[str] = set()
+def _done_plan_states(text: str) -> dict[str, str]:
+    """basename -> ``"done"`` or ``"ambiguous"`` for each PLANS.md line.
+
+    SCHEMA.md leaves the PLANS.md line grammar free (title, state, pointer),
+    so housekeep recognises a done state ONLY when the text after the link is
+    exactly one done word (after separators/whitespace). A done word buried in
+    prose is ``"ambiguous"``: reported INFO, never retired. This never
+    archives on prose.
+    """
+    result: dict[str, str] = {}
     for line in text.splitlines():
         match = _PLAN_LINK_RE.search(line)
         if not match:
             continue
         target = match.group(2).strip().split("#", 1)[0]
-        tail = line[match.end():]
-        state = re.findall(r"[A-Za-z]+", tail)
-        if any(word.lower() in _DONE_PLAN_STATES for word in state):
-            done.add(os.path.basename(target))
-    return done
+        name = os.path.basename(target)
+        words = re.findall(r"[A-Za-z]+", line[match.end():])
+        if not words:
+            continue
+        if len(words) == 1 and words[0].lower() in _DONE_PLAN_STATES:
+            result[name] = "done"
+        elif any(word.lower() in _DONE_PLAN_STATES for word in words):
+            result[name] = "ambiguous"
+    return result
 
 
 def _retarget_line(text: str, old_target: str, new_target: str) -> Optional[str]:
@@ -445,7 +459,7 @@ def _plan_plans(plan, *, root, project, policy, now=None, **_):
         text = index.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return
-    done = _done_plan_names(text)
+    states = _done_plan_states(text)
     files = {
         p.name: p for p in sorted(plans_dir.glob("*.md"))
         if p.name != "PLANS.md" and p.is_file()
@@ -455,9 +469,14 @@ def _plan_plans(plan, *, root, project, policy, now=None, **_):
     )
     now = now or datetime.now(timezone.utc)
     for name, path in files.items():
-        if name not in done:
-            continue  # not recognisably done: never retired
+        state = states.get(name)
+        if state is None:
+            continue  # no state, or no done word: never retired
         rel = path.relative_to(root).as_posix()
+        if state == "ambiguous":
+            plan.add(Action("info", "plans", rel,
+                            detail=f"ambiguous done state on {name}; not retired"))
+            continue
         touched = touches.get(rel)
         if touched is None:
             continue  # no history: never "untouched"
@@ -549,7 +568,15 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
         mp = rdir / "masterplan"
         if not mp.is_dir():
             continue
-        bundles = sorted(p for p in mp.iterdir() if p.is_dir())
+        # A nested bundle is a subdir of masterplan/ that holds the masterplan
+        # artifacts DIRECTLY (the legacy double-nested form). A flat D12 bundle
+        # may carry its own opaque subdirs, so a subdir without the artifacts
+        # at its top is not a bundle and is left alone.
+        bundles = sorted(
+            p for p in mp.iterdir()
+            if p.is_dir()
+            and any((p / name).is_file() for name in run_state.MASTERPLAN_ARTIFACTS)
+        )
         if not bundles:
             continue
         rel = rdir.relative_to(root).as_posix()
@@ -582,7 +609,9 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
             plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
                             dst=mp.relative_to(root).as_posix(),
                             detail=bundle.relative_to(root).as_posix()))
-        plan.add(Action("delete", "bundles", bundle.relative_to(root).as_posix(),
+        # Remove the now-empty nested dir with rmdir (never rmtree): if any
+        # file or subdir is still in it, it stays put, so nothing is lost.
+        plan.add(Action("rmdir", "bundles", bundle.relative_to(root).as_posix(),
                         detail="emptied nested bundle dir"))
 
 
@@ -610,10 +639,13 @@ def _plan_index(plan, *, root, project, policy, now=None, **_):
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
     manifest = load_work_manifest(root)
-    # Instance scope (schema form only), then the project's own scope.
+    # Instance scope (schema form only), then the project's own scope at
+    # `<project>/_agents/memory/` (the project `memory/` dir is the LEGACY
+    # surface). `Plan.add` dedupes, so the instance scope is planned once
+    # however many projects the walk yields.
     if manifest is not None:
         _plan_memory_index(plan, root, root / "_agents" / "memory", manifest, date)
-        _plan_memory_index(plan, root, project.path / "memory", manifest, date)
+        _plan_memory_index(plan, root, project.path / "_agents" / "memory", manifest, date)
         _plan_plans_index(plan, root, project.path, date)
 
 
@@ -804,6 +836,16 @@ def _apply_delete(root: Path, action: Action) -> bool:
     return True
 
 
+@applier("rmdir")
+def _apply_rmdir(root: Path, action: Action) -> bool:
+    """Remove a directory ONLY if it is empty (never rmtree)."""
+    try:
+        os.rmdir(root / action.src)
+    except OSError:
+        return False  # not empty, or already gone: leave it (no data loss)
+    return True
+
+
 def _remove_tree(target: Path) -> None:
     if not target.exists() and not target.is_symlink():
         return
@@ -824,11 +866,20 @@ def _change_line(action: Action) -> str:
 
 
 def _apply_changes(root: Path, plan: Plan) -> tuple[list[str], list[str], list[str]]:
-    """Apply every change; return ``(touched rels, lines, failures)``."""
+    """Apply every change; return ``(touched rels, lines, failures)``.
+
+    ``rmdir`` actions are deferred to the end and run only when every other
+    change succeeded, so a failed move never lets an emptied-dir cleanup run
+    over content still in the directory.
+    """
     touched: list[str] = []
     lines: list[str] = []
     failures: list[str] = []
+    deferred: list[Action] = []
     for action in plan.changes:
+        if action.kind == "rmdir":
+            deferred.append(action)
+            continue
         apply = APPLIERS.get(action.kind)
         if apply is None:
             failures.append(f"{action.kind} {action.src}")
@@ -842,6 +893,13 @@ def _apply_changes(root: Path, plan: Plan) -> tuple[list[str], list[str], list[s
             lines.append(_change_line(action))
         else:
             failures.append(f"{action.kind} {action.src}")
+    if not failures:
+        for action in deferred:
+            if _apply_rmdir(root, action):
+                touched.append(action.src)
+                lines.append(_change_line(action))
+            else:
+                print(f"ℹ️  kept non-empty dir {action.src}", file=sys.stderr)
     return touched, lines, failures
 
 

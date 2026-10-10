@@ -13,6 +13,7 @@ from tests.schema2_fixtures import DEFAULT_PROJECT, RecordSpec, build_schema2_pl
 from work_repo import housekeep, run_state
 
 
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     strip_lmer_env(monkeypatch)
@@ -97,6 +98,38 @@ def test_a_bucket_is_listed_with_its_adopt_line(tmp_path):
     (bucket / "_runs").mkdir(parents=True)
     infos = [a for a in _plan(tree, ("buckets",)).actions if a.kind == "info"]
     assert any(a.detail.startswith("work adopt git.example.test/unnamed/widget") for a in infos)
+
+
+def test_a_failed_move_skips_the_rmdir(tmp_path):
+    tree = build_schema2_plexus(tmp_path / "plexus")
+    rdir = _stopped_record(tree, uid_for(1))
+    bundle = _bundle(rdir)
+    plan = _plan(tree)
+    with patch("work_repo.housekeep._run_git", lambda args, cwd: (1, "boom")):
+        _touched, _lines, failures = housekeep._apply_changes(tree.root, plan)
+    assert failures
+    assert bundle.is_dir() and (bundle / "spec.md").is_file()
+
+
+def test_a_nested_dir_with_content_is_not_rmdir_ed(tmp_path):
+    tree = build_schema2_plexus(tmp_path / "plexus")
+    rdir = _stopped_record(tree, uid_for(1))
+    bundle = _bundle(rdir)
+    (bundle / "extra").mkdir()
+    (bundle / "extra" / "keep.md").write_text("keep\n")
+    _apply(tree, _plan(tree))
+    assert (bundle / "extra/keep.md").is_file()
+
+
+def test_a_flat_bundle_with_subdirs_is_not_flattened(tmp_path):
+    tree = build_schema2_plexus(tmp_path / "plexus")
+    rdir = _stopped_record(tree, uid_for(1))
+    mp = rdir / "masterplan"
+    (mp / "reports").mkdir(parents=True)
+    (mp / "spec.md").write_text("spec\n")
+    (mp / "reports" / "x.md").write_text("x\n")
+    plan = _plan(tree)
+    assert [a for a in plan.actions if a.kind == "move"] == []
 
 
 def test_a_second_run_is_a_noop(tmp_path):

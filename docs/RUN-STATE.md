@@ -895,7 +895,7 @@ dir is the audit trail. First run it by hand WITHOUT `--apply` and read the
 move table before scheduling anything:
 
 ```bash
-lmer housekeep --project <project>
+lmer housekeep <repo-url-or-path>
 ```
 
 Then a minimal `housekeep` taskdef in the work repo's taskdef tier, at
@@ -909,7 +909,7 @@ A crontab line runs it weekly — enough for the 365-day TTLs — with
 `LMER_NONINTERACTIVE=1` so no gate waits for a person:
 
 ```cron
-0 4 * * 0 LMER_NONINTERACTIVE=1 lmer housekeep --project <project>
+0 4 * * 0 LMER_NONINTERACTIVE=1 lmer housekeep <repo-url-or-path>
 ```
 
 Scheduled runs never pass `--archive-stale`: it is human-only, and

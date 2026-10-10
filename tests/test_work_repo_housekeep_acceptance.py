@@ -63,11 +63,16 @@ def _build(tmp_path):
     )
     # 5. host bucket
     (tree.root / "git.example.test/unnamed/widget/_runs").mkdir(parents=True)
-    _git(tree.root, "init", "-q")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                   check=True, capture_output=True)
+    _git(tree.root, "init", "-q", "-b", "main")
+    _git(tree.root, "remote", "add", "origin", str(origin))
     _git(tree.root, "add", "-A")
     env = {**os.environ, "GIT_AUTHOR_DATE": "2025-01-01T00:00:00Z",
            "GIT_COMMITTER_DATE": "2025-01-01T00:00:00Z"}
     _git(tree.root, "commit", "-qm", "seed", env=env)
+    _git(tree.root, "push", "-qu", "origin", "main")
     return tree, rdir
 
 
@@ -89,24 +94,30 @@ def test_the_dry_run_lists_the_moves_and_leaves_head_unchanged(tmp_path, monkeyp
     assert (tree.root / "_napkin/acme/topic/note.md").exists()
 
 
-def test_apply_makes_one_commit_and_mirrors_every_path(tmp_path, monkeypatch):
+def test_apply_makes_one_real_commit_and_the_tree_validates(tmp_path, monkeypatch):
+    """A REAL `--apply` commit, then `lmer-schema validate` exits 0."""
+    import sys
+
     tree, rdir = _build(tmp_path)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
-    with patch("work_repo.housekeep.git_ops.commit_work_path", return_value=0) as commit:
-        assert housekeep.cmd_housekeep(_args(apply=True)) == 0
-    assert commit.call_count == 1
-    paths, message = commit.call_args[0][:2]
+    before = _git(tree.root, "rev-list", "--count", "HEAD").stdout.strip()
+    assert housekeep.cmd_housekeep(_args(apply=True)) == 0
+    after = _git(tree.root, "rev-list", "--count", "HEAD").stdout.strip()
+    assert int(after) == int(before) + 1
+    message = _git(tree.root, "log", "-1", "--format=%B").stdout
     assert message.startswith("housekeep: ")
     assert "_archive/_napkin/acme/topic/note.md" in message
-    assert "_archive/_plans/done.md" in message
     assert (tree.root / "_archive/_napkin/acme/topic/note.md").is_file()
     assert (tree.project_dir() / "_archive/_plans/done.md").is_file()
     archived = tree.project_dir() / "_archive/_runs/chat" / uid_for(1)
     assert archived.is_dir()
     assert (archived / "masterplan/spec.md").is_file()
     assert not (rdir / "masterplan/spec.md").exists()
-    # The commit staged every moved path.
-    assert any("_archive/_napkin" in p for p in paths)
+    proc = subprocess.run(
+        [sys.executable, "-m", "lmer_schema.cli", "validate", str(tree.root)],
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_a_second_apply_makes_no_commit(tmp_path, monkeypatch):

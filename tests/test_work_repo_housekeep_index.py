@@ -19,7 +19,7 @@ def _clean(monkeypatch):
 def _build(tmp_path):
     tree = build_schema2_plexus(tmp_path / "plexus")
     instance = tree.root / "_agents" / "memory"
-    project = tree.project_dir() / "memory"
+    project = tree.project_dir() / "_agents" / "memory"
     for scope in (instance, project):
         scope.mkdir(parents=True, exist_ok=True)
     # Instance scope: one dangling entry, one with an archive mirror.
@@ -68,7 +68,7 @@ def test_dangling_memory_entries_are_tombstoned_and_archived_ones_repointed(tmp_
     assert "archived 2027-01-01" in instance
     # The moved entry is re-pointed, not tombstoned.
     assert "_archive/_agents/memory/moved.md" in instance
-    project = (tree.project_dir() / "memory/MEMORY.md").read_text()
+    project = (tree.project_dir() / "_agents/memory/MEMORY.md").read_text()
     assert "archived 2027-01-01" in project
     plans = (tree.project_dir() / "_plans/PLANS.md").read_text()
     assert "archived 2027-01-01" in plans
@@ -80,7 +80,7 @@ def test_every_rewritten_line_is_a_non_entry(tmp_path):
     _apply(tree, _plan(tree))
     for index in (
         tree.root / "_agents/memory/MEMORY.md",
-        tree.project_dir() / "memory/MEMORY.md",
+        tree.project_dir() / "_agents/memory/MEMORY.md",
         tree.project_dir() / "_plans/PLANS.md",
     ):
         for line in index.read_text().splitlines():
