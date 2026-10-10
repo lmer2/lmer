@@ -37,7 +37,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, plan_index, release_run, run_state, specs_index, write_journal
+from . import goals, housekeep, knowledge, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
@@ -265,6 +265,46 @@ Examples:
         )
         retirement_parser.add_argument("scoped_path", help="Work-repo-relative memory path")
         retirement_parser.add_argument("--message", "-m", help="Commit message")
+
+    # knowledge command (#372): generate `_knowledge/<org>/INDEX.md`.
+    knowledge_parser = subparsers.add_parser(
+        "knowledge", help="Generate knowledge-area indexes"
+    )
+    knowledge_subparsers = knowledge_parser.add_subparsers(
+        dest="knowledge_action", help="Knowledge action to perform"
+    )
+    knowledge_index_parser = knowledge_subparsers.add_parser(
+        "index", help="Generate (or check) `_knowledge/<org>/INDEX.md`"
+    )
+    knowledge_index_parser.add_argument(
+        "--check", action="store_true",
+        help="Write nothing; exit 1 when any generated index is out of date",
+    )
+    knowledge_index_parser.add_argument(
+        "--org", metavar="NAME", help="Limit the run to one organisation",
+    )
+
+    # housekeep command (#371): dry-run-first archival and index maintenance.
+    housekeep_parser = subparsers.add_parser(
+        "housekeep",
+        help="Archive stale content and maintain indexes (dry run by default)",
+    )
+    housekeep_parser.add_argument(
+        "--apply", action="store_true",
+        help="Perform the planned changes and make one commit (default: dry run)",
+    )
+    housekeep_parser.add_argument(
+        "--area", choices=housekeep.AREAS,
+        help="Limit the run to one area (default: every area)",
+    )
+    housekeep_parser.add_argument(
+        "--project", metavar="NAME",
+        help="Restrict the walk to one project (registry short name or host/project)",
+    )
+    housekeep_parser.add_argument(
+        "--archive-stale", action="store_true",
+        help="Include stale-run archiving (the runs area's opt-in)",
+    )
 
     # setup-workspace command
     setup_ws_parser = subparsers.add_parser(
@@ -4679,6 +4719,27 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return [rel] if rel else []
         except Exception:
             return []
+    if command == "knowledge":
+        if getattr(args, "knowledge_action", None) != "index":
+            return None
+        if getattr(args, "check", False):
+            return None  # --check writes nothing
+        return [knowledge.KNOWLEDGE_DIR]
+    if command == "housekeep":
+        if not getattr(args, "apply", False):
+            return None  # dry run writes nothing
+        # The scope the apply may write: the selected project dirs, the
+        # archive area and the napkin area. Non-empty in a legacy tree too.
+        rels = ["_archive", "_napkin", "napkin"]
+        try:
+            projects = housekeep.project_dirs(
+                _work_repo_root(), getattr(args, "project", None)
+            )
+            rels.extend(entry.rel for entry in projects)
+        except Exception:
+            pass  # an unknown --project exits 2 in main() before any write
+        rels.extend(run_candidates())
+        return pushing(rels)
     if command == "memory":
         if getattr(args, "memory_action", None) in ("forget", "revive"):
             from .memory import memory_retirement_paths
@@ -4776,7 +4837,9 @@ def main() -> int:
 
     # Record-writing helpers inherit their execution's UID. Without one,
     # a read resolver may choose the latest record, but a writer must refuse.
-    if args.command not in ("memory", "specs-index", "adopt", "migrate"):
+    if args.command not in (
+        "memory", "specs-index", "adopt", "migrate", "housekeep", "knowledge"
+    ):
         from .utils import SchemaContextError
 
         try:
@@ -4816,6 +4879,10 @@ def _dispatch(args, parser) -> int:
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
                           getattr(args, "scoped_path", None),
                           getattr(args, "allow_unbaselined_delete", False))
+    elif args.command == "housekeep":
+        return housekeep.cmd_housekeep(args)
+    elif args.command == "knowledge":
+        return knowledge.cmd_knowledge(args)
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":

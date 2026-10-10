@@ -1621,6 +1621,19 @@ One related case is automatic. When a stopped run is relaunched with a pushed an
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
 
+### Knowledge index (`work knowledge index`)
+
+`work knowledge index [--check] [--org NAME]` generates
+`_knowledge/<org>/INDEX.md` from the pages beneath the org: one line per page
+(title, relative link, last git-touch date), grouped by topic. A generated
+index starts with the `lmer:knowledge-index:generated` marker; an existing
+index without it is hand-written and is never overwritten (reported and
+skipped). A plain run rewrites stale generated indexes in place; `--check`
+writes nothing and exits 1 when any is out of date, 0 otherwise. `--check`
+compares everything except the per-line git date, so committing the
+regenerated index does not make it stale at once. An unknown `--org` exits 2.
+Neither mode commits — the caller commits.
+
 ### Adopting and migrating a work repo (`work adopt` / `work migrate`)
 
 Both verbs are **operator-shell** verbs: they run from a work-repo checkout
