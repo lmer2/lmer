@@ -1,0 +1,2 @@
+fixed:
+- "A session that ends at the instant its status is checked is no longer briefly reported as still running."
