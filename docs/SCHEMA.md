@@ -708,7 +708,7 @@ memory scope) but never shape findings.
 | `<short-name>/` | operator or adoption tooling creates it; a session creates it on first write for a registered project | directory; name matches `[a-z0-9][a-z0-9_-]*`; SHOULD have a registry entry and a registry entry SHOULD have the directory (either mismatch is a warning) | optional | machine |
 | `_knowledge/` | humans and agents | directory of `<org>/<topic>/` directories | optional | free-form |
 | `_knowledge/<org>/<topic>/*.md` | humans and agents; promotion from napkin | free-form markdown | optional | free-form |
-| `_knowledge/<org>/INDEX.md` | humans and agents | free-form markdown index; RECOMMENDED, never checked | optional | free-form |
+| `_knowledge/<org>/INDEX.md` | humans and agents; `work knowledge index` generates one when it carries the marker | free-form markdown index; RECOMMENDED. A generated index (starting with the `lmer:knowledge-index:generated` comment) is maintained by `work knowledge index`; a hand-written one is never overwritten. The validator never checks either | optional | free-form |
 | `_napkin/` | humans and agents | directory of `<org>/<topic>/` directories; subject to the housekeeping TTL | optional | free-form |
 | `_napkin/<org>/<topic>/*.md` | humans and agents | free-form markdown; never authoritative | optional | free-form |
 | `_taskdef/` | operator, or the root of a mounted taskdef repository | the task-definition contract of [TASKDEFS.md](./TASKDEFS.md); validated by the taskdef loader, not by `lmer-schema` | optional | opaque |

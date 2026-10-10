@@ -19,11 +19,16 @@ Contract:
 - A plain run rewrites stale generated indexes in place and prints what
   changed. `--check` writes nothing and exits 1 when any generated index is
   out of date (a missing index in an org that has pages counts as out of
-  date), 0 otherwise. Neither mode commits; the caller commits.
+  date), 0 otherwise. `--check` compares everything EXCEPT the per-line git
+  commit date — pages, titles, order, structure — so committing the
+  regenerated index does not make it stale at once (an uncommitted page has
+  no git date until the commit that adds it). An unknown `--org` exits 2.
+  Neither mode commits; the caller commits.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -148,20 +153,44 @@ def render_index(org: str, pages: Sequence[Page]) -> str:
 def _orgs(root: Path, org: Optional[str]) -> list[Path]:
     base = root / KNOWLEDGE_DIR
     if not base.is_dir():
+        if org:
+            raise KnowledgeError(org)
         return []
     if org:
         target = base / org
-        return [target] if target.is_dir() else []
+        if not target.is_dir():
+            raise KnowledgeError(org)
+        return [target]
     return sorted(p for p in base.iterdir() if p.is_dir())
+
+
+_DATE_SUFFIX_RE = re.compile(r" — \d{4}-\d{2}-\d{2}$", re.M)
+
+
+def _strip_dates(text: str) -> str:
+    """The index without its per-line git-commit dates.
+
+    `--check` compares this so committing the regenerated index does not make
+    it stale at once: an uncommitted page has no git date, and the date the
+    commit gives it would otherwise change the render.
+    """
+    return _DATE_SUFFIX_RE.sub("", text)
 
 
 def run_index(*, check: bool = False, org: Optional[str] = None,
               out=None) -> int:
-    """Generate (or check) the indexes; ``0`` ok, ``1`` out of date/refused."""
+    """Generate (or check) the indexes; ``0`` ok, ``1`` out of date, ``2``
+    an unknown ``--org``."""
     out = out or print
     root = work_repo_root()
+    try:
+        org_dirs = _orgs(root, org)
+    except KnowledgeError:
+        out(f"❌ no knowledge org named {org!r} in {root / KNOWLEDGE_DIR}",
+            file=sys.stderr)
+        return 2
     changed = False
-    for org_dir in _orgs(root, org):
+    for org_dir in org_dirs:
         name = org_dir.name
         pages = collect_pages(org_dir, root)
         if not pages:
@@ -175,6 +204,8 @@ def run_index(*, check: bool = False, org: Optional[str] = None,
                 continue
             if existing == rendered:
                 continue
+            if check and _strip_dates(existing) == _strip_dates(rendered):
+                continue  # only git-commit dates differ: a stable round-trip
         changed = True
         if check:
             out(f"{index.relative_to(root)} is out of date")

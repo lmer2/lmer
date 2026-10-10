@@ -241,9 +241,11 @@ class TestLegacyRuns:
         rdir = tree.session_dirs[0]
         state = run_state._read_sibling_state(rdir)
         state["status"] = "in-progress"
+        # Fresh relative to the plan's now (2027-01-01), so `_is_orphaned`
+        # is False and the record is not a candidate.
         state["owner"] = {
             "session_id": "20260824-101500-1-11111",
-            "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "claimed_at": "2027-01-01T00:00:00Z",
         }
         run_state._state_path(rdir).write_text(yaml.safe_dump(state, sort_keys=False))
         plan = housekeep.build_plan(

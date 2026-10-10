@@ -1527,6 +1527,19 @@ the record with `session.seeded_by`, and prints the uid and the launch line
 continuation source needing no `--allow-unsigned-source`, and `work commit` /
 `work session-end` publish it.
 
+#### `work knowledge index`
+
+`work knowledge index [--check] [--org NAME]` generates
+`_knowledge/<org>/INDEX.md` from the pages beneath the org: one line per page
+(title, relative link, last git-touch date), grouped by topic. A generated
+index starts with the `lmer:knowledge-index:generated` marker; an existing
+index without it is hand-written and is never overwritten (reported and
+skipped). A plain run rewrites stale generated indexes in place; `--check`
+writes nothing and exits 1 when any is out of date, 0 otherwise. `--check`
+compares everything except the per-line git date, so committing the
+regenerated index does not make it stale at once. An unknown `--org` exits 2.
+Neither mode commits — the caller commits.
+
 In a work repo migrated to the lmer schema the unit of record is the **session**: one launch writes one record, at `<project>/_runs/<slug>/<session-id>[--<name>]/`. Several launches against the same target share the `<slug>/` group — two people on one issue are two records — so "which run is this?" becomes "which *session* of this run?". `work sessions` answers it, and `--session <id>` is how a launch continues an existing record instead of opening a new one.
 
 Both surfaces work in a legacy tree too. There one shared run dir per target holds every session's writes, so no session id describes it, and the rows say so rather than presenting a directory name as a launch. The file shapes are unchanged in either form — see [RUN-STATE.md](./RUN-STATE.md) for what is *in* a record, and [SCHEMA.md](./SCHEMA.md#sessions-and-runs) for where it lives.

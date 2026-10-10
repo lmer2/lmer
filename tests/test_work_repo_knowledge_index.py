@@ -86,22 +86,45 @@ def test_a_hand_written_index_is_never_overwritten(tmp_path, monkeypatch):
     assert hand.read_bytes() == before
 
 
-def test_no_new_validator_codes(tmp_path, monkeypatch):
-    from lmer_schema import cli as schema_cli
+def test_an_unknown_org_exits_two(tmp_path, monkeypatch, capsys):
+    root = _build(tmp_path)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
+    assert knowledge.run_index(org="nope") == 2
+    assert knowledge.run_index(check=True, org="nope") == 2
+    assert "no knowledge org" in capsys.readouterr().err
 
+
+def test_check_stays_green_after_the_index_is_committed(tmp_path, monkeypatch):
+    """The generated index's git-commit dates must not make `--check` stale
+    the moment the index is committed."""
+    root = _build(tmp_path)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
+    knowledge.run_index()
+    _git(root, "add", "-A")
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-02-01T00:00:00Z",
+           "GIT_COMMITTER_DATE": "2026-02-01T00:00:00Z"}
+    _git(root, "commit", "-qm", "index", env=env)
+    assert knowledge.run_index(check=True) == 0
+
+
+def test_no_new_validator_codes(tmp_path, monkeypatch):
     root = _build(tmp_path)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
     before = _codes(root)
+    assert before, "the validator did not run"
     knowledge.run_index()
     after = _codes(root)
     assert after == before
 
 
 def _codes(root):
+    import sys
+
     proc = subprocess.run(
-        ["python", "-m", "lmer_schema.cli", "validate", str(root), "--json"],
+        [sys.executable, "-m", "lmer_schema.cli", "validate", str(root), "--json"],
         capture_output=True, text=True, check=False,
     )
+    assert proc.returncode in (0, 1), proc.stdout + proc.stderr
     try:
         doc = json.loads(proc.stdout)
     except ValueError:
