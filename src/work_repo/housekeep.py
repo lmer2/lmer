@@ -474,6 +474,125 @@ def _plan_plans(plan, *, root, project, policy, now=None, **_):
         ))
 
 
+@register("napkin")
+def _plan_napkin(plan, *, root, project, policy, now=None, **_):
+    """The napkin area: decay untouched notes under `_napkin/`.
+
+    The bare `napkin/` directory (where subdir-mode notes actually live today)
+    and a separately mounted napkin repository are REPORT-ONLY: the former has
+    no archive mirror at the work-repo root, and the latter's `_archive/` is at
+    its own root and would need its own commit, against the one-commit rule.
+    """
+    if policy is None:
+        return  # napkin: {archive_after: null} disables the area
+    if getattr(project, "kind", None) == "bucket":
+        return
+    now = now or datetime.now(timezone.utc)
+    napkin = root / "_napkin"
+    if napkin.is_dir():
+        files = [p for p in napkin.rglob("*.md") if p.is_file()]
+        touches = _last_touches(
+            root, [p.relative_to(root).as_posix() for p in files]
+        )
+        for path in files:
+            rel = path.relative_to(root).as_posix()
+            touched = touches.get(rel)
+            if touched is None:
+                continue  # no history: never decayed
+            age = _age_days(touched, now)
+            if age is None or age <= policy:
+                continue
+            dst = root / "_archive" / rel
+            if dst.exists():
+                plan.add(Action("info", "napkin", rel,
+                                detail=f"destination exists: {dst.relative_to(root).as_posix()}"))
+                continue
+            plan.add(Action("move", "napkin", rel, dst.relative_to(root).as_posix(), f"{policy}d"))
+    # Report-only: the bare `napkin/` directory.
+    bare = root / "napkin"
+    if bare.is_dir() and any(p.is_file() for p in bare.rglob("*.md")):
+        plan.add(Action("info", "napkin", "napkin",
+                        detail="bare napkin/ is report-only; move notes under _napkin/ to decay them"))
+    # Report-only: a separately mounted napkin repository.
+    mounted = os.environ.get("LMER_NAPKIN_PATH")
+    if mounted:
+        try:
+            outside = Path(mounted).resolve() != root.resolve() and not Path(mounted).resolve().is_relative_to(root.resolve())
+        except OSError:
+            outside = False
+        if outside:
+            plan.add(Action("info", "napkin", "napkin",
+                            detail="mounted napkin repository is report-only (its archive is its own commit)"))
+
+
+@register("bundles")
+def _plan_bundles(plan, *, root, project, policy, now=None, **_):
+    """The bundles area: flatten a legacy double-nested masterplan bundle.
+
+    Only a STOPPED record with exactly ONE nested bundle is relocated (D12);
+    a live record or a multi-bundle dir is reported and left untouched, and a
+    legacy run dir is never touched. `state.artifacts` names never change and
+    no state or event is written.
+    """
+    if getattr(project, "kind", None) == "bucket":
+        return
+    if load_work_manifest(root) is None:
+        return  # legacy run dirs are never touched
+    run_area = project.path / "_runs"
+    if not run_area.is_dir():
+        return
+    from .session_record import is_stopped
+
+    for rdir in run_state.iter_record_dirs(run_area):
+        mp = rdir / "masterplan"
+        if not mp.is_dir():
+            continue
+        bundles = sorted(p for p in mp.iterdir() if p.is_dir())
+        if not bundles:
+            continue
+        rel = rdir.relative_to(root).as_posix()
+        if len(bundles) > 1:
+            plan.add(Action("info", "bundles", rel,
+                            detail=f"{len(bundles)} nested bundles; a human decides"))
+            continue
+        state = run_state._read_sibling_state(rdir)
+        events = _parse_events_strict(rdir)
+        if state is None or events is None or not is_stopped(state, events):
+            plan.add(Action("info", "bundles", rel,
+                            detail="record is live; bundle left untouched"))
+            continue
+        bundle = bundles[0]
+        for child in sorted(bundle.iterdir()):
+            if child.is_file() or child.is_symlink():
+                plan.add(Action("move", "bundles", child.relative_to(root).as_posix(),
+                                (mp / child.name).relative_to(root).as_posix()))
+        # The record-root artifact links that point into the nested bundle.
+        for link in sorted(rdir.iterdir()):
+            if not link.is_symlink():
+                continue
+            target = os.path.normpath(os.path.join(str(link.parent), os.readlink(link)))
+            if target.startswith(str(bundle) + os.sep):
+                new = mp / os.path.relpath(target, str(bundle))
+                plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
+                                new.relative_to(root).as_posix()))
+        # Every `_specs` entry that targets the nested path.
+        for link, sub in _links_under(project.path, bundle.relative_to(project.path).as_posix()):
+            new = mp / sub
+            plan.add(Action("retarget", "bundles", link.relative_to(root).as_posix(),
+                            new.relative_to(root).as_posix()))
+        plan.add(Action("delete", "bundles", bundle.relative_to(root).as_posix(),
+                        detail="emptied nested bundle dir"))
+
+
+@register("buckets")
+def _plan_buckets(plan, *, root, project, policy, now=None, **_):
+    """The buckets area: list host buckets awaiting adoption (INFO only)."""
+    if getattr(project, "kind", None) != "bucket":
+        return
+    plan.add(Action("info", "buckets", project.rel,
+                    detail=f"work adopt {project.rel} <short-name>"))
+
+
 @register("index")
 def _plan_index(plan, *, root, project, policy, now=None, **_):
     """The index area: tombstone dangling entries in MEMORY.md and PLANS.md.
