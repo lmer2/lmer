@@ -178,9 +178,14 @@ def test_finalization_is_inside_total_reload_deadline(child, stage):
 from ask_channel import bus
 from lmer_cli.connector_ownership import Lease
 stage = ''' + repr(stage) + '''
+def publish(name, text):
+    # The test waits for the name to exist, so it must appear complete (#572).
+    temporary = root / (name + ".tmp")
+    temporary.write_text(text)
+    temporary.replace(root / name)
 def delay():
     if (root / "finalize").exists():
-        (root / "finalize.reached").write_text(stage)
+        publish("finalize.reached", stage)
         # Release after observing drain expiry; the deadline only bounds a broken test.
         deadline = time.monotonic() + ''' + repr(outlast(DRAIN_DEADLINE)) + '''
         while not (root / "release-finalize").exists() and time.monotonic() < deadline:
@@ -215,7 +220,7 @@ original_stop = connector_lifecycle.ConnectorLifecycle.stop
 def stop(self, *args, **kwargs):
     started = time.monotonic()
     result = original_stop(self, *args, **kwargs)
-    (root / "stop-result").write_text(json.dumps({"ok": result, "elapsed": time.monotonic()-started}))
+    publish("stop-result", json.dumps({"ok": result, "elapsed": time.monotonic()-started}))
     if not result:
         while not (root / "exit").exists(): time.sleep(.01)
     return result

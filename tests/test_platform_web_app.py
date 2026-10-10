@@ -489,6 +489,10 @@ ALLOWED_STORAGE_KEYS = {
     # `list` is the first mode and therefore the default, so an operator who
     # never touches the switch sees the view they already had.
     "FLEET_VIEW_STORAGE_KEY",
+    # Whether the status strip in uber lmer's chat pane is hidden (#507). A reading
+    # preference for that one pane, default shown; run-view and run-list strips are
+    # not governed by it, and hiding it fetches nothing less.
+    "ASSISTANT_STRIP_STORAGE_KEY",
 }
 
 

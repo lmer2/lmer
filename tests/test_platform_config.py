@@ -543,7 +543,40 @@ def test_binding_notice_network_bind_warns_plaintext(platform_root):
 def test_binding_notice_names_env_as_source(platform_root, monkeypatch):
     """An export shadowing the UI's value must not be invisible."""
     monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.5")
+    monkeypatch.setenv(cfg.ENV_BIND_PORT, "9100")
     assert "bind from environment" in cfg.binding_notice(cfg.load())
+
+
+def test_binding_notice_names_cli_overrides_as_source(platform_root, monkeypatch):
+    """A command-line endpoint is not reported as a default or the file's."""
+    cfg.save(cfg.PlatformConfig(bind_address="0.0.0.0", bind_port=9000))
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.5")
+    overrides = {"bind_address": "127.0.0.1", "bind_port": 9200}
+    config = cfg.load(overrides)
+    notice = cfg.binding_notice(config, overrides)
+    assert "http://127.0.0.1:9200" in notice
+    assert "bind from command line" in notice
+
+
+def test_binding_notice_attributes_address_and_port_separately(platform_root, monkeypatch):
+    monkeypatch.setenv(cfg.ENV_BIND_PORT, "9300")
+    overrides = {"bind_address": "127.0.0.1", "bind_port": None}
+    notice = cfg.binding_notice(cfg.load(overrides), overrides)
+    assert "address from command line, port from environment" in notice
+    assert ":9300" in notice
+
+
+def test_binding_notice_unset_overrides_fall_through_to_the_file(platform_root):
+    cfg.save(cfg.PlatformConfig(bind_address="0.0.0.0", bind_port=9000))
+    overrides = {"bind_address": None, "bind_port": None}
+    assert "bind from config.json" in cfg.binding_notice(cfg.load(overrides), overrides)
+
+
+def test_binding_notice_a_file_without_bind_keys_is_not_the_source(platform_root):
+    from lmer_platform.store import write_json
+
+    write_json(cfg.config_path(), {"autonomous_default": False})
+    assert "bind from default" in cfg.binding_notice(cfg.load())
 
 
 def test_binding_notice_names_file_as_source(platform_root):

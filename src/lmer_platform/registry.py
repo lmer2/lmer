@@ -159,6 +159,19 @@ def _is_zombie(pid: int) -> bool:
     return bool(fields) and fields[0] == "Z"
 
 
+def _kill_probe(pid: int) -> Optional[bool]:
+    """``kill(pid, 0)``: ``True`` reached it, ``None`` it is another user's, ``False`` gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return False
+    return True
+
+
 def _pid_alive(pid: object) -> bool:
     """Whether *pid* names a live process.
 
@@ -169,18 +182,20 @@ def _pid_alive(pid: object) -> bool:
     ``PermissionError`` means the process exists but belongs to another user, which
     counts as alive — the platform would rather show a session it cannot signal
     than silently drop a running one from the inventory.
+
+    The zombie check reads ``/proc``, and the spawn waiter can reap the process
+    between the probe and that read (#525). The read then finds nothing, which
+    :func:`_is_zombie` must call "not a zombie" for hosts without ``/proc``; so
+    the probe is asked again, and a reaped pid answers gone.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    reached = _kill_probe(pid)
+    if reached is not True:
+        return reached is None
+    if _is_zombie(pid):
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return not _is_zombie(pid)
+    return _kill_probe(pid) is not False
 
 
 def is_live(entry: Optional[dict]) -> bool:

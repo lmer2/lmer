@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1646,11 +1647,25 @@ def env_dumping_lmer(tmp_path):
     assertion belongs on what the process received — not on what the spawn code
     intended to pass.
     """
+    return _write_env_dumping_lmer(tmp_path)
+
+
+def _write_env_dumping_lmer(tmp_path):
     dump = tmp_path / "child-env.txt"
     script = tmp_path / "env-lmer"
+    # Publish by rename, never in place. The tests wait on "the dump exists and
+    # is not empty", which `env > dump` satisfies the instant the shell creates
+    # the file — long before `env` has finished writing it. A reader landing in
+    # that window gets an arbitrary subset, because /bin/sh rebuilds `environ`
+    # from its own variable table and the order bears no relation to the dict
+    # the spawn passed. That is the CI failure on pipeline 2101: a KeyError for
+    # one variable while the ones next to it in the source were present.
+    # Rename within a directory is atomic, so the dump path only ever holds a
+    # complete environment.
     script.write_text(
         "#!/bin/sh\n"
-        f'env > "{dump}"\n'
+        f'env > "{dump}.part"\n'
+        f'mv "{dump}.part" "{dump}"\n'
         'if [ -n "$FAKE_LMER_SLEEP" ]; then sleep "$FAKE_LMER_SLEEP"; fi\n',
         encoding="utf-8",
     )
@@ -1666,6 +1681,41 @@ def env_from_dump(dump):
         if sep and name:
             values[name] = value
     return values
+
+
+def test_the_env_dump_is_never_read_half_written(tmp_path):
+    """The fixture must publish atomically, or every test reading it is a
+    lottery over which variables happen to have been flushed.
+
+    Passing is guaranteed by construction (a rename cannot be observed
+    half-done); failing is probabilistic but overwhelming — a ~128 KB
+    environment overruns the stdio buffer, so the in-place form loses the tail
+    on most trials, and ten of them make a miss vanishingly unlikely.
+    """
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    for i in range(600):
+        env[f"BULK_{i:04d}"] = "x" * 200
+    script, dump = _write_env_dumping_lmer(tmp_path)
+
+    for trial in range(10):
+        if dump.exists():
+            dump.unlink()
+        child = subprocess.Popen(
+            [str(script)], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert wait_for(lambda: dump.is_file() and dump.stat().st_size)
+            seen = set(env_from_dump(dump))
+        finally:
+            child.kill()
+            child.wait()
+        missing = set(env) - seen
+        assert not missing, (
+            f"trial {trial}: the dump was readable with {len(missing)} variables "
+            f"still unwritten (e.g. {sorted(missing)[:3]}) — a test reading it "
+            "here would fail on whichever variable it happened to want"
+        )
 
 
 def test_child_env_carries_the_port_and_token_the_platform_chose(

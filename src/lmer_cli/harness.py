@@ -336,12 +336,14 @@ HARNESSES: dict[str, Harness] = {
             CredentialMount(".pi/agent/auth.json", "/home/developer/.pi/agent/auth.json"),
             # pi's custom provider/model registry (may carry apiKey fields) —
             # how users register self-hosted endpoints, e.g. a local
-            # llama.cpp server. Without it, in-container pi rejects
-            # LMER_LLM_NAME values that only exist in the host's registry.
+            # llama.cpp server. Mounted at a side path rather than pi's own
+            # ``models.json`` (issue #490): the pi runner merges it with the
+            # provider models discovered at launch and writes the real file,
+            # so the host config must stay a read-only input.
             # Hand-authored config pi only reads, hence ro.
             CredentialMount(
                 ".pi/agent/models.json",
-                "/home/developer/.pi/agent/models.json",
+                "/home/developer/.pi/agent/models.host.json",
                 mode="ro",
             ),
         ),

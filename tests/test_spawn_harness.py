@@ -532,6 +532,41 @@ class TestMainEndToEnd:
         # which every harness passes through identically.
         assert NONINTERACTIVE_NOTICE.splitlines()[0] in argv
 
+    def test_pi_child_of_non_pi_parent_renders_its_registry(self, tmp_path):
+        """A pi child exec'd directly by a non-pi parent must get the merged
+        registry pi actually reads: pi-runner.sh (which renders it at session
+        start) never runs on this path, and the host overlay is mounted at the
+        side path ``models.host.json``."""
+        agent_dir = tmp_path / ".pi" / "agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "models.host.json").write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "fixture-local": {
+                            "baseUrl": "http://127.0.0.1:8080/v1",
+                            "apiKey": "local",
+                            "models": [{"id": "fixture-model"}],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = {"pi-review": {"env": {"LMER_HARNESS": "pi"}}}
+        code, _, _ = _run_main(
+            tmp_path,
+            ["pi-review", "--prompt", "p"],
+            config=config,
+            extra_env={"LMER_HARNESS": "claude"},
+            stub="pi",
+        )
+        assert code == 0
+        written = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+        assert written["providers"]["fixture-local"]["models"] == [
+            {"id": "fixture-model"}
+        ]
+
     def test_child_stdin_is_devnull(self, tmp_path, monkeypatch):
         real_popen = spawn_harness.subprocess.Popen
         popen_kwargs = {}

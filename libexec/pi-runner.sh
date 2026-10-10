@@ -29,11 +29,19 @@ else
     echo "   Use pi's /login on the host, or set a provider key in your .env"
 fi
 
-# ~/.pi/agent/models.json (mounted from the host when present) registers
-# custom providers/models — e.g. a local llama.cpp server. Without it, pi
-# only knows its built-in model catalog.
-if [ -f "$HOME/.pi/agent/models.json" ]; then
-    echo "✅ pi custom model registry found at ~/.pi/agent/models.json"
+# ── Provider model discovery (issue #490) ──
+# lmer owns the provider definitions (name, base URL, API flavour, key
+# variable); the model list is discovered from each provider at launch, merged
+# with any host models.json overlay (host entries win), and written to pi's
+# registry. A provider that rejects the key, an obvious apiKey placeholder, or
+# a <provider>/<model> the named provider does not offer aborts here — before pi starts
+# — instead of producing a live session that cannot act. Skipped entirely when
+# nothing is configured, so a stock pi session pays no interpreter start.
+if [ -n "${LMER_PI_PROVIDERS:-}" ] || [ -f "$HOME/.pi/agent/models.host.json" ]; then
+    if ! "${LMER_PYTHON:-python3}" -m lmer_cli.pi_providers render; then
+        echo "❌ pi model registry could not be prepared — not starting pi"
+        exit 1
+    fi
 fi
 
 # ── Config + global context ──

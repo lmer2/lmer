@@ -350,8 +350,11 @@ question about host root. See
 [the bind address](#networking) for the one setting that widens it.
 
 One divergence specific to *this* image, which service mode does not have:
-`lmer_cli.runtime.detect_runtime()` picks a runtime by looking for a binary
-on `PATH`, and this image carries only the docker client. On a Podman host
+the image sets `LMER_CONTAINER_RUNTIME=docker`, so
+`lmer_cli.runtime.detect_runtime()` always answers docker here. That is the
+only client the image carries, and the image `ENV` beats a host-only
+`LMER_CONTAINER_RUNTIME=podman` in the mounted `~/.lmer/.env` (the daemon's
+`.env` load is first-wins), however the container is started. On a Podman host
 the in-container `lmer` therefore builds **docker-flavoured** run arguments
 (no `--userns=keep-id`) while a Podman engine executes them. Sessions on a
 Podman host are untested for that reason; treat them as part of the spike.
@@ -405,7 +408,7 @@ one benign and one not:
   `registry.list_sessions(live_only=True)`, and liveness is
   `kill(pid, 0)` plus a `/proc` zombie check against the pid recorded in
   the registry entry (`registry.is_live`,
-  `src/lmer_platform/registry.py:160-188`). Those pids were minted in the
+  `src/lmer_platform/registry.py:138-205`). Those pids were minted in the
   *previous* container's PID namespace. In the new namespace they are
   almost all absent — so the whole fleet is skipped, quietly, and
   `control_endpoint` refuses input for each session before it even reads

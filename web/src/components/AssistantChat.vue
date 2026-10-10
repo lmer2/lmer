@@ -2,6 +2,7 @@
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
+  mdiBellRingOutline,
   mdiRobot,
   mdiClose,
   mdiCogOutline,
@@ -20,7 +21,7 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
-import { projectColor, readDraft, storeDraft } from '../projects.js'
+import { projectColor, projectTextColor, readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
 
@@ -29,7 +30,7 @@ const props = defineProps({
   now: { type: Number, default: () => Date.now() },
 })
 
-const emit = defineEmits(['close', 'settings'])
+const emit = defineEmits(['close', 'settings', 'questions'])
 const POLL_MS = 10000
 
 const draftKey = `assistant:${props.workspace.id}`
@@ -58,6 +59,9 @@ watch(running, active => { if (!active) waitingDraft.value = readDraft(draftKey)
 const sessionId = computed(() => status.value ? status.value.session_id || status.value.history_session : null)
 const busy = computed(() => starting.value || restarting.value || stopping.value)
 const queued = computed(() => status.value?.pending || 0)
+// uber lmer's own unanswered asks to the operator (issue 507), counted by the daemon
+// from the same ask channel the run view answers them in.
+const openQuestions = computed(() => (running.value && status.value?.open_questions) || 0)
 
 function stale(mine) {
   return disposed || mine !== generation
@@ -140,7 +144,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <v-toolbar :color="projectColor(workspace.color)" density="comfortable" class="assistant-header">
+  <v-toolbar :color="projectColor(workspace.color)" :style="{ color: projectTextColor(workspace.color) }"
+    density="comfortable" class="assistant-header">
     <v-icon :icon="mdiRobot" class="ms-4 me-1" />
     <v-toolbar-title class="text-title-medium project-chat-title">{{ workspace.name }} · uber lmer</v-toolbar-title>
     <template v-if="status || problem">
@@ -151,6 +156,19 @@ onBeforeUnmount(() => {
         :live="running"
         @changed="load"
       />
+      <v-btn
+        v-if="openQuestions"
+        variant="text"
+        size="small"
+        class="open-questions"
+        :aria-label="`${openQuestions} open ${openQuestions === 1 ? 'question' : 'questions'} from uber lmer — answer in its run view`"
+        :title="`${openQuestions} open ${openQuestions === 1 ? 'question' : 'questions'} — answer in uber lmer's run view`"
+        @click="emit('questions', sessionId)"
+      >
+        <v-badge :content="openQuestions" color="warning" floating>
+          <v-icon :icon="mdiBellRingOutline" />
+        </v-badge>
+      </v-btn>
       <v-btn
         v-if="running"
         :prepend-icon="mdiRestart"
@@ -309,7 +327,7 @@ onBeforeUnmount(() => {
             started {{ ago(status.started_at, now) }}
           </span>
         </div>
-        <StatusStrip :status="status.statusline" :now="now" class="mb-3" />
+        <StatusStrip :status="status.statusline" :now="now" meter-color="primary" hideable class="mb-3" />
         <p v-if="restarting" class="text-body-small text-medium-emphasis mb-2">
           restarting — the conversation below is still the incarnation being
           replaced, until the daemon answers with the new one.

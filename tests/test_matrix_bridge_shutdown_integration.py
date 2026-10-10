@@ -19,11 +19,11 @@ real on the deploy host and nowhere else, so the runner supplies them through
 ``LMER_BRIDGE_RUN_ARGS`` (shlex-split, appended to the ``run`` command:
 volumes, env files, network). To run it by hand on the deploy host — shown
 with podman because that is the deploy host's runtime; the test itself
-resolves the runtime via ``detect_runtime()``, overridable with
-``LMER_BRIDGE_RUNTIME`` on a host where detection (docker-first) would pick
-the runtime the image was not built with::
+resolves the runtime via ``detect_runtime()``, so ``LMER_CONTAINER_RUNTIME``
+picks it on a host carrying both. ``LMER_BRIDGE_RUNTIME`` overrides it for this
+test alone::
 
-    export LMER_BRIDGE_RUNTIME=podman
+    export LMER_CONTAINER_RUNTIME=podman
 
     podman build -t lmer-matrix-bridge:test -f Dockerfile.matrix-bridge .
     export LMER_BRIDGE_IMAGE=lmer-matrix-bridge:test
@@ -75,9 +75,8 @@ def _logs(runtime: str, name: str) -> str:
 def test_a_container_stop_is_a_clean_exit_inside_the_grace():
     from lmer_cli.runtime import detect_runtime
 
-    # Overridable because detection prefers docker: on a host carrying both
-    # runtimes, an image built with podman is invisible to docker, and the
-    # test would error against the wrong store.
+    # Overridable for this test alone: an image built in one runtime's store
+    # is invisible to the other, and the test would error against the wrong one.
     runtime = os.environ.get("LMER_BRIDGE_RUNTIME") or detect_runtime()
     image = os.environ["LMER_BRIDGE_IMAGE"]
     extra = shlex.split(os.environ.get("LMER_BRIDGE_RUN_ARGS", ""))

@@ -59,8 +59,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         assert await browser.evaluate("document.querySelectorAll('main .run-row').length") == 2
         await browser.shot(output, "recovered-all-projects")
         for project in (alpha, beta):
-            await browser.click(project["name"], '[role="tab"]')
-            await browser.wait("document.querySelector('.project-identity').textContent.includes(" + json.dumps(project["name"]) + ")")
+            await browser.choose_project(project["name"])
             assert await browser.evaluate("document.querySelectorAll('main [aria-label=\"talk to uber lmer\"]').length") == 1
             assert await browser.evaluate("document.querySelector('header button[aria-label^=\"uber lmer\"]').getAttribute('aria-label').includes('running')")
         before = projects.status(alpha["id"])
@@ -105,7 +104,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.wait(group + "?.querySelector('.project-assistant').textContent.includes('failed')")
         assert await browser.evaluate(group + ".querySelectorAll('.run-row').length") == 1
         assert await browser.evaluate(group + ".textContent.includes('died unexpectedly')")
-        await browser.click("Alpha", '[role="tab"]')
+        await browser.choose_project("Alpha")
         await browser.wait("document.querySelector('main').textContent.includes('died unexpectedly')")
         assert await browser.evaluate("document.querySelector('header button[aria-label^=\"uber lmer\"]').getAttribute('aria-label').includes('crashed')")
         await browser.shot(output, "current-failure")

@@ -44,3 +44,46 @@ def test_resolved_paths_reuse_the_cache_and_other_paths_stay_isolated(tmp_path, 
     assert [e.message['text'] for e in assistant_conversation.events()] == ['second reply']
     monkeypatch.setattr(store, 'PLATFORM_DIR', str(first))
     assert [e.message['text'] for e in assistant_conversation.events()] == ['first reply']
+
+
+def test_a_digest_keeps_its_run_and_the_turn_carries_it(tmp_path, monkeypatch):
+    from lmer_platform import transcripts
+
+    monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path))
+    data = {"host": "gitlab.example.com", "project": "group/app", "slug": "run-1",
+            "label": "Fix the widget", "kind": "live_question", "state": None}
+    assistant_conversation.record("gitlab.example.com/group/app/run-1 needs you — live_question: ok?",
+                                  kind="live_question", data=data, session_id="s-1")
+    assistant_conversation.record("no run here", kind="complete", data={"slug": "only"}, session_id="s-1")
+    assistant_conversation.record("public reply", kind="reply", thread="thread", data=data, session_id="s-1")
+    events = assistant_conversation.events()
+    assert events[0].message["meta"]["run"] == {
+        "host": "gitlab.example.com", "project": "group/app", "slug": "run-1", "label": "Fix the widget",
+    }
+    assert "run" not in events[1].message["meta"]
+    assert "run" not in events[2].message["meta"]
+
+    turns, _copies = transcripts._comms_turns(events, "s-1")
+    first, second, third = (turn.to_dict() for turn in turns)
+    assert first["role"] == transcripts.PLATFORM_ROLE
+    assert first["digest"] == {"kind": "live_question", "run": events[0].message["meta"]["run"]}
+    assert second["digest"] == {"kind": "complete", "run": None}
+    assert "digest" not in third
+
+
+def test_a_digest_run_is_bounded_and_needs_its_whole_key():
+    long = "x" * 500
+    run = assistant_conversation.digest_run({"host": "h", "project": "p", "slug": "s", "label": long})
+    assert len(run["label"]) == assistant_conversation.MAX_RUN_FIELD_CHARS
+    assert assistant_conversation.digest_run({"host": "h", "project": "p"}) is None
+    nested = "/".join(["subgroup"] * 25) + "/app"
+    assert len(nested) > assistant_conversation.MAX_RUN_FIELD_CHARS
+    assert assistant_conversation.digest_run(
+        {"host": "gitlab.example.com", "project": nested, "slug": "s", "label": "x"}
+    ) is None, "a shortened project path would link a run that does not exist"
+    limit = "p" * assistant_conversation.MAX_RUN_FIELD_CHARS
+    assert assistant_conversation.digest_run(
+        {"host": "h", "project": limit, "slug": "s"}
+    ) == {"host": "h", "project": limit, "slug": "s"}
+    assert assistant_conversation.digest_run({"host": "h", "project": 3, "slug": "s"}) is None
+    assert assistant_conversation.digest_run("not a mapping") is None

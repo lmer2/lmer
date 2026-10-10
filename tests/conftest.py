@@ -1144,3 +1144,22 @@ def _reset_comms_hub():
     if hub is not None:
         hub.stop()
     platform_comms.register_hub(None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_thread_connectors():
+    """Drop the process-wide chat-thread connectors component between tests (#524).
+
+    Any route that calls ``connectors.ensure_connectors`` registers one, and a
+    later spawn with thread targets then consults it and refuses for want of
+    ``SLACK_BOT_TOKEN``. Serially another module happened to clear it in between;
+    an xdist worker's order does not.
+    """
+    yield
+    # Lazy: at module top it adds ~0.7s to every pytest start, workers included.
+    from lmer_platform import connectors as thread_connectors
+
+    component = thread_connectors.get_connectors()
+    thread_connectors.register_connectors(None)
+    if component is not None:
+        component.stop()

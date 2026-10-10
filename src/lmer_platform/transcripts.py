@@ -858,6 +858,10 @@ class Message:
     #: the pane shows them as a message to whoever is reading it.
     thread: Optional[str] = None
     peer: Optional[dict] = None
+    #: For a platform digest record (issue #507): ``{"kind", "run"}``, where
+    #: ``run`` is the owning run's ``host/project/slug/label`` or ``None`` on a
+    #: record written before the run was kept. The view draws these compactly.
+    digest: Optional[dict] = None
 
     @property
     def empty(self) -> bool:
@@ -886,6 +890,7 @@ class Message:
             "fidelity": self.fidelity,
             "thread": self.thread,
             **({"peer": self.peer} if self.peer else {}),
+            **({"digest": self.digest} if self.digest else {}),
         }
 
 
@@ -2738,6 +2743,7 @@ def _comms_messages(session_id: str) -> tuple:
 
 def _comms_turns(events: list, session_id: str) -> tuple:
     from lmer_cli import comms as bus
+    from .assistant_conversation import digest_run
 
     questions: dict = {}
     turns: list = []
@@ -2783,6 +2789,10 @@ def _comms_turns(events: list, session_id: str) -> tuple:
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
                 peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
+                digest={
+                    "kind": str(meta.get("digest_kind") or "event"),
+                    "run": digest_run(meta.get("run")),
+                } if kind == "digest" else None,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``

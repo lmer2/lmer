@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from lmer_cli import cli
 from lmer_cli.runtime import (
     InstallMode,
     detect_runtime,
@@ -41,6 +42,63 @@ from lmer_cli.runtime import (
 
 class TestDetectRuntime:
     """Test container runtime detection"""
+
+    @pytest.fixture(autouse=True)
+    def _no_override(self, monkeypatch):
+        monkeypatch.delenv("LMER_CONTAINER_RUNTIME", raising=False)
+
+    def test_override_picks_podman_when_both_available(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "podman")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "podman"
+
+    def test_override_is_case_and_whitespace_insensitive(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", " Docker ")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "docker"
+
+    def test_empty_override_falls_back_to_detection(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "docker"
+
+    def test_override_rejects_unknown_runtime(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "nerdctl")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            with pytest.raises(RuntimeErrorDetect, match="not supported"):
+                detect_runtime()
+
+    def test_override_missing_binary_does_not_fall_back(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "podman")
+        with patch("shutil.which") as mock_which:
+            mock_which.side_effect = lambda x: "/usr/bin/docker" if x == "docker" else None
+            with pytest.raises(RuntimeErrorDetect, match="podman is not on PATH"):
+                detect_runtime()
+
+    def test_build_takes_the_override_from_env_files(self, monkeypatch, tmp_path):
+        """`lmer build` runs before main()'s .env load, yet must build into the
+        store sessions run from; only the runtime key is loaded."""
+        (tmp_path / ".env").write_text(
+            "LMER_CONTAINER_RUNTIME=podman\nLMER_BUILD_ENV_PROBE=x\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LMER_BUILD_ENV_PROBE", raising=False)
+        monkeypatch.setenv("LMER_IMAGE", "img:test")
+        seen = {}
+
+        def fake_detect():
+            seen["runtime"] = os.environ.get("LMER_CONTAINER_RUNTIME")
+            return "podman"
+
+        # patch.dict: the load writes os.environ directly, which monkeypatch
+        # cannot undo for a variable that was absent when it was deleted.
+        with patch.dict(os.environ), \
+             patch.object(cli, "detect_runtime", side_effect=fake_detect), \
+             patch.object(cli, "build_image", return_value=True):
+            assert cli._handle_build([]) == 0
+            assert "LMER_BUILD_ENV_PROBE" not in os.environ
+        assert seen["runtime"] == "podman"
+        assert "LMER_CONTAINER_RUNTIME" not in os.environ
 
     def test_detect_docker_when_available(self):
         """Test Docker is detected when available"""
@@ -229,6 +287,19 @@ class TestBaseRunArgs:
 
         assert "podman" in args
         assert "--userns=keep-id" in args
+
+    def test_base_args_podman_nonroot_numeric_user_includes_userns(self):
+        args = base_run_args("podman", False, "1000:1000")
+
+        assert "--userns=keep-id" in args
+
+    def test_base_args_podman_root_user_skips_userns(self):
+        """Root under the default rootless map already IS the host uid, so
+        keep-id (and its whole-rootfs chown, issue #351) is skipped."""
+        for user in ("0:0", "0", "root", "root:root"):
+            args = base_run_args("podman", False, user)
+            assert "--userns=keep-id" not in args, user
+            assert args[args.index("--user") + 1] == user
 
     def test_base_args_docker_no_userns(self):
         """Test Docker args don't include --userns=keep-id"""

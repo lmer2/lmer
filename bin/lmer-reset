@@ -30,24 +30,40 @@ if uv tool list 2>/dev/null | grep -q "^lmer "; then
     echo "Found: uv tool 'lmer'"
 fi
 
-if command -v docker >/dev/null 2>&1; then
-    if docker image inspect lmer >/dev/null 2>&1; then
+# Detect container runtime. LMER_CONTAINER_RUNTIME overrides, with the rule
+# lmer_cli.runtime.detect_runtime() applies: trimmed, case-insensitive, and
+# only docker or podman, checked before anything runs the value.
+RUNTIME="${LMER_CONTAINER_RUNTIME:-}"
+RUNTIME="${RUNTIME#"${RUNTIME%%[![:space:]]*}"}"
+RUNTIME="${RUNTIME%"${RUNTIME##*[![:space:]]}"}"
+RUNTIME="$(printf '%s' "$RUNTIME" | tr '[:upper:]' '[:lower:]')"  # not ${,,}: macOS ships bash 3.2
+case "$RUNTIME" in
+    "")
+        if command -v docker >/dev/null 2>&1; then
+            RUNTIME="docker"
+        elif command -v podman >/dev/null 2>&1; then
+            RUNTIME="podman"
+        fi
+        ;;
+    docker|podman)
+        if ! command -v "$RUNTIME" >/dev/null 2>&1; then
+            echo "❌ LMER_CONTAINER_RUNTIME=$RUNTIME but $RUNTIME is not on PATH" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "❌ LMER_CONTAINER_RUNTIME='$LMER_CONTAINER_RUNTIME' is not supported; use docker or podman" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$RUNTIME" ]; then
+    if $RUNTIME image inspect lmer >/dev/null 2>&1; then
         IMAGE_EXISTS=true
-        echo "Found: lmer image"
+        echo "Found: lmer image ($RUNTIME)"
     fi
 
-    CONTAINER_IDS=$(docker ps -aq --filter ancestor=lmer 2>/dev/null || true)
-    if [ -n "$CONTAINER_IDS" ]; then
-        CONTAINERS_EXIST=true
-        echo "Found: containers using the image"
-    fi
-elif command -v podman >/dev/null 2>&1; then
-    if podman image inspect lmer >/dev/null 2>&1; then
-        IMAGE_EXISTS=true
-        echo "Found: lmer image"
-    fi
-
-    CONTAINER_IDS=$(podman ps -aq --filter ancestor=lmer 2>/dev/null || true)
+    CONTAINER_IDS=$($RUNTIME ps -aq --filter ancestor=lmer 2>/dev/null || true)
     if [ -n "$CONTAINER_IDS" ]; then
         CONTAINERS_EXIST=true
         echo "Found: containers using the image"
@@ -87,14 +103,6 @@ if $UV_TOOL_EXISTS; then
     echo "🗑️  Uninstalling uv tool 'lmer' ..."
     uv tool uninstall lmer
     echo "   Done"
-fi
-
-# Detect container runtime
-RUNTIME=""
-if command -v docker >/dev/null 2>&1; then
-    RUNTIME="docker"
-elif command -v podman >/dev/null 2>&1; then
-    RUNTIME="podman"
 fi
 
 if [ -n "$RUNTIME" ]; then

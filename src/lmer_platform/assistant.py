@@ -341,7 +341,7 @@ from typing import Optional
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 
-from . import memory, registry, spawn, statusline
+from . import ask, memory, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -801,6 +801,10 @@ class AssistantStatus:
     #: disconnects a thread from the pane header. Served here because this is the
     #: route the pane already polls.
     threads: list = field(default_factory=list)
+    #: The running incarnation's unanswered, unclosed questions to the operator
+    #: (issue #507), counted from its ask channel by
+    #: :func:`lmer_platform.ask.open_question_count`. ``0`` with nothing running.
+    open_questions: int = 0
 
     @property
     def age_seconds(self) -> Optional[float]:
@@ -829,6 +833,7 @@ class AssistantStatus:
             "memory": self.memory,
             "statusline": self.statusline,
             "threads": self.threads,
+            "open_questions": self.open_questions,
             "taskdef": TASKDEF,
             "target": TARGET,
         }
@@ -1216,6 +1221,7 @@ def status() -> AssistantStatus:
         answer,
         statusline=statusline.for_session(answer.session_id),
         threads=_connected_threads(answer.session_id),
+        open_questions=ask.open_question_count(answer.session_id),
     )
 
 
@@ -2635,7 +2641,7 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
         from . import assistant_conversation
 
         if label in assistant_conversation.DIGEST_KINDS:
-            assistant_conversation.record(text, kind=label)
+            assistant_conversation.record(text, kind=label, data=payload)
         return _live_assistant() is not None
 
 

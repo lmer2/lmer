@@ -1,5 +1,5 @@
 <script setup>
-import { computed, defineAsyncComponent, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import {
   mdiRobot, mdiClipboardTextOutline, mdiClockAlertOutline,
   mdiClockOutline, mdiCommentQuestionOutline, mdiConsole, mdiExitRun,
@@ -23,7 +23,7 @@ import {
   targetLink, targetRef, toneColor,
 } from '../format.js'
 import { rememberChoice, storedChoice } from '../preferences.js'
-import { projectColor } from '../projects.js'
+import { projectColor, projectTextColor } from '../projects.js'
 import { runKey as composeRunKey } from '../runref.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
@@ -52,6 +52,9 @@ const props = defineProps({
   run: { type: Object, required: true },
   identifiedWorkspaceId: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
+  // Non-zero, and changed, when the shell asks for this run's open questions
+  // (uber lmer's header badge, issue 507).
+  focusQuestions: { type: Number, default: 0 },
 })
 
 // `open` is forwarded from the related-runs switcher at the bottom of the page
@@ -279,8 +282,36 @@ const { count: operatorCount, unread: operatorUnread } = useOperatorChat(
 )
 watch(terminalSession, () => { operatorEntries.value = [] })
 
+// The badge and this dock read different polls, so the question can arrive
+// after the request: it stays pending until the dock has a reply box to focus,
+// for about one poll of each, so a much later question does not steal focus.
+const FOCUS_WAIT_MS = 15000
+const askDock = ref(null)
+let focusPending = false
+let focusUntil = 0
+
+function focusAskDock() {
+  if (!focusPending || Date.now() > focusUntil) return
+  const dock = askDock.value?.$el
+  if (!(dock instanceof Element)) return
+  dock.scrollIntoView?.({ block: 'start' })
+  const reply = dock.querySelector('textarea')
+  if (!reply) return
+  reply.focus({ preventScroll: true })
+  focusPending = false
+}
+
+watch(() => props.focusQuestions, async (nonce) => {
+  if (!nonce) return
+  focusPending = true
+  focusUntil = Date.now() + FOCUS_WAIT_MS
+  await nextTick()
+  focusAskDock()
+}, { immediate: true })
+
 function receiveOperatorEntries(page) {
   if (page.sessionId === terminalSession.value) operatorEntries.value = page.entries
+  if (focusPending) nextTick(focusAskDock)
 }
 
 // A run stopped on a question has no session to type into, and answering it is a
@@ -574,7 +605,8 @@ async function forget() {
   <div>
     <div class="d-flex flex-wrap ga-2 align-center mb-3">
       <v-chip v-if="!run.workspace_id || run.workspace_id !== identifiedWorkspaceId"
-        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
+        class="run-project-identity" :color="projectColor(run.workspace_color)"
+        :style="{ color: projectTextColor(run.workspace_color) }" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
       <template v-if="!run.live && !run.orchestrator">
         <v-select v-model="moveDestination" :items="projects.filter(project => !project.archived && project.id !== run.workspace_id)"
           item-title="name" item-value="id" label="Move to project" hide-details density="compact" style="min-width: 180px" />
@@ -789,6 +821,7 @@ async function forget() {
          run, so the tabs sit where they always did until a session posts. -->
     <AskChannel
       v-if="terminalSession"
+      ref="askDock"
       :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
       :live="!!run.live"
@@ -918,11 +951,11 @@ async function forget() {
 
               <!-- How long the harness has been quiet (T95), in the fleet row's
                    idiom: dimmed, subordinate, no chip and no colour. The state
-                   above is derived with liveness first (spec D24), so it reads
-                   "running" from the moment a session starts until it exits — a
-                   session that finished its work and is sitting at its prompt
-                   looks exactly like one that is working, and this is the line
-                   that tells them apart. The tooltip is the moment the container
+                   above is derived with liveness first (spec D24), so while the
+                   run is non-terminal it reads "running" from the moment a
+                   session starts until it exits — a session that finished its
+                   work and is sitting at its prompt looks exactly like one that
+                   is working, and this is the line that tells them apart. The tooltip is the moment the container
                    dated the output to, because a rendered age would depend on
                    this device's clock. Nothing at all when there is no reading. -->
               <div
