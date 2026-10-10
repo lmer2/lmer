@@ -1527,19 +1527,6 @@ the record with `session.seeded_by`, and prints the uid and the launch line
 continuation source needing no `--allow-unsigned-source`, and `work commit` /
 `work session-end` publish it.
 
-#### `work knowledge index`
-
-`work knowledge index [--check] [--org NAME]` generates
-`_knowledge/<org>/INDEX.md` from the pages beneath the org: one line per page
-(title, relative link, last git-touch date), grouped by topic. A generated
-index starts with the `lmer:knowledge-index:generated` marker; an existing
-index without it is hand-written and is never overwritten (reported and
-skipped). A plain run rewrites stale generated indexes in place; `--check`
-writes nothing and exits 1 when any is out of date, 0 otherwise. `--check`
-compares everything except the per-line git date, so committing the
-regenerated index does not make it stale at once. An unknown `--org` exits 2.
-Neither mode commits — the caller commits.
-
 In a work repo migrated to the lmer schema the unit of record is the **session**: one launch writes one record, at `<project>/_runs/<slug>/<session-id>[--<name>]/`. Several launches against the same target share the `<slug>/` group — two people on one issue are two records — so "which run is this?" becomes "which *session* of this run?". `work sessions` answers it, and `--session <id>` is how a launch continues an existing record instead of opening a new one.
 
 Both surfaces work in a legacy tree too. There one shared run dir per target holds every session's writes, so no session id describes it, and the rows say so rather than presenting a directory name as a launch. The file shapes are unchanged in either form — see [RUN-STATE.md](./RUN-STATE.md) for what is *in* a record, and [SCHEMA.md](./SCHEMA.md#sessions-and-runs) for where it lives.
@@ -1633,6 +1620,19 @@ What an id may name, and what happens when it does not:
 One related case is automatic. When a stopped run is relaunched with a pushed answer (`lmer --answer "…"`), the relaunch is a new container, and left to itself it would mint a new session id and file the answer in a fresh empty record beside the one that asked — with the question still standing in the real record. The platform's answer route closes that directly: it injects the asking record's id as `LMER_SESSION_ID` (`lmer --session`), so the launch writes there from its first `work` call. For a launcher that carries only the answer, `work session-start` falls back to routing itself to the newest session of this run that is stopped on a question — the record the answer is actually about — and only when the relaunch has written no record of its own. Naming the session, by either route, is the direct one.
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
+
+### Knowledge index (`work knowledge index`)
+
+`work knowledge index [--check] [--org NAME]` generates
+`_knowledge/<org>/INDEX.md` from the pages beneath the org: one line per page
+(title, relative link, last git-touch date), grouped by topic. A generated
+index starts with the `lmer:knowledge-index:generated` marker; an existing
+index without it is hand-written and is never overwritten (reported and
+skipped). A plain run rewrites stale generated indexes in place; `--check`
+writes nothing and exits 1 when any is out of date, 0 otherwise. `--check`
+compares everything except the per-line git date, so committing the
+regenerated index does not make it stale at once. An unknown `--org` exits 2.
+Neither mode commits — the caller commits.
 
 ### Adopting and migrating a work repo (`work adopt` / `work migrate`)
 

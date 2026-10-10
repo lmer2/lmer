@@ -96,15 +96,25 @@ def test_an_unknown_org_exits_two(tmp_path, monkeypatch, capsys):
 
 def test_check_stays_green_after_the_index_is_committed(tmp_path, monkeypatch):
     """The generated index's git-commit dates must not make `--check` stale
-    the moment the index is committed."""
+    the moment the index is committed.
+
+    A page is written AFTER the fixture commit, so it has no git date when
+    the index is generated; the commit that adds it gives it one. `--check`
+    must still be green, which exercises the date path (deleting the
+    `_strip_dates` comparison makes this fail).
+    """
     root = _build(tmp_path)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
-    knowledge.run_index()
+    (root / "_knowledge" / "beta" / "fresh.md").write_text("# Fresh page\n")
+    knowledge.run_index()  # fresh.md has no date yet
     _git(root, "add", "-A")
     env = {**os.environ, "GIT_AUTHOR_DATE": "2026-02-01T00:00:00Z",
            "GIT_COMMITTER_DATE": "2026-02-01T00:00:00Z"}
-    _git(root, "commit", "-qm", "index", env=env)
+    _git(root, "commit", "-qm", "index", env=env)  # fresh.md now has a date
     assert knowledge.run_index(check=True) == 0
+    # A structural change is still detected.
+    (root / "_knowledge" / "beta" / "another.md").write_text("# Another\n")
+    assert knowledge.run_index(check=True) == 1
 
 
 def test_no_new_validator_codes(tmp_path, monkeypatch):
