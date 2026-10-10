@@ -202,7 +202,10 @@ outside its own area's rules.
 
 ### knowledge
 
-`_knowledge/`, instance level, org/topic directories.
+`_knowledge/`, instance level, org/topic directories. `work knowledge index`
+generates each org's `INDEX.md` from its pages; a generated index carries the
+`lmer:knowledge-index:generated` marker, and a hand-written index is never
+overwritten.
 
 - **Role:** the durable wiki — how things are done, for humans and agents.
 - **Writers:** humans and agents; fed by promoted napkin notes and distilled
@@ -506,10 +509,16 @@ one call that flips a tree's form, by adding the manifest.
   session, or a stale one past the threshold) are the existing cleaner
   contract of [RUN-STATE.md](./RUN-STATE.md). Legacy `runs/archive/` is
   recognised in legacy trees and is never required to move.
-- The housekeeping tool applies the manifest's TTL policy — napkin decay,
-  done-plan retirement, index tombstone sweeps — and lists host buckets
-  awaiting adoption without ever adopting them. Its default mode is a dry run.
-  Scheduling is the operator's concern.
+- The housekeeping tool — `work housekeep` — applies the manifest's TTL
+  policy (napkin decay, done-plan retirement, runs archiving, index tombstone
+  sweeps, bundle flattening) and lists host buckets awaiting adoption without
+  ever adopting them. Liveness is decided from LIFECYCLE FACTS — a recorded
+  final `session_end`, or a never-started `work seed` — never a display
+  label; an unknown lifecycle is never moved, and seeds follow the runs
+  policy. Its default mode is a dry run; `--archive-stale` is human-only.
+  Scheduling is the operator's concern; the one supported unattended recipe
+  is in
+  [RUN-STATE.md](./RUN-STATE.md#running-the-cleaner-unattended-recipe).
 
 ## Sessions and runs
 
@@ -725,7 +734,7 @@ memory scope) but never shape findings.
 | `<project>/_runs/<slug>/` | session (`work` CLI) creates it; nothing is written at this level | directory holding session directories only; a file or non-session directory here is a warning; a slug that is the obsolete derivation of its own target (`chat-.`, `chat-<repo>.git`) is `record.plain-session-slug` and `work migrate` folds it into the bare taskdef group | optional | machine |
 | `<project>/_runs/.new-<session-id>-*/` | session (`work` CLI) | seed directory of the run-dir lifecycle in [RUN-STATE.md](./RUN-STATE.md): written, then moved to `<session-dir>` by one atomic rename | transient | machine |
 | `<session-dir>/` | see [Session directory](#session-directory) | see Session directory (`<session-dir>/` row) | see Session directory | see Session directory |
-| `<project>/_specs/` | tooling: the specs index sync of `work artifact`, `work session-end` and `work specs-index --rebuild` | flat directory of dated relative symlinks `YYYY-MM-DD-<runlabel>--<basename>.md` into session directories (`../_runs/<slug>/<session-dir>/…`); `<runlabel>` is the RECORD's label, `<name-or-slug>-<session-id>` (see [Sessions and runs](#sessions-and-runs)), so one entry per (record, artifact) and a second launch of one target never unlinks the first launch's entry; the `--` is reserved as the label/basename boundary and a label never contains one; no index file; dangling is an error, non-relative or escaping is an error in every form | optional | machine |
+| `<project>/_specs/` | tooling: the specs index sync of `work artifact`, `work session-end` and `work specs-index --rebuild` | flat directory of dated relative symlinks `YYYY-MM-DD-<runlabel>--<basename>.md` into session directories (`../_runs/<slug>/<session-dir>/…`); `<runlabel>` is the RECORD's label, `<name-or-slug>-<session-id>` (see [Sessions and runs](#sessions-and-runs)), so one entry per (record, artifact) and a second launch of one target never unlinks the first launch's entry; the `--` is reserved as the label/basename boundary and a label never contains one; an entry keeps its FIRST registration date across later session starts and re-registrations (#334); no index file; dangling is an error, non-relative or escaping is an error in every form | optional | machine |
 | `<project>/_plans/` | tooling and connectors | directory of plan files, run-plan symlinks and `PLANS.md` | optional | machine |
 | `<project>/_plans/<slug>.md` | tooling and connectors (`save_plan`) | kebab-case slug filename; free-form markdown body | optional | free-form |
 | `<project>/_plans/YYYY-MM-DD-<runlabel>--plan.md` | tooling: the run-plan link sync (no shipped lmer verb writes one at schema 1) | relative symlink to `../_runs/<slug>/<session-dir>/plan.md`, the session directory's current name (`--<name>` included once named); same integrity rules as `_specs/` | optional | machine |
