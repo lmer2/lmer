@@ -63,6 +63,7 @@ class Action:
     dst: Optional[str] = None
     policy: str = ""
     detail: str = ""
+    date: str = ""     # tombstone date for the `archived <date>` form
 
 
 @dataclass
@@ -397,16 +398,29 @@ def _done_plan_names(text: str) -> set[str]:
     return done
 
 
-def _retarget_line(text: str, name: str, new_target: str) -> Optional[str]:
-    """The PLANS.md text with the line linking *name* re-pointed at
+def _retarget_line(text: str, old_target: str, new_target: str) -> Optional[str]:
+    """The index text with the line linking *old_target* re-pointed at
     *new_target* (relative to the index's own directory)."""
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         for match in _PLAN_LINK_RE.finditer(line):
             target = match.group(2).strip().split("#", 1)[0]
-            if os.path.basename(target) == name:
+            if os.path.normpath(target) == os.path.normpath(old_target):
                 start, end = match.span(2)
                 lines[index] = line[:start] + new_target + line[end:]
+                return "".join(lines)
+    return None
+
+
+def _archive_links(text: str, old_target: str, date: str) -> Optional[str]:
+    """The index text with the *old_target* link replaced by `archived <date>`."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        for match in _PLAN_LINK_RE.finditer(line):
+            target = match.group(2).strip().split("#", 1)[0]
+            if os.path.normpath(target) == os.path.normpath(old_target):
+                start, end = match.span()
+                lines[index] = line[:start] + f"archived {date}" + line[end:]
                 return "".join(lines)
     return None
 
@@ -458,6 +472,83 @@ def _plan_plans(plan, *, root, project, policy, now=None, **_):
             "tombstone", "plans", index.relative_to(root).as_posix(),
             dst=os.path.relpath(dst, plans_dir), detail=name,
         ))
+
+
+@register("index")
+def _plan_index(plan, *, root, project, policy, now=None, **_):
+    """The index area: tombstone dangling entries in MEMORY.md and PLANS.md.
+
+    No TTL: an entry whose file is gone is swept on every run. A generated
+    tombstone reads as a non-entry line to memory.py (so its index
+    regeneration keeps it) and to the validator.
+    """
+    if getattr(project, "kind", None) == "bucket":
+        return
+    from . import memory
+
+    now = now or datetime.now(timezone.utc)
+    date = now.strftime("%Y-%m-%d")
+    manifest = load_work_manifest(root)
+    # Instance scope (schema form only), then the project's own scope.
+    if manifest is not None:
+        _plan_memory_index(plan, root, root / "_agents" / "memory", manifest, date)
+        _plan_memory_index(plan, root, project.path / "memory", manifest, date)
+        _plan_plans_index(plan, root, project.path, date)
+
+
+def _plan_memory_index(plan, root, scope_dir, manifest, date):
+    from . import memory
+
+    index = scope_dir / "MEMORY.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    scope_rel = scope_dir.relative_to(root).as_posix()
+    for line in text.splitlines():
+        if memory._is_tombstone(line):
+            continue
+        for target in memory._entry_targets(line):
+            if (scope_dir / target).exists():
+                continue  # the file is present: not dangling
+            key = f"{scope_rel}/{target}"
+            archive_rel = memory._retirement_archive_rel(key, manifest)
+            if (root / archive_rel).exists():
+                new_target = os.path.relpath(root / archive_rel, scope_dir)
+                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                                dst=new_target, detail=target))
+            else:
+                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                                detail=target, date=date))
+
+
+def _plan_plans_index(plan, root, project_dir, date):
+    index = project_dir / "_plans" / "PLANS.md"
+    if not index.is_file():
+        return
+    try:
+        text = index.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    for line in text.splitlines():
+        match = _PLAN_LINK_RE.search(line)
+        if not match:
+            continue
+        target = match.group(2).strip().split("#", 1)[0]
+        if not target.lower().endswith(".md"):
+            continue
+        if (index.parent / target).exists():
+            continue
+        archive = project_dir / "_archive/_plans" / os.path.basename(target)
+        if archive.exists():
+            new_target = os.path.relpath(archive, index.parent)
+            plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                            dst=new_target, detail=target))
+        else:
+            plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
+                            detail=target, date=date))
 
 
 def build_plan(root: Path, projects, policy: Policy, areas: Sequence[str],
@@ -547,16 +638,27 @@ def _apply_retarget(root: Path, action: Action) -> bool:
 @applier("tombstone")
 def _apply_tombstone(root: Path, action: Action) -> bool:
     index = root / action.src
-    if not action.dst or not action.detail:
+    if not action.detail:
         return False
     try:
         text = index.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    updated = _retarget_line(text, action.detail, action.dst)
-    if updated is None:
+    if action.dst:
+        updated = _retarget_line(text, action.detail, action.dst)
+    elif action.date:
+        updated = _archive_links(text, action.detail, action.date)
+    else:
         return False
-    index.write_text(updated, encoding="utf-8")
+    if updated is None or updated == text:
+        return False
+    if index.name == "MEMORY.md":
+        from . import memory
+
+        with memory._memory_retirement_lock(root):
+            index.write_text(updated, encoding="utf-8")
+    else:
+        index.write_text(updated, encoding="utf-8")
     return True
 
 
