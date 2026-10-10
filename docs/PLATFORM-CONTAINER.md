@@ -408,7 +408,7 @@ one benign and one not:
   `registry.list_sessions(live_only=True)`, and liveness is
   `kill(pid, 0)` plus a `/proc` zombie check against the pid recorded in
   the registry entry (`registry.is_live`,
-  `src/lmer_platform/registry.py:160-188`). Those pids were minted in the
+  `src/lmer_platform/registry.py:138-205`). Those pids were minted in the
   *previous* container's PID namespace. In the new namespace they are
   almost all absent — so the whole fleet is skipped, quietly, and
   `control_endpoint` refuses input for each session before it even reads

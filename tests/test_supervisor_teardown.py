@@ -120,6 +120,14 @@ def supervised(monkeypatch, tmp_path):
                 driver(stdin_read, observed)
             except BaseException as exc:
                 driver_errors.append(exc)
+                # A child that exits only on its driver's word would otherwise hold
+                # run_supervisor forever; waitid first so a reaped pid is never hit.
+                deadline = time.monotonic() + JOIN
+                while "child_pid" not in observed and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                with contextlib.suppress(KeyError, ChildProcessError, ProcessLookupError):
+                    os.waitid(os.P_PID, observed["child_pid"], os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    os.kill(observed["child_pid"], signal.SIGKILL)
 
         thread = threading.Thread(target=drive) if driver else None
         if thread:
@@ -178,11 +186,16 @@ def test_reaps_harness_without_waiting_for_descendants_pty_eof(supervised):
 
 @pytest.mark.parametrize("size", [(0, 0), (24, 1), (1, 80)])
 def test_transient_host_geometry_preserves_last_valid_size(supervised, size):
-    def resize(fd, _observed):
+    # The child exits only when the driver says so: a timed child could end before
+    # a starved driver ever saw the handler installed (#572).
+    def resize(fd, observed):
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, observed["evidence"]()
         supervisor._set_winsize(fd, *size)
         os.kill(os.getpid(), signal.SIGWINCH)
+        os.kill(observed["child_pid"], signal.SIGUSR2)
 
-    result, _ = supervised(f"import time; time.sleep({SHORT_CHILD})", driver=resize, host_size=(24, 80))
+    result, _ = supervised(NATURAL_EXIT_CHILD, driver=resize, host_size=(24, 80))
     assert result["final_geometry"] == (24, 80)
 
 

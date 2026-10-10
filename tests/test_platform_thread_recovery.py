@@ -22,7 +22,7 @@ from tests.test_platform_thread_connectors import (
     MATRIX_LINK, OTHER_SLACK_LINK, SLACK_LINK, FakeSlack, component, disconnect_notices,
     live_session, matrix_env, platform_root,
 )
-from tests.timing_budgets import JOIN, LINK, stretch
+from tests.timing_budgets import JOIN, LINK, outlast, stretch
 
 
 @pytest.fixture(autouse=True)
@@ -385,7 +385,7 @@ def held_receipt(rig, monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             entered.set()
-            release.wait(JOIN)
+            release.wait(outlast(JOIN))
             if rig.key.transport == "slack":
                 body = {"ok": True, "messages": [{"ts": "remote-receipt", "thread_ts": rig.key.root,
                                                 "user": "UBOT", "text": "pending delivery"}]}
@@ -431,6 +431,9 @@ def held_receipt(rig, monkeypatch):
 @pytest.mark.parametrize("change", ["none", "disconnect", "replace", "session-exit", "supervisor-change"])
 def test_review_stalled_receipt_leaves_other_threads_available(rig, monkeypatch, held_receipt, change):
     operation = pending(rig, monkeypatch, "unknown")
+    # The receipt stays held until release; the product's 15s client timeout
+    # would otherwise end it first and let a blocked reconcile through.
+    monkeypatch.setattr(connectors, "REMOTE_TIMEOUT_SECONDS", outlast(JOIN))
     live_session("s-2", port=int(rig.supervisor.endpoint.url.rsplit(":", 1)[1]))
     spawn.token_file_for("s-2").write_text(rig.supervisor.endpoint.token)
     rig.threads._environ["SLACK_BOT_TOKEN"] = "xoxb-test"
@@ -452,7 +455,10 @@ def test_review_stalled_receipt_leaves_other_threads_available(rig, monkeypatch,
                                     json={"action": "inspect"},
                                     headers={"Authorization": "Bearer recovery-test-secret"})
             assert other.status_code == 409 and "in progress" in other.json()["detail"]
-            pool.submit(rig.threads.reconcile).result(timeout=stretch(3))
+            # JOIN, not seconds: reconcile's fsyncs stretch under disk load (#572).
+            # What matters is that it finished while the receipt was still held.
+            pool.submit(rig.threads.reconcile).result(timeout=JOIN)
+            assert not request.done(), "reconcile waited for the held receipt"
             assert rig.threads.listing("s-2")[0]["running"]
             if change in ("disconnect", "replace"):
                 rig.threads.disconnect("s-1", rig.record["id"])
