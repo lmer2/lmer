@@ -1,8 +1,0 @@
-fixed:
-- "`--root-userns`/`LMER_ROOT_USERNS` now verifies that the podman engine it is talking to is rootless, instead of only checking the local user id: a non-root client pointed at a rootful podman service was granted container root plus the Claude Code sandbox bypass"
-- "A root container user under podman is now given an explicit `--userns=host` rather than no namespace flag, so an ambient `PODMAN_USERNS`/`containers.conf` `userns` cannot reinstate the keep-id remap lmer just reported skipping"
-- "An unreadable `~/.lmer/remapped` no longer aborts a launch; the remap marker is advisory, so a lookup that cannot be performed reads as 'not recorded'"
-- "`lmer build` now loads `.env` files, so `LMER_NO_PREWARM`, `LMER_ROOT_USERNS`, `LMER_CONTAINER_USER`, `LMER_PREWARM_TIMEOUT` and `LMER_IMAGE` work there as they do for a launch"
-- "A container runtime killed by a signal no longer records the keep-id remap as paid"
-- "The keep-id pre-warm now runs the resolved image ID rather than the tag, so a concurrent rebuild cannot make it warm one image and certify another"
-- "`verify-keep-id-chown.sh --measure-build` now refuses when `lmer build` would use a different runtime, and honours `LMER_IMAGE`, so it can no longer rebuild one image or store and time another"
