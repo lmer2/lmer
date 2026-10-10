@@ -482,8 +482,7 @@ The origin vocabulary names the tier whenever a manifest is present:
 (`lmer_cli.container.sources.declared_origin_label`), so the container banner
 and `--show-env` cannot drift. `sources.knowledge` and `sources.plans` are
 validated and warned about by name but not mounted by this release (they need
-runner-side wiring); see the tracking issue
-<https://git.20c.com/agents/global/-/issues/370>.
+runner-side wiring that has not shipped yet).
 
 > **ROLLOUT NOTE.** `work migrate --instance` folds `sources.yaml` into the
 > manifest and removes the legacy file, so deploy a release carrying the

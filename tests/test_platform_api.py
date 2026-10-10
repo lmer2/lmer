@@ -788,6 +788,18 @@ def test_the_answer_does_not_come_back_in_the_reply(client, answered):
     assert "command" not in response.text
 
 
+def test_the_answer_route_passes_a_repo_url_to_the_request(client, answered):
+    """`repo_url_required`: an adopted plain-project run is answered with the
+    transport URL the client now sends."""
+    response = client.post(
+        "/api/runs/answer",
+        headers=bearer_header(),
+        json={**ANSWER_BODY, "repo_url": "https://gitlab.example.com/agents/global.git"},
+    )
+    assert response.status_code == 202
+    assert answered.calls[0].repo_url == "https://gitlab.example.com/agents/global.git"
+
+
 def test_answer_confirmation_is_passed_as_the_exact_source_uid(client, answered):
     source_uid = "a" * 32
     response = client.post(

@@ -428,7 +428,7 @@ rules, same resolution against the environment overrides (see
 |---|---|---|
 | `taskdef` | `{repo, ref?}` | the shared task-definition repository |
 | `napkin` | `{repo}` | the napkin repository |
-| `knowledge`, `plans` | `{repo}` | declared and validated, but NOT mounted by this release (runner-side wiring pending): warned about by name and left unmounted — <https://git.20c.com/agents/global/-/issues/370> |
+| `knowledge`, `plans` | `{repo}` | declared and validated, but NOT mounted by this release (runner-side wiring has not shipped yet): warned about by name and left unmounted |
 
 - **The key set is the name's, not the section's.** `ref:` is `taskdef`'s
   alone — there is no `LMER_NAPKIN_REF` and nothing pins any other area to a

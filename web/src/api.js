@@ -265,13 +265,17 @@ function runFields(run) {
 // state a moment later, which the next fleet poll picks up.
 export function answerRun(
   run, answer,
-  { allowUnsignedSource, confirmProject = false, slot } = {},
+  { allowUnsignedSource, confirmProject = false, slot, repoUrl } = {},
 ) {
   const body = {
     ...runFields(run), answer,
     confirm_project: confirmProject || undefined,
     slot: slot || undefined,
   }
+  // The daemon's `repo_url_required` refusal asks for this field: an adopted
+  // schema-2 plain-project run has no tracked repo, so answering it needs the
+  // transport URL. Same option `resumeRun` already serializes.
+  if (repoUrl?.trim()) body.repo_url = repoUrl.trim()
   if (allowUnsignedSource) body.allow_unsigned_source = allowUnsignedSource
   return request('api/runs/answer', {
     method: 'POST',

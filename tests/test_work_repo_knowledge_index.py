@@ -77,6 +77,30 @@ def test_check_returns_one_after_a_page_is_added(tmp_path, monkeypatch):
     assert knowledge.run_index(check=True) == 0
 
 
+def test_check_reports_stale_when_the_last_page_is_removed(tmp_path, monkeypatch):
+    root = _build(tmp_path)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
+    assert knowledge.run_index() == 0
+    (root / "_knowledge/beta/README.md").unlink()
+    (root / "_knowledge/beta/notes/deep/nested.md").unlink()
+    assert knowledge.run_index(check=True) == 1
+
+
+def test_a_generated_index_is_regenerated_empty_when_its_last_page_is_removed(
+    tmp_path, monkeypatch
+):
+    root = _build(tmp_path)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
+    assert knowledge.run_index() == 0
+    (root / "_knowledge/beta/README.md").unlink()
+    (root / "_knowledge/beta/notes/deep/nested.md").unlink()
+    assert knowledge.run_index() == 0
+    index = (root / "_knowledge/beta/INDEX.md").read_text()
+    assert "README.md" not in index
+    assert index == knowledge.render_index("beta", [])
+    assert knowledge.run_index(check=True) == 0
+
+
 def test_a_hand_written_index_is_never_overwritten(tmp_path, monkeypatch):
     root = _build(tmp_path)
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))

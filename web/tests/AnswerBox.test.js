@@ -36,6 +36,37 @@ it('binds fresh answer continuation approval to the question source UID', async 
   )
 })
 
+it('offers a repository URL and resends when the daemon asks for one', async () => {
+  const refusal = Object.assign(new Error('this run records no repository'), {
+    code: 'repo_url_required',
+  })
+  answerRun.mockRejectedValueOnce(refusal).mockResolvedValueOnce({
+    session: { session_id: 's-answer' },
+  })
+  const wrapper = mountPane(AnswerBox, { run: {
+    host: 'git.example', project: 'acme/widget', slug: 'develop-1',
+    attention: { note: 'Proceed?' },
+  } })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+  await wrapper.findAll('button').find((button) => button.text() === 'answer').trigger('click')
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('this run records no repository')
+  const field = wrapper.findAll('input').find(
+    (input) => input.attributes('placeholder') === 'https://gitlab.example.com/group/project.git',
+  )
+  await field.setValue('https://git.example/acme/widget.git')
+  await wrapper.findAll('button').find(
+    (button) => button.text().includes('answer with this repository'),
+  ).trigger('click')
+  await flushPromises()
+
+  expect(answerRun).toHaveBeenLastCalledWith(
+    expect.any(Object), 'Proceed carefully',
+    { confirmProject: false, slot: null, repoUrl: 'https://git.example/acme/widget.git' },
+  )
+})
+
 it('sends the project fields and the selected slot beside the answer', async () => {
   answerRun.mockResolvedValueOnce({ session: { session_id: 's-answer' } })
   const wrapper = mountPane(AnswerBox, {

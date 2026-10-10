@@ -385,6 +385,13 @@ class TestDeriveRepoUrlFromReferenceUrls:
             f"https://oauth2:{host_token}@gitlab.example.com/group/project.git"
         )
 
+    def test_a_document_url_on_a_custom_port_keeps_it(self, derive, host_token):
+        """A non-default HTTPS port survives the credential insert."""
+        url = "https://gitlab.example.com:8443/group/project/-/blob/main/notes.md"
+        assert derive(url) == (
+            f"https://oauth2:{host_token}@gitlab.example.com:8443/group/project.git"
+        )
+
     def test_a_reference_derives_what_the_work_item_does(self, derive, host_token):
         base = "https://gitlab.example.com/group/project"
         assert derive(f"{base}/-/blob/main/docs/guide.md") == derive(f"{base}/-/issues/141")

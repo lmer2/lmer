@@ -35,13 +35,13 @@ from tests.conftest import strip_lmer_env
 from work_repo import git_ops, migrate
 
 PROJECT = "lmer"
-WORK_URL = "https://git.example.test/agents/global.git"
+WORK_URL = "https://git.example.test/example-group/example-project.git"
 MANIFEST = (
     "schema: 1\n"
     "name: example\n"
     "projects:\n"
     f"  {PROJECT}:\n"
-    "    repo: git.example.test/agents/global\n"
+    "    repo: git.example.test/example-group/example-project\n"
 )
 LEGACY_SOURCES = (
     "schema: 1\n"
@@ -151,7 +151,7 @@ def _manifest_sources(root):
     return dict(load_manifest(root).sources or {})
 
 
-AUTHED_WORK_URL = "https://oauth2:s3cret@git.example.test/agents/global.git"
+AUTHED_WORK_URL = "https://oauth2:s3cret@git.example.test/example-group/example-project.git"
 
 
 def _container_resolution(root, work_url):

@@ -2135,7 +2135,13 @@ def _derive_repo_url_from_task_target(target: str) -> str | None:
     if "/-/" in urlparse(target).path:
         token = _get_gitlab_token(host)
         if token:
-            return f"https://oauth2:{token}@{host}/{project_path}.git"
+            # Preserve the repository's authority: a non-default HTTPS port
+            # (gitlab.example.com:8443) must survive the credential insert.
+            try:
+                authority = host if parsed.port is None else f"{host}:{parsed.port}"
+            except ValueError:
+                authority = host
+            return f"https://oauth2:{token}@{authority}/{project_path}.git"
     return f"git@{host}:{project_path}"
 
 

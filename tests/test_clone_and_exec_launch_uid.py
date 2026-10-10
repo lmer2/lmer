@@ -27,7 +27,7 @@ def _isolated(monkeypatch, tmp_path):
 def _container_env(session_tree, **overrides):
     env = dict(os.environ)
     env.update({
-        "LMER_WORK_REPO": "https://git.example.test/agents/work",
+        "LMER_WORK_REPO": "https://git.example.test/example-group/example-work",
         "LMER_WORK_REPO_PATH": str(session_tree),
         "LMER_REPO_HOST": "git.example.test",
         "LMER_REPO_PROJECT": "acme/widgets",

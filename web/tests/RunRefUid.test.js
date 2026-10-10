@@ -96,6 +96,15 @@ it('answerRun and resumeRun keep uid beside the #542 and schema-v2 fields', asyn
   })
 })
 
+it('answerRun serializes the repository URL the daemon asks for', async () => {
+  await answerRun(uidRow, 'Proceed', { repoUrl: 'https://forge.test/acme/widget.git' })
+  expect(JSON.parse(sent().body)).toEqual({
+    host: 'forge.test', project: 'acme/widget', slug: 'develop-1', uid,
+    workspace_id: 'beta', home_revision: 2, answer: 'Proceed',
+    repo_url: 'https://forge.test/acme/widget.git',
+  })
+})
+
 for (const [name, call] of Object.entries({ relateRun, unrelateRun })) {
   it(`${name} sends the uid of both the subject and the related run`, async () => {
     await call(uidRow, relatedUid)

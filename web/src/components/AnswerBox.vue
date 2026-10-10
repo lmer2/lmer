@@ -60,6 +60,11 @@ const startedSession = ref(null)
 // carries and RunDetail renders as `resumeStarted.warning`.
 const startedWarning = ref(null)
 const unsignedSource = ref(null)
+// An adopted schema-2 plain-project run has no tracked repo: the daemon refuses
+// the answer with `repo_url_required` and asks for the transport URL. The URL is
+// held here and resent with the same draft.
+const repoUrlRequired = ref(false)
+const repoUrl = ref('')
 
 const note = computed(() => props.run.attention?.note || '')
 const questionRecorded = computed(
@@ -75,7 +80,7 @@ const canSend = computed(
     && (!props.run.confirm_project || projectConfirmed.value),
 )
 
-async function submitWithDecision(allowUnsignedSource = null) {
+async function submitWithDecision(allowUnsignedSource = null, repoUrlValue = null) {
   if (!canSend.value) return
   busy.value = true
   error.value = null
@@ -86,6 +91,7 @@ async function submitWithDecision(allowUnsignedSource = null) {
       {
         confirmProject: projectConfirmed.value,
         slot: selectedSlot.value,
+        ...(repoUrlValue ? { repoUrl: repoUrlValue } : {}),
         ...(allowUnsignedSource ? { allowUnsignedSource } : {}),
       },
     )
@@ -93,6 +99,7 @@ async function submitWithDecision(allowUnsignedSource = null) {
     startedWarning.value = result.warning || null
     draft.value = ''
     unsignedSource.value = null
+    repoUrlRequired.value = false
     emit('answered')
   } catch (exc) {
     // Loud, and in the server's own words: every refusal names both the reason and
@@ -104,9 +111,15 @@ async function submitWithDecision(allowUnsignedSource = null) {
     // would be the one way for an operator to actually lose what they typed.
     error.value = exc.message
     unsignedSource.value = exc.code === 'unsigned_session' ? exc.source : null
+    repoUrlRequired.value = exc.code === 'repo_url_required'
   } finally {
     busy.value = false
   }
+}
+
+function retryWithRepoUrl() {
+  if (!repoUrl.value.trim()) return
+  return submitWithDecision(null, repoUrl.value.trim())
 }
 
 function submit() {
@@ -171,6 +184,25 @@ function cancelUnsignedSource() {
           <v-btn variant="text" @click="cancelUnsignedSource">
             cancel and wait
           </v-btn>
+        </div>
+        <!-- `repo_url_required`: the run records no repository, so the answer
+             needs a transport URL. The draft is kept; this adds the URL and
+             resends it. -->
+        <div v-if="repoUrlRequired" class="mt-3">
+          <v-text-field
+            v-model="repoUrl"
+            label="repository URL"
+            placeholder="https://gitlab.example.com/group/project.git"
+            density="compact"
+            hide-details="auto"
+          />
+          <v-btn
+            color="warning"
+            variant="tonal"
+            class="mt-3"
+            :disabled="!repoUrl.trim()"
+            @click="retryWithRepoUrl"
+          >answer with this repository</v-btn>
         </div>
       </v-alert>
 

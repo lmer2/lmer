@@ -193,10 +193,13 @@ def run_index(*, check: bool = False, org: Optional[str] = None,
     for org_dir in org_dirs:
         name = org_dir.name
         pages = collect_pages(org_dir, root)
-        if not pages:
+        index = org_dir / INDEX_NAME
+        if not pages and not index.is_file():
+            # Nothing to index and no generated index to fix. An EXISTING
+            # marked index still runs: its last page may have been removed or
+            # archived, and it must be regenerated (empty) and reported stale.
             continue
         rendered = render_index(name, pages)
-        index = org_dir / INDEX_NAME
         if index.is_file():
             existing = index.read_text(encoding="utf-8")
             if not existing.startswith(MARKER):
