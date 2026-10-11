@@ -875,6 +875,33 @@ def _run_main_repoless(
                 return main(argv)
 
 
+class TestCiBaselineLaunchWiring:
+    """#452: the host resolves the toggle's ladder for this launch and the
+    container receives that one value, whatever the bare variable says."""
+
+    def test_task_tier_reaches_the_container_as_the_resolved_value(self):
+        captured: dict = {}
+        assert _run_main_repoless(
+            ["chat", _SLACK_URL], captured_env=captured,
+            extra_env={"LMER_CHAT_GATE_CI_BASELINE": "yes"},
+        ) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "1"
+
+    def test_specific_off_overrides_a_general_on(self):
+        captured: dict = {}
+        assert _run_main_repoless(
+            ["chat", _SLACK_URL], captured_env=captured,
+            extra_env={"LMER_GATE_CI_BASELINE": "1",
+                       "LMER_CHAT_GATE_CI_BASELINE": "0"},
+        ) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "0"
+
+    def test_unset_is_off(self):
+        captured: dict = {}
+        assert _run_main_repoless(["chat", _SLACK_URL], captured_env=captured) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "0"
+
+
 class TestGpuLaunchWiring:
     """The effective grant controls both the marker and runtime-failure posture."""
 

@@ -139,6 +139,7 @@ from .runtime import (
     lmer_state_dir,
     MEMORY_HINT,
     repo_root_path,
+    resolve_gate_ci_baseline,
     resource_limit_plan,
     RUNTIME_ENV,
     _valid_cpus,
@@ -1217,7 +1218,7 @@ def _display_env_config_cli(
     print("---")
 
 
-def _announce_resource_limits(limits: "list", gpu=None) -> None:
+def _announce_resource_limits(limits: "list", gpu=None, ci_baseline=None) -> None:
     """Say what bounds this container gets and what set each one (issue #453).
 
     Rendered from the plan the run arguments are built from, so the line and
@@ -1227,13 +1228,16 @@ def _announce_resource_limits(limits: "list", gpu=None) -> None:
     ladder, or ``default``; with three tiers per knob, which one won is the
     thing an operator cannot infer from the value alone.
     """
-    if not limits and gpu is None:
+    if not limits and gpu is None and ci_baseline is None:
         return
     shown = [
         f"{limit.flag.lstrip('-')}={limit.value} ({limit.source})" for limit in limits
     ]
     if gpu is not None:
         shown.append(f"gpu={gpu.value or 'none'} ({gpu.source})")
+    if ci_baseline is not None:
+        value, source = ci_baseline
+        shown.append(f"gate-ci-baseline={'on' if value == '1' else 'off'} ({source})")
     info(f"📐 Limits: {', '.join(shown)}")
 
 
@@ -2661,7 +2665,10 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     gpu = gpu_grant_plan(runtime, scope)
-    _announce_resource_limits(limits, gpu)
+    # Resolved on the host for the same scope (#452): the session's gate only
+    # ever sees this one value, never the scoped spellings.
+    ci_baseline = resolve_gate_ci_baseline(scope)
+    _announce_resource_limits(limits, gpu, ci_baseline)
     run += base_run_args(runtime, exec_mode, container_user, limits, gpu)
 
     # In developer mode, mount local repo dirs into the container to override
@@ -3104,6 +3111,7 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_CONTAINER_RUNTIME": None,
         DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        "LMER_GATE_CI_BASELINE": ci_baseline[0],
         # User-installed harnesses (issue #132): where the host mounted
         # ~/.lmer/harnesses inside the container (consumed by
         # clone_and_exec.py runner dispatch, lmer-supervisor, and

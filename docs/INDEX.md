@@ -108,6 +108,19 @@ How the commit and push gates avoid re-running the test suite, and when they ref
 
 ---
 
+### [GATE-CI-BASELINE.md](./GATE-CI-BASELINE.md)
+**Initial baseline from CI**
+
+How `gate-check --baseline` reuses passing CI on the exact starting commit:
+- The scoped `GATE_CI_BASELINE` toggle and the work-repo `ci_baseline` coverage mapping
+- Definition pins that hold each CI job to its audit, and `--print-pins` to refresh them
+- The per-job decision, the bounded smoke check, and the fallbacks
+- Exit codes and the `gate-baseline` receipt
+
+**Best for**: Turning on CI baseline reuse for a project, or reading why a run did or did not use it.
+
+---
+
 ### [LMER-CLI.md](./LMER-CLI.md)
 **LMER Python CLI (lmer)**
 

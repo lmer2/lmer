@@ -288,6 +288,19 @@ class TestDisplayEnvConfigCli:
         assert "LMER_TRUST_MISE" in output
         assert ".env (lmer state dir)" in output
 
+    def test_scoped_ci_baseline_toggle_is_listed_with_its_source(self, monkeypatch):
+        monkeypatch.setenv("LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE", "1")
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_env_config_cli(
+                host_lmer_vars=set(),
+                env_file_sources={
+                    "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": ".env (lmer state dir)"},
+            )
+        line = next(l for l in f.getvalue().splitlines()
+                    if "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE" in l)
+        assert ".env (lmer state dir)" in line
+
     def test_table_has_fenced_delimiters(self, monkeypatch):
         monkeypatch.setenv("LMER_TASK", "review")
 

@@ -108,9 +108,13 @@ NEVER include API tokens, passwords, or other secret values in `work log` messag
 {% block clean_gate %}
 ## Phase 0.5: Gate check on clean state
 
-Before making any changes, run `gate-check` to verify that the test suite passes on the untouched codebase. This confirms both that the test environment works and that there are no pre-existing failures that could be mistaken for regressions later.
+Before making any changes, run `gate-check --baseline` to verify that the untouched codebase passes and that this worker can run it, so pre-existing failures are never mistaken for regressions later. With `LMER_GATE_CI_BASELINE` on and a CI coverage mapping for the project, it reuses passing CI lint/test jobs on the exact starting commit plus a short local smoke check; otherwise — and on an lmer image that predates `--baseline`, which ignores the flag — it is the normal full `gate-check`. Report what its output says ran — a CI baseline is not a local full-suite run.
 
-If gate-check fails, do NOT proceed with development. Report the failure to the user and let them decide whether to continue.
+- Exit 0: the baseline is established; proceed.
+- Exit 3: CI already failed a required lint or test job at this commit. Do NOT proceed and do NOT re-run the suite locally to get a different answer — report the failing job evidence it printed and let the user decide whether to continue.
+- Any other failure: do NOT proceed with development. Report the failure (a failed environment smoke check is an environment problem to diagnose) and let the user decide whether to continue.
+
+This changes only the initial baseline: every later gate runs as usual.
 {% endblock %}
 
 {% block task_phases %}{% endblock %}
