@@ -290,7 +290,7 @@ def pending_questions(session_id: str) -> list:
 def open_question_count(session_id: str) -> int:
     """How many of :func:`pending_questions` there are; ``0`` if unreadable.
 
-    For uber lmer's header badge (issue #507): the ask route's data and rule, so
+    For uber lmer's question badge (issue #507): the ask route's data and rule, so
     it agrees with the run view's ask dock — and with ``lmer-signal list --open``
     for as long as the supervisor mirrors the bus into this directory
     (``lmer_cli.comms.AskDirProjection``). Best-effort like

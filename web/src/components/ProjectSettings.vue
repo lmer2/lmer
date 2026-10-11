@@ -1,16 +1,19 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { archiveProject, fetchAssistantInstructions, setAssistantInstructions, updateProject } from '../api.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
 
-const props = defineProps({ project: { type: Object, required: true } })
-const emit = defineEmits(['changed', 'close'])
+// `focus` is `{ id, section, nonce }`; the nonce makes a repeat tap count.
+const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null } })
+const emit = defineEmits(['changed', 'close', 'focused'])
 const form = ref({})
 const orders = ref(null)
 const instructions = ref('')
 const savedInstructions = ref('')
 const ordersOpen = ref(undefined)
+const ordersPanel = ref(null)
 const error = ref(null)
+const ordersError = ref(null)
 const busy = ref(false)
 // The picker speaks hex; the form keeps the stored spelling, preset name or hex.
 const pickedColor = computed({
@@ -27,22 +30,52 @@ const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color)
 const overrideKeys = ['model', 'harness', 'preset', 'agents']
 const overrideLabels = { model: 'Model', harness: 'Harness', preset: 'Preset', agents: 'Fan-out presets' }
 
-watch(() => props.project.id, async (id, _previous, onCleanup) => {
-  let current = true
-  onCleanup(() => { current = false })
+// Each read or save of the orders takes a ticket, and only the latest one's reply lands:
+// two quick taps, or a save during a read, would otherwise let the older text win.
+let ordersTicket = 0
+// A read waits out an orders save: a GET answered before the PUT would mark the saved
+// text unsaved, and the next Save project would write it over newer orders.
+let ordersSave = null
+// The tap whose orders the project watcher's own read already covers.
+let readForNonce
+
+watch(() => props.project.id, (id) => {
   orders.value = null
   instructions.value = ''
   savedInstructions.value = ''
   ordersOpen.value = undefined
   error.value = null
+  ordersError.value = null
   form.value = { name: props.project.name, color: props.project.color,
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
+  readForNonce = props.focus?.nonce
+  readOrders(id)
+}, { immediate: true })
+
+// uber lmer rewrites the orders from the chat, so each tap re-reads them: saving a
+// stale copy would overwrite the newer wording. An unsaved edit is kept.
+async function readOrders(id) {
+  await ordersSave?.catch(() => {})
+  const ticket = ++ordersTicket
   try {
     const loaded = await fetchAssistantInstructions(id)
-    if (!current) return
+    if (ticket !== ordersTicket) return
+    const edited = instructions.value !== savedInstructions.value
     orders.value = loaded
-    instructions.value = savedInstructions.value = loaded.instructions || ''
-  } catch (exc) { if (current) error.value = exc.message }
+    savedInstructions.value = loaded.instructions || ''
+    if (!edited) instructions.value = savedInstructions.value
+    ordersError.value = null
+  } catch (exc) { if (ticket === ordersTicket) ordersError.value = exc.message }
+}
+
+// The request is spent once read, so coming back to this project later opens it as it was.
+watch(() => props.focus?.nonce, async () => {
+  if (props.focus?.section !== 'orders' || props.focus.id !== props.project.id) return
+  ordersOpen.value = 0
+  if (props.focus.nonce !== readForNonce) readOrders(props.project.id)
+  emit('focused')
+  await nextTick()
+  ordersPanel.value?.$el?.scrollIntoView?.({ block: 'start' })
 }, { immediate: true })
 
 async function save() {
@@ -51,8 +84,13 @@ async function save() {
   error.value = null
   try {
     if (orders.value && instructions.value !== savedInstructions.value) {
-      orders.value = await setAssistantInstructions(id, instructions.value)
-      instructions.value = savedInstructions.value = orders.value.instructions || ''
+      const ticket = ++ordersTicket
+      ordersSave = setAssistantInstructions(id, instructions.value)
+      const saved = await ordersSave
+      if (ticket === ordersTicket) {
+        orders.value = saved
+        instructions.value = savedInstructions.value = saved.instructions || ''
+      }
     }
     await updateProject(id, { name: form.value.name, color: form.value.color,
       repositories: form.value.repositories.split('\n').map(value => value.trim()).filter(Boolean),
@@ -78,6 +116,7 @@ async function archive() {
     </v-card-actions>
     <v-card-text>
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+      <v-alert v-if="ordersError" type="error" class="mb-3">{{ ordersError }}</v-alert>
       <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" />
       <fieldset class="project-color mb-4" :disabled="busy">
         <legend class="text-body-medium mb-2">Project color
@@ -91,7 +130,7 @@ async function archive() {
       <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
         hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
       <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
-      <v-expansion-panels v-model="ordersOpen" class="project-orders">
+      <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
         <v-expansion-panel title="Standing instructions">
           <v-expansion-panel-text>
             <v-textarea v-model="instructions" label="Standing instructions" :disabled="busy || !orders"
