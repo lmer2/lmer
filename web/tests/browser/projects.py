@@ -23,8 +23,22 @@ from unittest.mock import patch
 import uvicorn
 from websockets.asyncio.client import connect
 
-from lmer_platform import api, assistant, config, projects, registry, runs, spawn, store
+from lmer_platform import api, ask, assistant, config, projects, registry, runs, spawn, store
 from lmer_platform import project_context as scope
+
+
+# Issue 575: the pane reaches the bottom of the window at every size, its toolbar
+# stays one compact row, and the question badge's corner is reserved in the field.
+FILL = """(() => {
+  const pane = [...document.querySelectorAll('.uber-pane')].find(e => e.checkVisibility());
+  const card = pane.querySelector('.chat-fill');
+  const slot = card.querySelector('.v-field__append-inner .question-slot');
+  return {inner: innerHeight, pane: pane.getBoundingClientRect().bottom, card: card.getBoundingClientRect().bottom,
+          scroller: card.querySelector('.chat').getBoundingClientRect().height,
+          toolbar: pane.querySelector('.uber-toolbar').getBoundingClientRect().height,
+          slot: slot && slot.getBoundingClientRect().width, badge: !!slot?.querySelector('.open-questions'),
+          overflow: document.documentElement.scrollWidth > innerWidth};
+})()"""
 
 
 class Browser:
@@ -123,11 +137,23 @@ async def rotating_composer(browser, output, project, settings):
             release.set()
         after = rotation.result(timeout=20)
     assert after['running'] and after['session_id'] != during['history_session']
-    await browser.wait("document.body.textContent.includes('You are talking to Beta')")
+    await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart uber lmer\"]')].some(e => e.checkVisibility())")
     await browser.wait("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && !e.disabled)")
     assert await browser.evaluate("[...document.querySelectorAll('.attachments')].some(e => e.checkVisibility() && e.textContent.includes('rotation.txt'))")
     assert await browser.evaluate("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && e.value === 'Beta draft retained through admission')")
     await browser.shot(output, 'rotation-successor-attachment')
+
+
+async def fills_the_window(browser, name):
+    await browser.wait("[...document.querySelectorAll('.uber-pane .chat-fill')].some(e => e.checkVisibility())")
+    await asyncio.sleep(.5)
+    sizes = await browser.evaluate(FILL)
+    # Both sides: short of the bottom is the old gap, past it is a transcript that
+    # grows instead of scrolling and pushes the composer off the screen.
+    assert abs(sizes["pane"] - sizes["inner"]) <= 1, (name, sizes)
+    assert 0 <= sizes["inner"] - sizes["card"] <= 16, (name, sizes)
+    assert sizes["toolbar"] <= 56 and sizes["slot"] == 36 and not sizes["overflow"], (name, sizes)
+    return sizes
 
 
 async def sidebar_chat(browser, name):
@@ -162,14 +188,14 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         assert "beta-question" in groups[1] and "alpha-question" not in groups[1], groups
         await browser.shot(output, "all-projects-desktop")
         await browser.click_element("document.querySelector('.project-assistant[aria-label^=\"Chat with Alpha\"]')")
-        await browser.wait("document.querySelector('.project-chat-title')?.textContent.includes('Alpha')")
+        await browser.wait("document.querySelector('.uber-pane')?.getAttribute('aria-label').startsWith('Alpha')")
         await browser.choose_project("All projects")
-        assert await browser.evaluate("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Alpha'))")
+        assert await browser.evaluate("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
         await browser.shot(output, "all-projects-bound-chat")
         await browser.evaluate("document.querySelector('[aria-label=\"close the uber lmer chat\"]').click()")
         await browser.choose_project("Beta")
         await browser.click("talk to uber lmer")
-        await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Beta'))")
+        await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Beta'))")
         await browser.wait("document.body.textContent.includes('Waiting to start — assistant limit reached')")
         assert projects.status(beta["id"])["history_session"]
         await browser.click_element("[...document.querySelectorAll('textarea')].find(e => e.checkVisibility() && !e.disabled)")
@@ -182,11 +208,23 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.wait("document.body.textContent.includes('Waiting to start — assistant limit reached')")
         projects.stop(alpha["id"])
         projects.reconcile(settings)
-        await browser.wait("document.body.textContent.includes('You are talking to Beta')")
+        await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart uber lmer\"]')].some(e => e.checkVisibility())")
         await browser.wait("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && !e.disabled)")
         assert await browser.evaluate("[...document.querySelectorAll('textarea')].filter(e => e.checkVisibility() && !e.disabled).some(e => e.value === 'Beta draft retained through admission')")
         await browser.shot(output, "historical-draft-admitted")
         await rotating_composer(browser, output, beta, settings)
+        fill = {}
+        with patch.object(ask, "open_question_count", lambda _session: 2):
+            await browser.call("Emulation.setDeviceMetricsOverride", width=3840, height=2160, deviceScaleFactor=1, mobile=False)
+            await browser.wait("[...document.querySelectorAll('.uber-pane .open-questions')].some(e => e.checkVisibility())")
+            fill["3840x2160"] = await fills_the_window(browser, "4k")
+            assert fill["3840x2160"]["badge"]
+            await browser.shot(output, "uber-pane-4k")
+        await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
+        await browser.wait("![...document.querySelectorAll('.uber-pane .open-questions')].some(e => e.checkVisibility())")
+        cleared = await fills_the_window(browser, "badge cleared")
+        assert cleared["slot"] == 36 and not cleared["badge"], cleared
+        fill["1440x1000"] = cleared
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.switcher_entry("Project settings for Beta")
         swatches = "[...document.querySelectorAll('.project-color .v-color-picker-swatches__color')]"
@@ -215,20 +253,23 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await browser.wait("document.querySelector('[aria-label=\"show the run list\"]')")
         await sidebar_chat(browser, "Beta")
-        await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Beta'))")
+        await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Beta'))")
         overflow = await browser.evaluate("document.documentElement.scrollWidth > innerWidth")
         assert not overflow, "Page overflows the phone viewport"
-        await browser.shot(output, "beta-phone")
+        with patch.object(ask, "open_question_count", lambda _session: 1):
+            await browser.wait("[...document.querySelectorAll('.uber-pane .open-questions')].some(e => e.checkVisibility())")
+            fill["390x844"] = await fills_the_window(browser, "phone")
+            await browser.shot(output, "beta-phone")
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.choose_project(alpha["name"])
         await sidebar_chat(browser, alpha["name"])
-        await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Alpha'))")
+        await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
         await browser.shot(output, "long-name-phone")
         await browser.click("colour scheme: follow the system")
         await browser.click("dark", ".v-list-item")
         await browser.wait("document.querySelector('.v-application.v-theme--dark')")
         await browser.shot(output, "long-name-phone-dark")
-        assert await browser.evaluate("getComputedStyle(document.querySelector('.assistant-header')).color") == 'rgb(255, 255, 255)'
+        assert await browser.evaluate("getComputedStyle([...document.querySelectorAll('.uber-toolbar')].find(e => e.checkVisibility())).color") == 'rgb(255, 255, 255)'
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
@@ -238,7 +279,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.click_element("document.querySelector('.v-dialog input')")
             await browser.call("Input.insertText", text=name)
             await browser.click("Create project")
-            await browser.wait(f"[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes({json.dumps(name)}))")
+            await browser.wait(f"[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith({json.dumps(name)}))")
             created = [row for row in projects.listing() if row["name"] == name]
             assert len(created) == 1 and created[0]["repositories"] == []
             await asyncio.sleep(.5)
@@ -246,11 +287,11 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         assert not browser.errors, browser.errors
         (output / "browser-results.json").write_text(json.dumps({
-            "result": "pass", "viewports": ["1440x1000", "390x844"], "colors_saved": list(projects.COLORS), "label_contrast": contrasts,
+            "result": "pass", "viewports": ["1440x1000", "390x844", "3840x2160"], "fill": fill, "colors_saved": list(projects.COLORS), "label_contrast": contrasts,
             "checks": ["project-local All projects groups", "actual chat identity while All projects selected",
                        "durable waiting/cancel", "20 preset color-picker swatches saved by name through UI", "URL/color reload",
                        "close/switch/bar robot opens Beta", "queued historical draft survives admission", "staged attachment survives real rotation gap",
-                       "phone overflow and long chat header", "dark theme identity", "name-only project creation opens own chat",
+                       "phone overflow and long chat header", "uber pane fills 4K and phone height, badge corner reserved", "dark theme identity", "name-only project creation opens own chat",
                        "all project app bar text contrasts >= 4.5", "no runtime exceptions"],
             "limits": "Real Chromium and HTTP routes, fixture inventory and sleeping assistant processes; no external transports or live daemon.",
         }, indent=2) + "\n")

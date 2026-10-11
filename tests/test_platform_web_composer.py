@@ -183,7 +183,12 @@ def test_the_send_control_is_outside_the_field(name, handler):
     """
     text = _read(name)
     field = _field(text)
-    assert "#append-inner" not in field, (
+    # Issue 575 put uber lmer's question badge in that corner, forwarded from the
+    # pane as a slot; the corner may carry that slot and nothing of the composer's.
+    inner = field[field.index("#append-inner"):] if "#append-inner" in field else ""
+    assert handler not in inner and (
+        not inner or re.search(r"#append-inner>\s*<slot name=\"composer-inner\" />\s*</template>", inner)
+    ), (
         f"{name}'s send control is back inside the field, where the tap that "
         "reaches it is the tap that focuses the textarea"
     )

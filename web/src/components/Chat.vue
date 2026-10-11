@@ -182,6 +182,9 @@ const props = defineProps({
     validator: (value) => ['session', 'conversation', 'transcript'].includes(value),
   },
   now: { type: Number, default: () => Date.now() },
+  // The uber lmer pane (issue 575): the card grows to the bottom of its column, and
+  // the message count and earlier-messages button are the parent's to draw.
+  fill: { type: Boolean, default: false },
 })
 
 // What a turn's role is titled as, for the roles that are not the agent's. See
@@ -540,6 +543,12 @@ const canLoadEarlier = computed(
     ? !!olderPage(messages.value, historyGenerations.value)
     : messages.value.length > 0 && messages.value[0].seq > 0,
 )
+
+// In fill mode the row can be empty, and an empty row would still keep its margin.
+const headerRow = computed(() => !props.fill || phase.value === 'loading'
+  || (props.view === 'conversation' && !!transcriptHidden.value)
+  || props.view === 'transcript'
+  || (props.view === 'session' && !!hiddenCount.value))
 
 const historyHasGap = computed(() => props.assistantHistory
   && historyGaps(messages.value, historyGenerations.value).some((gap) => gap.internal))
@@ -1310,18 +1319,20 @@ watch(() => props.view, () => {
 watch(rendererLoaded, () => {
   if (following.value) stickToBottom()
 }, { flush: 'post' })
+
+defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => composerMode.value === 'send') })
 </script>
 
 <template>
-  <v-card class="mb-3">
+  <v-card :class="fill ? 'chat-fill' : 'mb-3'">
     <v-card-text>
-      <div class="d-flex flex-wrap align-center ga-2 mb-3">
+      <div v-if="headerRow" class="d-flex flex-wrap align-center ga-2 mb-3">
         <span v-if="phase === 'loading'" class="text-body-small text-medium-emphasis">
           <v-progress-circular indeterminate size="12" width="2" class="me-2" />
           reading the transcript…
         </span>
         <span
-          v-else-if="total"
+          v-else-if="total && !fill"
           class="text-body-small text-medium-emphasis"
         >{{ total }} messages<template v-if="assistantHistory"> loaded</template><template v-else-if="spansSessions"> across {{ sessions.length }} sessions</template></span>
         <!-- The conversation view says what it leaves out and where the switch
@@ -1361,7 +1372,7 @@ watch(rendererLoaded, () => {
         {{ note }}
       </v-alert>
 
-      <div v-if="canLoadEarlier" class="d-flex mb-3">
+      <div v-if="canLoadEarlier && !fill" class="d-flex mb-3">
         <v-btn
           :prepend-icon="mdiUnfoldMoreHorizontal"
           variant="tonal"
@@ -1728,7 +1739,11 @@ watch(rendererLoaded, () => {
             @paste="onPaste"
             @keydown.ctrl.enter.prevent="send"
             @keydown.meta.enter.prevent="send"
-          />
+          >
+            <template v-if="$slots['composer-inner']" #append-inner>
+              <slot name="composer-inner" />
+            </template>
+          </v-textarea>
           <!-- The picker is hidden and driven from the button below, because a
                bare file input cannot be made a comfortable tap target and reads
                as nothing on a phone. On a phone that button is also the camera
@@ -1838,6 +1853,24 @@ watch(rendererLoaded, () => {
   max-height: 50vh;
   max-height: 50dvh;
   overflow-y: auto;
+}
+/* `overflow: visible`: a v-card clips, and a clipping flex item loses the automatic
+   minimum that keeps the composer from being squeezed. */
+.chat-fill {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  overflow: visible;
+}
+.chat-fill > :deep(.v-card-text) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+}
+.chat-fill .chat {
+  flex: 1 1 0;
+  min-height: 8rem;
+  max-height: none;
 }
 
 /* The wrap is declared here, on the bubble, rather than on each kind of content

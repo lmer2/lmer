@@ -130,6 +130,7 @@ const projectName = ref('')
 const projectError = ref(null)
 const creatingProject = ref(false)
 const platformSection = ref(null)
+const projectSettingsFocus = ref(null)
 const seenChats = ref([])
 const chatProject = ref(activeProject.value)
 const chatWorkspace = computed(() => projects.value.find(project => project.id === chatProject.value))
@@ -141,7 +142,7 @@ const barColor = computed(() => (barProject.value ? projectColor(barProject.valu
 const barStyle = computed(() => (barProject.value ? { color: projectTextColor(barProject.value.color) } : undefined))
 const switcherEvents = {
   choose: chooseProject,
-  settings: () => { view.value = 'project-settings' },
+  settings: () => { projectSettingsFocus.value = null; view.value = 'project-settings' },
   create: () => { projectDialog.value = true },
 }
 const switcherProps = computed(() => ({
@@ -677,6 +678,17 @@ function open(run) {
 const runRefNotice = ref(null)
 let stopRunRefs = null
 
+// On a phone the drawer would cover the settings it opens.
+let settingsNonce = 0
+
+function openProjectSettings(id, section) {
+  activeProject.value = id
+  view.value = 'project-settings'
+  settingsNonce += 1
+  projectSettingsFocus.value = section ? { id, section, nonce: settingsNonce } : null
+  if (mobile.value) uberOpen.value = false
+}
+
 // uber lmer's question badge (issue 507): open its own fleet row and point the run
 // view at the ask dock. A nonce, so a second tap on the same run focuses again.
 const questionsFocus = ref(null)
@@ -868,8 +880,8 @@ onUnmounted(() => {
          operator has two conversations — with an lmer working in a repository and
          with the uber lmer watching all of them — and telling the second to stop
          something while typing at the first is the mistake worth designing
-         against. So they never share an edge, and this one carries the accent
-         header its component draws.
+         against. So they never share an edge, and this one carries the project-colour
+         toolbar its component draws.
          No `permanent` and no `temporary`: Vuetify reads the same `mobile`
          breakpoint the left drawer is given, so it sits beside the content on a
          desktop and comes over it with a scrim on a phone, and the two drawers
@@ -877,9 +889,9 @@ onUnmounted(() => {
     <!-- Twice the navigator's width: this drawer holds a conversation, not a
          list, and prose in a 360px column wraps too hard to read. -->
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
-      <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject">
+      <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject" class="uber-pane-slot">
         <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
-          @settings="activeProject = project.id; view = 'project-settings'" @close="uberOpen = false"
+          @settings="openProjectSettings(project.id, $event)" @close="uberOpen = false"
           @questions="openAssistantQuestions" />
       </div>
       <p v-if="!chatWorkspace || chatWorkspace.archived" class="pa-4">Choose an active project to open its assistant chat.</p>
@@ -891,7 +903,8 @@ onUnmounted(() => {
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
         </v-alert>
         <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
-          :project="workspace" @changed="load" @close="view = 'fleet'" />
+          :project="workspace" :focus="projectSettingsFocus" @changed="load" @close="view = 'fleet'"
+          @focused="projectSettingsFocus = null" />
         <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail
@@ -1137,6 +1150,10 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.uber-pane-slot {
+  height: 100%;
+}
+
 /* The tone palette was chosen against the theme's surface, not a project's color
    (green "running" vanishes on a green project), so on a project bar a toned robot
    keeps its tone and sits on a disc of that surface. Untoned, it is bar text. */

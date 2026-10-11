@@ -342,3 +342,14 @@ it.each([false, true])('reconciles late bus posts across polls (combined=%s)', a
     vi.useRealTimers()
   }
 })
+
+it('keeps the run view\'s row above an empty transcript, and drops it only in fill mode', async () => {
+  const runView = await open([])
+  const first = (wrapper) => wrapper.get('.v-card-text').element.firstElementChild
+  expect(first(runView).classList.contains('mb-3')).toBe(true)
+  expect(first(runView).classList.contains('d-flex')).toBe(true)
+  fetchSessionMessages.mockResolvedValue({ messages: [], total: 0, cursor: 0 })
+  const filled = mountPane(Chat, { sessionId: 's-1', fill: true })
+  await flushPromises()
+  expect(first(filled).classList.contains('d-flex')).toBe(false)
+})
