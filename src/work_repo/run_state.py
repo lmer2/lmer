@@ -2599,6 +2599,7 @@ def emit_gate_event(
     test_targets: Optional[list] = None,
     test_cache_verdict: Optional[str] = None,
     test_cache_reason: Optional[str] = None,
+    ci_baseline: Optional[dict] = None,
 ) -> None:
     """Record a gate command outcome ('pass' | 'fail' | 'bypass') on the
     current run, as a machine-written receipt (issue #88): the `data`
@@ -2617,7 +2618,11 @@ def emit_gate_event(
     ran, a narrowed subset ran, or nothing ran because an earlier pass on
     the same tree was reused — a receipt that cannot tell those apart lets
     a subset green be read back as a full-suite green. Absent means the
-    caller could not say, never 'full'."""
+    caller could not say, never 'full'.
+
+    `ci_baseline` is the CI evidence a `gate-baseline` receipt rests on (#452):
+    project, full sha, every attempt of every required job, and the local
+    smoke result — the provenance of a baseline the local suite never ran."""
     try:
         rdir = run_dir()
         if rdir is None or _state_path(rdir) is None:
@@ -2651,6 +2656,9 @@ def emit_gate_event(
             )
         if test_cache_reason is not None:
             data["test_cache_reason"] = redact_secrets(str(test_cache_reason))
+        if ci_baseline is not None:
+            data["ci_baseline"] = json.loads(
+                redact_secrets(json.dumps(ci_baseline, default=str)))
         append_event(rdir, "gate", note=f"{gate}: {outcome}", data=data)
     except Exception:
         pass

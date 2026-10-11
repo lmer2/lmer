@@ -26,7 +26,7 @@ from typing import Callable, List
 from dotenv import dotenv_values, load_dotenv
 
 from .log import warning
-from .util import env_name_segment, get_bool_env
+from .util import FALSY_VALUES, TRUTHY_VALUES, env_name_segment, get_bool_env
 
 
 class InstallMode(Enum):
@@ -608,6 +608,39 @@ def _resolve_gpu(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
         "",
         _valid_gpu,
         GPU_HINT,
+    )
+
+
+#: The knob `gate-check --baseline` reads inside the session (#452). It rides
+#: the scoped ladder like the resources so it can be switched on per taskdef
+#: and per repository, and only the resolved value enters the container.
+GATE_CI_BASELINE_KNOB = "GATE_CI_BASELINE"
+GATE_CI_BASELINE_ENV = f"LMER_{GATE_CI_BASELINE_KNOB}"
+GATE_CI_BASELINE_HINT = "must be 1/true/yes or 0/false/no"
+
+
+def _valid_toggle(raw: str) -> str | None:
+    """``"1"`` or ``"0"`` for get_bool_env's spellings, None for anything else.
+
+    An explicit off is a value, not a blank: it answers its tier and stops
+    the walk, so ``LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE=0`` turns one
+    repository off under a general ``LMER_GATE_CI_BASELINE=1``.
+    """
+    value = raw.lower()
+    if value in TRUTHY_VALUES:
+        return "1"
+    if value in FALSY_VALUES:
+        return "0"
+    return None
+
+
+def resolve_gate_ci_baseline(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
+    """The session's ``LMER_GATE_CI_BASELINE`` (``"1"``/``"0"``) and its source."""
+    return _resolve_limit_env(
+        resource_env_names(GATE_CI_BASELINE_KNOB, scope),
+        "0",
+        _valid_toggle,
+        GATE_CI_BASELINE_HINT,
     )
 
 

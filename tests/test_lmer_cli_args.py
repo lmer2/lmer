@@ -438,6 +438,26 @@ class TestResourceLimitDiagnostic:
         out = buffer.getvalue()
         assert "cpus=2 (LMER_CPUS), gpu=0,1 (LMER_DEVELOP_GPU)" in out
 
+    def test_ci_baseline_toggle_is_shown_with_its_source(self):
+        import contextlib
+        import io
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import ResourceLimit
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits(
+                    [ResourceLimit("--cpus", "2", "LMER_CPUS")], None,
+                    ("1", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE"),
+                )
+                _announce_resource_limits([], None, ("0", "default"))
+        out = buffer.getvalue()
+        assert ("cpus=2 (LMER_CPUS), gate-ci-baseline=on "
+                "(LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE)") in out
+        assert "gate-ci-baseline=off (default)" in out
+
     def test_unsupported_gpu_request_is_shown_as_no_grant(self):
         import contextlib
         import io

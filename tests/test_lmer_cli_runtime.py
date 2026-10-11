@@ -1287,3 +1287,74 @@ class TestResourceLimitPlan:
         assert [limit.flag for limit in plan] == ["--pids-limit"]
         args = base_run_args("podman", False, "developer", plan)
         assert "--memory" not in args and "--cpus" not in args
+
+
+class TestGateCiBaselineLadder:
+    """LMER_GATE_CI_BASELINE rides the #453 ladder (#452): most specific first,
+    blank and invalid fall through, default off."""
+
+    def _resolve(self, env, scope=LaunchScope("develop", "agents/global")):
+        from lmer_cli.runtime import resolve_gate_ci_baseline
+        with patch.dict(os.environ, env, clear=False):
+            for name in [n for n in os.environ if n.endswith("GATE_CI_BASELINE") and n not in env]:
+                os.environ.pop(name)
+            return resolve_gate_ci_baseline(scope)
+
+    def test_default_is_off(self):
+        assert self._resolve({}) == ("0", "default")
+
+    def test_names_follow_the_resource_derivation(self):
+        assert resource_env_names("GATE_CI_BASELINE", LaunchScope("develop", "agents/global")) == [
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE",
+            "LMER_DEVELOP_GATE_CI_BASELINE",
+            "LMER_GATE_CI_BASELINE",
+        ]
+
+    def test_repo_tier_beats_task_and_general(self):
+        assert self._resolve({
+            "LMER_GATE_CI_BASELINE": "0",
+            "LMER_DEVELOP_GATE_CI_BASELINE": "0",
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "yes",
+        }) == ("1", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE")
+
+    def test_explicit_off_at_a_specific_tier_wins(self):
+        assert self._resolve({
+            "LMER_GATE_CI_BASELINE": "1",
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "false",
+        }) == ("0", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE")
+
+    def test_task_tier_applies_to_any_repository(self):
+        assert self._resolve({"LMER_DEVELOP_GATE_CI_BASELINE": "TRUE"},
+                             LaunchScope("develop", "other/repo")) == (
+            "1", "LMER_DEVELOP_GATE_CI_BASELINE")
+
+    def test_blank_falls_through(self):
+        assert self._resolve({
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "  ",
+            "LMER_GATE_CI_BASELINE": "1",
+        }) == ("1", "LMER_GATE_CI_BASELINE")
+
+    def test_invalid_warns_and_falls_through_to_the_next_candidate(self, capsys):
+        assert self._resolve({
+            "LMER_DEVELOP_GATE_CI_BASELINE": "maybe",
+            "LMER_GATE_CI_BASELINE": "1",
+        }) == ("1", "LMER_GATE_CI_BASELINE")
+        captured = capsys.readouterr()
+        assert "LMER_DEVELOP_GATE_CI_BASELINE" in captured.out + captured.err
+
+    def test_invalid_with_nothing_else_stays_off(self):
+        assert self._resolve({"LMER_GATE_CI_BASELINE": "on"}) == ("0", "default")
+
+    def test_no_repo_session_has_no_repo_tier(self):
+        assert self._resolve({
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "1",
+        }, LaunchScope("develop", None)) == ("0", "default")
+
+    def test_no_task_session_reads_only_the_general_name(self):
+        assert self._resolve({
+            "LMER_DEVELOP_GATE_CI_BASELINE": "1",
+            "LMER_GATE_CI_BASELINE": "0",
+        }, None) == ("0", "LMER_GATE_CI_BASELINE")
+
+    def test_there_is_no_repo_only_tier(self):
+        assert self._resolve({"LMER_AGENTS_GLOBAL_GATE_CI_BASELINE": "1"}) == ("0", "default")

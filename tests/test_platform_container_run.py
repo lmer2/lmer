@@ -349,6 +349,21 @@ def test_container_resource_limits_are_forwarded_including_scoped_spellings(host
         assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
 
 
+def test_ci_baseline_toggle_is_forwarded_including_scoped_spellings(host):
+    """#452's toggle is resolved by the ``lmer`` inside this container, on the
+    same ladder as the resources, so every spelling has to arrive here."""
+    values = {
+        "LMER_GATE_CI_BASELINE": "1",
+        "LMER_DEVELOP_GATE_CI_BASELINE": "0",
+        "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "1",
+    }
+    run = host.run(env=values)
+    for name in values:
+        assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
+    assert "LMER_GATE_CI_BASELINE_NOTES" not in host.run(
+        env={"LMER_GATE_CI_BASELINE_NOTES": "x"}).env_names
+
+
 def test_the_assistants_own_allocation_still_forwards_on_the_platform_prefix(host):
     """The asymmetry #453's review found: both halves of the feature have to
     survive one shell. ``LMER_PLATFORM_ASSISTANT_MEMORY`` matches the
