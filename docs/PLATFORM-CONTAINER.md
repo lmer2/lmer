@@ -387,12 +387,12 @@ for a session image tag the host may not have. It will try to pull it. Pin
 
 ### Restart semantics, and what breaks today
 
-On a bare host, sessions survive a daemon restart. Each session has a
-host-side `lmer` client process that owns the PTY master, and those
-processes are not children of the daemon in any meaningful sense — the
-daemon restarts, re-attaches, and the fleet carries on (spec R11, T36).
+On a bare host, sessions survive a daemon restart. Each session's container
+is detached and labelled, so the daemon's death costs it nothing; the new
+daemon finds it by label and follows it again — see
+[CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md) (spec R11, T36).
 
-In this topology those client processes live **inside the platform
+In this topology the `lmer` followers live **inside the platform
 container**, in its PID namespace. So every platform upgrade — every
 `docker restart`, every stop/run — kills all of them. Two consequences,
 one benign and one not:
@@ -403,7 +403,11 @@ one benign and one not:
   `~/.lmer/platform/logs/<id>.session/`, and the read path prefers it when
   it holds anything (`session_io.canonical_log`). The host-side tee dying
   costs nothing for a session whose image writes its own log.
-- **Re-attach does not, yet.** `reattach_all`
+- **Re-attach does not, yet, for sessions started before #444.** Sessions
+  launched since are found by container label rather than by pid, which
+  sidesteps the namespace problem below
+  ([CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md)); that path has not
+  been verified in this topology yet. For the older sessions: `reattach_all`
   (`src/lmer_platform/reattach.py:814`) is scoped to
   `registry.list_sessions(live_only=True)`, and liveness is
   `kill(pid, 0)` plus a `/proc` zombie check against the pid recorded in

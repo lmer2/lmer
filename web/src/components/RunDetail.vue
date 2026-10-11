@@ -933,6 +933,8 @@ async function forget() {
                 <dd><code class="scroll-x">{{ session.id }}</code></dd>
                 <dt>pid</dt>
                 <dd>{{ session.pid }}</dd>
+                <dt v-if="session.container_name">container</dt>
+                <dd v-if="session.container_name"><code class="scroll-x">{{ session.container_name }}</code></dd>
                 <dt>started</dt>
                 <dd :title="session.started_at || ''">{{ ago(session.started_at, now) }}</dd>
                 <dt v-if="session.log_path">log</dt>

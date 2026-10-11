@@ -9,6 +9,7 @@ crashed runs survive into the attention list.
 import asyncio
 import base64
 import json
+import os
 
 import pytest
 import yaml
@@ -16,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from lmer_platform import api, connectors
 from lmer_platform import config as cfg
-from lmer_platform import registry, store
+from lmer_platform import registry, spawn, store
 from tests.conftest import strip_lmer_env
 
 # The taskdef-tier fixtures, imported rather than copied — the same trade
@@ -301,6 +302,33 @@ def test_build_state_includes_sessions_without_run_dirs(platform_root):
     assert payload["totals"]["runs"] == 1
     assert payload["runs"][0]["slug"] == "develop-1"
     assert payload["runs"][0]["state"] == "running"
+
+
+def test_state_names_the_live_sessions_container(config, platform_root):
+    """#444: what the launching lmer reported at create reaches the session
+    block as ``container_name``; the id stays host-side."""
+    registry.register(
+        "s-20261009T152516-ff2b", pid=os.getpid(),
+        run={"host": "gitlab.example.com", "project": "agents/global", "slug": "chat-mr-389"},
+        task={"taskdef": "chat", "target": "mr-389"},
+    )
+    facts = spawn.ports_file_for("s-20261009T152516-ff2b")
+    facts.parent.mkdir(parents=True, exist_ok=True)
+    facts.write_text(json.dumps(
+        {"container": {"id": "9f3ca1b2c3d4e5", "name": "lmer-chat-mr-389-ff2b"}}
+    ))
+
+    app = api.create_app(config, SECRET, state_builder=api.build_state)
+    payload = TestClient(app).get("/api/state", headers=bearer_header()).json()
+
+    session = payload["runs"][0]["session"]
+    assert session["container_name"] == "lmer-chat-mr-389-ff2b"
+    assert "container_id" not in session
+    assert "9f3ca1b2c3d4e5" not in json.dumps(payload)
+    entry = registry.read_session("s-20261009T152516-ff2b")
+    assert (entry["container_id"], entry["container_name"]) == (
+        "9f3ca1b2c3d4e5", "lmer-chat-mr-389-ff2b",
+    )
 
 
 def test_build_state_surfaces_crashed_sessions_in_attention(platform_root):

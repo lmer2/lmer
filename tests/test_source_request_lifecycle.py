@@ -383,7 +383,7 @@ def test_daemon_mention_spawn_brief_reply_release(transport_host, fleet, monkeyp
     link = _link(event)
     for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests"):
         monkeypatch.setattr(daemon, name, lambda *args: SimpleNamespace(stop=lambda: None))
-    monkeypatch.setattr(daemon, "reattach_all", lambda: [])
+    monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     monkeypatch.setattr(connectors.ThreadConnectors, "start", lambda self: None)
     monkeypatch.setattr(connectors, "_slack_client", lambda _token: transports["slack"])
     admissions, briefs = [], []

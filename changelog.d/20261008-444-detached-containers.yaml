@@ -1,0 +1,9 @@
+fixed:
+- "Platform sessions now survive a daemon restart on podman and docker; the restarted platform finds each session's container by label and follows it again."
+changed:
+- "Closing the terminal no longer ends a CLI session: its container keeps running. Re-attach with `lmer follow <container>`; remove a stopped one with `<runtime> rm`."
+- "Consoles lmer attaches now detach with Ctrl-] Ctrl-\\ instead of Ctrl-P Ctrl-Q, which swallowed input."
+- "Stopping a session gives its container up to 200 s to finish its session-end work, instead of the runtimes' 10 s."
+added:
+- "A session's log ends with its container's real exit code, which is also recorded when the container exits while the platform is down."
+- "Session containers get readable names like `lmer-<run slug>-<suffix>`, shown in the control UI's live-session card."

@@ -130,7 +130,10 @@ def live_api(tmp_path, monkeypatch):
 
     def record(command, **kwargs):
         process = popen(command, **kwargs)
-        processes.append(process)
+        # Session launches only: the platform also runs the container runtime
+        # to clean up after a launch it throws away (#444).
+        if command and command[0] == str(binary):
+            processes.append(process)
         return process
 
     monkeypatch.setattr(spawn.subprocess, 'Popen', record)

@@ -62,6 +62,20 @@ Complete guide to using Docker and Podman with LMER. Covers:
 
 ---
 
+### [CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md)
+**Session Container Lifecycle**
+
+How lmer runs a session container detached and follows it:
+- Create, start attached, wait, record and remove
+- The detach keys (Ctrl-] Ctrl-\) and the labels on every session container
+- Closing the terminal no longer ends a CLI session; `lmer follow` and cleanup
+- How a restarted platform finds and follows its sessions again
+
+**Best for**: Re-attaching to a session, cleaning up stopped containers, and
+understanding why sessions survive a platform restart.
+
+---
+
 ### [PLATFORM-CONTAINER.md](./PLATFORM-CONTAINER.md)
 **Platform Container Image**
 

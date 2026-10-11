@@ -12,6 +12,7 @@ This module handles:
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -184,6 +185,101 @@ def detect_runtime() -> str:
     if shutil.which("podman"):
         return "podman"
     raise RuntimeErrorDetect("Neither Docker nor Podman found in PATH")
+
+
+#: The detach sequence on every console lmer attaches, replacing the runtimes'
+#: Ctrl-P Ctrl-Q, which swallows input (Ctrl-P is history-up in most TUIs).
+#: Detach keys belong to the attaching client (`start`/`attach`), not the
+#: container: docker's `create` has no such flag. Both runtimes need a sequence,
+#: since docker has no way to disable detaching.
+DETACH_KEYS = "ctrl-],ctrl-\\"
+
+#: Seconds a stop waits before killing a session container: room for the
+#: in-container session-end backstop
+#: (lmer_cli.container.clone_and_exec.SESSION_END_TIMEOUT_SECONDS) on every
+#: stop, rather than the runtimes' 10 s default.
+STOP_TIMEOUT_SECONDS = 200
+
+#: Labels lmer puts on every session container (#444). The platform finds its
+#: sessions by them after a restart.
+LABEL_MANAGED = "io.lmer.managed"
+LABEL_LAUNCHER = "io.lmer.launcher"
+LABEL_REPO_HOST = "io.lmer.repo.host"
+LABEL_REPO_PROJECT = "io.lmer.repo.project"
+LABEL_RUN_SLUG = "io.lmer.run.slug"
+LABEL_PLATFORM_SESSION = "io.lmer.platform.session"
+#: Which platform started it, so two platforms sharing one runtime never
+#: adopt or remove each other's containers.
+LABEL_PLATFORM_INSTANCE = "io.lmer.platform.instance"
+
+
+def container_labels(
+    *,
+    repo_host: Optional[str],
+    repo_project: Optional[str],
+    run_slug: Optional[str],
+    platform_session: Optional[str],
+    platform_instance: Optional[str] = None,
+) -> List[str]:
+    """``--label`` arguments identifying a session container's run. Never a
+    secret: labels are readable by anyone who can list containers."""
+    labels = {
+        LABEL_MANAGED: "1",
+        LABEL_LAUNCHER: "platform" if platform_session else "cli",
+        LABEL_PLATFORM_INSTANCE: platform_instance,
+        LABEL_REPO_HOST: repo_host,
+        LABEL_REPO_PROJECT: repo_project,
+        LABEL_RUN_SLUG: run_slug,
+        LABEL_PLATFORM_SESSION: platform_session,
+    }
+    args: List[str] = []
+    for key, value in labels.items():
+        if value:
+            args += ["--label", f"{key}={value}"]
+    return args
+
+
+#: Longest name lmer gives a container: a DNS label's length, short enough for
+#: a ``ps`` column. Only the slug is ever cut.
+NAME_MAX = 63
+NAME_PREFIX = "lmer"
+#: Hex digits of a random name suffix (a CLI run's, and any retry's).
+NAME_RANDOM_HEX = 6
+#: Most hex digits a session id lends the suffix, so the cap holds for any id.
+NAME_SESSION_HEX_MAX = 12
+_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
+_TRAILING_HEX = re.compile(r"-([0-9a-fA-F]+)$")
+
+
+def _name_part(text: Optional[str]) -> str:
+    """*text* in the runtimes' name charset (``[a-zA-Z0-9][a-zA-Z0-9_.-]*``)."""
+    return re.sub(r"-{2,}", "-", _NAME_UNSAFE.sub("-", text or "")).strip("-_.")
+
+
+def container_name(
+    run_slug: Optional[str], platform_session: Optional[str] = None, *, retry: bool = False
+) -> str:
+    """The ``--name`` of a session container: ``lmer-<run slug>-<suffix>``.
+
+    The suffix is the platform session id's trailing hex, or random for a CLI run
+    and for a *retry* after a name conflict. With no slug a platform session is
+    ``lmer-<session id>``, a CLI run ``lmer-<suffix>``. For humans reading
+    ``ps``; lmer itself finds its containers by label and id.
+    """
+    head = _name_part(run_slug)
+    session = _name_part(platform_session)
+    match = _TRAILING_HEX.search(session)
+    if retry or not session or (head and not match):
+        suffix = secrets.token_hex(NAME_RANDOM_HEX // 2)
+    elif head:
+        suffix = match.group(1).lower()[-NAME_SESSION_HEX_MAX:]
+    else:
+        head, suffix = session, ""
+    if retry and not head:
+        head = session
+    room = NAME_MAX - len(NAME_PREFIX) - 1 - (len(suffix) + 1 if suffix else 0)
+    head = head[:room].rstrip("-_.")
+    return "-".join(part for part in (NAME_PREFIX, head, suffix) if part)
 
 
 def tty_flags() -> List[str]:
@@ -904,10 +1000,15 @@ def base_run_args(
     gpu: "GPUGrant | None" = None,
 ) -> List[str]:
     """
-    Build base container run arguments.
+    Build base container create arguments.
+
+    The container is created detached and followed separately
+    (:mod:`lmer_cli.container_follow`), so its lifetime is never tied to a
+    client's terminal (#444). No ``--rm``: the exit code has to outlive the exit,
+    and the follower removes the container once it has read it.
 
     Includes:
-    - Runtime and run command
+    - Runtime and create command
     - TTY flags
     - Resource limits (CPU, memory, PIDs)
     - Security options
@@ -925,13 +1026,14 @@ def base_run_args(
     Returns:
         List of base Docker/Podman arguments
     """
-    args: List[str] = [runtime, "run", "--rm"]
+    args: List[str] = [runtime, "create"]
     # PID 1 init (tini): reap orphaned grandchildren and forward signals.
     # clone_and_exec.py runs the claude-runner as a child (session-end
     # backstop) instead of exec'ing it, so without an init the Python
     # process is PID 1 and zombies accumulate unreaped.
     args += ["--init"]
     args += tty_flags()
+    args += ["--stop-timeout", str(STOP_TIMEOUT_SECONDS)]
     args += ["--security-opt", "no-new-privileges"]
     # Disable SELinux labeling to allow SSH agent socket access
     # Container processes (container_t) cannot connect to user sockets (unconfined_t) by default
