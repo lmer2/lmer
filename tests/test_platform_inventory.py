@@ -892,6 +892,8 @@ SESSION_FIELD_READERS = {
               "the record that decides crashed-vs-dormant beside a wind-down mark",
     "activity": "RunCard.vue: 'idle 22m' beside the run's age (idle_seconds), "
                 "with last_output_at as its tooltip",
+    "container_name": "RunDetail.vue: the live-session card's container, the name "
+                      "to give `podman ps` or `lmer follow` (#444)",
 }
 
 #: Stands in for the token file's path, which is what the entry carries — the
@@ -916,6 +918,7 @@ def full_entry(**extra):
         control={"host": "127.0.0.1", "port": 8931, "token_ref": TOKEN_REF},
         transcript={"path": "/home/dev/.claude/projects/-work/abc.jsonl"},
         container_id="9f3ca1b2c3d4",
+        container_name="lmer-r1-ff2b",
         slot="slot-1",
         ports=[{"host": 30021, "container": 3000}],
         log_path="/home/dev/.lmer/platform/logs/s-full.log",
@@ -989,6 +992,7 @@ def test_the_detail_view_still_gets_every_field_it_reads(tmp_path, platform_root
     assert block["started_at"] == entry["started_at"]
     assert block["log_path"] == "/home/dev/.lmer/platform/logs/s-full.log"
     assert block["lifecycle"]["verb"] == "wind_down"
+    assert block["container_name"] == "lmer-r1-ff2b"
 
 
 @pytest.mark.parametrize("exited, served", [

@@ -341,7 +341,7 @@ from typing import Optional
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 
-from . import ask, memory, registry, spawn, statusline
+from . import ask, containers, memory, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -1917,6 +1917,10 @@ def stop(
 
         session_id = live.get("id")
         gone = _terminate(live.get("pid"))
+        if gone and isinstance(session_id, str):
+            # Its container is detached (#444): a follower killed before it could
+            # stop it would leave the old assistant running beside its successor.
+            containers.stop_for_session(session_id)
         if gone:
             # The spawn path keeps the entry of a session that exited unclean,
             # because that entry is how a crash is detected — but this exit was

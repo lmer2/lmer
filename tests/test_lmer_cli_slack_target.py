@@ -541,6 +541,13 @@ def _make_main_mocks(
     stack.enter_context(
         patch("lmer_cli.cli.subprocess.call", return_value=runtime_rc)
     )
+    # --- the launch is create, then follow (#444): a faked create writes no
+    # cidfile and starts nothing, so the follow is faked too ---
+    for reader in ("lmer_cli.cli.read_container_id",
+                   "lmer_cli.container_follow.read_container_id"):
+        stack.enter_context(patch(reader, return_value="fake-container"))
+    stack.enter_context(patch("lmer_cli.cli.follow_container", return_value=0))
+    stack.enter_context(patch("lmer_cli.cli.remove_container"))
 
     return stack
 

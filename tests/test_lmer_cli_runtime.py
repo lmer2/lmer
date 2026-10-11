@@ -261,9 +261,12 @@ class TestBaseRunArgs:
             os.environ.pop("LMER_MEMORY", None)
             args = base_run_args("docker", False, "developer")
 
-        assert "docker" in args
-        assert "run" in args
-        assert "--rm" in args
+        assert args[:2] == ["docker", "create"]
+        # Detached (#444): the follower reads the exit code and removes the
+        # container, so --rm would race the code away.
+        assert "--rm" not in args
+        # Detach keys belong to the attaching client; docker's create rejects them.
+        assert "--detach-keys" not in args
         # PID 1 init: reaps zombies now that clone_and_exec.py keeps the
         # runner as a child (session-end backstop) instead of exec'ing it.
         assert "--init" in args

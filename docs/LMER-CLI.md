@@ -153,6 +153,8 @@ The following environment variables control LMER behavior:
 
 - **`LMER_CONTAINER_RUNTIME`** - Selects the host's container runtime: `docker` or `podman`, trimmed and case-insensitive. Unset or empty, lmer uses docker if it is on `PATH`, else podman. Set it on a host with both installed to use podman; PATH cannot do this when both live in `/usr/bin`. Any other value (including a path), or a runtime that is not on `PATH`, is an error rather than a silent fallback, because the two runtimes get different run flags (`--userns=keep-id` for podman). Read by `lmer` (including `lmer build`), the platform daemon, the `Makefile`, `bin/lmer-reset` and `scripts/platform-container-run.sh` (where `--runtime` wins). Put it in `~/.lmer/.env`, which `lmer`, `lmer build` and the platform daemon load themselves, so it also holds for launches by a systemd-started daemon or listener, which never see a shell profile. The `Makefile` and the two shell scripts read only the process environment, so also export it in the shell you run them from. Host-only: lmer never forwards it into a session container, and the platform container helper sets it to `docker` inside, since both images ship only the docker client.
 
+- **`LMER_PLATFORM_SESSION_ID`**, **`LMER_PLATFORM_RUN_SLUG`**, **`LMER_PLATFORM_INSTANCE`**, **`LMER_PLATFORM_EXIT_FILE`** - **Set by the platform daemon on the `lmer` it spawns**, not operator configuration. The first three become the `io.lmer.platform.session`, `io.lmer.run.slug` and `io.lmer.platform.instance` labels on the session container, which is how a restarted daemon finds its own sessions (and never another platform's), and the session id and slug make up its `--name`; the fourth is where `lmer` records the container's exit code before removing it. Host-only: never forwarded into the container. See [CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md).
+
 - **`REPO_AUTH_PREFER_SSH`** - When set to a truthy value (`1`, `true`, `yes`), LMER will use SSH URLs for git operations instead of converting them to HTTPS with token authentication.
 
 - **`LMER_HARNESS`** - Which agent harness the session container runs: `claude` (default), `codex`, `pi`, or the name of a user-installed harness (see `LMER_HARNESSES_DIR` below). The `--harness` CLI flag takes precedence over the env var; when neither is set, the model name in `LMER_LLM_NAME` can autoselect the harness (word-bounded match: `opus`/`haiku`/`fable`/`sonnet`/`mythos` → `claude`; `gpt`/`codex`/`o3`/`o4` → `codex`; user-harness `model_hints` are checked after the built-ins). Unknown names fail fast on the host with the list of known harnesses. All built-in harness CLIs are baked into the one container image, so switching requires no rebuild. Claude is the full-feature tier; the others are core tier — see [HARNESSES.md](./HARNESSES.md) for the capability matrix, per-harness authentication, and how `LMER_LLM_NAME`/`LMER_REASONING_EFFORT`/`LMER_DANGER_ZONE` map onto each harness. Existing installs that never set this see no behavior change.
@@ -898,6 +900,17 @@ lmer-matrix-listener --log-level DEBUG
 ```
 
 The allowlist is explicit MXIDs only — never a server, a glob or room membership, because the homeserver federates and its identity providers may be open-signup — and an empty list means nobody may start a session (the listener refuses to start). Capacity, per-thread dedup (`~/.lmer/matrix-sessions/`) and the idle reaper are shared with the Slack listener, including its `LMER_SLACK_CHAT_*` tunables. This is not `lmer-matrix-bridge` ([MATRIX-CHAT.md](./MATRIX-CHAT.md)), the fleet appservice; the two coexist.
+
+### Following a session container (`lmer follow`)
+
+`lmer` starts its session container detached, so closing the terminal (or
+detaching with Ctrl-] Ctrl-\\) leaves the session running. `lmer follow
+<container> [--since <RFC 3339 time>]` attaches to it again, waits for it to
+exit, prints the exit code and removes it. `<container>` is the id or the
+container's name, `lmer-<run slug>-<suffix>`, which the launch and the detach
+notice print. A stopped CLI container is never
+removed automatically: follow it, or run `<runtime> rm <container>`. See
+[CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md).
 
 ### Building the Container Image
 

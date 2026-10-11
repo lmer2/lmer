@@ -630,7 +630,7 @@ def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket,
         monkeypatch.setattr(daemon, name, lambda *a: noop)
     for name in ("_subscribe_to_comms", "_run_thread_connectors", "_serve_thread_requests"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
-    monkeypatch.setattr(daemon, "reattach_all", lambda: [])
+    monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     seen = []
     build = api.create_app
     def create(*args, **kwargs):

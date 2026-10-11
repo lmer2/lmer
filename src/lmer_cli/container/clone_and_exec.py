@@ -92,6 +92,10 @@ KNOWN_HARNESS_RUNNERS = {
     "pi-runner",
 }
 
+#: How long the session-end backstop may take (a work-repo push). The container's
+#: stop timeout (lmer_cli.runtime.STOP_TIMEOUT_SECONDS) must exceed it.
+SESSION_END_TIMEOUT_SECONDS = 180
+
 # The canonical source config (sources.yaml, issue #105) file name at the
 # work-repo root (single source of truth for the refusal check and the
 # resolution step — see the section banner further down).
@@ -2659,7 +2663,7 @@ def run_state_session_end() -> None:
     if not work:
         return
     try:
-        subprocess.call([work, "session-end"], timeout=180)
+        subprocess.call([work, "session-end"], timeout=SESSION_END_TIMEOUT_SECONDS)
     except Exception as e:  # teardown cleanup must never fail the session
         print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
 

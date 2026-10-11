@@ -232,10 +232,12 @@ def register(
     transcript: Optional[dict] = None,
     uploads: Optional[dict] = None,
     container_id: Optional[str] = None,
+    container_name: Optional[str] = None,
     slot: Optional[str] = None,
     slack: Optional[dict] = None,
     started_at: Optional[str] = None,
     log_path: Optional[str] = None,
+    pid_identity: Optional[str] = None,
 ) -> dict:
     """Record a live session and return the entry as written.
 
@@ -264,6 +266,8 @@ def register(
         "owner_pid": os.getpid(),
         "started_at": started_at or utc_now_iso(),
         "container_id": container_id,
+        # For humans: lmer finds containers by label and id (#444).
+        "container_name": container_name,
         "task": task or {},
         "run": run or {},
         "control": control or {},
@@ -278,6 +282,9 @@ def register(
         "log_path": log_path,
         "slot": slot,
         "slack": slack or {},
+        # Boot id and start time of ``pid``, so a later daemon can tell this
+        # process from one that reused its pid (#444).
+        "pid_identity": pid_identity,
     }
     write_json(session_path(session_id), entry)
     logger.debug(

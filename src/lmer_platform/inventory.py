@@ -237,6 +237,10 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: the tests, which pin each field to the code that reads it, so widening this is
 #: a deliberate act rather than the side effect of writing a new key onto an entry.
 #:
+#: ``container_name`` is what an operator types into ``podman ps`` or
+#: ``lmer follow`` (#444). The container id stays host-side: nothing in the
+#: browser reads it.
+#:
 #: ``exited`` and ``lifecycle`` only mean something together: a row showing
 #: ``wind_down`` beside state ``crashed`` needs the record that decided between
 #: them, so the deciding evidence travels with the verdict.
@@ -251,6 +255,7 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: it on a dormant run and get a null it could not explain.
 SESSION_FIELDS = (
     "id", "pid", "started_at", "log_path", "lifecycle", "exited", "activity",
+    "container_name",
 )
 
 #: Taskdefs whose sessions are quiet *by design*, so silence means nothing about
