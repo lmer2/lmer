@@ -4,7 +4,7 @@ For named workspaces, project-bound routing, capacity and General migration, see
 [Projects](PROJECTS.md).
 
 Get the lmer platform — the web control plane for a fleet of lmer sessions,
-with its supervising assistant ("uber lmer") — running on a host in a few
+with its supervising assistant ("Ratchet") — running on a host in a few
 minutes. The full reference for a container deploy is
 [PLATFORM-CONTAINER.md](./PLATFORM-CONTAINER.md); this page is the short path.
 
@@ -117,8 +117,9 @@ consult relevant prior exchanges when context is missing.
 ## Using it
 
 - **Fleet view** — every run this platform tracks, attention first. The row
-  with the orange border and the robot is uber lmer itself; `chat` on that
-  row (or the robot in the app bar) opens its drawer.
+  with the orange border and the face is Ratchet itself; its expression is the
+  fleet's mood (hover or tap it for the reason). `chat` on that
+  row (or the face in the app bar) opens its drawer.
 - **Spawn a run** — the `run` button. Taskdef + target, optionally a preset,
   a fan-out roster (`--agents`), a title. A plain clone URL is a complete target
   by itself: the platform derives the run identity from it, records that
@@ -182,7 +183,7 @@ consult relevant prior exchanges when context is missing.
   while the other direction retires a death nobody is ever told about. The
   daemon's sweep clears these entries, since the UI's "clear crashed sessions"
   card only renders on a crashed row.
-- **uber lmer** — the supervising assistant. It hears attention changes and
+- **Ratchet** — the supervising assistant. It hears attention changes and
   session milestones (`lmer-signal`), can spawn/answer/wind-down runs on
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
@@ -197,7 +198,7 @@ consult relevant prior exchanges when context is missing.
   conversation fills the window's height at every size, from a phone to a 4K
   screen. **Standing instructions** in project settings shows when the orders
   last changed, says when there are none, and reminds you that they are usually
-  set by telling uber lmer in chat, which confirms the wording before storing them.
+  set by telling Ratchet in chat, which confirms the wording before storing them.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>` (`<uid>` in place of the slug
   for a schema-2 run), and tapping it opens that run's view. Details worth
@@ -228,7 +229,7 @@ consult relevant prior exchanges when context is missing.
     live).
   - Web-only: it reaches you after a bundle build and a UI image roll.
 - **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
-  run list, the content and uber lmer's drawer — in a 1620px band in the middle of
+  run list, the content and Ratchet's drawer — in a 1620px band in the middle of
   the screen instead of spreading it across a wide window. It is the effect of
   narrowing the browser, for a window that has other tabs in it. Offered on a desktop
   only (below the band's own width it does nothing) and remembered between loads.
@@ -244,7 +245,7 @@ consult relevant prior exchanges when context is missing.
   the fit switch (already the one gate on writing sizes) decides whether it happens.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
-- **uber lmer settings** — how its session is *run* (model, harness, preset,
+- **Ratchet settings** — how its session is *run* (model, harness, preset,
   agents fan-out, Slack/matrix threads), per platform instance: **Execution and chat
   defaults** in Platform settings, or `GET`/`POST /api/assistant/config`. The dialog groups its
   fields as **Session launch**, **Conversation** and **Reminders**, each with a line
@@ -255,9 +256,9 @@ consult relevant prior exchanges when context is missing.
   you restart it, and the dialog offers the restart. Standing orders are the
   chat's to edit and are deliberately not in this dialog. Thread permalinks go
   one per line; save and rotate to connect. The saved list survives rotations.
-  The dialog also holds the chat pane's **Show uber lmer's working transcript**
+  The dialog also holds the chat pane's **Show Ratchet's working transcript**
   switch: off (the default) the pane draws the conversation only — your
-  messages, and what uber lmer posted, asked and answered; on, its tool calls,
+  messages, and what Ratchet posted, asked and answered; on, its tool calls,
   watch events, hook re-prompts and unposted working notes appear muted beside
   them. Platform state (`chat_show_transcript` in `config.json`): the browser
   that saved it switches at once, and every other open drawer follows on its
@@ -265,26 +266,26 @@ consult relevant prior exchanges when context is missing.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
-- **Open-question badge** — uber lmer's message box shows a bell, in its right-hand
+- **Open-question badge** — Ratchet's message box shows a bell, in its right-hand
   corner, with the number
   of its own questions to you that are neither answered nor withdrawn
   (`open_questions` on `GET /api/assistant`, counted from its ask channel exactly as
   the run view's ask dock counts them). It updates on the pane's status poll,
-  whichever channel answered, and disappears at zero. Tapping it opens uber lmer's
+  whichever channel answered, and disappears at zero. Tapping it opens Ratchet's
   own run view and focuses the open questions there, answerable with an option or
   free text. The corner's space is kept while the bell is absent, so the box does
   not shift when it appears or clears, and tapping the bell does not focus the box.
-- **Status strip** — uber lmer's pane draws its strip with orange meters and a
+- **Status strip** — Ratchet's pane draws its strip with orange meters and a
   **hide** / **show status** control remembered in this browser; run views and the
   run list are unaffected. `LMER_PLATFORM_STATUS_STRIP=0` on the daemon turns the
   strip off fleet-wide, and with it the context-rotation reminder, which reads the
   same figure ([LMER-CLI.md](LMER-CLI.md#lmer-specific-environment-variables)).
-- **Thread icons** — every run row, the run view header and the uber lmer chat
+- **Thread icons** — every run row, the run view header and the Ratchet chat
   pane's toolbar carry two small icons, Slack and matrix. A dim one opens a
   one-field prompt for a thread permalink; a coloured one names the threads on
   hover, carries a count when there is more than one, and offers a link and a
   disconnect for each. Connecting and disconnecting happen **while the session
-  runs** — nothing restarts — and doing it on uber lmer also moves its standing
+  runs** — nothing restarts — and doing it on Ratchet also moves its standing
   `threads` setting, so the connection survives a rotation. A run with no live
   session shows what it was connected to and offers no new connection. The same
   three calls are `lmer-ctl threads list|connect|disconnect`.
@@ -385,12 +386,12 @@ consult relevant prior exchanges when context is missing.
   Upgrade the session image, daemon, and UI bundle together. Existing sessions
   from older images do not publish the acknowledgment needed by this detector.
 
-- **Digest nudges** — the daemon spools digests for uber lmer, and nothing reads
-  that spool until uber lmer takes it. When digests sit there while the session
+- **Digest nudges** — the daemon spools digests for Ratchet, and nothing reads
+  that spool until Ratchet takes it. When digests sit there while the session
   is quiet, the daemon types one reminder into it. Defaults: one digest, three
   minutes. Full behaviour in the section below.
 
-- **Context-fullness reminders** — when uber lmer's own status line reports that
+- **Context-fullness reminders** — when Ratchet's own status line reports that
   its context window has reached a threshold the operator set, the daemon
   recommends a rotation at its next breakpoint. Off by default; it never rotates
   anything itself. Full behaviour in the section below.
@@ -524,14 +525,14 @@ once the cause is fixed. External host listeners may still submit authenticated
 
 The digest spool is pull-only: the daemon detects questions, crashes, finished
 work and signalled milestones, writes a digest, and waits. What reads it is a
-watch uber lmer arms on itself — and a watch stops. A skipped re-arm, a stale
+watch Ratchet arms on itself — and a watch stops. A skipped re-arm, a stale
 edge detector, a harness with no background-monitor tool at all: each ends with
 digests sitting unread. Measured on 2026-08-19: ten digests over seventeen
 minutes, live questions among them, and the operator noticed before the
 assistant did.
 
 So the daemon nudges. On each detection tick (30s) it types **one sentence**
-into uber lmer's own session, over the same input path a wind-down uses:
+into Ratchet's own session, over the same input path a wind-down uses:
 
 ```
 [lmer platform] 4 digests have been waiting in your spool for 6 minutes and this
@@ -604,7 +605,7 @@ Two error paths matter, and they are opposite:
 
 The bound does not depend on the state file being writable. The daemon remembers
 the nudge in memory for the accumulation it was about, which matters because the
-outage that stops it recording a nudge also stops uber lmer draining the spool —
+outage that stops it recording a nudge also stops Ratchet draining the spool —
 without that memory, an unwritable `assistant.json` turned the interval into the
 30-second tick.
 
@@ -725,13 +726,13 @@ itself. A host that does not want the feature sets the interval to `0`.
 
 ## Context-fullness reminders
 
-uber lmer fills its context window over a working day, and it cannot see its own
+Ratchet fills its context window over a working day, and it cannot see its own
 fullness as a threshold — the figure exists, but reading it means asking the
 platform about itself on a schedule, which is the polling the whole design keeps
 out of the assistant's turns. So the daemon holds the number.
 
 Set `rotation.context_threshold` (a percentage, `0` is off and is the default)
-and on each detection tick the daemon compares it against what uber lmer's own
+and on each detection tick the daemon compares it against what Ratchet's own
 harness publishes on its status line. When the reading reaches the threshold it
 types **one sentence** into that session, over the same input path the digest
 nudge uses — including that path's harness-specific delivery: on a codex
@@ -747,7 +748,7 @@ without you. Finish what is in front of you, then rotate yourself at the next
 clean breakpoint ...
 ```
 
-**Nothing here rotates anything.** The daemon recommends; uber lmer decides, and
+**Nothing here rotates anything.** The daemon recommends; Ratchet decides, and
 what a good breakpoint is lives in the `orchestrate` taskdef — no open question of
 its own, no digest taken and not yet acted on, no half-finished brief, and never
 mid-decision. A daemon that rotated on a number would end a context window in the
@@ -772,7 +773,7 @@ where the harness dates it and the document's otherwise — a status line that
 re-publishes a figure it can no longer refresh would otherwise look permanently
 fresh.
 
-**The age bound is also why a reminder lands while uber lmer is working.** A
+**The age bound is also why a reminder lands while Ratchet is working.** A
 status line is published when the harness renders one, which does not happen
 while a session sits idle at its prompt — so an assistant that has been idle for
 longer than the bound has no usable reading and is told nothing until it is
@@ -832,7 +833,7 @@ reminder, which is the whole price of not storing it.
 
 ### Reserved assistant capacity
 
-`max_concurrent_sessions` limits **workers**. uber lmer has one additional,
+`max_concurrent_sessions` limits **workers**. Ratchet has one additional,
 reserved place: with a limit of eight, eight workers and one assistant may run
 at the same time. A full worker pool does not prevent assistant startup or
 replacement, and starting or rotating the assistant does not free a place for
@@ -859,9 +860,9 @@ guarantee that a process can start when host resources or other launch
 requirements are unavailable. Configured **service slots** are a separate
 ownership mechanism and are unaffected.
 
-### Rotating uber lmer, and who may
+### Rotating Ratchet, and who may
 
-uber lmer can rotate **itself**:
+Ratchet can rotate **itself**:
 
 ```sh
 lmer-ctl rotate --handoff -     # or --handoff-file PATH
@@ -881,7 +882,7 @@ successor: a fresh `generation` on `GET /api/assistant`, with `handoff` the note
 its predecessor wrote and the digest spool preserved for it.
 
 **Who may rotate is unchanged.** This adds a caller to an existing route, not a
-route and not a caller class: uber lmer's minted credential (#244) already opens
+route and not a caller class: Ratchet's minted credential (#244) already opens
 what the operator's shared secret opens, and an unauthenticated rotate is still a
 401. The operator-initiated rotate — the chat drawer's restart, or the route by
 hand — is untouched.
@@ -926,7 +927,7 @@ Then set a threshold: the feature is off until an operator does. There is no
 migration — nothing new is stored — and no container passthrough, since the
 daemon reads the setting itself.
 
-## uber lmer's memory
+## Ratchet's memory
 
 The assistant's harness keeps an agent-memory directory — small fact files and an
 index it re-reads at the start of every incarnation. That directory lives inside
@@ -990,7 +991,7 @@ every incarnation instead.
 
 ## Chat file upload
 
-Both chats — uber lmer's and any run's — take a file: drag it onto the composer,
+Both chats — Ratchet's and any run's — take a file: drag it onto the composer,
 paste it, or tap **attach** (which on a phone is the camera roll). It goes with
 the message, and the message names the path the agent will find it at.
 
@@ -1012,7 +1013,7 @@ the message, and the message names the path the agent will find it at.
   run directory in the work repo and commits it — **the run's decision, not the
   platform's**: the daemon has no host-side checkout to write into, since
   `/work` is cloned inside the container.
-- **Where uber lmer's land:** `~/.lmer/platform/assistant-uploads/`, one per host,
+- **Where Ratchet's land:** `~/.lmer/platform/assistant-uploads/`, one per host,
   like its memory store. It outlives every rotation and it is the assistant's to
   organise, rename and delete. Nothing prunes it.
 - **Nothing is pushed anywhere.** An upload can hold whatever was on your screen,
@@ -1028,7 +1029,7 @@ the message, and the message names the path the agent will find it at.
 - **A session started before this shipped cannot be handed a file.** Its
   container has no such mount and nothing can add one, so the upload is refused
   with a sentence naming the restart rather than stored where nothing reads it.
-  For uber lmer, **restart** in the chat header is that restart.
+  For Ratchet, **restart** in the chat header is that restart.
 - **Whether the agent can *see* an image depends on its harness.** claude opens
   one; codex and pi are not equivalent here. The honest fallback is the mechanism
   itself — the file is on disk and the path is in the message, so an agent that
@@ -1047,8 +1048,8 @@ the message, and the message names the path the agent will find it at.
 | what | where |
 |---|---|
 | platform state, logs, UI | `~/.lmer/platform/` |
-| uber lmer's memory store | `~/.lmer/platform/assistant-memory/` |
-| uber lmer's chat uploads | `~/.lmer/platform/assistant-uploads/` |
+| Ratchet's memory store | `~/.lmer/platform/assistant-memory/` |
+| Ratchet's chat uploads | `~/.lmer/platform/assistant-uploads/` |
 | a run's chat uploads | `~/.lmer/platform/logs/<session-id>.uploads/` |
 | per-instance config (incl. service slots) | `~/.lmer/platform/config.json` |
 | shared secret | `lmer platform secret` |

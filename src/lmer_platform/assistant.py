@@ -1350,7 +1350,7 @@ def _with_link_age(snapshot: dict, live: Optional[dict]) -> dict:
     with no record at all the snapshot is returned untouched. Both stamps are
     parsed rather than string-compared for the same reason: a lexicographic
     compare answers confidently for input it cannot judge. See
-    docs/PLATFORM-QUICKSTART.md, "uber lmer's memory".
+    docs/PLATFORM-QUICKSTART.md, "Ratchet's memory".
     """
     record = snapshot.get("link")
     if not isinstance(record, dict):
@@ -2072,7 +2072,7 @@ def rotate(
         # anything start() would refuse has to refuse while there is still an
         # assistant to keep. Both questions are settled here, and start() is told
         # not to re-ask the thread one — its answer can change between the stop
-        # and the respawn. docs/COMMS.md §9, "Rotating uber lmer", has the why.
+        # and the respawn. docs/COMMS.md §9, "Rotating Ratchet", has the why.
         launch, launch_sources = _launch_settings(settings)
         live = _live_assistant()
         try:

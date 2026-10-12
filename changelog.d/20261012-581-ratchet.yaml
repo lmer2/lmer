@@ -1,0 +1,4 @@
+changed:
+- "The orchestrator assistant is now called Ratchet everywhere people read its name; set the display name with LMER_PLATFORM_ASSISTANT_NAME (wire identifiers like the uber-lmer channel are unchanged, and both [uber lmer] and [Ratchet] tags are accepted on read)."
+added:
+- "Ratchet's face in the control UI shows the fleet's mood — question, oops, panic, strained, on it, skeptical, idle, yes, talking or off — with the reason beside it, and the tab icon follows it."

@@ -120,7 +120,7 @@ gracefully and are listed explicitly:
    claude only today), which is what lets the platform mount that directory out
    of the container: the platform's assistant persists its memory through a host
    mount rather than the work repo (issue #325 — see
-   [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#uber-lmers-memory)).
+   [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#ratchets-memory)).
    **That store is read natively on claude only.** The mount and the symlink are
    made on every assistant spawn whatever harness the session runs, but a codex
    or pi assistant has no feature that reads the path and does not get the

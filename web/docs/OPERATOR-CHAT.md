@@ -1,6 +1,6 @@
 # Operator chat display
 
-In **uber lmer settings**, set **Operator chat: keep last** to a positive whole
+In **Ratchet settings**, set **Operator chat: keep last** to a positive whole
 number to show only the newest N operator-chat entries. Set it to **0** to turn
 auto-clear off and show all entries supplied by the channel. An entry includes
 its question or note and any attached answer. The default is off.
