@@ -28,6 +28,6 @@ Two rules from chadd, kept in the code:
   ambiguous, so the mood reason is always available beside it (tooltip and
   accessible name).
 - `panic` is only for something genuinely serious, never a routine retry or a
-  single crash. The conservative rule: `panic` fires only on an attention item
-  whose reason is `critical_error`, or when **two or more** runs are broken
-  (crashed/failed or stuck) at the same time. A single broken run is `oops`.
+  single crash. The rule: `panic` fires only on an attention item whose reason
+  is `critical_error`. Ordinary crashes and stalls stay `oops`, however many
+  there are.

@@ -24,7 +24,7 @@ import { ago } from '../format.js'
 import { readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
-import { assistantName } from '../ratchet.js'
+import { assistantName, offReason } from '../ratchet.js'
 
 const props = defineProps({
   workspace: { type: Object, required: true },
@@ -71,13 +71,18 @@ const canLoadEarlier = computed(() => !!chat.value?.canLoadEarlier)
 // conversation, a failed or not-yet-read transcript), so it never vanishes.
 const bellOnToolbar = computed(() => !!openQuestions.value && !chat.value?.composerOpen)
 // A restart is a fresh context window, so which incarnation this is matters.
+// The displayed reason follows the displayed face: a stopped assistant gets the
+// off label, never a fleet mood it is not reporting on (spec §4.3).
+const displayReason = computed(() => running.value
+  ? props.moodReason
+  : offReason(status.value?.lifecycle || (rotating.value ? 'rotating' : 'stopped')))
 const identity = computed(() => {
   const parts = [`${props.workspace.name} · ${assistantName.value}`]
   if (running.value) {
     parts.push(`generation ${status.value.generation}`)
     if (status.value.started_at) parts.push(`started ${ago(status.value.started_at, props.now)}`)
   }
-  if (props.moodReason) parts.push(props.moodReason)
+  if (displayReason.value) parts.push(displayReason.value)
   return parts.join(' · ')
 })
 // Shown, never toggled: a tap's compatibility mouseenter has already opened the
@@ -159,7 +164,7 @@ onBeforeUnmount(() => {
       </v-tooltip>
       <!-- chadd's rule: a face alone is ambiguous, so the mood is always written
            beside it, not only on hover. -->
-      <span v-if="moodReason" class="ratchet-mood-label text-body-small text-medium-emphasis me-1">{{ moodReason }}</span>
+      <span v-if="displayReason" class="ratchet-mood-label text-body-small text-medium-emphasis me-1">{{ displayReason }}</span>
       <template v-if="status || problem">
         <ThreadLinks
           :session-id="sessionId"

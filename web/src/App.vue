@@ -33,7 +33,7 @@ import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
-import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason } from './ratchet.js'
+import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason, offReason } from './ratchet.js'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
 import {
@@ -391,7 +391,7 @@ const orchestratorHint = computed(() => {
   // the two and wins when both are there.
   const note = run ? (run.attention?.note || run.title || run.goal || run.phase) : null
   if (note) parts.push(note)
-  if (ratchetReason.value) parts.push(ratchetReason.value)
+  if (fleetReason.value) parts.push(fleetReason.value)
   return parts.join(' · ')
 })
 const fleetView = ref(storedFleetView())
@@ -436,46 +436,70 @@ const liveWorkers = computed(
 
 // --- Ratchet's mood (issue 581) ---------------------------------------------
 //
-// Computed over the runs this view shows (spec D5), plus what the open pane
-// reports about its own chat. Held across a failed poll on purpose: a face that
-// flipped to "idle" when the network dropped would be lying about the fleet.
+// Each surface gets the mood of the scope it shows (spec D5): the app bar over
+// the fleet view's runs, each pane over its own project's. Held across a failed
+// poll on purpose: a face that flipped to "idle" when the network dropped would
+// be lying about the fleet.
 const replyingByProject = ref({})
 const openQuestionsByProject = ref({})
-const lastRunStates = ref({})
-const justFinished = ref(0)
-const ratchetProject = computed(() => activeProject.value || chatProject.value || '')
-const ratchetInput = computed(() => ({
-  loaded: !!state.value,
-  runs: runs.value,
-  attention: attention.value,
-  liveWorkers: liveWorkers.value,
-  cap: workerCap.value,
-  openQuestions: openQuestionsByProject.value[ratchetProject.value] || 0,
-  replying: !!replyingByProject.value[ratchetProject.value],
-  justFinished: justFinished.value,
-}))
-const ratchetMood = ref('loading')
-const ratchetReason = ref(moodReason('loading', {}))
-watch([ratchetInput, fleetOnline], ([input, online]) => {
-  if (!online && input.loaded) {
-    ratchetReason.value = `fleet unreachable · last: ${ratchetReason.value.replace(/^fleet unreachable · last: /, '')}`
-    return
+// Completion history is keyed by full run identity, not slug: a slug is unique
+// only within a repository (review of !403).
+const previousRunStates = ref({})
+const justFinishedByProject = ref({})
+const fleetScopeId = computed(() => activeProject.value || '')
+const paneScopeId = computed(() => chatProject.value || activeProject.value || '')
+
+function moodInputFor(projectId) {
+  const allRuns = state.value?.runs || []
+  const allAttention = state.value?.attention || []
+  const scopeRuns = projectId ? allRuns.filter((run) => run.workspace_id === projectId) : allRuns
+  const scopeAttention = projectId ? allAttention.filter((run) => run.workspace_id === projectId) : allAttention
+  const finished = justFinishedByProject.value
+  return {
+    loaded: !!state.value,
+    runs: scopeRuns,
+    attention: scopeAttention,
+    liveWorkers: scopeRuns.filter((run) => run.live && !run.orchestrator).length,
+    cap: workerCap.value,
+    openQuestions: openQuestionsByProject.value[projectId] || 0,
+    replying: !!replyingByProject.value[projectId],
+    justFinished: projectId
+      ? (finished[projectId] || 0)
+      : Object.values(finished).reduce((total, count) => total + count, 0),
   }
-  ratchetMood.value = moodOf(input)
-  ratchetReason.value = moodReason(ratchetMood.value, input)
-}, { immediate: true, deep: true })
-// The off treatment follows the assistant's lifecycle, not the fleet's mood: a
-// stopped assistant has no face to read, so it gets the crossed-out one.
-const ratchetOff = computed(() => {
-  const run = orchestrator.value
-  if (run) return run.state !== 'running'
-  const project = chatWorkspace.value || workspace.value
-  if (project?.assistant?.lifecycle) return project.assistant.lifecycle !== 'running'
-  return false
-})
-// The tab icon follows the same mood (issue 581). No slash variant for `off`:
+}
+
+function useMood(input) {
+  const mood = ref('loading')
+  const reason = ref(moodReason('loading', {}))
+  watch([input, fleetOnline], ([value, online]) => {
+    if (!online && value.loaded) {
+      reason.value = `fleet unreachable · last: ${reason.value.replace(/^fleet unreachable · last: /, '')}`
+      return
+    }
+    mood.value = moodOf(value)
+    reason.value = moodReason(mood.value, value)
+  }, { immediate: true, deep: true })
+  return { mood, reason }
+}
+
+const { mood: fleetMood, reason: fleetMoodReason } = useMood(computed(() => moodInputFor(fleetScopeId.value)))
+const { mood: paneMood, reason: paneMoodReason } = useMood(computed(() => moodInputFor(paneScopeId.value)))
+
+// The off face and its label come from the assistant's lifecycle, not the
+// fleet's mood: a stopped assistant has no face to read (spec §4.3).
+function lifecycleOf(projectId) {
+  const project = projects.value.find((row) => row.id === projectId)
+  if (project?.assistant?.lifecycle) return project.assistant.lifecycle
+  const run = (state.value?.runs || []).find((row) => row.orchestrator && (!projectId || row.workspace_id === projectId))
+  return run ? run.state : null
+}
+const fleetLifecycle = computed(() => lifecycleOf(fleetScopeId.value))
+const fleetOff = computed(() => !!fleetLifecycle.value && fleetLifecycle.value !== 'running')
+const fleetReason = computed(() => fleetOff.value ? offReason(fleetLifecycle.value) : fleetMoodReason.value)
+// The tab icon follows the fleet mood (issue 581). No slash variant for `off`:
 // a tab icon is not a status surface, so it stays on the face.
-watch(ratchetMood, (mood) => {
+watch(fleetMood, (mood) => {
   document.getElementById('favicon')?.setAttribute('href', faceUrl(mood))
 }, { immediate: true })
 
@@ -646,11 +670,23 @@ function load() {
       state.value = await fetchState()
       applyAssistantName(state.value?.config)
       // One poll of memory for the `yes` flash: a run that reached `complete`
-      // since the previous poll shows it for this poll only.
+      // since the previous poll shows it for this poll only. Keyed by full run
+      // identity — a slug alone collides across repositories (review of !403) —
+      // and counted per project so a pane only flashes for its own.
       const rows = state.value?.runs || []
-      const previous = lastRunStates.value
-      justFinished.value = rows.filter((run) => run.state === 'complete' && previous[run.slug] && previous[run.slug] !== 'complete').length
-      lastRunStates.value = Object.fromEntries(rows.map((run) => [run.slug, run.state]))
+      const previous = previousRunStates.value
+      const finished = {}
+      const next = {}
+      for (const run of rows) {
+        const key = keyOf(run)
+        next[key] = run.state
+        if (run.state === 'complete' && previous[key] && previous[key] !== 'complete') {
+          const project = run.workspace_id || ''
+          finished[project] = (finished[project] || 0) + 1
+        }
+      }
+      previousRunStates.value = next
+      justFinishedByProject.value = finished
       projects.value = (await fetchProjects()).projects
       if (uberOpen.value) rememberChat(chatProject.value)
       fleetOnline.value = true
@@ -841,10 +877,13 @@ onUnmounted(() => {
             <v-btn v-bind="tooltip" icon :color="orchestratorTone" variant="text"
               :class="{ 'robot-on-surface': barColor && orchestratorTone }"
               :aria-label="orchestratorHint" @click="toggleProjectChat">
-              <RatchetFace :mood="ratchetMood" :off="ratchetOff" :size="24" />
+              <RatchetFace :mood="fleetMood" :off="fleetOff" :size="24" />
             </v-btn>
           </template>
         </v-tooltip>
+        <!-- chadd's rule, and the collapsed/mobile case especially: the face is
+             always paired with a plain-text status, not only a tooltip. -->
+        <span v-if="fleetReason" class="ratchet-bar-label text-body-small text-medium-emphasis">{{ fleetReason }}</span>
         <v-tooltip v-if="!mobile" :text="widthHint" location="bottom" open-on-focus>
           <template #activator="{ props: tooltip }">
             <v-btn v-bind="tooltip" :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
@@ -946,7 +985,7 @@ onUnmounted(() => {
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
       <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject" class="uber-pane-slot">
         <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
-          :mood="ratchetMood" :mood-reason="ratchetReason"
+          :mood="paneMood" :mood-reason="paneMoodReason"
           @settings="openProjectSettings(project.id, $event)" @close="uberOpen = false"
           @questions="openAssistantQuestions"
           @replying="replyingByProject[project.id] = $event"
@@ -1244,6 +1283,16 @@ onUnmounted(() => {
 .bar-cluster {
   display: flex;
   align-items: center;
+}
+
+/* The face's plain-text status in the bar (issue 581): the mobile/collapsed
+   surface has no hover, so the reason cannot live in the tooltip alone. */
+.ratchet-bar-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22ch;
+  margin-inline-start: 4px;
 }
 
 .bar-cluster-centered {

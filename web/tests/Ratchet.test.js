@@ -1,15 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
+import AssistantChat from '../src/components/AssistantChat.vue'
 import RatchetFace from '../src/components/RatchetFace.vue'
-import { fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
-import { mountPane } from './mount.js'
-import { DEFAULT_ASSISTANT_NAME, applyAssistantName, assistantName, faceFile, faceUrl, moodOf, moodReason } from '../src/ratchet.js'
+import { fetchAssistant, fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
+import { chooseProject, mountPane } from './mount.js'
+import { DEFAULT_ASSISTANT_NAME, applyAssistantName, assistantName, faceFile, faceUrl, moodOf, moodReason, offReason } from '../src/ratchet.js'
 
 vi.mock('../src/api.js', () => ({
+  fetchAssistant: vi.fn(),
   fetchProjects: vi.fn(),
   fetchState: vi.fn(), forgetRun: vi.fn(), prune: vi.fn(), rescan: vi.fn(),
   fetchRunRelations: vi.fn().mockResolvedValue({ run: {}, relations: [] }),
+  rotateAssistant: vi.fn(), startAssistant: vi.fn(), stopAssistant: vi.fn(),
 }))
 
 describe('assistantName', () => {
@@ -51,7 +54,8 @@ describe('moodOf', () => {
     ['a failed run', base({ runs: [run({ state: 'failed', live: false })] }), 'oops'],
     ['a stalled run', base({ attention: [att('stalled')] }), 'oops'],
     ['a critical error is serious', base({ attention: [att('critical_error')] }), 'panic'],
-    ['two broken runs are serious', base({ runs: [run({ state: 'crashed', live: false }), run({ slug: 't', state: 'failed', live: false })] }), 'panic'],
+    ['two broken runs stay oops', base({ runs: [run({ state: 'crashed', live: false }), run({ slug: 't', state: 'failed', live: false })] }), 'oops'],
+    ['two stalled runs stay oops', base({ attention: [att('stalled'), att('stalled', { slug: 't' })], liveWorkers: 2 }), 'oops'],
     ['near the cap', base({ liveWorkers: 5, cap: 6 }), 'strained'],
     ['at the cap', base({ liveWorkers: 6, cap: 6 }), 'strained'],
     ['under the cap', base({ liveWorkers: 4, cap: 6 }), 'on_it'],
@@ -63,6 +67,7 @@ describe('moodOf', () => {
     ['cap contention', base({ attention: [att('cap_reached')] }), 'skeptical'],
     ['a run just finished', base({ justFinished: 1 }), 'yes'],
     ['replying with a quiet fleet', base({ replying: true }), 'talking'],
+    ['one orchestrator ask is not double counted', base({ attention: [att('live_question', { orchestrator: true })], openQuestions: 1 }), 'question'],
   ])('%s → %s', (_label, input, mood) => {
     expect(moodOf(input)).toBe(mood)
   })
@@ -91,8 +96,9 @@ describe('moodReason', () => {
   it.each([
     ['question', base({ attention: [att('question'), att('live_question')] }), 'question: 2 questions waiting on you'],
     ['question', base({ openQuestions: 1 }), 'question: 1 question waiting on you'],
+    ['question', base({ attention: [att('live_question', { orchestrator: true })], openQuestions: 1 }), 'question: 1 question waiting on you'],
     ['panic', base({ attention: [att('critical_error')] }), 'panic: the daemon reported a critical error'],
-    ['panic', base({ runs: [run({ state: 'crashed' }), run({ slug: 't', state: 'failed' })] }), 'panic: 2 runs down at once'],
+    ['oops', base({ runs: [run({ state: 'crashed' }), run({ slug: 't', state: 'failed' })] }), 'oops: 2 runs crashed or stuck'],
     ['oops', base({ runs: [run({ state: 'crashed' })] }), 'oops: 1 run crashed or stuck'],
     ['strained', base({ liveWorkers: 5, cap: 6 }), 'strained: 5 of 6 sessions in use'],
     ['on_it', base({ liveWorkers: 3 }), 'on_it: 3 running'],
@@ -189,5 +195,79 @@ describe('Ratchet in the shell', () => {
     await flushPromises()
     expect(document.getElementById('favicon').getAttribute('href')).toBe('./assets/ratchet/ratchet_question.png')
     wrapper.unmount()
+  })
+
+  it('pairs the bar face with a plain-text status, and the off label when stopped', async () => {
+    fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] })
+    fetchState.mockResolvedValue(appState())
+    window.history.replaceState({}, '', '/?workspace=general')
+    const wrapper = mountPane(App)
+    await flushPromises()
+    expect(wrapper.get('header .bar-cluster .ratchet-bar-label').text()).toBe('off: stopped')
+    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
+    wrapper.unmount()
+  })
+
+  it('labels the pane off face with its own lifecycle, not the fleet mood', async () => {
+    fetchAssistant.mockResolvedValue({ running: false, lifecycle: 'stopped' })
+    const workspace = { id: 'alpha', name: 'Alpha', color: 'Blue' }
+    const wrapper = mountPane(AssistantChat, { workspace, mood: 'idle', moodReason: 'idle: nothing needs you' })
+    await flushPromises()
+    expect(wrapper.get('.ratchet-mood-label').text()).toBe('off: stopped')
+    expect(wrapper.get('.uber-identity').attributes('aria-label')).toContain('off: stopped')
+    wrapper.unmount()
+  })
+
+  it('keys completion history by run identity, not slug', async () => {
+    vi.useFakeTimers()
+    fetchState.mockResolvedValue(appState({
+      runs: [
+        { workspace_id: 'general', host: 'one.example', project: 'p', slug: 'same', state: 'complete', live: false, orchestrator: false },
+        { workspace_id: 'general', host: 'two.example', project: 'b', slug: 'same', state: 'running', live: true, orchestrator: false },
+      ],
+      totals: { live: 1 },
+    }))
+    const wrapper = mountPane(App)
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(10000)
+    await flushPromises()
+    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    vi.useRealTimers()
+    wrapper.unmount()
+  })
+
+  it('scopes each pane to its own project when the view moves to All projects', async () => {
+    const alpha = { id: 'alpha', name: 'Alpha', color: 'Blue', assistant: { lifecycle: 'running' } }
+    const beta = { id: 'beta', name: 'Beta', color: 'Blue', assistant: { lifecycle: 'running' } }
+    fetchProjects.mockResolvedValue({ projects: [alpha, beta] })
+    fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha' })
+    fetchState.mockResolvedValue(appState({
+      runs: [{ workspace_id: 'beta', host: 'h', project: 'p', slug: 'b1', state: 'running', live: true, orchestrator: false, attention: { reason: 'critical_error' } }],
+      attention: [{ workspace_id: 'beta', host: 'h', project: 'p', slug: 'b1', attention: { reason: 'critical_error' } }],
+      totals: { live: 1, attention: 1 },
+    }))
+    window.history.replaceState({}, '', '/?workspace=alpha')
+    const wrapper = mountPane(App)
+    await flushPromises()
+    await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+    await flushPromises()
+    await chooseProject(wrapper, 'All projects')
+    await flushPromises()
+    const pane = wrapper.findAllComponents(AssistantChat).find((candidate) => candidate.get('.uber-toolbar').isVisible())
+    expect(pane.props('mood')).toBe('idle')
+    // The bar is the fleet view, so it does see Beta's critical error.
+    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_panic.png')
+    wrapper.unmount()
+  })
+})
+
+describe('offReason', () => {
+  it.each([
+    ['stopped', 'off: stopped'],
+    ['starting', 'off: starting'],
+    [undefined, 'off: stopped'],
+    ['', 'off: stopped'],
+  ])('%s → %s', (lifecycle, text) => {
+    expect(offReason(lifecycle)).toBe(text)
   })
 })

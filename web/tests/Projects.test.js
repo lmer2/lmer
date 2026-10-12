@@ -1041,10 +1041,10 @@ it('opens the robot\'s tooltip from the keyboard with Enter or Space', async () 
   }
 })
 
-it('keeps the robot\'s label to the project name while no incarnation is running', async () => {
+it('labels a stopped assistant with its lifecycle, keeping the project name', async () => {
   const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
   await flushPromises()
-  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · Ratchet`)
+  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · Ratchet · off: stopped`)
   wrapper.unmount()
 })
 

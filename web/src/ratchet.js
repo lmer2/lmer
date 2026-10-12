@@ -38,7 +38,11 @@ const reasonOf = (row) => row?.attention?.reason
 const count = (rows, test) => (rows || []).filter(test).length
 
 function questions(input) {
-  return count(input.attention, (row) => QUESTION_REASONS.includes(reasonOf(row))) + (input.openQuestions || 0)
+  const rows = count(input.attention, (row) => QUESTION_REASONS.includes(reasonOf(row)))
+  // The assistant's own live ask is both its `live_question` attention row and
+  // its status `open_questions`; count it once (issue 581 review).
+  const ownRows = count(input.attention, (row) => row.orchestrator && QUESTION_REASONS.includes(reasonOf(row)))
+  return rows + Math.max(0, (input.openQuestions || 0) - ownRows)
 }
 // A run is broken once whether the state or an attention reason says so; the
 // reason is not counted again for a run whose state already did.
@@ -47,11 +51,10 @@ function broken(input) {
   const byReason = count(input.attention, (row) => BROKEN_REASONS.includes(reasonOf(row)) && !BROKEN_STATES.includes(row.state))
   return byState + byReason
 }
-// `panic` is only for something genuinely serious (chadd's rule): a critical
-// error, or two or more runs down at once. One crash is `oops`.
+// `panic` is only for something genuinely serious (chadd's rule): the explicit
+// `critical_error` signal. Ordinary crashes and stalls stay `oops`, however many.
 function serious(input) {
-  const critical = count(input.attention, (row) => reasonOf(row) === 'critical_error')
-  return critical > 0 || broken(input) >= 2
+  return count(input.attention, (row) => reasonOf(row) === 'critical_error') > 0
 }
 function nearCap(input) {
   return !!input.cap && input.cap > 0 && (input.liveWorkers || 0) >= input.cap * NEAR_CAP_RATIO
@@ -78,10 +81,7 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
 export function moodReason(mood, input) {
   switch (mood) {
     case 'question': return `question: ${plural(questions(input), 'question')} waiting on you`
-    case 'panic':
-      return count(input.attention, (row) => reasonOf(row) === 'critical_error') > 0
-        ? 'panic: the daemon reported a critical error'
-        : `panic: ${plural(broken(input), 'run')} down at once`
+    case 'panic': return 'panic: the daemon reported a critical error'
     case 'oops': return `oops: ${plural(broken(input), 'run')} crashed or stuck`
     case 'strained': return `strained: ${input.liveWorkers} of ${input.cap} sessions in use`
     case 'on_it': return `on_it: ${input.liveWorkers} running`
@@ -99,4 +99,11 @@ export function faceFile(mood) {
 
 export function faceUrl(mood) {
   return `./assets/ratchet/${faceFile(mood)}.png`
+}
+
+// The off face's plain-text label (spec §4.3): the lifecycle word, so a stopped
+// assistant never reads as a fleet mood it is not reporting on.
+export function offReason(lifecycle) {
+  const word = typeof lifecycle === 'string' && lifecycle.trim() ? lifecycle.trim() : 'stopped'
+  return `off: ${word}`
 }
