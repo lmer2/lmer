@@ -33,6 +33,7 @@ import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
+import { applyAssistantName, assistantName } from './ratchet.js'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
 import {
@@ -385,9 +386,9 @@ const orchestratorTone = computed(() => (
 ))
 const orchestratorHint = computed(() => {
   const run = orchestrator.value
-  if (!run) return 'talk to uber lmer'
+  if (!run) return `talk to ${assistantName.value}`
   const meta = stateMeta(run.state)
-  const parts = [`uber lmer — ${meta.label}`]
+  const parts = [`${assistantName.value} — ${meta.label}`]
   // What it is doing, or what it needs. The attention note is the more urgent of
   // the two and wins when both are there.
   const note = run.attention?.note || run.title || run.goal || run.phase
@@ -539,7 +540,7 @@ function haystack(run) {
     run.attention && attentionLabel(run.attention.reason),
     run.attention?.note,
     run.preset, run.agents, driverLabel(run),
-    run.orchestrator && 'uber lmer',
+    run.orchestrator && assistantName.value.toLowerCase(),
     // The word the row shows, not the age beside it: "unchecked" is a state an
     // operator asks the list for ("what has nobody looked at"), while the time is
     // rendered relative and a query never means one — the same reason `updated`
@@ -599,6 +600,7 @@ function load() {
   inFlight = (async () => {
     try {
       state.value = await fetchState()
+      applyAssistantName(state.value?.config)
       projects.value = (await fetchProjects()).projects
       if (uberOpen.value) rememberChat(chatProject.value)
       fleetOnline.value = true
@@ -699,7 +701,7 @@ function openAssistantQuestions(sessionId) {
   const run = (state.value?.runs || []).find((candidate) => candidate.orchestrator
     && sessionId && (candidate.session?.id === sessionId || candidate.last_session_id === sessionId))
   if (!run) {
-    runRefNotice.value = 'uber lmer\'s session is not in the fleet view yet — its questions will be answerable there once it is'
+    runRefNotice.value = `${assistantName.value}'s session is not in the fleet view yet — its questions will be answerable there once it is`
     return
   }
   runRefNotice.value = null
@@ -1004,7 +1006,7 @@ onUnmounted(() => {
                  entirely on a daemon whose payload carries no cap. -->
             <span
               v-if="workerCap"
-              title="live worker sessions against this host's cap; uber lmer holds its own slot beside them"
+              :title="`live worker sessions against this host's cap; ${assistantName} holds its own slot beside them`"
             >{{ liveWorkers }}/{{ workerCap }} workers</span>
             <span>{{ totals.attention }} need you</span>
             <span v-if="state?.generated_at" :title="state.generated_at">

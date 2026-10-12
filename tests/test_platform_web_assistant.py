@@ -166,8 +166,8 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
 
 def test_the_supervisor_is_called_uber_lmer_and_never_an_assistant():
     text = _read(DRAWER)
-    assert '{{ workspace.name }} · uber lmer' in text
-    assert 'agent-label="uber lmer"' in text
+    assert '${props.workspace.name} · ${assistantName.value}' in text
+    assert ':agent-label="assistantName"' in text
     assert 'Waiting to start — assistant limit reached' in text
     # Issue 575: the pane's colour and toolbar say whose it is; the intro lines went.
     assert 'this chat belong to this project' not in ' '.join(text.split())
@@ -176,7 +176,7 @@ def test_the_supervisor_is_called_uber_lmer_and_never_an_assistant():
 def test_the_composer_says_who_is_at_the_other_end():
     text = _read(DRAWER)
     assert 'You are talking to' not in text
-    assert ':composer-label="`Say something to ${workspace.name} · uber lmer`"' in text
+    assert ':composer-label="`Say something to ${workspace.name} · ${assistantName}`"' in text
     assert ':workspace-id="workspace.id"' in text
     assert 'say something to this session' in _read(CHAT)
 
@@ -347,8 +347,8 @@ def test_the_toolbar_offers_restart_and_stop_and_hides_the_verbs_the_daemon_woul
     assert 'v-if="status || problem"' in toolbar, (
         "the cluster is drawn before the first status arrives"
     )
-    assert 'aria-label="restart uber lmer"' in toolbar
-    assert 'aria-label="stop uber lmer"' in toolbar
+    assert ':aria-label="`restart ${assistantName}`"' in toolbar
+    assert ':aria-label="`stop ${assistantName}`"' in toolbar
 
 
 def test_restart_is_the_rotate_route_and_the_other_two_are_their_own():
@@ -561,7 +561,7 @@ def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
         "the queue depth comes from somewhere other than the status"
     )
     words = _operator_words(DRAWER)
-    assert "waiting for uber lmer" in words, (
+    assert "waiting for" in words, (
         "the operator is never told something is queued"
     )
     assert "queued === 1 ? 'digest' : 'digests'" in text, (
@@ -651,7 +651,7 @@ def test_project_settings_says_how_standing_orders_are_usually_set_and_when_they
     """
     editor = WEB / "src" / "components" / "ProjectSettings.vue"
     words = _words(editor)
-    assert ('Usually set by telling uber lmer in chat — "from now on…", "always…" — '
+    assert ('Usually set by telling in chat — "from now on…", "always…" — '
             "and it confirms the wording before storing them.") in words
     assert "No standing instructions yet." in words
     assert "last changed" in words
@@ -682,7 +682,7 @@ def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
     )
     # The naming rule is the drawer's, and it travels with the feature: the
     # dialog is about the same recipient.
-    assert "uber lmer" in words, "the dialog never says whose settings these are"
+    assert "{{ assistantName }} settings" in text, "the dialog never says whose settings these are"
     assert "assistant" not in words.lower(), (
         f"the dialog calls the supervisor an assistant to the operator: {words!r}"
     )
@@ -838,6 +838,7 @@ const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]@mdi\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
   .replace(/from ['"]\.\.\/operatorChat.js['"]/g, `from '${import.meta.resolve('./src/operatorChat.js')}'`)
+  .replace(/from ['"]\.\.\/ratchet.js['"]/g, `from '${import.meta.resolve('./src/ratchet.js')}'`)
   .replace(/import .* from ['"]\.\.\/api.js['"]/, `
     const fetchAssistantConfig = async () => ({ settings: {} });
     const setAssistantConfig = async (body) => {
@@ -974,7 +975,7 @@ globalThis.fetch = async (url, options = {}) => {
 const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
-  .replace(/from ['"]\\.\\.\\/(api|format|operatorChat)\\.js['"]/g,
+  .replace(/from ['"]\\.\\.\\/(api|format|operatorChat|ratchet)\\.js['"]/g,
     (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
 const component = (await import(
   `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`

@@ -504,7 +504,7 @@ def test_the_operator_chat_pane_is_this_runs_channel_not_the_supervisor():
             "a session pane names uber lmer: the supervisor chat is the fleet's, "
             "not a run's (T31)"
         )
-    assert "uber lmer" in _header(), (
+    assert "{{ assistantName }}" in _header(), (
         "the detail header no longer marks the orchestrator's own run (T85)"
     )
 
@@ -1429,12 +1429,12 @@ def test_the_header_marks_the_orchestrators_own_run():
         "the badge draws a different shape from the drawer that opens the same "
         "session, so nothing connects the two"
     )
-    assert ">uber lmer<" in header, "the badge has no word, only a colour and a shape"
+    assert ">{{ assistantName }}<" in header, "the badge has no word, only a colour and a shape"
     # Beside the signal and before the name, on the line that already carries both:
     # the identity line below is deliberately one row and is about the *run*.
     assert (
         header.index("toneColor(meta.tone)")
-        < header.index(">uber lmer<")
+        < header.index(">{{ assistantName }}<")
         < header.index("{{ run.title || run.label }}")
     ), "the badge is not between the state chip and the run's name"
 

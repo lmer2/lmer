@@ -115,6 +115,7 @@ import { inView, layerOf } from '../conversation.js'
 import { readDraft, storeDraft } from '../projects.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
+import { assistantName } from '../ratchet.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -607,11 +608,9 @@ function muted(message) {
 }
 
 // How a bus channel reads in a header (issue 407); anything unlisted is already
-// a word.
-const CHANNEL_LABELS = { 'uber-lmer': 'uber lmer' }
-
+// a word. The assistant's channel carries the configured display name (issue 581).
 function sourceLabel(source) {
-  const name = CHANNEL_LABELS[source.channel] || source.channel
+  const name = source.channel === 'uber-lmer' ? assistantName.value : source.channel
   return source.author ? `${name} · ${source.author}` : name
 }
 
@@ -1341,7 +1340,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
         <span
           v-if="view === 'conversation' && transcriptHidden"
           class="text-body-small text-medium-emphasis transcript-note"
-        >· {{ transcriptHidden }} transcript turns not shown — the working transcript is off in uber lmer settings</span>
+        >· {{ transcriptHidden }} transcript turns not shown — the working transcript is off in {{ assistantName }} settings</span>
         <span
           v-else-if="view === 'transcript'"
           class="text-body-small text-medium-emphasis transcript-note"

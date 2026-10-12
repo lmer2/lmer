@@ -936,7 +936,7 @@ def test_a_thread_link_the_container_chose_never_becomes_an_href(platform_root):
 def test_the_view_names_the_source_and_the_kind():
     text = _chat()
     assert "sourceLabel(source)" in text and "message.comms_kind" in text
-    assert "'uber-lmer': 'uber lmer'" in text
+    assert "source.channel === 'uber-lmer' ? assistantName.value" in text
     api_js = (CHAT.parent.parent / "api.js").read_text(encoding="utf-8")
     send = api_js[api_js.index("export function sendSessionInput"):]
     send = send[:send.index("\n}\n")]

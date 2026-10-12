@@ -248,7 +248,7 @@ def _badge(text):
     several chips and this is the one identified by what it says, which is also the
     only thing about it that has survived three passes of the operator's.
     """
-    end = text.index(">uber lmer<")
+    end = text.index(">{{ assistantName }}<")
     return text[text.rindex("<v-chip", 0, end):end]
 
 
@@ -1023,11 +1023,11 @@ def test_both_listings_mark_the_platforms_own_session():
     """
     for source in (RUN_CARD, RUN_NAV):
         text = _read(source)
-        assert ">uber lmer<" in text, (
+        assert ">{{ assistantName }}<" in text, (
             f"{source.name} does not name the platform's own session, so the row "
             "that orchestrates the fleet reads as one of the runs in it"
         )
-        assert "assistant" not in text.lower(), (
+        assert "assistant" not in re.sub(r"assistantName", "", text).lower(), (
             f"{source.name} calls the supervisor an assistant; that spelling is the "
             "module's and the API's, and never an operator's (T31)"
         )
@@ -1060,7 +1060,7 @@ def test_the_orchestrator_card_offers_the_chat():
         "the chat button does something other than asking the shell to open "
         "the drawer"
     )
-    assert 'aria-label="talk to uber lmer"' in button.group(0), (
+    assert ':aria-label="`talk to ${assistantName}`"' in button.group(0), (
         "the button's accessible name no longer matches the bar toggle's, so "
         "a screen reader meets two names for one conversation"
     )

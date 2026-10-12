@@ -90,7 +90,7 @@ it('groups every All-project status locally and keeps the actual chat destinatio
 it('shows waiting/cancel with an explicit project and keeps a draft until the assistant starts', async () => {
   const wrapper = mountPane(AssistantChat, { workspace: projects[1] })
   await flushPromises()
-  expect(wrapper.text()).toContain('Beta · uber lmer')
+  expect(wrapper.text()).toContain('Beta · Ratchet')
   expect(wrapper.text()).toContain('Waiting to start — assistant limit reached · queue position 1')
   await wrapper.get('textarea').setValue('Beta draft only')
   api.stopAssistant.mockResolvedValue({ running: false, lifecycle: 'stopped' })
@@ -262,8 +262,8 @@ it.each([
   ['a project sharing the tone\'s hue', 'green', true],
   ['a dark custom project', 'night', true],
   ['a light custom project', 'pink', true],
-  ['a project with no uber lmer run', 'alpha', false],
-])('keeps uber lmer\'s robot readable on %s', async (_label, workspace, onSurface) => {
+  ['a project with no Ratchet run', 'alpha', false],
+])('keeps Ratchet\'s robot readable on %s', async (_label, workspace, onSurface) => {
   const extra = [{ id: 'green', name: 'Green', color: 'Green' }, { id: 'night', name: 'Night', color: '#101030' },
     { id: 'pink', name: 'Pink', color: '#ff69b4' }]
   api.fetchProjects.mockResolvedValue({ projects: [...projects, ...extra] })
@@ -275,7 +275,7 @@ it.each([
   const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
   await flushPromises()
   const supervised = workspace !== 'alpha'
-  const robot = wrapper.get(supervised ? 'header button[aria-label^="uber lmer — running"]' : 'header button[aria-label="talk to uber lmer"]')
+  const robot = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label="talk to Ratchet"]')
   expect(robot.classes().includes('text-success')).toBe(supervised)
   expect(robot.classes().includes('robot-on-surface')).toBe(onSurface)
 })
@@ -353,11 +353,11 @@ it.each(['toolbar', 'attention card', 'calm card'])('binds a closed drawer to th
   await flushPromises()
   await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
   await flushPromises()
-  await wrapper.get('[aria-label="close the uber lmer chat"]').trigger('click')
+  await wrapper.get('[aria-label="close the Ratchet chat"]').trigger('click')
   await chooseProject(wrapper, 'Beta')
   await flushPromises()
-  if (shortcut === 'toolbar') await wrapper.get('header button[aria-label^="uber lmer"]').trigger('click')
-  else await wrapper.getComponent(RunCard).get('[aria-label="talk to uber lmer"]').trigger('click')
+  if (shortcut === 'toolbar') await wrapper.get('header button[aria-label^="Ratchet"]').trigger('click')
+  else await wrapper.getComponent(RunCard).get('[aria-label="talk to Ratchet"]').trigger('click')
   await flushPromises()
   const pane = wrapper.findAllComponents(AssistantChat).find(pane => pane.get('.uber-toolbar').isVisible())
   expect(pane.props('workspace').id).toBe('beta')
@@ -401,7 +401,7 @@ it('keeps the live Chat instance and draft through a running generation change',
   const editor = wrapper.getComponent(Chat).get('textarea').element
   await wrapper.getComponent(Chat).get('textarea').setValue('Draft across rotation')
   api.rotateAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 'second-beta' })
-  await wrapper.get('[aria-label="restart uber lmer"]').trigger('click')
+  await wrapper.get('[aria-label="restart Ratchet"]').trigger('click')
   await flushPromises()
   const confirm = [...document.querySelectorAll('.v-dialog button')].find(button => button.textContent.trim() === 'restart')
   confirm.click()
@@ -740,7 +740,7 @@ it('posts project instructions as JSON to the explicitly scoped HTTP endpoint', 
   } finally { vi.unstubAllGlobals() }
 })
 
-it('badges uber lmer\'s open questions from its status poll and asks the shell to open them', async () => {
+it('badges Ratchet\'s open questions from its status poll and asks the shell to open them', async () => {
   vi.useFakeTimers()
   const answers = [2, 1, 0]
   api.fetchAssistant.mockImplementation(() => Promise.resolve({ running: true, lifecycle: 'running',
@@ -750,7 +750,7 @@ it('badges uber lmer\'s open questions from its status poll and asks the shell t
   const badge = () => wrapper.find('.open-questions')
   expect(badge().exists()).toBe(true)
   expect(badge().text()).toContain('2')
-  expect(badge().attributes('aria-label')).toBe('2 open questions from uber lmer — answer in its run view')
+  expect(badge().attributes('aria-label')).toBe('2 open questions from Ratchet — answer in its run view')
   await badge().trigger('click')
   expect(wrapper.emitted('questions')).toEqual([['s-alpha']])
   await vi.advanceTimersByTimeAsync(10000)
@@ -782,23 +782,23 @@ it('keeps the question badge inside the composer, its corner kept when it clears
   vi.useRealTimers()
 })
 
-it('puts every uber lmer control on one toolbar, with no overflow menu and no intro lines', async () => {
+it('puts every Ratchet control on one toolbar, with no overflow menu and no intro lines', async () => {
   api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
   const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
   await flushPromises()
   const toolbar = wrapper.get('.uber-toolbar')
-  for (const label of ['restart uber lmer', 'stop uber lmer', 'project settings', 'standing orders', 'close the uber lmer chat']) {
+  for (const label of ['restart Ratchet', 'stop Ratchet', 'project settings', 'standing orders', 'close the Ratchet chat']) {
     expect(toolbar.find(`[aria-label="${label}"]`).exists()).toBe(true)
   }
-  expect(wrapper.find('[aria-label="more uber lmer controls"]').exists()).toBe(false)
+  expect(wrapper.find('[aria-label="more Ratchet controls"]').exists()).toBe(false)
   expect(wrapper.text()).not.toContain('You are talking to')
   expect(wrapper.text()).not.toContain('belong to this project')
   await toolbar.get('[aria-label="project settings"]').trigger('click')
   await toolbar.get('[aria-label="standing orders"]').trigger('click')
   expect(wrapper.emitted('settings')).toEqual([[], ['orders']])
-  await toolbar.get('[aria-label="stop uber lmer"]').trigger('click')
+  await toolbar.get('[aria-label="stop Ratchet"]').trigger('click')
   await flushPromises()
-  expect(document.querySelector('.v-dialog')?.textContent).toContain('Stop uber lmer?')
+  expect(document.querySelector('.v-dialog')?.textContent).toContain('Stop Ratchet?')
   wrapper.unmount()
 })
 
@@ -823,7 +823,7 @@ it('counts loaded messages and steps back to earlier ones from the toolbar, not 
   wrapper.unmount()
 })
 
-it('opens project settings on the standing instructions from uber lmer\'s toolbar', async () => {
+it('opens project settings on the standing instructions from Ratchet\'s toolbar', async () => {
   api.fetchAssistant.mockImplementation(id => Promise.resolve({ running: true, lifecycle: 'running', session_id: `s-${id}` }))
   api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase', limit: 4000 })
   const wrapper = mountPane(App)
@@ -992,7 +992,7 @@ it('clears a failed read of the standing orders once a re-read succeeds', async 
 })
 
 // Issue 578: the toolbar is a neutral theme surface, not the project colour.
-it('paints uber lmer\'s toolbar with the neutral theme colour, never the project colour', async () => {
+it('paints Ratchet\'s toolbar with the neutral theme colour, never the project colour', async () => {
   api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
   const wrapper = mountPane(AssistantChat, { workspace: { ...projects[0], color: 'Purple' } })
   await flushPromises()
@@ -1009,7 +1009,7 @@ it('names the generation and its age in the robot\'s tooltip, not in the pane bo
     generation: 22, started_at: '2026-10-11T04:00:00Z' })
   const wrapper = mountPane(AssistantChat, { workspace: projects[0], now })
   await flushPromises()
-  const identity = `${projects[0].name} · uber lmer · generation 22 · started 8h ago`
+  const identity = `${projects[0].name} · Ratchet · generation 22 · started 8h ago`
   const robot = wrapper.get('.uber-toolbar .uber-identity')
   expect(robot.attributes()).toMatchObject({ role: 'button', tabindex: '0', 'aria-label': identity })
   expect(wrapper.get('.uber-body').text()).not.toMatch(/generation|started/)
@@ -1028,7 +1028,7 @@ it('names the generation and its age in the robot\'s tooltip, not in the pane bo
 
 it('opens the robot\'s tooltip from the keyboard with Enter or Space', async () => {
   api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
-  const identity = `${projects[0].name} · uber lmer · generation 3`
+  const identity = `${projects[0].name} · Ratchet · generation 3`
   for (const key of ['enter', 'space']) {
     const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
     await flushPromises()
@@ -1044,7 +1044,7 @@ it('opens the robot\'s tooltip from the keyboard with Enter or Space', async () 
 it('keeps the robot\'s label to the project name while no incarnation is running', async () => {
   const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
   await flushPromises()
-  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · uber lmer`)
+  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · Ratchet`)
   wrapper.unmount()
 })
 
@@ -1062,7 +1062,7 @@ it('keeps the digest and problem notices out of the flex body so they size to th
   const alerts = [...body.querySelectorAll('.v-alert')]
   expect(alerts.map(alert => alert.textContent)).toEqual([
     expect.stringContaining('daemon unreachable'),
-    expect.stringContaining('2 digests waiting for uber lmer'),
+    expect.stringContaining('2 digests waiting for Ratchet'),
   ])
   for (const alert of alerts) {
     expect(alert.parentElement).not.toBe(body)
@@ -1094,11 +1094,11 @@ it('says when the standing orders are empty, from the stored document rather tha
   stored.unmount()
 })
 
-it('hints that standing orders are usually set by telling uber lmer in chat', async () => {
+it('hints that standing orders are usually set by telling Ratchet in chat', async () => {
   for (const orders of [{ instructions: null }, { instructions: 'Always rebase' }]) {
     const wrapper = await settingsWithOrders(orders)
     expect(wrapper.get('.orders-hint').text().replace(/\s+/g, ' ')).toBe(
-      'Usually set by telling uber lmer in chat — "from now on…", "always…" — and it confirms the wording before storing them.')
+      'Usually set by telling Ratchet in chat — "from now on…", "always…" — and it confirms the wording before storing them.')
     wrapper.unmount()
   }
 })
@@ -1123,8 +1123,8 @@ it('shows when the standing orders last changed and refreshes it from a save', a
   never.unmount()
 })
 
-it('opens uber lmer\'s own run on its question badge and focuses the ask dock there', async () => {
-  const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'uber lmer', orchestrator: true,
+it('opens Ratchet\'s own run on its question badge and focuses the ask dock there', async () => {
+  const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'Ratchet', orchestrator: true,
     workspace_id: 'alpha', workspace_name: projects[0].name, workspace_color: 'Blue', live: true,
     last_session_id: 's-alpha', session: { id: 's-alpha' }, state: 'waiting_on_you', attention: { reason: 'live_question' },
     questions: [{ id: 'q1', kind: 'question', text: 'Ship it?', options: [], answered: false, closed: false }] }

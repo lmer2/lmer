@@ -26,6 +26,7 @@ import {
 import { rememberChoice, storedChoice } from '../preferences.js'
 import { projectColor, projectTextColor } from '../projects.js'
 import { runKey as composeRunKey } from '../runref.js'
+import { assistantName } from '../ratchet.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
 // it arrives as its own chunk. It is now deferred twice over: a tab panel renders
@@ -670,7 +671,7 @@ async function forget() {
         size="small"
         title="the platform's own orchestrating session, not one of the runs"
         variant="tonal"
-      >uber lmer</v-chip>
+      >{{ assistantName }}</v-chip>
       <!-- The heading line is the run's *name*, so this is where the title goes
            (the operator asked: "if meta.title is set it should be used in the
            details header and the listings") — not an extra item on the identity

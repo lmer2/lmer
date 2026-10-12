@@ -22,6 +22,7 @@ SUITES = [
     "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",
     "tests/Projects.test.js",
+    "tests/Ratchet.test.js",
     "tests/RequestRecovery.test.js",
     "tests/StatusStrip.test.js",
     "tests/UnassignedRuns.test.js",
