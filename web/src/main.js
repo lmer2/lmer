@@ -121,6 +121,8 @@ const light = {
     'chat-agent': '#eae7e2',
     'chat-operator': '#f3d9ce',
     'chat-action': '#dedbd5',
+    // The uber lmer toolbar: darker than `surface` in both schemes; dark deliberately reuses `background`.
+    'uber-toolbar': '#e4e0da',
     // style.css renders <code> against these; without them the declarations are
     // invalid and inline code loses its background in both schemes.
     // A step *deeper* than every ground above, which is the only direction open
@@ -153,6 +155,7 @@ const dark = {
     'chat-agent': '#1b1a19',
     'chat-operator': '#402922',
     'chat-action': '#0f0e0e',
+    'uber-toolbar': '#1b1a19',
     code: '#2e2c2a',
     'on-code': '#e8e6e3',
   },

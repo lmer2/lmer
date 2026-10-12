@@ -903,7 +903,7 @@ onUnmounted(() => {
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
         </v-alert>
         <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
-          :project="workspace" :focus="projectSettingsFocus" @changed="load" @close="view = 'fleet'"
+          :project="workspace" :focus="projectSettingsFocus" :now="now" @changed="load" @close="view = 'fleet'"
           @focused="projectSettingsFocus = null" />
         <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />

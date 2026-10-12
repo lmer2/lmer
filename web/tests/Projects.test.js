@@ -948,6 +948,138 @@ it('clears a failed read of the standing orders once a re-read succeeds', async 
   wrapper.unmount()
 })
 
+// Issue 578: the toolbar is a neutral theme surface, not the project colour.
+it('paints uber lmer\'s toolbar with the neutral theme colour, never the project colour', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const wrapper = mountPane(AssistantChat, { workspace: { ...projects[0], color: 'Purple' } })
+  await flushPromises()
+  const toolbar = wrapper.get('.uber-toolbar')
+  expect(toolbar.classes()).toContain('bg-uber-toolbar')
+  expect(toolbar.attributes('style') || '').not.toMatch(/background|color/)
+  expect(toolbar.html()).not.toContain(projectColor('Purple'))
+  wrapper.unmount()
+})
+
+it('names the generation and its age in the robot\'s tooltip, not in the pane body', async () => {
+  const now = Date.parse('2026-10-11T12:00:00Z')
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha',
+    generation: 22, started_at: '2026-10-11T04:00:00Z' })
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0], now })
+  await flushPromises()
+  const identity = `${projects[0].name} · uber lmer · generation 22 · started 8h ago`
+  const robot = wrapper.get('.uber-toolbar .uber-identity')
+  expect(robot.attributes()).toMatchObject({ role: 'button', tabindex: '0', 'aria-label': identity })
+  expect(wrapper.get('.uber-body').text()).not.toMatch(/generation|started/)
+  expect(wrapper.findComponent({ name: 'StatusStrip' }).exists()).toBe(true)
+  // The tooltip's text is in the DOM before it opens, so its model is what says it
+  // is up. A real tap's mouseenter-then-click is pinned in web/tests/browser/projects.py.
+  const tooltip = wrapper.findAllComponents({ name: 'VTooltip' }).find(t => t.props('text') === identity)
+  expect(tooltip.props('modelValue')).toBe(false)
+  for (const activation of ['first', 'second']) {
+    await robot.trigger('click')
+    await flushPromises()
+    expect(tooltip.props('modelValue'), activation).toBe(true)
+  }
+  wrapper.unmount()
+})
+
+it('opens the robot\'s tooltip from the keyboard with Enter or Space', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const identity = `${projects[0].name} · uber lmer · generation 3`
+  for (const key of ['enter', 'space']) {
+    const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+    await flushPromises()
+    const tooltip = wrapper.findAllComponents({ name: 'VTooltip' }).find(t => t.props('text') === identity)
+    expect(tooltip.props('modelValue'), key).toBe(false)
+    await wrapper.get('.uber-toolbar .uber-identity').trigger(`keydown.${key}`)
+    await flushPromises()
+    expect(tooltip.props('modelValue'), key).toBe(true)
+    wrapper.unmount()
+  }
+})
+
+it('keeps the robot\'s label to the project name while no incarnation is running', async () => {
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · uber lmer`)
+  wrapper.unmount()
+})
+
+// jsdom has no layout and the suite loads no CSS, so this pins the structure that
+// keeps the notices out of the flex column: Vuetify's `.v-alert { flex: 1 1 }`
+// only applies to an alert that is itself a flex item of `.uber-body`.
+it('keeps the digest and problem notices out of the flex body so they size to their text', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3, pending: 2 })
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  api.fetchAssistant.mockRejectedValue(new Error('daemon unreachable'))
+  await wrapper.vm.$.setupState.load()
+  await flushPromises()
+  const body = wrapper.get('.uber-body').element
+  const alerts = [...body.querySelectorAll('.v-alert')]
+  expect(alerts.map(alert => alert.textContent)).toEqual([
+    expect.stringContaining('daemon unreachable'),
+    expect.stringContaining('2 digests waiting for uber lmer'),
+  ])
+  for (const alert of alerts) {
+    expect(alert.parentElement).not.toBe(body)
+    expect(alert.parentElement.classList).toContain('uber-notices')
+    expect(alert.classList).toContain('v-alert--density-compact')
+  }
+  expect(wrapper.get('.uber-notices').element.parentElement).toBe(body)
+  wrapper.unmount()
+})
+
+const settingsWithOrders = async (orders, props = {}) => {
+  api.fetchAssistantInstructions.mockResolvedValue({ limit: 4000, ...orders })
+  const wrapper = mountPane(ProjectSettings, { project: projects[0], focus: { id: 'alpha', section: 'orders', nonce: 1 }, ...props })
+  await flushPromises()
+  return wrapper
+}
+
+it('says when the standing orders are empty, from the stored document rather than the draft', async () => {
+  const wrapper = await settingsWithOrders({ instructions: null, instructions_at: null })
+  expect(wrapper.get('.orders-empty').text()).toBe('No standing instructions yet.')
+  await wrapper.get('.project-orders textarea').setValue('A draft that is not saved yet')
+  expect(wrapper.find('.orders-empty').exists()).toBe(true)
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(wrapper.find('.orders-empty').exists()).toBe(false)
+  wrapper.unmount()
+  const stored = await settingsWithOrders({ instructions: 'Always rebase', instructions_at: '2026-10-11T10:00:00Z' })
+  expect(stored.find('.orders-empty').exists()).toBe(false)
+  stored.unmount()
+})
+
+it('hints that standing orders are usually set by telling uber lmer in chat', async () => {
+  for (const orders of [{ instructions: null }, { instructions: 'Always rebase' }]) {
+    const wrapper = await settingsWithOrders(orders)
+    expect(wrapper.get('.orders-hint').text().replace(/\s+/g, ' ')).toBe(
+      'Usually set by telling uber lmer in chat — "from now on…", "always…" — and it confirms the wording before storing them.')
+    wrapper.unmount()
+  }
+})
+
+it('shows when the standing orders last changed and refreshes it from a save', async () => {
+  const now = Date.parse('2026-10-11T13:00:00Z')
+  const wrapper = await settingsWithOrders({ instructions: 'Always rebase', instructions_at: '2026-10-11T10:00:00Z' }, { now })
+  const changed = wrapper.get('.orders-changed')
+  expect(changed.text()).toBe('last changed 3h ago')
+  expect(changed.attributes('title')).toBe('2026-10-11T10:00:00Z')
+  await wrapper.setProps({ now: now + 2 * 3600 * 1000 })
+  expect(wrapper.get('.orders-changed').text()).toBe('last changed 5h ago')
+  api.setAssistantInstructions.mockResolvedValueOnce({ instructions: 'Always rebase, never squash', limit: 4000,
+    instructions_at: '2026-10-11T14:59:00Z' })
+  await wrapper.get('.project-orders textarea').setValue('Always rebase, never squash')
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(wrapper.get('.orders-changed').text()).toBe('last changed 1m ago')
+  wrapper.unmount()
+  const never = await settingsWithOrders({ instructions: null, instructions_at: null })
+  expect(never.find('.orders-changed').exists()).toBe(false)
+  never.unmount()
+})
+
 it('opens uber lmer\'s own run on its question badge and focuses the ask dock there', async () => {
   const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'uber lmer', orchestrator: true,
     workspace_id: 'alpha', workspace_name: projects[0].name, workspace_color: 'Blue', live: true,

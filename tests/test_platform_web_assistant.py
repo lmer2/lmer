@@ -278,15 +278,36 @@ def test_a_daemon_that_did_not_answer_degrades_instead_of_resetting():
     )
 
 
-def test_the_supervisors_generation_and_age_are_shown_from_the_status():
+def test_the_supervisors_generation_and_age_are_on_the_toolbar_tooltip_not_the_body():
     """Which incarnation you are talking to is not cosmetic: a rotation (§8.3) is
     a fresh context window, so a note it "already has" may be a note the one
-    before it had."""
+    before it had.
+
+    Issue 578 took the line out of the pane body ("nothing visible in the pane
+    body"), so it lives in the robot icon's tooltip on the toolbar instead.
+    """
     text = _read(DRAWER)
-    assert "status.generation" in text, "nothing says which incarnation this is"
-    assert "ago(status.started_at, now)" in text, (
+    script = text[:text.index("<template>")]
+    identity = script[script.index("const identity = computed("):]
+    identity = identity[:identity.index("\n})\n")]
+    assert "status.value.generation" in identity, "nothing says which incarnation this is"
+    assert "ago(status.value.started_at, props.now)" in identity, (
         "how long this one has been up is not shown, or is computed here rather "
         "than by the one helper that formats a relative time"
+    )
+    markup = _template(DRAWER)
+    toolbar = markup[markup.index("<v-toolbar"):markup.index("</v-toolbar>")]
+    tooltip = re.search(r'<v-tooltip\s[^>]*v-model="identityShown"[^>]*:text="identity"[^>]*>', toolbar, re.S)
+    assert tooltip, "the incarnation is not on the toolbar's robot tooltip"
+    # A tap's compatibility mouseenter opens it first, so a toggle on the click closes it.
+    assert "open-on-click" not in tooltip.group(0), "a phone tap opens the tooltip and closes it again"
+    assert '@click="identityShown = true"' in toolbar, "a phone, which has no hover, cannot open it"
+    assert ':aria-label="identity"' in toolbar and 'tabindex="0"' in toolbar, (
+        "the incarnation is out of reach of a screen reader or a keyboard"
+    )
+    body = markup[markup.index('<div class="uber-body'):]
+    assert "generation" not in body and "started_at" not in body, (
+        "the generation line is back in the pane body"
     )
 
 
@@ -615,6 +636,35 @@ def test_the_standing_orders_button_opens_them_in_project_settings():
     assert "request(workspacePath('api/assistant/instructions', workspaceId), {" in client
 
 
+def test_project_settings_says_how_standing_orders_are_usually_set_and_when_they_changed():
+    """Issue 578 restores what the drawer's read-only panel said and the settings
+    section did not.
+
+    - The hint. The chat stays the usual write path because uber lmer confirms the
+      wording there before it stores it, which this textarea skips.
+    - An empty state, from the stored document rather than the draft.
+    - The last-changed time. ``instructions_at`` is the daemon's own stamp, aged by
+      the shell's clock.
+
+    The hint names the permanent document only, so #448's temporary orders can sit
+    beside it without contradicting it.
+    """
+    editor = WEB / "src" / "components" / "ProjectSettings.vue"
+    words = _words(editor)
+    assert ('Usually set by telling uber lmer in chat — "from now on…", "always…" — '
+            "and it confirms the wording before storing them.") in words
+    assert "No standing instructions yet." in words
+    assert "last changed" in words
+    text = _read(editor)
+    assert 'v-if="orders && !savedInstructions"' in text, (
+        "the empty state follows the draft, or shows before the orders were read"
+    )
+    assert "ago(orders.instructions_at, now)" in text
+    assert re.search(r"<ProjectSettings\b[^>]*:now=\"now\"", _read(APP), re.S), (
+        "Project settings is not given the shell's clock, so last changed stops ageing"
+    )
+
+
 def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
     """Global execution settings remain separate from the project instruction editor."""
     settings = WEB / "src" / "components" / "AssistantSettings.vue"
@@ -747,15 +797,22 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
 def test_the_drawer_takes_its_colour_from_the_theme():
     """A hex here is a colour the theme cannot change (main.js owns the palette).
 
-    The accent header is what makes this panel unmistakably not the run navigator,
-    so it is the one place most likely to reach for a literal.
+    The toolbar is the place most likely to reach for a literal. Since issue 578 it
+    is a neutral theme surface, `uber-toolbar`, rather than the project colour. What
+    sets the drawer apart from the run navigator is its edge and its "uber lmer"
+    name, both pinned above.
     """
     text = _read(DRAWER)
     hexes = re.findall(r"#[0-9a-fA-F]{3,8}\b", text)
     assert not hexes, f"the drawer hardcodes {hexes} instead of naming a theme colour"
-    assert 'color="primary"' in text, (
-        "the drawer has no accent, so it reads as the same panel as the run "
-        "navigator on the other edge"
+    toolbar = re.search(r"<v-toolbar\b[^>]*>", text, re.S).group(0)
+    assert 'color="uber-toolbar"' in toolbar, "the toolbar does not take the theme's neutral surface"
+    assert "projectColor" not in text and ":style" not in toolbar, (
+        "the toolbar is painted with the project colour again"
+    )
+    theme = _read(WEB / "src" / "main.js")
+    assert len(re.findall(r"'uber-toolbar': '#[0-9a-f]{6}'", theme)) == 2, (
+        "uber-toolbar is not defined in both colour schemes"
     )
 
 
