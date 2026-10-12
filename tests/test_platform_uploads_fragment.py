@@ -82,7 +82,7 @@ class TestPackagedTemplate:
         """Clarification 3: uber lmer manages the host store — reads, organises,
         deletes — and nothing prunes it for it."""
         rendered = render_fragment()
-        assert "uber lmer" in rendered
+        assert "Ratchet" in rendered
         assert "delete" in rendered
 
     def test_it_does_not_assume_the_harness_can_see_an_image(self):

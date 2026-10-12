@@ -2851,6 +2851,14 @@ def _comms_turns(events: list, session_id: str) -> tuple:
             )
             if tagged:
                 copies.append(("user", _collapsed(line), None))
+                # A container started before a rename keeps typing the old tag
+                # (#581); claim every alias so the pane does not show the
+                # relayed message twice until that session rotates.
+                if message.source.channel == bus.CHANNEL_UBER:
+                    current = bus.assistant_display_name()
+                    for alias in bus.assistant_label_aliases():
+                        if alias != current:
+                            copies.append(("user", _collapsed(line.replace(f"[{current}", f"[{alias}", 1)), None))
     return turns, copies
 
 

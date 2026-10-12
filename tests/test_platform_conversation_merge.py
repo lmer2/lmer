@@ -795,6 +795,34 @@ def test_the_harness_copy_of_a_relayed_record_is_hidden(platform_root):
     assert said(page).count(("user", "hello there")) == 2
 
 
+def test_the_new_assistant_tag_is_claimed(platform_root):
+    """A current worker types ``[Ratchet] …``; the bus record must not show twice."""
+    session_id = "s-bus-ratchet"
+    plant_rows(session_id, [
+        user_row("[Ratchet] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100)
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[Ratchet")]
+    assert harness_copies == [], "the harness's copy of the relayed record is still shown"
+    assert said(page).count(("user", "the review is posted")) == 1
+
+
+def test_a_legacy_assistant_tag_is_still_claimed(platform_root):
+    """A container started before the rename still types ``[uber lmer] …`` (#581)."""
+    session_id = "s-bus-legacy"
+    plant_rows(session_id, [
+        user_row("[uber lmer] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100)
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[uber lmer")]
+    assert harness_copies == [], "the legacy tag's harness copy is still shown"
+    assert said(page).count(("user", "the review is posted")) == 1
+
+
 def test_a_late_answer_is_labelled_and_a_command_is_the_platforms(platform_root):
     session_id = "s-bus-late"
     registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
