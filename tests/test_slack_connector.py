@@ -234,6 +234,12 @@ class TestRendering:
         assert connector.render_outbound(self._record("close", "")) is None
         assert connector.render_outbound(self._record("close", "withdrawn — already answered")) is None
 
+    def test_the_assistant_label_follows_the_configured_name(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_NAME", "Sprocket")
+        assert connector._who({"channel": "uber-lmer"}) == "Sprocket"
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_NAME")
+        assert connector._who({"channel": "uber-lmer"}) == "Ratchet"
+
     def test_the_agents_message_is_plain_and_other_channels_are_tagged(self):
         assert connector.render_outbound(self._record("message", "done")) == "done"
         assert connector.render_outbound(self._record("message", "go", channel="uber-lmer")) == "💬 [Ratchet] go"

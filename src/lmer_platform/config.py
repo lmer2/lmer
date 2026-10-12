@@ -1416,6 +1416,20 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
     return config
 
 
+def export_assistant_name(config: "PlatformConfig") -> None:
+    """Make this process's environment agree with the resolved display name.
+
+    Host-side consumers that have no config in hand — the daemon's notices and
+    errors, the CLI help, and the connector child's inherited environment — read
+    :func:`lmer_cli.comms.assistant_display_name` from the environment. Exporting
+    the resolved value here keeps them all on one name even when it was set only
+    in ``config.json`` (review of !403).
+    """
+    name = (config.assistant_name or "").strip()
+    if name:
+        os.environ[ASSISTANT_NAME_ENV] = name
+
+
 def _seed_gitlab_token_host(work_repo_url: Optional[str]) -> None:
     """Default the generic token's issuing host to the resolved work repo.
 

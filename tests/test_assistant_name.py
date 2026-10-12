@@ -31,6 +31,22 @@ class TestDisplayName:
         assert comms.assistant_label_aliases({"LMER_PLATFORM_ASSISTANT_NAME": "Sprocket"}) == (
             "Sprocket", "Ratchet", "uber lmer")
 
+    def test_aliases_use_a_resolved_name_over_the_environment(self):
+        # The host has config.json's name in hand even when its own env does not
+        # (review of !403): the resolved name is the first alias either way.
+        assert comms.assistant_label_aliases({}, name="Sprocket") == (
+            "Sprocket", "Ratchet", "uber lmer")
+        assert comms.assistant_label_aliases({"LMER_PLATFORM_ASSISTANT_NAME": "Cog"}, name="Sprocket") == (
+            "Sprocket", "Ratchet", "uber lmer")
+
+    def test_relay_label_uses_the_resolved_name(self):
+        message = comms.Message(id="s/1", seq=1, session="s", at="2026-01-01T00:00:00Z",
+                                source=comms.Source(comms.CHANNEL_UBER), kind="message",
+                                text="the review is posted")
+        text, tagged = comms.relay_payload(message, assistant_name="Sprocket")
+        assert tagged and text == "[Sprocket] the review is posted"
+        assert comms.relay_payload(message, assistant_name=None)[0] == "[Ratchet] the review is posted"
+
 
 class TestWireIdentifiersUntouched:
     """Grep guards: the rename is human-facing only."""

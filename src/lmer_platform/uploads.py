@@ -375,7 +375,7 @@ def registry_pointer(directory: Optional[Path]) -> dict:
     return {"path": str(directory), "container_path": CONTAINER_UPLOADS_DIR}
 
 
-def mounted_store(session_id: str, entry: Optional[dict]) -> Path:
+def mounted_store(session_id: str, entry: Optional[dict], assistant_name: Optional[str] = None) -> Path:
     """The store a live session's registry *entry* says it was given.
 
     Raises :class:`StoreUnavailable` when the entry records none, which covers
@@ -386,11 +386,12 @@ def mounted_store(session_id: str, entry: Optional[dict]) -> Path:
     """
     pointer = (entry or {}).get("uploads")
     if not isinstance(pointer, dict) or not pointer.get("path"):
+        name = (assistant_name or "").strip() or assistant_display_name()
         raise StoreUnavailable(
             "this session has no upload store: it was started before file "
             "upload existed, or its store could not be created. Restart the "
             "session ("
-            f"{assistant_display_name()}: restart it from the chat header) and the next "
+            f"{name}: restart it from the chat header) and the next "
             "one will accept files."
         )
     directory = upload_dir_for(session_id, str((entry or {}).get("kind") or ""))

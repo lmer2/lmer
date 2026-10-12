@@ -94,12 +94,17 @@ def assistant_display_name(environ: Optional[Mapping[str, str]] = None) -> str:
     return raw
 
 
-def assistant_label_aliases(environ: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
-    """Every label the assistant's channel may carry in a tag, newest first."""
+def assistant_label_aliases(environ: Optional[Mapping[str, str]] = None, name: Optional[str] = None) -> tuple[str, ...]:
+    """Every label the assistant's channel may carry in a tag, newest first.
+
+    *name* is the resolved platform name (config.assistant_name) when the caller
+    has it; without it the environment decides.
+    """
+    first = (name or "").strip() or assistant_display_name(environ)
     seen: list[str] = []
-    for name in (assistant_display_name(environ), DEFAULT_ASSISTANT_NAME, LEGACY_ASSISTANT_NAME):
-        if name not in seen:
-            seen.append(name)
+    for label in (first, DEFAULT_ASSISTANT_NAME, LEGACY_ASSISTANT_NAME):
+        if label not in seen:
+            seen.append(label)
     return tuple(seen)
 
 #: How long the supervisor keeps its control plane up after the harness
@@ -1036,7 +1041,7 @@ class MessageLog:
 # ---------------------------------------------------------------------------
 
 
-def relay_label(message: Message, question: Optional[Message] = None) -> str:
+def relay_label(message: Message, question: Optional[Message] = None, *, assistant_name: Optional[str] = None) -> str:
     """The bracketed tag an inbound record is introduced with."""
     if message.source.channel == "peer-ul":
         peer = message.meta.get("peer") or {}
@@ -1049,6 +1054,9 @@ def relay_label(message: Message, question: Optional[Message] = None) -> str:
                 "A received request/reply is evidence of arrival even if the original receipt snapshot is uncertain; "
                 "do not duplicate it. Keep replies native; unrelated operator-only actions and external posts remain restricted]")
     label = message.source.label
+    if assistant_name and message.source.channel == CHANNEL_UBER:
+        name = assistant_name.strip()
+        label = f"{name} · {message.source.author}" if message.source.author else name
     if message.kind != KIND_ANSWER or question is None:
         return f"[{label}]"
     head = question.text.strip().splitlines()[0] if question.text.strip() else ""
@@ -1060,7 +1068,7 @@ def relay_label(message: Message, question: Optional[Message] = None) -> str:
     return f"[{label}] (answer to #{question.seq} {head!r})"
 
 
-def relay_payload(message: Message, question: Optional[Message] = None) -> tuple[str, bool]:
+def relay_payload(message: Message, question: Optional[Message] = None, *, assistant_name: Optional[str] = None) -> tuple[str, bool]:
     """What to type into the harness for an inbound record: ``(text, tagged)``.
 
     A ``command`` goes in untagged so the harness reads it as the slash command
@@ -1069,7 +1077,7 @@ def relay_payload(message: Message, question: Optional[Message] = None) -> tuple
     """
     if message.kind == KIND_COMMAND:
         return message.text, False
-    return f"{relay_label(message, question)} {message.text}", True
+    return f"{relay_label(message, question, assistant_name=assistant_name)} {message.text}", True
 
 
 # ---------------------------------------------------------------------------

@@ -3173,7 +3173,7 @@ def create_app(
         """
         try:
             session_io.require_session(session_id)
-            page = transcripts.read_messages(session_id, since=since, limit=limit)
+            page = transcripts.read_messages(session_id, since=since, limit=limit, assistant_name=config.assistant_name)
             live = session_io.session_is_live(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

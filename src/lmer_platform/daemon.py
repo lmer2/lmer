@@ -62,7 +62,7 @@ from .config import (
     revoke_connector_credential,
 )
 from .config import (
-    ConfigError, binding_notice, ensure_secret, load as load_config, read_secret,
+    ConfigError, binding_notice, ensure_secret, export_assistant_name, load as load_config, read_secret,
 )
 from .detect import Detector
 from .ingress import Ingress
@@ -392,6 +392,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ingress = Ingress()
     overrides = _overrides(args)
     config = load_config(overrides)
+    export_assistant_name(config)
     secret = ensure_secret(config)
 
     # flush=True throughout: stdout is a pipe under nohup/systemd, so Python
