@@ -37,6 +37,8 @@ __all__ = [
     "KIND_ANSWER", "KIND_CLOSE", "KIND_COMMAND", "KNOWN_KINDS", "AGENT_KINDS",
     "RELAYED_KINDS", "CHANNEL_AGENT", "CHANNEL_TERMINAL", "CHANNEL_PLATFORM",
     "CHANNEL_UBER", "CHANNEL_SLACK", "CHANNEL_MATRIX", "CHANNEL_LABELS",
+    "ASSISTANT_NAME_ENV", "DEFAULT_ASSISTANT_NAME", "LEGACY_ASSISTANT_NAME",
+    "assistant_display_name", "assistant_label_aliases",
     "CHANNEL_SUPERVISOR", "EVENT_SESSION_END_REQUESTED", "PLATFORM_SUBSCRIBER",
     "COMMAND_CHANNELS", "MAX_TEXT_CHARS", "MAX_OPTIONS", "MAX_OPTION_CHARS",
     "MAX_OPEN_QUESTIONS", "MAX_AGENT_ENTRIES", "ACCEPTED_NEW",
@@ -72,6 +74,33 @@ COMMS_LOG_ENV = "LMER_COMMS_LOG"
 TERMINAL_MIRROR_ENV = "LMER_COMMS_TERMINAL_MIRROR"
 TERMINAL_CONFIRM_ENV = "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"
 DEFAULT_TERMINAL_CONFIRM_SECONDS = 30
+
+#: The assistant's human-facing name (issue #581). One env var on host, daemon
+#: and inside containers; the platform exports it at spawn. Wire identifiers
+#: (``CHANNEL_UBER``) never follow it.
+ASSISTANT_NAME_ENV = "LMER_PLATFORM_ASSISTANT_NAME"
+DEFAULT_ASSISTANT_NAME = "Ratchet"
+#: What sessions started before the rename still type; accepted on read.
+LEGACY_ASSISTANT_NAME = "uber lmer"
+MAX_ASSISTANT_NAME_CHARS = 40
+
+
+def assistant_display_name(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The configured display name, or the default for blank/unset/over-long."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(ASSISTANT_NAME_ENV) or "").strip()
+    if not raw or len(raw) > MAX_ASSISTANT_NAME_CHARS:
+        return DEFAULT_ASSISTANT_NAME
+    return raw
+
+
+def assistant_label_aliases(environ: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
+    """Every label the assistant's channel may carry in a tag, newest first."""
+    seen: list[str] = []
+    for name in (assistant_display_name(environ), DEFAULT_ASSISTANT_NAME, LEGACY_ASSISTANT_NAME):
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 #: How long the supervisor keeps its control plane up after the harness
 #: exits, so a subscriber can fetch and ack the last records over HTTP. The
@@ -127,7 +156,6 @@ CHANNEL_LABELS = {
     CHANNEL_AGENT: "agent",
     CHANNEL_TERMINAL: "terminal",
     CHANNEL_PLATFORM: "platform",
-    CHANNEL_UBER: "uber lmer",
     CHANNEL_SLACK: "slack",
     CHANNEL_MATRIX: "matrix",
 }
@@ -232,7 +260,10 @@ class Source:
 
     @property
     def label(self) -> str:
-        name = CHANNEL_LABELS.get(self.channel, self.channel)
+        if self.channel == CHANNEL_UBER:
+            name = assistant_display_name()
+        else:
+            name = CHANNEL_LABELS.get(self.channel, self.channel)
         return f"{name} · {self.author}" if self.author else name
 
     def to_dict(self) -> dict:

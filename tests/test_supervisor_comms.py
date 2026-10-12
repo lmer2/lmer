@@ -83,7 +83,7 @@ class TestRecords:
 
     def test_source_label_is_channel_then_author(self):
         assert Source(CHANNEL_SLACK, author="tester").label == "slack · tester"
-        assert Source(CHANNEL_UBER).label == "uber lmer"
+        assert Source(CHANNEL_UBER).label == "Ratchet"
         assert Source("future-thing").label == "future-thing"
 
     def test_source_channel_is_validated_not_sanitized(self):

@@ -1,0 +1,62 @@
+"""The assistant's display name (issue #581): one value, every surface, no wire change."""
+import re
+from pathlib import Path
+
+import pytest
+
+from lmer_cli import comms
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+class TestDisplayName:
+    def test_default_is_ratchet(self):
+        assert comms.DEFAULT_ASSISTANT_NAME == "Ratchet"
+        assert comms.assistant_display_name({}) == "Ratchet"
+
+    def test_env_overrides(self):
+        assert comms.assistant_display_name({"LMER_PLATFORM_ASSISTANT_NAME": "Sprocket"}) == "Sprocket"
+
+    def test_blank_env_falls_back_to_default(self):
+        assert comms.assistant_display_name({"LMER_PLATFORM_ASSISTANT_NAME": "   "}) == "Ratchet"
+
+    def test_the_tag_uses_the_name(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_NAME", "Sprocket")
+        assert comms.Source(comms.CHANNEL_UBER).label == "Sprocket"
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_NAME")
+        assert comms.Source(comms.CHANNEL_UBER).label == "Ratchet"
+
+    def test_aliases_carry_the_legacy_label(self):
+        assert comms.assistant_label_aliases({}) == ("Ratchet", "uber lmer")
+        assert comms.assistant_label_aliases({"LMER_PLATFORM_ASSISTANT_NAME": "Sprocket"}) == (
+            "Sprocket", "Ratchet", "uber lmer")
+
+
+class TestWireIdentifiersUntouched:
+    """Grep guards: the rename is human-facing only."""
+
+    def test_channel_value_is_stable(self):
+        from lmer_platform import comms as platform_comms
+        assert comms.CHANNEL_UBER == "uber-" + "lmer"
+        assert platform_comms.CHANNEL_UBER == "uber-" + "lmer"
+        assert comms.CHANNEL_UBER in comms.COMMAND_CHANNELS
+
+    @pytest.mark.parametrize("path, needle", [
+        ("src/lmer_platform/daemon.py", '== "uber-' + 'lmer"'),
+        ("src/lmer_platform/project_events.py", '== "uber-' + 'lmer"'),
+        ("src/lmer_platform/api.py", 'return "uber-' + 'lmer"'),
+        ("web/src/outbound.js", "'uber-" + "lmer'"),
+    ])
+    def test_comparisons_still_name_the_channel(self, path, needle):
+        assert needle in (REPO / path).read_text(encoding="utf-8"), path
+
+    def test_container_passthrough_declares_the_name(self):
+        source = (REPO / "src/lmer_cli/cli.py").read_text(encoding="utf-8")
+        pattern = re.compile(
+            r"""["']LMER_PLATFORM_ASSISTANT_NAME["']\s*:\s*os\.environ\.get\(\s*["']LMER_PLATFORM_ASSISTANT_NAME["']\s*\)"""
+        )
+        assert pattern.search(source), "LMER_PLATFORM_ASSISTANT_NAME missing from cli.py's container env dict"
+
+    def test_documented_in_the_env_var_reference(self):
+        docs = (REPO / "docs/LMER-CLI.md").read_text(encoding="utf-8")
+        assert "**`LMER_PLATFORM_ASSISTANT_NAME`**" in docs

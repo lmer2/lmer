@@ -236,11 +236,11 @@ class TestRendering:
 
     def test_the_agents_message_is_plain_and_other_channels_are_tagged(self):
         assert connector.render_outbound(self._record("message", "done")) == "done"
-        assert connector.render_outbound(self._record("message", "go", channel="uber-lmer")) == "💬 [uber lmer] go"
+        assert connector.render_outbound(self._record("message", "go", channel="uber-lmer")) == "💬 [Ratchet] go"
         assert connector.render_outbound(self._record("message", "ok", channel="terminal")) == "💬 [terminal] ok"
         assert connector.render_outbound(self._record("note", "working")) is None
         assert connector.render_outbound(self._record("milestone", "pushed")) == "🏁 pushed"
-        assert connector.render_outbound(self._record("command", "/followup", channel="uber-lmer")) == "⌨️ [uber lmer] /followup"
+        assert connector.render_outbound(self._record("command", "/followup", channel="uber-lmer")) == "⌨️ [Ratchet] /followup"
 
     def test_attachments_are_named(self):
         text = connector.render_outbound(self._record("message", "see", attachments=[{"name": "shot.png"}]))
@@ -1024,7 +1024,7 @@ def test_assistant_reply_reaches_slack_and_human_reply_reaches_its_pty(rig):
     rig.connector.start()
     try:
         rig.agent("message", "hello from the assistant")
-        rig.wait_until(lambda: any("[uber lmer] hello from the assistant" in text for _, _, text in rig.slack.posted))
+        rig.wait_until(lambda: any("[Ratchet] hello from the assistant" in text for _, _, text in rig.slack.posted))
         rig.slack.human_says("hello back")
         rig.wait_until(lambda: b"hello back" in b"".join(rig.sink))
         assert b"[slack \xc2\xb7 tester] hello back" in b"".join(rig.sink)

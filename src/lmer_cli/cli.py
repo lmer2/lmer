@@ -3711,6 +3711,7 @@ def main(argv: list[str] | None = None) -> int:
         # whether it mirrors what a human types at the terminal (issue #407).
         "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": os.environ.get("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"),
+        "LMER_PLATFORM_ASSISTANT_NAME": os.environ.get("LMER_PLATFORM_ASSISTANT_NAME"),
         "LMER_COMMS_TERMINAL_MIRROR": os.environ.get("LMER_COMMS_TERMINAL_MIRROR"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
