@@ -247,7 +247,7 @@ const draft = ref(readDraft(draftKey).text)
 watch(draft, text => storeDraft(draftKey, text, []))
 const sending = ref(false)
 const pending = ref([])
-// Ratchet's "talking" mood (issue #581): an operator message is in flight or
+// Ratchet's "talking" mood (issue 581): an operator message is in flight or
 // has not yet shown up in the transcript.
 watch(() => sending.value || pending.value.length > 0, (value) => emit('replying', value), { immediate: true })
 const showInjected = ref(false)

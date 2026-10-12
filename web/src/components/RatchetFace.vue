@@ -1,5 +1,5 @@
 <script setup>
-// Ratchet's face (issue #581): one mood in, one <img> out. The fade and the
+// Ratchet's face (issue 581): one mood in, one <img> out. The fade and the
 // off treatment live here so the pane header and the bar button agree. The
 // files are chadd's 128px art, downscaled in CSS only.
 import { computed } from 'vue'

@@ -434,7 +434,7 @@ const liveWorkers = computed(
   () => runs.value.filter((run) => run.live && !run.orchestrator).length,
 )
 
-// --- Ratchet's mood (issue #581) ---------------------------------------------
+// --- Ratchet's mood (issue 581) ---------------------------------------------
 //
 // Computed over the runs this view shows (spec D5), plus what the open pane
 // reports about its own chat. Held across a failed poll on purpose: a face that
@@ -473,7 +473,7 @@ const ratchetOff = computed(() => {
   if (project?.assistant?.lifecycle) return project.assistant.lifecycle !== 'running'
   return false
 })
-// The tab icon follows the same mood (issue #581). No slash variant for `off`:
+// The tab icon follows the same mood (issue 581). No slash variant for `off`:
 // a tab icon is not a status surface, so it stays on the face.
 watch(ratchetMood, (mood) => {
   document.getElementById('favicon')?.setAttribute('href', faceUrl(mood))
