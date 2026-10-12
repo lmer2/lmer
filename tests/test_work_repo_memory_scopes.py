@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 import itertools
 import json
+import posixpath
 import threading
 
 import pytest
@@ -902,11 +903,19 @@ class TestTwoSessionsDoNotDeleteEachOther:
             assert memory.restore_memory() == 0
 
         def retire(agent_dir):
-            """Tombstone the shared line: keep the file, drop the link."""
+            """Tombstone the shared line the way ``forget`` does: re-point the
+            entry at THIS file's archive mirror (the identity-bearing form).
+            A bare ``forgotten <date>`` word tombstone carries no identity and
+            gap (e) correctly re-indexes the live file."""
+            scope_rel = tree.project_memory_dir.relative_to(tree.root)
+            target = posixpath.relpath(
+                memory._archive_rel_for_key((scope_rel / "shared.md").as_posix()),
+                scope_rel.as_posix(),
+            )
             index = agent_dir / "MEMORY.md"
             index.write_text(
                 "".join(
-                    "- Shared — forgotten 2026-08-25 — s\n"
+                    f"- [Shared]({target}) — a fact\n"
                     if "shared.md" in line
                     else line
                     for line in index.read_text().splitlines(keepends=True)
