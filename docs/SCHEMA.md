@@ -247,7 +247,12 @@ selects its scope:
   a session can neither drop an entry it never held nor restore one another
   session retired. A writer that cannot tell which files it was given MUST
   delete nothing. Mirroring a scope from one session's directory is how a
-  session deletes work it never knew about.
+  session deletes work it never knew about. A writer MUST also keep each
+  scope's `MEMORY.md` entry lines derived from the scope's live files and its
+  retirement state: a live memory file with no entry gets one, and an entry
+  whose file is gone is tombstoned in place per [Index lines](#index-lines) —
+  never silently dropped. Non-entry lines — headings, hand-written commentary
+  and the tombstones `forget` wrote — are preserved verbatim.
 
 ### record
 
@@ -477,6 +482,10 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
   records (project) or the manifest (root), so concurrent writers converge,
   and a rebase conflict confined to them is resolved by rendering again from
   the merged tree ([WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)).
+  `MEMORY.md` is not last-writer-wins either: `work memory persist` merges its
+  lines and reconciles its entry lines with the scope's live files and
+  retirement state ([memory](#memory)), so concurrent writers converge rather
+  than overwrite one another's entries.
   Every schema-defined symlink MUST be relative and MUST resolve inside the
   plexus.
 - A bare `git clone` of any conforming plexus is readable markdown throughout

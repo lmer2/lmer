@@ -897,12 +897,6 @@ class TestGapEIndexReconciliation:
             line for line in published.splitlines(keepends=True) if "_archive/" in line
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (e): entry lines are never reconciled with live files — "
-        "a dangling entry survives and an unindexed live file stays unindexed",
-    )
     def test_after_persist_entries_and_live_files_agree_and_hand_written_lines_stay(
         self, schema2_plexus
     ):
@@ -929,12 +923,6 @@ class TestGapEIndexReconciliation:
         codes = {finding.code for finding in validate(alpha.clone).findings}
         assert not codes & {ENTRY_WITHOUT_FILE, FILE_WITHOUT_ENTRY}, codes
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (e): a session with no MEMORY.md leaves the scope's "
-        "index untouched, so its new file is never indexed",
-    )
     def test_a_session_with_no_index_still_gets_its_new_file_an_entry(self, schema2_plexus):
         plexus = schema2_plexus
         alpha = plexus.enter(plexus.start("alpha"))

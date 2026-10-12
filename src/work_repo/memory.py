@@ -129,6 +129,7 @@ import re
 import shutil
 import sys
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
@@ -2053,6 +2054,7 @@ def _write_scope(
     """
     dest.mkdir(parents=True, exist_ok=True)
     root = work_repo_root()
+    index_path = dest / MEMORY_INDEX
     held = set(files)
     keep = _shadowed(dest, held, claimed)
     restored = _manifest_files(manifest, scope)
@@ -2100,13 +2102,12 @@ def _write_scope(
         if source.is_file()
     }
     if index_text is not None:
-        index = dest / MEMORY_INDEX
         merged = _merged_index_text(
-            _read_text(index) if index.is_file() else "",
+            _read_text(index_path) if index_path.is_file() else "",
             index_text,
             _manifest_index(manifest, scope),
         )
-        index.write_text(merged, encoding="utf-8")
+        index_path.write_text(merged, encoding="utf-8")
         copied += 1
         # What THIS SESSION HOLDS — its own index lines — never the merged
         # survivors, exactly as `entry["files"]` records the source and not
@@ -2127,7 +2128,150 @@ def _write_scope(
         entry["index"] = _index_lines(index_text)
     else:
         entry.setdefault("index", [])
+
+    # Reconcile the scope's OWN index with the scope's live files and its
+    # retirement state (#369 gap (e)). Runs for both tree forms and even when
+    # the agent has no index: this persist changed the scope's live files, and
+    # a dangling entry is a validator ERROR in schema form. The session's
+    # recorded `index` above stays what the session HOLDS, so the next persist
+    # still tells its own removals from another writer's edits.
+    current = _read_text(index_path) if index_path.is_file() else ""
+    if current.strip() or any(rel.name != MEMORY_INDEX for rel in _files_under(dest)):
+        reconciled = _reconcile_index(current, dest, retired or set())
+        if reconciled != current:
+            index_path.write_text(reconciled, encoding="utf-8")
     return copied, deleted, declined
+
+
+def _tombstone_date() -> str:
+    """The date a reconciled tombstone carries (``YYYY-MM-DD``, UTC)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _tombstone_line(line: str, live: Set[str], when: str) -> str:
+    """Replace the link of every DEAD entry on *line* with ``archived <date>``.
+
+    The ``docs/SCHEMA.md`` 'Index lines' tombstone: the line stays and its
+    hand-written text survives; only the link to a file that is no longer
+    there goes. A link that is not a relative ``.md`` entry (a URL, an anchor,
+    a link already pointing at ``_archive/``) is left alone, and so is an
+    entry whose file IS live — a line may legitimately carry several.
+    """
+    def replace(match: "re.Match") -> str:
+        target = match.group(1)
+        if not target.lower().endswith(".md") or _NOT_RELATIVE_RE.match(target):
+            return match.group(0)
+        normalized = posixpath.normpath(target)
+        if any(part in _ARCHIVE_MARKERS for part in normalized.split("/")):
+            return match.group(0)
+        if normalized in live:
+            return match.group(0)
+        return f"archived {when}"
+
+    return _LINK_RE.sub(replace, line)
+
+
+def _generated_entry(dest: Path, rel: Path) -> str:
+    """A generated index line for a live memory with no entry.
+
+    Form: ``- [<frontmatter name or stem>](<relative path>) — <description>``.
+    The title prefers the memory's own ``name`` (what the agent and the
+    validator read), falling back to the filename stem; the description is the
+    frontmatter's, omitted when absent so the line is still a valid entry.
+    """
+    data = _frontmatter(_read_text(dest / rel))
+    name = data.get("name") if data is not None else None
+    title = name if isinstance(name, str) and name.strip() else rel.stem
+    line = f"- [{title}]({rel.as_posix()})"
+    description = data.get("description") if data is not None else None
+    if isinstance(description, str) and description.strip():
+        line += f" — {' '.join(description.split())}"
+    return line + "\n"
+
+
+def _tombstone_covers(text: str, dest: Path, rel: Path) -> bool:
+    """Whether *text* carries a tombstone that accounts for *rel*.
+
+    A retired memory's file may still be live in the scope — a stale session
+    re-created it, or ``forget`` moved it while a copy stayed behind — and its
+    entry line was deliberately removed. Re-indexing it would resurrect a line
+    somebody retired, so the reconcile must see the tombstone as covering it.
+
+    Two tombstone shapes (docs/SCHEMA.md, 'Index lines'): a link re-pointed at
+    the ``_archive/`` mirror, whose target names the file; and the word form
+    (``archived``/``forgotten`` plus a date), which keeps the title. The file's
+    frontmatter ``name`` or its stem is what either carries.
+    """
+    data = _frontmatter(_read_text(dest / rel))
+    name = data.get("name") if data is not None else None
+    # Match the full filename, not the stem: a short stem (``a.md``) would
+    # match almost any line carrying that letter and silently suppress a real
+    # entry. Word boundaries keep ``shared.md`` from matching ``sharedness``.
+    candidates = [rel.name.lower()]
+    if isinstance(name, str) and name.strip():
+        candidates.append(name.strip().lower())
+    for line in text.splitlines():
+        if _entry_targets(line):
+            continue
+        lowered = line.lower()
+        if not _is_tombstone(line) and not re.search(
+            r"\b(?:archived|forgotten)\b", lowered
+        ):
+            continue
+        if any(
+            re.search(rf"(?<![a-z0-9]){re.escape(c)}(?![a-z0-9])", lowered)
+            for c in candidates
+        ):
+            return True
+    return False
+
+
+def _reconcile_index(text: str, dest: Path, retired: Set[Path]) -> str:
+    """Make the scope index's entry lines agree with the scope's live files.
+
+    Entry lines for files that are gone are tombstoned IN PLACE (never
+    dropped); live memory files with no entry get a generated line appended,
+    unless the scope's retirement state already accounts for them — *retired*
+    (the keys ``work memory forget`` recorded) or a tombstone the index
+    already carries (:func:`_tombstone_covers`) — so a retired line stays
+    retired. Every non-entry line — headings, hand-written commentary, blank
+    lines and the tombstones ``work memory forget`` wrote — is kept
+    byte-identical and in position. This runs after the line merge, on the
+    scope's own index, so it reads the scope's live files plus its retirement
+    state and never one session's view.
+    """
+    live = {
+        rel.as_posix()
+        for rel in _files_under(dest)
+        if rel.suffix.lower() == ".md"
+        and rel.name != MEMORY_INDEX
+        and not _is_conflict_copy(rel)
+    }
+    when = _tombstone_date()
+    out: List[str] = []
+    indexed: Set[str] = set()
+    for line in text.splitlines(keepends=True):
+        targets = _entry_targets(line)
+        if not targets:
+            out.append(line)
+            continue
+        for target in targets:
+            if target in live:
+                indexed.add(target)
+        if all(target in live for target in targets):
+            out.append(line)
+        else:
+            out.append(_tombstone_line(line, live, when))
+    for rel in sorted(live - indexed):
+        if Path(rel) in retired:
+            continue
+        if _tombstone_covers(text, dest, Path(rel)):
+            continue
+        out.append(_generated_entry(dest, Path(rel)))
+    result = "".join(out)
+    if result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _route(source: Path):

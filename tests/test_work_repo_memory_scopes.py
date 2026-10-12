@@ -454,12 +454,15 @@ class TestARetirementThatEmptiesAScopeStillCarries:
         # dir is exactly what a crash or a killed container leaves, and it is
         # indistinguishable from this. Under-deleting an index line loses
         # nothing; the lines go as soon as one session holds an index again.
-        assert PROJECT_MEMORY_FILE in (
-            tree.project_memory_dir / memory.MEMORY_INDEX
-        ).read_text()
-        assert USER_MEMORY_FILE in (
-            tree.instance_memory_dir / memory.MEMORY_INDEX
-        ).read_text()
+        # Gap (e) then reconciles each surviving entry with the now-empty
+        # scope: the line stays, non-lossily, as `archived <date>` rather
+        # than dangling (never a silent drop).
+        project_index = (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        instance_index = (tree.instance_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert "archived" in project_index, project_index
+        assert f"({PROJECT_MEMORY_FILE})" not in project_index, project_index
+        assert "archived" in instance_index, instance_index
+        assert f"({USER_MEMORY_FILE})" not in instance_index, instance_index
 
     def test_retiring_every_memory_carries_in_a_legacy_tree_too(self, legacy_tree):
         tree, agent_dir = legacy_tree
@@ -658,11 +661,15 @@ class TestLegacyFormIsUnchanged:
         assert rc == 0
         assert (tree.project_memory_dir / "prefs.md").exists()
         assert (tree.project_memory_dir / "gotcha.md").exists()
-        # The index is written verbatim, not rebuilt: one scope, nothing to
-        # split, and no reason for the bytes to change. It replaces the one
-        # in the work repo entirely because this session restored every line
-        # of it and then dropped them (issue #369) — the honest edit.
-        assert (tree.project_memory_dir / "MEMORY.md").read_text() == index
+        # The hand-written lines are kept verbatim, and the one scope's own
+        # index is reconciled against its live files (gap (e)): the unindexed
+        # `gotcha.md` — and every seeded live file whose entry this session
+        # dropped — gains a generated entry rather than staying invisible.
+        text = (tree.project_memory_dir / "MEMORY.md").read_text()
+        assert text.startswith(index), text
+        for path in tree.project_memory_dir.glob("*.md"):
+            if path.name != memory.MEMORY_INDEX:
+                assert f"({path.name})" in text, (path.name, text)
         assert staged == [f"{PRIMARY_REPO}/memory"]
         assert not (tree.root / "_agents").exists()
 
@@ -869,10 +876,13 @@ class TestTwoSessionsDoNotDeleteEachOther:
 
         Invariant, checked on the FILE and on its INDEX LINE uniformly after
         every persist: the scope holds the last thing some session
-        deliberately did — an edit, a removal, or a retirement (tombstoning
-        the index line while keeping the file). A session that merely held a
-        stale copy never reverts it, never deletes it, and never resurrects a
-        line another session retired.
+        deliberately did — an edit, a removal, or a retirement. Gap (e)
+        reconciles the entry with the live files, so a removal that carries
+        tombstones the line (``archived <date>``, never a silent drop) while
+        a retirement tombstones it and keeps the file; a removal the write
+        gate refuses leaves the file and its entry intact. A session that
+        merely held a stale copy never reverts it, never deletes it, and
+        never resurrects a line another session retired.
 
         The index half is here because `entry["index"]` had the mirror of the
         file-side bug: it recorded the surviving lines rather than the lines
@@ -904,7 +914,7 @@ class TestTwoSessionsDoNotDeleteEachOther:
             )
 
         expected = "a fact"
-        linked = True  # is the shared memory still LINKED in the scope's index?
+        retired = False  # has a session deliberately tombstoned the shared line?
         removed = False
         for name, action in zip(("s1", "s2", "s3"), actions):
             monkeypatch.setenv("LMER_AGENT_MEMORY_DIR", str(dirs[name]))
@@ -918,7 +928,7 @@ class TestTwoSessionsDoNotDeleteEachOther:
                 removed = True
             elif action == "retire":
                 retire(dirs[name])
-                linked = False
+                retired = True
 
             for cycle in ("one", "two"):
                 self._add(dirs[name], f"{name}-{cycle}", "project", f"{name} {cycle}")
@@ -935,11 +945,16 @@ class TestTwoSessionsDoNotDeleteEachOther:
                 assert rc == 0
                 index_text = (tree.project_memory_dir / "MEMORY.md").read_text()
 
-                # The index line: retired stays retired, on BOTH cycles and
-                # for every session after the one that retired it.
-                assert ("(shared.md)" in index_text) == linked, (
+                # The index line: gap (e) ties it to the live file. A
+                # retirement is a deliberate tombstone and stays unlinked
+                # while the file survives; a removal whose deletion carries
+                # leaves no file, so the line is tombstoned in place; a
+                # removal the write gate refuses (an upstream edit is newer)
+                # leaves the file live and the entry linked.
+                expected_linked = (not retired) and shared.is_file()
+                assert ("(shared.md)" in index_text) == expected_linked, (
                     f"{name}:{action} cycle {cycle} "
-                    f"{'lost' if linked else 'resurrected'} the shared index "
+                    f"{'lost' if expected_linked else 'resurrected'} the shared index "
                     f"line (actions={actions})"
                 )
 

@@ -165,8 +165,13 @@ def test_a_tombstone_line_stays_in_its_own_scopes_index(schema2_tree, monkeypatc
     for scope, directory in scopes.items():
         (directory / f"{scope}_fact.md").write_text(_memory_file(f"{scope}-fact", kinds[scope]))
         (directory / f"{scope}_live.md").write_text(_memory_file(f"{scope}-live", kinds[scope]))
+        # Append to the fixture's index rather than replacing it: the seeded
+        # live file must keep its entry, or gap (e) would (correctly) generate
+        # one and this test would be measuring that instead of tombstone
+        # isolation.
         (directory / "MEMORY.md").write_text(
-            "# Memory\n"
+            (directory / "MEMORY.md").read_text()
+            + "# Memory\n"
             + _index_line(f"{scope} fact", f"{scope}_fact.md")
             + _index_line(f"{scope} live", f"{scope}_live.md")
         )
@@ -210,9 +215,18 @@ def test_an_instance_forget_does_not_leak_a_live_entry_into_a_project_index(
     scopes = memory.memory_scope_dirs()
     name = "user_operator_prefers_terse_replies.md"
     (scopes["instance"] / name).write_text(_memory_file("operator-prefers-terse-replies", "user"))
-    (scopes["instance"] / "MEMORY.md").write_text(_index_line("Operator prefers terse replies", name))
+    # Append to the fixture indexes rather than replacing them: a live file
+    # whose entry was dropped would be (correctly) re-indexed by gap (e), and
+    # this test is about the retired line's scope, not about reconciliation.
+    (scopes["instance"] / "MEMORY.md").write_text(
+        (scopes["instance"] / "MEMORY.md").read_text()
+        + _index_line("Operator prefers terse replies", name)
+    )
     (scopes["project"] / "project_fact.md").write_text(_memory_file("project-fact", "project"))
-    (scopes["project"] / "MEMORY.md").write_text(_index_line("Project fact", "project_fact.md"))
+    (scopes["project"] / "MEMORY.md").write_text(
+        (scopes["project"] / "MEMORY.md").read_text()
+        + _index_line("Project fact", "project_fact.md")
+    )
     project_before = (scopes["project"] / "MEMORY.md").read_text()
 
     assert memory.restore_memory() == 0
