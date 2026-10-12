@@ -167,7 +167,7 @@ def test_the_bar_control_carries_the_orchestrators_state_and_what_it_needs():
         "can disagree with the map about what a state looks like"
     )
     markup = _read(APP)
-    button = re.search(r'<v-btn\b[^>]*:icon="mdiRobot"[^>]*/>', markup, re.S)
+    button = re.search(r'<v-btn\b[^>]*\bicon\b[^>]*>\s*<RatchetFace\b[^>]*/>\s*</v-btn>', markup, re.S)
     assert button, "the uber lmer bar control is no longer recognisable"
     assert ':aria-label="orchestratorHint"' in button.group(0)
     assert ':color="orchestratorTone"' in button.group(0), (

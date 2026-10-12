@@ -275,7 +275,7 @@ it.each([
   const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
   await flushPromises()
   const supervised = workspace !== 'alpha'
-  const robot = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label="talk to Ratchet"]')
+  const robot = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label^="talk to Ratchet"]')
   expect(robot.classes().includes('text-success')).toBe(supervised)
   expect(robot.classes().includes('robot-on-surface')).toBe(onSurface)
 })

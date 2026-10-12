@@ -1,5 +1,16 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
+import App from '../src/App.vue'
+import RatchetFace from '../src/components/RatchetFace.vue'
+import { fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
+import { mountPane } from './mount.js'
 import { DEFAULT_ASSISTANT_NAME, applyAssistantName, assistantName, faceFile, faceUrl, moodOf, moodReason } from '../src/ratchet.js'
+
+vi.mock('../src/api.js', () => ({
+  fetchProjects: vi.fn(),
+  fetchState: vi.fn(), forgetRun: vi.fn(), prune: vi.fn(), rescan: vi.fn(),
+  fetchRunRelations: vi.fn().mockResolvedValue({ run: {}, relations: [] }),
+}))
 
 describe('assistantName', () => {
   it('defaults to Ratchet', () => {
@@ -104,5 +115,70 @@ describe('faceUrl', () => {
   it('gives the pre-poll state its own mood name but the talking face', () => {
     expect(faceFile('loading')).toBe('ratchet_talking')
     expect(faceUrl('loading')).toBe('./assets/ratchet/ratchet_talking.png')
+  })
+})
+
+describe('RatchetFace', () => {
+  it('draws the mood with alt text and the configured name', () => {
+    const wrapper = mountPane(RatchetFace, { mood: 'question', size: 32 })
+    const img = wrapper.get('img.ratchet-face')
+    expect(img.attributes('src')).toBe('./assets/ratchet/ratchet_question.png')
+    expect(img.attributes('alt')).toBe('Ratchet, question')
+    expect(img.attributes('width')).toBe('32')
+    expect(wrapper.classes()).not.toContain('ratchet-off')
+  })
+
+  it('shows the off face, crossed out, when the assistant is not running', () => {
+    const wrapper = mountPane(RatchetFace, { mood: 'idle', off: true })
+    expect(wrapper.classes()).toContain('ratchet-off')
+    expect(wrapper.get('img').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
+    expect(wrapper.get('img').attributes('alt')).toBe('Ratchet, off')
+  })
+
+  it('declares the fade and its reduced-motion opt-out in its own stylesheet', async () => {
+    const source = (await import('../src/components/RatchetFace.vue?raw')).default
+    expect(source).toMatch(/transition:\s*opacity\s+(1[0-4]\d|150)ms/)
+    expect(source).toContain('prefers-reduced-motion: reduce')
+  })
+})
+
+const appState = (extra = {}) => ({
+  runs: [], attention: [], totals: { runs: 0, live: 0, attention: 0 },
+  config: { max_concurrent_sessions: 6 }, ...extra,
+})
+
+describe('Ratchet in the shell', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'running' } }] })
+    fetchRunRelations.mockResolvedValue({ run: {}, relations: [] })
+    window.localStorage.clear()
+    document.title = 'lmer'
+  })
+
+  it('draws the mood face in the app bar', async () => {
+    fetchState.mockResolvedValue(appState({ runs: [{ slug: 'a', state: 'running', live: true, orchestrator: false }], totals: { live: 1 } }))
+    const wrapper = mountPane(App)
+    await flushPromises()
+    const face = wrapper.get('header .bar-cluster img.ratchet-face')
+    expect(face.attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    expect(face.attributes('alt')).toBe('Ratchet, on_it')
+    wrapper.unmount()
+  })
+
+  it('holds the last face while the fleet is offline and says so', async () => {
+    vi.useFakeTimers()
+    fetchState.mockResolvedValue(appState({ runs: [{ slug: 'a', state: 'running', live: true, orchestrator: false }], totals: { live: 1 } }))
+    const wrapper = mountPane(App)
+    await flushPromises()
+    const face = () => wrapper.get('header .bar-cluster img.ratchet-face')
+    expect(face().attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    fetchState.mockRejectedValueOnce(new Error('Network unavailable'))
+    await vi.advanceTimersByTimeAsync(10000)
+    await flushPromises()
+    expect(face().attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    expect(wrapper.get('header .bar-cluster button').attributes('aria-label')).toContain('fleet unreachable')
+    vi.useRealTimers()
+    wrapper.unmount()
   })
 })

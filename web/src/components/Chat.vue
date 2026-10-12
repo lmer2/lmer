@@ -188,6 +188,8 @@ const props = defineProps({
   fill: { type: Boolean, default: false },
 })
 
+const emit = defineEmits(['replying'])
+
 // What a turn's role is titled as, for the roles that are not the agent's. See
 // the header: the role itself is never shown.
 const SPEAKERS = {
@@ -245,6 +247,9 @@ const draft = ref(readDraft(draftKey).text)
 watch(draft, text => storeDraft(draftKey, text, []))
 const sending = ref(false)
 const pending = ref([])
+// Ratchet's "talking" mood (issue #581): an operator message is in flight or
+// has not yet shown up in the transcript.
+watch(() => sending.value || pending.value.length > 0, (value) => emit('replying', value), { immediate: true })
 const showInjected = ref(false)
 const historyGenerations = ref(new Map())
 let predecessorPoll = 0

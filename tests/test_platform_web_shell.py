@@ -622,7 +622,7 @@ def test_the_bar_cluster_is_centred_on_a_desktop_and_in_flow_on_a_phone():
         "centring is not keyed on the same `mobile` the drawers already read, "
         "so the bar and the drawers can disagree about which device this is"
     )
-    for control in ("mdiRobot", "THEME_ICONS[themeMode]", "doRescan"):
+    for control in ("RatchetFace", "THEME_ICONS[themeMode]", "doRescan"):
         after_cluster = text[cluster.start():]
         assert control in after_cluster.split("</v-app-bar>")[0], (
             f"{control} is not inside the cluster, so centring moves only part "

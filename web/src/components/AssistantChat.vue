@@ -3,7 +3,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   mdiBellRingOutline,
-  mdiRobot,
   mdiClose,
   mdiCogOutline,
   mdiPlayCircleOutline,
@@ -14,6 +13,7 @@ import {
 } from '@mdi/js'
 import ThreadLinks from './ThreadLinks.vue'
 import Chat from './Chat.vue'
+import RatchetFace from './RatchetFace.vue'
 import {
   fetchAssistant,
   rotateAssistant,
@@ -29,10 +29,12 @@ import { assistantName } from '../ratchet.js'
 const props = defineProps({
   workspace: { type: Object, required: true },
   now: { type: Number, default: () => Date.now() },
+  mood: { type: String, default: 'loading' },
+  moodReason: { type: String, default: '' },
 })
 
 // `settings` carries the section to open: 'orders' for the standing-orders button.
-const emit = defineEmits(['close', 'settings', 'questions'])
+const emit = defineEmits(['close', 'settings', 'questions', 'replying', 'open-questions'])
 const POLL_MS = 10000
 
 const draftKey = `assistant:${props.workspace.id}`
@@ -61,6 +63,7 @@ const queued = computed(() => status.value?.pending || 0)
 // uber lmer's own unanswered asks to the operator (issue 507), counted by the daemon
 // from the same ask channel the run view answers them in.
 const openQuestions = computed(() => (running.value && status.value?.open_questions) || 0)
+watch(openQuestions, (value) => emit('open-questions', value), { immediate: true })
 const questionWords = computed(() => `${openQuestions.value} open ${openQuestions.value === 1 ? 'question' : 'questions'}`)
 const loaded = computed(() => chat.value?.total || 0)
 const canLoadEarlier = computed(() => !!chat.value?.canLoadEarlier)
@@ -74,6 +77,7 @@ const identity = computed(() => {
     parts.push(`generation ${status.value.generation}`)
     if (status.value.started_at) parts.push(`started ${ago(status.value.started_at, props.now)}`)
   }
+  if (props.moodReason) parts.push(props.moodReason)
   return parts.join(' · ')
 })
 // Shown, never toggled: a tap's compatibility mouseenter has already opened the
@@ -149,10 +153,13 @@ onBeforeUnmount(() => {
         <template #activator="{ props: tip }">
           <span v-bind="tip" class="uber-identity ms-3 me-1" role="button" tabindex="0" :aria-label="identity"
             @click="identityShown = true" @keydown.enter.space.prevent="identityShown = true">
-            <v-icon :icon="mdiRobot" size="small" />
+            <RatchetFace :mood="mood" :off="!running" :size="20" />
           </span>
         </template>
       </v-tooltip>
+      <!-- chadd's rule: a face alone is ambiguous, so the mood is always written
+           beside it, not only on hover. -->
+      <span v-if="moodReason" class="ratchet-mood-label text-body-small text-medium-emphasis me-1">{{ moodReason }}</span>
       <template v-if="status || problem">
         <ThreadLinks
           :session-id="sessionId"
@@ -334,6 +341,7 @@ onBeforeUnmount(() => {
           :composer-label="`Say something to ${workspace.name} · ${assistantName}`"
           :conversation-key="composerActive ? draftKey : `${draftKey}:history`"
           :agent-label="assistantName"
+          @replying="emit('replying', $event)"
         >
           <!-- The slot keeps its width without the bell, so the text never reflows.
                `.stop`: a click in the field focuses it and raises a phone keyboard. -->
@@ -379,6 +387,14 @@ onBeforeUnmount(() => {
   flex: 1 1 0;
 }
 .loaded-count { white-space: nowrap; }
+/* chadd's rule: the face is never alone. Keep the reason on one line and let it
+   give way before the toolbar's controls do. */
+.ratchet-mood-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 34ch;
+}
 .uber-identity { display: inline-flex; cursor: default; }
 .question-slot {
   /* A disabled field (mid-send) sets `pointer-events: none` on its input. */

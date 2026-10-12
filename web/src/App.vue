@@ -2,7 +2,6 @@
 import { computed, mergeProps, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useDisplay, useTheme } from 'vuetify'
 import {
-  mdiRobot,
   mdiAlertOutline,
   mdiArrowLeft,
   mdiArrowCollapseHorizontal,
@@ -20,6 +19,7 @@ import {
 } from '@mdi/js'
 import AddRun from './components/AddRun.vue'
 import ForgetCompleted from './components/ForgetCompleted.vue'
+import RatchetFace from './components/RatchetFace.vue'
 import { fleetTitle } from './fleetTitle.js'
 import AssistantChat from './components/AssistantChat.vue'
 import FleetMap from './components/FleetMap.vue'
@@ -33,7 +33,7 @@ import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
-import { applyAssistantName, assistantName } from './ratchet.js'
+import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason } from './ratchet.js'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
 import {
@@ -386,13 +386,12 @@ const orchestratorTone = computed(() => (
 ))
 const orchestratorHint = computed(() => {
   const run = orchestrator.value
-  if (!run) return `talk to ${assistantName.value}`
-  const meta = stateMeta(run.state)
-  const parts = [`${assistantName.value} — ${meta.label}`]
+  const parts = run ? [`${assistantName.value} — ${stateMeta(run.state).label}`] : [`talk to ${assistantName.value}`]
   // What it is doing, or what it needs. The attention note is the more urgent of
   // the two and wins when both are there.
-  const note = run.attention?.note || run.title || run.goal || run.phase
+  const note = run ? (run.attention?.note || run.title || run.goal || run.phase) : null
   if (note) parts.push(note)
+  if (ratchetReason.value) parts.push(ratchetReason.value)
   return parts.join(' · ')
 })
 const fleetView = ref(storedFleetView())
@@ -434,6 +433,46 @@ const workerCap = computed(() => state.value?.config?.max_concurrent_sessions ||
 const liveWorkers = computed(
   () => runs.value.filter((run) => run.live && !run.orchestrator).length,
 )
+
+// --- Ratchet's mood (issue #581) ---------------------------------------------
+//
+// Computed over the runs this view shows (spec D5), plus what the open pane
+// reports about its own chat. Held across a failed poll on purpose: a face that
+// flipped to "idle" when the network dropped would be lying about the fleet.
+const replyingByProject = ref({})
+const openQuestionsByProject = ref({})
+const lastRunStates = ref({})
+const justFinished = ref(0)
+const ratchetProject = computed(() => activeProject.value || chatProject.value || '')
+const ratchetInput = computed(() => ({
+  loaded: !!state.value,
+  runs: runs.value,
+  attention: attention.value,
+  liveWorkers: liveWorkers.value,
+  cap: workerCap.value,
+  openQuestions: openQuestionsByProject.value[ratchetProject.value] || 0,
+  replying: !!replyingByProject.value[ratchetProject.value],
+  justFinished: justFinished.value,
+}))
+const ratchetMood = ref('loading')
+const ratchetReason = ref(moodReason('loading', {}))
+watch([ratchetInput, fleetOnline], ([input, online]) => {
+  if (!online && input.loaded) {
+    ratchetReason.value = `fleet unreachable · last: ${ratchetReason.value.replace(/^fleet unreachable · last: /, '')}`
+    return
+  }
+  ratchetMood.value = moodOf(input)
+  ratchetReason.value = moodReason(ratchetMood.value, input)
+}, { immediate: true, deep: true })
+// The off treatment follows the assistant's lifecycle, not the fleet's mood: a
+// stopped assistant has no face to read, so it gets the crossed-out one.
+const ratchetOff = computed(() => {
+  const run = orchestrator.value
+  if (run) return run.state !== 'running'
+  const project = chatWorkspace.value || workspace.value
+  if (project?.assistant?.lifecycle) return project.assistant.lifecycle !== 'running'
+  return false
+})
 
 // --- forgetting a finished run (T101) ----------------------------------------
 //
@@ -601,6 +640,12 @@ function load() {
     try {
       state.value = await fetchState()
       applyAssistantName(state.value?.config)
+      // One poll of memory for the `yes` flash: a run that reached `complete`
+      // since the previous poll shows it for this poll only.
+      const rows = state.value?.runs || []
+      const previous = lastRunStates.value
+      justFinished.value = rows.filter((run) => run.state === 'complete' && previous[run.slug] && previous[run.slug] !== 'complete').length
+      lastRunStates.value = Object.fromEntries(rows.map((run) => [run.slug, run.state]))
       projects.value = (await fetchProjects()).projects
       if (uberOpen.value) rememberChat(chatProject.value)
       fleetOnline.value = true
@@ -788,9 +833,11 @@ onUnmounted(() => {
       <div class="bar-cluster" :class="{ 'bar-cluster-centered': !mobile }">
         <v-tooltip :text="orchestratorHint" location="bottom" open-on-focus>
           <template #activator="{ props: tooltip }">
-            <v-btn v-bind="tooltip" :icon="mdiRobot" :color="orchestratorTone" variant="text"
+            <v-btn v-bind="tooltip" icon :color="orchestratorTone" variant="text"
               :class="{ 'robot-on-surface': barColor && orchestratorTone }"
-              :aria-label="orchestratorHint" @click="toggleProjectChat" />
+              :aria-label="orchestratorHint" @click="toggleProjectChat">
+              <RatchetFace :mood="ratchetMood" :off="ratchetOff" :size="24" />
+            </v-btn>
           </template>
         </v-tooltip>
         <v-tooltip v-if="!mobile" :text="widthHint" location="bottom" open-on-focus>
@@ -894,8 +941,11 @@ onUnmounted(() => {
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
       <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject" class="uber-pane-slot">
         <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
+          :mood="ratchetMood" :mood-reason="ratchetReason"
           @settings="openProjectSettings(project.id, $event)" @close="uberOpen = false"
-          @questions="openAssistantQuestions" />
+          @questions="openAssistantQuestions"
+          @replying="replyingByProject[project.id] = $event"
+          @open-questions="openQuestionsByProject[project.id] = $event" />
       </div>
       <p v-if="!chatWorkspace || chatWorkspace.archived" class="pa-4">Choose an active project to open its assistant chat.</p>
     </v-navigation-drawer>

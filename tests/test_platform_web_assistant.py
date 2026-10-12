@@ -143,7 +143,7 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
     """
     app = _read(APP)
     button = None
-    for match in re.finditer(r"<v-btn\b[^>]*>", app, re.S):
+    for match in re.finditer(r"<v-btn\b[^>]*>.*?</v-btn>", app, re.S):
         if '@click="toggleProjectChat"' in match.group(0):
             button = match.group(0)
             break
@@ -152,12 +152,11 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
     assert "if (uberOpen.value) uberOpen.value = false" in toggle, "the bar button cannot close it again"
     assert "openProjectChat(activeProject.value || chatProject.value)" in toggle, "reopening lost its project destination"
     assert "aria-label" in button, "an icon-only button needs a name"
-    assert "mdiRobot" in button, (
-        "the toggle draws no icon, or one pasted as path data rather than taken "
-        "from @mdi/js"
+    assert "RatchetFace" in button, (
+        "the toggle draws no face, so the assistant's mood has no home in the bar"
     )
-    assert "mdiRobot" in _read(DRAWER), (
-        "the bar button and the drawer's header no longer share an icon, so "
+    assert "RatchetFace" in _read(DRAWER), (
+        "the bar button and the drawer's header no longer share a face, so "
         "nothing connects the tap to the panel it opened"
     )
 
