@@ -17,6 +17,11 @@
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4f2" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1a19" />
     <title>lmer platform</title>
+    <!-- Ratchet's face in the tab (issue 581). The watcher in App.vue replaces
+         the href with the current mood's file once the fleet loads; this is the
+         pre-poll face. Absolute on purpose: Vite rewrites a public-dir path in
+         index.html to the `./` base at build time. -->
+    <link rel="icon" id="favicon" type="image/png" href="/assets/ratchet/ratchet_talking.png" />
     <!-- The one frame the theme cannot reach. Vuetify injects its theme stylesheet
          from JS, so everything before the app mounts is painted by the browser from
          `color-scheme` — which src/style.css leaves as `light dark`, i.e. the OS

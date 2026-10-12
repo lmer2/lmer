@@ -181,4 +181,13 @@ describe('Ratchet in the shell', () => {
     vi.useRealTimers()
     wrapper.unmount()
   })
+
+  it('sets the tab icon to the current face', async () => {
+    document.head.innerHTML = '<link rel="icon" id="favicon" href="./assets/ratchet/ratchet_talking.png">'
+    fetchState.mockResolvedValue(appState({ attention: [{ slug: 'q', attention: { reason: 'question' } }], totals: { attention: 1 } }))
+    const wrapper = mountPane(App)
+    await flushPromises()
+    expect(document.getElementById('favicon').getAttribute('href')).toBe('./assets/ratchet/ratchet_question.png')
+    wrapper.unmount()
+  })
 })

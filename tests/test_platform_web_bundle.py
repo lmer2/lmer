@@ -416,6 +416,12 @@ def test_ratchet_faces_are_served_from_the_assets_directory(bundle):
     assert expected <= names, f"missing from dist/assets/ratchet: {sorted(expected - names)}"
 
 
+def test_the_tab_icon_is_served_from_the_assets_directory(bundle):
+    index = (DIST / "index.html").read_text(encoding="utf-8")
+    assert 'rel="icon"' in index and "assets/ratchet/ratchet_talking.png" in index
+    assert (ASSETS / "ratchet" / "ratchet_talking.png").is_file()
+
+
 # --- the source decisions the build above is the consequence of --------------
 
 def test_every_view_that_renders_agent_words_defers_the_renderer():

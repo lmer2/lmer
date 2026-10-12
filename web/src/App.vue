@@ -473,6 +473,11 @@ const ratchetOff = computed(() => {
   if (project?.assistant?.lifecycle) return project.assistant.lifecycle !== 'running'
   return false
 })
+// The tab icon follows the same mood (issue #581). No slash variant for `off`:
+// a tab icon is not a status surface, so it stays on the face.
+watch(ratchetMood, (mood) => {
+  document.getElementById('favicon')?.setAttribute('href', faceUrl(mood))
+}, { immediate: true })
 
 // --- forgetting a finished run (T101) ----------------------------------------
 //
