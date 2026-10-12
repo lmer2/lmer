@@ -129,6 +129,7 @@ import re
 import shutil
 import sys
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
@@ -285,12 +286,24 @@ def retirement_state_path(root: Optional[Path] = None) -> Path:
     return base / RETIREMENT_STATE_NAME
 
 
-def _retirement_archive_rel(key: str, manifest: Manifest) -> str:
-    """The archive-mirror path for one validated retirement *key*."""
+def _archive_rel_for_key(key: str) -> str:
+    """The archive-mirror path for one validated retirement *key*.
+
+    Pure path arithmetic: the retirement key already carries the scope
+    (``_agents/memory`` at instance scope, ``<project>/_agents/memory`` at
+    project scope), so the mirror is the key with ``_archive`` inserted after
+    its scope root. :func:`_retirement_archive_rel` is the historical
+    manifest-taking spelling; the manifest is not read.
+    """
     parts = PurePosixPath(key).parts
     if parts[:2] == ("_agents", "memory"):
         return PurePosixPath("_archive", *parts).as_posix()
     return PurePosixPath(parts[0], "_archive", *parts[1:]).as_posix()
+
+
+def _retirement_archive_rel(key: str, manifest: Manifest) -> str:
+    """The archive-mirror path for one validated retirement *key*."""
+    return _archive_rel_for_key(key)
 
 
 def _validate_retirement_key(key: object, manifest: Manifest) -> str:
@@ -2053,6 +2066,7 @@ def _write_scope(
     """
     dest.mkdir(parents=True, exist_ok=True)
     root = work_repo_root()
+    index_path = dest / MEMORY_INDEX
     held = set(files)
     keep = _shadowed(dest, held, claimed)
     restored = _manifest_files(manifest, scope)
@@ -2100,13 +2114,12 @@ def _write_scope(
         if source.is_file()
     }
     if index_text is not None:
-        index = dest / MEMORY_INDEX
         merged = _merged_index_text(
-            _read_text(index) if index.is_file() else "",
+            _read_text(index_path) if index_path.is_file() else "",
             index_text,
             _manifest_index(manifest, scope),
         )
-        index.write_text(merged, encoding="utf-8")
+        index_path.write_text(merged, encoding="utf-8")
         copied += 1
         # What THIS SESSION HOLDS — its own index lines — never the merged
         # survivors, exactly as `entry["files"]` records the source and not
@@ -2127,7 +2140,167 @@ def _write_scope(
         entry["index"] = _index_lines(index_text)
     else:
         entry.setdefault("index", [])
+
+    # Reconcile the scope's OWN index with the scope's live files and its
+    # retirement state (#369 gap (e)). Runs for both tree forms and even when
+    # the agent has no index: this persist changed the scope's live files, and
+    # a dangling entry is a validator ERROR in schema form. The session's
+    # recorded `index` above stays what the session HOLDS, so the next persist
+    # still tells its own removals from another writer's edits.
+    current = _read_text(index_path) if index_path.is_file() else ""
+    if current.strip() or any(rel.name != MEMORY_INDEX for rel in _files_under(dest)):
+        reconciled = _reconcile_index(current, dest, retired or set())
+        if reconciled != current:
+            index_path.write_text(reconciled, encoding="utf-8")
     return copied, deleted, declined
+
+
+def _tombstone_date() -> str:
+    """The date a reconciled tombstone carries (``YYYY-MM-DD``, UTC)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _tombstone_line(line: str, live: Set[str], when: str) -> str:
+    """Replace the link of every DEAD entry on *line* with ``archived <date>``.
+
+    The ``docs/SCHEMA.md`` 'Index lines' tombstone: the line stays and its
+    hand-written text survives; only the link to a file that is no longer
+    there goes. A link that is not a relative ``.md`` entry (a URL, an anchor,
+    a link already pointing at ``_archive/``) is left alone, and so is an
+    entry whose file IS live — a line may legitimately carry several.
+    """
+    def replace(match: "re.Match") -> str:
+        target = match.group(1)
+        if not target.lower().endswith(".md") or _NOT_RELATIVE_RE.match(target):
+            return match.group(0)
+        normalized = posixpath.normpath(target)
+        if any(part in _ARCHIVE_MARKERS for part in normalized.split("/")):
+            return match.group(0)
+        if normalized in live:
+            return match.group(0)
+        return f"archived {when}"
+
+    return _LINK_RE.sub(replace, line)
+
+
+def _generated_entry(dest: Path, rel: Path) -> Optional[str]:
+    """A generated index line for a live memory with no entry, or ``None``.
+
+    Form: ``- [<frontmatter name or stem>](<relative path>) — <description>``.
+    The title prefers the memory's own ``name``, falling back to the filename
+    stem; the description is the frontmatter's, omitted when absent so the
+    line is still a valid entry.
+
+    The line MUST round-trip through ``_entry_targets`` and the validator's
+    ``parse_index_entries``, or the next persist re-appends it forever. Both
+    parse one line with the same bracket-link pattern, so the title may hold
+    no ``]`` and no newline, and the path no whitespace or ``)``. A name like
+    ``Cache [v2]`` loses its inner ``]`` (the closing one is the syntax), and
+    a block-scalar name collapses to one line. A path the grammar cannot
+    address returns ``None`` — leaving the file unindexed is a WARN, while an
+    unparseable line is an unbounded growth loop.
+    """
+    path = rel.as_posix()
+    if any(ch.isspace() for ch in path) or ")" in path:
+        return None
+    data = _frontmatter(_read_text(dest / rel))
+    name = data.get("name") if data is not None else None
+    title = name if isinstance(name, str) and name.strip() else rel.stem
+    title = " ".join(title.split()).replace("]", "")
+    if not title:
+        title = " ".join(rel.stem.split()).replace("]", "") or "memory"
+    line = f"- [{title}]({path})"
+    description = data.get("description") if data is not None else None
+    if isinstance(description, str) and description.strip():
+        line += f" — {' '.join(description.split())}"
+    return line + "\n"
+
+
+def _has_exact_archive_tombstone(root: Path, text: str, dest: Path, rel: Path) -> bool:
+    """Whether *text* re-points *rel*'s link at *rel*'s own archive mirror.
+
+    The identity-bearing half of the retirement contract: ``work memory
+    forget`` re-points the entry at ``<scope>/_archive/.../<file>``, so a
+    tombstone whose target normalizes to exactly that path is a retirement of
+    THIS file. Nothing about a title, a name or a nearby word is consulted —
+    a handwritten sentence or a link to a different archived memory cannot
+    match, which is what keeps an unrelated mention from hiding a live file.
+    """
+    try:
+        scope_rel = dest.relative_to(root)
+    except ValueError:
+        return False
+    expected = posixpath.normpath(
+        posixpath.relpath(
+            _archive_rel_for_key((scope_rel / rel).as_posix()),
+            scope_rel.as_posix(),
+        )
+    )
+    for line in text.splitlines():
+        for target in _LINK_RE.findall(line):
+            if not target.lower().endswith(".md") or _NOT_RELATIVE_RE.match(target):
+                continue
+            if posixpath.normpath(target) == expected:
+                return True
+    return False
+
+
+def _reconcile_index(text: str, dest: Path, retired: Set[Path]) -> str:
+    """Make the scope index's entry lines agree with the scope's live files.
+
+    Entry lines for files that are gone are tombstoned IN PLACE (never
+    dropped); a live memory file with no entry gets a generated line appended,
+    unless the scope's recorded retirement state accounts for it — *retired*
+    (the keys ``work memory forget`` recorded) or an exact archive-mirror
+    tombstone for that file (:func:`_has_exact_archive_tombstone`). No
+    handwritten prose, title or nearby word suppresses a generated entry; the
+    identity is the recorded key or the exact mirror path, nothing else.
+    Every non-entry line — headings, hand-written commentary, blank lines and
+    the tombstones ``work memory forget`` wrote — is kept byte-identical and
+    in position. This runs after the line merge, on the scope's own index, so
+    it reads the scope's live files plus its retirement state and never one
+    session's view.
+    """
+    live = {
+        rel.as_posix()
+        for rel in _files_under(dest)
+        if rel.suffix.lower() == ".md"
+        and rel.name != MEMORY_INDEX
+        and not _is_conflict_copy(rel)
+    }
+    when = _tombstone_date()
+    out: List[str] = []
+    indexed: Set[str] = set()
+    for line in text.splitlines(keepends=True):
+        targets = _entry_targets(line)
+        if not targets:
+            out.append(line)
+            continue
+        for target in targets:
+            if target in live:
+                indexed.add(target)
+        if all(target in live for target in targets):
+            out.append(line)
+        else:
+            out.append(_tombstone_line(line, live, when))
+    pending = sorted(live - indexed)
+    if pending and out and not out[-1].endswith("\n"):
+        # The last line had no terminator; without this the first generated
+        # entry is concatenated onto it.
+        out[-1] += "\n"
+    if pending:
+        root = work_repo_root()
+    for rel in pending:
+        path = Path(rel)
+        if path in retired or _has_exact_archive_tombstone(root, text, dest, path):
+            continue
+        entry = _generated_entry(dest, path)
+        if entry is not None:
+            out.append(entry)
+    result = "".join(out)
+    if result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _route(source: Path):

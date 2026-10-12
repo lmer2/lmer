@@ -89,6 +89,7 @@ in D.
 from __future__ import annotations
 
 import json
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -98,6 +99,7 @@ from typing import Callable, Iterator, Optional
 
 import pytest
 
+from lmer_schema.checks.agents import parse_index_entries
 from lmer_schema.checks.runner import validate
 from tests.conftest import strip_lmer_env
 from tests.plexus_fixtures import (
@@ -897,12 +899,6 @@ class TestGapEIndexReconciliation:
             line for line in published.splitlines(keepends=True) if "_archive/" in line
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (e): entry lines are never reconciled with live files — "
-        "a dangling entry survives and an unindexed live file stays unindexed",
-    )
     def test_after_persist_entries_and_live_files_agree_and_hand_written_lines_stay(
         self, schema2_plexus
     ):
@@ -929,12 +925,6 @@ class TestGapEIndexReconciliation:
         codes = {finding.code for finding in validate(alpha.clone).findings}
         assert not codes & {ENTRY_WITHOUT_FILE, FILE_WITHOUT_ENTRY}, codes
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#369 gap (e): a session with no MEMORY.md leaves the scope's "
-        "index untouched, so its new file is never indexed",
-    )
     def test_a_session_with_no_index_still_gets_its_new_file_an_entry(self, schema2_plexus):
         plexus = schema2_plexus
         alpha = plexus.enter(plexus.start("alpha"))
@@ -950,3 +940,111 @@ class TestGapEIndexReconciliation:
         assert _entries(project) == _live(project)
         codes = {finding.code for finding in validate(alpha.clone).findings}
         assert FILE_WITHOUT_ENTRY not in codes, codes
+
+    # -- gap (e) false-match regressions (astra !401 P1) --------------------
+
+    def test_unrelated_archival_prose_does_not_hide_a_live_file(self, schema2_plexus):
+        """A handwritten sentence mentioning a name near the word "archived"
+        is prose, not a retirement: the live file must still get an entry."""
+        plexus = schema2_plexus
+        alpha = plexus.enter(plexus.start("alpha"))
+        assert memory.restore_memory() == 0
+        scope = plexus.scope(alpha)
+        (scope / "deployment.md").write_text(_memory_file("deployment", "project"))
+        text = "# Memory\nArchived deployment notes remain useful.\n"
+        (scope / memory.MEMORY_INDEX).write_text(text)
+
+        reconciled = memory._reconcile_index(text, scope, set())
+
+        assert "(deployment.md)" in reconciled, reconciled
+        assert "Archived deployment notes remain useful." in reconciled, reconciled
+
+    def test_an_archive_link_to_a_different_memory_does_not_hide_a_live_file(
+        self, schema2_plexus
+    ):
+        """An archive link names the memory it retired; a link to a DIFFERENT
+        archived file must not suppress this file's entry."""
+        plexus = schema2_plexus
+        alpha = plexus.enter(plexus.start("alpha"))
+        assert memory.restore_memory() == 0
+        scope = plexus.scope(alpha)
+        (scope / "deployment.md").write_text(_memory_file("deployment", "project"))
+        other = posixpath.relpath(
+            memory._archive_rel_for_key(f"{plexus.project_rel}/old.md"),
+            plexus.project_rel,
+        )
+        text = f"# Memory\n- [deployment guide]({other}) — old\n"
+        (scope / memory.MEMORY_INDEX).write_text(text)
+
+        reconciled = memory._reconcile_index(text, scope, set())
+
+        assert "(deployment.md)" in reconciled, reconciled
+        assert other in reconciled, reconciled
+
+    def test_an_exact_archive_mirror_tombstone_still_suppresses_the_entry(
+        self, schema2_plexus
+    ):
+        """The identity-bearing half: a link re-pointed at THIS file's own
+        archive mirror is a retirement and keeps the line unindexed."""
+        plexus = schema2_plexus
+        alpha = plexus.enter(plexus.start("alpha"))
+        assert memory.restore_memory() == 0
+        scope = plexus.scope(alpha)
+        (scope / "fact.md").write_text(_memory_file("fact", "project"))
+        target = posixpath.relpath(
+            memory._archive_rel_for_key(f"{plexus.project_rel}/fact.md"),
+            plexus.project_rel,
+        )
+        text = f"# Memory\n- [fact]({target}) — a fact\n"
+        (scope / memory.MEMORY_INDEX).write_text(text)
+
+        reconciled = memory._reconcile_index(text, scope, set())
+
+        assert "- [fact](fact.md)" not in reconciled, reconciled
+        assert target in reconciled, reconciled
+
+    # -- generated-title grammar (astra !401 P2) ----------------------------
+
+    @staticmethod
+    def _reconcile_one(plexus, alpha, frontmatter: str) -> str:
+        scope = plexus.scope(alpha)
+        (scope / "fact.md").write_text(frontmatter)
+        (scope / memory.MEMORY_INDEX).write_text("# Memory\n")
+        return memory._reconcile_index("# Memory\n", scope, set())
+
+    def test_a_bracketed_name_round_trips_and_is_idempotent(self, schema2_plexus):
+        plexus = schema2_plexus
+        alpha = plexus.enter(plexus.start("alpha"))
+        assert memory.restore_memory() == 0
+        first = self._reconcile_one(
+            plexus,
+            alpha,
+            "---\n"
+            'name: "Cache [v2]"\n'
+            'description: "live fact"\n'
+            "metadata:\n  node_type: memory\n  type: project\n"
+            "---\n\nbody\n",
+        )
+        line = next(line for line in first.splitlines() if "fact.md" in line)
+        assert memory._entry_targets(line) == ["fact.md"], line
+        assert parse_index_entries(line) == ["fact.md"], line
+        assert memory._reconcile_index(first, plexus.scope(alpha), set()) == first
+
+    def test_a_multiline_name_round_trips_and_is_idempotent(self, schema2_plexus):
+        plexus = schema2_plexus
+        alpha = plexus.enter(plexus.start("alpha"))
+        assert memory.restore_memory() == 0
+        first = self._reconcile_one(
+            plexus,
+            alpha,
+            "---\n"
+            "name: |\n  Line one\n  Line two\n"
+            'description: "live fact"\n'
+            "metadata:\n  node_type: memory\n  type: project\n"
+            "---\n\nbody\n",
+        )
+        line = next(line for line in first.splitlines() if "fact.md" in line)
+        assert "\n" not in line, line
+        assert memory._entry_targets(line) == ["fact.md"], line
+        assert parse_index_entries(line) == ["fact.md"], line
+        assert memory._reconcile_index(first, plexus.scope(alpha), set()) == first

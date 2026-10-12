@@ -107,13 +107,17 @@ abort it after preserving any manual conflict resolutions. For detached HEAD,
 preserve any local commits and check out the intended branch. The command
 does not choose a branch or discard commits on the operator's behalf.
 
-For a conflict raised by this command and successfully aborted, the local
-commit is retained on its original branch. Rebase it manually, resolve the
-reported files, stage those specific paths, and continue the rebase. Then
-retry `work commit` or `work memory persist` to publish and verify it. A
-project README's generated block needs no hand resolution: a retried `work
-commit` re-renders it from the current records; only the text outside the
-markers is yours to merge.
+For a conflict raised by this command and successfully aborted, the outcome
+depends on the command. `work commit` retains the local commit on its
+original branch: rebase it manually, resolve the reported files, stage those
+specific paths, and continue the rebase, then retry `work commit` to publish
+and verify it. `work memory persist` instead takes its local commit back
+(drop-and-roll-back, never `--hard`, so the checkout stays publishable) and
+saves upstream's version of each conflicting memory as a
+`<stem>.conflict-<sid>.md` copy beside the agent's own file; reconcile that
+copy and persist again. A project README's generated block needs no hand
+resolution: a retried `work commit` re-renders it from the current records;
+only the text outside the markers is yours to merge.
 
 An autostash restoration failure is different from an aborted rebase: the
 rebase has finished, and the saved edits remain in the reported stash. Inspect
@@ -136,9 +140,16 @@ For a transport failure, repair access and retry the command. No new edit or
 empty commit is needed to retry an existing local commit.
 
 When recovering memory conflicts, inspect both `MEMORY.md` and the memory
-files, including deletions and content changes. These Git guards preserve
-the existing restore-manifest merge behavior; they do not implement a new
-memory merge or automatic conflict-resolution policy.
+files, including deletions and content changes. `work memory persist` pulls
+the published branch first (fast-forward only) before it merges, so a
+sibling's already-published add or edit is seen before the merge rather than
+colliding at the rebase. On a publication conflict it aborts the rebase
+cleanly and takes its local commit back, then writes upstream's version of
+each conflicting memory as a `<stem>.conflict-<sid>.md` copy in the agent's
+memory dir (D.conflict-api). Reconcile that copy into the session's own file,
+then persist again: the copy is not a memory and is skipped on the way out.
+The restore baseline is keyed by the launch's session id, so a manifest
+recorded under another session is not a baseline.
 
 Deploying these checks requires rebuilding and rolling the session container
 image. Existing containers retain their baked `work` implementation. Host-side

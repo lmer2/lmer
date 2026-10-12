@@ -42,6 +42,14 @@ def publication(request, tmp_path, monkeypatch):
     target.parent.mkdir(parents=True)
     target.write_text("base\n")
     git(repo, "add", "--", str(target))
+    if request.param == "memory":
+        # A memory scope with a file but no index is not a clean target: gap
+        # (e) reconciles it on the next persist, which would land a commit.
+        # Seed the index so this fixture is the "nothing to publish" case the
+        # tests here need.
+        index = target.parent / "MEMORY.md"
+        index.write_text("- [fact](fact.md)\n")
+        git(repo, "add", "--", str(index))
     git(repo, "commit", "-m", "seed")
     git(repo, "push", "-u", "origin", "main")
     peer = tmp_path / "peer"
