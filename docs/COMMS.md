@@ -115,7 +115,7 @@ line in the log and the same object on the wire.
 | `milestone` | agent | no | reportable work happened (what a bare `lmer-signal "…"` means) |
 | `question` | agent | no | blocks the asker until an `answer`; carries `options` |
 | `answer` | any channel | to the waiting CLI if one is attached, else into the PTY | reply to a `question` |
-| `close` | agent | no | the asker stopped waiting |
+| `close` | agent | no | the asker stopped waiting; retained on bus/platform, omitted from Slack/Matrix threads (the humans who answered already know) |
 | `command` | `platform` and `uber-lmer` only | yes, **untagged** | a slash command for the harness (`/followup`) |
 
 **Question state is a fold, not a field.** A `question` is open until the
@@ -693,7 +693,8 @@ card sends the chip's text and is unaffected.
 Rules: the first accepted answer wins and the supervisor decides it; the
 fan-out of the accepted answer *is* the echo to the other channels, and the
 originating channel skips its own record; a `close` fans out so every channel
-withdraws its reply affordance; a late answer is a message, never a re-answer.
+withdraws its reply affordance, though the Slack/Matrix connectors do not render
+it into the thread (issue #579); a late answer is a message, never a re-answer.
 
 **What binds as an answer in a thread.** A human writing in a Slack or matrix
 thread has not promised to be answering, so only three things bind, and

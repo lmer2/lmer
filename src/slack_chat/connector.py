@@ -206,9 +206,13 @@ def render_outbound(
     *questions* maps question id → record, for the answer lines. *own_channel*
     is whose thread is being rendered: the matrix connector renders with the
     same code and must skip matrix's records, not Slack's.
+
+    A ``close`` is bookkeeping the humans in the thread already know about (they
+    are the ones who answered), so it is skipped too — it stays on the bus, the
+    platform and the transcript (issue #579).
     """
     source = record.get("source") or {}
-    if source.get("channel") in (own_channel, "peer-ul") or record.get("kind") == "note":
+    if source.get("channel") in (own_channel, "peer-ul") or record.get("kind") in ("note", "close"):
         return None
     kind = record.get("kind")
     text = str(record.get("text") or "")
@@ -232,8 +236,6 @@ def render_outbound(
             body = f"↩️ late answer{about} from {_who(source)}: {text} _(already answered)_"
         else:
             body = f"✅ answered{about} from {_who(source)}: {text}"
-    elif kind == "close":
-        body = "⏹ the session stopped waiting for an answer" + (f" — {text}" if text else "")
     elif kind == "milestone":
         body = f"🏁 {text}"
     elif kind == "command":

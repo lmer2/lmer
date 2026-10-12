@@ -125,6 +125,11 @@ class TestRules:
         assert text and "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in text
         assert connector.render_outbound({"kind": "message", "text": "x", "source": {"channel": "matrix"}, "meta": {}}) is None
 
+    def test_close_records_never_reach_a_matrix_thread(self):
+        # Issue #579: the close stays on the bus/platform/transcript.
+        assert connector.render_outbound({"kind": "close", "text": "", "source": {"channel": "agent"}, "meta": {}}) is None
+        assert connector.render_outbound({"kind": "close", "text": "withdrawn — already answered", "source": {"channel": "agent"}, "meta": {}}) is None
+
 
 # ---------------------------------------------------------------------------
 # a fake homeserver
