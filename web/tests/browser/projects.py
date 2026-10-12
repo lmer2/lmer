@@ -41,6 +41,29 @@ FILL = """(() => {
 })()"""
 
 
+TOOLBAR = """(() => {
+  const toolbar = [...document.querySelectorAll('.uber-toolbar')].find(e => e.checkVisibility());
+  return {background: getComputedStyle(toolbar).backgroundColor,
+          ink: getComputedStyle(toolbar.querySelector('[aria-label="project settings"]')).color,
+          bar: getComputedStyle(document.querySelector('header.v-app-bar')).backgroundColor};
+})()"""
+
+IDENTITY = "[...document.querySelectorAll('.uber-identity')].find(e => e.checkVisibility())"
+IDENTITY_SHOWN = ("[...document.querySelectorAll('.v-tooltip .v-overlay__content')].some(e => e.checkVisibility() && "
+                  f"e.textContent.trim() === {IDENTITY}.getAttribute('aria-label'))")
+
+
+def luminance(value):
+    rgb = [int(number) / 255 for number in re.findall(r"\d+", value)[:3]]
+    rgb = [part / 12.92 if part <= .04045 else ((part + .055) / 1.055) ** 2.4 for part in rgb]
+    return sum(part * weight for part, weight in zip(rgb, (.2126, .7152, .0722)))
+
+
+def contrast(first, second):
+    first, second = luminance(first), luminance(second)
+    return (max(first, second) + .05) / (min(first, second) + .05)
+
+
 class Browser:
     def __init__(self, connection):
         self.connection, self.serial, self.errors = connection, 0, []
@@ -72,17 +95,30 @@ class Browser:
         (self.output / "failure.html").write_text(await self.evaluate("document.body.innerHTML"))
         raise AssertionError(f"Browser condition timed out: {expression}")
 
+    async def centre(self, expression):
+        return await self.evaluate("(() => { const e = " + expression + "; const r = e.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()")
+
     async def click_element(self, expression):
         await self.evaluate(expression + ".scrollIntoView({block:'center'})")
         await asyncio.sleep(.5)
-        position = await self.evaluate("(() => { const e = " + expression + "; const r = e.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()")
+        position = await self.centre(expression)
         await self.call("Input.dispatchMouseEvent", type="mousePressed", button="left", clickCount=1, **position)
         await self.call("Input.dispatchMouseEvent", type="mouseReleased", button="left", clickCount=1, **position)
         await asyncio.sleep(.2)
 
+    async def tap_element(self, expression):
+        """A touchscreen tap; Chromium derives the compatibility mouse events and the click."""
+        position = await self.centre(expression)
+        await self.call("Input.dispatchTouchEvent", type="touchStart", touchPoints=[position])
+        await self.call("Input.dispatchTouchEvent", type="touchEnd", touchPoints=[])
+        await asyncio.sleep(.2)
+
+    @staticmethod
+    def labelled(label, selector="button"):
+        return f"[...document.querySelectorAll({json.dumps(selector)})].find(e => e.checkVisibility() && !e.closest('[inert]') && e.getBoundingClientRect().right > 0 && e.getBoundingClientRect().left < innerWidth && (e.getAttribute('aria-label') || e.textContent.trim()) === {json.dumps(label)})"
+
     async def click(self, label, selector="button"):
-        target = f"[...document.querySelectorAll({json.dumps(selector)})].find(e => e.checkVisibility() && !e.closest('[inert]') && e.getBoundingClientRect().right > 0 && e.getBoundingClientRect().left < innerWidth && (e.getAttribute('aria-label') || e.textContent.trim()) === {json.dumps(label)})"
-        await self.click_element(target)
+        await self.click_element(self.labelled(label, selector))
 
     # The app bar's project switcher: on desktop in the bar itself, on phones in
     # the bar's extension row. Only one is rendered, but match the visible one.
@@ -165,6 +201,62 @@ async def sidebar_chat(browser, name):
     await browser.click_element(f"document.querySelector('.project-assistant[aria-label^={json.dumps('Chat with ' + name)}]')")
 
 
+async def identity_stays_shown(browser, gesture):
+    # Sampled after the tooltip's transitions, so a show-then-hide on one gesture is caught.
+    seen = []
+    for pause in (.05, .3, 1):
+        await asyncio.sleep(pause)
+        seen.append(await browser.evaluate(f"Boolean({IDENTITY_SHOWN})"))
+    assert all(seen), (gesture, seen)
+
+
+async def identity_on_touch(chrome, output, secret, url):
+    """One real tap on the robot leaves its identity up, and a tap elsewhere puts it away.
+
+    Touch input only, in a page of its own: a tap also fires the compatibility
+    mouseenter that element.click() skips, and a page this probe has driven with
+    a mouse hands hover back to that cursor after the tap, which a phone cannot.
+    """
+    request = urllib.request.Request(f"http://127.0.0.1:{chrome}/json/new?about:blank", method="PUT")
+    page = json.load(urllib.request.urlopen(request))
+    try:
+        async with connect(page["webSocketDebuggerUrl"], max_size=16 * 1024 * 1024) as connection:
+            phone = Browser(connection)
+            phone.output = output
+            await phone.call("Runtime.enable")
+            await phone.call("Network.enable")
+            await phone.call("Network.setExtraHTTPHeaders", headers={"Authorization": f"Bearer {secret}"})
+            await phone.call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
+            await phone.call("Emulation.setTouchEmulationEnabled", enabled=True, maxTouchPoints=1)
+            await phone.call("Page.navigate", url=url)
+            await phone.wait(phone.labelled("show the run list"))
+            await phone.tap_element(phone.labelled("show the run list"))
+            await phone.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
+            await phone.tap_element("document.querySelector('.project-assistant[aria-label^=\"Chat with Beta\"]')")
+            await phone.wait(f"{IDENTITY}?.getAttribute('aria-label').includes('generation')")
+            await asyncio.sleep(.5)
+            await phone.tap_element(IDENTITY)
+            await identity_stays_shown(phone, "tap")
+            await phone.shot(output, "robot-identity-tap")
+            await phone.tap_element("[...document.querySelectorAll('.uber-pane .chat')].find(e => e.checkVisibility())")
+            await phone.wait(f"!{IDENTITY_SHOWN}")
+            assert not phone.errors, phone.errors
+    finally:
+        urllib.request.urlopen(f"http://127.0.0.1:{chrome}/json/close/{page['id']}").read()
+
+
+async def identity_on_hover(browser):
+    """A mouse hover shows the robot's identity, and a click on the robot keeps it up."""
+    centre = await browser.centre(IDENTITY)
+    await browser.call("Input.dispatchMouseEvent", type="mouseMoved", **centre)
+    await identity_stays_shown(browser, "hover")
+    await browser.call("Input.dispatchMouseEvent", type="mousePressed", button="left", clickCount=1, **centre)
+    await browser.call("Input.dispatchMouseEvent", type="mouseReleased", button="left", clickCount=1, **centre)
+    await identity_stays_shown(browser, "hover then click")
+    await browser.call("Input.dispatchMouseEvent", type="mouseMoved", x=1, y=centre["y"] + 300)
+    await browser.wait(f"!{IDENTITY_SHOWN}")
+
+
 async def probe(chrome, output, url, secret, alpha, beta, settings):
     deadline = time.monotonic() + 20
     page = None
@@ -223,6 +315,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("![...document.querySelectorAll('.uber-pane .open-questions')].some(e => e.checkVisibility())")
         cleared = await fills_the_window(browser, "badge cleared")
+        await identity_on_hover(browser)
         assert cleared["slot"] == 36 and not cleared["badge"], cleared
         fill["1440x1000"] = cleared
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
@@ -240,12 +333,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             assert projects.get(beta["id"])["color"] == color
             await browser.wait(f"getComputedStyle({bar}).backgroundColor === getComputedStyle(document.querySelector('.project-color .v-chip')).backgroundColor")
             colors = await browser.evaluate("(() => { const style = getComputedStyle(" + bar + "); return [style.color, style.backgroundColor]; })()")
-            def luminance(value):
-                rgb = [int(number) / 255 for number in re.findall(r"\d+", value)[:3]]
-                rgb = [part / 12.92 if part <= .04045 else ((part + .055) / 1.055) ** 2.4 for part in rgb]
-                return sum(part * weight for part, weight in zip(rgb, (.2126, .7152, .0722)))
-            foreground, background = map(luminance, colors)
-            contrasts[color] = (max(foreground, background) + .05) / (min(foreground, background) + .05)
+            contrasts[color] = contrast(*colors)
             assert contrasts[color] >= 4.5, (color, colors, contrasts[color])
         await browser.call("Page.reload")
         await browser.wait(f"{browser.SWITCHER}?.textContent.trim() === 'Beta'")
@@ -259,17 +347,25 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         with patch.object(ask, "open_question_count", lambda _session: 1):
             await browser.wait("[...document.querySelectorAll('.uber-pane .open-questions')].some(e => e.checkVisibility())")
             fill["390x844"] = await fills_the_window(browser, "phone")
+            await identity_on_touch(chrome, output, secret, await browser.evaluate("location.href"))
             await browser.shot(output, "beta-phone")
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.choose_project(alpha["name"])
         await sidebar_chat(browser, alpha["name"])
         await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
         await browser.shot(output, "long-name-phone")
-        await browser.click("colour scheme: follow the system")
-        await browser.click("dark", ".v-list-item")
-        await browser.wait("document.querySelector('.v-application.v-theme--dark')")
+        # Issue 578: a neutral theme surface, not the project colour, with legible icons.
+        toolbars = {}
+        for scheme, menu in (("light", "colour scheme: follow the system"), ("dark", "colour scheme: light")):
+            await browser.click(menu)
+            await browser.click(scheme, ".v-list-item")
+            await browser.wait(f"document.querySelector('.v-application.v-theme--{scheme}')")
+            toolbars[scheme] = await browser.evaluate(TOOLBAR)
+            toolbars[scheme]["contrast"] = contrast(toolbars[scheme]["background"], toolbars[scheme]["ink"])
         await browser.shot(output, "long-name-phone-dark")
-        assert await browser.evaluate("getComputedStyle([...document.querySelectorAll('.uber-toolbar')].find(e => e.checkVisibility())).color") == 'rgb(255, 255, 255)'
+        assert toolbars["light"]["background"] != toolbars["dark"]["background"], toolbars
+        for toolbar in toolbars.values():
+            assert toolbar["background"] != toolbar["bar"] and toolbar["contrast"] >= 4.5, toolbars
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
@@ -287,11 +383,11 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
         assert not browser.errors, browser.errors
         (output / "browser-results.json").write_text(json.dumps({
-            "result": "pass", "viewports": ["1440x1000", "390x844", "3840x2160"], "fill": fill, "colors_saved": list(projects.COLORS), "label_contrast": contrasts,
+            "result": "pass", "viewports": ["1440x1000", "390x844", "3840x2160"], "fill": fill, "colors_saved": list(projects.COLORS), "label_contrast": contrasts, "uber_toolbar": toolbars,
             "checks": ["project-local All projects groups", "actual chat identity while All projects selected",
                        "durable waiting/cancel", "20 preset color-picker swatches saved by name through UI", "URL/color reload",
                        "close/switch/bar robot opens Beta", "queued historical draft survives admission", "staged attachment survives real rotation gap",
-                       "phone overflow and long chat header", "uber pane fills 4K and phone height, badge corner reserved", "dark theme identity", "name-only project creation opens own chat",
+                       "phone overflow and long chat header", "uber pane fills 4K and phone height, badge corner reserved", "robot identity on a real tap and a mouse hover", "dark theme identity", "name-only project creation opens own chat",
                        "all project app bar text contrasts >= 4.5", "no runtime exceptions"],
             "limits": "Real Chromium and HTTP routes, fixture inventory and sleeping assistant processes; no external transports or live daemon.",
         }, indent=2) + "\n")

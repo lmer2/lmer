@@ -159,11 +159,16 @@ consult relevant prior exchanges when context is missing.
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
   remains available across rotations, reloads, and daemon restarts.
-  The drawer's one compact toolbar, in the project's colour, holds the Slack and
-  matrix icons, restart, stop, project settings, standing orders (opens project
-  settings with **Standing instructions** expanded), the count of loaded messages,
-  earlier messages, and close. The conversation fills the window's height at
-  every size, from a phone to a 4K screen.
+  The drawer's one compact toolbar, on a neutral surface a shade darker than the
+  pane, holds the Slack and matrix icons, restart, stop, project settings,
+  standing orders (opens project settings with **Standing instructions**
+  expanded), the count of loaded messages, earlier messages, and close. Hover, tap
+  or focus the robot icon for the incarnation's generation and how long ago it
+  started; a tap elsewhere puts it away. The
+  conversation fills the window's height at every size, from a phone to a 4K
+  screen. **Standing instructions** in project settings shows when the orders
+  last changed, says when there are none, and reminds you that they are usually
+  set by telling uber lmer in chat, which confirms the wording before storing them.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
   view. Details worth knowing:

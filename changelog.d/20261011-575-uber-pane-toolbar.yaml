@@ -1,5 +1,5 @@
 changed:
-- "uber lmer's pane drops its header bar for one compact toolbar in the project's colour, holding Slack and matrix, restart, stop, project settings, standing orders, the count of loaded messages, earlier messages and close; the ⋮ menu and the two introductory lines are gone (#575)."
+- "uber lmer's pane drops its header bar for one compact toolbar holding Slack and matrix, restart, stop, project settings, standing orders, the count of loaded messages, earlier messages and close; the ⋮ menu and the two introductory lines are gone (#575)."
 - "The standing-orders button opens Project settings with Standing instructions expanded, in place of the read-only panel in the pane (#575)."
 - "uber lmer's open-question bell moves into the message box's right-hand corner, which stays reserved so the box never shifts when the bell appears or clears (#575)."
 fixed:

@@ -21,7 +21,7 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
-import { projectColor, projectTextColor, readDraft, storeDraft } from '../projects.js'
+import { readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
 
@@ -66,6 +66,18 @@ const canLoadEarlier = computed(() => !!chat.value?.canLoadEarlier)
 // The toolbar holds the bell whenever there is no composer to hold it (a recorded
 // conversation, a failed or not-yet-read transcript), so it never vanishes.
 const bellOnToolbar = computed(() => !!openQuestions.value && !chat.value?.composerOpen)
+// A restart is a fresh context window, so which incarnation this is matters.
+const identity = computed(() => {
+  const parts = [`${props.workspace.name} · uber lmer`]
+  if (running.value) {
+    parts.push(`generation ${status.value.generation}`)
+    if (status.value.started_at) parts.push(`started ${ago(status.value.started_at, props.now)}`)
+  }
+  return parts.join(' · ')
+})
+// Shown, never toggled: a tap's compatibility mouseenter has already opened the
+// tooltip, so toggling on the click that follows would close it again.
+const identityShown = ref(false)
 
 function stale(mine) {
   return disposed || mine !== generation
@@ -129,9 +141,17 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="uber-pane" role="region" :aria-label="`${workspace.name} · uber lmer`">
-    <v-toolbar :color="projectColor(workspace.color)" :style="{ color: projectTextColor(workspace.color) }"
-      density="compact" class="uber-toolbar">
-      <v-icon :icon="mdiRobot" size="small" class="ms-3 me-1" :title="`${workspace.name} · uber lmer`" />
+    <v-toolbar color="uber-toolbar" density="compact" class="uber-toolbar">
+      <!-- A tap target, not a `title` on the icon: Vuetify hides a non-clickable icon
+           from screen readers, and a phone has no hover. -->
+      <v-tooltip v-model="identityShown" :text="identity" location="bottom">
+        <template #activator="{ props: tip }">
+          <span v-bind="tip" class="uber-identity ms-3 me-1" role="button" tabindex="0" :aria-label="identity"
+            @click="identityShown = true" @keydown.enter.space.prevent="identityShown = true">
+            <v-icon :icon="mdiRobot" size="small" />
+          </span>
+        </template>
+      </v-tooltip>
       <template v-if="status || problem">
         <ThreadLinks
           :session-id="sessionId"
@@ -252,29 +272,26 @@ onBeforeUnmount(() => {
     </v-dialog>
 
     <div class="uber-body pa-3">
-      <v-alert v-if="problem" type="warning" density="compact" class="mb-3">
-        {{ problem }}
-        <template v-if="status"> — showing what the daemon last reported.</template>
-      </v-alert>
+      <!-- A block between the alerts and the flex body: v-alert is `flex: 1 1`, so as
+           a flex item it took an equal share of the pane's height with the chat. -->
+      <div class="uber-notices">
+        <v-alert v-if="problem" type="warning" density="compact" class="mb-3">
+          {{ problem }}
+          <template v-if="status"> — showing what the daemon last reported.</template>
+        </v-alert>
+        <v-alert v-if="queued" type="info" density="compact" :icon="false" class="text-body-small mb-3">
+          {{ queued }} {{ queued === 1 ? 'digest' : 'digests' }} waiting for uber lmer
+          <template v-if="running">— read on its next check.</template>
+          <template v-else>— nothing is reading them while none is running.</template>
+        </v-alert>
+      </div>
       <div v-if="!status && !problem" class="text-body-small text-medium-emphasis">
         <v-progress-circular indeterminate size="12" width="2" class="me-2" />
         asking the daemon…
       </div>
 
       <template v-else>
-        <v-alert v-if="queued" type="info" density="compact" class="mb-3">
-          {{ queued }} {{ queued === 1 ? 'digest' : 'digests' }} waiting for uber lmer
-          <template v-if="running">— read on its next check.</template>
-          <template v-else>— nothing is reading them while none is running.</template>
-        </v-alert>
-
         <template v-if="running">
-          <div class="d-flex flex-wrap ga-2 text-body-small text-medium-emphasis mb-2">
-            <span>generation {{ status.generation }}</span>
-            <span v-if="status.started_at" :title="status.started_at">
-              started {{ ago(status.started_at, now) }}
-            </span>
-          </div>
           <StatusStrip :status="status.statusline" :now="now" meter-color="primary" hideable class="mb-3" />
           <p v-if="restarting" class="text-body-small text-medium-emphasis mb-2">
             restarting — the conversation below is still the incarnation being
@@ -361,6 +378,7 @@ onBeforeUnmount(() => {
   flex: 1 1 0;
 }
 .loaded-count { white-space: nowrap; }
+.uber-identity { display: inline-flex; cursor: default; }
 .question-slot {
   /* A disabled field (mid-send) sets `pointer-events: none` on its input. */
   pointer-events: auto;

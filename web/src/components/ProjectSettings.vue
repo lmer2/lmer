@@ -1,10 +1,12 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { archiveProject, fetchAssistantInstructions, setAssistantInstructions, updateProject } from '../api.js'
+import { ago } from '../format.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
 
 // `focus` is `{ id, section, nonce }`; the nonce makes a repeat tap count.
-const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null } })
+const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null },
+  now: { type: Number, default: () => Date.now() } })
 const emit = defineEmits(['changed', 'close', 'focused'])
 const form = ref({})
 const orders = ref(null)
@@ -133,9 +135,20 @@ async function archive() {
       <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
         <v-expansion-panel title="Standing instructions">
           <v-expansion-panel-text>
+            <p v-if="orders && !savedInstructions" class="orders-empty text-medium-emphasis mb-3">
+              No standing instructions yet.
+            </p>
             <v-textarea v-model="instructions" label="Standing instructions" :disabled="busy || !orders"
               :maxlength="orders?.limit" :counter="orders?.limit" rows="6" />
-            <p>Saved with this project. Each new assistant incarnation reads these instructions.</p>
+            <p class="mb-2">Saved with this project. Each new assistant incarnation reads these instructions.</p>
+            <p class="orders-hint text-body-small text-medium-emphasis mb-2">
+              Usually set by telling uber lmer in chat — "from now on…", "always…" — and it
+              confirms the wording before storing them.
+            </p>
+            <p v-if="orders?.instructions_at" :title="orders.instructions_at"
+              class="orders-changed text-body-small text-medium-emphasis mb-0">
+              last changed {{ ago(orders.instructions_at, now) }}
+            </p>
           </v-expansion-panel-text>
         </v-expansion-panel>
       </v-expansion-panels>
