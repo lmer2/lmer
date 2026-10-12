@@ -60,3 +60,38 @@ class TestWireIdentifiersUntouched:
     def test_documented_in_the_env_var_reference(self):
         docs = (REPO / "docs/LMER-CLI.md").read_text(encoding="utf-8")
         assert "**`LMER_PLATFORM_ASSISTANT_NAME`**" in docs
+
+
+class TestPlatformConfig:
+    def test_default_is_ratchet(self, monkeypatch):
+        from lmer_platform import config as platform_config
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_NAME", raising=False)
+        cfg = platform_config.load({"work_repo_url": "https://git.example.com/w.git"})
+        assert cfg.assistant_name == "Ratchet"
+
+    def test_env_wins_over_default(self, monkeypatch):
+        from lmer_platform import config as platform_config
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_NAME", "Sprocket")
+        cfg = platform_config.load({"work_repo_url": "https://git.example.com/w.git"})
+        assert cfg.assistant_name == "Sprocket"
+
+    def test_blank_assistant_name_is_default(self, monkeypatch):
+        from lmer_platform import config as platform_config
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_NAME", "   ")
+        cfg = platform_config.load({"work_repo_url": "https://git.example.com/w.git"})
+        assert cfg.assistant_name == "Ratchet"
+
+    def test_over_long_name_is_default(self):
+        from lmer_platform import config as platform_config
+        cfg = platform_config.load({"work_repo_url": "https://git.example.com/w.git", "assistant_name": "x" * 41})
+        assert cfg.assistant_name == "Ratchet"
+
+
+class TestPropagation:
+    def test_spawn_exports_the_name(self):
+        source = (REPO / "src/lmer_platform/spawn.py").read_text(encoding="utf-8")
+        assert '"LMER_PLATFORM_ASSISTANT_NAME"' in source
+
+    def test_assistant_env_file_carries_the_name(self):
+        source = (REPO / "src/lmer_platform/assistant.py").read_text(encoding="utf-8")
+        assert 'values["LMER_PLATFORM_ASSISTANT_NAME"]' in source

@@ -341,6 +341,7 @@ from typing import Optional
 
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
+from lmer_cli.comms import assistant_display_name
 
 from . import ask, containers, memory, registry, spawn, statusline
 from .config import (
@@ -1116,7 +1117,7 @@ def _refuse_unusable(candidate: list) -> None:
 
 def _threads_full(reason: str) -> None:
     raise AssistantThreadsFull(
-        f"uber lmer's standing thread list would become unusable: {reason}. "
+        f"{assistant_display_name()}'s standing thread list would become unusable: {reason}. "
         "Remove one in its settings first — the list there is what each "
         "start and rotation reads."
     ) from None
@@ -1710,6 +1711,7 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
     if project_context.current():
         values["LMER_WORKSPACE_ID"] = project_context.current()
         values["LMER_WORKSPACE_NAME"] = projects.get(project_context.current())["name"]
+    values["LMER_PLATFORM_ASSISTANT_NAME"] = config.assistant_name
     path = env_file_path()
     body = "".join(_dotenv_line(name, value) for name, value in values.items())
     try:

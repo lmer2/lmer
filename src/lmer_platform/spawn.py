@@ -3805,6 +3805,7 @@ def _spawn_session(
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
             terminal_settings()["confirm_seconds"].value
         ),
+        "LMER_PLATFORM_ASSISTANT_NAME": config.assistant_name,
     }
     invocation_env.update(channels.env)
     invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)

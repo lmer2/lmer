@@ -302,9 +302,9 @@ def test_public_reply_keeps_the_authenticated_generation_across_rotation(
     elif boundary == "after_auth":
         label = api._thread_label
 
-        def label_after_rotation(caller):
+        def label_after_rotation(*args, **kwargs):
             rotate()
-            return label(caller)
+            return label(*args, **kwargs)
 
         monkeypatch.setattr(api, "_thread_label", label_after_rotation)
     else:

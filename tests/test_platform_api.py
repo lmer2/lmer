@@ -279,6 +279,14 @@ def test_config_summary_omits_secret_path_and_exposes_caps(client):
     assert summary["base_url"].startswith("http://")
 
 
+def test_config_summary_exposes_the_assistant_name(platform_root, monkeypatch):
+    monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_NAME", raising=False)
+    config = cfg.load({"work_repo_url": "https://git.example.com/agents/work.git"})
+    app = api.create_app(config, SECRET, state_builder=api.build_state)
+    summary = TestClient(app).get("/api/state", headers=bearer_header()).json()["config"]
+    assert summary["assistant_name"] == "Ratchet"
+
+
 # --- build_state (integration, no network) ----------------------------------
 
 def test_build_state_reports_unconfigured_work_repo(platform_root):

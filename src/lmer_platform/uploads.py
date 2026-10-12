@@ -55,6 +55,7 @@ from . import registry, store
 from .store import logs_dir
 from .project_context import assistant_dir
 from . import projects, project_context
+from lmer_cli.comms import assistant_display_name
 
 logger = logging.getLogger("lmer_platform.uploads")
 
@@ -388,7 +389,8 @@ def mounted_store(session_id: str, entry: Optional[dict]) -> Path:
         raise StoreUnavailable(
             "this session has no upload store: it was started before file "
             "upload existed, or its store could not be created. Restart the "
-            "session (uber lmer: restart it from the chat header) and the next "
+            "session ("
+            f"{assistant_display_name()}: restart it from the chat header) and the next "
             "one will accept files."
         )
     directory = upload_dir_for(session_id, str((entry or {}).get("kind") or ""))

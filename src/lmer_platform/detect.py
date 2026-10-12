@@ -317,6 +317,7 @@ from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
 from lmer_cli import runref
+from lmer_cli.comms import assistant_display_name
 
 from . import (
     ask, assistant, checkin, nudge, registry, rotation, runs, stall, statusline,
@@ -1414,11 +1415,11 @@ class Detector:
         if not threshold:
             return (
                 "context-fullness reminders are OFF on this host "
-                "(rotation_context_threshold is 0): uber lmer is never told its "
+                f"(rotation_context_threshold is 0): {assistant_display_name()} is never told its "
                 "window is filling. POST /api/assistant/config to set a percent."
             )
         return (
-            f"context-fullness reminder ON: when uber lmer's own status line "
+            f"context-fullness reminder ON: when {assistant_display_name()}'s own status line "
             f"reports {threshold}% of its context window used, it is told once "
             f"— and again at most every "
             f"{rotation.REMINDER_INTERVAL_SECONDS // 60}m while it stays there — "

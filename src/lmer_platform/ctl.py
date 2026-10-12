@@ -126,6 +126,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from lmer_cli import routing_receipts, runref
+from lmer_cli.comms import assistant_display_name
 
 from lmer_platform.client import (
     Call,
@@ -854,7 +855,7 @@ def create_parser() -> argparse.ArgumentParser:
         "send",
         help=(
             "Send a message to a live session on its bus; the agent sees it "
-            "tagged [uber lmer] for workers, or [peer UL message] for an explicitly "
+            f"tagged [{assistant_display_name()}] for workers, or [peer UL message] for an explicitly "
             "addressed peer UL. Peer sends require --ref, remain native and never mirror to external threads "
             "(POST /api/sessions/{id}/comms)."
         ),
@@ -1015,7 +1016,7 @@ def create_parser() -> argparse.ArgumentParser:
         "post",
         help=(
             "Post once into a thread. The post is attributed to this credential "
-            "— `uber lmer` or `operator` — not to anything in the text."
+            f"— `{assistant_display_name()}` or `operator` — not to anything in the text."
         ),
     )
     thread_post.add_argument("permalink", help="Thread permalink.")
