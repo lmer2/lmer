@@ -524,6 +524,113 @@ def test_an_untracked_run_is_refused_by_the_route_itself(client, platform_root):
     assert registry.list_sessions(live_only=False) == []
 
 
+# --- by uid (spec §6.1, §6.4) -------------------------------------------------
+
+UID = "d" * 32
+REPO_URL = "https://gitlab.example.com/agents/global.git"
+
+
+def test_a_resume_body_carries_the_uid_and_the_repo_url(client, resumed):
+    """A schema-2 execution is addressed by its uid; the slug may be left out."""
+    response = client.post(
+        "/api/runs/resume", headers=bearer_header(),
+        json={"host": HOST, "project": PROJECT, "uid": UID, "repo_url": REPO_URL},
+    )
+
+    assert response.status_code == 202, response.text
+    (request,) = resumed.calls
+    assert request.uid == UID
+    assert request.repo_url == REPO_URL
+    assert (request.host, request.project) == (HOST, PROJECT)
+
+
+def test_an_answer_body_carries_the_uid_and_the_repo_url(client, monkeypatch, platform_root):
+    """``repo_url`` is the transport a schema-2 record with no repo-bearing
+    target needs, and the answer route used to drop it on the floor."""
+    from lmer_platform import answer as answer_mod
+
+    calls = []
+
+    def fake_answer(config, request):
+        calls.append(request)
+        return answer_mod.AnswerResult(
+            host=request.host, project=request.project, slug=SLUG, question=None,
+            session=spawn_result(platform_root), uid=request.uid,
+        )
+
+    monkeypatch.setattr(api, "answer_run", fake_answer)
+
+    response = client.post(
+        "/api/runs/answer", headers=bearer_header(),
+        json={"host": HOST, "project": PROJECT, "uid": UID, "repo_url": REPO_URL,
+              "answer": "yes"},
+    )
+
+    assert response.status_code == 202, response.text
+    (request,) = calls
+    assert request.uid == UID
+    assert request.repo_url == REPO_URL
+    assert response.json()["run"]["uid"] == UID
+
+
+def test_a_resume_by_an_untracked_uid_is_refused_as_untracked_not_slugless(
+    client, platform_root
+):
+    """The whole path with nothing stubbed: a uid stands in for the slug, so the
+    refusal is about the run, never ``slug is required``."""
+    response = client.post(
+        "/api/runs/resume", headers=bearer_header(),
+        json={"host": HOST, "project": PROJECT, "uid": UID},
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"]["code"] == "run_not_tracked"
+
+
+@pytest.mark.parametrize("path,verb", [
+    ("/api/runs/resume", "resume_run"), ("/api/runs/answer", "answer_run"),
+])
+def test_a_padded_uid_is_not_a_500_after_the_session_started(
+    client, monkeypatch, platform_root, path, verb
+):
+    """The request strips the uid; re-reading the raw body after the spawn
+    refused the padding and turned a started session into a 500. The check-in
+    stamps the uid the request validated."""
+    from lmer_platform import answer as answer_mod, checkin, runs
+
+    def fake(config, request):
+        if verb == "answer_run":
+            return answer_mod.AnswerResult(
+                host=HOST, project=PROJECT, slug="chat", question=None,
+                session=spawn_result(platform_root), uid=UID,
+            )
+        return resume_mod.ResumeResult(
+            host=HOST, project=PROJECT, slug="chat", taskdef=TASKDEF, target="",
+            continued=True, started_slug="chat",
+            session=spawn_result(platform_root), uid=UID,
+        )
+
+    monkeypatch.setattr(api, verb, fake)
+
+    response = client.post(
+        path, headers=bearer_header(cfg.mint_assistant_credential()),
+        json={"host": HOST, "project": PROJECT, "uid": f"  {UID}\n", "answer": "yes"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert runs.run_key(HOST, PROJECT, UID) in checkin.read_marks()
+
+
+def test_a_malformed_uid_is_refused_by_the_resume_route(client, platform_root):
+    response = client.post(
+        "/api/runs/resume", headers=bearer_header(),
+        json={**RESUME_BODY, "uid": "NOT-A-UID"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "uid" in response.json()["detail"]["message"]
+
+
 def test_resuming_at_capacity_returns_429(client, monkeypatch):
     """Continuing a run is not a reason to exceed the cap — it is a spawn."""
     refuse_with(monkeypatch, api, spawn.CapacityError("concurrency cap reached: 4/4"))
@@ -705,7 +812,7 @@ def test_spawn_verb_passes_agents_as_a_typed_field(platform_root, monkeypatch):
 
     monkeypatch.setattr(daemon, "spawn_session", capture)
     assert daemon.main([
-        "spawn", "develop", "https://example.com/x", "--agents", "sol,fable",
+        "spawn", "develop", "https://example.com/g/p/-/issues/1", "--agents", "sol,fable",
     ]) == 0
     request = seen["request"]
 
@@ -727,7 +834,7 @@ def test_spawn_verb_without_agents_says_nothing_about_them(platform_root,
         return spawn_result(platform_root, session_id="s-1")
 
     monkeypatch.setattr(daemon, "spawn_session", capture)
-    daemon.main(["spawn", "develop", "https://example.com/x"])
+    daemon.main(["spawn", "develop", "https://example.com/g/p/-/issues/1"])
     assert seen["request"].agents is None
 
 

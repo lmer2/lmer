@@ -129,6 +129,35 @@ consult relevant prior exchanges when context is missing.
 - **Answer a question** — a run stopped on a question shows a reply box.
   Answering a *stopped* run starts a fresh session with the answer attached;
   replying to a *live* one is delivered into the waiting session.
+- **Schema-2 runs are keyed by uid** — on a schema-2 work repo every launch is
+  a record of its own, so the platform mints the launch's execution uid before
+  the container starts (it passes `lmer --launch-uid`) and keys the run
+  `host/project/<uid>`; the slug is only the group label every launch of it
+  shares. A schema-1 run keeps its `host/project/<slug>` key. The `uid` comes
+  back in the spawn reply's `run` and in the resume and answer replies' `run`
+  and `started`, fleet rows carry it, and every run-keyed route (`adopt`,
+  `forget`, `meta`, `relations`, `answer`, `resume`, `files`) takes `uid`
+  beside `{host, project, slug}` (body or `?uid=`). `lmer-ctl`'s
+  `host/project/<key>` argument reads a 32-hex last segment as a uid.
+  Resuming or answering such a run starts a fresh execution with the old
+  record as read-only context: a new row of its own, while the source keeps
+  the state it stopped in.
+- **A second session on a project is a warning, not a 409** — on schema 2 a
+  second chat (or a second continuation of one record) is a separate record,
+  so nothing refuses it. The spawn, resume and answer replies' `warning`
+  carries a concurrency note instead, `N live session(s) already on
+  host/project [for <target>]: <session ids>`, narrowed to the same work item
+  when the target is one; the UI shows it. Detected and said, never enforced.
+  A schema-1 run is still one run, one session.
+- **Target-less schema-2 records resume** — a schema-2 record with an empty
+  target, a document (reference) URL, or an `other` URL (one that is not a
+  repository, a work item or a known thread) can be resumed and answered: the
+  launch names its repository with `--repo`, from the request's `repo_url` or
+  else the clone URL recorded for the run. With neither, the call is refused
+  `repo_url_required` and asks for one; the platform will not invent a URL. A
+  schema-1 record with no target is still refused. A record whose target is a
+  bare repository URL resumes on `--repo` too, with that URL dropped as the
+  positional; it lands in the same run, whose slug is the taskdef either way.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
 - **Wound down, not crashed** — a dead session's leftover registry entry is
@@ -153,8 +182,9 @@ consult relevant prior exchanges when context is missing.
   drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
   remains available across rotations, reloads, and daemon restarts.
 - **Run references in chat** — the assistant writes a run's name as a link whose
-  href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
-  view. Details worth knowing:
+  href is `lmer://run/<host>/<project>/<slug>` (`<uid>` in place of the slug
+  for a schema-2 run), and tapping it opens that run's view. Details worth
+  knowing:
   - It is an **in-app dispatch, not navigation**: no history entry, no URL to
     paste or bookmark, nothing that survives a reload. Run views are deliberately
     not browser-addressable (issue #241).
@@ -331,6 +361,46 @@ consult relevant prior exchanges when context is missing.
   its context window has reached a threshold the operator set, the daemon
   recommends a rotation at its next breakpoint. Off by default; it never rotates
   anything itself. Full behaviour in the section below.
+
+### Schema-form views
+
+Three views appear only when the work repo is in schema form (#374). The fleet
+payload's `state.mirror.form` says which form the mirror is in: `schema`,
+`legacy`, or `null` when there is no mirror. It is a presence test for the
+manifest and runs no validation. A legacy tree shows no change: nothing extra
+mounts and no extra request is sent.
+
+- **Sessions per target** — in a run's detail view, for a row that carries a
+  `uid`, the "launches of this target" panel lists every session record in the
+  run's `_runs/<slug>/` group, oldest start first. Each row shows the short uid
+  (with a copy button), the `--<name>` suffix, chips for "this run", `live`, and
+  the row's project when it differs from the run's, then the status, the record
+  state (`active`, `stale`, `seeded`, …) and when it started. **resume** opens a
+  form under that row (slot, direction, and project confirmation when needed) and
+  posts the row's own `uid`, so it continues that launch and no other. A row this
+  orchestrator does not track is read-only and says so; adopt it to continue it
+  from here. The data comes from
+  `GET /api/runs/sessions?host=&project=&slug=|uid=`, which reads the daemon's
+  mirror without pulling, so a launch that pushed seconds ago can be missing for
+  one interval.
+- **Work repo** — once, at the bottom of the all-projects fleet view, because the
+  work repo belongs to no single project. It holds the two panels below, both
+  read from `GET /api/workrepo/schema`, and a **re-validate** button. It reloads
+  when the mirror's HEAD changes.
+  - **Unnamed repos awaiting adoption** — built from the validator's
+    `tree.host-bucket` findings. Each bucket shows its path and a copyable
+    `work adopt <host>/<project> <short-name>` line. Replace `<short-name>` with
+    the name you want before you run it: the platform never derives a name, and
+    the panel has no adopt action.
+  - **Validator findings** — renders `lmer-schema validate --json` over the
+    mirror, exactly as the CLI prints it for that tree. A form/tier header comes
+    first, then a count summary, then each finding's severity, code, path and
+    message. Only errors affect conformance. An unusable manifest is shown as
+    the validator's verdict, not as an API failure.
+
+The validation is cached per mirror HEAD for up to ten minutes, because
+staleness findings move with the clock. **re-validate** (`?refresh=1`) runs it
+again now. Neither route ever pulls, and a legacy tree is never validated.
 
 ## Assistant mentions and DM replies
 

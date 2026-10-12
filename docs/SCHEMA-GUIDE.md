@@ -80,13 +80,13 @@ renaming them makes them silently invisible.
 
 | path | written by | read by | dual-read | exercised by |
 |---|---|---|---|---|
-| `_plexus.yaml` | you, by hand (no `work adopt` ships yet) | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
+| `_plexus.yaml` | you, by hand, or `work adopt` | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
 | `<short-name>/` | your `git mv`; a session on first write | registry resolution | n/a | `work sessions` |
-| `_knowledge/` | humans and agents | humans and agents | n/a | nothing ships at schema 1 |
+| `_knowledge/` | humans and agents; `work knowledge index` generates each org's `INDEX.md` | humans and agents | n/a | `work knowledge index` |
 | `_napkin/` | humans and agents | **nothing in this release — see below** | no | — |
 | `_taskdef/` | you, or a mounted taskdef repo | `taskdef_search_dirs()` | yes (`_taskdef` then `taskdef`) | `lmer --task <name>` |
 | `_agents/` | see *Agent surface* | | yes | |
-| `_archive/` | housekeeping tooling | humans | n/a | nothing ships at schema 1 |
+| `_archive/` | `work housekeep` | humans | n/a | `work housekeep` |
 | `README.md` | you (outside the markers); `lmer-schema index --write` (the block) | humans on GitLab; the validator | n/a | `lmer-schema index .` |
 | any other top-level name | humans | the validator | n/a | `lmer-schema validate` — project-shaped with no registry entry: `tree.unregistered-project` WARN; dotted: `tree.host-bucket` INFO; a registered remote's old path as a real directory: `tree.bucket-collision` ERROR |
 
@@ -106,12 +106,12 @@ your notes in two and the validator will not say a word, because a bare
 | `<project>/_runs/.new-*` | `work` CLI (seed, then one atomic rename) | nobody | no | any first write in a run |
 | `<session-dir>/` | see *Session directory* | | no | |
 | `<project>/_specs/` | `work artifact`, `work session-end`, `work specs-index --rebuild` | humans; `work specs-index` | no | `work specs-index` |
-| `<project>/_plans/`, `PLANS.md`, run-plan links | no shipped writer at schema 1 | the validator | no | `lmer-schema validate` |
+| `<project>/_plans/`, `PLANS.md`, run-plan links | `work housekeep` (done-plan retirement; run-plan links have no shipped writer) | the validator | no | `work housekeep`; `lmer-schema validate` |
 | `<project>/_info/` | you | `work read-project-info` | **no** | `work read-project-info` |
 | `<project>/_info/gate-check.yaml` | you | `gate-check` (after `.lmer/gate-check.yaml`) | no | `gate-check` |
 | `<project>/_taskdef/` | you | `taskdef_search_dirs()` | yes | `lmer --task <name>` |
 | `<project>/_agents/` | see *Agent surface* | | no (memory) | |
-| `<project>/_archive/` | housekeeping; the session cleaner | humans | n/a | nothing ships at schema 1 |
+| `<project>/_archive/` | `work housekeep` | humans | n/a | `work housekeep` |
 | `<project>/README.md` | every durability push in the project (block); you (outside); `lmer-schema index --write` | humans on GitLab; the validator | no | `work commit` |
 
 ### Session directory
@@ -146,19 +146,14 @@ the writer; nothing else may touch the file.
 
 ## 3. Adopting a legacy repo into schema 1
 
-There is **no automatic legacy-layout adoption tool**. No `work adopt` or
-`work migrate` verb ships. The separate `lmer-schema migrate` command
-upgrades an already adopted schema-1 tree to schema 2 (§4); it does not move
-legacy directories. For legacy adoption, the form each tree takes is described
-in SCHEMA.md's
-[Legacy form](./SCHEMA.md#legacy-form) section and
-[Appendix A](./SCHEMA.md#appendix-a-legacy-mapping-informative), and the move
-between them is yours to make. Layout adoption uses `git mv`, a hand-written
-manifest, and two
-throwaway scripts you write yourself (steps 4 and 5 below state exactly what
-they must do; ~20 lines each, and this branch deliberately ships neither). That
-is fine — it is one commit per project — but plan it as a manual edit, not a
-command.
+Legacy layout adoption is tooling. `work adopt <host>/<project> <shortname>`
+names a host bucket, registers it and moves it to `<short-name>/` in one
+commit (dry run by default); `work migrate <project>` then moves the bare
+areas inside it to their schema names. The separate `lmer-schema migrate`
+command upgrades an already adopted schema-1 tree to schema 2 (§4); it does
+not move legacy directories. The form each tree takes is described in
+SCHEMA.md's [Legacy form](./SCHEMA.md#legacy-form) section and
+[Appendix A](./SCHEMA.md#appendix-a-legacy-mapping-informative).
 
 ### Prerequisites
 
@@ -176,12 +171,14 @@ command.
 ### Dry run on a scratch clone — do this first, every time
 
 ```bash
-git clone "$LMER_WORK_REPO_PATH" /tmp/work-scratch
-git -C /tmp/work-scratch remote remove origin   # a stray push is unrecoverable
+# A local bare remote: every `--apply` pushes its one commit there, and a
+# stray push can never reach the real work repo.
+git clone --bare "$LMER_WORK_REPO_PATH" /tmp/work-scratch-remote.git
+git clone /tmp/work-scratch-remote.git /tmp/work-scratch
 PYTHONPATH=src python -m lmer_schema.cli validate /tmp/work-scratch
 ```
 
-Record the baseline counts. Everything below is measured as a delta from them.
+Keep that baseline validator output; compare each step's findings with it.
 Run the project steps inside a subshell whose work context points only at the
 scratch clone (replace the example identity with the project being migrated):
 
@@ -207,113 +204,78 @@ When using a source checkout instead of installed executables, give
 
 ### The steps, in order, for one project
 
-Each step is followed by what the validator said on one example: a scratch
-clone of one real work repo as of 2026-09-12 (371 run dirs, 194 memory files).
-Every number below — counts, run dirs, index entries — is from that snapshot
-and will differ on your tree; watch the deltas and the finding codes, not the
-absolute values. Counts are `errors / warnings / informational`.
+Every `--apply` lands ONE commit and pushes it; a failed push exits `1` with
+the commit already made locally. Re-run `lmer-schema validate` after each
+step and compare the finding codes with the baseline.
 
-**0. Baseline.** `form=legacy exit=1` — `3 / 5 / 220`.
-
-**1. Add the manifest and one registry entry.** Nothing moves yet.
-
-```yaml
-# _plexus.yaml
-schema: 1
-name: <instance>
-projects:
-  <short-name>:
-    repo: <host>/<group>/<repo>     # normalized: no scheme, no .git, no trailing /
-```
-
-`form=schema exit=1` — `4 / 7 / 218`. The tree flips form on this one file.
-The new ERROR is the one you want to see:
-
-```
-ERROR tree.bucket-collision  <host>/<group>/<repo>
-  `<host>/<group>/<repo>` is a real directory while `projects.<short-name>`
-  registers that remote: a split tree — work would land in both
-  `<host>/<group>/<repo>/` and `<short-name>/`.
-```
-
-These new WARNs are normal: `tree.entry-without-dir` (the short name has no
-directory yet) and `tree.unregistered-project` for any dotless top-level
-directory that happens to be project-shaped. A standalone `sources.yaml`
-also raises `manifest.sources-legacy-file` from INFO to WARN.
-
-**2. Move the project and leave the compat symlink.**
+**1. Adopt the bucket.** `work adopt` resolves `<host>/<project>`, checks the
+shortname, the registry and the schema-tier fix list, bootstraps `_plexus.yaml`
+if the tree has none (one loud notice: that file flips the WHOLE tree to schema
+form), writes the registry entry through the writer, and `git mv`s the directory
+to `<short-name>/` in ONE commit. Dry run by default; `--compat-link` leaves a
+relative symlink at the old path (INFO), `--remote URL` adds a remote, and
+`--force` adopts despite schema-tier ERRORs, carrying them into the new
+directory as they are.
 
 ```bash
-git mv <host>/<group>/<repo> <short-name>
-ln -s ../../<short-name> <host>/<group>/<repo>     # relative, depth-matched
-git add <host>/<group>/<repo>
+work adopt git.example.test/group/project example          # dry run
+work adopt git.example.test/group/project example --apply  # one commit
 ```
 
-`3 / 84 / 141`. The collision clears and `tree.bucket-compat-link` INFO
-appears. Warnings jump because the tree is now a real schema-form project
-rather than legacy-tier bucket contents: 78 `agents.memory-scope-mismatch`
-findings escalate INFO → WARN. Step 4 clears them.
-
-**3. Rename `info/` and `taskdef/`.**
+**2. Migrate the project.** `work migrate <project>` plans the bare-area
+renames (`runs/` → `_runs/`, `specs/` → `_specs/`, `plans/` → `_plans/`,
+`info/` → `_info/`, `taskdef/` → `_taskdef/`), nests each legacy run dir under
+its first session id, lifts non-`project` memories to the instance scope,
+re-points the `_specs/`/`_plans/` entries in place (keeping their registration
+dates), folds the pre-A1 plain-session groups (step 3), and lands ONE commit,
+which also regenerates the project README's index block.
+Dry run by default and idempotent: a re-run is a no-op. `--compat-link` leaves
+a relative symlink at each old bare path. A legacy tree gets the nesting and
+the fold in one move.
 
 ```bash
-# Move each directory only if it exists and contains tracked files.
-git mv <short-name>/info <short-name>/_info
-git mv <short-name>/taskdef <short-name>/_taskdef
+work migrate example            # dry run
+work migrate example --apply    # one commit
 ```
 
-`3 / 84 / 141` — **unchanged**. The validator does not check these areas, so it
-cannot tell you that you skipped this step. `work read-project-info` can:
-with `_info/` in place it printed 7 pages; with the bare `info/` left behind it
-printed **2**: only the task-level `<project>/<task_type>/info/` pages, because
-schema form reads project info from `_info/` only. Check the count, not the
-exit code.
+**3. The fold.** A record whose slug is the obsolete derivation of its own
+target — `chat-.`, `chat-<repo>`, `chat-<repo>.git`, `masterplan-.` — moves
+into the bare taskdef group: `_runs/<taskdef>/<session-id>[--<name>]`, with
+only its `slug:` scalar rewritten and every other byte identical; its `_specs/`
+entries are re-registered under the record's new label, dates kept. A record
+re-slugged on purpose (anything carrying `reslugged_from`, the release record)
+is never touched. A destination session dir that already exists is never
+overwritten: in a schema-form `_runs/` the record is reported and skipped;
+while a legacy `runs/` dir is still being nested, it is a blocker that refuses
+the whole migration. Merge the two by hand, then re-run. The fold is refused
+while any session in the group is live (no final `session_end`, or an
+unreadable record): finish or sign out that session, or for a stale record
+that never signed out run `work housekeep --archive-stale`. The same predicate
+is the validator's `record.plain-session-slug` ERROR and the `lmer-schema
+migrate` blocker. A platform row tracked under an old slug stops resolving and
+is forgotten by hand: `lmer platform forget <host>/<project>/<old-slug>`.
 
-**4. Split memory into the two scopes.** Route each file by its frontmatter
-`type:`, and route each `MEMORY.md` line by the file its link points at.
-
-`4 / 7 / 140`. The 78 scope-mismatch warnings clear; the fourth ERROR is not
-the migration's — see the box.
-
-> **The index is line-oriented, and lines lie.** Route by parsing `](name.md)`,
-> never by substring. A `MEMORY.md` that has lost a newline carries two entries
-> on one physical line; a first-link-wins splitter then files the second entry
-> in the wrong scope, and it shows up as an `agents.memory-entry-without-file`
-> ERROR in one scope and an `agents.memory-file-without-entry` WARN in the
-> other. Grep for it before you split: `awk '{if (gsub(/\]\(/,"&")>1) print NR}'`.
-
-**5. Nest the run dirs under their session ids, then rebuild the specs index —
-in the same commit.** `runs/<slug>[--<name>]/` becomes
-`_runs/<slug>/<session-id>[--<name>]/`; the session id is the `session` field
-of the record's own first `events.jsonl` line. This is the second script, and
-the only one that has to read anything.
-
-After the move alone: `144 / 7 / 253` — every `specs/` symlink is now dangling.
-**Do not commit here.** You do not re-point them by hand; drop the old index
-and let the tool write the new one:
+**4. The instance surfaces.** `work migrate --instance` moves
+`agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
+and `taskdef/` → `_taskdef/` — it leaves `napkin/` in place (see *What to
+leave alone*) — and folds a standalone
+`sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
+file in the same commit. It REFUSES unless the running release reads the
+manifest `sources:` tier: deploy the release carrying #370 on every host first,
+because removing `sources.yaml` switches declared sources off on any host still
+running a pre-#370 release.
 
 ```bash
-git rm -r -f --quiet <short-name>/specs     # -f: step 2's git mv staged these
-work specs-index --rebuild
+work migrate --instance            # dry run
+work migrate --instance --apply
 ```
 
-`4 / 7 / 253`. The rebuild wrote 163 entries in the schema-form grammar —
-`YYYY-MM-DD-<name-or-slug>-<session-id>--<artifact>.md`, the session id
-included, which is what keeps two launches of one run from overwriting each
-other's entry — and silently dropped the two entries that were already dangling
-before migration.
+After an applied `work migrate`, the validator runs at the schema tier and its
+whole report is printed; only ERRORs under what this run migrated make the
+exit code non-zero (other projects awaiting their turn are reported, not
+counted), and the commit stands either way.
 
-The 4 remaining errors are the tree's, not the migration's: 3
-`agents.memory-frontmatter` (memories with no `description:` — an ERROR in
-legacy form too) and 1 `agents.memory-entry-without-file` from the malformed
-index line of step 4. Migration added none of them, which is the only number
-that matters here.
-
-Expect and do not chase: `record.session-stale` INFO for every old
-`in-progress` record (113 here) and `record.masterplan-nested` INFO for pre-D12
-bundles (40). Neither affects conformance.
-
-**6. Validate, then start a session against the migrated tree.**
+**5. Validate, then start a session against the migrated tree.**
 
 ```bash
 lmer-schema validate /tmp/work-scratch
@@ -325,11 +287,11 @@ LMER_WORK_REPO_PATH=/tmp/work-scratch LMER_REPO_URL=https://<host>/<group>/<repo
 The record must land at
 `<short-name>/_runs/develop-issue-999/20260912-160000-9-4242/` holding
 `state.yaml` and `events.jsonl`. Confirm the old history came through:
-`work sessions` counted 371 records before this launch and 372 after, session
-ids and all.
+`work sessions` lists one more record after this launch than before, with the
+migrated records' session ids unchanged.
 
-**7. Roll back.** On a scratch clone, `git reset --hard HEAD && git clean -fd`
-returns the tree to the baseline counts exactly (`3 / 5 / 220` here). On the
+**6. Roll back.** On a scratch clone, `git reset --hard <baseline commit> &&
+git clean -fd` returns the tree to the baseline validator output exactly. On the
 real repo **do not use `git clean`** — it deletes untracked run state other
 sessions have written. Branch-switching the live checkout is not safe either:
 other sessions `work commit` into it. With a local migration branch that has no
@@ -339,11 +301,11 @@ records publish to the migration branch. Migrate in a **separate clone**, push
 the result as one commit, and roll back by not pushing (or by reverting that
 commit).
 
-**8. Repeat per project.** One project, one commit, one validate. A tree
+**7. Repeat per project.** One project, one commit, one validate. A tree
 holds migrated and unmigrated projects at once; that is the point of the `_`
 prefix.
 
-**9. Render the index blocks.** `lmer-schema index . --write` (preview first
+**8. Render the index blocks.** `lmer-schema index . --write` (preview first
 without `--write`): every project README gets its generated run table and the
 root README its project list, text outside the markers untouched. Commit the
 result as one change through the normal gated commit — the root `README.md`
@@ -354,11 +316,14 @@ its own; the root block is yours to re-render, and commit the same way, when
 
 ### What to leave alone
 
-- `napkin/` — no reader for `_napkin/` in this release (§2).
-- `runs/archive/` and `{host}/{project}/{task_type}/{target}/` — recognised
-  legacy and read-side fallback; both informational, neither required to move.
-- Instance `agent-files/`, `mirrors/`, `taskdef/` — dual-read, so they migrate
-  independently and whenever you like.
+- `napkin/` — no reader for `_napkin/` in this release (§2); `work migrate
+  --instance` leaves it in place and says so.
+- `{host}/{project}/{task_type}/{target}/` — recognised legacy and a read-side
+  fallback; informational, not required to move. (`runs/archive/` is not in
+  this list: `work migrate` relocates it to `_archive/_runs/`.)
+- Instance `agent-files/` and `taskdef/` — dual-read — and `mirrors/` — an
+  opaque operator directory no runtime reads — so `work migrate --instance`
+  can move them whenever you like once #370 is deployed fleet-wide.
 - `<project>/README.md` text outside the markers is yours; the block is
   regenerated; edit the hand text in a separate clone while sessions push.
 
@@ -373,15 +338,14 @@ before cutover; a clean validator does not prove that the fleet is stopped.
 Keep the legacy layout adoption in §3 separate from this version change.
 
 Upgrade every operator's host `lmer` as well, before the cut-over, not only
-the image: the host CLI alone exports `LMER_TASK_TARGET`, so a lagging host
-keeps filing local-path launches (`lmer chat .`) under `chat-.` beside the
-`chat` groups that current hosts create. The migration owner can detect a
-lagging host afterwards with one line — any `chat-.` record added after the
-cut-over names it in the commit's author:
-
-```bash
-git log --since=<cutover> --diff-filter=A --name-only -- '*/_runs/chat-./*' | grep -c state.yaml
-```
+the image: the host CLI alone exports `LMER_TASK_TARGET`. A current container
+classifies the target it is given (`work_repo.utils.classify_target`), so a
+lagging host's `.` lands in the bare-taskdef group anyway — but a host still
+exporting the raw spelling keeps filing local-path launches (`lmer chat .`)
+under `chat-.` beside the `chat` groups current hosts create. After the
+cut-over, a new `record.plain-session-slug` finding from `lmer-schema
+validate` names a lagging runtime; fold the group (below), then reinstall
+that host's CLI.
 
 On each operator host, from the checkout of the merged tree:
 
@@ -415,6 +379,16 @@ Retain the original manifest and record hashes for comparison. Keep its
 remote removed for layout tests, or point it only at a disposable local bare
 repository when testing publication.
 
+### Fold plain-session groups
+
+A schema-2 tree that already holds `chat-.`, `chat-<repo>` or
+`chat-<repo>.git` groups (filed by a pre-classifier host) folds them into the
+bare-taskdef group with `work migrate <project>`: dry run first, then
+`--apply`. It is idempotent, and it refuses while a session in the group is
+live. `lmer-schema migrate` lists a plain-session group as a blocker naming
+the same command, so `--apply` cannot land while one remains. See §3 for the
+adoption step that produces those groups.
+
 ### Preview, apply, and prove preservation
 
 With the v2-capable runtime selected:
@@ -429,7 +403,9 @@ lmer-schema migrate /path/to/scratch-plexus --apply --json
 The first call is read-only. Review `diff` and `blockers`; do not apply with
 blockers present. The first successful apply changes only the manifest's
 version scalar, preserving comments, unknown keys, historical IDs, record
-bytes and paths. The second apply reports `applied: false` with no changes.
+bytes and paths. A plain-session fold is a prerequisite the blocker names,
+not part of the manifest apply: it changes only the paths of the folded
+records and the one `slug:` scalar each carries. The second apply reports `applied: false` with no changes.
 A blocked migration exits 1; unusable input exits 2. Validate before and
 after as well: migration preflight is not a replacement for full validation.
 

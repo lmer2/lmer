@@ -278,26 +278,28 @@ fi
 # =============================================================================
 section "🔗 Declared Sources"
 
-# Reads ${LMER_WORK_REPO_PATH:-/work}/sources.yaml and reports declared-source
-# reachability via the frozen helper CLI (lmer_cli.container.sources doctor;
-# contract in that module's docstring). Every finding here is a WARNING,
-# never an error — a broken declared source must not flip doctor's exit code.
-# All URLs printed below come pre-scrubbed from the helper's JSON. The
-# unredacted clone_url (--emit-clone-urls opt-in) is never echoed, never
-# written to disk (the record loop is fed by process substitution, not a
-# here-string, which bash backs with a $TMPDIR file), and never passed in
-# argv (/proc/<pid>/cmdline is readable by everything else in this
-# container) — git receives it through ephemeral GIT_CONFIG_* env, the same
-# never-in-argv rule the clone cache follows.
+# Reads the declared-source tiers at ${LMER_WORK_REPO_PATH:-/work} — the
+# plexus manifest's `_plexus.yaml sources:` section and the legacy standalone
+# sources.yaml — and reports which tier is in effect per source plus
+# declared-source reachability, via the frozen helper CLI
+# (lmer_cli.container.sources doctor; contract in that module's docstring).
+# Both tiers resolve through the helper's load_sources (issue #370) — never
+# through shell-side YAML — and the helper reads the manifest beside --path.
+# Every finding here is a WARNING, never an error — a broken declared source
+# must not flip doctor's exit code. All URLs printed below come pre-scrubbed
+# from the helper's JSON. The unredacted clone_url (--emit-clone-urls opt-in)
+# is never echoed, never written to disk (the record loop is fed by process
+# substitution, not a here-string, which bash backs with a $TMPDIR file),
+# and never passed in argv (/proc/<pid>/cmdline is readable by everything
+# else in this container) — git receives it through ephemeral GIT_CONFIG_*
+# env, the same never-in-argv rule the clone cache follows.
 SOURCES_YAML="${LMER_WORK_REPO_PATH:-/work}/sources.yaml"
 PLEXUS_MANIFEST="${LMER_WORK_REPO_PATH:-/work}/_plexus.yaml"
 # --- Sources precedence (lmer schema spec §4) ---
 # env override > `_plexus.yaml sources:` > legacy standalone sources.yaml.
-# Resolution is per source: an env override covers its own key and the
-# file covers the rest (clone_and_exec resolution matrix). The manifest
-# tier is DECLARED-ONLY today — its loader is a spec §10 follow-up and
-# nothing consumes it yet — so doctor reports the rule and warns when the
-# legacy file is the tier in effect, but never claims the manifest is.
+# Resolution is per source key: an env override covers its own key and the
+# declaration files cover the rest (clone_and_exec resolution matrix); the
+# helper's `tiers` map says which file each declared key resolved from.
 # The env var names mirror lmer_cli.container.sources.SOURCE_ENV_OVERRIDES
 # (pinned by tests/test_doctor_sources.py). Only the NAMES are printed: an
 # override value can carry a credential and never reaches output.
@@ -312,68 +314,38 @@ done
 if [[ -n "$SOURCES_ENV_IN_EFFECT" ]]; then
     pass "env override tier in effect for: $SOURCES_ENV_IN_EFFECT (precedence: $SOURCES_PRECEDENCE_RULE)"
 fi
-# Manifest tier: same guarded-python3 + PyYAML approach as the taskdef
-# schema check below. Detection only — nothing is loaded from it.
-PLEXUS_SOURCES_STATE="absent"
-if [[ -f "$PLEXUS_MANIFEST" ]]; then
-    PLEXUS_SOURCES_STATE="$("${LMER_PYTHON:-python3}" -c '
-import sys
-try:
-    import yaml
-except Exception:
-    print("noyaml"); sys.exit(0)
-try:
-    with open(sys.argv[1]) as f:
-        data = yaml.safe_load(f)
-except Exception:
-    print("unreadable"); sys.exit(0)
-sources = data.get("sources") if isinstance(data, dict) else None
-print("declared" if isinstance(sources, dict) and sources else "none")
-' "$PLEXUS_MANIFEST" 2>/dev/null)" || true
-    [[ -n "$PLEXUS_SOURCES_STATE" ]] || PLEXUS_SOURCES_STATE="nopython"
+# Which declaration files are present, by name. The manifest counts when a
+# dangling symlink sits there (-L): that is a present, broken manifest the
+# helper reports as such — the rule load_manifest applies.
+DECLARED_FILES_PRESENT=""
+if [[ -f "$SOURCES_YAML" ]]; then
+    DECLARED_FILES_PRESENT="sources.yaml"
 fi
-# Three "could not look" states are kept apart so the operator fixes the
-# right thing: the interpreter, its PyYAML, or the manifest. All are notes
-# only (detail, never warn/error): manifest shape is the validator's job,
-# not doctor's, and none of them changes the exit code.
-case "$PLEXUS_SOURCES_STATE" in
-    declared)
-        warn "$PLEXUS_MANIFEST declares a sources: section but this lmer does not load it yet (loader is a spec §10 follow-up) — declared-only, not loaded; keep the env override or legacy sources.yaml until the loader lands"
-        ;;
-    nopython)
-        detail "$PLEXUS_MANIFEST present but ${LMER_PYTHON:-python3} unavailable — sources: section unknown"
-        ;;
-    noyaml)
-        detail "$PLEXUS_MANIFEST present but PyYAML unavailable to ${LMER_PYTHON:-python3} — sources: section unknown (not a manifest problem)"
-        ;;
-    unreadable)
-        detail "$PLEXUS_MANIFEST present but not parseable here — sources: section unknown"
-        ;;
-esac
+if [[ -e "$PLEXUS_MANIFEST" || -L "$PLEXUS_MANIFEST" ]]; then
+    DECLARED_FILES_PRESENT="${DECLARED_FILES_PRESENT:+$DECLARED_FILES_PRESENT and }_plexus.yaml"
+fi
 # Renderer-supported taskdef schemas, captured from the helper's doctor
 # document (supported_taskdef_schemas) — never re-derived in shell. Filled
 # by the META record below; the taskdef schema check re-asks the helper if
-# it is still empty (legacy mode: no sources.yaml, but /taskdef cloned via
-# the env-var override path).
+# it is still empty (legacy mode: no declaration file, but /taskdef cloned
+# via the env-var override path).
 SUPPORTED_TASKDEF_SCHEMAS_CSV=""
-if [[ ! -f "$SOURCES_YAML" ]]; then
-    # Absent file is silent legacy mode (spec G5) — a skip note, not a finding.
+# The file the taskdef declaration came from, for the taskdef schema hint
+# below; set from the SRC record once the helper has said which tier.
+TASKDEF_DECL_FILE="$SOURCES_YAML"
+if [[ -z "$DECLARED_FILES_PRESENT" ]]; then
+    # Nothing present is silent legacy mode (spec G5) — a skip note, not a
+    # finding. The helper is not asked: it has nothing to read.
     if ! $QUIET; then
         echo "  - no sources.yaml at $SOURCES_YAML — silent legacy mode, checks skipped"
     fi
 else
-    # The legacy standalone file is the tier in effect (for every source an
-    # env override does not cover). A warning, not an error: the file is
-    # recognized and honored; it retires when the tree migrates (spec §4).
-    LEGACY_TIER_SCOPE=""
-    if [[ -n "$SOURCES_ENV_IN_EFFECT" ]]; then
-        LEGACY_TIER_SCOPE=" for sources not overridden by env"
-    fi
-    warn "legacy sources.yaml tier in effect ($SOURCES_YAML)$LEGACY_TIER_SCOPE — precedence: $SOURCES_PRECEDENCE_RULE; the _plexus.yaml sources: tier is declared-only until its loader lands; the standalone file retires when the tree migrates"
-    # One helper invocation. --path is passed explicitly even though the
-    # helper's own default resolves to the same $LMER_WORK_REPO_PATH file:
-    # the path checked above is the one reported in the messages below, and
-    # this is the section's test seam. On a validation refusal (exit 2) the
+    # One helper invocation whenever either file exists. --path is passed
+    # explicitly even though the helper's own default resolves to the same
+    # $LMER_WORK_REPO_PATH file: the path checked above is the one reported
+    # in the messages below, and this is the section's test seam; the
+    # helper reads $PLEXUS_MANIFEST beside it. On a validation refusal
+    # (exit 2 — either tier untrustworthy, or a manifest it cannot read) the
     # helper still emits one JSON document, so the exit code is deliberately
     # ignored in favor of the document.
     SOURCES_JSON="$("${LMER_PYTHON:-python3}" -m lmer_cli.container.sources doctor \
@@ -395,10 +367,27 @@ try:
         raise ValueError("not a JSON object")
 except Exception:
     sys.exit(3)
+# The tier each declared key resolved from (manifest | legacy), from the
+# helper. Missing for a key only if the helper predates the tiers map.
+tiers = doc.get("tiers") if isinstance(doc.get("tiers"), dict) else {}
+# What the document amounts to: a declaration ("declared"), nothing
+# declared and nothing to say ("silent" — the skip note), or nothing
+# declared but a finding to show ("unread": a tier that could not be read,
+# or a refusal with no sources) — so the shell never prints the silent-
+# legacy note beside a warning that contradicts it.
+if doc.get("present"):
+    state = "declared"
+elif doc.get("warnings") or doc.get("errors"):
+    state = "unread"
+else:
+    state = "silent"
 rows = [["META",
          "1" if doc.get("ok") else "0",
          clean(doc.get("schema")),
-         ",".join(str(s) for s in doc.get("supported_taskdef_schemas") or [])]]
+         ",".join(str(s) for s in doc.get("supported_taskdef_schemas") or []),
+         state,
+         ",".join(clean(n) for n, t in tiers.items() if t == "manifest"),
+         ",".join(clean(n) for n, t in tiers.items() if t == "legacy")]]
 for w in doc.get("warnings") or []:
     rows.append(["WARN", clean(w)])
 for e in doc.get("errors") or []:
@@ -411,42 +400,96 @@ if isinstance(srcs, dict):
         rows.append(["SRC", clean(name), clean(entry.get("mode")),
                      "1" if entry.get("anonymous") else "0",
                      clean(entry.get("ref")), clean(entry.get("repo")),
-                     clean(entry.get("clone_url"))])
+                     clean(entry.get("clone_url")),
+                     clean(tiers.get(name)) or "unknown"])
 for row in rows:
     print(SEP.join(row))
 ' 2>/dev/null)" || true
     fi
     if [[ -z "$SOURCES_PARSED" ]]; then
         # Degrade to a single warning: python3/the helper module unavailable,
-        # or the helper emitted nothing parseable.
-        warn "sources.yaml present but the sources helper is unavailable or its output was unparseable — declared sources unchecked"
+        # or the helper emitted nothing parseable. (PyYAML missing and a
+        # manifest the helper cannot read are NOT this case: the helper
+        # still runs and reports each as its own finding below.)
+        warn "$DECLARED_FILES_PRESENT present but the sources helper is unavailable or its output was unparseable — declared sources unchecked"
         detail "tried: ${LMER_PYTHON:-python3} -m lmer_cli.container.sources doctor --json --path $SOURCES_YAML"
     else
         LS_REMOTE_CMD=(git ls-remote --)
         if command -v timeout &>/dev/null; then
             LS_REMOTE_CMD=(timeout 20 git ls-remote --)
         fi
-        while IFS=$'\x1f' read -r REC_TAG REC_1 REC_2 REC_3 REC_4 REC_5 REC_6; do
+        while IFS=$'\x1f' read -r REC_TAG REC_1 REC_2 REC_3 REC_4 REC_5 REC_6 REC_7; do
             case "$REC_TAG" in
                 META)
-                    if [[ "$REC_1" == "1" ]]; then
-                        pass "sources.yaml valid (schema $REC_2)"
-                    fi
+                    # ok, legacy schema, supported taskdef schemas, state
+                    # (declared | silent | unread), keys resolved from the
+                    # manifest, keys resolved from the legacy file.
                     SUPPORTED_TASKDEF_SCHEMAS_CSV="$REC_3"
                     detail "supported taskdef schemas: $REC_3"
+                    case "$REC_4" in
+                        silent)
+                            # A file is present but declares nothing (a
+                            # manifest without a sources: section): silent
+                            # legacy mode, the same skip note as no file.
+                            if ! $QUIET; then
+                                echo "  - no sources.yaml at $SOURCES_YAML — silent legacy mode, checks skipped"
+                            fi
+                            continue
+                            ;;
+                        unread)
+                            # Nothing declared, but the WARN/ERR records
+                            # below say why (a tier that could not be read).
+                            continue
+                            ;;
+                    esac
+                    if [[ "$REC_1" == "1" && -n "$REC_2" ]]; then
+                        pass "sources.yaml valid (schema $REC_2)"
+                    fi
+                    if [[ -n "$REC_5" ]]; then
+                        pass "_plexus.yaml sources: tier in effect for: ${REC_5//,/, } ($PLEXUS_MANIFEST) — precedence: $SOURCES_PRECEDENCE_RULE"
+                    fi
+                    # The legacy standalone file is the tier in effect only
+                    # for the keys it resolves: those the helper attributes
+                    # to it, minus any an env override covers (env beats
+                    # both files, per key). A warning, not an error: the
+                    # file is recognized and honored; it retires when the
+                    # tree migrates (spec §4).
+                    LEGACY_KEYS_IN_EFFECT=""
+                    for key in ${REC_6//,/ }; do
+                        var="LMER_$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')_REPO"
+                        if [[ " $SOURCES_ENV_OVERRIDE_VARS " == *" $var "* && -n "${!var:-}" ]]; then
+                            continue
+                        fi
+                        LEGACY_KEYS_IN_EFFECT="${LEGACY_KEYS_IN_EFFECT:+$LEGACY_KEYS_IN_EFFECT, }$key"
+                    done
+                    if [[ -n "$LEGACY_KEYS_IN_EFFECT" ]]; then
+                        warn "legacy sources.yaml tier in effect for: $LEGACY_KEYS_IN_EFFECT ($SOURCES_YAML) — precedence: $SOURCES_PRECEDENCE_RULE; the standalone file retires when the tree migrates"
+                    fi
                     ;;
                 WARN|ERR)
-                    # Helper findings (load warnings, refusal errors) are all
-                    # warnings here — doctor's exit semantics stay unchanged.
+                    # Helper findings (load warnings incl. the stale-legacy
+                    # notice, refusal errors incl. an unreadable manifest,
+                    # the PyYAML-missing and core-unimportable notices) are
+                    # all warnings here — doctor's exit semantics stay
+                    # unchanged.
                     warn "$REC_1"
                     ;;
                 SRC)
                     SRC_NAME="$REC_1"; SRC_MODE="$REC_2"; SRC_ANON="$REC_3"
                     SRC_REF="$REC_4"; SRC_REPO="$REC_5"; SRC_CLONE_URL="$REC_6"
+                    SRC_TIER="$REC_7"
+                    # The file this declaration came from, for the fix-it hints.
+                    SRC_DECL_FILE="$SOURCES_YAML"
+                    if [[ "$SRC_TIER" == "manifest" ]]; then
+                        SRC_DECL_FILE="$PLEXUS_MANIFEST"
+                    fi
+                    if [[ "$SRC_NAME" == "taskdef" ]]; then
+                        TASKDEF_DECL_FILE="$SRC_DECL_FILE"
+                    fi
                     if [[ -z "$SRC_CLONE_URL" ]]; then
                         # No derivation (no work-repo URL) — the helper's own
                         # warning above already covers it once.
-                        detail "$SRC_NAME: clone URL not derived — reachability not checked"
+                        detail "$SRC_NAME: clone URL not derived — reachability not checked (tier: $SRC_TIER)"
                         continue
                     fi
                     LS_REMOTE_OUT=""
@@ -496,7 +539,7 @@ for row in rows:
                         fi
                         exit "$LS_REMOTE_RC"
                     )"; then
-                        pass "$SRC_NAME source reachable: $SRC_REPO (mode: $SRC_MODE)"
+                        pass "$SRC_NAME source reachable: $SRC_REPO (tier: $SRC_TIER, mode: $SRC_MODE)"
                         if [[ -n "$SRC_REF" ]]; then
                             # Accept branch, tag, full ref path, or full SHA.
                             # Matched in-shell rather than through a
@@ -521,9 +564,9 @@ for row in rows:
                                 fi
                             done < <(printf '%s\n' "$LS_REMOTE_OUT")
                             if $REF_PRESENT; then
-                                pass "$SRC_NAME ref '$SRC_REF' present on remote"
+                                pass "$SRC_NAME ref '$SRC_REF' present on remote (tier: $SRC_TIER)"
                             else
-                                warn "$SRC_NAME ref '$SRC_REF' not found on $SRC_REPO — fix sources.taskdef.ref in $SOURCES_YAML or push the ref"
+                                warn "$SRC_NAME ref '$SRC_REF' not found on $SRC_REPO (tier: $SRC_TIER) — fix sources.taskdef.ref in $SRC_DECL_FILE or push the ref"
                             fi
                         fi
                     else
@@ -536,7 +579,7 @@ for row in rows:
                         elif [[ "$SRC_ANON" == "1" ]]; then
                             SRC_REMEDY="anonymous derivation (credential-less work-repo URL) — the repo must be publicly readable, or use the env var override"
                         fi
-                        warn "$SRC_NAME source unreachable: $SRC_REPO (mode: $SRC_MODE) — git ls-remote failed; $SRC_REMEDY"
+                        warn "$SRC_NAME source unreachable: $SRC_REPO (tier: $SRC_TIER, mode: $SRC_MODE) — git ls-remote failed; $SRC_REMEDY"
                     fi
                     ;;
             esac
@@ -614,7 +657,7 @@ print(schema)
             elif [[ ",$SUPPORTED_TASKDEF_SCHEMAS_CSV," == *",$TASKDEF_SCHEMA,"* ]]; then
                 pass "taskdef schema $TASKDEF_SCHEMA supported by this renderer (supports: $SUPPORTED_TASKDEF_SCHEMAS_CSV)"
             else
-                warn "taskdef declares schema $TASKDEF_SCHEMA but this renderer supports only: $SUPPORTED_TASKDEF_SCHEMAS_CSV — upgrade the container image, or pin sources.taskdef.ref (in $SOURCES_YAML) to a ref using a supported schema"
+                warn "taskdef declares schema $TASKDEF_SCHEMA but this renderer supports only: $SUPPORTED_TASKDEF_SCHEMAS_CSV — upgrade the container image, or pin sources.taskdef.ref (in $TASKDEF_DECL_FILE) to a ref using a supported schema"
             fi
             ;;
     esac

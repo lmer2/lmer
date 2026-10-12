@@ -56,6 +56,9 @@ tests:
     # text-only edit to SCHEMA.md must run it.
     - tests/test_lmer_schema_cli.py
     - tests/test_lmer_schema_manifest.py
+    # Reads the read-path modules' source to pin that they never mention
+    # ruamel (the manifest writer is the only ruamel importer, #365).
+    - tests/test_lmer_schema_manifest_roundtrip.py
     - tests/test_masterplan_provisioning.py
     - tests/test_performance.py
     - tests/test_platform_ask.py
@@ -93,6 +96,8 @@ tests:
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
     - tests/test_user_harnesses.py
+    # Reads the golden INDEX.md files under tests/fixtures/knowledge-index/.
+    - tests/test_work_repo_knowledge_index.py
     - tests/test_work_repo_release_run.py
     - tests/test_work_repo_run_state.py
     - tests/test_workrepo_isolation_guard.py

@@ -398,3 +398,120 @@ def test_a_stamp_a_few_seconds_ahead_is_still_believed(platform_root):
     )
     facts = checkin.checkin_of({"checked_at": ahead}, window=WINDOW)
     assert facts["since"] == ahead
+
+
+# --- the key segment (spec §6.1) ---------------------------------------------
+#
+# A schema-2 row is keyed by its execution uid, so its mark lives under
+# host/project/<uid>: two launches of one slug group are two clocks.
+
+UID = "a" * 32
+OTHER_UID = "b" * 32
+
+
+def test_a_check_is_recorded_and_read_under_the_uid_key(platform_root):
+    uid_row = row("chat", uid=UID)
+    sibling = row("chat", uid=OTHER_UID)
+    checkin.observe(fleet(uid_row, sibling))
+
+    assert checkin.record_check("git.example.com", "acme/widgets", UID) is True
+
+    marks = checkin.read_marks()
+    assert f"git.example.com/acme/widgets/{UID}" in marks
+    assert "git.example.com/acme/widgets/chat" not in marks
+    facts = checkin.row_checkin(uid_row, marks, window=WINDOW)
+    assert facts["checked_at"] == marks[f"git.example.com/acme/widgets/{UID}"]["checked_at"]
+    assert checkin.row_checkin(sibling, marks, window=WINDOW)["checked_at"] is None
+
+
+def test_a_stale_uid_row_is_announced_under_its_uid_key(platform_root):
+    uid_row = row("chat", uid=UID)
+    checkin.observe(fleet(uid_row))
+    stamp(UID, "first_seen", iso(hours=2))
+
+    stale = checkin.stale_runs(fleet(uid_row), window=WINDOW)
+    assert [run.ref for run in stale] == [f"git.example.com/acme/widgets/{UID}"]
+    assert stale[0].slug == "chat" and stale[0].uid == UID
+    assert stale[0].to_dict()["uid"] == UID
+
+    checkin.record_announced(stale)
+    assert "announced_at" in checkin.read_marks()[f"git.example.com/acme/widgets/{UID}"]
+
+
+# --- carrying marks to a run's new key (spec §6.1 transition) ----------------
+
+OLD_PARTS = ("git.example.com", "acme/widgets", "chat")
+NEW_PARTS = ("git.example.com", "acme/widgets", UID)
+OLD_KEY = "git.example.com/acme/widgets/chat"
+NEW_KEY = f"git.example.com/acme/widgets/{UID}"
+
+
+def test_rekey_moves_the_marks(platform_root):
+    checked = iso(minutes=5)
+    stamp("chat", "checked_at", checked)
+    stamp("chat", "first_seen", iso(hours=3))
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": True, "conflict": False}
+
+    marks = checkin.read_marks()
+    assert OLD_KEY not in marks
+    assert marks[NEW_KEY]["checked_at"] == checked
+    assert checkin.row_checkin(row("chat", uid=UID), marks, window=WINDOW)["checked_at"] == checked
+
+
+def test_rekey_is_idempotent(platform_root):
+    stamp("chat", "checked_at", iso(minutes=5))
+    checkin.rekey(OLD_PARTS, NEW_PARTS)
+    before = checkin.read_marks()
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": False, "conflict": False}
+    assert checkin.read_marks() == before
+
+
+def test_rekey_of_an_absent_old_key_is_a_no_op(platform_root):
+    stamp(UID, "checked_at", iso(minutes=5))
+    before = checkin.read_marks()
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": False, "conflict": False}
+    assert checkin.read_marks() == before
+
+
+def test_rekey_carries_over_the_stamps_the_new_key_lacks(platform_root):
+    first_seen, checked = iso(hours=3), iso(minutes=5)
+    stamp("chat", "checked_at", checked)
+    stamp("chat", "first_seen", first_seen)
+    stamp(UID, "first_seen", first_seen)
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": True, "conflict": False}
+    assert checkin.read_marks()[NEW_KEY] == {"checked_at": checked, "first_seen": first_seen}
+
+
+def test_rekey_keeps_the_later_of_two_differing_stamps_and_is_no_conflict(platform_root):
+    """A mark is all bookkeeping stamps (``runs.BOOKKEEPING_STAMPS``): two keys
+    stamping one run differently are not two answers to keep (review !387)."""
+    older, newer = iso(hours=2), iso(minutes=10)
+    stamp("chat", "checked_at", newer)
+    stamp(UID, "checked_at", older)
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": True, "conflict": False}
+
+    assert checkin.read_marks()[NEW_KEY]["checked_at"] == newer
+    assert checkin.conflicted(NEW_PARTS) is False
+
+
+def test_a_stamp_pair_an_earlier_build_kept_is_still_read_and_reported(platform_root):
+    older, newer = iso(hours=2), iso(minutes=10)
+    stamp(UID, "checked_at", {"old": older, "new": newer})
+
+    assert checkin.rekey(OLD_PARTS, NEW_PARTS) == {"moved": False, "conflict": True}
+    assert checkin.conflicted(NEW_PARTS) is True
+    marks = checkin.read_marks()
+    assert marks[NEW_KEY]["checked_at"] == {"old": older, "new": newer}
+    # Both values are kept through the next unrelated write, and the clock
+    # runs from the later of them.
+    checkin.observe(fleet(row("chat", uid=UID)))
+    assert checkin.read_marks()[NEW_KEY]["checked_at"] == {"old": older, "new": newer}
+    facts = checkin.row_checkin(row("chat", uid=UID), checkin.read_marks(), window=WINDOW)
+    assert facts["checked_at"] == newer
+    assert facts["since"] == newer
+    assert facts["stale"] is False

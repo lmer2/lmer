@@ -8,10 +8,14 @@ interpreter. git ls-remote is faked via a PATH-prepended `git`; the taskdef
 clone dir uses the existing LMER_DOCTOR_TASKDEF_DIR seam. One case drives
 the REAL helper end-to-end (LMER_PYTHON unset, PYTHONPATH=src/).
 
-The section also reports the sources precedence rule (spec §4: env override
-> `_plexus.yaml sources:` > legacy `sources.yaml`). A legacy file in effect
-is a WARN, so cases that put one in place assert on `_finding_warns` (the
-tier line excluded) rather than `_warn_lines`.
+The section also reports which declaration tier is in effect per source
+(spec §4 / issue #370: env override > `_plexus.yaml sources:` > legacy
+`sources.yaml`), resolved by the helper's `doctor` document (`tiers`) — never
+by shell-side YAML. A legacy file in effect is a WARN, so cases that put one
+in place assert on `_finding_warns` (the tier line excluded) rather than
+`_warn_lines`. Cases whose outcome depends on what the tree actually
+declares (both tiers, a broken manifest, a manifest without `sources:`) run
+the real helper through `_run_real_doctor`.
 
 doctor runs many unrelated sections that may warn or error in a host
 sandbox, so every assertion is scoped to the Declared Sources block (stdout
@@ -39,12 +43,49 @@ WARN_MARK = "⚠"
 PASS_MARK = "✓"
 
 DECLARED_REPO = "https://git.example.com/group/taskdef.git"
+NAPKIN_REPO = "https://git.example.com/group/napkin.git"
 
-# The precedence rule as doctor prints it, and the marker of the WARN it
-# raises when the legacy standalone file is the tier in effect.
+# The work-repo URL the real-helper cases derive auth from; its token must
+# never reach doctor's output.
+WORK_REPO_TOKEN = "hosttoken456"
+WORK_REPO_URL = f"https://oauth2:{WORK_REPO_TOKEN}@git.example.com/group/work.git"
+
+# The precedence rule as doctor prints it, the marker of the WARN it raises
+# when the legacy standalone file is the tier in effect, the PASS it prints
+# when the manifest tier is, and the pre-loader wording that must be gone
+# now that the manifest tier is loaded (issue #370).
 PRECEDENCE_RULE = "env override > _plexus.yaml sources: > legacy sources.yaml"
 LEGACY_TIER_WARN = "legacy sources.yaml tier in effect"
-MANIFEST_DECLARED_ONLY = "declared-only"
+MANIFEST_TIER_PASS = "_plexus.yaml sources: tier in effect"
+DECLARED_ONLY = "declared-only"
+
+# Tree shapes for the real-helper cases. The manifest declares taskdef; the
+# two legacy files declare taskdef alone, or taskdef (outranked by the
+# manifest, so stale) plus napkin (the legacy tier in effect for that key).
+PLEXUS_WITH_SOURCES = (
+    "schema: 1\n"
+    "name: example\n"
+    "sources:\n"
+    "  taskdef:\n"
+    f"    repo: {DECLARED_REPO}\n"
+    "    ref: main\n"
+)
+LEGACY_WITH_TASKDEF = (
+    "schema: 1\n"
+    "sources:\n"
+    "  taskdef:\n"
+    f"    repo: {DECLARED_REPO}\n"
+    "    ref: main\n"
+)
+LEGACY_WITH_BOTH = (
+    "schema: 1\n"
+    "sources:\n"
+    "  taskdef:\n"
+    f"    repo: {DECLARED_REPO}\n"
+    "    ref: other\n"
+    "  napkin:\n"
+    f"    repo: {NAPKIN_REPO}\n"
+)
 
 
 def test_work_repo_credential_file_contract_is_documented():
@@ -96,13 +137,20 @@ def _finding_warns(block):
 
 
 def _helper_doc(clone_url, *, ref="main", repo=DECLARED_REPO, mode="https-userinfo",
-                anonymous=False, warnings=(), errors=(), ok=True, schema=1):
-    """Canned `sources doctor --json --emit-clone-urls` document (frozen seam)."""
+                anonymous=False, warnings=(), errors=(), ok=True, schema=1,
+                tier="legacy"):
+    """Canned `sources doctor --json --emit-clone-urls` document (frozen seam).
+
+    `tier` is what the helper's `tiers` map says taskdef resolved from —
+    `legacy` (sources.yaml) or `manifest` (`_plexus.yaml sources:`).
+    """
     return {
         "ok": ok,
         "path": "unused-by-doctor",
         "present": True,
-        "schema": schema,
+        "schema": schema if tier == "legacy" else None,
+        "manifest_path": "unused-by-doctor",
+        "manifest_present": tier == "manifest",
         "work_repo_url": "https://git.example.com/group/work.git",
         "sources": {
             "taskdef": {
@@ -114,6 +162,7 @@ def _helper_doc(clone_url, *, ref="main", repo=DECLARED_REPO, mode="https-userin
                 "clone_url_redacted": False,
             }
         },
+        "tiers": {"taskdef": tier},
         "warnings": list(warnings),
         "errors": list(errors),
         "supported_sources_schemas": [1],
@@ -121,7 +170,16 @@ def _helper_doc(clone_url, *, ref="main", repo=DECLARED_REPO, mode="https-userin
     }
 
 
-def _write_stub_python(tmp_path, doc, no_emit_doc=None, no_yaml=False):
+def _no_yaml_shim_dir(tmp_path):
+    """A PYTHONPATH entry that makes an interpreter look like one without
+    PyYAML (a shadowing `yaml` module that raises ImportError)."""
+    shim_dir = tmp_path / "no-yaml-shim"
+    shim_dir.mkdir(exist_ok=True)
+    (shim_dir / "yaml.py").write_text('raise ImportError("PyYAML not installed")\n')
+    return shim_dir
+
+
+def _write_stub_python(tmp_path, doc, no_emit_doc=None):
     """LMER_PYTHON stub: canned JSON for the helper module, real python otherwise.
 
     doctor also runs `$LMER_PYTHON -c '<flatten/parse script>'`, so everything
@@ -131,24 +189,12 @@ def _write_stub_python(tmp_path, doc, no_emit_doc=None, no_yaml=False):
     WITHOUT `--emit-clone-urls` — i.e. the Declared-Sources loop gets `doc`
     and the taskdef check's legacy re-ask gets `no_emit_doc`, so a test can
     tell which of the two supplied a value.
-
-    `no_yaml` makes the delegated interpreter look like one without PyYAML
-    (a shadowing `yaml` module that raises ImportError), for the
-    "present but PyYAML unavailable" diagnosis.
     """
     canned = tmp_path / "canned-helper.json"
     canned.write_text(json.dumps(doc))
     fallback = tmp_path / "canned-helper-no-emit.json"
     fallback.write_text(json.dumps(no_emit_doc if no_emit_doc is not None else doc))
     exec_line = f'exec {shlex.quote(sys.executable)} "$@"\n'
-    if no_yaml:
-        shim_dir = tmp_path / "no-yaml-shim"
-        shim_dir.mkdir(exist_ok=True)
-        (shim_dir / "yaml.py").write_text('raise ImportError("PyYAML not installed")\n')
-        exec_line = (
-            f"export PYTHONPATH={shlex.quote(str(shim_dir))}\n"
-            f'exec {shlex.quote(sys.executable)} "$@"\n'
-        )
     stub = tmp_path / "stub-lmer-python"
     stub.write_text(
         "#!/usr/bin/env bash\n"
@@ -247,6 +293,33 @@ def _run_doctor(*, work, taskdef_dir, lmer_python=None, fake_git_dir=None,
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
 
 
+def _run_real_doctor(tmp_path, work, *, git_body=GIT_OK_MAIN, no_yaml=False,
+                     extra_env=None, verbose=False):
+    """Run doctor against the REAL helper: LMER_PYTHON unset, PYTHONPATH=src/.
+
+    `python3` resolves to the test interpreter's bin dir (PATH prepend); the
+    branch's lmer_cli.container.sources reads the tree under `work`, derives
+    the credentialed clone URLs from LMER_REPO_URL, and the fake git answers
+    ls-remote. `no_yaml` puts the PyYAML shim first on PYTHONPATH.
+    """
+    git_dir = _write_fake_git(tmp_path, git_body)
+    pythonpath = [str(SRC_DIR)]
+    if no_yaml:
+        pythonpath.insert(0, str(_no_yaml_shim_dir(tmp_path)))
+    env = {
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+        "PATH": os.pathsep.join(
+            [str(git_dir), str(Path(sys.executable).parent), os.environ.get("PATH", "")]
+        ),
+        "LMER_REPO_URL": WORK_REPO_URL,
+    }
+    env.update(extra_env or {})
+    return _run_doctor(
+        work=work, taskdef_dir=tmp_path / "no-taskdef", fake_git_dir=git_dir,
+        extra_env=env, verbose=verbose,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -282,11 +355,12 @@ class TestDoctorDeclaredSources:
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
         assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
+        # Every pass/warn line names the tier the declaration came from.
         assert (
-            f"taskdef source reachable: {DECLARED_REPO} (mode: https-userinfo)"
-            in block
+            f"taskdef source reachable: {DECLARED_REPO} "
+            "(tier: legacy, mode: https-userinfo)" in block
         )
-        assert "taskdef ref 'main' present on remote" in block
+        assert "taskdef ref 'main' present on remote (tier: legacy)" in block
         assert _finding_warns(block) == [], block
 
     def test_unreachable_source_warns_with_remediation(self, tmp_path):
@@ -305,6 +379,7 @@ class TestDoctorDeclaredSources:
         warns = _finding_warns(block)
         assert len(warns) == 1, block
         assert "taskdef source unreachable" in warns[0]
+        assert "(tier: legacy, mode: https-userinfo)" in warns[0]
         assert "git ls-remote failed" in warns[0]
         assert (
             "check host reachability and that the work-repo credential grants "
@@ -355,7 +430,9 @@ class TestDoctorDeclaredSources:
         warns = _finding_warns(block)
         assert len(warns) == 1, block
         assert "taskdef ref 'main' not found on" in warns[0]
-        assert "fix sources.taskdef.ref" in warns[0]
+        assert "(tier: legacy)" in warns[0]
+        # The fix-it hint names the file the declaration came from.
+        assert f"fix sources.taskdef.ref in {work}/sources.yaml" in warns[0]
 
     def test_present_ref_survives_a_remote_with_many_refs(self, tmp_path):
         """(d2) A present ref must not be reported missing on a big remote.
@@ -670,48 +747,57 @@ class TestDoctorDeclaredSources:
         assert len(warns) == 1, block
         assert "supports only: 1,2,3" in warns[0]
 
-    def test_real_helper_end_to_end(self, tmp_path):
-        """(i) Real helper: LMER_PYTHON unset, PYTHONPATH=src/, real sources.yaml.
+    @pytest.mark.parametrize("tree", ["legacy", "manifest", "both"])
+    def test_real_helper_end_to_end(self, tmp_path, tree):
+        """(i) Real helper: LMER_PYTHON unset, PYTHONPATH=src/, a real tree.
 
         `python3` resolves to the test interpreter's bin dir (PATH prepend);
-        the branch's lmer_cli.container.sources parses the file, derives the
-        credentialed clone URL from LMER_REPO_URL, and the fake git answers
-        ls-remote. The work-repo token must never appear in output.
+        the branch's lmer_cli.container.sources reads the declaration
+        tier(s), derives the credentialed clone URL from LMER_REPO_URL, and
+        the fake git answers ls-remote. Three tree shapes: the legacy file
+        alone, the manifest alone, and both — the manifest outranking the
+        legacy taskdef (stale) while the legacy napkin stays in effect. The
+        work-repo token must never appear in output.
         """
         work = tmp_path / "work"
         work.mkdir()
-        (work / "sources.yaml").write_text(
-            "schema: 1\n"
-            "sources:\n"
-            "  taskdef:\n"
-            f"    repo: {DECLARED_REPO}\n"
-            "    ref: main\n"
-        )
-        git_dir = _write_fake_git(tmp_path, GIT_OK_MAIN)
-        python_bin_dir = Path(sys.executable).parent
-        proc = _run_doctor(
-            work=work, taskdef_dir=tmp_path / "no-taskdef",
-            fake_git_dir=git_dir,
-            extra_env={
-                "PYTHONPATH": str(SRC_DIR),
-                "PATH": os.pathsep.join(
-                    [str(git_dir), str(python_bin_dir), os.environ.get("PATH", "")]
-                ),
-                "LMER_REPO_URL": (
-                    "https://oauth2:hosttoken456@git.example.com/group/work.git"
-                ),
-            },
-        )
+        if tree == "legacy":
+            (work / "sources.yaml").write_text(LEGACY_WITH_TASKDEF)
+        if tree == "both":
+            (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
+        if tree in ("manifest", "both"):
+            (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        proc = _run_real_doctor(tmp_path, work)
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
-        assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
+        tier = "legacy" if tree == "legacy" else "manifest"
         assert (
-            f"taskdef source reachable: {DECLARED_REPO} (mode: https-userinfo)"
-            in block
+            f"taskdef source reachable: {DECLARED_REPO} "
+            f"(tier: {tier}, mode: https-userinfo)" in block
         )
-        assert "taskdef ref 'main' present on remote" in block
-        assert _finding_warns(block) == [], block
-        assert "hosttoken456" not in proc.stdout + proc.stderr
+        assert f"taskdef ref 'main' present on remote (tier: {tier})" in block
+        if tree == "legacy":
+            assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
+            (legacy_warn,) = _warn_lines(block)
+            assert LEGACY_TIER_WARN in legacy_warn and "for: taskdef" in legacy_warn
+        elif tree == "manifest":
+            assert MANIFEST_TIER_PASS in block
+            assert _warn_lines(block) == [], block
+        else:
+            assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
+            assert any(
+                MANIFEST_TIER_PASS in line and "for: taskdef" in line
+                for line in block.splitlines()
+            ), block
+            (legacy_warn,) = [w for w in _warn_lines(block) if LEGACY_TIER_WARN in w]
+            assert "for: napkin" in legacy_warn
+            assert any("stale" in w and "taskdef" in w for w in _warn_lines(block)), block
+            assert (
+                f"napkin source reachable: {NAPKIN_REPO} "
+                "(tier: legacy, mode: https-userinfo)" in block
+            )
+        assert DECLARED_ONLY not in block
+        assert WORK_REPO_TOKEN not in proc.stdout + proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -720,15 +806,6 @@ class TestDoctorDeclaredSources:
 
 # A credentialed override value: doctor may name the VARIABLE, never its value.
 ENV_OVERRIDE_URL = "https://x-token:envsekrit789@git.example.com/group/taskdef.git"
-
-PLEXUS_WITH_SOURCES = (
-    "schema: 1\n"
-    "name: example\n"
-    "sources:\n"
-    "  taskdef:\n"
-    f"    repo: {DECLARED_REPO}\n"
-    "    ref: main\n"
-)
 
 
 def _tier_lines(block):
@@ -756,8 +833,15 @@ def test_doctor_env_override_names_match_the_helper_contract():
     assert names == set(SOURCE_ENV_OVERRIDES.values())
 
 
+def test_doctor_no_longer_calls_the_manifest_tier_declared_only():
+    """The loader landed (issue #370): doctor reports the tier in effect, and
+    the pre-loader 'declared-only … until its loader lands' wording is gone
+    from the script itself, not merely from the paths the cases exercise."""
+    assert DECLARED_ONLY not in DOCTOR.read_text()
+
+
 class TestDoctorSourcesPrecedence:
-    """Which tier supplied the declared sources, and the legacy WARN."""
+    """Which tier supplied each declared source, and the legacy WARN."""
 
     def test_env_override_tier_in_effect(self, tmp_path):
         """Env override set, no files: the env tier is named, values never shown."""
@@ -787,9 +871,9 @@ class TestDoctorSourcesPrecedence:
     def test_legacy_sources_yaml_tier_warns_naming_the_rule(self, tmp_path):
         """Legacy file is the tier in effect → exactly one WARN, never an error.
 
-        The warn names the precedence rule and says the manifest tier is
-        declared-only until its loader lands; the reachability checks still
-        run and pass beneath it.
+        The warn names the keys the legacy file resolves and the precedence
+        rule; the reachability checks still run and pass beneath it, each
+        naming the tier. The pre-loader 'declared-only' claim is gone.
         """
         work = tmp_path / "work"
         work.mkdir()
@@ -805,18 +889,21 @@ class TestDoctorSourcesPrecedence:
         warns = _warn_lines(block)
         assert len(warns) == 1, block
         assert LEGACY_TIER_WARN in warns[0]
+        assert "for: taskdef" in warns[0]
         assert f"{work}/sources.yaml" in warns[0]
         assert PRECEDENCE_RULE in warns[0]
-        assert MANIFEST_DECLARED_ONLY in warns[0]
-        assert "not overridden by env" not in warns[0]
+        assert DECLARED_ONLY not in block
+        assert MANIFEST_TIER_PASS not in block
         assert "✗" not in block
         assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
-        assert "taskdef ref 'main' present on remote" in block
+        assert "taskdef ref 'main' present on remote (tier: legacy)" in block
 
-    def test_env_override_beside_legacy_file_qualifies_the_legacy_warn(
+    def test_legacy_warn_names_only_the_keys_the_legacy_file_resolves(
         self, tmp_path
     ):
-        """Resolution is per source: env covers its key, the file the rest."""
+        """Resolution is per source: an env override covers its own key, so
+        the legacy WARN names the keys the file still resolves and not the
+        overridden one."""
         work = tmp_path / "work"
         work.mkdir()
         (work / "sources.yaml").write_text("schema: 1\n")
@@ -835,20 +922,47 @@ class TestDoctorSourcesPrecedence:
         ), block
         (legacy_warn,) = _warn_lines(block)
         assert LEGACY_TIER_WARN in legacy_warn
-        assert "not overridden by env" in legacy_warn
+        assert "for: taskdef" in legacy_warn
+        assert "napkin" not in legacy_warn
         assert "envsekrit789" not in proc.stdout + proc.stderr
 
-    def test_manifest_sources_are_declared_only_not_loaded(self, tmp_path):
-        """_plexus.yaml sources: with no legacy file → declared-only, no claim.
+    def test_env_override_covering_every_legacy_key_drops_the_legacy_warn(
+        self, tmp_path
+    ):
+        """The legacy file resolves nothing once env covers its only key: no
+        legacy WARN at all (the declaration is still reachability-checked)."""
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "sources.yaml").write_text("schema: 1\n")
+        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO))
+        git_dir = _write_fake_git(tmp_path, GIT_OK_MAIN)
+        proc = _run_doctor(
+            work=work, taskdef_dir=tmp_path / "no-taskdef",
+            lmer_python=stub, fake_git_dir=git_dir,
+            extra_env={"LMER_TASKDEF_REPO": ENV_OVERRIDE_URL},
+        )
+        assert proc.returncode != 2, proc.stderr
+        block = _declared_sources_block(proc.stdout)
+        assert any(
+            "env override tier in effect" in line and "LMER_TASKDEF_REPO" in line
+            for line in block.splitlines()
+        ), block
+        assert _warn_lines(block) == [], block
+        assert "taskdef source reachable" in block
+        assert "envsekrit789" not in proc.stdout + proc.stderr
 
-        No code consumes the manifest tier yet (loader is a spec §10
-        follow-up), so doctor must not say it is in effect, and must not run
-        the reachability checks against it.
+    def test_manifest_sources_are_loaded_and_named_as_the_tier_in_effect(
+        self, tmp_path
+    ):
+        """_plexus.yaml sources: with no legacy file → the manifest tier is
+        in effect: the helper-backed reachability check runs against it and
+        every pass line names the tier. (The inverse of the pre-loader case,
+        which asserted 'declared-only' and that git was never called.)
         """
         work = tmp_path / "work"
         work.mkdir()
         (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
-        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO))
+        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO, tier="manifest"))
         git_dir = _write_fake_git(tmp_path, GIT_OK_MAIN)
         proc = _run_doctor(
             work=work, taskdef_dir=tmp_path / "no-taskdef",
@@ -856,68 +970,135 @@ class TestDoctorSourcesPrecedence:
         )
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
-        (manifest_warn,) = _warn_lines(block)
-        assert "_plexus.yaml" in manifest_warn
-        assert "sources:" in manifest_warn
-        assert MANIFEST_DECLARED_ONLY in manifest_warn
-        assert "not loaded" in manifest_warn
-        assert LEGACY_TIER_WARN not in manifest_warn
-        assert not any(
-            "_plexus.yaml" in line and "in effect" in line
-            for line in block.splitlines()
-        ), block
-        # Nothing was loaded from it: no helper-backed pass lines, no git.
-        assert "source reachable" not in block
-        assert _git_invocations(tmp_path) == []
-        assert f"no sources.yaml at {work}/sources.yaml" in block
-
-    def _manifest_lines(self, tmp_path, work, stub):
-        proc = _run_doctor(
-            work=work, taskdef_dir=tmp_path / "no-taskdef", lmer_python=stub,
-            verbose=True,
+        (tier_line,) = [line for line in block.splitlines() if MANIFEST_TIER_PASS in line]
+        assert PASS_MARK in tier_line
+        assert "for: taskdef" in tier_line
+        assert f"{work}/_plexus.yaml" in tier_line
+        assert PRECEDENCE_RULE in tier_line
+        assert (
+            f"taskdef source reachable: {DECLARED_REPO} "
+            "(tier: manifest, mode: https-userinfo)" in block
         )
-        assert proc.returncode != 2, proc.stderr
-        block = _declared_sources_block(proc.stdout)
-        assert _warn_lines(block) == [], block   # detail only: exit code untouched
-        return [line for line in block.splitlines() if "_plexus.yaml" in line]
+        assert "taskdef ref 'main' present on remote (tier: manifest)" in block
+        assert _warn_lines(block) == [], block
+        assert DECLARED_ONLY not in block
+        assert LEGACY_TIER_WARN not in block
+        # No legacy file: neither its validity line nor the skip note.
+        assert "sources.yaml valid" not in block
+        assert "no sources.yaml at" not in block
+        # The reachability check really ran against the manifest's declaration.
+        assert f"ARGV {DECLARED_REPO}" in _git_invocations(tmp_path)
 
-    def test_manifest_unparseable_is_a_detail_naming_the_file(self, tmp_path):
-        """A broken _plexus.yaml: verbose detail says so; shape is the
-        validator's job, so no WARN and no exit-code change."""
-        work = tmp_path / "work"
-        work.mkdir()
-        (work / "_plexus.yaml").write_text("projects: [broken\n")
-        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO))
-        (line,) = self._manifest_lines(tmp_path, work, stub)
-        assert "present but not parseable here" in line
-        assert "PyYAML" not in line
-
-    def test_manifest_with_pyyaml_missing_is_a_different_diagnosis(self, tmp_path):
-        """PyYAML absent from $LMER_PYTHON is NOT "not parseable": the detail
-        blames the interpreter, not the manifest, and is still detail-only."""
+    def test_manifest_declared_ref_missing_names_the_manifest(self, tmp_path):
+        """The fix-it hint for a missing ref names the file the declaration
+        came from — the manifest, not the (absent) legacy file."""
         work = tmp_path / "work"
         work.mkdir()
         (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
-        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO), no_yaml=True)
-        (line,) = self._manifest_lines(tmp_path, work, stub)
-        assert "PyYAML unavailable" in line
-        assert str(stub) in line
-        assert "not parseable" not in line
+        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO, tier="manifest"))
+        git_dir = _write_fake_git(tmp_path, GIT_OK_OTHER_REFS)
+        proc = _run_doctor(
+            work=work, taskdef_dir=tmp_path / "no-taskdef",
+            lmer_python=stub, fake_git_dir=git_dir,
+        )
+        assert proc.returncode != 2, proc.stderr
+        (warn,) = _warn_lines(_declared_sources_block(proc.stdout))
+        assert "taskdef ref 'main' not found on" in warn
+        assert "(tier: manifest)" in warn
+        assert f"fix sources.taskdef.ref in {work}/_plexus.yaml" in warn
+
+    def test_both_tiers_report_manifest_for_the_outranked_key_and_the_stale_warn(
+        self, tmp_path
+    ):
+        """Real helper: the manifest and the legacy file both declare taskdef.
+
+        The manifest wins per key: taskdef is reported at tier manifest, the
+        helper's stale-legacy WARN surfaces for it, and the legacy WARN names
+        only napkin — the one key the legacy file still resolves.
+        """
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
+        proc = _run_real_doctor(tmp_path, work)
+        assert proc.returncode != 2, proc.stderr
+        block = _declared_sources_block(proc.stdout)
+        assert f"{PASS_MARK} sources.yaml valid (schema 1)" in block
+        (tier_line,) = [line for line in block.splitlines() if MANIFEST_TIER_PASS in line]
+        assert PASS_MARK in tier_line and "for: taskdef" in tier_line
+        warns = _warn_lines(block)
+        (legacy_warn,) = [w for w in warns if LEGACY_TIER_WARN in w]
+        assert "for: napkin" in legacy_warn
+        assert "taskdef" not in legacy_warn.split("(", 1)[0]
+        (stale_warn,) = [w for w in warns if "stale" in w]
+        assert "taskdef" in stale_warn
+        assert f"{work}/sources.yaml" in stale_warn
+        assert f"{work}/_plexus.yaml" in stale_warn
+        assert len(warns) == 2, block
+        assert (
+            f"taskdef source reachable: {DECLARED_REPO} "
+            "(tier: manifest, mode: https-userinfo)" in block
+        )
+        assert "taskdef ref 'main' present on remote (tier: manifest)" in block
+        assert (
+            f"napkin source reachable: {NAPKIN_REPO} "
+            "(tier: legacy, mode: https-userinfo)" in block
+        )
+        assert DECLARED_ONLY not in block
+        assert "✗" not in block
+        assert WORK_REPO_TOKEN not in proc.stdout + proc.stderr
+
+    def test_broken_manifest_is_a_warning_naming_the_file(self, tmp_path):
+        """Real helper: a broken _plexus.yaml is the helper's refusal document
+        (exit 2 there), surfaced as ONE WARN naming the file — never an error,
+        so doctor exits exactly as it does on an empty work root."""
+        empty = tmp_path / "empty-work"
+        empty.mkdir()
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "_plexus.yaml").write_text("projects: [broken\n")
+        baseline = _run_real_doctor(tmp_path, empty)
+        proc = _run_real_doctor(tmp_path, work)
+        assert baseline.returncode != 2, baseline.stderr
+        assert proc.returncode == baseline.returncode, proc.stdout
+        block = _declared_sources_block(proc.stdout)
+        (warn,) = _warn_lines(block)
+        assert f"{work}/_plexus.yaml" in warn
+        assert "unparseable" in warn
+        assert "PyYAML" not in warn
+        assert "✗" not in block
+        assert "source reachable" not in block
+
+    def test_manifest_with_pyyaml_missing_is_a_different_diagnosis(self, tmp_path):
+        """PyYAML absent from the helper's interpreter is NOT "unparseable":
+        the WARN blames the interpreter, not the manifest (and not the
+        lmer-schema core)."""
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        proc = _run_real_doctor(tmp_path, work, no_yaml=True)
+        assert proc.returncode != 2, proc.stderr
+        block = _declared_sources_block(proc.stdout)
+        (warn,) = _warn_lines(block)
+        assert "PyYAML" in warn
+        assert f"{work}/_plexus.yaml" in warn
+        assert "unparseable" not in warn
+        assert "lmer_schema" not in warn
+        assert "source reachable" not in block
 
     def test_manifest_without_sources_section_is_silent(self, tmp_path):
-        """A _plexus.yaml with no sources: key adds nothing to the section."""
+        """Real helper: a _plexus.yaml with no sources: key is not a
+        declaration — the section keeps the silent-legacy skip note."""
         work = tmp_path / "work"
         work.mkdir()
         (work / "_plexus.yaml").write_text("schema: 1\nname: example\n")
-        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO))
-        proc = _run_doctor(
-            work=work, taskdef_dir=tmp_path / "no-taskdef", lmer_python=stub,
-        )
+        proc = _run_real_doctor(tmp_path, work)
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
         assert _warn_lines(block) == [], block
         assert "_plexus.yaml" not in block
         assert "silent legacy mode" in block
+        assert _git_invocations(tmp_path) == []
 
     def test_nothing_present_keeps_the_silent_legacy_line(self, tmp_path):
         """No env, no manifest, no file: the existing skip note and no tier talk."""
@@ -936,20 +1117,53 @@ class TestDoctorSourcesPrecedence:
         assert _tier_lines(block) == [], block
         assert _warn_lines(block) == [], block
 
+    def test_helper_unavailable_for_a_manifest_only_tree(self, tmp_path):
+        """The helper runs whenever either file exists, so for a manifest-only
+        tree its absence is the same single degrade warning, naming the file
+        that went unchecked — the python-missing diagnosis, kept apart from
+        PyYAML-missing and manifest-unreadable."""
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        proc = _run_doctor(
+            work=work, taskdef_dir=tmp_path / "no-taskdef",
+            lmer_python="/bin/false",
+        )
+        assert proc.returncode != 2, proc.stderr
+        block = _declared_sources_block(proc.stdout)
+        (warn,) = _warn_lines(block)
+        assert "_plexus.yaml present" in warn
+        assert "sources helper is unavailable" in warn
+        assert "declared sources unchecked" in warn
+        assert "no sources.yaml at" not in block
+
     def test_tier_findings_never_change_the_exit_code(self, tmp_path):
         """Differential: the noisiest tier state exits exactly as the empty one.
 
-        Both tiers present (manifest declared-only + legacy in effect) and an
-        unreachable source produce several warnings; the exit code must be
-        the one an empty work root produces in the same sandbox.
+        Both tiers in effect (manifest for taskdef, legacy for napkin), the
+        helper's stale-legacy WARN and two unreachable sources produce several
+        warnings; the exit code must be the one an empty work root produces
+        in the same sandbox.
         """
         empty = tmp_path / "empty-work"
         empty.mkdir()
         work = tmp_path / "work"
         work.mkdir()
         (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
-        (work / "sources.yaml").write_text("schema: 1\n")
-        stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO))
+        (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
+        stale = (
+            f"{work}/sources.yaml: `sources.taskdef` is also declared in "
+            f"{work}/_plexus.yaml, which takes precedence; the sources.yaml "
+            "entry is stale and ignored — remove it"
+        )
+        doc = _helper_doc(DECLARED_REPO, tier="manifest", warnings=[stale])
+        doc["schema"] = 1
+        doc["sources"]["napkin"] = {
+            "repo": NAPKIN_REPO, "mode": "https-userinfo", "anonymous": False,
+            "clone_url": NAPKIN_REPO, "clone_url_redacted": False,
+        }
+        doc["tiers"]["napkin"] = "legacy"
+        stub = _write_stub_python(tmp_path, doc)
         git_dir = _write_fake_git(tmp_path, GIT_UNREACHABLE)
         baseline = _run_doctor(
             work=empty, taskdef_dir=tmp_path / "no-taskdef",
@@ -963,7 +1177,9 @@ class TestDoctorSourcesPrecedence:
         assert noisy.returncode == baseline.returncode, noisy.stdout
         block = _declared_sources_block(noisy.stdout)
         warns = _warn_lines(block)
-        assert any(LEGACY_TIER_WARN in w for w in warns), block
-        assert any(MANIFEST_DECLARED_ONLY in w for w in warns), block
-        assert any("taskdef source unreachable" in w for w in warns), block
+        assert any(LEGACY_TIER_WARN in w and "for: napkin" in w for w in warns), block
+        assert any("stale" in w for w in warns), block
+        assert any(MANIFEST_TIER_PASS in line for line in block.splitlines()), block
+        assert sum("source unreachable" in w for w in warns) == 2, block
+        assert DECLARED_ONLY not in block
         assert "✗" not in block

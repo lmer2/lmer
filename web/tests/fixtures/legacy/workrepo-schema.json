@@ -1,0 +1,7 @@
+{
+  "buckets": [],
+  "document": null,
+  "form": "legacy",
+  "note": "lmer-schema validate --json over this daemon's mirror, exactly as the CLI prints it. Cached per mirror revision for up to ten minutes, because staleness findings move with the clock; ?refresh=1 re-validates now. No pull is forced. A host bucket is adopted with its `work adopt` line, after choosing the short name.",
+  "tier": "legacy"
+}

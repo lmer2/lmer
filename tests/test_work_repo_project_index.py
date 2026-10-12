@@ -41,6 +41,7 @@ from tests.schema2_fixtures import (
     uid_for,
 )
 from work_repo import project_index as pi
+from work_repo import run_state
 from work_repo import session_record
 from work_repo.project_index import (
     END_MARKER,
@@ -137,7 +138,8 @@ def _summary(**overrides) -> RecordSummary:
         dir_rel="_runs/chat/" + uid_for(1), dir_name=uid_for(1), uid=uid_for(1), readable=True,
         slug="chat", name="named-run", goal_line=None, first_log=None, status="in-progress",
         stop_reason=None, phase=None, started_at="2026-09-20T10:00:00Z",
-        updated="2026-09-20T10:05:00Z", signed_out=True, source_uid=None, source_rel=None,
+        updated="2026-09-20T10:05:00Z", signed_out=True, seeded=False,
+        source_uid=None, source_rel=None,
     )
     base.update(overrides)
     return RecordSummary(**base)
@@ -156,6 +158,110 @@ def _render(tree: Schema2Tree, project: str = DEFAULT_PROJECT, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestContinuesResolvesByUid:
+    """A1-rest.index-labels: a `continues` source is addressed by
+    `session.source_session_uid`, so a folded, freeze-renamed or archived
+    source never dangles."""
+
+    def _move(self, tree, uid, dest_rel):
+        src = tree.record_dir(DEFAULT_PROJECT, uid)
+        dest = tree.project_dir(DEFAULT_PROJECT) / dest_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dest)
+        tree.records[DEFAULT_PROJECT][uid] = dest
+        return dest
+
+    def test_a_folded_source_resolves_to_its_new_group(self, tree):
+        src, cont = uid_for(1), uid_for(2)
+        tree.add(DEFAULT_PROJECT, RecordSpec(src, "chat-.", stamp(1), stamp(1, 11)))
+        self._move(tree, src, f"_runs/chat/{src}")
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            cont, "chat", stamp(2), stamp(2, 11), source_uid=src,
+            source_path=f"{DEFAULT_PROJECT}/_runs/chat-./{src}"))
+        assert f"continues [{src[:8]}](_runs/chat/{src}/)" in _rows(_render(tree))[0]
+
+    def test_an_archived_source_resolves_to_the_archive(self, tree):
+        src, cont = uid_for(1), uid_for(2)
+        tree.add(DEFAULT_PROJECT, RecordSpec(src, "chat", stamp(1), stamp(1, 11)))
+        self._move(tree, src, f"_archive/_runs/chat/{src}")
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            cont, "chat", stamp(2), stamp(2, 11), source_uid=src,
+            source_path=f"{DEFAULT_PROJECT}/_runs/chat/{src}"))
+        assert f"continues [{src[:8]}](_archive/_runs/chat/{src}/)" in _rows(_render(tree))[0]
+
+    def test_an_unknown_uid_falls_back_to_the_recorded_path(self, tree):
+        src, cont = uid_for(1), uid_for(2)
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            cont, "chat", stamp(2), stamp(2, 11), source_uid=src,
+            source_path=f"{DEFAULT_PROJECT}/_runs/chat/{src}"))
+        assert f"continues [{src[:8]}](_runs/chat/{src}/)" in _rows(_render(tree))[0]
+
+    def test_a_freeze_renamed_source_resolves_by_uid_not_a_stale_path(self, tree):
+        src, cont = uid_for(1), uid_for(2)
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            src, "chat", stamp(1), stamp(1, 11), name="first", dir_suffix="first"))
+        # The recorded path names the pre-rename dir; the uid map wins.
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            cont, "chat", stamp(2), stamp(2, 11), source_uid=src,
+            source_path=f"{DEFAULT_PROJECT}/_runs/chat/{src}"))
+        assert f"continues [{src[:8]}](_runs/chat/{src}--first/)" in _rows(_render(tree))[0]
+
+    def test_an_untracked_archive_source_is_filtered(self, tree):
+        src = uid_for(1)
+        tree.add(DEFAULT_PROJECT, RecordSpec(src, "chat", stamp(1), stamp(1, 11)))
+        self._move(tree, src, f"_archive/_runs/chat/{src}")
+        project_dir = tree.project_dir()
+        # The listing filter rejects the archive path, so the map must not
+        # resolve it (the link would dangle on the forge).
+        assert src not in pi._source_dir_map(
+            project_dir, include=lambda rel: "_archive" not in rel
+        )
+        assert pi._source_dir_map(project_dir).get(src) == f"_archive/_runs/chat/{src}"
+
+    def test_a_default_label_and_an_inherited_name_render_as_the_row_label(self, tree):
+        tree.add(DEFAULT_PROJECT,
+                 RecordSpec(uid_for(1), "chat", stamp(1), stamp(1, 11), name="chat-261009-abcd"),
+                 RecordSpec(uid_for(2), "chat", stamp(2), stamp(2, 11), name="tidy"))
+        rows = _rows(_render(tree))
+        assert any("chat-261009-abcd" in row for row in rows)
+        assert any("tidy" in row for row in rows)
+        assert all("_(unnamed)_" not in row for row in rows)
+
+    def test_unnamed_is_marked_only_when_name_is_null(self, tree):
+        tree.add(DEFAULT_PROJECT, RecordSpec(
+            uid_for(1), "chat", stamp(1), stamp(1, 11), goal="do it"))
+        assert "_(unnamed)_" in _rows(_render(tree))[0]
+
+
+class TestSeededRow:
+    """A1-rest.index-labels: the `seeded` state word (D13)."""
+
+    def _mark_seeded(self, tree, uid, seeded_by):
+        import yaml as _yaml
+
+        path = tree.record_dir(DEFAULT_PROJECT, uid) / "state.yaml"
+        state = _yaml.safe_load(path.read_text())
+        state["session"]["seeded_by"] = seeded_by
+        path.write_text(_yaml.safe_dump(state, sort_keys=False))
+
+    def test_a_seeded_record_reads_seeded_in_the_index(self, tree):
+        uid = uid_for(1)
+        tree.add(DEFAULT_PROJECT, RecordSpec(uid, "chat", stamp(1), stamp(1, 11), signed_out=None))
+        self._mark_seeded(tree, uid, "b" * 32)
+        assert "| seeded |" in _rows(_render(tree))[0]
+
+    def test_a_seeded_record_reads_seeded_in_the_sessions_listing(self, tree):
+        uid = uid_for(1)
+        tree.add(DEFAULT_PROJECT, RecordSpec(uid, "chat", stamp(1), stamp(1, 11), signed_out=None))
+        self._mark_seeded(tree, uid, "b" * 32)
+        rows = run_state.list_sessions(base=tree.project_dir() / "_runs", now=stamp(1, 12))
+        row = next(r for r in rows if r["id"] == uid)
+        assert row["seeded"] is True and row["state"] == "seeded"
+
+    def test_the_legend_lists_seeded(self):
+        assert "**seeded**" in pi.PROJECT_LEGEND
+
+
 class TestDisplayState:
     @pytest.mark.parametrize("status", ["complete", "archived"])
     def test_a_complete_or_archived_record_is_closed(self, status):
@@ -170,6 +276,23 @@ class TestDisplayState:
             updated=UPDATED,
         )
         assert state == "waiting on question"
+
+    def test_a_seeded_record_reads_seeded(self):
+        state = session_record.display_state(
+            readable=True, status="in-progress", stop_reason=None, signed_out=False,
+            updated=UPDATED, seeded=True,
+        )
+        assert state == "seeded"
+
+    def test_seeded_outranks_ended_and_open(self):
+        assert session_record.display_state(
+            readable=True, status="in-progress", stop_reason=None, signed_out=True,
+            updated=UPDATED, seeded=True,
+        ) == "seeded"
+        assert session_record.display_state(
+            readable=True, status="in-progress", stop_reason=None, signed_out=False,
+            updated=UPDATED, now=AT_WINDOW, seeded=True,
+        ) == "seeded"
 
     def test_a_signed_out_in_progress_record_is_ended_not_closed(self):
         state = session_record.display_state(
@@ -1275,7 +1398,9 @@ class TestTrackedRecordFilter:
         pi.tracked_record_filter(checkout.root, DEFAULT_PROJECT)
         assert len(calls) == 1
         cmd, kwargs = calls[0]
-        assert cmd[:3] == ["git", "ls-files", "-z"] and cmd[-1] == "widgets/_runs"
+        assert cmd[:3] == ["git", "ls-files", "-z"]
+        # The live run area and C's archive home, one invocation.
+        assert cmd[-2:] == ["widgets/_runs", "widgets/_archive/_runs"]
         assert kwargs["env"]["LC_ALL"] == "C" and kwargs["timeout"] == pi.GIT_TIMEOUT_SECONDS
 
 
@@ -1509,8 +1634,9 @@ class TestLegendText:
             "One row per execution record under `_runs/`, newest first — rendered by lmer from each "
             "record's own `state.yaml`, `events.jsonl` and `log.yaml` on every work-repo push and by "
             "`lmer-schema index --write` (lmer index format 1). States: **closed** = status complete "
-            "or archived · **waiting on question** = stopped on a recorded question · **ended, not "
-            "closed** = in progress with a recorded session end · **open** = in progress with no "
+            "or archived · **waiting on question** = stopped on a recorded question · **seeded** = "
+            "a `work seed` record nobody has run in yet · **ended, not closed** = in progress with "
+            "a recorded session end · **open** = in progress with no "
             "sign-out recorded; the last-activity column is the date the record last changed. "
             "Nothing here ever ends a run. Edit this file outside the markers only."
         )

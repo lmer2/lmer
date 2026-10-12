@@ -107,16 +107,49 @@ writing the guess down, is worse than asking for it: hence
 :attr:`~ResumeError.code` the UI turns into "give me the repo URL", and
 :attr:`ResumeRequest.repo_url` to satisfy it.
 
+A schema-2 record is one execution, addressed by its uid
+-------------------------------------------------------
+In a schema-2 tree a record's identity is ``host/project/<uid>`` and the slug is
+only its group label (spec D1, §6.4). :attr:`ResumeRequest.uid` addresses the
+tracked entry and the record by that uid, and an entry the key transition
+(:mod:`lmer_platform.run_transition`) could not bind to one record is refused
+with its candidates (:class:`RunUnresolved`) rather than read as the group's
+newest. Continuing such a record never writes in it: the spawn mints a fresh
+uid and the source travels as read-only context (``--source-session``), so
+four slug-era rules stop applying to a record that carries ``session.uid``:
+
+- the landing-run prediction (:func:`_landing_slug`) — the identity is the uid,
+  and the new record's group is whatever ``derive_slug`` says;
+- the live-session refusal — two continuations of one source are a fork, two
+  rows with one label (D8). The spawn's concurrency note
+  (:func:`lmer_platform.spawn.concurrent_sessions_note`) rides back as the
+  reply's ``warning`` instead;
+- ``runs.note_session`` on the source row — the continuation is its own
+  uid-keyed row, so the source keeps its own ``last_session_id`` and reads its
+  state from its own record (#229);
+- the "records no target" refusal. An empty, ``reference`` or ``other``
+  target cannot carry a launch by itself, so the launch names its repository
+  with ``--repo`` — a TRANSPORT URL, which is the caller's ``repo_url`` or the
+  run's recorded ``repo`` and, with neither, :class:`RepoUrlRequired` (#537).
+  The registry's scheme-less ``repo:`` and the primary-remote fold are identity
+  and only ever validate that URL; neither is cloned from.
+
+Legacy records keep every one of those rules exactly as described above.
+
 A finished run reopens on a direction, not on a click
 -----------------------------------------------------
 ``complete``/``archived`` is neither a hard refusal here nor a silent reopen —
 both are wrong, in opposite directions. The run-state contract already decides it
 (docs/RUN-STATE.md §3, issue #96): a session that resolves a finished run does not
-re-seed "and never silently resumes either". *With* a seed direction
-(``LMER_START_PROMPT``, which is what ``lmer --prompt`` sets) it records the seed
-as the goal, reopens with ``work state set --status=in-progress``, and proceeds on
-it; *without* one it asks the user whether this is a new target or a continuation,
-and ends the session if the question goes unanswered.
+re-seed "and never silently resumes either". In a legacy tree, *with* a seed
+direction (``LMER_START_PROMPT``, which is what ``lmer --prompt`` sets) it records
+the seed as the goal, reopens with ``work state set --status=in-progress``, and
+proceeds on it; *without* one it asks the user whether this is a new target or a
+continuation, and ends the session if the question goes unanswered. On schema 2 a
+finished record is never reopened in place (spec D14, #437) — continue it as a
+new execution: ``lmer <taskdef> [<target>] --source-session <uid>`` (or the
+platform's continue, which is this module), with the direction seeding the new
+record instead.
 
 So a finished run needs :attr:`ResumeRequest.direction`, and it travels as
 ``--prompt=<text>``. That makes the reopen the operator's explicit direction in
@@ -138,7 +171,11 @@ Each of these costs a container slot and leaves the operator believing they acte
 - **A live session on the landing run.** Liveness outranks committed run state
   (spec D24), so a row can read "waiting on you" while a session is already
   working it. Two containers for one run then fight over its owner claim — and
-  this is also what makes a double-tapped button harmless.
+  this is also what makes a double-tapped button harmless. Legacy records only:
+  a schema-2 continuation is a fork, not a second writer (above).
+- **An entry the key transition left unresolved.** Its slug names several
+  executions and nothing proves which one it meant; the refusal lists them so
+  the operator can re-adopt by uid.
 - **A run stopped on a question.** A plain respawn reads the question back with no
   answer and leaves the stop in place, so the run is exactly as blocked as before.
   That one has its own verb (``POST /api/runs/answer``) and the refusal names it.
@@ -163,14 +200,16 @@ from __future__ import annotations
 from .projects import run_operation, resume_selection
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from lmer_cli.container.clone_and_exec import _scrub_credentials
 from work_repo import run_state
 from work_repo import session_record
-from lmer_schema.manifest import ManifestError, load_manifest
+from work_repo.utils import classify_target
 
 from . import runs
 # Deliberate reuse of two private helpers rather than two second copies of
@@ -189,15 +228,18 @@ from .answer import (
     AnswerError,
     NotAnswerable,
     _FINISHED_STATUSES,
+    _clean_uid,
     _load_state as _load_state_or_refuse,
     _reject_traversal,
 )
 from .config import PlatformConfig
 from .spawn import (
+    SpawnError,
     SpawnRequest,
     SpawnResult,
     derive_repo_identity,
     live_session_for_run,
+    schema_two,
     spawn_session,
 )
 from .store import StoreError, append_event
@@ -224,7 +266,7 @@ logger = logging.getLogger("lmer_platform.resume")
 
 __all__ = [
     "ResumeError", "RunNotTracked", "NotResumable", "RunIsLive", "QuestionOpen",
-    "SessionNotFound", "RepoUrlRequired", "DirectionRequired",
+    "SessionNotFound", "RunUnresolved", "RepoUrlRequired", "DirectionRequired",
     "UnsignedSessionSource", "DIRECTION_FLAG",
     "MAX_DIRECTION_CHARS", "ResumeRequest", "ResumeResult", "resume_run",
 ]
@@ -359,6 +401,29 @@ class SessionNotFound(NotResumable):
     code = "session_not_found"
 
 
+class RunUnresolved(NotResumable):
+    """The tracked entry names a slug group whose executions it cannot be bound to.
+
+    The key transition (:mod:`lmer_platform.run_transition`) marks a slug-keyed
+    entry unresolved when its group holds several schema-2 records and nothing
+    proves which one the row meant. Continuing "the newest" of them is the
+    slug-era guess that transition exists to retire, so this refuses and carries
+    the candidates — ``{uid, started_at, name}`` each — for a picker that
+    re-adopts by uid (``POST /api/runs/adopt {uid}``). Its own code because the
+    remedy is a different request, not a wait. Raised for the answer verb too,
+    whose route already renders this module's ``{code, message}`` bodies.
+    """
+
+    code = "run_unresolved"
+
+    def __init__(self, message: str, candidates: Optional[list] = None):
+        super().__init__(message)
+        self.candidates = list(candidates or [])
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "candidates": self.candidates}
+
+
 @dataclass(frozen=True)
 class ResumeRequest:
     """Which run to continue, and the four things a caller may say about it.
@@ -378,11 +443,25 @@ class ResumeRequest:
     is the newest launch of the group; it is optional because in a legacy tree
     there is nothing to choose between, and because the ordinary continue is one
     tap on a row that has already named its address.
+
+    ``uid`` addresses a schema-2 execution (32 lowercase hex; spec §6.4). Two
+    decisions ride on it:
+
+    - **A uid-addressed request needs no slug.** The slug is the group label,
+      and the tracked entry the uid resolves to already records it — so it is
+      taken from there (:func:`_bind_to_tracked`), and a slug sent beside a uid
+      is replaced by the entry's rather than compared with it: the uid is the
+      address, and a label is not a second one.
+    - **A uid with a ``session_id`` naming another record is refused.** Both
+      would pick a record, and quietly preferring either reads a whole record
+      off a launch the caller did not mean. The same holds when the uid comes
+      from the tracked entry rather than the request.
     """
 
     host: str
     project: str
-    slug: str
+    slug: Optional[str] = None
+    uid: Optional[str] = None
     taskdef: Optional[str] = None
     repo_url: Optional[str] = None
     direction: Optional[str] = None
@@ -404,21 +483,35 @@ class ResumeRequest:
         Blank optional fields normalise to ``None`` rather than to a refusal: all
         three are text inputs in a form the ordinary continue submits empty, and
         an empty box means "I did not say", not "I said nothing".
+
+        ``slug`` is optional only beside a ``uid`` — see the class docstring.
         """
+        uid = _clean_uid(self.uid, ResumeError)
         fields = {}
         for name in ("host", "project", "slug"):
             value = getattr(self, name)
+            if name == "slug" and uid is not None and (
+                value is None or (isinstance(value, str) and not value.strip())
+            ):
+                fields[name] = None
+                continue
             if not isinstance(value, str) or not value.strip():
                 raise ResumeError(f"{name} is required")
             fields[name] = value.strip()
-        _reject_traversal_or_refuse(fields, ResumeError)
+        _reject_traversal_or_refuse(
+            {name: value for name, value in fields.items() if value is not None},
+            ResumeError,
+        )
+        session_id = _clean_session_id(self.session_id)
+        _refuse_mismatched_session(uid, session_id)
 
         return replace(
             self,
+            uid=uid,
             taskdef=_clean_taskdef(self.taskdef),
             repo_url=_clean_text("repo_url", self.repo_url),
             direction=_clean_direction(self.direction),
-            session_id=_clean_session_id(self.session_id),
+            session_id=session_id,
             allow_unsigned_source=_clean_session_id(self.allow_unsigned_source),
             workspace_id=_clean_text("workspace_id", self.workspace_id),
             home_revision=_clean_optional_int("home_revision", self.home_revision),
@@ -436,8 +529,14 @@ class ResumeRequest:
         a refusal composed from the request alone would name a directory that does
         not exist. Refusals that have a resolved run in hand name its
         :attr:`~lmer_platform.workrepo.RunDirRef.rel_path` instead.
+
+        ``host/project/<uid>`` for a schema-2 execution, through
+        :func:`lmer_platform.runs.key_parts` — the one spelling of that rule.
         """
-        return runs.run_key(self.host, self.project, self.slug)
+        return runs.run_key(*runs.key_parts(
+            {"host": self.host, "project": self.project,
+             "slug": self.slug, "uid": self.uid}
+        ))
 
 
 @dataclass(frozen=True)
@@ -473,6 +572,9 @@ class ResumeResult:
     #: its own — ``session`` here is the container session, a different namespace
     #: (module docstring), and an override injects nothing to name anyway.
     rel_path: Optional[str] = None
+    #: The schema-2 execution the operator pointed at, when the run is one. The
+    #: execution the session founds is ``session.uid`` — a different row.
+    uid: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Wire form, deliberately **without** the spawn's ``command``.
@@ -486,22 +588,32 @@ class ResumeResult:
 
         ``warning`` is carried through from the spawn, the same key ``POST
         /api/sessions`` publishes, so a client can render it unconditionally on
-        either reply. It is ``None`` on every path a resume can reach today and
-        that is not an accident: :func:`_repo_url_for` refuses unless the URL
-        derives back to *this* run's host and project — through the spawn's own
-        :func:`lmer_platform.spawn.derive_repo_identity`, which is precisely the
-        derivation :func:`lmer_platform.spawn._untracked_run_warning` fires on
-        failing. Present
-        anyway, because the alternative is a field that silently stops existing on
-        one of two sibling routes the day that guarantee is loosened.
+        either reply. On a legacy record it is ``None`` on every path a resume
+        can reach, and that is not an accident: :func:`_repo_url_for` refuses
+        unless the URL derives back to *this* run's host and project — through
+        the spawn's own :func:`lmer_platform.spawn.derive_repo_identity`, which
+        is precisely the derivation :func:`lmer_platform.spawn._untracked_run_warning`
+        fires on failing. On a schema-2 record it is where the concurrency note
+        (:func:`lmer_platform.spawn.concurrent_sessions_note`) arrives: a second
+        continuation of one source is a fork that nothing refuses, so the reply
+        is how the operator hears about the first (spec §6.3).
+
+        ``uid`` keys appear in ``run`` and ``started`` only for a schema-2
+        execution, so a legacy reply keeps exactly the shape it had.
         """
+        run = {"host": self.host, "project": self.project, "slug": self.slug}
+        if self.uid is not None:
+            run["uid"] = self.uid
+        started = {
+            "host": self.host,
+            "project": self.project,
+            "slug": self.started_slug,
+        }
+        if self.session.uid is not None:
+            started["uid"] = self.session.uid
         return {
-            "run": {"host": self.host, "project": self.project, "slug": self.slug},
-            "started": {
-                "host": self.host,
-                "project": self.project,
-                "slug": self.started_slug,
-            },
+            "run": run,
+            "started": started,
             "continued": self.continued,
             "taskdef": self.taskdef,
             "target": self.target,
@@ -520,6 +632,10 @@ class ResumeResult:
             },
             "warning": self.session.warning,
             "note": (
+                f"a fresh execution was started with {self.uid} as its read-only "
+                "source — it is a row of its own, and the source keeps the state "
+                "it stopped in"
+                if self.uid is not None and self.continued else
                 "a fresh session was started on this run — it claims the run and "
                 "prints its own resume brief at session start, so the run's state "
                 "catches up a moment later"
@@ -610,6 +726,22 @@ def _clean_session_id(value: Optional[str]) -> Optional[str]:
     return session_id
 
 
+def _refuse_mismatched_session(uid: Optional[str], session_id: Optional[str]) -> None:
+    """Refuse a ``session_id`` that names a different record than ``uid``.
+
+    Compared through ``run_state.session_id_of`` so the ``<uid>--<name>`` dir a
+    fleet row shows still agrees with its own uid. See :class:`ResumeRequest`.
+    """
+    if uid is None or session_id is None:
+        return
+    if run_state.session_id_of(session_id) != uid:
+        raise ResumeError(
+            f"session_id {session_id!r} names a different record than uid {uid} "
+            "— each picks the record a resume reads, so send one of them, or two "
+            "that agree"
+        )
+
+
 def _clean_direction(value: Optional[str]) -> Optional[str]:
     """The seed direction, stripped and bounded.
 
@@ -661,14 +793,70 @@ def _require_tracked(request: ResumeRequest) -> runs.TrackedRun:
     nor adopted may well be a colleague's, and starting a container for it is not
     a decision to make on their behalf — adopting it first is how an operator says
     it is theirs.
+
+    Looked up by uid when the request carries one (spec §6.4). An entry the key
+    transition left unresolved is refused here, before anything is read off the
+    mirror: :func:`refuse_if_unresolved`.
     """
-    entry = runs.get_tracked(request.host, request.project, request.slug)
+    entry = runs.get_tracked(
+        request.host, request.project, request.slug, uid=request.uid
+    )
     if entry is None:
         raise RunNotTracked(
             f"{request.key} is not tracked by this orchestrator — adopt it "
             "first (POST /api/runs/adopt) so it is in scope, then resume it"
         )
+    refuse_if_unresolved(entry, "resume")
     return entry
+
+
+def refuse_if_unresolved(entry: runs.TrackedRun, verb: str) -> None:
+    """Raise :class:`RunUnresolved` when *entry* awaits a re-adopt by uid.
+
+    The mark is the index's own (:func:`lmer_platform.runs.readopt_marks`), read
+    rather than re-derived: :mod:`lmer_platform.run_transition` is what decides
+    an entry is unresolved, and a second opinion here could continue a record
+    that decision declined to pick. A *conflict* mark is not a refusal — that
+    entry is bound to one record and only its carried platform state clashed.
+    Shared with :mod:`lmer_platform.answer`, hence *verb*.
+    """
+    mark = runs.readopt_marks().get(entry.key)
+    if not mark or "candidates" not in mark:
+        return
+    candidates = mark["candidates"]
+    listed = ", ".join(
+        str(candidate.get("uid")) for candidate in candidates
+        if isinstance(candidate, dict)
+    ) or "none listed"
+    raise RunUnresolved(
+        f"{entry.key} names a slug group with several executions and nothing "
+        f"proves which one this row meant ({listed}) — re-adopt it by uid "
+        f"(POST /api/runs/adopt with one of those uids), then {verb} that",
+        candidates,
+    )
+
+
+def _bind_to_tracked(request, tracked: runs.TrackedRun):
+    """*request* addressed the way *tracked* is keyed.
+
+    A uid-addressed request takes its slug — the group label — from the entry
+    (:class:`ResumeRequest`). A slug-addressed request that reached a uid-keyed
+    entry (through the alias a key transition left) takes the entry's uid, so
+    the record is resolved by uid and never as "the newest in the group", which
+    is what that transition exists to stop. Then a ``session_id`` is held to the
+    uid. A legacy entry has no uid and the request comes back unchanged.
+
+    Duck-typed over the two request classes: :mod:`lmer_platform.answer` binds
+    the same way and has no ``session_id``.
+    """
+    if tracked.uid is None:
+        return request
+    _refuse_mismatched_session(tracked.uid, getattr(request, "session_id", None))
+    return replace(
+        request,
+        uid=tracked.uid,
+        slug=tracked.slug if request.uid is not None else request.slug,
+    )
 
 
 def _require_run_dir(config: PlatformConfig, request: ResumeRequest) -> RunDirRef:
@@ -685,8 +873,14 @@ def _require_run_dir(config: PlatformConfig, request: ResumeRequest) -> RunDirRe
     looked for: the resolve is what proves this identity lives in this project dir
     at all, and re-deriving the project dir from the request would be a second
     answer to a question :mod:`~lmer_platform.workrepo` already owns.
+
+    A uid names exactly one record, wherever its group is, and an unknown one is
+    absent rather than the group's newest (:func:`lmer_platform.workrepo.
+    resolve_run_dir`); a ``session_id`` beside it was already held to agree.
     """
-    ref = resolve_run_dir(config, request.host, request.project, request.slug)
+    ref = resolve_run_dir(
+        config, request.host, request.project, request.slug, uid=request.uid
+    )
     if ref is None:
         raise NotResumable(
             f"{request.key} is not in the host mirror, so the platform cannot "
@@ -694,7 +888,7 @@ def _require_run_dir(config: PlatformConfig, request: ResumeRequest) -> RunDirRe
             "yet, the mirror may be stale (rescan to refresh), or the run dir may "
             "have been renamed since it was tracked"
         )
-    if request.session_id is None:
+    if request.session_id is None or request.uid is not None:
         return ref
     return _require_session(config, request, ref)
 
@@ -798,9 +992,14 @@ def _load_state(ref: RunDirRef) -> dict:
 
 
 def _resume_inputs(
-    state: dict, tracked: runs.TrackedRun, ref: RunDirRef, request: ResumeRequest
+    config: PlatformConfig,
+    state: dict,
+    tracked: runs.TrackedRun,
+    ref: RunDirRef,
+    request: ResumeRequest,
+    execution: Optional[str] = None,
 ) -> tuple:
-    """The ``(taskdef, target)`` the spawn carries, or refuse.
+    """The ``(taskdef, target, repo_url)`` the spawn carries, or refuse.
 
     Precedence for the taskdef is override, then the run's own state, then the
     index. The run's state beats the index for the same reason as in
@@ -819,13 +1018,26 @@ def _resume_inputs(
     Both are re-checked here rather than only at :meth:`ResumeRequest.validate`,
     because the value that reaches this point may have come from the mirror — a
     repo every dev writes to, which the platform reads and must not simply trust.
+
+    *execution* is the schema-2 record's uid (:func:`schema_two_record`), and it
+    is what lifts the target refusal (spec §6.4, #537): that record is addressed
+    by its uid, not by a slug its target would have to make unique, so an empty,
+    ``reference`` or ``other`` target is resumable — given a transport URL for
+    ``--repo`` to name the repository with, since that target cannot carry the
+    launch itself. The URL is :func:`_repo_url_for`'s, whose order is the one
+    the transport needs: the caller's, then the recorded clone URL, then
+    :class:`RepoUrlRequired`. It is the third value, and ``None`` wherever the
+    target carries the launch on its own — every legacy record among them —
+    so the repo URL there is resolved after the landing checks, as it always was.
     """
     taskdef = request.taskdef or state.get("taskdef") or tracked.taskdef
     target = state.get("target") or tracked.target
+    needs_transport = execution is not None and _target_needs_transport(target)
     missing = [
         name
         for name, value in (("taskdef", taskdef), ("target", target))
         if not (isinstance(value, str) and value.strip())
+        and not (name == "target" and needs_transport)
     ]
     if missing:
         raise NotResumable(
@@ -837,10 +1049,77 @@ def _resume_inputs(
                 " — resume it from a shell with `lmer <taskdef> <target>`"
             )
         )
-    taskdef, target = taskdef.strip(), target.strip()
+    taskdef = taskdef.strip()
+    target = target.strip() if isinstance(target, str) else ""
     _reject_unsafe_taskdef(taskdef, NotResumable)
     _reject_argv_flag("target", target, NotResumable)
-    return taskdef, target
+    repo_url = _repo_url_for(config, tracked, request) if needs_transport else None
+    return taskdef, target, repo_url
+
+
+def _target_needs_transport(target) -> bool:
+    """Whether *target* cannot carry a launch without ``--repo`` (spec §6.5).
+
+    The classes :func:`lmer_platform.spawn._needs_repo_flag` emits the flag for —
+    no target, a document URL whose clone must come from the repository (#523),
+    or an ``other`` URL — read through the one classifier
+    (:func:`work_repo.utils.classify_target`), so this and the spawn cannot
+    disagree about which targets those are.
+    """
+    return classify_target(target if isinstance(target, str) else None) in (
+        "none", "reference", "other",
+    )
+
+
+def _launch_target(target: str) -> Optional[str]:
+    """The target positional the spawn carries, or ``None`` for none.
+
+    ``None`` for an empty target — an empty positional is a value argparse
+    would take — and for a ``repository``-class one: a record written before
+    spec §6.5 can carry a bare clone URL as its target, and that beside the
+    ``repo_url`` every resume passes is "two repositories named" to
+    :meth:`lmer_platform.spawn.SpawnRequest.validate`, so such a record could
+    never be resumed. The repository is then the validated ``repo_url`` alone,
+    on ``--repo``; ``derive_slug`` gives the bare taskdef for a repository
+    target and for none, so the run lands where it did.
+    """
+    if classify_target(target or None) in ("none", "repository"):
+        return None
+    return target
+
+
+def schema_two_record(
+    config: PlatformConfig, state: dict, ref: RunDirRef, error=NotResumable
+) -> Optional[str]:
+    """The uid of a schema-2 execution record, or ``None`` for anything else.
+
+    "A record with ``session.uid``" in spec §6.4's terms, in a mirror whose
+    manifest is schema 2 — the manifest is read only once the record claims a
+    uid, so a legacy record never reaches it and its refusals keep their order.
+    Every rule the module docstring lists as lifted for schema 2 keys on this.
+
+    The uid must be the one the record's directory is addressed by
+    (:func:`lmer_platform.workrepo.record_session_id`), or the record is
+    refused with *error* (answer passes its own): a record copied under
+    another uid would be launched as ``--source-session <directory>`` while
+    the reply and the event named the uid its state claims. A directory
+    that is no session record at all is left to the refusal
+    :func:`_schema_two_source` gives it.
+    """
+    session = state.get("session")
+    uid = session.get("uid") if isinstance(session, dict) else None
+    if not (isinstance(uid, str) and runs.UID_RE.match(uid)):
+        return None
+    if not _schema_two(config):
+        return None
+    addressed = record_session_id(ref)
+    if addressed is not None and addressed != uid:
+        raise error(
+            f"{ref.rel_path} records session uid {uid}, but its directory is "
+            f"{addressed} — a copied or hand-edited record, which the platform "
+            "will not continue under either uid"
+        )
+    return uid
 
 
 def _recorded_slug(state: dict, ref: RunDirRef) -> str:
@@ -890,6 +1169,24 @@ def _landing_slug(
             "against this target is what you meant"
         )
     return derived, False
+
+
+def _execution_landing(
+    taskdef: str, target: str, state: dict, ref: RunDirRef, request: ResumeRequest
+) -> tuple:
+    """``(slug, continued)`` for a schema-2 continuation — never a refusal.
+
+    :func:`_landing_slug`'s prediction exists because a legacy session writes in
+    whatever run its slug resolves to. A schema-2 one writes in a record of its
+    own (the uid the spawn mints), so there is no run to land on by mistake:
+    the group is whatever ``derive_slug`` says, which after the port's fold is
+    the source's own (spec §6.4). ``continued`` still separates the ordinary
+    continue from an override that starts different work — it is what decides
+    whether the source's state governs the checks, and what the reply says.
+    """
+    derived = run_state.derive_slug(taskdef, target)
+    continued = request.taskdef is None or derived == _recorded_slug(state, ref)
+    return derived, continued
 
 
 def _refuse_if_live(request: ResumeRequest, slug: str) -> None:
@@ -983,7 +1280,10 @@ def _refuse_if_question(state: dict, ref: RunDirRef) -> None:
 
 
 def _require_direction_if_finished(
-    state: dict, ref: RunDirRef, request: ResumeRequest
+    state: dict,
+    ref: RunDirRef,
+    request: ResumeRequest,
+    continuation: Optional[tuple] = None,
 ) -> None:
     """A finished run reopens only on an explicit direction — see the docstring.
 
@@ -991,10 +1291,30 @@ def _require_direction_if_finished(
     container keys on (``run_state.decide`` → ``completed_run``), and because a
     terminal status outranks a stale stop everywhere else in the platform
     (``inventory._derive``).
+
+    *continuation* is ``(uid, taskdef, target)`` for a schema-2 record, which is
+    never reopened in place (spec D14, #437): the refusal is the same, and its
+    words name the route that does work there — a new execution with the record
+    as its source — instead of a reopen the record's writer rule would refuse.
     """
     status = state.get("status")
     if status not in _FINISHED_STATUSES or request.direction:
         return
+    if continuation is not None:
+        uid, taskdef, target = continuation
+        # Scrubbed: this message reaches the UI and the assistant's transcript,
+        # and a recorded target can carry a token.
+        launch = " ".join(
+            part for part in ("lmer", taskdef, _scrub_credentials(target or "")) if part
+        )
+        raise DirectionRequired(
+            f"{ref.rel_path} is {status}, and a finished schema-2 record is never "
+            "reopened in place — continue it as a new execution: "
+            f"`{launch} --source-session {uid}` (or the platform's continue). "
+            "Say what the new execution should do and it is passed as its seed; "
+            "without one the session would only start up to ask whether you "
+            "meant to"
+        )
     raise DirectionRequired(
         f"{ref.rel_path} is {status}, and a finished run is only reopened on an "
         "explicit direction (docs/RUN-STATE.md §3) — say what the next session "
@@ -1005,7 +1325,10 @@ def _require_direction_if_finished(
 
 
 def _repo_url_for(
-    config: PlatformConfig, tracked: runs.TrackedRun, request: ResumeRequest
+    config: PlatformConfig,
+    tracked: runs.TrackedRun,
+    request: ResumeRequest,
+    verb: str = "resume",
 ) -> str:
     """The repo URL the spawn derives its run identity from, or refuse.
 
@@ -1042,6 +1365,20 @@ def _repo_url_for(
     a spawn whose fold no-opped on a cold mirror — otherwise lost this comparison
     permanently, and lost it with a message telling the operator to supply a repo
     URL that does not exist.
+
+    For a schema-2 record whose target cannot carry the launch, this URL is also
+    the TRANSPORT — the one ``--repo`` clones from (:func:`_resume_inputs`) — and
+    that is why only these two sources are ever consulted. The registry's
+    ``repo:`` and the primary-remote fold are scheme-less identity; they sit on
+    the right-hand side of the comparison below and nowhere else, and neither is
+    a clone URL — so a URL that passes the comparison must also be shaped like
+    one (:func:`_is_clone_url`), or the registry's own spelling, supplied or
+    recorded, would pass as the transport by folding to the run's identity.
+    A transport URL may carry credentials, so any refusal quotes it
+    scrubbed (``_scrub_credentials``), and nothing here logs it.
+
+    *verb* words the refusal for :mod:`lmer_platform.answer`, which resolves the
+    same transport through here.
     """
     url = request.repo_url or tracked.repo
     if not url:
@@ -1050,7 +1387,7 @@ def _repo_url_for(
             "its host, project and slug but not where its code is cloned from, and "
             "the platform will not invent one: the value is written into the "
             "tracked index as this run's repo and every later verb believes it. "
-            "Supply repo_url with the resume"
+            f"Supply repo_url with the {verb}"
         )
     # BOTH sides folded, or the comparison is one a secondary-keyed row can
     # never win: the URL side moves to the primary and the tracked side does
@@ -1062,12 +1399,40 @@ def _repo_url_for(
     if (host, project) != folded_identity(config, request.host, request.project):
         source = "supplied" if request.repo_url else "recorded for this run"
         raise RepoUrlRequired(
-            f"the {source} repo URL {url!r} names {host}/{project}, but the run is "
+            f"the {source} repo URL {_scrub_credentials(url)!r} names "
+            f"{host}/{project}, but the run is "
             f"{request.host}/{request.project} — the session would be filed under a "
-            "different run than the one being resumed. Supply a repo_url for "
-            f"{request.host}/{request.project}"
+            f"different run than the one being {verb.rstrip('e')}ed. Supply a "
+            f"repo_url for {request.host}/{request.project}"
+        )
+    if not _is_clone_url(url):
+        # After the comparison, so every refusal it gave keeps its words; this
+        # one is for a value it lets through. The registry's scheme-less
+        # identity spelling folds to the run's own project, and would then be
+        # spawned as a ``--repo`` the host CLI cannot clone and recorded as the
+        # run's repo for every later verb to trust.
+        source = "supplied" if request.repo_url else "recorded for this run"
+        raise RepoUrlRequired(
+            f"the {source} repo URL {_scrub_credentials(url)!r} is not a clone URL "
+            "— it has no scheme and is not scp form (user@host:path), so nothing "
+            f"could clone from it. Supply a clone URL for {request.host}/"
+            f"{request.project} as repo_url with the {verb}"
         )
     return url
+
+
+#: A URL with a scheme, and git's scp form ``user@host:path``.
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_RE = re.compile(r"^[^\s/@:]+@[^\s/:]+:")
+
+
+def _is_clone_url(url: str) -> bool:
+    """Whether *url* is shaped like something git clones from: a scheme, or scp
+    form — what ``resolve.is_likely_url`` and the classifier's ``repository``
+    row accept as a URL. A scheme-less ``host/group/project`` is an identity
+    spelling (the registry's ``repo:``), never a clone URL; which project a
+    clone URL names is :func:`_repo_url_for`'s comparison, not this."""
+    return bool(_SCHEME_RE.match(url) or _SCP_RE.match(url))
 
 
 def _direction_args(direction: Optional[str]) -> tuple:
@@ -1114,19 +1479,35 @@ def _landing_session_id(
 
 
 def _schema_two(config: PlatformConfig) -> bool:
-    """Whether the mirror uses fresh execution records."""
+    """Whether the mirror uses fresh execution records.
+
+    :func:`lmer_platform.spawn.schema_two` is the one manifest test — the spawn
+    below asks it the same question to decide whether to mint a uid, and two
+    readers could answer differently. Only the refusal is this module's: an
+    unreadable manifest is a :class:`NotResumable` (409, the mirror may be fixed
+    by the next pull), worded for the record being selected.
+    """
     try:
-        manifest = load_manifest(config.mirror_path)
-    except ManifestError as exc:
+        return schema_two(config)
+    except SpawnError as exc:
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
         raise NotResumable(
-            f"the host mirror manifest cannot be read ({exc}); refusing to "
+            f"the host mirror manifest cannot be read ({cause}); refusing to "
             "guess whether the selected session is a source or a writer"
         ) from exc
-    return manifest is not None and manifest.schema >= 2
 
 
-def _source_provenance(ref: RunDirRef, state: dict, source_uid: str) -> tuple[dict, bool]:
-    """Return visible launch facts and whether the source signed out."""
+def _source_provenance(
+    ref: RunDirRef, state: dict, source_uid: str
+) -> tuple[dict, bool]:
+    """Return visible launch facts and whether the source is stopped.
+
+    Stopped is :func:`work_repo.session_record.is_stopped`: signed out, or a
+    record ``work seed`` left that nothing ever started in (spec D13). No
+    session could be writing it, so there is nothing for an unsigned
+    acknowledgement to accept. It is that module's one shared rule, called
+    rather than restated.
+    """
     events = run_state.read_events(ref.path, last_n=0)
     metadata = state.get("session") if isinstance(state.get("session"), dict) else {}
     def stamp(value) -> str:
@@ -1145,13 +1526,18 @@ def _source_provenance(ref: RunDirRef, state: dict, source_uid: str) -> tuple[di
             events[-1].get("ts", "?") if events else state.get("updated", "?")
         ),
     }
-    return provenance, session_record.signed_out(events)
+    return provenance, session_record.is_stopped(state, events)
 
 
 def _schema_two_source(
     config: PlatformConfig, request: ResumeRequest, ref: RunDirRef, state: dict
 ) -> tuple[Optional[str], Optional[str]]:
-    """Validate and return ``(source UID, exact unsigned acknowledgement)``."""
+    """Validate and return ``(source UID, exact unsigned acknowledgement)``.
+
+    A seeded source needs no acknowledgement (spec §5.2): it is a valid
+    continuation source the moment ``work seed`` publishes it, and the launch
+    line that consumes it carries no ``--allow-unsigned-source``.
+    """
     if not _schema_two(config):
         return None, None
     source_uid = record_session_id(ref)
@@ -1168,8 +1554,8 @@ def _schema_two_source(
             "allow_unsigned_source must exactly match the selected source UID "
             f"{source_uid}"
         )
-    provenance, signed_out = _source_provenance(ref, state, source_uid)
-    if not signed_out and request.allow_unsigned_source != source_uid:
+    provenance, stopped = _source_provenance(ref, state, source_uid)
+    if not stopped and request.allow_unsigned_source != source_uid:
         raise UnsignedSessionSource(
             f"source session {source_uid} has no recorded final session_end "
             f"(operator={provenance['operator']}, host={provenance['hostname']}, "
@@ -1179,7 +1565,7 @@ def _schema_two_source(
             "the source will remain read-only and will not be signed out or rewritten.",
             provenance,
         )
-    acknowledgement = source_uid if not signed_out else None
+    acknowledgement = source_uid if not stopped else None
     return source_uid, acknowledgement
 
 
@@ -1200,36 +1586,55 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     """
     request = request.validate()
     tracked = _require_tracked(request)
+    request = _bind_to_tracked(request, tracked)
     ref = _require_run_dir(config, request)
     state = _load_state(ref)
     source_session_id, unsigned_source_ack = _schema_two_source(
         config, request, ref, state
     )
-    taskdef, target = _resume_inputs(state, tracked, ref, request)
-    started_slug, continued = _landing_slug(taskdef, target, state, ref, request)
-
-    _refuse_if_live(request, started_slug)
-    if continued and started_slug != request.slug:
-        # The run was renamed: it is tracked under its directory name while any
-        # session for it registers under the recorded slug, so the check above did
-        # not look at the identity the operator named.
-        _refuse_if_live(request, request.slug)
-
-    landing_state, landing_ref = _landing_state(
-        config, request, state, ref, started_slug, continued
+    # The schema-2 execution this record is, when it is one — the switch for
+    # every slug-era rule the module docstring lists as lifted.
+    execution = (
+        schema_two_record(config, state, ref) if source_session_id is not None else None
     )
+    taskdef, target, transport = _resume_inputs(
+        config, state, tracked, ref, request, execution
+    )
+
+    if execution is not None:
+        started_slug, continued = _execution_landing(taskdef, target, state, ref, request)
+        # No live-session refusal: a second continuation of this source is a
+        # fork, and the spawn's reply says who else is on the project instead.
+        landing_state, landing_ref = (state, ref) if continued else (None, None)
+    else:
+        started_slug, continued = _landing_slug(taskdef, target, state, ref, request)
+
+        _refuse_if_live(request, started_slug)
+        if continued and started_slug != request.slug:
+            # The run was renamed: it is tracked under its directory name while
+            # any session for it registers under the recorded slug, so the check
+            # above did not look at the identity the operator named.
+            _refuse_if_live(request, request.slug)
+
+        landing_state, landing_ref = _landing_state(
+            config, request, state, ref, started_slug, continued
+        )
     if landing_state is not None:
         _refuse_if_question(landing_state, landing_ref)
-        _require_direction_if_finished(landing_state, landing_ref, request)
+        _require_direction_if_finished(
+            landing_state, landing_ref, request,
+            (execution, taskdef, target) if execution is not None else None,
+        )
 
-    repo_url = _repo_url_for(config, tracked, request)
+    repo_url = transport or _repo_url_for(config, tracked, request)
 
     result = spawn_session(
         config,
         SpawnRequest(
             **resume_selection(request.key, request.slot),
             taskdef=taskdef,
-            target=target,
+            # An empty- or repository-target record launches on ``--repo``.
+            target=_launch_target(target),
             repo_url=repo_url,
             # The record every refusal above was measured against, so a continue
             # lands in the launch the operator asked to continue rather than in a
@@ -1245,7 +1650,7 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
         ),
     )
 
-    if continued:
+    if continued and execution is None:
         # Best-effort, and the ordering is the reason: the session is already
         # running, so a bookkeeping failure reported as a failed resume would send
         # the operator to resume again — which the live-session check would then
@@ -1255,6 +1660,10 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
         # (``runs.track``, source ``spawned``), which for an override is the
         # sibling; pointing the *source* run's detail view at a session belonging
         # to another run would be a worse lie than the one this fixes.
+        #
+        # And never for a schema-2 record (#229): the continuation is its own
+        # uid-keyed row, tracked by the spawn under the uid it minted, and the
+        # source row keeps the session that wrote it.
         try:
             runs.note_session(
                 request.host, request.project, request.slug, result.session_id
@@ -1269,20 +1678,21 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
 
     # Length, not text: the platform's history is a debugging artifact people read
     # and paste, and a direction is the operator's content.
+    run = {"host": request.host, "project": request.project, "slug": request.slug}
+    started = {"host": request.host, "project": request.project, "slug": started_slug}
+    # Schema 2 only, so a legacy event keeps its shape: there the slug is a
+    # group label, and only the uids say which execution was read and which
+    # one the session founds.
+    if execution is not None:
+        run["uid"] = execution
+        if result.uid is not None:
+            started["uid"] = result.uid
     append_event(
         "run_resumed",
         note=request.key,
         data={
-            "run": {
-                "host": request.host,
-                "project": request.project,
-                "slug": request.slug,
-            },
-            "started": {
-                "host": request.host,
-                "project": request.project,
-                "slug": started_slug,
-            },
+            "run": run,
+            "started": started,
             "continued": continued,
             "taskdef": taskdef,
             "session": result.session_id,
@@ -1309,4 +1719,5 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
         # against: the source run for a continue, the sibling for an override, and
         # nothing at all for an override that founds a run.
         rel_path=landing_ref.rel_path if landing_ref is not None else None,
+        uid=execution,
     )

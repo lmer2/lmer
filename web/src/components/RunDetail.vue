@@ -14,6 +14,7 @@ import AskHistory from './AskHistory.vue'
 import Chat from './Chat.vue'
 import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
+import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
 import { forgetRun, resumeRun, moveRun } from '../api.js'
@@ -168,6 +169,9 @@ async function loadRunFiles() {
     const query = new URLSearchParams({
       host: props.run.host, project: props.run.project, slug: props.run.slug,
     })
+    // A schema-2 row's directory is named by its uid (spec §6.1); a row without
+    // one keeps the query it always sent.
+    if (props.run.uid) query.set('uid', props.run.uid)
     const response = await fetch(`api/runs/files?${query}`, {
       credentials: 'same-origin',
     })
@@ -1097,6 +1101,20 @@ async function forget() {
             </v-card-text>
           </v-card>
         </template>
+
+        <!-- Every launch of this target (#374), beside the continue verb because
+             it is the same question asked of a group: which launch goes on next.
+             Outside `canResume` on purpose — a live run still has siblings worth
+             seeing — and only for a schema-2 row: a schema-1 run is one shared
+             record per target, so a legacy row mounts nothing and sends nothing.
+             In this panel and not a fifth tab, for the same reason as the file list below. -->
+        <SessionsPerTarget
+          v-if="run.uid"
+          :run="run"
+          :slots="slots"
+          :now="now"
+          @changed="emit('changed')"
+        />
 
         <template v-if="run.events && run.events.length">
           <div class="section-title">recent events</div>

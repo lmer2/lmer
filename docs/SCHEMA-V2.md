@@ -124,10 +124,14 @@ time is only a fallback for records without a usable timestamp.
 read-only context. The new record captures the source UID, a hash of the source
 state, its state snapshot, and recent events. It does not append lineage,
 answers, owner changes or sign-out events to the predecessor.
-Goal, phase, question and ledger/release checkpoints seed the new record.
+Goal, phase, question, the name label and ledger/release checkpoints seed the
+new record (a name inherited from the source is a label; a launch `--name`
+replaces it, as it replaces a default label).
 The context snapshot records their provenance; owner, claim and terminal
 status are not inherited. A launch goal (`lmer --goal`, applied once by
-`work session-start`) replaces the inherited one. A continuation whose source
+`work session-start`) replaces the inherited one. When the source's target
+derives no repository, name it explicitly with `lmer <taskdef> --repo
+<url-or-path>`; `--repo` must itself be a repository. A continuation whose source
 was filed under a different slug — a `chat-.` record from before local-path
 targets exported an empty target — lands under the current derivation
 (`chat`), keeps `source_session_uid` and `context.source_path` into the old
@@ -156,6 +160,22 @@ retrying with `--allow-unsigned-source SOURCE_UID`. That value must match the
 selected source. Platform resume and answer calls carry these explicit flags
 through the host CLI. Ambient source/acknowledgement variables do not select
 context for a fresh host launch.
+
+The platform addresses a schema-2 record by its uid (`host/project/<uid>`;
+`uid` in the resume and answer requests) and mints the new execution's uid
+itself, so it can key the new row before the container starts. Resume and
+answer launch `lmer <taskdef> [<target>] [--repo <url>] --source-session
+SOURCE_UID --launch-uid NEW_UID`, never `--session`. `--repo` is added when
+the recorded target cannot carry the launch — empty, a document (reference)
+URL or an `other` URL — and names the request's `repo_url`, else the clone URL
+recorded for the run; with neither the call is refused for a `repo_url`. A
+resume of a record whose target is a bare repository URL drops that positional
+and names the repository with `--repo` the same way.
+`--launch-uid` is flag-only (a host-exported or `.env` `LMER_LAUNCH_UID` is
+never forwarded), must be 32 lowercase hex, is refused beside `--session`, and
+a uid that already names a record refuses the session start. A second
+continuation of one source is not refused: it is a fork, two rows with one
+label, and the reply's `warning` names the live sessions already on the project.
 The UI offers **Continue fresh** for the same decision; cancelling leaves
 both the source and launch state alone.
 
@@ -339,11 +359,14 @@ repository or lies inside a `_runs/` record is never written (the push skips
 it with a warning, the backfill reports it `refused`), so neither can reach
 outside the tree or into a historical record.
 
-**What a row says.** The label is the record's `name`, else the goal's first
-line, else the first `log.yaml` message (a derived label is marked
-`_(unnamed)_`); a continuation links its source record. The state cell uses
-four clock-free words — `closed` (status complete or archived),
-`waiting on question` (a recorded question outranks a sign-out),
+**What a row says.** The label is the record's `name` — an unnamed schema-2
+record carries the default label `<taskdef>-<yymmdd>-<uid4>`, and a
+continuation inherits its source's name — else the goal's first line, else
+the first `log.yaml` message (a derived label is marked `_(unnamed)_`, which
+now means only `name: null`); a continuation links its source record, by
+session uid. The state cell uses five clock-free words — `closed` (status
+complete or archived), `waiting on question` (a recorded question outranks a
+sign-out), `seeded` (a `work seed` record nobody has run in),
 `ended, not closed` (in progress with a recorded final `session_end`) and
 `open` (no sign-out recorded) — beside a last-activity column that is the
 date the record last changed. Nothing in the block ends a run; as everywhere

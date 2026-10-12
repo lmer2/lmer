@@ -316,3 +316,348 @@ def test_an_entry_written_by_a_build_that_stores_more_still_loads(platform_root)
     assert entry.key == "h/p/s"
     assert entry.last_session_id == SESSION_ID
     assert not hasattr(entry, "session_dir"), "and the address is still not stored"
+
+
+# --- uid identity (A2.key, spec §6.1) ---------------------------------------
+
+#: A schema-2 execution uid: 32 lowercase hex.
+UID_A = "0123456789abcdef0123456789abcdef"
+UID_B = "fedcba9876543210fedcba9876543210"
+
+
+def test_two_uid_entries_sharing_one_slug_coexist(platform_root):
+    """A slug is a group label; the uid is the identity. Two launches against
+    one target are two entries, never one overwriting the other."""
+    first = runs.track("h", "p", "chat", uid=UID_A)
+    second = runs.track("h", "p", "chat", uid=UID_B)
+
+    assert first.key == f"h/p/{UID_A}"
+    assert second.key == f"h/p/{UID_B}"
+    assert first.slug == second.slug == "chat"
+    assert len(runs.list_tracked()) == 2
+
+
+def test_get_tracked_addresses_by_uid(platform_root):
+    runs.track("h", "p", "chat", uid=UID_A)
+
+    by_uid = runs.get_tracked("h", "p", uid=UID_A)
+    assert by_uid is not None and by_uid.uid == UID_A
+    # No slug-keyed entry exists: a uid entry is not also addressable by slug.
+    assert runs.get_tracked("h", "p", "chat") is None
+
+
+def test_track_stores_the_slug_as_the_group_label(platform_root):
+    entry = runs.track("h", "p", "develop-1", uid=UID_A)
+    assert entry.to_dict()["uid"] == UID_A
+    assert entry.to_dict()["slug"] == "develop-1"
+
+
+def test_old_uidless_index_loads_unchanged(platform_root):
+    """Forward/backward tolerance: an index written before uids existed keys by
+    slug and reads exactly as it always did."""
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": {
+        "h/p/develop-1": {
+            "host": "h", "project": "p", "slug": "develop-1",
+            "source": "spawned", "first_seen": "2026-01-01T00:00:00Z",
+        },
+    }})
+
+    entry = runs.get_tracked("h", "p", "develop-1")
+    assert entry is not None and entry.uid is None
+    assert entry.key == "h/p/develop-1"
+
+
+def test_malformed_uid_is_dropped_not_fatal(platform_root, caplog):
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": {
+        "h/p/develop-1": {
+            "host": "h", "project": "p", "slug": "develop-1",
+            "uid": "NOT-HEX", "source": "spawned",
+        },
+    }})
+
+    entry = runs.get_tracked("h", "p", "develop-1")
+    assert entry is not None and entry.uid is None
+    assert entry.key == "h/p/develop-1"
+
+
+def test_the_uid_grammar_refuses_a_trailing_newline():
+    """``$`` matches before a final newline, so ``^…$`` with ``.match`` took
+    ``<uid>\\n`` for a uid — a key segment carrying a newline."""
+    assert runs.UID_RE.match(UID_A)
+    assert runs.UID_RE.match(UID_A + "\n") is None
+
+
+def test_run_key_of_entry_reads_the_uid(platform_root):
+    assert runs.run_key_of_entry(
+        {"run": {"host": "h", "project": "p", "slug": "chat", "uid": UID_A}}
+    ) == ("h", "p", UID_A)
+    assert runs.run_key_of_entry(
+        {"run": {"host": "h", "project": "p", "slug": "chat"}}
+    ) == ("h", "p", "chat")
+    assert runs.run_key_of_entry(None) is None
+
+
+def test_key_parts_over_the_three_shapes(platform_root):
+    """One helper spells "the key segment" for a fleet row, a request body and a
+    registry ``run`` block (spec §6.1)."""
+    fleet_row = {"host": "h", "project": "p", "slug": "chat", "uid": UID_A}
+    request_body = {"host": "h", "project": "p", "slug": "chat", "uid": UID_A}
+    registry_block = {"run": {"host": "h", "project": "p", "slug": "chat", "uid": UID_A}}
+
+    assert runs.key_parts(fleet_row) == ("h", "p", UID_A)
+    assert runs.key_parts(request_body) == ("h", "p", UID_A)
+    assert runs.key_parts(registry_block) == ("h", "p", UID_A)
+    assert runs.key_parts({"host": "h", "project": "p", "slug": "chat"}) == ("h", "p", "chat")
+
+
+def test_note_session_and_forget_address_a_uid_entry(platform_root):
+    runs.track("h", "p", "chat", uid=UID_A)
+
+    assert runs.note_session("h", "p", uid=UID_A, session_id=SESSION_ID).last_session_id == SESSION_ID
+    assert runs.forget("h", "p", uid=UID_A) is True
+    assert runs.list_tracked() == []
+
+
+def test_run_for_session_reads_the_registry_uid(platform_root):
+    registry_entry = {"run": {"host": "h", "project": "p", "slug": "chat", "uid": UID_A}}
+    assert runs.run_key_of_entry(registry_entry) == ("h", "p", UID_A)
+
+
+def test_keys_helper_follows_the_uid(platform_root):
+    runs.track("h", "p", "chat", uid=UID_A)
+    runs.track("h", "p", "chat", uid=UID_B)
+    assert runs.keys(runs.list_tracked()) == {("h", "p", UID_A), ("h", "p", UID_B)}
+
+
+def test_lossless_collision_keeps_both_values():
+    assert runs.merge_values(None, 1) == (1, False)
+    assert runs.merge_values(1, None) == (1, False)
+    assert runs.merge_values(1, 1) == (1, False)
+    merged, conflict = runs.merge_values(1, 2)
+    assert conflict is True
+    assert merged == {"old": 1, "new": 2}
+
+
+def test_transition_record_round_trips():
+    transition = runs.Transition(old_key="h/p/chat", new_key=f"h/p/{UID_A}")
+    assert transition.state == "pending"
+    assert set(transition.stores) == set(runs.TRANSITION_STORES)
+    assert all(v == "pending" for v in transition.stores.values())
+    assert runs.Transition.from_dict(transition.to_dict()) == transition
+
+
+# --- review !387 -------------------------------------------------------------
+
+
+def test_run_for_session_finds_a_uid_tracked_run_whose_registry_entry_is_gone(platform_root):
+    """A clean exit removes the registry entry; the tracked index's
+    ``last_session_id`` still answers, with the uid as the key segment."""
+    from lmer_platform import registry
+
+    runs.track("h", "p", "chat", uid=UID_A, session_id=SESSION_ID)
+    runs.track("h", "p", "chat", uid=UID_B, session_id="s-other")
+    assert registry.read_session(SESSION_ID) is None, "precondition: no registry entry"
+
+    assert runs.run_for_session(SESSION_ID) == ("h", "p", UID_A)
+    assert runs.run_of_session(SESSION_ID) == {
+        "host": "h", "project": "p", "slug": "chat", "uid": UID_A,
+    }
+
+
+def test_run_of_session_keeps_a_schema_one_run_s_shape(platform_root):
+    runs.track("h", "p", "chat", session_id=SESSION_ID)
+
+    assert runs.run_of_session(SESSION_ID) == {"host": "h", "project": "p", "slug": "chat"}
+
+
+@pytest.mark.parametrize("uid", [
+    UID_A.upper(), UID_A[:-1], UID_A + "\n", 42, ["x"],
+])
+def test_key_parts_refuses_a_malformed_uid_rather_than_keying_by_slug(uid):
+    with pytest.raises(runs.RunIndexError, match="uid"):
+        runs.key_parts({"host": "h", "project": "p", "slug": "chat", "uid": uid})
+    with pytest.raises(runs.RunIndexError, match="uid"):
+        runs.key_parts({"run": {"host": "h", "project": "p", "slug": "chat", "uid": uid}})
+
+
+def test_an_absent_uid_keys_by_slug():
+    for uid in (None, ""):
+        assert runs.key_parts(
+            {"host": "h", "project": "p", "slug": "chat", "uid": uid}
+        ) == ("h", "p", "chat")
+
+
+def test_flat_fields_win_over_a_nested_run_block():
+    row = {"host": "h", "project": "p", "slug": "chat", "uid": UID_A,
+           "run": {"host": "h", "project": "p", "slug": "chat", "uid": UID_B}}
+
+    assert runs.key_parts(row) == ("h", "p", UID_A)
+    assert runs.key_parts_lenient(row) == ("h", "p", UID_A)
+
+
+def test_the_lenient_reader_degrades_and_never_raises():
+    bad = {"host": "h", "project": "p", "slug": "chat", "uid": UID_A.upper()}
+    assert runs.key_parts_lenient(bad) == ("h", "p", "chat")
+    assert runs.key_parts_lenient({"run": bad}) == ("h", "p", "chat")
+    assert runs.key_parts_lenient({"host": "h", "slug": "chat"}) is None
+    assert runs.key_parts_lenient(None) is None
+    assert runs.run_key_of_entry({"run": bad}) == ("h", "p", "chat")
+
+
+def test_retracking_a_schema_one_entry_keeps_its_pre_uid_shape(platform_root, monkeypatch):
+    """Byte-identical: no ``uid`` key appears in runs.json, the entry keeps its
+    key order, and the reply shape is unchanged."""
+    monkeypatch.setattr(runs, "utc_now_iso", lambda: "2026-07-02T00:00:00Z")
+    pre_uid = {
+        "host": "h", "project": "p", "slug": "chat", "source": "spawned",
+        "first_seen": "2026-07-01T00:00:00Z", "last_seen": "2026-07-01T00:00:00Z",
+        "last_session_id": "s-1", "taskdef": "chat", "target": None, "repo": None,
+        "note": "mine",
+    }
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": {"h/p/chat": dict(pre_uid)}})
+
+    tracked = runs.track("h", "p", "chat", session_id="s-2")
+
+    stored = runs.load_index()["h/p/chat"]
+    expected = {**pre_uid, "last_seen": "2026-07-02T00:00:00Z", "last_session_id": "s-2"}
+    assert json.dumps(stored) == json.dumps(expected)
+    assert "uid" not in tracked.to_dict()
+
+
+def test_a_track_written_null_uid_is_dropped_on_retrack(platform_root):
+    """An entry an earlier build of this branch wrote with ``"uid": null``
+    returns to the schema-1 shape."""
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": {"h/p/chat": {
+        "host": "h", "project": "p", "slug": "chat", "uid": None, "source": "spawned",
+    }}})
+
+    runs.note_session("h", "p", "chat", "s-1")
+
+    assert "uid" not in runs.load_index()["h/p/chat"]
+
+
+def test_merge_values_keeps_the_later_stamp_and_reports_no_conflict():
+    old = {"title": "same", "updated_at": "2026-01-02T00:00:00Z", "revision": 3}
+    new = {"title": "same", "updated_at": "2026-01-01T00:00:00+00:00", "revision": 5}
+
+    merged, conflict = runs.merge_values(old, new)
+
+    assert conflict is False
+    assert merged == {"title": "same", "updated_at": "2026-01-02T00:00:00Z", "revision": 5}
+
+
+def test_merge_values_merges_one_level():
+    merged, conflict = runs.merge_values({"a": {"x": 1}}, {"a": {"x": 2}})
+
+    assert conflict is True
+    assert merged == {"a": {"old": {"x": 1}, "new": {"x": 2}}}
+    assert runs.holds_conflict(merged)
+    assert not runs.holds_conflict({"a": {"x": 1}})
+
+
+def _two_entries(old_extra, new_extra):
+    old_key, new_key = "h/p/chat", f"h/p/{UID_A}"
+    base = {"host": "h", "project": "p", "slug": "chat", "source": "spawned",
+            "first_seen": "2026-07-01T00:00:00Z", "last_seen": "2026-07-01T00:00:00Z"}
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": {
+        old_key: {**base, **old_extra},
+        new_key: {**base, "uid": UID_A, "source": "adopted",
+                  "last_seen": "2026-07-03T00:00:00Z", **new_extra},
+    }})
+    return old_key, new_key
+
+
+def test_a_merge_onto_a_uid_entry_keeps_a_differing_note_and_marks_it(platform_root):
+    old_key, new_key = _two_entries(
+        {"note": "the slug note", "last_session_id": "s-old", "taskdef": "chat"},
+        {"note": "the uid note", "last_session_id": "s-new"},
+    )
+
+    runs.begin_transition("h", "p", "chat", UID_A)
+
+    entry = runs.load_index()[new_key]
+    assert entry["note"] == "the uid note"
+    assert entry["carried"]["note"] == {"old": "the slug note", "new": "the uid note"}
+    assert entry["carried"]["last_session_id"] == {"old": "s-old", "new": "s-new"}
+    assert entry["taskdef"] == "chat", "a field the uid entry lacked is carried"
+    assert entry["last_seen"] == "2026-07-03T00:00:00Z", "the later stamp is kept"
+    assert entry["source"] == "adopted"
+    assert entry["conflict"] == {"stores": ["index"]}
+    assert runs.carried_session_ids(new_key) == ["s-new", "s-old"]
+
+
+def test_a_merge_differing_only_in_stamps_and_session_is_no_conflict(platform_root):
+    _old_key, new_key = _two_entries(
+        {"note": "same", "last_session_id": "s-old"},
+        {"note": "same", "last_session_id": "s-new"},
+    )
+
+    runs.begin_transition("h", "p", "chat", UID_A)
+
+    entry = runs.load_index()[new_key]
+    assert "conflict" not in entry
+    assert "note" not in entry["carried"]
+
+
+def test_what_clears_a_conflict_mark(platform_root):
+    """An explicit note replaces the kept pair; the mark itself goes only when
+    asked to settle with no store still conflicted."""
+    _old_key, new_key = _two_entries({"note": "old"}, {"note": "new"})
+    runs.begin_transition("h", "p", "chat", UID_A)
+    runs.mark_transition(new_key, (), conflict=["meta"])
+    assert runs.conflict_stores(new_key) == ["index", "meta"]
+
+    assert runs.settle_conflict(new_key, ["index", "meta"]) == ["index", "meta"]
+    runs.track("h", "p", "chat", uid=UID_A, note="resolved")
+    assert runs.index_conflicted(new_key) is False
+    assert runs.load_index()[new_key]["note"] == "resolved"
+
+    assert runs.settle_conflict(new_key, ["meta"]) == ["meta"]
+    assert runs.settle_conflict(new_key, []) == []
+    assert "conflict" not in runs.load_index()[new_key]
+
+
+def test_merge_values_keeps_the_earlier_origin_stamp():
+    """``first_seen``/``created``/``created_at`` record a beginning: the earlier
+    of two is the true one. Every other stamp keeps the later."""
+    old = {"first_seen": "2026-01-01T00:00:00Z", "created_at": "2026-01-01T00:00:00Z",
+           "last_seen": "2026-01-01T00:00:00Z"}
+    new = {"first_seen": "2026-03-01T00:00:00Z", "created_at": "2026-03-01T00:00:00+00:00",
+           "last_seen": "2026-03-01T00:00:00Z"}
+
+    merged, conflict = runs.merge_values(old, new)
+
+    assert conflict is False
+    assert merged["first_seen"] == "2026-01-01T00:00:00Z"
+    assert merged["created_at"] == "2026-01-01T00:00:00Z"
+    assert merged["last_seen"] == "2026-03-01T00:00:00Z"
+    assert runs.merge_values({"created": 5}, {"created": 3})[0] == {"created": 3}
+
+
+def test_a_second_carry_onto_one_uid_keeps_both_kept_pairs(platform_root):
+    """Two slug entries bound to one uid in turn: the second carry's pair is
+    added beside the first, never written over it."""
+    old_key, new_key = _two_entries(
+        {"note": "first slug note", "last_session_id": "s-first"},
+        {"note": "the uid note", "last_session_id": "s-new"},
+    )
+    runs.begin_transition("h", "p", "chat", UID_A)
+    runs.mark_transition(new_key, runs.TRANSITION_STORES)
+    runs.finish_transition(new_key)
+    index = runs.load_index()
+    index["h/p/chat-again"] = {
+        "host": "h", "project": "p", "slug": "chat-again", "source": "spawned",
+        "note": "second slug note", "last_session_id": "s-second",
+    }
+    store.write_json(store.snapshot_path(runs.RUNS_FILE), {"runs": index})
+
+    runs.begin_transition("h", "p", "chat-again", UID_A)
+
+    entry = runs.load_index()[new_key]
+    assert entry["note"] == "the uid note"
+    assert entry["carried"]["note"] == [
+        {"old": "first slug note", "new": "the uid note"},
+        {"old": "second slug note", "new": "the uid note"},
+    ]
+    assert runs.carried_session_ids(new_key) == ["s-new", "s-first", "s-second"]
+    assert entry["conflict"] == {"stores": ["index"]}

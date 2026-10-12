@@ -29,7 +29,10 @@ from tests.plexus_fixtures import PRIMARY_REPO, PROJECT, build_schema_plexus
 SHA_BUMP = "a" * 40
 SHA_MERGE = "b" * 40
 # The seed address every release of this fixture's repository derives.
-BASE = "release-repo"
+# A bare repository URL is not a work item, so the target derives the bare
+# taskdef (spec §3; the pre-change `release-repo` spelling was the old
+# derivation). The re-slug then produces `release-v<version>`.
+BASE = "release"
 # The same address in the schema-form tree below, whose registered project is
 # reached by short name and whose target is a branch rather than a URL.
 SCHEMA_BASE = "release-main"
@@ -191,7 +194,7 @@ class TestSecondRelease:
         prep-release, so the successor's ctl dry-run skips it and the
         successor records the SAME `X.Y.Z`. The decline happens at the
         release-MR gate — after leg 1 step 5 — so the declined run has
-        already taken `release-repo-v0.6.0` and is parked there, terminal.
+        already taken `release-v0.6.0` and is parked there, terminal.
 
         If the successor's address is decided by whether that DIRECTORY is
         free, its re-slug is skipped, it completes on the seed address, and

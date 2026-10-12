@@ -96,11 +96,24 @@ A third prune is not about a name at all. The legacy
 ("read-side fallback only; informational"), and ``{task_type}`` is an OPEN set
 (any ``LMER_TASK`` value), so there is no name to prune by and none that would
 be safe to prune: every one of them is a legal project short name too.
-:func:`_is_legacy_task_tree` recognises the SHAPE instead — a directory
-directly inside a project-shaped one, holding a legacy ``{target}``
-(:data:`LEGACY_TARGET_MARKERS`) — which is what stops issue #379's
-reproduction: a tree whose only findings, and whose exit 1, came out of a
-scope-out.
+:func:`_is_legacy_task_tree` recognises it by POSITION and by SHAPE instead,
+one per level (issue #379, which is what stops its reproduction: a tree whose
+only findings, and whose exit 1, came out of a scope-out):
+
+- ``{task_type}/`` sits DIRECTLY INSIDE A PROJECT. Which directories are
+  projects is the layout walk's answer, and the runner hands that list down
+  (``projects=``, the same list every per-project module gets) so this walk
+  does not rediscover it: a listed directory is a project by its entry,
+  before it has grown a single §1 marker. Where the list is silent — no list
+  (a bare root, :func:`lmer_schema.migration._record_blockers`), or a nested
+  project the walk's own rule never names (nothing below a project is a
+  second project; the live ``syseng/infra/ansible-roles/*/runs/`` shape) —
+  the §1 marker test answers, as it did before the list arrived. The list
+  adds a project; it never becomes a whitelist. The root is never one.
+- ``{target}/`` is recognised by what the legacy writers LEFT in it
+  (:data:`LEGACY_TARGET_MARKERS`). No position can do this job: a
+  ``{target}`` holding only a run area is, directory for directory, a nested
+  project holding only a run area, and the list cannot name either.
 
 Severity choices, and where they come from
 ==========================================
@@ -186,7 +199,7 @@ import yaml
 
 from lmer_schema.checks.findings import Report, Severity, Tier, register
 from lmer_schema.checks import symlinks
-from lmer_schema.registry import PROJECT_MARKERS, is_project_shaped
+from lmer_schema.registry import PROJECT_MARKERS, is_host_bucket_name, is_project_shaped
 
 __all__ = [
     "EVENTS_FILE",
@@ -211,6 +224,7 @@ __all__ = [
     "TASK_STATUSES",
     "check_record",
     "iter_run_areas",
+    "plain_session_move_text",
 ]
 
 #: The session-unit run area (D22) and its legacy, shared-dir twin (§3.5).
@@ -335,7 +349,10 @@ LEGACY_PROJECT_AREAS = frozenset({"info", "taskdef"})
 #: ``log.yaml`` beside it in every real legacy target — verified against every
 #: one in the live tree), and under-pruning costs a scope-out being checked
 #: while over-pruning costs a real project's records never being checked at
-#: all. Only one of those is silent.
+#: all. Only one of those is silent. The project list the runner hands down
+#: (#379's positional half) does not change this: it names projects, never
+#: what sits below one, and ``<project>/<x>/<y>/runs`` with nothing else in
+#: ``<y>`` is the nested-project shape exactly.
 LEGACY_TARGET_MARKERS = frozenset({"log.yaml", "reports"})
 
 #: Names a ``{target}/`` can never be: every schema and legacy AREA name.
@@ -425,6 +442,15 @@ register(
         "shape; reported for migration, never an error"
     ),
 )
+register(
+    "record.plain-session-slug",
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary=(
+        "a pre-A1 plain-session leftover: the slug is the obsolete derivation "
+        "of the record's own target; `work migrate <project>` folds it"
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +458,7 @@ register(
 # ---------------------------------------------------------------------------
 
 
-def iter_run_areas(root) -> Iterator[Tuple[Path, str]]:
+def iter_run_areas(root, *, projects=None) -> Iterator[Tuple[Path, str]]:
     """Yield ``(path, layout)`` for every run area under *root*.
 
     *layout* is :data:`SESSION_LAYOUT` for a ``_runs/`` area and
@@ -440,8 +466,18 @@ def iter_run_areas(root) -> Iterator[Tuple[Path, str]]:
     order; see the module docstring for what is skipped and why the walk
     stops at an area rather than descending through it — in particular the
     opaque and free-form tiers, which are never entered and never reported.
+
+    *projects* is the layout walk's project list (anything ``Path()`` accepts,
+    the runner's :class:`~lmer_schema.checks.walk.ProjectDir` included) or
+    ``None``. It never changes where run areas are looked for — the walk is
+    by name at any depth either way — only where the prunes that ask "is
+    this directory a project" take their answer from: the list where it
+    names a directory, the §1 marker test everywhere else (module
+    docstring). ``None`` is the marker test alone, today's answer on a bare
+    root.
     """
     root = Path(root)
+    known = None if projects is None else frozenset(Path(project) for project in projects)
     stack: List[Path] = [root]
     while stack:
         current = stack.pop()
@@ -456,40 +492,65 @@ def iter_run_areas(root) -> Iterator[Tuple[Path, str]]:
                 yield child, SESSION_LAYOUT
             elif name == LEGACY_RUNS_DIR:
                 yield child, LEGACY_LAYOUT
-            elif not _is_scope_out(child, parent=current, root=root):
+            elif not _is_scope_out(child, parent=current, root=root, projects=known):
                 descend.append(child)
         # Reversed, because the stack pops last-in first: keeps the yield
         # order the name order an operator would `ls`.
         stack.extend(reversed(descend))
 
 
-def _is_scope_out(child: Path, *, parent: Path, root: Path) -> bool:
+def _is_scope_out(child: Path, *, parent: Path, root: Path, projects) -> bool:
     """Whether the walk stops at *child* — the module docstring's prune rules,
     in one decision: an opaque or free-form AREA, or a legacy
-    ``{task_type}/`` level."""
-    return _is_opaque(child, parent=parent, root=root) or _is_legacy_task_tree(
-        child, parent=parent, root=root
-    )
+    ``{task_type}/`` level. *projects* is :func:`iter_run_areas`'s list,
+    already a set of paths, or ``None``."""
+    return _is_opaque(
+        child, parent=parent, root=root, projects=projects
+    ) or _is_legacy_task_tree(child, parent=parent, root=root, projects=projects)
 
 
-def _is_opaque(child: Path, *, parent: Path, root: Path) -> bool:
+def _is_project(path: Path, *, root: Path, projects) -> bool:
+    """Whether *path* is a project directory — the ONE answer every prune
+    here that asks takes.
+
+    Positional first: a directory the layout walk LISTED is a project by its
+    entry, shaped or not (the runner hands that list down as *projects*).
+    Shape second: the §1 marker test, which is the whole answer when there is
+    no list and the only answer for what the list never names — a nested
+    project, since nothing below a project is a second project to the walk.
+    The plexus ROOT is never a project, and it has to be said: a schema-form
+    root holds ``_agents/`` and ``_taskdef/``, so the marker test calls it
+    project-shaped, and every project would otherwise sit where a
+    ``{task_type}`` sits. No legacy task tree lives there anyway — the layout
+    starts at ``{host}/{project}/``.
+    """
+    if path == root:
+        return False
+    if projects is not None and path in projects:
+        return True
+    return is_project_shaped(path)
+
+
+def _is_opaque(child: Path, *, parent: Path, root: Path, projects) -> bool:
     """Whether *child* is an opaque or free-form area, so the walk stops.
 
     The two prune rules of the module docstring: a schema-owned ``_`` name is
     that area at any depth, while a bare legacy name is only an area where it
     CAN be one — at the plexus root for the instance surfaces (and not when
-    the directory is itself project-shaped), directly inside a project-shaped
-    directory for ``taskdef``.
+    the directory is itself a project), directly inside a project for
+    ``taskdef``. "A project" is :func:`_is_project`'s answer.
     """
     name = child.name
     if name in OPAQUE_AREAS:
         return True
     if parent == root:
-        return name in LEGACY_INSTANCE_AREAS and not is_project_shaped(child)
-    return name in LEGACY_PROJECT_AREAS and is_project_shaped(parent)
+        return name in LEGACY_INSTANCE_AREAS and not _is_project(
+            child, root=root, projects=projects
+        )
+    return name in LEGACY_PROJECT_AREAS and _is_project(parent, root=root, projects=projects)
 
 
-def _is_legacy_task_tree(child: Path, *, parent: Path, root: Path) -> bool:
+def _is_legacy_task_tree(child: Path, *, parent: Path, root: Path, projects) -> bool:
     """Whether *child* is a legacy ``{task_type}/`` level, whose contents §7
     puts out of scope (issue #379).
 
@@ -501,24 +562,26 @@ def _is_legacy_task_tree(child: Path, *, parent: Path, root: Path) -> bool:
     found there — a tree whose only findings come out of a scope-out and whose
     ``validate`` exits 1 on them.
 
-    Pruned by SHAPE, because there is no name to prune by: ``{task_type}`` is
-    whatever ``LMER_TASK`` said (``develop``, ``review``, any taskdef name),
-    an open set that a legal project short name is drawn from too. The shape
-    is two levels, and both are required — *child* sits DIRECTLY inside a
-    project-shaped directory, and at least one of ITS children is a legacy
-    ``{target}`` (:func:`_is_legacy_target`). A run area sitting directly
-    inside a project is not this layout and stays checked. The project half
-    costs nothing to satisfy on a real tree: the writer that made these dirs
-    made ``{host}/{project}/info/`` in the same breath
-    (``ensure_work_repo_directory``), which is a §1 marker.
+    There is no name to prune by: ``{task_type}`` is whatever ``LMER_TASK``
+    said (``develop``, ``review``, any taskdef name), an open set that a legal
+    project short name is drawn from too. So the rule is two levels, both
+    required, each answered its own way:
 
-    The plexus ROOT is excluded outright, and it has to be: a schema-form root
-    holds ``_agents/`` and ``_taskdef/``, so it is project-shaped by the §1
-    marker test, and every project would otherwise be a ``{task_type}``
-    candidate. No legacy task tree lives there anyway — the layout starts at
-    ``{host}/{project}/``.
+    - *child* sits DIRECTLY inside a project — :func:`_is_project`: the
+      layout walk's list where it names *parent* (the runner's path), the §1
+      marker test where it does not. A run area sitting directly inside a
+      project is not this layout and stays checked. The marker half costs
+      nothing to satisfy on a real legacy tree: the writer that made these
+      dirs made ``{host}/{project}/info/`` in the same breath
+      (``ensure_work_repo_directory``), which is a §1 marker; what the list
+      adds is the project the registry names before it has grown one.
+    - at least one of *child*'s children is a legacy ``{target}`` —
+      :func:`_is_legacy_target`, by what the legacy writers left there. The
+      list has nothing to say at this level and must not: a ``{target}``
+      holding only a run area and a nested project holding only a run area
+      are the same directory to it (:data:`LEGACY_TARGET_MARKERS`).
     """
-    if parent == root or not is_project_shaped(parent):
+    if not _is_project(parent, root=root, projects=projects):
         return False
     return any(_is_legacy_target(entry) for entry in _children(child))
 
@@ -532,6 +595,29 @@ def _is_legacy_target(path: Path) -> bool:
     return any((path / marker).exists() for marker in LEGACY_TARGET_MARKERS)
 
 
+def plain_session_move_text(slug, taskdef, *, area=RUNS_DIR, group=None) -> str:
+    """The §7 move text for a plain-session leftover, shared verbatim.
+
+    The validator check and the ``lmer-schema migrate`` blocker both carry
+    this one string (B.port-check/B.port-blocker), so the finding and the
+    refusal cannot drift on what to do or how. It names the move and the
+    ONE command that repairs it. *group* is the directory's on-disk name
+    (default *slug*); in a legacy ``runs/`` area that directory IS the
+    record, so it moves whole under a session id rather than per ``<uid>``.
+    """
+    group = slug if group is None else group
+    if area == LEGACY_RUNS_DIR:
+        move = f"`{area}/{group}/ \u2192 {RUNS_DIR}/{taskdef}/<session-id>/`"
+    else:
+        move = f"`{area}/{group}/<uid> \u2192 {RUNS_DIR}/{taskdef}/<uid>`"
+    return (
+        f"`{area}/{group}/` is a pre-A1 plain-session leftover: its `slug:` is "
+        f"the obsolete derivation of its own target. Fold it into the bare "
+        f"taskdef group ({move}, "
+        f"`slug: {slug} \u2192 {taskdef}`) with `work migrate <project>`."
+    )
+
+
 def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECONDS,
                  manifest=..., projects=None) -> None:
     """Run every record-area check over the plexus at *root* into *report*.
@@ -539,6 +625,9 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
     *now* is the instant staleness is measured against (default: UTC now),
     injected so a test's verdict does not depend on the wall clock;
     *stale_after* is that window in seconds (:data:`STALE_AFTER_SECONDS`).
+    *projects* is the layout walk's project list when the caller has one (the
+    runner does; ``None`` discovers it here for the schema-2 claim check and
+    leaves the run-area walk to the §1 marker test, :func:`iter_run_areas`).
     A root that does not exist yields nothing — "is there a tree at all" is
     the runner's question, not a record finding.
     """
@@ -562,11 +651,20 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
             except RunStateError:
                 report.add("record.release-claim", _rel(root, path),
                            "invalid shared release claim; arbitration must refuse")
-    for area, layout in iter_run_areas(root):
+    # `record.plain-session-slug` is evaluated only in schema form: a legacy
+    # tree (no manifest) keeps validating green and folds its leftovers at
+    # adoption, inside `work migrate` (spec §7, review S3). A host bucket is
+    # skipped inside the check itself — a bucket never blocks (D9) and this
+    # `record.*` code has no legacy downgrade.
+    plain_session = manifest is not None
+    for area, layout in iter_run_areas(root, projects=projects):
         if layout == SESSION_LAYOUT:
-            _check_session_area(root, area, report, now=now, stale_after=stale_after)
+            _check_session_area(
+                root, area, report, now=now, stale_after=stale_after,
+                plain_session=plain_session,
+            )
         else:
-            _check_legacy_area(root, area, report)
+            _check_legacy_area(root, area, report, plain_session=plain_session)
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +672,7 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
 # ---------------------------------------------------------------------------
 
 
-def _check_session_area(root, area, report, *, now, stale_after) -> None:
+def _check_session_area(root, area, report, *, now, stale_after, plain_session) -> None:
     """``<project>/_runs/`` — grouping dirs only, one per (taskdef, target)."""
     for child in _children(area):
         name = child.name
@@ -589,10 +687,13 @@ def _check_session_area(root, area, report, *, now, stale_after) -> None:
                 f"`{name}` is not one (D22: nothing is written at this level)",
             )
             continue
-        _check_slug_group(root, child, report, now=now, stale_after=stale_after)
+        _check_slug_group(
+            root, child, report, now=now, stale_after=stale_after,
+            plain_session=plain_session,
+        )
 
 
-def _check_slug_group(root, group, report, *, now, stale_after) -> None:
+def _check_slug_group(root, group, report, *, now, stale_after, plain_session) -> None:
     """``_runs/<slug>/`` — the grouping level: session dirs and nothing else."""
     for child in _children(group):
         name = child.name
@@ -635,9 +736,11 @@ def _check_slug_group(root, group, report, *, now, stale_after) -> None:
         _check_record_dir(
             root, child, report, layout=SESSION_LAYOUT, now=now, stale_after=stale_after
         )
+    if plain_session:
+        _check_plain_session_group(root, group, report, area=RUNS_DIR)
 
 
-def _check_legacy_area(root, area, report) -> None:
+def _check_legacy_area(root, area, report, *, plain_session) -> None:
     """``<project>/runs/`` — one shared dir per target, read in place (§3.5)."""
     for child in _children(area):
         name = child.name
@@ -651,6 +754,45 @@ def _check_legacy_area(root, area, report) -> None:
         if _state_file(child) is None:
             continue  # not a run dir: the resolver only matches state files
         _check_record_dir(root, child, report, layout=LEGACY_LAYOUT, now=None, stale_after=None)
+        if plain_session:
+            _check_plain_session_group(root, child, report, area=LEGACY_RUNS_DIR)
+
+
+def _check_plain_session_group(root, group, report, *, area) -> None:
+    """One `record.plain-session-slug` finding when *group* holds a pre-A1
+    plain-session record (spec §7, check `record.plain-session-slug`).
+
+    The predicate is `run_state.is_legacy_plain_session_slug`, the ONE shared
+    rule the migrate blocker and the fold use; this check never re-derives it.
+    A host bucket is skipped: D9 says a bucket never blocks, and a `record.*`
+    code carries no legacy downgrade, so the runner's tier pin could not
+    soften it. A group in a bare legacy `runs/` area inside a schema-form tree
+    is still checked — `work migrate <project>` nests and folds it — but a
+    legacy TREE is never walked here (`plain_session` is off without a
+    manifest).
+    """
+    if is_host_bucket_name(_rel(root, group).split("/", 1)[0]):
+        return  # D9: a bucket never blocks
+    from work_repo.run_state import is_legacy_plain_session_slug
+
+    candidates = []
+    if _state_file(group) is not None:
+        candidates.append(group)
+    candidates.extend(child for child in _children(group) if _state_file(child) is not None)
+    for rdir in candidates:
+        try:
+            data = yaml.safe_load(_state_file(rdir).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue  # the shape codes already report an unreadable state
+        if is_legacy_plain_session_slug(data):
+            report.add(
+                "record.plain-session-slug",
+                _rel(root, group),
+                plain_session_move_text(
+                    data.get("slug"), data.get("taskdef"), area=area, group=group.name
+                ),
+            )
+            return
 
 
 def _check_seed_dir(root, path, report) -> None:

@@ -9,11 +9,13 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from lmer_cli.resolve import (
+    NotACheckoutError,
     ResolveError,
     _git,
     get_remote_url,
     is_likely_url,
     normalize_repo_url,
+    probe_local_repo,
 )
 
 
@@ -227,6 +229,44 @@ class TestNormalizeRepoUrl:
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ResolveError):
                 normalize_repo_url("", Path(tmpdir), None)
+
+
+class TestProbeLocalRepo:
+    """The non-raising local-checkout probe (A1-wave0.host-export)."""
+
+    def _checkout(self, base: Path) -> Path:
+        repo = base / "widgets"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://gitlab.example.com/g/widgets.git"],
+            cwd=repo, capture_output=True,
+        )
+        return repo
+
+    def test_a_checkout_resolves(self, tmp_path):
+        repo = self._checkout(tmp_path)
+        assert probe_local_repo("widgets", tmp_path) == repo.resolve()
+        assert probe_local_repo("./widgets", tmp_path) == repo.resolve()
+        assert probe_local_repo(str(repo), tmp_path) == repo.resolve()
+
+    def test_a_missing_path_is_none(self, tmp_path):
+        assert probe_local_repo("mybranch", tmp_path) is None
+
+    def test_a_non_git_directory_raises(self, tmp_path):
+        (tmp_path / "plain").mkdir()
+        with pytest.raises(NotACheckoutError, match="not a git repository"):
+            probe_local_repo("plain", tmp_path)
+
+    def test_an_existing_file_raises(self, tmp_path):
+        (tmp_path / "README.md").write_text("hi\n")
+        with pytest.raises(NotACheckoutError):
+            probe_local_repo("README.md", tmp_path)
+
+    def test_a_url_is_never_probed(self, tmp_path):
+        assert probe_local_repo("https://gitlab.example.com/g/p", tmp_path) is None
+        assert probe_local_repo("git@gitlab.example.com:g/p", tmp_path) is None
+        assert probe_local_repo("", tmp_path) is None
 
 
 class TestRemapTaskdefToContainer:

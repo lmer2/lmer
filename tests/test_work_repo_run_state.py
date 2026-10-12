@@ -714,6 +714,37 @@ class TestFormatBrief:
             "Run: hunt the seg fault (slug: develop-issue-123, status: in-progress)"
         )
 
+    def test_a_dir_name_half_that_disagrees_with_the_name_is_shown(self):
+        """T19(1): a post-freeze `work name` leaves a stale `--<name>` suffix."""
+        d = run_state.decide(_state(name="new"), [], "s-1")
+        text = run_state.format_brief(d, dir_name="s-1--old")
+        assert text.splitlines()[0] == (
+            "Run: new (dir: s-1--old, slug: develop-issue-123, status: in-progress)"
+        )
+
+    def test_an_unsuffixed_unfrozen_dir_is_not_a_mismatch(self):
+        d = run_state.decide(_state(name="new"), [], "s-1")
+        text = run_state.format_brief(d, dir_name="s-1")
+        assert text.splitlines()[0] == (
+            "Run: new (slug: develop-issue-123, status: in-progress)"
+        )
+
+    def test_an_unnamed_legacy_brief_header_stays_byte_identical(self):
+        d = run_state.decide(_state(), [], "s-1")
+        text = run_state.format_brief(d, dir_name="develop-issue-123")
+        assert text.splitlines()[0] == "Run: develop-issue-123 (status: in-progress)"
+
+    def test_the_continuation_route_quotes_a_query_target(self):
+        """T18: a route printed from the brief must be pasteable, so a target
+        with `&` or `?` is shell-quoted."""
+        route = run_state.continuation_route(
+            "chat", "https://gitlab.example.com/g/p/-/issues?label_name=bug&state=opened", "ab" * 16
+        )
+        assert route == (
+            "lmer chat 'https://gitlab.example.com/g/p/-/issues?label_name=bug&state=opened' "
+            "--source-session " + "ab" * 16
+        )
+
     def test_brief_tolerates_non_dict_critical_error(self):
         state = _state(stop_reason="critical_error", critical_error="oops")
         d = run_state.decide(state, [], "s-1")
@@ -751,6 +782,39 @@ class TestFormatBrief:
         assert "COMPLETED RUN" in text
         assert 'work state set --stop-reason=question --question "<text>"' in text
         assert "never proceed on a guess" in text
+
+    def test_schema_two_completed_brief_names_the_continuation_route(self):
+        """D14: a schema-2 finished record is continued as a new execution,
+        addressed by its uid — never reopened in place."""
+        uid = "ab" * 16
+        state = _state(status="complete", stop_reason="complete")
+        state["schema"] = 2
+        state["session"] = {"uid": uid}
+        state["taskdef"] = "chat"
+        state["target"] = ""
+        d = run_state.decide(state, [], "s-1")
+        assert d["session_uid"] == uid and d["schema"] == 2
+        text = run_state.format_brief(d, seed="go")
+        assert f"--source-session {uid}" in text
+        assert "work state set --status=in-progress" not in text
+        assert "Seed provided (LMER_START_PROMPT): go" in text
+
+    def test_schema_two_completed_brief_renders_a_nonempty_target(self):
+        uid = "cd" * 16
+        target = "https://gitlab.example.com/g/p/-/merge_requests/9"
+        state = _state(status="complete")
+        state["schema"] = 2
+        state["session"] = {"uid": uid}
+        state["taskdef"] = "review"
+        state["target"] = target
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        assert f"lmer review {target} --source-session {uid}" in text
+
+    def test_legacy_completed_brief_stays_byte_identical(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d, seed="go")
+        assert "work state set --status=in-progress --stop-reason=none" in text
+        assert "--source-session" not in text
 
     def test_in_progress_brief_has_no_completed_directive(self):
         d = run_state.decide(_state(), [], "s-1")

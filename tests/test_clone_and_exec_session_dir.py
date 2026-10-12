@@ -41,6 +41,16 @@ What is pinned here, in the order the module reaches it:
   (``run_state._usable_session_id`` / ``SESSION_ID_RE``) — a test that fails
   if either side drifts. ``main()`` mints before it places, since a session
   dir cannot be named by a variable that does not exist yet.
+- **No work item, no suffix.** The group is keyed by ``_derive_run_slug``,
+  and a target that is not a work item — nothing, a path, a bare repository
+  URL, a document URL — derives the bare taskdef (run-identity spec §3), so
+  a plain chat lands in ``_runs/chat/`` whatever the host exported and two
+  such launches are two records in ONE group (#311). The rule mirrors
+  ``run_state.derive_slug``; the §9.1 derive-slug table runs through both
+  copies in ``TestAgreesWithTheWorkCli``. A work item — an issue, an MR, a
+  branch, a SHA, a thread permalink the handler owns — keeps today's slug,
+  and two launches on one work item are two records that never touch
+  (#117, ``TestTwoLaunchesOnOneTarget``).
 """
 
 import os
@@ -81,6 +91,72 @@ SESSION_ID = "20260825-120000-4242-31245"
 #: The launch context of the fixture tree's REGISTERED project, as the host
 #: CLI exports it (``_parse_host_project`` splits the clone URL into these two).
 PRIMARY_HOST, PRIMARY_PATH = PRIMARY_REPO.split("/", 1)
+
+#: The §9.1 derive-slug table, bare half: every target that is NOT a work
+#: item — nothing, a path, a bare repository URL (#81's ``.git`` spelling
+#: included), a document URL on or off a forge — derives the bare taskdef
+#: (spec §3). A lagging host still exports ``.`` or the raw clone URL; the
+#: container classifies what it is given, so those land here too.
+BARE_TARGETS = [
+    pytest.param(None, id="no-target"),
+    pytest.param("", id="empty-target"),
+    pytest.param(".", id="dot"),
+    pytest.param("./x", id="relative-path"),
+    pytest.param("/abs", id="absolute-path"),
+    pytest.param("https://h/g/p", id="bare-url"),
+    pytest.param("https://h/g/p.git", id="bare-url-dot-git"),
+    pytest.param("https://h/g/p/-/blob/main/x.md", id="document-url"),
+    # astra, !380: a work-item spelling inside a file path is a filename — the
+    # route decides, so these are documents and land in the bare group too
+    pytest.param(
+        "https://github.com/acme/widget/blob/main/issues/123", id="document-url-spelling-an-issue"
+    ),
+    pytest.param(
+        "https://gitlab.example.com/team/widget/-/blob/main/compare/result.md",
+        id="document-url-spelling-a-compare",
+    ),
+    # round two: a literal ``-`` directory in a GitHub file path is payload,
+    # not GitLab's boundary — the shape is decided by the host first
+    pytest.param(
+        "https://github.com/acme/widget/blob/main/-/issues/123",
+        id="document-url-with-a-dash-directory",
+    ),
+    pytest.param("https://github.com/acme/widget/tree/main/-/blob/x", id="tree-url-with-a-dash-directory"),
+    pytest.param(f"https://{PRIMARY_REPO}.git", id="issue-81-clone-url"),
+    pytest.param("https://docs.python.org/3/library/os.html", id="off-forge-document"),
+]
+
+#: The table's work-item half: ``(taskdef, target, slug)``, the slug being
+#: what each pair derived BEFORE the §3 rule — pinned so the rule changes
+#: nothing for a work item. The thread permalinks are ``special`` (§2): the
+#: handler owns them, and they keep their slug beside the work items.
+WORK_ITEM_SLUGS = [
+    pytest.param("develop", TARGET, SLUG, id="issue-url"),
+    pytest.param(
+        "review", f"https://{PRIMARY_REPO}/-/merge_requests/7", "review-mr-7", id="mr-url"
+    ),
+    pytest.param("review", "https://github.com/owner/repo/pull/9", "review-pr-9", id="pr-url"),
+    pytest.param("review", "feature/some-branch", "review-feature-some-branch", id="branch"),
+    pytest.param("develop", "a" * 40, "develop-" + "a" * 12, id="full-sha"),
+    pytest.param(
+        "chat",
+        "https://myworkspace.slack.com/archives/C0123ABCDEF/p1700000000123456",
+        "chat-p1700000000123456",
+        id="slack-permalink",
+    ),
+    pytest.param(
+        "chat",
+        "https://matrix.to/#/!abc:example.org/$evt?via=example.org",
+        "chat-$evt",
+        id="matrix-permalink",
+    ),
+]
+
+#: Both halves as ``(taskdef, target)`` — what the parity test walks.
+SLUG_TABLE = [
+    *(pytest.param("chat", *row.values, id=row.id) for row in BARE_TARGETS),
+    *(pytest.param(*row.values[:2], id=row.id) for row in WORK_ITEM_SLUGS),
+]
 
 
 @pytest.fixture(autouse=True)
@@ -550,6 +626,83 @@ class TestAResumeOpensNoSecondDirectory:
         )
 
 
+class TestTwoLaunchesOnOneTarget:
+    """``_runs/<slug>/`` groups; the session dir is the record (D22).
+
+    Two launches never meet: each prepares its own ``<session-id>/`` under
+    the group its (taskdef, target) derives, and the work CLI resolves each
+    launch back to its own dir. What the slug rule adds (spec §3) is WHICH
+    group a plain session joins — the bare taskdef's, whatever the host
+    exported for the target.
+    """
+
+    #: Two launch ids in the minted shape, five minutes apart.
+    LAUNCHES = ("20260825-120000-4242-31245", "20260825-120500-4243-31246")
+
+    def _launch(self, monkeypatch, tree, session, task, target):
+        """One container start, then the dir the work CLI resolves for it."""
+        _set_context(
+            monkeypatch, tree.root, host=PRIMARY_HOST, project=PRIMARY_PATH,
+            session=session, task=task, target=target,
+        )
+        clone_and_exec.ensure_work_repo_directory(
+            tree.root, PRIMARY_HOST, PRIMARY_PATH, task, target
+        )
+        resolved = run_state.run_dir()
+        assert resolved is not None and resolved.is_dir()
+        return resolved
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            pytest.param(f"https://{PRIMARY_REPO}.git", id="clone-url"),
+            pytest.param(f"https://{PRIMARY_REPO}", id="repo-url"),
+            pytest.param(".", id="dot"),
+        ],
+    )
+    def test_two_launches_on_a_repository_target_share_the_bare_group(
+        self, tmp_path, monkeypatch, target
+    ):
+        """#311: the second plain chat on a project is a second record in
+        ``_runs/chat/`` — not a ``chat-project.git`` sibling — including the
+        ``.`` and bare-URL spellings a lagging host still exports."""
+        tree = build_schema_plexus(tmp_path / "work")
+        first, second = [
+            self._launch(monkeypatch, tree, session, "chat", target)
+            for session in self.LAUNCHES
+        ]
+        group = tree.runs_dir / "chat"
+        assert first.parent == group and second.parent == group
+        assert first != second
+        assert _dirs_in(group) == sorted(self.LAUNCHES)
+        assert [name for name in _dirs_in(tree.runs_dir) if name.startswith("chat")] == [
+            "chat"
+        ]
+
+    def test_two_launches_on_one_work_item_never_share_a_record(
+        self, tmp_path, monkeypatch
+    ):
+        """#117, resolved by design (§9.5 pin): one work-item group, two
+        session dirs, and each launch resolves to its own — the record IS the
+        session dir, so there is nothing to share and nothing to arbitrate."""
+        target = f"https://{PRIMARY_REPO}/-/issues/99"
+        tree = build_schema_plexus(tmp_path / "work")
+        first, second = [
+            self._launch(monkeypatch, tree, session, TASKDEF, target)
+            for session in self.LAUNCHES
+        ]
+        group = tree.runs_dir / "develop-issue-99"
+        assert first.parent == group and second.parent == group
+        assert {first.name, second.name} == set(self.LAUNCHES)
+        assert _dirs_in(group) == sorted(self.LAUNCHES)
+        # The second launch neither reused the first's address nor touched
+        # it: both are the empty dirs `work seed`'s rename replaces.
+        assert list(first.iterdir()) == [] and list(second.iterdir()) == []
+        # ... and the first launch still resolves to its own dir afterwards.
+        monkeypatch.setenv("LMER_SESSION_ID", self.LAUNCHES[0])
+        assert run_state.run_dir() == first
+
+
 # ---------------------------------------------------------------------------
 # The cross-subsystem agreement
 # ---------------------------------------------------------------------------
@@ -607,22 +760,56 @@ class TestAgreesWithTheWorkCli:
         )
         assert placement.base == utils.work_repo_layout().base
 
-    @pytest.mark.parametrize(
-        "task,target",
-        [
-            pytest.param("develop", TARGET, id="issue-url"),
-            pytest.param("review", "feature/some-branch", id="branch"),
-            pytest.param("develop", "a" * 40, id="full-sha"),
-            pytest.param("chat", None, id="no-target"),
-            pytest.param("develop", "", id="empty-target"),
-        ],
-    )
-    def test_the_slug_is_the_work_cli_slug(self, monkeypatch, task, target):
+    @pytest.mark.parametrize("task,target", SLUG_TABLE)
+    def test_the_slug_is_the_work_cli_slug(self, task, target):
         """The group level is keyed by (taskdef, target) — one derivation or
-        the launch prepares a different group than the one `work seed` uses."""
+        the launch prepares a different group than the one `work seed` uses.
+        The whole §9.1 table, both halves, through both copies."""
         assert clone_and_exec._derive_run_slug(task, target) == run_state.derive_slug(
             task, target
         )
+
+    @pytest.mark.parametrize("target", BARE_TARGETS)
+    def test_no_work_item_derives_the_bare_taskdef(self, target):
+        """Spec §3: ``if not is_work_item(target): return taskdef`` — in both
+        copies, so ``lmer chat <clone-url>``, ``lmer chat .`` and a plain
+        ``lmer chat`` are ONE group, and #81's ``chat-project.git`` is never
+        minted again."""
+        assert clone_and_exec._derive_run_slug("chat", target) == "chat"
+        assert run_state.derive_slug("chat", target) == "chat"
+
+    @pytest.mark.parametrize("target", BARE_TARGETS)
+    def test_no_plain_session_slug_carries_a_dot_or_a_repository_basename(self, target):
+        """§9.1's negative form of the rule, as an operator reads ``ls
+        _runs/``: no ``chat-.``, no ``chat-.-x``, no ``chat-project.git``."""
+        basename = (target or "").rstrip("/").rsplit("/", 1)[-1]
+        for slug in (
+            clone_and_exec._derive_run_slug("chat", target),
+            run_state.derive_slug("chat", target),
+        ):
+            assert "." not in slug
+            assert not basename or basename not in slug
+
+    @pytest.mark.parametrize("task,target,slug", WORK_ITEM_SLUGS)
+    def test_a_work_item_keeps_today_s_slug(self, task, target, slug):
+        """The rule is a guard, not a rewrite: the full-SHA truncation and
+        ``sanitize_task_target`` run unchanged behind it, and a thread
+        permalink — ``special``, handler-owned — is a work item to it."""
+        assert clone_and_exec._derive_run_slug(task, target) == slug
+        assert run_state.derive_slug(task, target) == slug
+
+    def test_the_work_cli_classifies_the_env_target_it_falls_back_to(self, monkeypatch):
+        """Review S1: ``derive_slug`` resolves ``LMER_TASK_TARGET`` FIRST and
+        classifies the value it found — a ``None`` target over a clone URL in
+        the env is the bare taskdef, over an issue URL it is the issue's slug.
+        The entrypoint's copy has no fallback of its own (its caller read the
+        env), so the same ``None`` is bare whatever the env says."""
+        monkeypatch.setenv("LMER_TASK_TARGET", f"https://{PRIMARY_REPO}.git")
+        assert run_state.derive_slug("chat", None) == "chat"
+        assert clone_and_exec._derive_run_slug("chat", None) == "chat"
+        monkeypatch.setenv("LMER_TASK_TARGET", TARGET)
+        assert run_state.derive_slug(TASKDEF, None) == SLUG
+        assert clone_and_exec._derive_run_slug(TASKDEF, None) == TASKDEF
 
     def test_the_state_file_names_are_the_work_cli_names(self):
         """"Which children are records" turns on these names in three

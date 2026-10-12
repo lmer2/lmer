@@ -152,9 +152,14 @@ def start_launch() -> dict:
     defaults = _launch_fields()
     for key, value in defaults.items():
         metadata.setdefault(key, value)
+    # A pre-minted execution uid from the host (`--launch-uid`) is this launch's
+    # identity; it is consumed here (one-shot) so a child session spawned from
+    # this process mints its own rather than reusing ours.
+    requested = os.environ.pop("LMER_LAUNCH_UID", "")
+    uid = requested if UID_RE.fullmatch(requested or "") else uuid.uuid4().hex
     # PID/time describe this execution, never a predecessor's metadata.
     metadata.update(
-        uid=uuid.uuid4().hex,
+        uid=uid,
         pid=defaults["pid"],
         started_at=defaults["started_at"],
         execution_hostname=defaults["execution_hostname"],
@@ -245,13 +250,17 @@ def display_state(
     updated,
     now: datetime | str | None = None,
     stale_after: int = STALE_AFTER_SECONDS,
+    seeded: bool = False,
 ) -> str:
     """The one word a human reads for a record, derived from the record alone.
 
     Precedence: ``unreadable`` (the state file did not parse) → ``closed``
     (status complete or archived) → ``waiting on question`` (a recorded
-    question outranks a sign-out: the run is parked, not over) → ``ended, not
-    closed`` (in progress with an observed final ``session_end``) → ``open``.
+    question outranks a sign-out: the run is parked, not over) → ``seeded``
+    (a `work seed` record nobody has run in — D13; before ``ended, not
+    closed`` and before the clock-free ``open``, since nothing ever ran in
+    it) → ``ended, not closed`` (in progress with an observed final
+    ``session_end``) → ``open``.
 
     Without ``now`` the answer is a pure function of the record, which is what
     a file committed to a shared repository must be (the README index).
@@ -270,6 +279,8 @@ def display_state(
         return "closed"
     if stop_reason == "question":
         return "waiting on question"
+    if seeded:
+        return "seeded"
     if signed_out is True:
         return "ended, not closed"
     if now is None:

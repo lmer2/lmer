@@ -200,7 +200,8 @@ Path(sys.argv[1]).write_text(json.dumps({
         # The parent's name never reaches the child's record: the variables
         # were stripped, so the child's own session start applied nothing.
         child_state = run_state.load_state(directory)
-        assert child_state["name"] is None
+        # The child carries only its own default label (D5), never the parent's name.
+        assert run_state.is_default_label(child_state)
         assert child_state["goal"] is None
         assert run_state.load_state(parent_dir)["name"] == "parent-run"
         assert _snapshot_record(parent_dir) == before

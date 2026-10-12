@@ -68,7 +68,7 @@ README = f"{PROJECT}/README.md"
 #: A record committed by the fixture, so the first README of the project has a tracked row.
 SEEDED = RecordSpec(uid_for(1), "chat", stamp(1), stamp(1, 1), name="seeded")
 NUDGE = ("💡 this run has no name yet — work name <kebab-case> (or launch with lmer --name); "
-         "the index lists it by its goal or first log line until then")
+         "the index lists it by its default label (or its goal or first log line) until then")
 SKIPPED = f"⚠️  project index skipped: {README} — "
 LEFTOVER_SKIPPED = "⚠️  project index leftover skipped: "
 

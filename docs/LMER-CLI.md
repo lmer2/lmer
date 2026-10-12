@@ -109,17 +109,17 @@ The following environment variables control LMER behavior:
 
 - **`LMER_WORK_REPO_CREDENTIAL_FILE`** - **Computed and injected inside the container** (not a host input): the mode-`0600` session credential file created for the work-repo clone. `lmer doctor` uses a disposable copy for same-host declared-source probes, so Git cannot alter the live credential on success or authentication failure. The entrypoint discards any inherited value before minting this path; setting it on the host or in `.env` has no effect.
 
-- **`LMER_NAPKIN_REPO`** - Optional Git URL (SSH or HTTPS) of a dedicated *napkin* repo for shared team working notes. When set, lmer clones it to `/napkin` inside the container and points `LMER_NAPKIN_PATH` there. When unset, napkin falls back to the work repo's `sources.napkin` declaration if one exists (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else to a `napkin/` subdir of the work repo. This variable is an explicit, **mismatch-checked override** of the declaration, not the only way to point at a napkin source: when a declaration also exists and the two URLs are equal after normalization, the env value wins silently (it supplies the credential the declared form lacks); when they differ, lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. It also remains the operator-controlled escape hatch for a napkin repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. The host resolves its credential; the container clone boundary writes that credential to a session file and retains the clean URL.
+- **`LMER_NAPKIN_REPO`** - Optional Git URL (SSH or HTTPS) of a dedicated *napkin* repo for shared team working notes. When set, lmer clones it to `/napkin` inside the container and points `LMER_NAPKIN_PATH` there. When unset, napkin falls back to the work repo's `sources.napkin` declaration in `_plexus.yaml sources:` or the legacy `sources.yaml` if one exists (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else to a `napkin/` subdir of the work repo. This variable is an explicit, **mismatch-checked override** of the declaration, not the only way to point at a napkin source: when a declaration also exists and the two URLs are equal after normalization, the env value wins silently (it supplies the credential the declared form lacks); when they differ, lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. It also remains the operator-controlled escape hatch for a napkin repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. The host resolves its credential; the container clone boundary writes that credential to a session file and retains the clean URL.
 
 - **`LMER_NAPKIN_TOKEN`** - Optional auth token for `LMER_NAPKIN_REPO`. It remains the highest-priority host-side lookup for the napkin URL and falls back to the standard per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset. Its resolved value lands only in the napkin clone's mode-`0600` container credential file, never in Git argv, its remote URL, or repository config.
 
 - **`LMER_NAPKIN_PATH`** - **Computed and injected by lmer** (not a host input): the in-container path agents write napkin notes to. `/napkin` in separate-repo mode, else `{LMER_WORK_REPO_PATH}/napkin`. Agents and company-level Claude config should always reference `$LMER_NAPKIN_PATH` (and `~/napkin`, which is symlinked to it). Because it is computed rather than read from the host environment, it does not appear in `lmer --show-env` unless also set as a host `LMER_` variable.
 
-- **`LMER_TASKDEF_REPO`** - Optional Git URL (SSH or HTTPS) of a shared taskdef repo. When set, lmer clones it to `/taskdef` inside the container and inserts it into the task-definition search order **between** the work-repo taskdefs and the lmer built-in (i.e. after `{work_repo}/taskdef/`, before `/Agents/global/taskdef`). The taskdef source can equally be declared in the work repo's `sources.yaml` (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)); this variable is then an explicit, **mismatch-checked override** of that declaration rather than the only configuration mechanism. When a `sources.taskdef.repo` declaration also exists: equal after normalization → the env value wins silently, because it supplies the credential for the same source; different → lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. The env var also remains the operator-controlled escape hatch for a taskdef repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. Credential handling matches `LMER_NAPKIN_REPO`: a session file plus a clean retained URL.
+- **`LMER_TASKDEF_REPO`** - Optional Git URL (SSH or HTTPS) of a shared taskdef repo. When set, lmer clones it to `/taskdef` inside the container and inserts it into the task-definition search order **between** the work-repo taskdefs and the lmer built-in (i.e. after `{work_repo}/taskdef/`, before `/Agents/global/taskdef`). The taskdef source can equally be declared in the work repo's `_plexus.yaml sources:` or the legacy `sources.yaml` (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)); this variable is then an explicit, **mismatch-checked override** of that declaration rather than the only configuration mechanism. When a `sources.taskdef.repo` declaration also exists: equal after normalization → the env value wins silently, because it supplies the credential for the same source; different → lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. The env var also remains the operator-controlled escape hatch for a taskdef repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. Credential handling matches `LMER_NAPKIN_REPO`: a session file plus a clean retained URL.
 
 - **`LMER_TASKDEF_TOKEN`** - Optional auth token for `LMER_TASKDEF_REPO`. It remains the highest-priority host-side lookup and falls back to per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset. Its resolved value lands only in the taskdef clone's mode-`0600` container credential file.
 
-- **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the taskdef clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, a `sources.taskdef.ref` declaration in the work repo's `sources.yaml` applies if present (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else the repo's default branch is used. Like the repo URL variables, this is an explicit, **mismatch-checked override** of the declared ref — resolution runs per field, so a ref-only mismatch counts: declared ref equal to the env value → the env value wins silently; different → interactive stop-and-ask, or exit 2 headless before any auxiliary clone. And like them, it stays the operator-controlled escape hatch when the declared taskdef source can't be used and the env-var pair (`LMER_TASKDEF_REPO` + this ref) points elsewhere.
+- **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the taskdef clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, a `sources.taskdef.ref` declaration in the work repo's `_plexus.yaml sources:` or the legacy `sources.yaml` applies if present (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else the repo's default branch is used. Like the repo URL variables, this is an explicit, **mismatch-checked override** of the declared ref — resolution runs per field, so a ref-only mismatch counts: declared ref equal to the env value → the env value wins silently; different → interactive stop-and-ask, or exit 2 headless before any auxiliary clone. And like them, it stays the operator-controlled escape hatch when the declared taskdef source can't be used and the env-var pair (`LMER_TASKDEF_REPO` + this ref) points elsewhere.
 
 - **`LMER_MATRIX_AS_TOKEN`** - Appservice token for the Matrix bridge (`lmer-matrix-bridge`, see [MATRIX-CHAT.md](./MATRIX-CHAT.md)), as installed in the homeserver's appservice registration. Read only by the bridge, which runs **host-side** beside the platform daemon; it is deliberately *not* in the container-env passthrough, because a session container has no use for the bridge's Matrix identity and every use for it if compromised. Never read from `config.json`: a token-shaped key in the `matrix` section is a refusal, not a fallback.
 
@@ -330,7 +330,9 @@ active turn. See [Codex delivery](CODEX-DELIVERY.md).
 
 - **`LMER_RUN_GOAL`** - The run's goal, recorded at session start. **Flag-only**, from `lmer --goal "<text>"`, with the same never-forwarded rule as `LMER_RUN_NAME`. Applied once by `work session-start` on the session-opening call (`goal_set` event, secret-redacted); an explicit launch goal replaces a goal inherited from a continuation source. A multi-line goal reaches the container like any other multi-line value (the `-e NAME` marker leg). Stripped from every spawn-harness child.
 
-- **`LMER_TASK_TARGET`** - The primary task target as the container reads it: a URL (issue, MR, branch, repository) exported as given, and **empty** for a local filesystem path target (`lmer chat .`, `./`, `../x`, an absolute checkout path). A local path resolves the repository from the checkout's git origin and carries no identity worth a slug, so the empty target makes every slug derivation yield the bare taskdef (`chat`, not `chat-.`); it is delivered empty rather than left absent so the container can never fall back to a value from its own environment. Records created under this rule are host-only through the platform (its resume and answer routes refuse an empty recorded target) until a follow-up lands; groups created before it (`chat-.`) stay addressable by their recorded slug. See docs/RUN-STATE.md §3.
+- **`LMER_LAUNCH_UID`** - A pre-minted execution uid (32 lowercase hex) this launch records under on a schema-2 work repo; the platform mints one for every schema-2 spawn, resume and answer so it can key the run `host/project/<uid>` before the container starts. **Flag-only**: sourced exclusively from `lmer --launch-uid <uid>`; a host-exported or `.env`-set `LMER_LAUNCH_UID` is never forwarded (a stale exported uid would make every launch reuse one record's identity). In the container, before the session uid is minted, a uid that already names a record in the project's run area refuses the session start (exit 2, `Session start refused: launch uid already names a record`). A launch with no repository (a repo-less thread chat, or `LMER_NO_REPO`) has no run area, so there is nothing for its uid to collide with and the check passes; a run area that exists but cannot be listed refuses the start (exit 2), since "no record" is only an answer once the area was read. Otherwise the uid becomes `LMER_SESSION_ID` and is removed from the environment (one-shot), so a child session mints its own. A value that is not 32 lowercase hex is ignored there and a fresh uid minted. On a schema-1 tree it is dropped unread.
+
+- **`LMER_TASK_TARGET`** - The primary task target as the container reads it. A work-item, reference or `other` URL is exported as given; a repository target — a local filesystem path (`lmer chat .`, `./`, `../x`, an absolute checkout path) or a bare repository URL — and no target at all export **empty**. A repository carries no identity worth a slug, so the empty target makes every slug derivation yield the bare taskdef (`chat`, not `chat-.`); it is delivered empty rather than left absent so the container can never fall back to a value from its own environment. The platform resumes and answers a schema-2 record with an empty recorded target by its uid, naming the repository with `--repo` (the request's `repo_url` or the run's recorded clone URL); a schema-1 record with an empty target is still refused there. Groups created before this rule (`chat-.`) stay addressable by their recorded slug. See docs/RUN-STATE.md §3.
 
 - **`LMER_SESSION_ID`** - Which work-repo record this launch writes in: in a schema-form work repo every launch owns `<project>/_runs/<slug>/<session-id>[--<name>]/`, and this variable is what picks one ([RUN-STATE.md §5](./RUN-STATE.md), [SCHEMA.md](./SCHEMA.md)). It is normally **minted inside the container** at startup — `clone_and_exec.main`, before anything is placed, as UTC timestamp + pid + random — and inherited unchanged by the runner, the hooks and every `work` invocation, so an ordinary launch opens a record of its own. As a *host* input it is **flag-only**: sourced exclusively from `lmer --session <id>`, never from a host-exported or `.env` `LMER_SESSION_ID`. That refusal is stricter in kind than `LMER_ANSWER`'s, not merely the same habit: **every** lmer container exports this variable, so an agent that runs `lmer` to spawn a child session always has one in its own environment — an env fallback would send the child into its parent's record and leave two live containers writing one `state.yaml`, which is the collision the per-launch record exists to prevent. Injecting it is how a resume continues the record it resolved instead of opening a fresh one beside it (see `--session` below). It also names the session in `owner` claims and in every recorded event, and is `unknown` when unset.
 
@@ -444,6 +446,50 @@ run-state, SessionEnd and Slack guards described elsewhere remain Claude-only.
 
 The work repo can declare the canonical taskdef and napkin sources in a `sources.yaml` file at its root. This makes the work repo itself the source of truth for where shared taskdefs and napkin notes come from, and turns the `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO` / `LMER_TASKDEF_REF` environment variables into explicit, mismatch-checked overrides instead of the only configuration mechanism. Resolution runs in-container (in `clone_and_exec`, after the work-repo clone and before the auxiliary clones), where `sources.yaml` is guaranteed present and fresh.
 
+#### Declaration tiers (env > `_plexus.yaml sources:` > `sources.yaml`)
+
+A schema-2 work repo may declare the same sources in its `_plexus.yaml`
+`sources:` section; the standalone `sources.yaml` remains the legacy tier.
+Resolution is per source key, whole entry, highest tier first:
+
+| tier | declaration | notes |
+|---|---|---|
+| env | `LMER_TASKDEF_REPO` / `LMER_TASKDEF_REF` / `LMER_NAPKIN_REPO` | operator-controlled; always wins |
+| manifest | `_plexus.yaml sources:` | wins over a legacy entry; one stale-legacy WARN names the outranked `sources.yaml` key |
+| legacy | `sources.yaml` | the pre-#370 tier; still read and validated in full |
+
+A key only the legacy file declares keeps the legacy entry. Neither file
+present (and no `sources:` section) is **silent legacy mode** — zero output.
+`sources:` carries no version of its own: the manifest's `schema:` is
+`lmer_schema.manifest`'s. The same-host trust rule, the credential and
+ambiguous-URL refusals and the per-name `ref:` rule apply at EVERY tier, so a
+manifest `sources.napkin.ref` refuses start just as the legacy one does.
+
+```yaml
+# _plexus.yaml
+schema: 2
+name: example
+sources:
+  taskdef:
+    repo: https://gitlab.example.com/group/taskdefs.git
+    ref: main
+  napkin:
+    repo: https://gitlab.example.com/group/napkin.git
+```
+
+The origin vocabulary names the tier whenever a manifest is present:
+`declared (manifest)` / `declared (sources.yaml)`
+(`lmer_cli.container.sources.declared_origin_label`), so the container banner
+and `--show-env` cannot drift. `sources.knowledge` and `sources.plans` are
+validated and warned about by name but not mounted by this release (they need
+runner-side wiring that has not shipped yet).
+
+> **ROLLOUT NOTE.** `work migrate --instance` folds `sources.yaml` into the
+> manifest and removes the legacy file, so deploy a release carrying the
+> manifest tier on **every** host before applying it. `--instance` checks
+> `lmer_cli.container.sources.MANIFEST_TIER_SUPPORTED` locally and refuses
+> otherwise; the fleet is the operator's responsibility.
+
 #### Schema (version 1)
 
 ```yaml
@@ -503,11 +549,11 @@ On the host side, `--show-env` reads the declaration from the local clone cache,
 
 #### Known trade-off: declared-only sources are not clone-cache accelerated
 
-The clone-cache updater (see `LMER_CLONE_CACHE`) warms mirrors for the repos named by `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO`. A source configured **only** in `sources.yaml` is not among them: the declaration is authoritative container-side, and host-side it is knowable only through the same best-effort (possibly stale) cache read `--show-env` labels as such. A source you migrate from the env var to a declaration therefore loses warm-mirror acceleration and is cloned directly every session. Correctness is unaffected — this is exactly the cold-cache path lmer used before the cache existed — but if clone time matters for a large taskdef repo, keeping the env var set alongside the declaration (the normalized-equal `env-match` row, which is silent and non-conflicting) keeps the mirror warm.
+The clone-cache updater (see `LMER_CLONE_CACHE`) warms mirrors for the repos named by `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO`. A source configured **only** in `_plexus.yaml sources:` or `sources.yaml` is not among them: the declaration is authoritative container-side, and host-side it is knowable only through the same best-effort (possibly stale) cache read `--show-env` labels as such. A source you migrate from the env var to a declaration therefore loses warm-mirror acceleration and is cloned directly every session. Correctness is unaffected — this is exactly the cold-cache path lmer used before the cache existed — but if clone time matters for a large taskdef repo, keeping the env var set alongside the declaration (the normalized-equal `env-match` row, which is silent and non-conflicting) keeps the mirror warm.
 
 #### `bin/doctor`
 
-Inside the container, `bin/doctor`'s `🔗 Declared Sources` section reports on the declaration: schema validity, reachability of each declared source (`git ls-remote` with a disposable copy of the work-repo session credential attached through process-scoped Git config), whether the declared `ref` exists on the remote, and whether the cloned taskdef repo's `taskdef.yaml` schema is supported. The live credential remains unchanged in its mode-`0600` file even when Git approves or rejects the probe credential; the probe's argv and URL are clean. Every finding is a **warning** — a broken declaration never flips doctor's exit code. The underlying helper CLI (`python3 -m lmer_cli.container.sources doctor --json`) reads `${LMER_WORK_REPO_PATH:-/work}/sources.yaml` by default; pass `--path` to point it elsewhere.
+Inside the container, `bin/doctor`'s `🔗 Declared Sources` section reports on the declaration, including which tier each source came from (manifest or `sources.yaml`): schema validity, reachability of each declared source (`git ls-remote` with a disposable copy of the work-repo session credential attached through process-scoped Git config), whether the declared `ref` exists on the remote, and whether the cloned taskdef repo's `taskdef.yaml` schema is supported. The live credential remains unchanged in its mode-`0600` file even when Git approves or rejects the probe credential; the probe's argv and URL are clean. Every finding is a **warning** — a broken declaration never flips doctor's exit code. The underlying helper CLI (`python3 -m lmer_cli.container.sources doctor --json`) reads `${LMER_WORK_REPO_PATH:-/work}/sources.yaml` by default; pass `--path` to point it elsewhere.
 
 ### Work-Repo Claude Assets
 
@@ -596,6 +642,8 @@ Set `LMER_TASKDEF_PATHS=/path/to/my-tasks` to make your tasks available.
 - If no target is provided, the CLI will try to infer from the current directory's git remote.
 - When providing a local git path, lmer extracts the remote URL instead of using `file://` protocol.
 - PR/MR/issue URLs (e.g., `https://github.com/org/repo/pull/123`) are automatically converted to their base repository URLs. Newer GitLab installs that serve issues under `/-/work_items/<id>` are also recognized and treated the same as the older `/-/issues/<id>` form.
+- A document URL (a file, tree or wiki page inside a repository) is task context: its repository is derived from the URL, so `lmer chat <doc-url>` clones that repository and records the document as the target. `lmer chat --repo <url>` with no positional is the plain project session.
+- `work setup-workspace` exports the raw repository URL as `LMER_TASK_TARGET`, so a run it opens mid-session files under the bare taskdef rather than a work-item slug.
 
 **Default behavior**: Without `--exec`, lmer runs `claude-runner` which starts an interactive Claude Code session.
 
@@ -929,7 +977,8 @@ lmer build --local /path/to/agents/global
 
 ### Command-Line Options
 
-- `<target>...` - One or more repository URLs, local git paths, or PR/MR/issue URLs. The first target is the primary target (sets environment variables and is cloned into `/workspace`). Additional targets are secondary (cloned into subdirectories like `/workspace/mr-123` but don't override environment variables).
+- `<target>...` - One or more targets. The first is the primary target (sets environment variables and is cloned into `/workspace`); additional targets are secondary (cloned into subdirectories like `/workspace/mr-123` but don't override environment variables). What a target *is* follows the shared classifier (`work_repo.utils.classify_target`): a checkout path or a bare repository URL is the repository, and the session's target is empty; an issue/MR/PR/commit URL, a branch, a SHA or an `mr-N`/`issue-N` shorthand is the target; a document URL inside a repository is task context, and its repository is derived; a Slack or Matrix thread permalink is claimed by its handler. A positional that names an existing filesystem entry which is not a git checkout — a plain directory or a file — is refused (exit 2), never read as a branch name. Any other URL is refused unless `--repo` names the repository, and a work-item/reference URL that derives no repository (for example `https://gitlab.com/-/issues/1`) is refused rather than silently cloning the cwd origin; the cwd-origin fallback applies only to a non-URL branch, SHA or shorthand.
+- `--repo <url-or-path>` - An explicit repository for this launch (URL or local path). It beats a repository derived from a work-item, reference or thread target, so `lmer chat --repo <url>` with no positional is the plain project session, launched from anywhere. The value must itself be a repository: a path resolves like a positional (its git origin and host path, honouring `--remote`) and must be a checkout, and a URL must be classified `repository` — a work-item, reference or `other` URL is refused, as is a path that names no existing checkout. The URL is injected with the GitLab token when available. Refused as `two repositories named` beside a repository-class positional, and also beside `--checkout`, `LMER_NO_REPO`, `--no-clone` or `--no-task`. Nothing new reaches the container.
 - `--exec` - Run an arbitrary command in the container instead of starting Claude Code
 - `--no-clone` - Skip git clone, just run command (requires `--exec` and `--no-task`)
 - `--no-task` - Run without selecting a task (exec mode only)
@@ -948,9 +997,10 @@ lmer build --local /path/to/agents/global
 - `--manual-start` - Do not auto-inject `/start` into Claude on launch. By default the supervisor sends `/start` shortly after Claude is ready so the configured task begins immediately
 - `--prompt <text>` - Follow-up prompt injected immediately after the auto-`/start`, so an automated run can hand Claude an extra instruction without manual typing (e.g. `lmer chat <issue-url> --prompt="research X online first"`). Claude queues input typed while it is still working on `/start`, so the prompt becomes the next conversation turn. Forwarded to the container as `LMER_START_PROMPT`. Ignored under `--manual-start` (nothing is auto-injected then)
 - `--answer <text>` - Answer to the run's recorded open question. Forwarded to the container as `LMER_ANSWER` (this flag is the ONLY source — a host-exported or `.env` `LMER_ANSWER` is never forwarded); `work session-start` applies it before printing the resume brief (records a `question_answered` event, clears the question stop) so the fresh session resumes seeded with the question+answer pair. Ignored when the run isn't stopped on a recorded question. See `LMER_ANSWER` above and docs/RUN-STATE.md §2
-- `--name <kebab>` - The run's name, forwarded to the container as `LMER_RUN_NAME` (this flag is the ONLY source — a host-exported or `.env` `LMER_RUN_NAME` is never forwarded) and recorded once by `work session-start` on the call that opens the record's session, under the `work name` rules: normalised to kebab-case, unique per project. A name another run of the project holds is reported in the session's start output and the run stays unnamed (`work name <other>` renames it later); a name that lands is shown in that start output — the brief's `Run: <name> (slug: …)` header, or on schema 2 a `Run name: <name>` line under `This launch (lmer --name/--goal, already recorded):` — so the agent skips its naming step; nothing about a name can refuse a session. An empty value or a name with a newline is refused here (exit 2); with `--no-task` there is no run to record it in, so it is refused too; with `--exec` it is accepted and the host prints `ℹ️  --name/--goal are recorded by work session-start; this --exec command must run it for them to apply`. Every durability push prints a one-line reminder while the run is still unnamed. See `LMER_RUN_NAME` above and docs/RUN-STATE.md §4
+- `--name <kebab>` - The run's name, a **label** forwarded to the container as `LMER_RUN_NAME` (this flag is the ONLY source — a host-exported or `.env` `LMER_RUN_NAME` is never forwarded) and recorded once by `work session-start` on the call that opens the record's session, under the `work name` rules: normalised to kebab-case. On schema 2 the launch name replaces a default or inherited label; only a legacy tree enforces per-project uniqueness, where a name another run holds is reported in the session's start output and the run stays unnamed (`work name <other>` renames it later). A name that lands is shown in that start output — the brief's `Run: <name> (slug: …)` header, or on schema 2 a `Run name: <name>` line under `This launch (lmer --name/--goal, already recorded):` — so the agent skips its naming step; nothing about a name can refuse a session. An empty value or a name with a newline is refused here (exit 2); with `--no-task` there is no run to record it in, so it is refused too; with `--exec` it is accepted and the host prints `ℹ️  --name/--goal are recorded by work session-start; this --exec command must run it for them to apply`. Every durability push prints a one-line reminder while the run is still unnamed. See `LMER_RUN_NAME` above and docs/RUN-STATE.md §4
 - `--goal <text>` - The run's goal, forwarded to the container as `LMER_RUN_GOAL` (flag-only, as above) and recorded once by `work session-start` on the session-opening call; it replaces a goal inherited from a continuation source. The session's start output shows it as the current `Goal:`; a continuation's replaced goal appears only as `Predecessor goal (context only, replaced by the launch goal): …`. A multi-line goal is fine. An empty value is refused (exit 2), as is the flag with `--no-task`; with `--exec` the same note as `--name` applies. See `LMER_RUN_GOAL` above
 - `--session <id>` - Session id of the run record this launch continues, forwarded to the container as `LMER_SESSION_ID` (this flag is the ONLY source — a host-exported or `.env` `LMER_SESSION_ID` is never forwarded, because every lmer container exports one and a child would inherit its parent's record). The id names **one launch inside the run's group** — a session directory's `<session-id>`, or its full `<session-id>--<name>`, as `work sessions` lists them — so the session writes in that record rather than minting a new one beside it; without it a relaunch of a run opens a fresh empty record and the launch you meant to continue is left as it was. A value that could not be a directory name (a path separator, `.`, `..`, empty, a glob character, or one padded with spaces) is refused here, before the container starts (exit 2), because nothing below refuses it: the container-side guards read an unusable id as *no* id at all, so the session would start, quietly file itself under a synthesized id or in the group's newest launch, and look completely normal until the launch you named turned out to be untouched. Whitespace is refused rather than trimmed — silently rewriting an id would send the launch to a directory you did not type. A legacy work repo has no session directories to name, so nothing there is addressed by the id — it is still this session's id in `owner` claims and events, exactly as an unnamed launch's would be. See `LMER_SESSION_ID` above and [Resuming a specific session by id](#resuming-a-specific-session-by-id)
+- `--launch-uid <uid>` - The fresh execution uid this launch records under on a schema-2 work repo; a caller that mints one never reuses it. Platform use: the platform mints the uid and passes this flag so it can key the run `host/project/<uid>` from the start. Forwarded to the container as `LMER_LAUNCH_UID` (this flag is the ONLY source — a host-exported or `.env` `LMER_LAUNCH_UID` is never forwarded), where a uid that already names a record refuses the session start. Refused here (exit 2) unless it is 32 lowercase hex, and refused with `--session` (a schema-1 continuation already names the record it writes). See `LMER_LAUNCH_UID` above
 - `--fastapi` - Expose a FastAPI endpoint inside the container that lets a controlling process drive Claude's stdin/stdout (`POST /input`, `GET /output`). The chosen port is published to `127.0.0.1` on the host. See [Supervisor and FastAPI Endpoint](#supervisor-and-fastapi-endpoint)
 - `--fastapi-port-range LOW-HIGH` - Port range to pick a free FastAPI port from (default `8700-8799`). The host CLI picks one free port from this range before container start and publishes only that port
 - `--fastapi-host <host>` - Inside-container bind host for the FastAPI endpoint (default `0.0.0.0` when `--fastapi` is set so the published port works)
@@ -1462,6 +1512,20 @@ model, effort, configuration and arbitrary extra fields. Secrets are scrubbed.
 See [Schema 2](./SCHEMA-V2.md) for the current contract. The lineage/resume
 behavior described below applies to schema 1 and legacy trees.
 
+#### `work name` and `work seed`
+
+- `work name <kebab-case>` — set the current record's name label. On schema 2
+a name is a **label**: two records may share one, and a launch `--name`
+replaces a default or inherited label. A record already frozen keeps its
+directory: the verb prints `directory frozen at <old dir>; it will not be
+renamed`. A legacy tree keeps per-project uniqueness.
+- `work seed <taskdef> <target> [--goal …] [--name …]` — create a run record
+for another slug without claiming it. On schema 2 it mints a fresh uid, writes
+the record with `session.seeded_by`, and prints the uid and the launch line
+`lmer <taskdef> [<target>] --source-session <uid>`; the record is a valid
+continuation source needing no `--allow-unsigned-source`, and `work commit` /
+`work session-end` publish it.
+
 In a work repo migrated to the lmer schema the unit of record is the **session**: one launch writes one record, at `<project>/_runs/<slug>/<session-id>[--<name>]/`. Several launches against the same target share the `<slug>/` group — two people on one issue are two records — so "which run is this?" becomes "which *session* of this run?". `work sessions` answers it, and `--session <id>` is how a launch continues an existing record instead of opening a new one.
 
 Both surfaces work in a legacy tree too. There one shared run dir per target holds every session's writes, so no session id describes it, and the rows say so rather than presenting a directory name as a launch. The file shapes are unchanged in either form — see [RUN-STATE.md](./RUN-STATE.md) for what is *in* a record, and [SCHEMA.md](./SCHEMA.md#sessions-and-runs) for where it lives.
@@ -1504,11 +1568,12 @@ Sessions: 3 (1 active, 1 ended not closed, 1 closed)
 
 - **`closed`** — `status` is `complete` or `archived`.
 - **`waiting on question`** — `stop_reason` is `question`; a recorded question outranks a sign-out, the run is parked, not over.
+- **`seeded`** — a `work seed` record nobody has run in yet (`session.seeded_by` set, no `session_start`); listed, never running.
 - **`ended, not closed`** — in progress with a recorded final `session_end`.
 - **`active`** — in progress, no sign-out recorded, `updated` within the last 14 days (the validator's `record.session-stale` window).
 - **`stale`** — in progress, no sign-out recorded, quiet for longer than that. A reading of the record, not a verdict on the run: nothing here ever ends a run, and age or silence never means signed out.
 
-The two-word header buckets are spelled `ended not closed` and `waiting on question`. A schema-1 record that still sits in a schema-2 tree (one recorded before the migration) keeps its schema-1 row — no `state=` tail — and is not counted in the buckets. `⚠️  state unreadable` marks only a record whose state file really could not be parsed; it never appears on a readable schema-2 row. **`--running`** keeps its meaning — in progress with something live in it — which on schema 2 is "no sign-out recorded", i.e. the `active` and `stale` rows; the header stays `Running sessions: <n>`.
+The header buckets are spelled `seeded`, `ended not closed` and `waiting on question`. A schema-1 record that still sits in a schema-2 tree (one recorded before the migration) keeps its schema-1 row — no `state=` tail — and is not counted in the buckets. `⚠️  state unreadable` marks only a record whose state file really could not be parsed; it never appears on a readable schema-2 row. **`--running`** keeps its meaning — in progress with something live in it — which on schema 2 is "no sign-out recorded", i.e. the `active` and `stale` rows; the header stays `Running sessions: <n>`.
 
 **`--json`** emits `{"form": …, "count": N, "sessions": [...]}` on one line — `form` is `"schema"` or `"legacy"`, and with no run context the document carries `"detail"` with the reason and an empty list. Each session entry carries `id`, `dir_name`, `path` (absolute, in-container), `address` (`<slug>/<session-id>`, the run-area-relative name), `slug`, `name`, `status`, `stop_reason`, `phase`, `created`, `updated`, `owner` and `orphaned`; a schema-2 entry also carries `session` (the launch metadata block), `signed_out` and `state` — the same word the text row prints.
 
@@ -1554,6 +1619,116 @@ What an id may name, and what happens when it does not:
 One related case is automatic. When a stopped run is relaunched with a pushed answer (`lmer --answer "…"`), the relaunch is a new container, and left to itself it would mint a new session id and file the answer in a fresh empty record beside the one that asked — with the question still standing in the real record. The platform's answer route closes that directly: it injects the asking record's id as `LMER_SESSION_ID` (`lmer --session`), so the launch writes there from its first `work` call. For a launcher that carries only the answer, `work session-start` falls back to routing itself to the newest session of this run that is stopped on a question — the record the answer is actually about — and only when the relaunch has written no record of its own. Naming the session, by either route, is the direct one.
 
 The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
+
+### Housekeeping (`work housekeep`)
+
+`work housekeep [--apply] [--area napkin|plans|bundles|index|runs|buckets]
+[--project NAME] [--archive-stale]` archives stale content and maintains the
+indexes. It is a **dry run by default**; `--apply` performs the planned
+changes and makes ONE commit (through the normal gated push, which also
+refreshes each touched project's README). Areas run in execution order
+`napkin`, `plans`, `bundles`, `index`, `runs`, `buckets`.
+
+- **Areas and actions.** `napkin` decays untouched notes under `_napkin/`;
+  `plans` retires done plan files past their TTL and re-points their
+  `PLANS.md` line at the archive mirror; `bundles` flattens a legacy
+  double-nested masterplan bundle in a stopped session; `index` tombstones a
+  dangling `MEMORY.md`/`PLANS.md` entry in place (or re-points it at the
+  `_archive/` mirror); `runs` archives stopped records; `buckets` lists host
+  buckets awaiting adoption (INFO only).
+- **Policy** comes from `_plexus.yaml housekeeping:`, per area:
+  `napkin.archive_after` (default 365d), `plans.archive_after` (default
+  null), `runs.archive_after` (default 90d). `<N>d` means N days; `null`
+  disables the area. An invalid value refuses only that area.
+- **Liveness** is lifecycle facts: a schema-2 record is stopped only with a
+  final `session_end`, or as a never-started `work seed`. An unknown
+  lifecycle is never moved; a started record past the staleness window is
+  INFO `possibly orphaned`.
+- **`--archive-stale`** is human-only and moves such an unsigned record. It
+  is refused (exit 2) under `LMER_NONINTERACTIVE=1`, because scheduled runs
+  must never pass it. The only deletion is a stale `.new-*` orphan.
+- Inside a session every applied change is one event in the caller's own
+  record; from an operator shell the per-change lines go into the commit
+  body. See the unattended recipe in
+  [RUN-STATE.md](./RUN-STATE.md#running-the-cleaner-unattended-recipe).
+- **Napkin choices:** the bare `napkin/` directory and a separately mounted
+  napkin repository are report-only (the former has no mirror at the
+  work-repo root; the latter's archive is its own commit).
+
+### Knowledge index (`work knowledge index`)
+
+`work knowledge index [--check] [--org NAME]` generates
+`_knowledge/<org>/INDEX.md` from the pages beneath the org: one line per page
+(title, relative link, last git-touch date), grouped by topic. A generated
+index starts with the `lmer:knowledge-index:generated` marker; an existing
+index without it is hand-written and is never overwritten (reported and
+skipped). A plain run rewrites stale generated indexes in place; `--check`
+writes nothing and exits 1 when any is out of date, 0 otherwise. `--check`
+compares everything except the per-line git date, so committing the
+regenerated index does not make it stale at once. An unknown `--org` exits 2.
+Neither mode commits — the caller commits.
+
+### Adopting and migrating a work repo (`work adopt` / `work migrate`)
+
+Both verbs are **operator-shell** verbs: they run from a work-repo checkout
+with no session env, are exempt from the session-uid gate, and still declare
+their write scope to the write-attribution journal. Both are **dry runs by
+default** and print the full plan; `--apply` performs it in ONE commit. Exit
+codes: `0` success (or a dry run); `1` a refusal before anything changed, or a
+failed push after the commit was made locally (the message says which); `2` a
+usage error. After a successful `work migrate --apply` the schema-tier
+validator runs over the whole tree and prints its full report, but only
+ERRORs under the paths this run migrated (the project dir, or the instance
+surfaces and `_plexus.yaml`) make the exit code `1` — another project still
+awaiting its turn does not fail this one. The commit stands regardless;
+`work adopt` does not run the validator.
+
+**`work adopt <host>/<project> <shortname> [--apply] [--compat-link]
+[--description TEXT] [--remote URL]... [--force]`** names a host bucket and
+registers it. It resolves the bucket, checks the shortname and the registry,
+shows the SCHEMA-tier fix list (the tree is leaving the lenient legacy tier),
+bootstraps `_plexus.yaml` through the writer if the tree has none, writes the
+registry entry, and `git mv`s the directory to `<shortname>/`. `--compat-link`
+leaves a relative symlink at the old path (INFO); `--description` sets the
+registry entry's description; `--remote` may repeat; `--force` adopts despite
+schema-tier ERRORs in the fix list, carrying them into `<shortname>/` as they
+are. It does not rename the bare areas inside — that is `work migrate`.
+
+**`work migrate <project> [--apply] [--compat-link]`** moves one registered
+project's bare areas to their schema names (`runs/` → `_runs/`, `specs/` →
+`_specs/`, and the rest), nests each legacy run dir under its first session id,
+lifts non-`project` memories to the instance scope, re-points the `_specs/`
+and `_plans/` entries in place (keeping their dates), and folds the pre-A1
+plain-session groups (`chat-.`, `chat-<repo>`, `chat-<repo>.git`) into the
+bare taskdef group — only the `slug:` scalar is rewritten, and a folded
+record's `_specs/` entries are re-registered under its new label with their
+dates kept. A fold destination that already exists is never overwritten: in a
+schema-form `_runs/` it is reported and that record skipped; while a legacy
+`runs/` dir is still being nested, it is a blocker that refuses the whole
+migration. It is idempotent: a re-run is a no-op. The migration
+refuses while any record it would move is live: finish or sign out that
+session, or for a stale record that never signed out run `work housekeep
+--archive-stale`. `--compat-link` leaves a relative symlink at each old bare
+path (never inside `_runs/`) and is refused with `--instance`.
+
+**`work migrate --instance [--apply]`** moves the instance surfaces
+(`agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
+`taskdef/` → `_taskdef/`; `napkin/` stays where it is, with a note, because
+no release reads `_napkin/` yet) and folds a standalone
+`sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
+file in the same commit. Each legacy entry goes through the container
+loader's own rules (same-host trust rule against `LMER_WORK_REPO`, else the
+work repo's `origin`), keeping its transport spelling; a key the manifest
+already declares keeps the manifest entry, with one warning. The version
+floor is the first release carrying #370: both the dry run and the apply
+refuse unless the running release reads the manifest `sources:` tier.
+**Deploy #370 fleet-wide before applying the instance fold**, because removing
+`sources.yaml` switches declared sources off on any host still running a
+pre-#370 release. `--instance` and `<project>` are mutually exclusive.
+
+The `lmer-schema migrate` preview (schema 1 → 2) lists any plain-session
+groups it cannot carry over as `Directory move:` lines and as blockers, each
+naming `work migrate <project>`; `--apply` refuses while they remain.
 
 ### Troubleshooting
 

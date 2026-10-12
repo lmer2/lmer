@@ -547,6 +547,63 @@ def test_a_run_key_keeps_a_project_that_contains_a_slash():
                     "slug": "the-slug"}
 
 
+UID = "e" * 32
+
+
+def test_a_uid_last_segment_becomes_the_uid_field():
+    """A schema-2 run's key is ``host/project/<uid>`` (spec §6.1), and the
+    routes address its record by ``uid`` — a slug field holding a uid would
+    name a group that does not exist."""
+    body = build("runs", "forget", f"gitlab.example.com/agents/global/{UID}").body
+    assert body == {"host": "gitlab.example.com", "project": "agents/global",
+                    "uid": UID}
+
+
+@pytest.mark.parametrize("segment", [
+    "E" * 32,          # upper case is not the uid grammar
+    "e" * 31,          # one short
+    "develop-141",
+])
+def test_anything_else_in_the_last_segment_stays_a_slug(segment):
+    body = build("runs", "forget", f"gitlab.example.com/agents/global/{segment}").body
+    assert body == {"host": "gitlab.example.com", "project": "agents/global",
+                    "slug": segment}
+
+
+def test_the_related_run_takes_a_uid_too():
+    body = build("runs", "relate", RUN_KEY, f"gitlab.example.com/agents/global/{UID}").body
+    assert body["related"] == {"host": "gitlab.example.com", "project": "agents/global",
+                               "uid": UID}
+
+
+def test_the_uid_grammar_is_the_index_s_own():
+    """Spelled in ``ctl`` to keep its imports off the platform's state modules,
+    so the copy is pinned here."""
+    from lmer_platform import runs
+
+    assert ctl.UID_RE.pattern == runs.UID_RE.pattern
+    assert ctl.UID_RE.match(UID + "\n") is None, "a trailing newline is not a uid"
+
+
+def test_the_run_key_help_names_both_last_segments(configured, capsys):
+    with pytest.raises(SystemExit):
+        ctl.main(["runs", "forget", "--help"], transport=Recorder())
+    assert "host/project/<slug|uid>" in capsys.readouterr().out
+
+
+def test_a_uid_key_round_trips_through_meta(configured, client, platform_root, capsys):
+    from lmer_platform import runs
+
+    runs.track("gitlab.example.com", "agents/global", "chat", uid=UID)
+    key = f"gitlab.example.com/agents/global/{UID}"
+
+    ok(["runs", "meta", "set", key, "--title", "one launch"], client, capsys)
+    read = ok(["runs", "meta", "get", key], client, capsys)
+
+    assert read["meta"]["title"] == "one launch"
+    assert read["run"]["uid"] == UID
+
+
 def test_a_key_that_cannot_name_a_run_is_refused_before_any_request(
     configured, capsys
 ):

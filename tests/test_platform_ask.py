@@ -1534,3 +1534,20 @@ def test_the_ui_labels_the_live_reason_differently():
         "the row must not read the same for a run that has exited and a session "
         "that is waiting"
     )
+
+
+def test_the_refusal_names_a_uid_run_key(platform_root, plane):
+    """A schema-2 run is keyed ``host/project/<uid>``, so the resume hint names
+    the uid, not the group slug (spec §6.1)."""
+    uid = "0123456789abcdef0123456789abcdef"
+    session_id = live_session(platform_root, run={
+        "host": "gitlab.example.com", "project": "agents/global",
+        "slug": "develop-141", "uid": uid,
+    })
+    question = protocol.post_question(channel_for(session_id), "which branch?")
+    plane.stop()
+
+    with pytest.raises(ask.SessionGone) as exc:
+        ask.answer_question(session_id, question.id, "prep-release")
+
+    assert f"gitlab.example.com/agents/global/{uid}" in str(exc.value)

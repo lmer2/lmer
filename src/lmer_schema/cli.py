@@ -403,7 +403,14 @@ def _dispatch(parser: _ArgumentParser, args) -> int:
             print(json.dumps(result, indent=2))
         else:
             print(result["diff"] or "Already schema 2; no changes.")
-            print("Directory moves: none; historical records remain unchanged.")
+            if result["moves"]:
+                for move in result["moves"]:
+                    print(
+                        f"Directory move: {move['from']} -> {move['to']} "
+                        f"(slug: {move['slug']})"
+                    )
+            else:
+                print("Directory moves: none; historical records remain unchanged.")
             for blocker in result["blockers"]:
                 print(f"Blocked: {blocker}")
             if result["applied"]:

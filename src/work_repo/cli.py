@@ -37,7 +37,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, plan_index, release_run, run_state, specs_index, write_journal
+from . import goals, housekeep, knowledge, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
@@ -248,12 +248,63 @@ Examples:
         "-m",
         help="Commit message (defaults to auto-generated)",
     )
+    memory_persist_parser.add_argument(
+        "--allow-unbaselined-delete",
+        action="store_true",
+        help=(
+            "On a persist with no restore baseline (a session that never "
+            "restored), also delete the scope files the agent dir does not "
+            "hold, listing each. Any persist records a baseline, so this "
+            "acts only on such a first persist; later, retire a memory with "
+            "`work memory forget`"
+        ),
+    )
     for action in ("forget", "revive"):
         retirement_parser = memory_subparsers.add_parser(
             action, help=f"Explicitly {action} a scoped schema-2 memory"
         )
         retirement_parser.add_argument("scoped_path", help="Work-repo-relative memory path")
         retirement_parser.add_argument("--message", "-m", help="Commit message")
+
+    # knowledge command (#372): generate `_knowledge/<org>/INDEX.md`.
+    knowledge_parser = subparsers.add_parser(
+        "knowledge", help="Generate knowledge-area indexes"
+    )
+    knowledge_subparsers = knowledge_parser.add_subparsers(
+        dest="knowledge_action", help="Knowledge action to perform"
+    )
+    knowledge_index_parser = knowledge_subparsers.add_parser(
+        "index", help="Generate (or check) `_knowledge/<org>/INDEX.md`"
+    )
+    knowledge_index_parser.add_argument(
+        "--check", action="store_true",
+        help="Write nothing; exit 1 when any generated index is out of date",
+    )
+    knowledge_index_parser.add_argument(
+        "--org", metavar="NAME", help="Limit the run to one organisation",
+    )
+
+    # housekeep command (#371): dry-run-first archival and index maintenance.
+    housekeep_parser = subparsers.add_parser(
+        "housekeep",
+        help="Archive stale content and maintain indexes (dry run by default)",
+    )
+    housekeep_parser.add_argument(
+        "--apply", action="store_true",
+        help="Perform the planned changes and make one commit (default: dry run)",
+    )
+    housekeep_parser.add_argument(
+        "--area", choices=housekeep.AREAS,
+        help="Limit the run to one area (default: every area)",
+    )
+    housekeep_parser.add_argument(
+        "--project", metavar="NAME",
+        help="Restrict the walk to one project (registry short name or host/project)",
+    )
+    housekeep_parser.add_argument(
+        "--archive-stale", action="store_true",
+        help="Include stale-run archiving (the runs area's opt-in)",
+    )
 
     # setup-workspace command
     setup_ws_parser = subparsers.add_parser(
@@ -468,6 +519,64 @@ Examples:
     specs_index_parser.add_argument(
         "--rebuild", action="store_true",
         help="Rebuild the index from runs/ (backfill for specs that predate it)",
+    )
+
+    # adopt command (issue #367 — name a host-bucket tree and register it).
+    # An operator-shell verb: it writes records it does not own and is
+    # exempt from the session-uid gate, but still declares its write scope.
+    adopt_parser = subparsers.add_parser(
+        "adopt",
+        help="Name a host-bucket tree and register it in one commit (dry run by default)",
+    )
+    adopt_parser.add_argument(
+        "bucket",
+        help="the host bucket, `<host>/<project>` relative to the work-repo root",
+    )
+    adopt_parser.add_argument("name", help="the short name the bucket moves to")
+    adopt_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the adoption; without it the command is a read-only dry run",
+    )
+    adopt_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at the old bucket path",
+    )
+    adopt_parser.add_argument(
+        "--description", help="registry description for the project",
+    )
+    adopt_parser.add_argument(
+        "--remote", action="append", default=None,
+        help="an additional remote for the project; may be repeated",
+    )
+    adopt_parser.add_argument(
+        "--force", action="store_true",
+        help="adopt despite schema-tier ERRORs in the fix list",
+    )
+
+    # migrate command (issue #368 — bare-name to schema-form tree migration).
+    # An operator-shell verb like `adopt`: exempt from the session-uid gate,
+    # but still declaring its write scope.
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Migrate a registered project or the instance surfaces to schema form "
+             "(dry run by default)",
+    )
+    migrate_target = migrate_parser.add_mutually_exclusive_group()
+    migrate_target.add_argument(
+        "project", nargs="?",
+        help="a registered project's short name",
+    )
+    migrate_target.add_argument(
+        "--instance", action="store_true",
+        help="migrate the instance surfaces and fold a standalone sources.yaml",
+    )
+    migrate_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the migration; without it the command is a read-only dry run",
+    )
+    migrate_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at each old project path (project form only)",
     )
 
     # release command (single-flight release claim — RUN-STATE.md §7).
@@ -977,7 +1086,8 @@ def cmd_goal(
 
 @work_transaction
 def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser,
-               scoped_path: str | None = None) -> int:
+               scoped_path: str | None = None,
+               allow_unbaselined_delete: bool = False) -> int:
     """
     Execute memory command.
 
@@ -992,7 +1102,7 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     if action == "restore":
         return restore_memory()
     elif action == "persist":
-        return persist_memory(message)
+        return persist_memory(message, allow_unbaselined_delete)
     elif action in ("forget", "revive"):
         from .memory import (
             MemoryRetirementError, forget_memory, revive_memory, memory_retirement_paths,
@@ -1156,6 +1266,23 @@ def _require_run() -> tuple[Path, dict] | tuple[None, None]:
         return None, None
 
 
+def _run_state_subject(state: dict, detail: str = "") -> str:
+    """The `run-state:` commit subject for a record: `<slug> <name> <detail>`.
+
+    One helper for every `run-state: {slug} ...` site (D14): the record's
+    label (including a default label — it is what makes the subject unique
+    when two launches share a slug) rides beside the slug. An unnamed record
+    keeps today's `<slug> <detail>` byte for byte.
+    """
+    parts = [str(state.get("slug"))]
+    name = state.get("name")
+    if isinstance(name, str) and name.strip():
+        parts.append(name)
+    if detail:
+        parts.append(detail)
+    return "run-state: " + " ".join(parts)
+
+
 def _push_run_dir(
     state: dict,
     detail: str,
@@ -1172,7 +1299,7 @@ def _push_run_dir(
         old_rel = run_state.run_rel_for_dir_name(old_dir_name)
         if old_rel and old_rel not in rels:
             rels.append(old_rel)
-    rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
+    rc = commit_work_path(rels, _run_state_subject(state, detail))
     if rc != 0:
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
@@ -1711,7 +1838,11 @@ def cmd_name(value: str | None) -> int:
     if state.get("name") == name:
         print(f"✅ Name unchanged: {name}")
         return 0
-    holder = _name_conflict(rdir, name, state.get("slug"))
+    # D4: uniqueness is a LEGACY-tree rule. On a process record a name is a
+    # label, so two continuations of one source may carry the same label.
+    holder = None
+    if not run_state.is_process_record():
+        holder = _name_conflict(rdir, name, state.get("slug"))
     if holder is not None:
         print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
         return 1
@@ -1719,6 +1850,11 @@ def cmd_name(value: str | None) -> int:
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "run_named", note=name)
     print(f"✅ Run named: {name}")
+    if state.get("frozen"):
+        # The freeze took the one directory rename (or deliberately skipped
+        # it); a post-freeze name cannot move the dir, so say so (D14/§9.5).
+        old_rel = run_state.run_area_rel_name(rdir) or rdir.name
+        print(f"   directory frozen at `{old_rel}`; it will not be renamed")
     return 0
 
 
@@ -1783,7 +1919,7 @@ def cmd_ledger(args) -> int:
     # not at session end (non-fatal, like artifact writes).
     rc = commit_work_path(
         run_state.run_rel_path_candidates(),
-        f"run-state: {state['slug']} ledger {task_id}={args.status}",
+        _run_state_subject(state, f"ledger {task_id}={args.status}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (ledger saved locally)")
@@ -1980,8 +2116,9 @@ def _cmd_goals_freeze(note: str | None) -> int:
 
     old_dir_name = None
     if not state.get("frozen"):
-        if not state.get("name"):
-            # A run can still be unnamed at spec approval, and the
+        if not state.get("name") or run_state.is_default_label(state):
+            # A run can still be unnamed at spec approval (or carry only a
+            # default label, D5), and the
             # frozen stamp would forfeit the one-shot name-bearing rename
             # forever ("no second chance") — leave the seam to the phase
             # gate, which fires at the first execution-family transition.
@@ -2352,6 +2489,7 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
 _STATE_BUCKETS = (
     ("active", "active"),
     ("stale", "stale"),
+    ("seeded", "seeded"),
     ("ended, not closed", "ended not closed"),
     ("waiting on question", "waiting on question"),
     ("closed", "closed"),
@@ -2559,6 +2697,7 @@ def cmd_resume(as_json: bool = False, session: str | None = None) -> int:
             # Web (tree) URL of the run dir (issue #104) — fail-soft None
             # keeps the brief byte-identical when no URL is derivable.
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     return 0
 
@@ -2703,7 +2842,7 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
         stage_paths.append(specs_index.specs_rel_path())
     rc = commit_work_path(
         stage_paths,
-        f"run-state: {state['slug']} artifact {name}",
+        _run_state_subject(state, f"artifact {name}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
@@ -2797,7 +2936,9 @@ def cmd_seed(args) -> int:
         name = _validate_name(args.name)
         if name is None:
             return 1
-        holder = _name_conflict(base / slug, name, slug)
+        holder = None
+        if not run_state.is_process_record():
+            holder = _name_conflict(base / slug, name, slug)
         if holder is not None:
             print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
             return 1
@@ -2823,13 +2964,28 @@ def cmd_seed(args) -> int:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
 
+    # Remember the seed on the launch's own state, so `work commit` (which
+    # stages only the launch's own group) publishes it too (#535). Schema 2
+    # only; a no-op in a legacy tree.
+    try:
+        run_state.note_seeded_record(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        # The seed is still written; only its publication record is lost, so
+        # `work commit` will report it as a stray. Say so rather than letting
+        # it disappear silently.
+        print(
+            f"⚠️  could not record the seed for publication ({exc}); "
+            "`work commit` may report it as a stray",
+            file=sys.stderr,
+        )
+
     print(f"✅ Run seeded: {rdir}")
     if seeded is not None:
-        launch = f"lmer {args.taskdef}"
-        if args.target:
-            launch += f" {shlex.quote(args.target)}"
+        route = run_state.continuation_route(
+            args.taskdef, args.target, seeded["uid"]
+        )
         print(f"   uid: {seeded['uid']}")
-        print(f"   Pick it up with: {launch} --source-session {seeded['uid']}")
+        print(f"   Pick it up with: {route}")
     print("   Not pushed — run `work commit` to publish it.")
     return 0
 
@@ -3251,7 +3407,7 @@ def _shared_release_claim_locked(*, release=False, force=False, as_json=False):
         outcome, detail, _commit = publish_overlay_commit(
             root,
             base=base,
-            message=f"run-state: {state['slug']} release {action}",
+            message=_run_state_subject(state, f"release {action}"),
             blobs={claim_rel: release_claims.serialize_claim(claim)},
             subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
         )
@@ -3379,7 +3535,7 @@ def cmd_release_claim(as_json: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc), as_json)
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release claim", extra_rels
+            _run_state_subject(state, "release claim"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             action = {
@@ -3554,7 +3710,7 @@ def cmd_release_unclaim(force: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc))
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim"
+            _run_state_subject(state, "release unclaim")
         )
         if outcome == CLAIM_PUSH_WON:
             if holder != session:
@@ -3669,7 +3825,7 @@ def _shared_release_abort(*, reason: str | None, force: bool) -> int:
         outcome, detail, _commit = publish_overlay_commit(
             root,
             base=base,
-            message=f"run-state: {state['slug']} release abort",
+            message=_run_state_subject(state, "release abort"),
             blobs={claim_rel: release_claims.serialize_claim(claim)},
             subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
         )
@@ -3808,7 +3964,7 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release abort", extra_rels
+            _run_state_subject(state, "release abort"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             cleared = f" (claim cleared: session {holder})" if holder else ""
@@ -4040,9 +4196,12 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
     naming or re-goaling the run again (the `LMER_ANSWER` consume-once idea,
     decided from the record rather than a marker file). The name goes through
     the same rules as `work name` (`_validate_name`, then `_name_conflict`
-    over the whole project) and lands only when the record has none; a held
-    or unusable name is a one-line stdout warning and the run stays unnamed,
-    because a cosmetic label must never refuse a session. The goal is
+    over the whole project). On a process record (schema 2) the launch name
+    always applies on the opening call (D5/§5.1: it replaces a default or an
+    inherited name); a legacy/schema-1 record keeps the old rule and is named
+    only when it has none. A held or unusable name is a one-line stdout
+    warning and the run keeps its default label (or stays unnamed), because a
+    cosmetic label must never refuse a session. The goal is
     redacted like every other free-text writer and replaces a goal inherited
     from a continuation source — an explicit launch goal outranks the
     predecessor's.
@@ -4077,16 +4236,29 @@ def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
             return {}
         candidate = dict(state)
         events: list[tuple[str, str]] = []
-        if name_text.strip() and state.get("name") is None:
+        # On a process record a launch `--name` always applies on the opening
+        # call (D5/§5.1: it replaces a default OR an inherited name). A
+        # legacy/schema-1 record keeps today's rule (only an absent name is
+        # filled). `opened` already limits this to the call that opened the
+        # record.
+        existing_name = state.get("name")
+        name_replaceable = existing_name is None or run_state.is_process_record()
+        if name_text.strip() and name_replaceable:
             name = _validate_name(name_text)
+            keeps = ("this run keeps its label" if run_state.is_process_record()
+                     else "this run stays unnamed")
             if name is None:
                 print(f"⚠️  launch name '{name_text}' not applied: not a usable name; "
-                      "this run stays unnamed — work name <other>")
+                      f"{keeps} — work name <other>")
             else:
-                holder = _name_conflict(rdir, name, state.get("slug"))
+                # D4: the held-by check is a legacy rule; on a process record
+                # a label never conflicts.
+                holder = None
+                if not run_state.is_process_record():
+                    holder = _name_conflict(rdir, name, state.get("slug"))
                 if holder is not None:
                     print(f"⚠️  launch name '{name}' not applied: held by run '{holder}' "
-                          "(names are unique per project); this run stays unnamed — "
+                          f"(names are unique per project); {keeps} — "
                           "work name <other>")
                 else:
                     candidate["name"] = name
@@ -4295,6 +4467,7 @@ def cmd_session_start(session: str | None = None) -> int:
             seed=os.environ.get("LMER_START_PROMPT") or None,
             answered=answered,
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     except Exception as exc:  # never break a session (spec §6)
         print(f"⚠️  run-state session-start failed (continuing): {exc}")
@@ -4330,7 +4503,7 @@ def _start_process_record(source_session: str | None = None) -> int:
                 # to the launch lines below, labelled as replaced.
                 decision["goal"] = None
             print(f"Context from session {context['source_session_uid']} (read-only):")
-            print(run_state.format_brief(decision, answered=answered))
+            print(run_state.format_brief(decision, answered=answered, dir_name=rdir.name))
             warning = _source_slug_warning(context, state.get("slug"))
             if warning:
                 print(warning)
@@ -4382,7 +4555,7 @@ def _release_claim_at_session_end(rdir) -> None:
             print(f"⚠️  session-end claim release failed: {exc}")
             return
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim (session end)"
+            _run_state_subject(state, "release unclaim (session end)")
         )
         if outcome == CLAIM_PUSH_WON:
             print(f"✅ Release claim released at session end: {state.get('slug')}")
@@ -4441,6 +4614,11 @@ def cmd_session_end() -> int:
         if held:
             _release_claim_at_session_end(rdir)
         rels = run_state.run_rel_path_candidates()
+        # Records this launch seeded into another group (D13) — the last push
+        # of the session must carry them or they are stranded locally (#535).
+        for seeded_rel in run_state.seeded_record_rel_paths():
+            if seeded_rel not in rels:
+                rels.append(seeded_rel)
         # Masterplan-sync (and freeze-rename) specs-index entries ride along —
         # this is the last push of the session, so leaving them unstaged
         # strands them locally (review on !126).
@@ -4453,7 +4631,9 @@ def cmd_session_end() -> int:
         # them — and a deferral here has no later commit to flush it.
         rc = commit_work_path(
             rels,
-            f"run-state: session end {state['slug']}",
+            "run-state: session end "
+            + str(state["slug"])
+            + (f" {state['name']}" if state.get("name") else ""),
             allow_during_gate=True,
         )
         if rc != 0:
@@ -4526,6 +4706,12 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return None
         specs_rel = specs_index.specs_rel_path()
         return [specs_rel] if specs_rel else []
+    if command == "adopt":
+        from . import adopt
+        return adopt.write_rel_paths(args)
+    if command == "migrate":
+        from . import migrate
+        return migrate.write_rel_paths(args)
     if command == "seed":
         try:
             slug = run_state.derive_slug(args.taskdef, args.target)
@@ -4533,6 +4719,27 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return [rel] if rel else []
         except Exception:
             return []
+    if command == "knowledge":
+        if getattr(args, "knowledge_action", None) != "index":
+            return None
+        if getattr(args, "check", False):
+            return None  # --check writes nothing
+        return [knowledge.KNOWLEDGE_DIR]
+    if command == "housekeep":
+        if not getattr(args, "apply", False):
+            return None  # dry run writes nothing
+        # The scope the apply may write: the selected project dirs, the
+        # archive area and the napkin area. Non-empty in a legacy tree too.
+        rels = ["_archive", "_napkin", "napkin"]
+        try:
+            projects = housekeep.project_dirs(
+                _work_repo_root(), getattr(args, "project", None)
+            )
+            rels.extend(entry.rel for entry in projects)
+        except Exception:
+            pass  # an unknown --project exits 2 in main() before any write
+        rels.extend(run_candidates())
+        return pushing(rels)
     if command == "memory":
         if getattr(args, "memory_action", None) in ("forget", "revive"):
             from .memory import memory_retirement_paths
@@ -4630,7 +4837,9 @@ def main() -> int:
 
     # Record-writing helpers inherit their execution's UID. Without one,
     # a read resolver may choose the latest record, but a writer must refuse.
-    if args.command not in ("memory", "specs-index"):
+    if args.command not in (
+        "memory", "specs-index", "adopt", "migrate", "housekeep", "knowledge"
+    ):
         from .utils import SchemaContextError
 
         try:
@@ -4668,7 +4877,12 @@ def _dispatch(args, parser) -> int:
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
-                          getattr(args, "scoped_path", None))
+                          getattr(args, "scoped_path", None),
+                          getattr(args, "allow_unbaselined_delete", False))
+    elif args.command == "housekeep":
+        return housekeep.cmd_housekeep(args)
+    elif args.command == "knowledge":
+        return knowledge.cmd_knowledge(args)
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
@@ -4710,6 +4924,12 @@ def _dispatch(args, parser) -> int:
         return cmd_artifact(args.name, args.file, args.sync)
     elif args.command == "specs-index":
         return cmd_specs_index(args.rebuild)
+    elif args.command == "adopt":
+        from . import adopt
+        return adopt.cmd_adopt(args)
+    elif args.command == "migrate":
+        from . import migrate
+        return migrate.cmd_migrate(args)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "release":

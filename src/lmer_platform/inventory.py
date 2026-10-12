@@ -133,7 +133,7 @@ from .config import DEFAULT_STALL_BACKSTOP_SECONDS, DEFAULT_STALL_IDLE_SECONDS
 from .lifecycle import VERB_WIND_DOWN
 from .reattach import OUTPUT_CONTROL_PLANE, OUTPUT_SESSION_LOG, detached_record
 from .registry import is_live
-from .runs import RunIndexError, run_key
+from .runs import UID_RE, RunIndexError, key_parts, run_key, run_key_of_entry
 from .session_io import session_activity
 from .workrepo import RunDirRef
 
@@ -314,6 +314,14 @@ class RunView:
     slug: str
     state: str
     name: Optional[str] = None
+    #: The schema-2 execution uid this row is keyed by, or ``None`` for a row
+    #: keyed by its slug (spec §6.1). Taken from whatever named the run — the
+    #: tracked entry that resolved the record, or the session's registry ``run``
+    #: block — and never from the record's directory name: a slug-keyed entry
+    #: whose group happens to hold a schema-2 record is still slug-keyed until a
+    #: transition moves it, and a row that read the directory would silently
+    #: re-key it here. ``slug`` stays the group label beside it.
+    uid: Optional[str] = None
     #: What this orchestrator says the run is about, one line, or ``None``
     #: (:mod:`lmer_platform.meta`). Beside :attr:`label` rather than replacing it:
     #: a view that shows one string shows the title and falls back to the label,
@@ -515,6 +523,10 @@ class RunView:
             "host": self.host,
             "project": self.project,
             "slug": self.slug,
+            # The key segment's other half: a client composes the run's key with
+            # ``runKey()`` from these four, and every fold below the inventory
+            # reads them through :func:`lmer_platform.runs.key_parts_lenient`.
+            "uid": self.uid,
             "label": self.label,
             # This orchestrator's note about the run, not the run's own state, and
             # on the row rather than fetched per run: it is what a listing names a
@@ -726,11 +738,36 @@ def _recent_events(ref: RunDirRef, last_n: int) -> list:
 
 
 def _session_key(entry: dict) -> Optional[tuple]:
-    run = entry.get("run") or {}
-    host, project, slug = run.get("host"), run.get("project"), run.get("slug")
-    if not (host and project and slug):
-        return None
-    return (host, project, slug)
+    """``(host, project, key segment)`` off a registry entry, or ``None``.
+
+    The registry ``run`` block carries ``uid`` for a schema-2 launch, so two
+    launches of one slug group are two keys here (spec §6.1).
+    """
+    return run_key_of_entry(entry)
+
+
+def _entry_key(entry) -> tuple:
+    """``(host, project, key segment)`` for a tracked entry.
+
+    Through :func:`lmer_platform.runs.key_parts`, the one spelling of the key
+    segment; ``getattr`` because the stand-ins a caller passes need not carry a
+    ``uid`` at all, and a missing one is a slug-keyed entry.
+    """
+    return key_parts({
+        "host": entry.host,
+        "project": entry.project,
+        "slug": entry.slug,
+        "uid": getattr(entry, "uid", None),
+    })
+
+
+def _uid_of(uid: object) -> Optional[str]:
+    """*uid* when it is a well-formed execution uid, else ``None``.
+
+    :func:`lmer_platform.runs.key_parts_lenient` ignores a malformed uid and keys
+    by slug, so a row that carried one would name a key it is not filed under.
+    """
+    return uid if isinstance(uid, str) and UID_RE.match(uid) else None
 
 
 def _activity_for(entry: dict, known: Optional[Mapping]) -> Optional[dict]:
@@ -1129,6 +1166,7 @@ def _view_from_run_dir(
     title: Optional[str] = None,
     stall: Optional[StallPolicy] = None,
     statusline: Optional[dict] = None,
+    uid: Optional[str] = None,
 ) -> RunView:
     state, error = _load_state_tolerantly(ref)
     run_state_state, attention = _derive(
@@ -1142,6 +1180,7 @@ def _view_from_run_dir(
         host=ref.host,
         project=ref.project,
         slug=ref.slug,
+        uid=uid,
         state=run_state_state,
         name=state.get("name"),
         title=title,
@@ -1214,6 +1253,7 @@ def _view_from_session(
         host=run.get("host") or "—",
         project=run.get("project") or "—",
         slug=(entry.get("id") if assistant_session else run.get("slug")) or entry.get("id") or "—",
+        uid=_uid_of(run.get("uid")),
         state=state,
         name=run.get("name") or (run.get("slug") if assistant_session else None),
         title=title,
@@ -1249,6 +1289,7 @@ def _view_from_tracked(entry, *, title: Optional[str] = None) -> RunView:
         host=entry.host,
         project=entry.project,
         slug=entry.slug,
+        uid=_uid_of(getattr(entry, "uid", None)),
         state="dormant",
         title=title,
         taskdef=entry.taskdef,
@@ -1260,7 +1301,7 @@ def _view_from_tracked(entry, *, title: Optional[str] = None) -> RunView:
 
 
 def build_inventory(
-    run_refs: Iterable[RunDirRef],
+    run_refs: Iterable[Any],
     sessions: Iterable[dict],
     *,
     event_count: int = 3,
@@ -1282,6 +1323,16 @@ def build_inventory(
     resolved; any tracked run whose dir is missing from the mirror still gets a row
     built from index metadata. Passing ``None`` means "no index" and yields exactly
     the refs and sessions given — the shape the unit tests use.
+
+    Each item of *run_refs* is a :class:`RunDirRef`, or a ``(tracked entry, ref)``
+    pair naming the entry that resolved it. A pair's row is keyed by the
+    **entry** — ``(host, project, uid or slug)`` through
+    :func:`lmer_platform.runs.key_parts` — so two schema-2 launches of one slug
+    group are two rows, each joined to its own session, title and last session
+    (spec §6.1). The key is never re-derived from the directory: a slug-keyed
+    entry that resolved to a schema-2 record keeps its slug key until a
+    transition moves it, rather than being re-keyed silently here. A bare ref is
+    keyed by its slug, as it always was.
 
     *questions* maps a session id to its unanswered questions
     (:func:`lmer_platform.ask.pending_by_session`). It is passed in rather than
@@ -1354,7 +1405,7 @@ def build_inventory(
     # cannot: a clean exit removes its entry. That id is what lets a finished run
     # still serve its terminal history (see RunView.session_id_for_history).
     last_sessions = {
-        (entry.host, entry.project, entry.slug): getattr(entry, "last_session_id", None)
+        _entry_key(entry): getattr(entry, "last_session_id", None)
         for entry in tracked or []
     }
 
@@ -1367,15 +1418,18 @@ def build_inventory(
         return by_session_statusline.get(session_id)
 
     def title_for(entry: dict) -> Optional[str]:
-        run = entry.get("run") or {}
-        return _title_for(
-            by_title, run.get("host"), run.get("project"), run.get("slug")
-        )
+        key = _session_key(entry)
+        return _title_for(by_title, *key) if key is not None else None
 
     runs: list[RunView] = []
     seen: set[tuple] = set()
-    for ref in run_refs:
-        key = (ref.host, ref.project, ref.slug)
+    for item in run_refs:
+        if isinstance(item, tuple):
+            tracked_entry, ref = item
+            key = _entry_key(tracked_entry)
+            uid = _uid_of(getattr(tracked_entry, "uid", None))
+        else:
+            ref, key, uid = item, (item.host, item.project, item.slug), None
         seen.add(key)
         entry = by_key.get(key)
         runs.append(
@@ -1383,14 +1437,15 @@ def build_inventory(
                 ref, entry, event_count=event_count,
                 last_session_id=last_sessions.get(key),
                 questions=questions_for(entry),
-                title=_title_for(by_title, ref.host, ref.project, ref.slug),
+                title=_title_for(by_title, *key),
                 stall=stall,
                 statusline=statusline_for(entry),
+                uid=uid,
             )
         )
 
     for tracked_entry in tracked or []:
-        key = (tracked_entry.host, tracked_entry.project, tracked_entry.slug)
+        key = _entry_key(tracked_entry)
         if key in seen:
             continue  # a run-dir row already covers it
         if key in by_key:

@@ -106,6 +106,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -123,6 +124,7 @@ from lmer_cli.tokens import _inject_gitlab_token_if_available
 # The schema side of the tree, consumed rather than re-derived: `load_registry`
 # owns what a registry entry means and `urls.normalize` is the one remote
 # normalizer (D21).
+from lmer_schema.form import has_manifest
 from lmer_schema.manifest import ManifestError
 from lmer_schema.registry import (
     RegistryError,
@@ -142,7 +144,8 @@ logger = logging.getLogger("lmer_platform.workrepo")
 __all__ = [
     "MIRROR_STATE_FILE", "RunDirRef", "MirrorStatus", "mirror_status",
     "ensure_clone", "pull", "iter_run_dirs", "run_dirs", "record_session_id",
-    "folded_identity", "fold_registry",
+    "folded_identity", "fold_registry", "resolve_run_dir", "group_records",
+    "group_sessions",
 ]
 
 MIRROR_STATE_FILE = "mirror.json"
@@ -173,15 +176,22 @@ _ANNOUNCED: set = set()
 # direct slug re-read every state file in the project.
 _RESLUGGED_INDEX: dict[tuple[str, str, str], tuple[str, dict[str, str]]] = {}
 _RESLUGGED_INDEX_LOCK = threading.Lock()
+# One scan per mirrored revision and project for execution-uid addresses (spec
+# §6.1, review N6). A uid-keyed fleet row resolves its record through this; a
+# uid that sits in a different group from the requested slug must still find its
+# record, which is why it is not the slug walk.
+_UID_INDEX: dict[tuple[str, str, str], tuple[str, dict[str, tuple[str, str]]]] = {}
+_UID_INDEX_LOCK = threading.Lock()
 #: A session DIRECTORY name: the ``LMER_SESSION_ID`` form (a UTC
 #: ``%Y%m%d-%H%M%S`` timestamp, a pid and a random suffix) plus the optional
 #: ``--<name>`` the freeze rename appends once (``docs/SCHEMA.md``, "Sessions
 #: and runs"). Restated here rather than imported: the pattern's owner is
-#: ``lmer_schema.checks.record.SESSION_DIR_RE``, but that module is the
+#: ``SESSION_DIR_RE`` in the validator's record check, but that module is the
 #: VALIDATOR — this one depends on the schema's model side only (``manifest``,
-#: ``registry``, ``urls``), and a fleet read path has no business importing the
-#: check registry to sort two directory names. Both quote ``docs/SCHEMA.md``;
-#: keep them in step there.
+#: ``registry``, ``urls``, ``form``), and a fleet read path has no business
+#: importing the check registry to sort two directory names (the validator's
+#: platform consumer is :mod:`lmer_platform.schema_report`, kept off this path).
+#: Both quote ``docs/SCHEMA.md``; keep them in step there.
 _SESSION_DIR_RE = re.compile(
     rf"{run_state.SESSION_ID_RE.pattern}(?:--[^/]+)?"
 )
@@ -215,6 +225,10 @@ class RunDirRef:
     #: it. ``None`` only for a ref built without one, whose address is then the
     #: legacy composition — see :attr:`rel_path` and the module header.
     address: Optional[str] = None
+    #: The schema-2 execution uid this record is addressed by, when its directory
+    #: name carries one (``<uid>`` or ``<uid>--<name>``). ``None`` for a legacy
+    #: timestamp-id record and for a ref built without a directory name.
+    uid: Optional[str] = None
 
     @property
     def rel_path(self) -> str:
@@ -1483,6 +1497,7 @@ def _ref_for(
     candidate = _checked_dir(root, record)
     if candidate is None or not _holds_run_state(candidate):
         return None
+    uid = run_state.session_id_of(candidate.name)
     return RunDirRef(
         host=host,
         project=project,
@@ -1490,6 +1505,7 @@ def _ref_for(
         path=candidate,
         dir_name=None if candidate.name == slug else candidate.name,
         address=_address(root, candidate),
+        uid=uid if session_record.UID_RE.fullmatch(uid) else None,
     )
 
 
@@ -1665,9 +1681,11 @@ def _grouped_refs(
                 host, project, group.name, claim,
             )
             claim = group.name
+        uid = run_state.session_id_of(session.name)
         yield RunDirRef(
             host=host, project=project, slug=claim, path=session,
             dir_name=session.name, address=address,
+            uid=uid if session_record.UID_RE.fullmatch(uid) else None,
         )
 
 
@@ -1874,6 +1892,69 @@ def _build_reslugged_index(root: Path, host: str, project: str,
     return {slug: found[1] for slug, found in matches.items()}
 
 
+def _build_uid_index(
+    root: Path, host: str, project: str, identities: _RegistryIdentities
+) -> dict[str, tuple[str, str]]:
+    """Map each schema-2 execution uid to ``(slug, address)`` in this project.
+
+    The whole ``_runs/*/`` area is walked, not just each group's newest record,
+    because a uid addresses ONE launch and that launch may not be its group's
+    newest (spec §6.1, review N6). A legacy timestamp id is not a uid and is not
+    indexed. The slug is the grouping directory's name, so a resolved ref still
+    carries the group label.
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for project_dir in _project_dirs(root, host, project, identities):
+        schema = _checked_dir(root, project_dir / _SCHEMA_RUNS_DIR)
+        if schema is None:
+            continue
+        try:
+            groups = sorted(schema.iterdir())
+        except OSError:
+            groups = []
+        for group in groups:
+            if not group.is_dir() or group.name.startswith("."):
+                continue
+            for session in _sessions_in(group):
+                uid = run_state.session_id_of(session.name)
+                if not session_record.UID_RE.fullmatch(uid):
+                    continue
+                address = _address(root, session)
+                if address is not None:
+                    index.setdefault(uid, (group.name, address))
+    return index
+
+
+def _uid_run_dir(
+    config: PlatformConfig, root: Path, host: str, project: str, uid: str,
+    identities: _RegistryIdentities,
+) -> Optional[RunDirRef]:
+    """The session record a schema-2 execution uid names, or ``None``.
+
+    Built once per mirrored revision and project, exactly like the carried
+    reslug identity index, because the fleet polls one uid row at a time. An
+    unknown uid is ``None`` and never falls back to the newest record in a
+    group: a uid that resolves to nothing means the record is not in the mirror,
+    which the inventory renders rather than guesses around.
+    """
+    revision = mirror_status(config).head_sha
+    cache_key = (str(root), host, project)
+    with _UID_INDEX_LOCK:
+        cached = _UID_INDEX.get(cache_key)
+        if revision is not None and cached is not None and cached[0] == revision:
+            index = cached[1]
+        else:
+            index = _build_uid_index(root, host, project, identities)
+            if revision is not None:
+                _UID_INDEX[cache_key] = (revision, index)
+
+    found = index.get(uid)
+    if found is None:
+        return None
+    slug, address = found
+    return _ref_for(root, host, project, slug, root.joinpath(*address.split("/")))
+
+
 def _reslugged_run_dir(
     config: PlatformConfig, root: Path, host: str, project: str, slug: str,
     identities: _RegistryIdentities,
@@ -1921,9 +2002,16 @@ def _reslugged_run_dir(
 
 
 def resolve_run_dir(
-    config: PlatformConfig, host: str, project: str, slug: str
+    config: PlatformConfig, host: str, project: str, slug: Optional[str] = None,
+    *, uid: Optional[str] = None,
 ) -> Optional[RunDirRef]:
     """Locate one tracked run's directory in the mirror, or ``None``.
+
+    With a ``uid`` the record is found by execution uid — the session dir whose
+    name carries that uid, whatever group it sits in (spec §6.1, review N6) —
+    and nothing else is consulted: an unknown uid is ``None``, never the newest
+    record in the requested slug's group. Without one the four slug lookups
+    below run as they always did.
 
     Direct path lookup handles the ordinary case. Once scope comes from the local
     index (spec D25) the platform knows exactly which paths it wants; the one
@@ -1976,13 +2064,15 @@ def resolve_run_dir(
     (:mod:`lmer_platform.meta`), related runs (:mod:`lmer_platform.relations`),
     ``answer``, ``resume`` and ``forget``. Only the *address* was ever wrong.
     """
-    if not (host and project and slug):
+    if not (host and project and (slug or uid)):
         return None
     root = config.mirror_path.resolve()
     # Lazy, and read at most once per resolve: a legacy run and a host bucket's
     # run both compose their own path, so the manifest is only touched for a run
     # neither of them found.
     identities = _RegistryIdentities(root)
+    if uid is not None:
+        return _uid_run_dir(config, root, host, project, uid, identities)
     ref = _ref_at(root, host, project, slug, slug)
     if ref is not None:
         return ref
@@ -1993,3 +2083,179 @@ def resolve_run_dir(
     if renamed is not None:
         return renamed
     return _reslugged_run_dir(config, root, host, project, slug, identities)
+
+
+def group_records(
+    config: PlatformConfig, host: str, project: str, slug: str
+) -> list[RunDirRef]:
+    """Every session record of one ``_runs/<slug>/`` group, in start order.
+
+    The public companion A2.transition needs (spec §6.1): the group is the
+    schema-form run's slug directory, and each child carrying a state file is one
+    independent launch (D22). Each ref carries its uid when the directory name
+    has one (``None`` for an unmigrated or legacy record).
+
+    Start order is the logged ``started_at`` (:func:`work_repo.session_record.sort_key`),
+    not directory-name order: a schema-2 directory name is a random uid, so name
+    order is not start order for the records this exists to list. Built from the
+    same :func:`_project_dirs` / :func:`_sessions_in` walk as the resolvers, never
+    a second walk.
+    """
+    root = config.mirror_path.resolve()
+    identities = _RegistryIdentities(root)
+    refs: list[RunDirRef] = []
+    seen: set[Path] = set()
+    for project_dir in _project_dirs(root, host, project, identities):
+        group = _checked_dir(root, project_dir / _SCHEMA_RUNS_DIR / slug)
+        if group is None:
+            continue
+        for session in _sessions_in(group):
+            if session in seen:
+                continue
+            seen.add(session)
+            ref = _ref_for(root, host, project, slug, session)
+            if ref is not None:
+                refs.append(ref)
+    refs.sort(key=lambda ref: session_record.sort_key(ref.path))
+    return refs
+
+
+def _stamp_text(value) -> Optional[str]:
+    """A recorded stamp as the text a reply carries, or ``None``.
+
+    An unquoted stamp in a hand-edited state file reaches here as a YAML
+    ``datetime`` rather than a string; it is still the stamp that was recorded,
+    so it is rendered rather than dropped.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return value if isinstance(value, str) and value else None
+
+
+def _session_facts(root: Path, session: Path, now: str) -> dict:
+    """What one session record of a group says about itself — mirror facts only.
+
+    ``uid`` is the record's own ``session.uid`` and, for a record that carries
+    none (a timestamp-id launch, an unreadable state file), the id its directory
+    name addresses it by (:func:`work_repo.run_state.session_id_of`). Whatever
+    the platform knows about the row — live, tracked, its project — is added by
+    the caller; this module reads the mirror and nothing else.
+
+    ``record_state`` is :func:`work_repo.session_record.display_state` against
+    the caller's *now* (so an open record reads ``active`` or ``stale``, the
+    word ``work sessions`` prints), with one addition the listing makes the same
+    way: a record ``work seed`` left and nothing ever started in reads
+    ``seeded`` (:func:`work_repo.session_record.is_seeded`, D13), because
+    "open" would claim a session that never ran.
+    """
+    state = _read_run_state(session)
+    try:
+        events = run_state.read_events(session, last_n=0)
+    except (OSError, UnicodeDecodeError):
+        events = []
+    metadata = state.get("session") if state is not None else None
+    if not isinstance(metadata, dict):
+        metadata = {}
+    recorded_uid = metadata.get("uid")
+    _sid, _sep, suffix = session.name.partition("--")
+    if state is None:
+        record_state = session_record.display_state(
+            readable=False, status=None, stop_reason=None, signed_out=None,
+            updated=None,
+        )
+    elif session_record.is_seeded(state, events):
+        record_state = "seeded"
+    else:
+        record_state = session_record.display_state(
+            readable=True,
+            status=state.get("status"),
+            stop_reason=state.get("stop_reason"),
+            signed_out=session_record.signed_out(events),
+            updated=state.get("updated"),
+            now=now,
+        )
+    name = state.get("name") if state is not None else None
+    status = state.get("status") if state is not None else None
+    return {
+        "uid": (
+            recorded_uid if isinstance(recorded_uid, str) and recorded_uid
+            else run_state.session_id_of(session.name)
+        ),
+        "dir_name": session.name,
+        "name_suffix": suffix or None,
+        "name": name if isinstance(name, str) else None,
+        "started_at": _stamp_text(metadata.get("started_at"))
+        or _stamp_text(state.get("created") if state is not None else None),
+        "status": status if isinstance(status, str) else None,
+        "record_state": record_state,
+        "rel_path": _address(root, session),
+    }
+
+
+def group_sessions(
+    config: PlatformConfig, host: str, project: str, slug: Optional[str] = None,
+    uid: Optional[str] = None, *, now: Optional[str] = None,
+) -> dict:
+    """The session records of ONE ``_runs/<slug>/`` group, in START order.
+
+    The read behind the control UI's "sessions per target" view (#374, spec
+    §13.F): ``{"form", "group", "sessions"}``, where ``group`` is the group's
+    mirror-relative address and each session is :func:`_session_facts`.
+
+    **Which group.** With a ``uid`` the group is the parent directory of the
+    record that uid names (:func:`resolve_run_dir`'s uid lookup), so a launch
+    whose group label is not the slug the caller holds still finds its siblings.
+    Without one it is ``<project>/_runs/<slug>/`` under the first directory
+    :func:`_project_dirs` offers that holds it — the resolver's own walk, so
+    the group listed is the group the fleet row reads. Every path in the answer
+    was found on disk; none is composed from the request.
+
+    **Start order, not name order.** :func:`_sessions_in` says which children
+    are records, but its "name order is start order" claim holds only for
+    timestamp ids: a schema-2 directory name is a random uid. So the records are
+    sorted by :func:`work_repo.session_record.sort_key`, the logged
+    ``started_at`` — the order :func:`group_records` uses.
+
+    **Legacy.** A mirror with no manifest is a legacy tree, and a slug whose
+    record is a legacy ``runs/<slug>`` directory is a legacy row; both answer
+    ``form: "legacy"`` with no sessions, because a legacy record is one shared
+    record per target with no launches under it. A schema-form group that is
+    not in the mirror (a launch that has pushed nothing yet, an unknown uid) is
+    ``form: "schema"`` with no sessions — a state, not an error.
+
+    *now* is the clock ``record_state`` is read against (default: this
+    process's, through :func:`_now`, the module's one clock hook). It never
+    pulls and never imports the validator: this is the fleet read path, and the
+    check registry has no business on it (module header).
+    """
+    root = config.mirror_path.resolve()
+    if not has_manifest(root):
+        return {"form": "legacy", "group": None, "sessions": []}
+    if now is None:
+        now = datetime.fromtimestamp(_now(), timezone.utc).isoformat()
+    group: Optional[Path] = None
+    if uid:
+        ref = resolve_run_dir(config, host, project, uid=uid)
+        if ref is not None and record_session_id(ref) is not None:
+            group = ref.path.parent
+    elif host and project and slug:
+        identities = _RegistryIdentities(root)
+        for project_dir in _project_dirs(root, host, project, identities):
+            candidate = _checked_dir(root, project_dir / _SCHEMA_RUNS_DIR / slug)
+            if candidate is not None and _sessions_in(candidate):
+                group = candidate
+                break
+        if group is None:
+            ref = resolve_run_dir(config, host, project, slug)
+            if ref is not None and record_session_id(ref) is None:
+                return {"form": "legacy", "group": None, "sessions": []}
+    if group is None:
+        return {"form": "schema", "group": None, "sessions": []}
+    sessions = sorted(_sessions_in(group), key=session_record.sort_key)
+    return {
+        "form": "schema",
+        "group": _address(root, group),
+        "sessions": [_session_facts(root, session, now) for session in sessions],
+    }
