@@ -12,3 +12,91 @@ export function applyAssistantName(config) {
   const raw = config && typeof config.assistant_name === 'string' ? config.assistant_name.trim() : ''
   assistantName.value = raw || DEFAULT_ASSISTANT_NAME
 }
+
+// --- the mood (spec §4.3 + §4.5, chadd's 2026-10-12 mapping) ----------------
+// One pure function of the fleet state the view already holds. First rule wins.
+// Files are named for the state; `loading` has no face of its own and shows
+// `talking` — before the first poll there is nothing to be alarmed about.
+export const MOODS = [
+  'question', 'oops', 'panic', 'strained', 'on_it', 'skeptical',
+  'idle', 'yes', 'talking', 'loading',
+]
+// Mood -> chadd's file basename (documentation; the files are the states).
+export const MOOD_FACES = {
+  question: 'ratchet_question', oops: 'ratchet_oops', panic: 'ratchet_panic',
+  strained: 'ratchet_strained', on_it: 'ratchet_on_it',
+  skeptical: 'ratchet_skeptical', idle: 'ratchet_idle', yes: 'ratchet_yes',
+  talking: 'ratchet_talking', loading: 'ratchet_talking', off: 'ratchet_off',
+}
+export const QUESTION_REASONS = ['live_question', 'question']
+export const BROKEN_REASONS = ['crashed', 'critical_error', 'stalled', 'stuck_teardown', 'unreadable']
+export const BROKEN_STATES = ['crashed', 'failed']
+export const REVIEW_REASONS = ['yield', 'feedback', 'cap_reached', 'slot_contention']
+export const NEAR_CAP_RATIO = 0.8
+
+const reasonOf = (row) => row?.attention?.reason
+const count = (rows, test) => (rows || []).filter(test).length
+
+function questions(input) {
+  return count(input.attention, (row) => QUESTION_REASONS.includes(reasonOf(row))) + (input.openQuestions || 0)
+}
+// A run is broken once whether the state or an attention reason says so; the
+// reason is not counted again for a run whose state already did.
+function broken(input) {
+  const byState = count(input.runs, (row) => BROKEN_STATES.includes(row.state))
+  const byReason = count(input.attention, (row) => BROKEN_REASONS.includes(reasonOf(row)) && !BROKEN_STATES.includes(row.state))
+  return byState + byReason
+}
+// `panic` is only for something genuinely serious (chadd's rule): a critical
+// error, or two or more runs down at once. One crash is `oops`.
+function serious(input) {
+  const critical = count(input.attention, (row) => reasonOf(row) === 'critical_error')
+  return critical > 0 || broken(input) >= 2
+}
+function nearCap(input) {
+  return !!input.cap && input.cap > 0 && (input.liveWorkers || 0) >= input.cap * NEAR_CAP_RATIO
+}
+function reviews(input) {
+  return count(input.attention, (row) => REVIEW_REASONS.includes(reasonOf(row)))
+}
+
+export function moodOf(input) {
+  if (!input || !input.loaded) return 'loading'
+  if (questions(input) > 0) return 'question'
+  if (serious(input)) return 'panic'
+  if (broken(input) > 0) return 'oops'
+  if ((input.justFinished || 0) > 0) return 'yes'
+  if (nearCap(input)) return 'strained'
+  if ((input.liveWorkers || 0) > 0) return 'on_it'
+  if (reviews(input) > 0) return 'skeptical'
+  if (input.replying) return 'talking'
+  return 'idle'
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+export function moodReason(mood, input) {
+  switch (mood) {
+    case 'question': return `question: ${plural(questions(input), 'question')} waiting on you`
+    case 'panic':
+      return count(input.attention, (row) => reasonOf(row) === 'critical_error') > 0
+        ? 'panic: the daemon reported a critical error'
+        : `panic: ${plural(broken(input), 'run')} down at once`
+    case 'oops': return `oops: ${plural(broken(input), 'run')} crashed or stuck`
+    case 'strained': return `strained: ${input.liveWorkers} of ${input.cap} sessions in use`
+    case 'on_it': return `on_it: ${input.liveWorkers} running`
+    case 'skeptical': return `skeptical: ${reviews(input)} waiting on your review`
+    case 'yes': return `yes: ${plural(input.justFinished, 'run')} just finished`
+    case 'talking': return 'talking: answering you'
+    case 'loading': return 'loading: waiting for the fleet view'
+    default: return 'idle: nothing needs you'
+  }
+}
+
+export function faceFile(mood) {
+  return MOOD_FACES[mood] || MOOD_FACES.idle
+}
+
+export function faceUrl(mood) {
+  return `./assets/ratchet/${faceFile(mood)}.png`
+}
