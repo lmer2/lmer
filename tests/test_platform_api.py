@@ -794,10 +794,10 @@ def test_the_answer_route_passes_a_repo_url_to_the_request(client, answered):
     response = client.post(
         "/api/runs/answer",
         headers=bearer_header(),
-        json={**ANSWER_BODY, "repo_url": "https://gitlab.example.com/agents/global.git"},
+        json={**ANSWER_BODY, "repo_url": "https://gitlab.example.com/example/repo.git"},
     )
     assert response.status_code == 202
-    assert answered.calls[0].repo_url == "https://gitlab.example.com/agents/global.git"
+    assert answered.calls[0].repo_url == "https://gitlab.example.com/example/repo.git"
 
 
 def test_answer_confirmation_is_passed_as_the_exact_source_uid(client, answered):

@@ -17,6 +17,7 @@ changed:
 - "on schema 2 a name is a label: two continuations of one source may carry the same label, and `work name`, `work seed --name` and a launch `--name` no longer refuse a label another record holds (#536)"
 - "`lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_plexus.yaml` is cached (#370)"
 fixed:
+- "answering an adopted plain-project run that needs both a repository URL and unsigned-source confirmation no longer loops between the two refusals; each retry now carries both options forward (#536)"
 - "`work commit` and `work session-end` now publish a record `work seed` wrote into another group; previously it was reported as a stray and left unpublished (#535)"
 - "a document URL target — a file, tree or wiki page inside a repository — clones that repository instead of being refused or mis-derived (#523)"
 - "a list-page target such as `/-/issues` or `/-/merge_requests` no longer leaks the `/-/…` route into the work-repo project path (#391)"

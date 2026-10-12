@@ -60,6 +60,10 @@ const startedSession = ref(null)
 // carries and RunDetail renders as `resumeStarted.warning`.
 const startedWarning = ref(null)
 const unsignedSource = ref(null)
+// The source UID the operator explicitly approved. It is set only by
+// `continueUnsignedSource`, and travels with every later retry so a repository
+// URL asked for in between cannot drop the approval (and vice versa).
+const unsignedSourceAck = ref(null)
 // An adopted schema-2 plain-project run has no tracked repo: the daemon refuses
 // the answer with `repo_url_required` and asks for the transport URL. The URL is
 // held here and resent with the same draft.
@@ -80,7 +84,7 @@ const canSend = computed(
     && (!props.run.confirm_project || projectConfirmed.value),
 )
 
-async function submitWithDecision(allowUnsignedSource = null, repoUrlValue = null) {
+async function submitWithDecision() {
   if (!canSend.value) return
   busy.value = true
   error.value = null
@@ -91,15 +95,19 @@ async function submitWithDecision(allowUnsignedSource = null, repoUrlValue = nul
       {
         confirmProject: projectConfirmed.value,
         slot: selectedSlot.value,
-        ...(repoUrlValue ? { repoUrl: repoUrlValue } : {}),
-        ...(allowUnsignedSource ? { allowUnsignedSource } : {}),
+        ...(repoUrl.value.trim() ? { repoUrl: repoUrl.value.trim() } : {}),
+        ...(unsignedSourceAck.value
+          ? { allowUnsignedSource: unsignedSourceAck.value }
+          : {}),
       },
     )
     startedSession.value = result.session?.session_id || 'a new session'
     startedWarning.value = result.warning || null
     draft.value = ''
     unsignedSource.value = null
+    unsignedSourceAck.value = null
     repoUrlRequired.value = false
+    repoUrl.value = ''
     emit('answered')
   } catch (exc) {
     // Loud, and in the server's own words: every refusal names both the reason and
@@ -119,7 +127,7 @@ async function submitWithDecision(allowUnsignedSource = null, repoUrlValue = nul
 
 function retryWithRepoUrl() {
   if (!repoUrl.value.trim()) return
-  return submitWithDecision(null, repoUrl.value.trim())
+  return submitWithDecision()
 }
 
 function submit() {
@@ -128,12 +136,18 @@ function submit() {
 
 function continueUnsignedSource() {
   const uid = unsignedSource.value?.uid
-  if (uid) return submitWithDecision(uid)
+  if (!uid) return
+  // Bind the approval to this exact source UID, then resend carrying whatever
+  // repository URL the form already holds — the two refusals are independent and
+  // a source can need both.
+  unsignedSourceAck.value = uid
+  return submitWithDecision()
 }
 
 function cancelUnsignedSource() {
   error.value = null
   unsignedSource.value = null
+  unsignedSourceAck.value = null
 }
 </script>
 

@@ -67,6 +67,55 @@ it('offers a repository URL and resends when the daemon asks for one', async () 
   )
 })
 
+it('carries the repository URL through unsigned-source confirmation', async () => {
+  const uid = 'b'.repeat(32)
+  const repoRefusal = Object.assign(new Error('this run records no repository'), {
+    code: 'repo_url_required',
+  })
+  const unsignedRefusal = Object.assign(new Error('source has no final sign-out'), {
+    code: 'unsigned_session',
+    source: { uid, operator: 'alice', hostname: 'build.example' },
+  })
+  answerRun
+    .mockRejectedValueOnce(repoRefusal)
+    .mockRejectedValueOnce(unsignedRefusal)
+    .mockResolvedValueOnce({ session: { session_id: 's-answer' } })
+  const wrapper = mountPane(AnswerBox, { run: {
+    host: 'git.example', project: 'acme/widget', slug: 'develop-1',
+    attention: { note: 'Proceed?' },
+  } })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+  await wrapper.findAll('button').find((button) => button.text() === 'answer').trigger('click')
+  await flushPromises()
+
+  // repo_url_required: supply the transport URL and resend.
+  const field = wrapper.findAll('input').find(
+    (input) => input.attributes('placeholder') === 'https://gitlab.example.com/group/project.git',
+  )
+  await field.setValue('https://git.example/acme/widget.git')
+  await wrapper.findAll('button').find(
+    (button) => button.text().includes('answer with this repository'),
+  ).trigger('click')
+  await flushPromises()
+
+  // unsigned_session: the URL entered above must survive "continue fresh".
+  expect(wrapper.text()).toContain('source has no final sign-out')
+  await wrapper.findAll('button').find(
+    (button) => button.text().includes('continue fresh'),
+  ).trigger('click')
+  await flushPromises()
+
+  expect(answerRun).toHaveBeenLastCalledWith(
+    expect.any(Object), 'Proceed carefully',
+    {
+      confirmProject: false, slot: null,
+      repoUrl: 'https://git.example/acme/widget.git',
+      allowUnsignedSource: uid,
+    },
+  )
+  expect(wrapper.text()).toContain('Answer handed to s-answer')
+})
+
 it('sends the project fields and the selected slot beside the answer', async () => {
   answerRun.mockResolvedValueOnce({ session: { session_id: 's-answer' } })
   const wrapper = mountPane(AnswerBox, {
