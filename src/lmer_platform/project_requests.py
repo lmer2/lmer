@@ -162,7 +162,7 @@ def _release(row, reason):
         db.execute("UPDATE requests SET state='invalid',error=? WHERE id=?", (reason, row["id"]))
         db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (row["project_id"], row["id"]))
         raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (row["project_id"],)).fetchone()
-        state = assistant.AssistantState.from_dict(json.loads(raw[0]))
+        state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=row["project_id"])
         retained = tuple(note for note in state.pending if not (
             note.kind == "conversation_request" and (note.data or {}).get("request_id") == row["id"]))
         state = replace(state, pending=retained, pending_since=retained[0].at if retained else None)
@@ -234,7 +234,7 @@ def _queue(db, row, project_id, ownership):
     if payload["actions"]:
         payload["instruction"] += " Existing action receipts are attached. Do not repeat completed or uncertain actions."
     raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (project_id,)).fetchone()
-    state = assistant.AssistantState.from_dict(json.loads(raw[0]))
+    state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=project_id)
     note = assistant.PendingNote(at=store.utc_now_iso(), kind="conversation_request",
                                  note="A conversation request is waiting for its owning project.", data=payload)
     state = replace(state, pending=(*state.pending, note), pending_since=state.pending_since or note.at,
