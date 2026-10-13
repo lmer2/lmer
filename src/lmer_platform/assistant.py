@@ -327,6 +327,7 @@ from __future__ import annotations
 
 from .projects import serialized
 
+import hashlib
 import json
 import logging
 import os
@@ -361,7 +362,7 @@ from .config import (
 # "what a credential looks like" is a second thing to forget a pattern from, and
 # this one covers the platform's own shared secret *by value*, which no
 # reimplementation here would.
-from .transcripts import _scrub, _scrub_decoded
+from .transcripts import _scrub, _scrub_decoded, scrub_pass
 from .store import (
     StoreError,
     TS_FORMAT,
@@ -522,6 +523,11 @@ _LOCK = threading.RLock()
 #: cover process spawn or bounded termination waits; status polling must not pay
 #: for either operation.
 _PUBLICATION_LOCK = threading.RLock()
+
+#: Scrub results per spool (issue #583): ``spool -> (credentials, {digest: note})``.
+#: Each load replaces its spool's entry with the notes it just read, so a taken
+#: note leaves the memo; a change in the credentials masked by value empties it.
+_SCRUBBED_NOTES: dict = {}
 
 
 
@@ -686,7 +692,8 @@ class AssistantState:
         }
 
     @classmethod
-    def from_dict(cls, payload: Optional[dict]) -> "AssistantState":
+    @scrub_pass()
+    def from_dict(cls, payload: Optional[dict], *, memo_spool: Optional[str] = None) -> "AssistantState":
         """Rebuild from a snapshot, repairing rather than rejecting.
 
         An absent file is the empty state — the normal case on a host where the
@@ -706,6 +713,9 @@ class AssistantState:
         notes get theirs in :meth:`PendingNote.from_dict` for the same reason; the
         standing orders keep their own pair (:func:`set_instructions` on the way
         in, ``api._instructions_reply`` on the way out).
+
+        *memo_spool* names the project whose spool this is and turns on reuse of
+        that spool's previous scrub results (:func:`_pending_notes`).
         """
         if not isinstance(payload, dict):
             return cls()
@@ -720,14 +730,7 @@ class AssistantState:
         ):
             pending_seq = 0
         raw_pending = payload.get("pending")
-        pending = tuple(
-            note
-            for note in (
-                PendingNote.from_dict(item)
-                for item in (raw_pending if isinstance(raw_pending, list) else [])
-            )
-            if note is not None
-        )
+        pending = _pending_notes(raw_pending if isinstance(raw_pending, list) else [], memo_spool)
         return cls(
             session_id=_opt_str(payload.get("session_id")),
             started_at=_opt_str(payload.get("started_at")),
@@ -839,6 +842,41 @@ class AssistantStatus:
         }
 
 
+def _pending_notes(raw: list, memo_spool: Optional[str]) -> tuple:
+    """:meth:`PendingNote.from_dict` over *raw*, reusing *memo_spool*'s earlier results.
+
+    A hit is the result an earlier load computed from the same stored note under
+    the same credentials, so it is exactly what a scrub would return now. Notes
+    are not skipped for having been scrubbed on write: the scrub is not
+    idempotent (``a://b@c@d`` loses one userinfo segment per pass).
+    """
+    if memo_spool is None:
+        notes = (PendingNote.from_dict(item) for item in raw)
+        return tuple(note for note in notes if note is not None)
+    with scrub_pass() as known:
+        cached_known, cached = _SCRUBBED_NOTES.get(memo_spool, (None, {}))
+        if cached_known != known:
+            cached = {}
+        kept: dict = {}
+        notes = []
+        for item in raw:
+            digest = hashlib.sha256(json.dumps(item).encode("utf-8")).hexdigest()
+            if digest in cached:
+                entry = cached[digest]
+            else:
+                note = PendingNote.from_dict(item)
+                # The data travels as JSON so that no caller holding a note
+                # can change what a later load is handed.
+                entry = None if note is None else (
+                    replace(note, data=None), None if note.data is None else json.dumps(note.data))
+            kept[digest] = entry
+            if entry is not None:
+                note, data = entry
+                notes.append(note if data is None else replace(note, data=json.loads(data)))
+        _SCRUBBED_NOTES[memo_spool] = (known, kept)
+    return tuple(notes)
+
+
 def _opt_str(value: object) -> Optional[str]:
     """A non-empty string, or ``None`` for anything else."""
     return value if isinstance(value, str) and value else None
@@ -891,7 +929,7 @@ def read_state() -> AssistantState:
             "platform_assistant_state_unreadable error=%s — starting from empty", exc
         )
         return AssistantState()
-    return AssistantState.from_dict(stored)
+    return AssistantState.from_dict(stored, memo_spool=project_context.current() or projects.GENERAL)
 
 
 def _write_state(state: AssistantState) -> bool:
