@@ -9,7 +9,7 @@ What these tests pin:
   off on a pre-#370 host;
 - the three instance moves (`agent-files/claude`, `mirrors`, `taskdef/`);
   `napkin/` stays, with a note, because no release reads `_napkin/` yet and the standalone ``sources.yaml`` folded into
-  ``_plexus.yaml sources:`` through the writer, removed in ONE commit;
+  ``_lmer.yaml sources:`` through the writer, removed in ONE commit;
 - the transport spelling is carried byte-for-byte (no registry-identity
   normalization), so the container's own resolution derives the same clone
   before and after the fold;
@@ -76,7 +76,7 @@ def _git(cwd, *args) -> str:
 
 def _build_instance_tree(root):
     root.mkdir(parents=True)
-    (root / "_plexus.yaml").write_text(MANIFEST, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(MANIFEST, encoding="utf-8")
     (root / "README.md").write_text("# work repo\n", encoding="utf-8")
     (root / "sources.yaml").write_text(LEGACY_SOURCES, encoding="utf-8")
     (root / "agent-files" / "claude" / "skills" / "hello").mkdir(parents=True)
@@ -215,7 +215,7 @@ class TestApply:
             "napkin": {"repo": "https://git.example.test/agents/napkin.git"},
         }
         assert "sources.yaml" in commits[0].paths
-        assert "_plexus.yaml" in commits[0].paths
+        assert "_lmer.yaml" in commits[0].paths
 
     def test_the_transport_spelling_is_carried_byte_for_byte(self, work, commits):
         # The declared repo is a transport, never a registry identity: an
@@ -241,7 +241,7 @@ class TestApply:
             work / "sources.yaml",
             WORK_URL,
             manifest_sources=_manifest_sources(work),
-            manifest_path=work / "_plexus.yaml",
+            manifest_path=work / "_lmer.yaml",
         )
         assert before["sources"]["taskdef"] == after["sources"]["taskdef"]
         # And the derived clone is identical on both sides.
@@ -279,7 +279,7 @@ class TestApply:
         assert _container_resolution(work, work_url) == before
 
     def test_a_manifest_entry_wins_and_warns(self, work, commits):
-        (work / "_plexus.yaml").write_text(
+        (work / "_lmer.yaml").write_text(
             MANIFEST
             + "sources:\n"
             "  taskdef:\n"

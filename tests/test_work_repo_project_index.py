@@ -1643,14 +1643,14 @@ class TestLegendText:
 
     def test_the_root_intro_is_the_specified_sentence(self):
         assert pi.ROOT_INTRO == (
-            "Generated from `_plexus.yaml` by `lmer-schema index --write` (lmer index format 1). "
+            "Generated from `_lmer.yaml` by `lmer-schema index --write` (lmer index format 1). "
             "Each project directory shows its own run index below its file list. Edit this file "
             "outside the markers only."
         )
 
     def test_the_root_legend_is_the_specified_name_list(self):
         assert pi.ROOT_LEGEND == (
-            "Other names at this level: `_plexus.yaml`, `_agents/`, `_knowledge/`, `_napkin/`, "
+            "Other names at this level: `_lmer.yaml`, `_agents/`, `_knowledge/`, `_napkin/`, "
             "`_taskdef/`, `_archive/`, `_memory_retirements.json`, `napkin/`, `taskdef/`, "
             "`agent-files/`, `mirrors/`, `knowledge/` — see lmer `docs/SCHEMA.md`; everything else "
             "is human content."
@@ -1812,9 +1812,9 @@ class TestSchema2Fixtures:
         assert len(case.clones) == 3
         for repo in (case.root, *case.clones):
             assert git(repo, "status", "--porcelain").stdout == ""
-            assert (repo / "_plexus.yaml").is_file()
+            assert (repo / "_lmer.yaml").is_file()
             assert (repo / "widgets" / "_runs" / "chat" / uid_for(1) / "state.yaml").is_file()
-        assert case.origin_file("_plexus.yaml") == case.tree.manifest.read_text()
+        assert case.origin_file("_lmer.yaml") == case.tree.manifest.read_text()
         assert case.origin_file("widgets/README.md") is None
         assert os.environ["GIT_CONFIG_GLOBAL"] == "/dev/null"
 
@@ -1837,7 +1837,7 @@ class TestSchema2Fixtures:
         assert git(probe, "commit", "-q", "-m", "probe", check=False).returncode != 0, (
             "the hostile global config must really refuse a plain commit")
         case = publication2(tmp_path, monkeypatch)
-        assert case.origin_file("_plexus.yaml") is not None
+        assert case.origin_file("_lmer.yaml") is not None
         assert os.environ["GIT_CONFIG_GLOBAL"] == "/dev/null"
         with pytest.raises(TypeError):
             publication2(tmp_path / "again")  # type: ignore[call-arg]  # monkeypatch is required

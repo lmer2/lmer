@@ -3,7 +3,7 @@
 `work_repo.utils` is the ONE module that knows the second set of names. Every
 sibling reaches the form and the project dir through `work_repo_layout()` (and
 the area helpers built on it), so a second module can never re-derive
-`_plexus.yaml`, `_info/` or `_agents/memory/` and drift from this one — the
+`_lmer.yaml`, `_info/` or `_agents/memory/` and drift from this one — the
 source guard at the bottom of this file pins that.
 
 Three behaviours are load-bearing and each has its own class here:
@@ -87,7 +87,7 @@ def _set_context(monkeypatch, root, *, host=None, project=None, url=None):
 
 def _break_manifest(root, text):
     """Replace the tree's manifest with *text* (a present, unusable one)."""
-    (Path(root) / "_plexus.yaml").write_text(text, encoding="utf-8")
+    (Path(root) / "_lmer.yaml").write_text(text, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class TestLegacyByteIdentical:
     ):
         """Detection is at the work-repo ROOT (D20), not anywhere in the tree."""
         tree = build_legacy_plexus(tmp_path / "plexus-legacy")
-        (tree.project_dir / "_plexus.yaml").write_text(
+        (tree.project_dir / "_lmer.yaml").write_text(
             "schema: 1\nname: nested\n", encoding="utf-8"
         )
         host, path = PRIMARY_REPO.split("/", 1)
@@ -215,7 +215,7 @@ def schema_tree(tmp_path):
 
 
 class TestSchemaFormResolution:
-    """`_plexus.yaml` present -> the registry decides the project dir."""
+    """`_lmer.yaml` present -> the registry decides the project dir."""
 
     def test_form_and_manifest(self, monkeypatch, schema_tree):
         _set_context(monkeypatch, schema_tree.root)
@@ -404,7 +404,7 @@ class TestPresentButBrokenManifestFailsClosed:
         assert _work_repo_base() is None
         err = capsys.readouterr().err
         assert str(self.tree.manifest) in err
-        assert "_plexus.yaml" in err
+        assert "_lmer.yaml" in err
 
     def test_reported_once_per_process(self, capsys):
         _break_manifest(self.tree.root, _BROKEN_MANIFESTS["unparseable"])
@@ -495,7 +495,7 @@ class TestCoreImportFailureWithNoManifestDegradesToLegacy:
         self, no_core_api, capsys
     ):
         """Presence is asked at the work-repo ROOT with or without the core."""
-        (self.tree.project_dir / "_plexus.yaml").write_text(
+        (self.tree.project_dir / "_lmer.yaml").write_text(
             "schema: 1\nname: nested\n", encoding="utf-8"
         )
         assert work_repo_form() == LEGACY_FORM
@@ -548,7 +548,7 @@ class TestCoreImportFailureWithAManifestFailsClosed:
         assert _work_repo_base() is None
         err = capsys.readouterr().err
         assert str(self.tree.manifest) in err
-        assert "_plexus.yaml" in err
+        assert "_lmer.yaml" in err
 
     def test_reported_once_per_process(self, no_core_api, capsys):
         _work_repo_base()
@@ -763,7 +763,7 @@ class TestNothingIsCachedAcrossCalls:
         _set_context(monkeypatch, root, host=host, project=path)
         assert work_repo_form() == LEGACY_FORM
         assert _work_repo_base() == tree.project_dir
-        (root / "_plexus.yaml").write_text(
+        (root / "_lmer.yaml").write_text(
             f"schema: 1\nname: example\nprojects:\n  {PROJECT}:\n"
             f"    repo: {PRIMARY_REPO}\n",
             encoding="utf-8",
@@ -854,7 +854,7 @@ class TestOnlyThisModuleKnowsTheSecondNames:
     #: form. Prose mentioning `lmer_schema` is fine — the import spellings
     #: are what a second implementation needs.
     @pytest.mark.parametrize(
-        "token", ["_plexus.yaml", "import lmer_schema", "from lmer_schema"]
+        "token", ["_lmer.yaml", "import lmer_schema", "from lmer_schema"]
     )
     def test_no_sibling_re_derives_the_form(self, token):
         offenders = [

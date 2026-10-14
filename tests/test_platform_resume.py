@@ -230,7 +230,7 @@ def child_payload(dump, timeout=10.0):
 def plant_schema_two_source(config, *, signed_out=False):
     """One opaque schema-2 source record with launch provenance."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
     )
     source = plant_run(
@@ -1096,7 +1096,7 @@ def plant_widgets_manifest(config):
     """A registry that knows ``widgets`` at both of its remotes (D8). Planted
     before the identity is derived, because it is what the fold reads."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 1\nname: example-plexus\nprojects:\n  widgets:\n"
         f"    repo: {WIDGETS_PRIMARY}\n    remotes: [{WIDGETS_SECONDARY}]\n",
         encoding="utf-8",
@@ -1968,7 +1968,7 @@ SSH_URL = "ssh://git@git.example.test:2222/acme/widgets.git"
 
 def plant_schema_two_manifest(config, projects="{}"):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         f"schema: 2\nname: example-plexus\nprojects: {projects}\n", encoding="utf-8"
     )
 

@@ -26,7 +26,7 @@ Three mechanics, one module, because they are the halves of one promise —
    ``_runs/``, newest first — between ``<!-- lmer:index:start -->`` and
    ``<!-- lmer:index:end -->`` in ``<project>/README.md``, and
    ``lmer-schema index --write`` renders the root ``README.md``'s project
-   list from ``_plexus.yaml``. The block is the kernel's
+   list from ``_lmer.yaml``. The block is the kernel's
    (``work_repo.project_index``, imported lazily: the import direction is
    ``work_repo -> lmer_schema``), and so is the freshness oracle here: the
    existing block is compared byte for byte with a fresh render of what is
@@ -180,7 +180,7 @@ register(
     tier=Tier.MACHINE,
     summary=(
         "a `README.md` generated index block that no longer matches a fresh "
-        "render of the records (or, at the plexus root, of `_plexus.yaml`), or "
+        "render of the records (or, at the plexus root, of `_lmer.yaml`), or "
         "whose markers are malformed"
     ),
 )

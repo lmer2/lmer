@@ -21,7 +21,7 @@ def session_tree(tmp_path, monkeypatch):
     strip_lmer_env(monkeypatch)
     root = tmp_path / "plexus"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         "schema: 2\nname: example\nprojects:\n  widgets:\n"
         "    repo: git.example.test/acme/widgets\n"
     )
@@ -412,7 +412,7 @@ def _git_work_repo(session_tree):
     )
     clone = session_tree.parent / "workrepo"
     subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
-    (clone / "_plexus.yaml").write_text((session_tree / "_plexus.yaml").read_text())
+    (clone / "_lmer.yaml").write_text((session_tree / "_lmer.yaml").read_text())
     _git(clone, "add", ".")
     _git(clone, "commit", "-q", "-m", "init")
     _git(clone, "push", "-q", "-u", "origin", "main")
@@ -644,7 +644,7 @@ def test_launcher_replaces_inherited_uid_once_after_schema_detection(session_tre
 def test_launcher_uses_v2_identity_when_registry_is_unusable(session_tree, monkeypatch):
     from lmer_cli.container import clone_and_exec
 
-    (session_tree / "_plexus.yaml").write_text(
+    (session_tree / "_lmer.yaml").write_text(
         "schema: 2\nname: example\nprojects:\n  bad:\n"
         "    remotes: [git.example.test/Team/Repo]\n"
     )
@@ -905,7 +905,7 @@ def test_container_accepted_continuation_is_fresh_and_read_only(
 def test_container_schema_one_keeps_inherited_session_writer(
     session_tree, tmp_path, monkeypatch
 ):
-    (session_tree / "_plexus.yaml").write_text(
+    (session_tree / "_lmer.yaml").write_text(
         "schema: 1\nname: example\nprojects:\n  widgets:\n"
         "    repo: git.example.test/acme/widgets\n"
     )

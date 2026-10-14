@@ -397,7 +397,7 @@ def _render_sources_block(monkeypatch, cached, env=None,
 
     `cached` is what the clone-cache reader pretends the work repo's cached
     sources.yaml contains (None = miss, reported with `reason`); `manifest`
-    is the cached `_plexus.yaml` content (None = no manifest, so the
+    is the cached `_lmer.yaml` content (None = no manifest, so the
     no-manifest output is byte-identical to before #370); `env` is the
     complete LMER_* environment for the render (everything else is stripped
     first).
@@ -407,7 +407,7 @@ def _render_sources_block(monkeypatch, cached, env=None,
         monkeypatch.setenv(key, value)
 
     def _reader(url, path="sources.yaml"):
-        if path == "_plexus.yaml":
+        if path == "_lmer.yaml":
             if manifest is None:
                 return None, clone_cache.CACHE_FILE_ABSENT
             return manifest, clone_cache.CACHE_HIT
@@ -788,7 +788,7 @@ class TestSourcesManifestTier:
         assert "stale" in output
 
     def test_a_manifest_without_sources_is_not_reported_as_a_declaration(self, monkeypatch):
-        """A schema-2 repo always has `_plexus.yaml`; one without a
+        """A schema-2 repo always has `_lmer.yaml`; one without a
         `sources:` section must read as no declaration, not as one."""
         output = _render_sources_block(
             monkeypatch, None,

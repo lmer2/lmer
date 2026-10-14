@@ -28,7 +28,7 @@ def configured(tmp_path, monkeypatch):
     """A configured checkout (has a manifest) beside a foreign tree."""
     root = tmp_path / "configured"
     root.mkdir()
-    (root / "_plexus.yaml").write_text("schema: 1\nname: example\n")
+    (root / "_lmer.yaml").write_text("schema: 1\nname: example\n")
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(root))
     return root
 
@@ -59,7 +59,7 @@ class TestCheckoutOf:
     def test_a_foreign_tree_with_its_own_checkout_takes_that_one(self, configured, tmp_path):
         other = tmp_path / "other"
         (other / "_runs").mkdir(parents=True)
-        (other / "_plexus.yaml").write_text("schema: 1\nname: other\n")
+        (other / "_lmer.yaml").write_text("schema: 1\nname: other\n")
         assert checkout_of(other / "_runs" / "r") == other.resolve()
         git_tree = tmp_path / "clone"
         (git_tree / ".git").mkdir(parents=True)
@@ -103,7 +103,7 @@ class TestTheLockFollowsTheTree:
     def test_a_foreign_checkout_serializes_on_itself(self, configured, tmp_path):
         other = tmp_path / "other"
         other.mkdir()
-        (other / "_plexus.yaml").write_text("schema: 1\nname: other\n")
+        (other / "_lmer.yaml").write_text("schema: 1\nname: other\n")
         rdir = other / "widgets" / "_runs" / "chat" / "r"
         with checkout_lock(other):
             thread, done, errors = _write_in_thread(

@@ -100,7 +100,7 @@ def _plexus_project_dir(work_root):
     """Schema-form project dir for the launch's repo: ``(dir, problem)``.
 
     Form detection is manifest presence (spec D20): with no
-    ``{work_root}/_plexus.yaml`` the tree is legacy and ``(None, None)`` is
+    ``{work_root}/_lmer.yaml`` the tree is legacy and ``(None, None)`` is
     returned without reading anything. In schema form the launch's repo —
     ``LMER_REPO_URL``, else ``https://{LMER_REPO_HOST}/{LMER_REPO_PROJECT}``
     — is normalized and looked up across every registry entry's ``repo:``
@@ -123,7 +123,7 @@ def _plexus_project_dir(work_root):
     A missing ``projects:`` is an empty registry, not a problem; an entry
     that is not a mapping is skipped (the validator's complaint, D19).
     """
-    manifest = work_root / "_plexus.yaml"
+    manifest = work_root / "_lmer.yaml"
     if not manifest.exists():
         return None, None
     try:
@@ -166,7 +166,7 @@ def _plexus_project_dir(work_root):
 
 
 def plexus_manifest_problem():
-    """Why ``{LMER_WORK_REPO_PATH}/_plexus.yaml`` cannot be used, or None.
+    """Why ``{LMER_WORK_REPO_PATH}/_lmer.yaml`` cannot be used, or None.
 
     The reason string ``_plexus_project_dir`` fails closed on, surfaced
     for callers that report rather than resolve: None when there is no
@@ -189,12 +189,12 @@ def work_repo_taskdef_dirs():
     Looks up:
       1. {LMER_WORK_REPO_PATH}/<shortname>/_taskdef/
          (project-scoped, schema form — <shortname> comes from the
-         ``_plexus.yaml`` registry via _plexus_project_dir(); absent when
+         ``_lmer.yaml`` registry via _plexus_project_dir(); absent when
          the tree is legacy or the repo is unregistered)
       2. {LMER_WORK_REPO_PATH}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}/taskdef/
          (project-scoped, legacy {host}/{project} — the host bucket an
          unnamed repo's work lives in, spec D9)
-      Both project tiers are dropped when a ``_plexus.yaml`` is present
+      Both project tiers are dropped when a ``_lmer.yaml`` is present
       but unusable (fail-closed, plan T6 — see _plexus_project_dir();
       plexus_manifest_problem() says why).
       3. {LMER_WORK_REPO_PATH}/_taskdef/ then {LMER_WORK_REPO_PATH}/taskdef/

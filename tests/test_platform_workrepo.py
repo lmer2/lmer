@@ -1501,12 +1501,12 @@ FIXTURE_IDENTITY = ("gitlab.example.com", "acme/widgets")
 
 
 def _plant_manifest(config, projects, *, name="example-plexus", schema=1):
-    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
-    (config.mirror_path / "_plexus.yaml").write_text(
+    """A ``_lmer.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({"schema": schema, "name": name, "projects": projects}),
         encoding="utf-8",
     )
-    return config.mirror_path / "_plexus.yaml"
+    return config.mirror_path / "_lmer.yaml"
 
 
 def _plant_session_run(config, project_dir, slug, session_id, *, state=True,
@@ -1653,11 +1653,11 @@ def test_run_dirs_skip_a_flat_project_with_no_recoverable_identity(config, caplo
 
 
 def test_run_dirs_survive_an_unusable_manifest(config):
-    """A broken ``_plexus.yaml`` is the validator's problem. This is a read path
+    """A broken ``_lmer.yaml`` is the validator's problem. This is a read path
     the fleet view polls: it loses the runs whose identity that file held, and
     nothing else."""
     workrepo.ensure_clone(config)
-    (config.mirror_path / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    (config.mirror_path / "_lmer.yaml").write_text("projects: [", encoding="utf-8")
     _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
 
     assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"], (
@@ -2239,10 +2239,10 @@ def test_an_unregistered_identity_still_falls_through_to_its_host_bucket(config)
 
 def test_a_schema_form_resolve_survives_an_unusable_manifest(config, caplog,
                                                              announcing):
-    """A broken ``_plexus.yaml`` is the validator's problem. This read path loses
+    """A broken ``_lmer.yaml`` is the validator's problem. This read path loses
     the runs whose identity that file held, says so once, and nothing else."""
     workrepo.ensure_clone(config)
-    (config.mirror_path / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    (config.mirror_path / "_lmer.yaml").write_text("projects: [", encoding="utf-8")
     _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
 
     with caplog.at_level("WARNING", logger="lmer_platform.workrepo"):

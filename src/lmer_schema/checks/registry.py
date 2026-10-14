@@ -50,7 +50,7 @@ wants the exit-2 unusable path instead (the runner may prefer it) calls
 ``load_registry``/``build_registry`` directly and lets it raise; the taxonomy
 is the same either way, since ``RegistryError`` is a ``ManifestError``.
 
-Findings are reported against the manifest itself (``_plexus.yaml``, the
+Findings are reported against the manifest itself (``_lmer.yaml``, the
 repo-relative path), naming the entry in the message the way the file spells
 it — ``projects.<name>.remotes:[1]`` — because that is what the operator
 edits. Every value printed goes through ``scrub_credentials`` and the

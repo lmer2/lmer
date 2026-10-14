@@ -490,7 +490,7 @@ class TestSchema2BucketIdentity:
             )
 
     def test_registered_project_is_authoritative_over_legacy_bucket(self, tmp_path):
-        (tmp_path / "_plexus.yaml").write_text(
+        (tmp_path / "_lmer.yaml").write_text(
             yaml.safe_dump({
                 "schema": 2,
                 "name": "test",

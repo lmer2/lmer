@@ -92,8 +92,8 @@ class TestBuilderApi:
         first = build_schema_plexus(tmp_path / "one")
         second = build_schema_plexus(tmp_path / "two")
         assert first.root != second.root
-        (first.root / "_plexus.yaml").unlink()
-        assert (second.root / "_plexus.yaml").is_file()
+        (first.root / "_lmer.yaml").unlink()
+        assert (second.root / "_lmer.yaml").is_file()
 
     def test_fixture_trees_live_under_tmp_path(self, schema_plexus, legacy_plexus, tmp_path):
         for tree in (schema_plexus, legacy_plexus):

@@ -1,4 +1,4 @@
-"""``_plexus.yaml`` rewrites — the ONE tool-side write path (issue #366).
+"""``_lmer.yaml`` rewrites — the ONE tool-side write path (issue #366).
 
 Spec D10 says the registry is tool-written on adoption and §4 that the tool
 writer always emits canonical form. This module is that writer: an importable
@@ -686,7 +686,7 @@ def _write_atomic(path: Path, text: str, mode: int) -> None:
 
 
 class ManifestWriter:
-    """An open ``_plexus.yaml``: the round-trip document plus the parsed
+    """An open ``_lmer.yaml``: the round-trip document plus the parsed
     model. Obtained from :func:`load_for_write` or :func:`create`, never
     built by hand.
 

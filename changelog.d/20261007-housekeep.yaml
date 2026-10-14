@@ -1,2 +1,2 @@
 added:
-- "`work housekeep [--apply] [--area …] [--project …]` archives stale content and maintains indexes, dry-run by default with one commit on `--apply`; the per-area TTL policy comes from `_plexus.yaml housekeeping:` (#371)"
+- "`work housekeep [--apply] [--area …] [--project …]` archives stale content and maintains indexes, dry-run by default with one commit on `--apply`; the per-area TTL policy comes from `_lmer.yaml housekeeping:` (#371)"

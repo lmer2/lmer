@@ -1,5 +1,5 @@
 added:
-- "the `_plexus.yaml sources:` tier is read at container start, by `lmer --show-env` and by `bin/doctor`, with env > manifest > legacy `sources.yaml` precedence (#370)"
+- "the `_lmer.yaml sources:` tier is read at container start, by `lmer --show-env` and by `bin/doctor`, with env > manifest > legacy `sources.yaml` precedence (#370)"
 - "`lmer_cli.container.sources.MANIFEST_TIER_SUPPORTED` marks a release that reads the manifest tier, the version floor `work migrate --instance` checks (#370)"
 changed:
 - "declared-source origins name the tier (`declared (manifest)` / `declared (sources.yaml)`) whenever a manifest is present (#370)"

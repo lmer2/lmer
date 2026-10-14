@@ -78,7 +78,7 @@ def claim_clones(session_tree, tmp_path):
     git(session_tree, "init", "--initial-branch=main")
     git(session_tree, "config", "user.name", "Test")
     git(session_tree, "config", "user.email", "test@example.test")
-    git(session_tree, "add", "_plexus.yaml")
+    git(session_tree, "add", "_lmer.yaml")
     git(session_tree, "commit", "-m", "schema fixture")
     git(session_tree, "remote", "add", "origin", str(origin))
     git(session_tree, "push", "-u", "origin", "main")

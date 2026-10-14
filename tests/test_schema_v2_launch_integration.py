@@ -210,7 +210,7 @@ Path(sys.argv[1]).write_text(json.dumps({
 def test_schema_one_child_retains_established_identity(session_tree, tmp_path):
     from lmer_cli.container import spawn_harness
 
-    manifest = session_tree / "_plexus.yaml"
+    manifest = session_tree / "_lmer.yaml"
     manifest.write_text(manifest.read_text().replace("schema: 2", "schema: 1"))
     env = dict(os.environ, LMER_SESSION_ID="20260917-120000-1-42")
     result = spawn_harness.build_child_env(env, {}, {})

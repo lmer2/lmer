@@ -760,7 +760,7 @@ class TestPersistRefusals:
         # silent demotion the resolver exists to prevent.
         tree, agent_dir = schema_tree
         (agent_dir / "prefs.md").write_text(_memory_file("prefs", "user"))
-        (tree.root / "_plexus.yaml").write_text("schema: [not, an, int]\n")
+        (tree.root / "_lmer.yaml").write_text("schema: [not, an, int]\n")
 
         rc, staged = _persist()
 

@@ -859,7 +859,7 @@ def _schema_one_tree(tmp_path, *, in_progress):
     root = tmp_path / "plexus"
     record = root / "widgets" / "_runs" / "chat" / "20260917-120000-1-7"
     record.mkdir(parents=True)
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         "schema: 1\nname: example\nprojects:\n  widgets:\n"
         "    repo: git.example.test/acme/widgets\n",
         encoding="utf-8",
@@ -910,7 +910,7 @@ class TestMigrate:
         assert code == EXIT_CLEAN
         assert "Schema 2 applied locally." in out
         after = _tree_bytes(root)
-        manifest = Path("_plexus.yaml")
+        manifest = Path("_lmer.yaml")
         assert after[manifest] == before[manifest].replace(b"schema: 1", b"schema: 2")
         assert {k: v for k, v in after.items() if k != manifest} == {
             k: v for k, v in before.items() if k != manifest
@@ -991,7 +991,7 @@ def _checkout(tree, monkeypatch, tmp_path):
     `widgets` records committed; whatever is added afterwards is untracked."""
     isolate_git(monkeypatch, tmp_path)
     git(tree.root, "init", "-q", "--initial-branch=main")
-    git(tree.root, "add", "--", "_plexus.yaml", "widgets")
+    git(tree.root, "add", "--", "_lmer.yaml", "widgets")
     git(tree.root, "commit", "-q", "-m", "fixture")
 
 
@@ -1506,7 +1506,7 @@ class TestIndexUnusableInput:
         assert code == EXIT_UNUSABLE
         assert out == ""
         assert err.strip() == (
-            "Index refused: no _plexus.yaml — legacy trees are out of scope for the "
+            "Index refused: no _lmer.yaml — legacy trees are out of scope for the "
             "index; adopt the schema first"
         )
         assert not (legacy / "README.md").exists()

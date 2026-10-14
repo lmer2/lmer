@@ -127,7 +127,7 @@ def _signed_out_events(session, start="2026-08-24T10:15:00Z", end="2026-08-24T10
 def _build_adopted_project(root):
     """The adopted-but-unmigrated tree (one registered project, bare areas)."""
     root.mkdir(parents=True)
-    (root / "_plexus.yaml").write_text(MANIFEST, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(MANIFEST, encoding="utf-8")
     (root / "README.md").write_text("# work repo\n", encoding="utf-8")
     project = root / PROJECT
     runs = project / "runs"
@@ -437,13 +437,13 @@ class TestPlan:
 
 class TestPreconditions:
     def test_a_missing_manifest_points_at_work_adopt(self, work):
-        (work / "_plexus.yaml").unlink()
+        (work / "_lmer.yaml").unlink()
         with pytest.raises(migrate.MigrateError) as excinfo:
             migrate.plan_project(PROJECT, root=work)
         assert "work adopt" in str(excinfo.value)
 
     def test_the_version_floor_refuses_a_newer_schema(self, work):
-        (work / "_plexus.yaml").write_text(MANIFEST.replace("schema: 1", "schema: 99"))
+        (work / "_lmer.yaml").write_text(MANIFEST.replace("schema: 1", "schema: 99"))
         with pytest.raises(migrate.MigrateError) as excinfo:
             migrate.plan_project(PROJECT, root=work)
         assert "version floor" in str(excinfo.value)
@@ -452,8 +452,8 @@ class TestPreconditions:
     def test_the_writer_refusal_is_the_schema_writable_check(self, work):
         real = work / "manifest-elsewhere.yaml"
         real.write_text(MANIFEST, encoding="utf-8")
-        (work / "_plexus.yaml").unlink()
-        (work / "_plexus.yaml").symlink_to("manifest-elsewhere.yaml")
+        (work / "_lmer.yaml").unlink()
+        (work / "_lmer.yaml").symlink_to("manifest-elsewhere.yaml")
         with pytest.raises(migrate.MigrateError) as excinfo:
             migrate.plan_project(PROJECT, root=work)
         assert "not writable" in str(excinfo.value)
@@ -757,7 +757,7 @@ class TestApply:
         status = _git(work, "status", "--porcelain")
         assert all(line[1] == " " for line in status.splitlines()), status
         assert f"R  {PROJECT}/runs/develop-issue-12/state.yaml -> {PROJECT}/_runs/develop-issue-12/{SID_ONE}/state.yaml" in status
-        assert (work / "_plexus.yaml").read_text(encoding="utf-8") == MANIFEST
+        assert (work / "_lmer.yaml").read_text(encoding="utf-8") == MANIFEST
 
     def test_one_commit_through_the_existing_helper(self, work, commits):
         rc, _text = _render(work, apply=True)

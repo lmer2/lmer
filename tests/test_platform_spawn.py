@@ -318,13 +318,13 @@ WIDGETS_TARGET = "https://gitlab.example.com/acme/widgets/-/work_items/42"
 
 
 def plant_manifest(config, projects, *, name="example-plexus"):
-    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    """A ``_lmer.yaml`` at the mirror root — the registry IS the identity (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
         encoding="utf-8",
     )
-    return config.mirror_path / "_plexus.yaml"
+    return config.mirror_path / "_lmer.yaml"
 
 
 def register_widgets(config):
@@ -395,13 +395,13 @@ def _no_mirror(config):
 
 
 def _mirror_without_a_manifest(config):
-    """A legacy work repo: a mirror, and no ``_plexus.yaml`` anywhere in it."""
+    """A legacy work repo: a mirror, and no ``_lmer.yaml`` anywhere in it."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
 
 
 def _unusable_manifest(config):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 1\nname: example\nprojects: [this is not a mapping]\n",
         encoding="utf-8",
     )
@@ -411,7 +411,7 @@ def _manifest_this_build_cannot_read(config):
     """A manifest from a newer writer: present, parseable, and refused."""
     plant_manifest(config, {"widgets": {"repo": REGISTERED_PRIMARY}},
                    name="example-plexus")
-    path = config.mirror_path / "_plexus.yaml"
+    path = config.mirror_path / "_lmer.yaml"
     path.write_text(
         path.read_text(encoding="utf-8").replace("schema: 1", "schema: 99"),
         encoding="utf-8",

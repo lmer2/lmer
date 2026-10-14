@@ -126,7 +126,7 @@ def _build_project(root):
     already dangles, one that points outside the project, and a ``memory/``
     holding every routing case."""
     root.mkdir(parents=True)
-    (root / "_plexus.yaml").write_text(MANIFEST, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(MANIFEST, encoding="utf-8")
     (root / "README.md").write_text("# work repo\n", encoding="utf-8")
     project = root / PROJECT
     record = project / "runs" / "develop-issue-12"

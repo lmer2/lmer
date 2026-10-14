@@ -298,7 +298,7 @@ A reading guide to SCHEMA.md, plus the two things it deliberately leaves out —
 The normative layout of everything lmer reads and writes outside the code repos it works on — one repository holding it is a *plexus*:
 - The single form: flat short-name project dirs, `_`-prefixed schema-owned names, and the `{host}/{project}/` host bucket for repos nobody has named yet
 - The areas (napkin, plans, knowledge, memory at two scopes, record, `_agents/`) and their writer/shape/strictness contracts
-- The `_plexus.yaml` manifest: schema int, registry identity (`repo:`/`remotes:`, repoless projects), sources, housekeeping policy
+- The `_lmer.yaml` manifest: schema int, registry identity (`repo:`/`remotes:`, repoless projects), sources, housekeeping policy
 - Sessions as the unit of record (`_runs/<slug>/<session-id>[--<name>]/`), archive, and the legacy mapping
 - What `lmer-schema validate` checks at each strictness tier, versioning, and the change process
 - The generated `README.md` index blocks at the plexus root and in each project: the inventory rows, the `index.readme-missing` / `index.readme-stale` codes and the hand-text marker rule

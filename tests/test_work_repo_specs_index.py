@@ -855,7 +855,7 @@ def _empty_schema_tree(monkeypatch, tmp_path, session=SID_A, target="issue-101")
     """A schema tree whose registered project has no records or index yet."""
     root = tmp_path / "plexus-empty"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         f"schema: 1\nname: example\nprojects:\n  {PROJECT}:\n"
         f"    repo: {PRIMARY_REPO}\n",
         encoding="utf-8",

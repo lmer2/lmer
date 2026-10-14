@@ -151,7 +151,7 @@ def _only_error(document, code, path):
 
 
 def _edit_manifest(tree, mutate):
-    """Round-trip ``_plexus.yaml`` through *mutate* (comments are not kept —
+    """Round-trip ``_lmer.yaml`` through *mutate* (comments are not kept —
     the manifest's shape is what these tests change, never its prose)."""
     document = yaml.safe_load(tree.manifest.read_text(encoding="utf-8"))
     mutate(document)

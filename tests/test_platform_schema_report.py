@@ -215,7 +215,7 @@ def test_an_absent_mirror_has_no_form(platform_root, tmp_path):
 
 
 def test_a_broken_manifest_is_a_200_carrying_exit_code_2(platform_root, mirror):
-    (mirror / "_plexus.yaml").write_text("schema: [unclosed\n", encoding="utf-8")
+    (mirror / "_lmer.yaml").write_text("schema: [unclosed\n", encoding="utf-8")
     reply = _schema(_client(mirror))
     assert reply.status_code == 200, reply.text
     body = reply.json()

@@ -42,7 +42,7 @@ sources:
     repo: https://git.example.com/20c/napkin.git
 """
 
-# The manifest tier (issue #370): a `_plexus.yaml` whose `sources:` declares
+# The manifest tier (issue #370): a `_lmer.yaml` whose `sources:` declares
 # taskdef at a different URL than GOOD, so a test can tell which tier won.
 MANIFEST_TASKDEF_REPO = "https://git.example.com/agents/taskdefs-v2.git"
 MANIFEST_GOOD = f"""\
@@ -677,7 +677,7 @@ class TestDoctorTiers:
     def test_manifest_is_read_beside_path_not_from_the_env_root(
         self, capsys, tmp_path, monkeypatch
     ):
-        """The decision record: `<dir of --path>/_plexus.yaml`, nothing else."""
+        """The decision record: `<dir of --path>/_lmer.yaml`, nothing else."""
         other = tmp_path / "other"
         other.mkdir()
         _write_manifest(other, MANIFEST_GOOD)

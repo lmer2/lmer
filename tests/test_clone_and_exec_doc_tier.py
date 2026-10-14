@@ -23,7 +23,7 @@ What is pinned here:
   per-file source labels), rather than a hand-written expectation.
 - **A work repo it cannot read never raises and never guesses.** This runs
   on container start's always-succeed path: a present-but-unreadable
-  ``_plexus.yaml`` degrades to the lmer defaults, says why, and does not
+  ``_lmer.yaml`` degrades to the lmer defaults, says why, and does not
   read the legacy names for it (D20 — the same split-tree refusal
   ``_resolve_work_repo_placement`` makes for placement).
 - **The tier ORDER does not move.** Only where the middle tier looks changed:
@@ -468,11 +468,11 @@ class TestUnreadableWorkRepo:
     """Container start's always-succeed path: degrade, say why, never guess."""
 
     def _broken_manifest_tree(self, root):
-        """A tree whose ``_plexus.yaml`` is present and unparseable, with a
+        """A tree whose ``_lmer.yaml`` is present and unparseable, with a
         legacy-named info dir holding a decoy — the thing that must NOT be
         read for it (D20)."""
         root.mkdir(parents=True, exist_ok=True)
-        _write(root / "_plexus.yaml", "schema: 1\nprojects: [oops\n")
+        _write(root / "_lmer.yaml", "schema: 1\nprojects: [oops\n")
         _write(root / PRIMARY_HOST / PRIMARY_PATH / "info" / "AGENTS.md", LEGACY_DECOY)
         return root
 
@@ -490,7 +490,7 @@ class TestUnreadableWorkRepo:
         assert provisioned == ["AGENTS.md", "rules/testing.md"]
         assert (workspace / "AGENTS.md").read_text() == DEFAULT_AGENTS
         stderr = capsys.readouterr().err
-        assert "_plexus.yaml" in stderr
+        assert "_lmer.yaml" in stderr
         assert "AGENTS.md (lmer-defaults)" in stderr
 
     def test_a_present_manifest_without_the_core_reads_no_legacy_names(
@@ -501,7 +501,7 @@ class TestUnreadableWorkRepo:
         the agent a pre-migration copy of someone's conventions."""
         root = tmp_path / "work"
         root.mkdir()
-        _write(root / "_plexus.yaml", "schema: 1\nname: example\n")
+        _write(root / "_lmer.yaml", "schema: 1\nname: example\n")
         _write(root / PRIMARY_HOST / PRIMARY_PATH / "info" / "AGENTS.md", LEGACY_DECOY)
         workspace = _make_workspace(tmp_path / "workspace")
         global_path = _make_global(tmp_path / "global")
@@ -522,7 +522,7 @@ class TestUnreadableWorkRepo:
         root = tmp_path / "work"
         root.mkdir()
         _write(
-            root / "_plexus.yaml",
+            root / "_lmer.yaml",
             "schema: 1\nname: example\nprojects:\n  lmer:\n    remotes:\n"
             f"      - {PRIMARY_REPO}\n",
         )
@@ -598,7 +598,7 @@ class TestAgreesWithPlacement:
         root = tmp_path / "work"
         root.mkdir()
         _write(
-            root / "_plexus.yaml",
+            root / "_lmer.yaml",
             f"schema: 1\nname: example\nprojects:\n  lmer:\n    repo: {PRIMARY_REPO}\n",
         )
         monkeypatch.setenv("LMER_REPO_HOST", host)

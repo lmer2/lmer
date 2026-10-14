@@ -1,4 +1,4 @@
-"""``_plexus.yaml`` — the plexus manifest, parsed into a typed model (spec §4).
+"""``_lmer.yaml`` — the plexus manifest, parsed into a typed model (spec §4).
 
 The manifest is the one file whose presence makes a tree schema form (D20):
 ``schema:`` int, instance ``name``, the ``projects`` registry, area
@@ -88,7 +88,7 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 
 #: The manifest filename at the plexus root (§2).
-MANIFEST_NAME = "_plexus.yaml"
+MANIFEST_NAME = "_lmer.yaml"
 
 #: Schema versions this loader understands. A present manifest declaring
 #: anything else fails loud (see the module docstring).
@@ -151,7 +151,7 @@ HOUSEKEEPING_POLICY_KEYS = ("archive_after",)
 
 
 class ManifestError(Exception):
-    """A present ``_plexus.yaml`` cannot be read or interpreted.
+    """A present ``_lmer.yaml`` cannot be read or interpreted.
 
     The single exception type of this module. Callers treat any instance as
     "this tree is schema form and unusable" — never as "no manifest, fall back
@@ -165,7 +165,7 @@ class ManifestError(Exception):
 
 @dataclass(frozen=True)
 class Manifest:
-    """One parsed ``_plexus.yaml``.
+    """One parsed ``_lmer.yaml``.
 
     ``projects``, ``sources`` and ``housekeeping`` are the sections as
     written: short name / source name / area name -> the raw entry mapping
@@ -210,7 +210,7 @@ def manifest_path(root) -> Path:
 def load_manifest(root) -> Optional[Manifest]:
     """Load the manifest of the plexus rooted at *root*.
 
-    Returns ``None`` when no ``_plexus.yaml`` exists there — the legacy-form
+    Returns ``None`` when no ``_lmer.yaml`` exists there — the legacy-form
     signal (D20). Anything present that cannot be read or interpreted raises
     :class:`ManifestError`; see the module docstring for the full taxonomy.
     """

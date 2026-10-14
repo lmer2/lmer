@@ -302,7 +302,7 @@ to the instance-wide scope shared by every project in the work repo — so a fac
 about you, or about how you should work, is recalled in every project rather
 than only the one you happened to learn it in. Recall reads both scopes, with
 the project scope taking precedence on a name collision. In a legacy work repo
-(no `_plexus.yaml`) there is only one scope and everything lands in
+(no `_lmer.yaml`) there is only one scope and everything lands in
 `{host}/{project}/memory/` as before.
 
 - **Restore is automatic.** At session start, any previously-saved memory for

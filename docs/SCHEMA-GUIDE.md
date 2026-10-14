@@ -20,12 +20,12 @@ it.
 **One repo conforming to that layout is a plexus.** Your work repo is a plexus
 in its *legacy form*.
 
-**Form detection.** A `_plexus.yaml` at the repo root means schema form; no
+**Form detection.** A `_lmer.yaml` at the repo root means schema form; no
 manifest means legacy form. That is the whole test — one file, no flag, no
 config. The same lmer release reads both, so you migrate trees one at a time,
 and never have to.
 
-**The manifest and the registry.** [`_plexus.yaml`](./SCHEMA.md#the-manifest-_plexusyaml)
+**The manifest and the registry.** [`_lmer.yaml`](./SCHEMA.md#the-manifest-_lmeryaml)
 carries a `schema:` int, a `name:`, and `projects:` — the registry, which is
 now the *only* source of project identity. An entry maps a short name to a
 primary `repo:` and optional additional `remotes:`. A session normalizes its
@@ -80,7 +80,7 @@ renaming them makes them silently invisible.
 
 | path | written by | read by | dual-read | exercised by |
 |---|---|---|---|---|
-| `_plexus.yaml` | you, by hand, or `work adopt` | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
+| `_lmer.yaml` | you, by hand, or `work adopt` | `lmer_schema.form.detect_form`, `work_repo.utils.work_repo_layout` | n/a | `lmer-schema validate .` |
 | `<short-name>/` | your `git mv`; a session on first write | registry resolution | n/a | `work sessions` |
 | `_knowledge/` | humans and agents; `work knowledge index` generates each org's `INDEX.md` | humans and agents | n/a | `work knowledge index` |
 | `_napkin/` | humans and agents | **nothing in this release — see below** | no | — |
@@ -209,7 +209,7 @@ the commit already made locally. Re-run `lmer-schema validate` after each
 step and compare the finding codes with the baseline.
 
 **1. Adopt the bucket.** `work adopt` resolves `<host>/<project>`, checks the
-shortname, the registry and the schema-tier fix list, bootstraps `_plexus.yaml`
+shortname, the registry and the schema-tier fix list, bootstraps `_lmer.yaml`
 if the tree has none (one loud notice: that file flips the WHOLE tree to schema
 form), writes the registry entry through the writer, and `git mv`s the directory
 to `<short-name>/` in ONE commit. Dry run by default; `--compat-link` leaves a
@@ -259,7 +259,7 @@ is forgotten by hand: `lmer platform forget <host>/<project>/<old-slug>`.
 `agent-files/claude` → `_agents/claude`, `mirrors` → `_agents/mirrors`,
 and `taskdef/` → `_taskdef/` — it leaves `napkin/` in place (see *What to
 leave alone*) — and folds a standalone
-`sources.yaml` into `_plexus.yaml sources:` through the writer, removing the
+`sources.yaml` into `_lmer.yaml sources:` through the writer, removing the
 file in the same commit. It REFUSES unless the running release reads the
 manifest `sources:` tier: deploy the release carrying #370 on every host first,
 because removing `sources.yaml` switches declared sources off on any host still
@@ -312,7 +312,7 @@ result as one change through the normal gated commit — the root `README.md`
 included: no session's push ever stages it, so `work commit` would leave it
 behind. From here every durability push keeps the project blocks fresh on
 its own; the root block is yours to re-render, and commit the same way, when
-`_plexus.yaml` changes.
+`_lmer.yaml` changes.
 
 ### What to leave alone
 
@@ -419,7 +419,7 @@ never infer sign-out from age or manufacture an end event to pass preflight.
 
 Before launching these tasks, commit the scratch manifest change through the
 normal gate and publish it to the disposable local remote; verify that remote's
-`_plexus.yaml` declares `schema: 2`. Ordinary `work commit` publishes session,
+`_lmer.yaml` declares `schema: 2`. Ordinary `work commit` publishes session,
 specification and memory paths, not the manifest. Running it with an uncommitted
 version change would otherwise publish v2 records under a schema-1 manifest.
 Production cutover is a separate step after the rehearsal.
@@ -498,7 +498,7 @@ summary line says so whenever it wrote the root (`commit the root README.md
 explicitly through the normal gated commit`); a root left to `work commit`
 stays uncommitted and disappears with the container. From then on the
 project blocks keep themselves fresh; the root block is re-rendered, and
-committed the same way, when `_plexus.yaml` changes.
+committed the same way, when `_lmer.yaml` changes.
 
 The backfill never writes inside a historical record. A project directory is
 written into only when it is the real directory its name says: one that is a
@@ -560,7 +560,7 @@ project holds run records and no generated index block). Legacy tree:
 ```bash
 PYTHONPATH=src python -m lmer_schema.cli validate /nope; echo "exit=$?"          # 2
 mkdir -p "$SCRATCH/broken"
-printf 'schema: true\nname: x\n' > "$SCRATCH/broken/_plexus.yaml"
+printf 'schema: true\nname: x\n' > "$SCRATCH/broken/_lmer.yaml"
 PYTHONPATH=src python -m lmer_schema.cli validate "$SCRATCH/broken"; echo "exit=$?"  # 2
 PYTHONPATH=src python -m lmer_schema.cli validate "$SCRATCH/broken" --list-checks   # 2, stderr
 ```

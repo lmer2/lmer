@@ -1,6 +1,6 @@
 """``lmer_schema.checks.manifest`` — the manifest-envelope checks (issue #353).
 
-The validator's first check module: it looks at the ``_plexus.yaml``
+The validator's first check module: it looks at the ``_lmer.yaml``
 ENVELOPE only — presence, parseability, the ``schema:`` int in BOTH
 directions, ``name:``, unknown keys, and the ``sources:``/``housekeeping:``
 sections. What is pinned here:

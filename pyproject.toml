@@ -33,7 +33,7 @@ dependencies = [
     "pre-commit>=3.5.0",
     "requests>=2.33.0",
     "pyyaml>=6.0",
-    # Round-trip rewrites of the hand-annotated `_plexus.yaml` (issue #365;
+    # Round-trip rewrites of the hand-annotated `_lmer.yaml` (issue #365;
     # the decision is docs/DEVELOPMENT.md "Manifest rewrites"). PyYAML drops
     # every comment on dump; ruamel's round-trip mode keeps them, and only
     # the manifest WRITER imports it — the read path (`lmer_schema.manifest`,

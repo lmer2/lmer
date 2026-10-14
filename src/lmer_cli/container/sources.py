@@ -88,7 +88,7 @@ Error taxonomy
 Declaration tiers (issue #370)
 ==============================
 A source is declared in one of two files and ``load_sources`` reads both:
-the plexus manifest's ``_plexus.yaml sources:`` section (the schema-form
+the plexus manifest's ``_lmer.yaml sources:`` section (the schema-form
 tier) and the legacy standalone ``sources.yaml``. Precedence is per source
 key, whole entry: an env-var override beats the manifest (the container's
 resolution matrix in ``clone_and_exec``), the manifest beats the legacy
@@ -104,7 +104,7 @@ refuses start — including an outranked legacy file, which keeps its
 is ``lmer_schema.manifest``'s, and ``sources:`` carries no second version
 field.
 
-This module never opens or parses ``_plexus.yaml``: the caller hands in the
+This module never opens or parses ``_lmer.yaml``: the caller hands in the
 raw ``Manifest.sources`` dict ``lmer_schema.manifest.load_manifest`` already
 returns (``manifest_sources=``) plus the path to name in messages
 (``manifest_path=``), so there is one manifest parser and the import
@@ -127,7 +127,7 @@ Capability marker (version floor)
 ``MANIFEST_TIER_SUPPORTED = True`` is a plain module constant and the ONE
 importable capability marker B's ``work migrate --instance`` checks as its
 version floor (spec §10 rollout E -> B; astra R7). What it asserts: this
-lmer's container start, ``--show-env`` and doctor read ``_plexus.yaml
+lmer's container start, ``--show-env`` and doctor read ``_lmer.yaml
 sources:`` with env > manifest > legacy precedence. Who reads it: the
 ``--instance`` fold refuses when the marker is absent or false — absent
 means a pre-E release. What it cannot prove: it covers only the install
@@ -188,7 +188,7 @@ changing any of it is a breaking change to doctor:
 
 - Manifest location (decision record, #370 point 4 — additive to the seam
   above): ``doctor`` reads the manifest BESIDE ``--path``, at
-  ``<directory of --path>/_plexus.yaml``, rather than through a separate
+  ``<directory of --path>/_lmer.yaml``, rather than through a separate
   ``--manifest PATH`` option. The two declaration files are siblings at
   the work-repo root by definition (the manifest's ``sources:`` is the
   folded-in ``sources.yaml``) and ``clone_and_exec`` resolves both from that
@@ -290,7 +290,7 @@ _RESERVED_SOURCE_KEYS = ("masterplan_mirror",)
 # import contract above). Used only as the default message label when a
 # caller passes `manifest_sources` without `manifest_path`; this module never
 # opens the file. tests/test_sources_config.py drift-guards the mirror.
-MANIFEST_FILENAME = "_plexus.yaml"
+MANIFEST_FILENAME = "_lmer.yaml"
 
 # Declaration tiers (issue #370): where a resolved source came from, carried
 # per source in the config's `tiers` map (module docstring, "Declaration
@@ -1044,7 +1044,7 @@ def load_sources(
     ``Manifest.sources`` dict ``lmer_schema.manifest.load_manifest``
     returns — and ``manifest_path`` the manifest's path, named in messages
     (default: the bare filename). This function never opens or parses
-    ``_plexus.yaml`` itself. Omit ``manifest_sources`` (``None``) on a tree
+    ``_lmer.yaml`` itself. Omit ``manifest_sources`` (``None``) on a tree
     without a manifest: the result is then exactly the legacy-only value.
 
     Returns ``(config, warnings)``:
@@ -1318,7 +1318,7 @@ def _cmd_validate(args) -> int:
 
 def _doctor_manifest_sources(root) -> Tuple[Optional[dict], bool, list, list]:
     """The manifest tier for `doctor`: ``(manifest_sources, manifest_present,
-    warnings, errors)``, read from ``<root>/_plexus.yaml`` — the directory of
+    warnings, errors)``, read from ``<root>/_lmer.yaml`` — the directory of
     ``--path`` (decision record in the module docstring, "Doctor CLI").
 
     Presence is a stat, ``is_symlink()`` first — the rule ``load_manifest``

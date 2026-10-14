@@ -67,9 +67,9 @@ mapping section → list of entry strings. Entry-quality rules unchanged
 The gate-check Changelog check accepts a staged fragment as the changelog
 update; release commits that rewrite `CHANGELOG.yaml` itself still pass.
 
-## Manifest rewrites: ruamel.yaml round trip for `_plexus.yaml`, PyYAML everywhere else
+## Manifest rewrites: ruamel.yaml round trip for `_lmer.yaml`, PyYAML everywhere else
 
-**Decision (2026-10-07):** tool rewrites of `_plexus.yaml` — the registry
+**Decision (2026-10-07):** tool rewrites of `_lmer.yaml` — the registry
 writer (#366) and its consumers `work adopt` (#367) and `work migrate`
 (#368) — go through ruamel.yaml's round-trip mode, declared as a core
 dependency (`ruamel.yaml>=0.19.1,<0.20`) that ONLY the manifest writer

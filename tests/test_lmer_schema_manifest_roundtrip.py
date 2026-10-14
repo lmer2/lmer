@@ -1,4 +1,4 @@
-"""``_plexus.yaml`` rewrites through ruamel.yaml's round trip (issue #365).
+"""``_lmer.yaml`` rewrites through ruamel.yaml's round trip (issue #365).
 
 The manifest is hand-edited and annotated, and every PyYAML writer in lmer
 drops every comment on rewrite. This file is the time-boxed spike that
@@ -529,7 +529,7 @@ def test_newer_or_bool_schema_is_refused_before_any_write(tmp_path, value, fragm
     """The PyYAML read path is the gate: a newer int (§8 version floor) or
     the ``schema: true`` bool trap raises ``ManifestError`` and ruamel is
     never reached, so the file on disk is untouched byte for byte."""
-    path = tmp_path / "_plexus.yaml"
+    path = tmp_path / "_lmer.yaml"
     text = _fixture_text().replace("schema: 1", f"schema: {value}", 1)
     path.write_bytes(text.encode("utf-8"))
     opened = []

@@ -1,6 +1,6 @@
 """Manifest-envelope checks — the validator's first check module (spec §4/§7).
 
-This module answers one question: is the ``_plexus.yaml`` at the root of this
+This module answers one question: is the ``_lmer.yaml`` at the root of this
 tree a manifest lmer can use, and what should the operator know about it? It
 checks the ENVELOPE — presence, parseability, the ``schema:`` int in both
 directions, ``name:``, unknown keys, the ``sources:`` mounts and the
@@ -100,7 +100,7 @@ register(
     Severity.INFO,
     tier=Tier.LEGACY,
     summary=(
-        "no `_plexus.yaml` at the plexus root: the tree is legacy form, "
+        "no `_lmer.yaml` at the plexus root: the tree is legacy form, "
         "recognised and read in place (never an error)"
     ),
 )
@@ -109,7 +109,7 @@ register(
     Severity.ERROR,
     tier=Tier.MACHINE,
     summary=(
-        "a present `_plexus.yaml` that cannot be read or interpreted "
+        "a present `_lmer.yaml` that cannot be read or interpreted "
         "(unusable input: a broken manifest never demotes a tree to legacy)"
     ),
 )

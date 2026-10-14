@@ -7,7 +7,7 @@ YAML writers of their own:
   ``ruamel`` import anywhere in either module;
 - the manifest is written only through ``lmer_schema.writer`` (reached via
   ``work_repo.utils.core_module("writer")``), never by opening
-  ``_plexus.yaml`` for writing or calling ``write_text``/``write_bytes`` on
+  ``_lmer.yaml`` for writing or calling ``write_text``/``write_bytes`` on
   it;
 - no module imports the test package.
 
@@ -38,7 +38,7 @@ _FILE_WRITE_ATTRS = {
 
 #: The manifest's own names; a direct write touching one of these is a
 #: bypass of the writer.
-_MANIFEST_NAMES = {"_plexus.yaml", "MANIFEST_NAME", "manifest_path", "manifest"}
+_MANIFEST_NAMES = {"_lmer.yaml", "MANIFEST_NAME", "manifest_path", "manifest"}
 
 
 def _tree(name):

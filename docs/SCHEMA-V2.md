@@ -2,7 +2,7 @@
 
 Schema 2 keeps the [schema-1 layout](./SCHEMA.md), but changes who may write
 a record, how repository identity compares, and how memory retirement works.
-The root `_plexus.yaml` declares `schema: 2`. Older lmer versions that only
+The root `_lmer.yaml` declares `schema: 2`. Older lmer versions that only
 understand schema 1 must refuse writes; schema 1 remains supported under its
 original rules until an explicit migration.
 
@@ -337,7 +337,7 @@ between `<!-- lmer:index:start -->` and `<!-- lmer:index:end -->`: a table
 with one row per execution record under `_runs/`, newest first, rendered from
 each record's own `state.yaml`, `events.jsonl` and — only when the record has
 neither name nor goal — `log.yaml`. The root `README.md` may carry the same
-kind of block listing the registered projects from `_plexus.yaml`. Text
+kind of block listing the registered projects from `_lmer.yaml`. Text
 outside the markers is human content, never touched and never checked; the
 first append normalises only the hand text's trailing newlines.
 
@@ -450,7 +450,7 @@ commit and publish the result through the normal repository gates.
 | `<project>/_claims/release.yaml` | Release claim CLI | Optional machine-owned shared resource claim |
 | `<session-dir>/state.yaml` → `session` | Current execution | Freeform metadata dictionary, opaque UID required |
 | `<session-dir>/events.jsonl` → `session_start.data.session` | Current execution | Start metadata snapshot |
-| `README.md` → index block | `lmer-schema index --write` | Optional generated project list between the index markers, rendered from `_plexus.yaml` plus a fixed legend; text outside the markers is content |
+| `README.md` → index block | `lmer-schema index --write` | Optional generated project list between the index markers, rendered from `_lmer.yaml` plus a fixed legend; text outside the markers is content |
 | `<project>/README.md` → index block | Every durability push in the project; `lmer-schema index --write` | Optional generated run table between the index markers, one row per committed record, newest first; text outside the markers is content |
 
 The validator accepts unknown session metadata. It reports invalid identity

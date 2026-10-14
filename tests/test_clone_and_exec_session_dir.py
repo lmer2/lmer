@@ -12,7 +12,7 @@ What is pinned here, in the order the module reaches it:
 
 - **Form detection costs one stat in a legacy tree.** The entrypoint runs
   standalone and must not depend on the package being importable (see its
-  module docstring), so a tree with no ``_plexus.yaml`` answers "legacy"
+  module docstring), so a tree with no ``_lmer.yaml`` answers "legacy"
   without importing anything — proved by resolving one with the core made
   unimportable. A tree that HAS a manifest and a build that cannot read it
   refuses to place anything rather than falling back to the legacy names
@@ -214,9 +214,9 @@ def _without_core():
 
 
 def _broken_manifest(root):
-    """A root whose ``_plexus.yaml`` is present and cannot be parsed."""
+    """A root whose ``_lmer.yaml`` is present and cannot be parsed."""
     root.mkdir(parents=True, exist_ok=True)
-    (root / "_plexus.yaml").write_text("schema: 1\nprojects: [oops\n", encoding="utf-8")
+    (root / "_lmer.yaml").write_text("schema: 1\nprojects: [oops\n", encoding="utf-8")
     return root
 
 
@@ -343,14 +343,14 @@ class TestPlacement:
         )
         assert placement.schema is True
         assert placement.base is None
-        assert placement.problem and "_plexus.yaml" in placement.problem
+        assert placement.problem and "_lmer.yaml" in placement.problem
 
     def test_a_present_manifest_without_the_core_is_not_a_legacy_tree(self, tmp_path):
         """The one thing that must never happen (D20): a schema tree read at
         the legacy names because this build could not read its manifest."""
         root = tmp_path / "work"
         root.mkdir()
-        (root / "_plexus.yaml").write_text("schema: 1\nname: example\n", encoding="utf-8")
+        (root / "_lmer.yaml").write_text("schema: 1\nname: example\n", encoding="utf-8")
         with _without_core():
             placement = clone_and_exec._resolve_work_repo_placement(
                 root, PRIMARY_HOST, PRIMARY_PATH
@@ -364,7 +364,7 @@ class TestPlacement:
         fallback WITHIN the form, matching the work CLI and the validator."""
         root = tmp_path / "work"
         root.mkdir()
-        (root / "_plexus.yaml").write_text(
+        (root / "_lmer.yaml").write_text(
             "schema: 1\nname: example\nprojects:\n  lmer:\n    remotes:\n"
             f"      - {PRIMARY_REPO}\n",
             encoding="utf-8",
@@ -438,7 +438,7 @@ class TestSchemaFormSessionDir:
         chain's ``{project}/info/``)."""
         root = tmp_path / "work"
         root.mkdir()
-        (root / "_plexus.yaml").write_text(
+        (root / "_lmer.yaml").write_text(
             f"schema: 1\nname: example\nprojects:\n  lmer:\n    repo: {PRIMARY_REPO}\n",
             encoding="utf-8",
         )
@@ -534,7 +534,7 @@ class TestSchemaFormSessionDir:
             root, PRIMARY_HOST, PRIMARY_PATH, TASKDEF, TARGET
         )
         assert _tree_dirs(root) == []
-        assert "_plexus.yaml" in capsys.readouterr().err
+        assert "_lmer.yaml" in capsys.readouterr().err
 
     def test_running_twice_is_idempotent(self, tmp_path, monkeypatch):
         tree = build_schema_plexus(tmp_path / "work")

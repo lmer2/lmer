@@ -143,7 +143,7 @@ def test_standalone_manifest_tier_call_needs_neither_lmer_schema_nor_pyyaml(tmp_
             {missing!r},
             work_repo_url=work_url,
             manifest_sources=manifest,
-            manifest_path="/work/_plexus.yaml",
+            manifest_path="/work/_lmer.yaml",
         )
         assert warnings == [], warnings
         assert cfg["sources"] == dict(taskdef=dict(repo="https://git.example.com/agents/taskdefs.git", ref="main")), cfg
@@ -156,7 +156,7 @@ def test_standalone_manifest_tier_call_needs_neither_lmer_schema_nor_pyyaml(tmp_
                 {missing!r},
                 work_repo_url=work_url,
                 manifest_sources=dict(napkin=dict(repo="https://evil.example.org/20c/napkin.git")),
-                manifest_path="/work/_plexus.yaml",
+                manifest_path="/work/_lmer.yaml",
             )
         except mod.SourcesConfigError as exc:
             assert "LMER_NAPKIN_REPO" in str(exc), exc
