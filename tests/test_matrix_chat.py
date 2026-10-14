@@ -524,6 +524,47 @@ class TestConnector:
         assert asserted.matrix.uploads == [("report.txt", "text/plain", b"all green")]
         assert any(s[3] == "m.file" for s in asserted.matrix.sent)
 
+    @pytest.mark.parametrize("authenticated_media", [False, True])
+    def test_a_credential_shaped_name_is_scrubbed_everywhere(self, tmp_path, authenticated_media):
+        shaped = "ghp_" + "Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz3"
+        store = tmp_path / "uploads"
+        store.mkdir()
+        (store / "f.csv").write_text("a,b\n", encoding="utf-8")
+        rig = Rig(tmp_path, uploads=str(store), authenticated_media=authenticated_media)
+        rig.connector.room_id = ROOM
+        record = {"kind": "message", "text": "see", "source": {"channel": "agent"}, "meta": {},
+                  "attachments": [{"name": f"{shaped}.csv", "media_type": "text/csv", "bytes": 4,
+                                   "path": "/home/developer/.lmer-uploads/f.csv"}]}
+        try:
+            rig.connector._post_outbound(record, {})
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+        assert len(rig.matrix.sent) == 2
+        assert all(shaped not in sent[2] for sent in rig.matrix.sent)
+        assert all(shaped not in filename for filename, _type, _data in rig.matrix.uploads)
+        assert len(rig.matrix.uploads) == (1 if authenticated_media else 0)
+
+    def test_a_record_posted_into_another_thread_does_not_upload_here(self, tmp_path):
+        store = tmp_path / "uploads"
+        store.mkdir()
+        (store / "f.csv").write_text("a,b\n", encoding="utf-8")
+        rig = Rig(tmp_path, uploads=str(store), authenticated_media=True)
+        rig.connector.room_id = ROOM
+        record = {"kind": "message", "text": "see", "source": {"channel": "agent"},
+                  "meta": {"thread": "https://matrix.to/#/!other:example.org/$elsewhere"},
+                  "attachments": [{"name": "f.csv", "media_type": "text/csv", "bytes": 4,
+                                   "path": "/home/developer/.lmer-uploads/f.csv"}]}
+        try:
+            rig.connector._post_outbound(record, {})
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+        assert rig.matrix.uploads == []
+        assert [sent[3] for sent in rig.matrix.sent] == ["m.text"]
+
 
 # ---------------------------------------------------------------------------
 # configuration, the target handler, the listener

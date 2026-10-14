@@ -931,11 +931,36 @@ is never blindly replayed. The connector runs until stopped:
 - **files**: a file in a live thread message is downloaded into the session's upload
   store — capped at the same size a read of a thread copies in — and the record
   names it with the `[lmer upload] <path> (<type>, <size>)` reference #246
-  defines. The agent's `--attach` goes the other way:
-  Slack posts the name; matrix uploads the bytes only under
-  `LMER_MATRIX_AUTHENTICATED_MEDIA=1` (the operator's assertion that the
-  homeserver requires authentication for media) and only when the bytes pass
-  the scrub, else posts a one-line "withheld" note.
+  defines. The agent's `--attach` goes the other way, under one set of rules
+  for both transports and both doors (the connector and `post --thread`). The
+  message text names each file (`📎 <name>`). Each file then follows as its own
+  thread item, either uploaded or replaced by a
+  `📎 <name> withheld: <reason>` note. `post --thread` gathers its notes into one
+  message. The bytes are read from the session's
+  upload store on a descriptor. A file over 25 MiB (the inbound cap) is withheld.
+  Text files are redacted. A binary file whose literal bytes carry something
+  credential-shaped is withheld, but the scan does not see inside compressed
+  containers. There is no file-type allowlist. A record that went into another
+  thread (`meta.thread`, from `post --thread`) uploads nothing here, because its
+  files went to the thread it names. Slack uploads through
+  `files.getUploadURLExternal` and `files.completeUploadExternal` into the thread.
+  This needs the `files:write` scope, and without it the note names that scope.
+  Another definitive Slack refusal, at upload or at share, is named by its error
+  code. At upload nothing is visible yet, so the connector retries a transport
+  failure, a rate limit, or a server-side or temporary Slack code. At share it
+  retries a rate limit. A documented refusal of `files.completeUploadExternal`,
+  or a rejection the durable layer already verifies (`restricted_action`,
+  `is_archived`, …), becomes the note. Any other failure (for `internal_error`,
+  "part of the operation may have succeeded") holds delivery for
+  `connector_recovery` ([CONNECTOR-RECOVERY.md](CONNECTOR-RECOVERY.md)), as an
+  uncertain text post does. `post --thread` is one attempt and notes the failure. A share is
+  attributed by its file id in the host registry, because Slack never returns the
+  share's `ts`. This lets a connector on the thread relay another run's file and
+  recognise its own. The connector records an upload before
+  sharing it, so a retry shares the same file and never re-posts the text.
+  Matrix uploads only under `LMER_MATRIX_AUTHENTICATED_MEDIA=1` (the operator's
+  assertion that the homeserver requires authentication for media). A file
+  never stops the text post.
 
 **Attach delivers one notice.** A single `message`, tagged `[slack]` or
 `[matrix]`, names the thread, its full snapshot count (root included), the
@@ -1720,7 +1745,11 @@ servicer that dies holding one lets the asker's `--timeout` end the wait, becaus
 nothing retries a request that was already claimed.
 
 A file in a thread is **described** on the record either way, and copied into the
-session's upload store when there is one and the read still has room: each file is
+session's upload store when there is one and the read still has room. The
+platform's `GET /api/comms/thread` (`lmer-ctl thread read`) copies into the
+calling assistant's mounted store. Any other caller gets a reason naming
+`lmer-signal read <permalink>`, the command that copies the file in (#550). In
+each case: each file is
 bounded (25 MiB) and so is a whole read (100 MiB), counted as the bytes arrive
 rather than after they are resident — the files are posted by whoever is in the
 thread, and on the platform route the process fetching them serves the fleet. A
@@ -1752,9 +1781,10 @@ lmer-ctl thread post <permalink> "<text>"
 ```
 
 The same work, in the daemon, with the daemon's credentials — for the UI and for
-uber lmer. No session and no connection is involved, so a file in the thread is
-described rather than copied anywhere, and the prefix comes from the **caller's
-credential** the way `source.channel` does: `uber lmer` for the assistant's,
+uber lmer. No connection is involved. A file in the thread is copied into the
+calling assistant's upload store. For any other caller it is described, with
+`lmer-signal read <permalink>` named as the command that copies it in. The prefix
+comes from the **caller's credential** the way `source.channel` does: `uber lmer` for the assistant's,
 `operator` for the shared secret, a connector's channel for a connector's.
 
 ### Refusals

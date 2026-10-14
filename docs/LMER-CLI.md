@@ -764,6 +764,7 @@ In a chat-bridged session the terminal is a separate channel from the thread: re
    - `app_mentions:read` — receive @bot mentions (**required for `lmer-slack-listener`**; not needed for the direct `lmer chat <permalink>` flow)
    - `im:write` — open a direct message with a user (**required for `lmer-signal dm`**; without it every DM fails at `conversations.open`, whatever the allow list says)
    - `users:read` — confirm an inbound DM, channel-mention or thread-mention sender's handle when `LMER_SLACK_DM_ALLOWED_USERS` lists handles, and look up outbound DM recipients named by handle (exact user-ID entries need neither lookup)
+   - `files:write` — upload a run's `lmer-signal post --attach` files into the thread. Without it the text still posts and each file is replaced by `📎 <name> withheld: the Slack app lacks the files:write scope`
 
    Adding a scope to an app that is already installed needs a **re-install** (step 3) before it takes effect.
 3. Go back to **"OAuth & Permissions"**, click **"Install to Workspace"**, and approve. Copy the **"Bot User OAuth Token"** (starts with `xoxb-`) and set it in your `.env` file:

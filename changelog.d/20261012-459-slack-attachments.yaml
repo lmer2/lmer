@@ -1,0 +1,3 @@
+fixed:
+- "Slack threads now receive a run's `--attach` files as uploads, or a withheld note naming why; needs the `files:write` scope"
+- "`lmer-ctl thread read` copies a thread's files into the calling assistant's upload store instead of only describing them"

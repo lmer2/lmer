@@ -90,7 +90,8 @@ triggering message ID, conversation, thread root, permalink and optional DM
 parent receipt. Each message carries text and an explicit clipping flag if it
 exceeds 8,000 characters. Read the source thread to obtain the full text.
 
-The assistant reads the supplied permalink with `lmer-ctl thread read <permalink>`
+The assistant reads the supplied permalink with `lmer-ctl thread read <permalink>`,
+which copies the thread's files into the assistant's upload store,
 and responds using `lmer-ctl thread post <permalink> <text>`. That explicit post
 addresses only the named conversation and does not journal the body on the
 assistant's shared bus. Do not use a broadcast `lmer-signal post` for contextual
