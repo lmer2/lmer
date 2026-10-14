@@ -53,7 +53,7 @@ SCHEMA_VERSION = 1
 #: The ``meta`` keys the supervisor stamps itself. A caller's own copy of one is
 #: dropped rather than stored, and ``docs/COMMS.md`` §1 lists exactly these.
 RESERVED_META_KEYS = (
-    "late", "answered_by", "delivered", "session_origin", "option",
+    "late", "answered_by", "delivered", "session_origin", "option", "off_thread",
 )
 
 #: File name inside the mounted session directory
@@ -108,6 +108,15 @@ CHANNEL_UBER = "uber-lmer"
 CHANNEL_SLACK = "slack"
 CHANNEL_MATRIX = "matrix"
 CHANNEL_SUPERVISOR = "supervisor"
+
+#: ``meta`` flag for a record the Slack/Matrix threads neither show nor bind a
+#: reply to. An open question so flagged still reaches uber lmer as live.
+META_OFF_THREAD = "off_thread"
+
+
+def off_thread(record: Optional[Mapping]) -> bool:
+    return bool(record) and (record.get("meta") or {}).get(META_OFF_THREAD) is True
+
 
 # Structured lifecycle acknowledgment; consumers never infer it from prose.
 EVENT_SESSION_END_REQUESTED = "session_end_requested"
@@ -635,6 +644,7 @@ class MessageLog:
         meta: object = None,
         session_caller: bool = False,
         local_only: bool = False,
+        off_thread: bool = False,
     ) -> tuple[Message, str]:
         """Validate, arbitrate, persist and publish one record.
 
@@ -651,6 +661,9 @@ class MessageLog:
         for a channel that showed the human a numbered list. It names the
         option; it is not parsed out of *text*, so free text is never turned
         into a choice.
+
+        *off_thread* (supervisor only) keeps a question off the chat threads;
+        an answer or close to it inherits the flag.
         """
         if not isinstance(kind, str) or not kind:
             raise CommsError("kind is required")
@@ -668,6 +681,8 @@ class MessageLog:
         extra = _clean_meta(meta)
         for reserved in RESERVED_META_KEYS:
             extra.pop(reserved, None)
+        if off_thread:
+            extra[META_OFF_THREAD] = True
 
         with self._cond:
             if source.ref:
@@ -687,6 +702,8 @@ class MessageLog:
                 if state is None:
                     raise CommsError(f"in_reply_to {in_reply_to!r} names no question on this session")
                 reply_to = target
+                if state.question.meta.get(META_OFF_THREAD) is True:
+                    extra[META_OFF_THREAD] = True
                 if kind == KIND_ANSWER:
                     offered = state.question.options
                     if picked is not None:

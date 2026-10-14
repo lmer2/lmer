@@ -19,6 +19,7 @@ and what a thread is told.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -355,7 +356,7 @@ class ThreadConnectors:
                 # Not this check's to refuse: an unusable target is dropped with
                 # a warning by adopt_launch_targets, not made fatal to a launch.
                 continue
-            ref = self._resolved(ref, require_resolution=True)
+            ref = self._held_check_ref(ref, besides=besides)
             with self._lock:
                 holder = self._live_holder(ref, besides=besides)
             if holder is not None:
@@ -375,6 +376,37 @@ class ThreadConnectors:
                     "or disconnect the thread there, then launch this one",
                     status=409,
                 )
+
+    def _held_check_ref(self, ref: ThreadRef, *, besides: Optional[str]) -> ThreadRef:
+        """The identity :meth:`refuse_held_targets` checks *ref* under.
+
+        The replaced session's own record is reused as it stands, with no
+        transport read. Any other target must resolve; a refusal names the
+        method that failed.
+        """
+        if besides is not None:
+            with self._lock:
+                for record in self._sessions.get(besides, ()):
+                    if record["id"] == ref.id or record["permalink"] == ref.permalink:
+                        return _ref_of(record)
+        if ref.channel == CHANNEL_SLACK:
+            self._require_slack_credentials()
+        elif ref.key["room"].startswith("#"):
+            self._require_matrix_credentials()
+        try:
+            return self._resolved(ref, require_resolution=True)
+        except ThreadError as exc:
+            method = "conversations.replies" if ref.channel == CHANNEL_SLACK else "room alias resolution"
+            if exc.retry_after is not None:
+                later = f"; rate limited, so retry in {math.ceil(exc.retry_after)}s or later"
+            elif exc.transient:
+                later = "; it is transient, but no retry time was given"
+            else:
+                later = ""
+            raise ThreadError(
+                f"cannot check who holds {ref.permalink}: {method} failed ({exc}){later}",
+                status=exc.status, transient=exc.transient, retry_after=exc.retry_after,
+            ) from None
 
     def prepare(self, permalink: object, *, checks: bool = True) -> ThreadRef:
         """Parse *permalink* and check this host can actually serve it.
@@ -415,10 +447,13 @@ class ThreadConnectors:
             )
         except Exception as exc:
             if require_resolution:
+                status = getattr(exc, "status", None)
                 raise ThreadError(
                     f"cannot verify the matrix room {ref.key['room']}: {exc} — "
                     "retry once it can be resolved, or launch without that thread",
-                    status=getattr(exc, "status", 502),
+                    # MatrixError carries status=None when the homeserver never answered.
+                    status=status if isinstance(status, int) else 502,
+                    **thread_access.retry_hint(exc),
                 ) from None
             logger.warning(
                 "platform_thread_alias_unresolved room=%s error=%s", ref.key["room"], exc,

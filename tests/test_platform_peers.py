@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
@@ -76,6 +77,16 @@ def host(fleet, tmp_path, monkeypatch):
     hub.stop()
 
 
+def submitted(native, ident=None):
+    """The destination adapter's receipt once its relay worker has settled it."""
+    for _ in range(500):
+        receipts = [r for r in native.snapshot()["receipts"] if ident in (None, r["delivery_id"])]
+        if receipts and receipts[-1]["state"] != "pending":
+            return receipts[-1]
+        threading.Event().wait(.01)
+    raise AssertionError("the destination never settled the relay")
+
+
 def send(host, text="Requested coordination", ref="task-1", **extra):
     http, alpha, _beta, _first, second, _attach = host
     return http.post(f"/api/sessions/{second['session']}/comms", headers=credential(alpha["id"]),
@@ -134,8 +145,9 @@ def test_peer_send_and_reply_have_native_bus_history_and_durable_provenance(host
     assert result.status_code == 200, result.text
     payload = result.json()
     assert payload["outcome"] == "recorded"
-    assert payload["relay"]["state"] == "accepted" and payload["relay"]["submit_confirmed"] is False
+    assert payload["relay"] == {"queued": True, "bytes_written": 0}
     record = payload["message"]
+    assert submitted(second["native"], record["id"])["state"] == "accepted"
     assert record["source"]["channel"] == "peer-ul"
     assert record["meta"]["peer"]["project_id"] == alpha["id"]
     assert record["meta"]["peer"]["session"] == first["session"]
@@ -250,10 +262,12 @@ def test_uncertain_delivery_is_retained_and_never_replayed(host, fleet, monkeypa
 
         second["native"]._request.side_effect = lose
     first = send(host)
-    assert first.status_code == 409, first.text
     if lost == "native":
-        assert first.json()["detail"]["relay"]["state"] == "uncertain"
-        assert first.json()["detail"]["relay"]["submit_confirmed"] is False
+        # The destination's adapter owns the outcome: it escalates, never resends.
+        assert first.status_code == 200 and first.json()["outcome"] == "recorded", first.text
+        assert submitted(second["native"])["state"] == "uncertain"
+    else:
+        assert first.status_code == 409, first.text
     projects.rotate(alpha["id"], fleet)
     repeated = send(host)
     assert repeated.status_code == first.status_code, repeated.text
@@ -369,15 +383,15 @@ def test_process_loss_after_bus_acceptance_retains_sending_receipt(host, monkeyp
     assert second["log"].seq == 1
 
 
-def test_native_refusal_is_not_hidden_by_bus_acceptance(host):
+def test_an_unreachable_destination_retries_the_recorded_send_itself(host):
+    """Not "refused": the destination adapter resubmits it, so a peer resend would arrive twice."""
     second = host[4]
     second["native"]._connect.side_effect = codex_delivery.CodexDeliveryError("fixture native destination unavailable")
     first = send(host)
-    assert first.status_code == 409, first.text
-    assert first.json()["detail"]["outcome"] == "delivery_refused"
-    assert first.json()["detail"]["relay"]["retryable"] is True
+    assert first.status_code == 200 and first.json()["outcome"] == "recorded", first.text
+    assert submitted(second["native"])["state"] == "retrying"
     repeated = send(host)
-    assert repeated.status_code == 409 and repeated.json()["detail"]["replayed_receipt"]
+    assert repeated.status_code == 200 and repeated.json()["replayed_receipt"]
     assert second["log"].seq == 1
     assert not any(call.args[0] == "turn/start" for call in second["native"]._request.call_args_list)
 

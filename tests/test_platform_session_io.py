@@ -34,6 +34,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from lmer_cli import codex_delivery
 from lmer_platform import api, registry, session_io, spawn
 from lmer_platform import config as cfg
 from lmer_platform import store
@@ -170,6 +171,11 @@ class FakeControlPlane:
 
     def answer(self, path, status, payload):
         self.answers[path] = (status, payload)
+
+    @property
+    def posts(self):
+        """The calls minus GETs: a submitting /input probes /healthz first."""
+        return [call for call in self.calls if call.get("method") != "GET"]
 
     def stop(self):
         self._server.shutdown()
@@ -769,7 +775,7 @@ def test_input_arrives_with_the_session_bearer_token(platform_root, control_plan
     reply = session_io.send_input("s-1", "the answer", append_newline=True)
 
     assert reply == {"bytes_written": 7}
-    assert control_plane.calls == [{
+    assert control_plane.posts == [{
         "path": "/input",
         "authorization": f"Bearer {CONTROL_TOKEN}",
         "body": {"data": "the answer", "append_newline": True},
@@ -800,7 +806,7 @@ def test_a_chat_message_is_marked_as_one_for_the_supervisor(
         "s-1", "!206 was merged", append_newline=True, sanitize=True
     )
 
-    assert control_plane.calls[0]["body"] == {
+    assert control_plane.posts[0]["body"] == {
         "data": "!206 was merged",
         "append_newline": True,
         "sanitize": True,
@@ -821,8 +827,8 @@ def test_slash_command_intent_is_forwarded_only_with_the_prose_guard(
         preserve_slash_commands=True,
     )
 
-    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
-    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
+    assert control_plane.posts[0]["body"]["preserve_slash_commands"] is True
+    assert "preserve_slash_commands" not in control_plane.posts[1]["body"]
 
 
 def test_input_nobody_flagged_puts_nothing_new_on_the_wire(
@@ -836,7 +842,7 @@ def test_input_nobody_flagged_puts_nothing_new_on_the_wire(
 
     session_io.send_input("s-1", "!ls", append_newline=True)
 
-    assert "sanitize" not in control_plane.calls[0]["body"]
+    assert "sanitize" not in control_plane.posts[0]["body"]
 
 
 def test_the_input_payload_is_never_logged(platform_root, control_plane, caplog):
@@ -1721,7 +1727,7 @@ def test_tty_input_frame_reaches_the_control_plane(
         while not control_plane.calls and time.monotonic() < deadline:
             time.sleep(0.01)
 
-    assert control_plane.calls == [{
+    assert control_plane.posts == [{
         "path": "/input",
         "authorization": f"Bearer {CONTROL_TOKEN}",
         "body": {"data": "typed", "append_newline": True},
@@ -2214,4 +2220,35 @@ def test_codex_delivery_failures_are_visible_without_legacy_semantic_changes(pla
     with pytest.raises(session_io.ControlPlaneError, match='Original input is retained') as exc:
         session_io.send_input('s-1', 'original', append_newline=True, delivery_id='stable-1')
     assert exc.value.delivered == ambiguous
-    assert control_plane.calls[0]['body']['delivery_id'] == 'stable-1'
+    assert control_plane.posts[0]['body']['delivery_id'] == 'stable-1'
+
+
+@pytest.mark.parametrize("health, append_newline, budget", [
+    ({"codex_delivery": {"runtime": None, "rpc_timeout": 3.0}}, True, 21.0),
+    ({"codex_delivery": {"runtime": None}}, True, 420.0),
+    (None, True, 420.0),
+    ({"codex_delivery": {"runtime": None, "rpc_timeout": float("inf")}}, True, 420.0),
+    ({"codex_delivery": {"runtime": None, "rpc_timeout": 1e7}}, True, 420.0),
+    ({"rows": 24}, True, None),
+    ({"codex_delivery": {"runtime": None, "rpc_timeout": 3.0}}, False, None),
+])
+def test_a_submitting_input_reads_for_the_sessions_own_codex_budget(
+    platform_root, control_plane, monkeypatch, health, append_newline, budget
+):
+    """The session's reported RPC deadline wins over the daemon's; other harnesses keep five seconds."""
+    monkeypatch.setenv(codex_delivery.RPC_TIMEOUT_ENV, "60")
+    plant_session("s-1", port=control_plane.port)
+    monkeypatch.setattr(session_io, "quiet_health", lambda session_id: health)
+    seen = []
+    real_call = session_io._call
+    monkeypatch.setattr(
+        session_io, "_call",
+        lambda *args, **kwargs: seen.append(kwargs["timeout"]) or real_call(*args, **kwargs),
+    )
+
+    session_io.send_input("s-1", "hi", append_newline=append_newline)
+
+    if budget is None:
+        assert seen == [session_io.CONTROL_TIMEOUT_SECONDS]
+    else:
+        assert seen == [(session_io.CONTROL_TIMEOUT_SECONDS, session_io.CONTROL_TIMEOUT_SECONDS + budget)]

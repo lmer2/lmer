@@ -1,0 +1,6 @@
+fixed:
+- "Codex sessions no longer leave an inbound message unseen until the next one: it is confirmed, safely retried, or raised to uber lmer."
+- "Messages posted to a slow Codex session are no longer reported as not sent and then delivered, which invited a duplicate resend."
+- "Uber lmer rotation no longer fails for hours when Slack rate-limits a thread it already holds; other unverifiable threads are refused with the failing method named, and the wait a rate limit asked for."
+added:
+- "LMER_CODEX_RPC_TIMEOUT sets the Codex delivery request deadline (default 10s, was a fixed 3s); healthz reports it with observed latency."

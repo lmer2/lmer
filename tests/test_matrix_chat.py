@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
 from ask_channel import bus
 from lmer_cli import comms, supervisor, targets, thread_posts
@@ -342,6 +343,14 @@ class TestConnector:
         rig.matrix.human_says("> <@lmer:example.org> branch?\n\nthanks!")
         rig.connector.sync_once()
         assert rig.log.read_since(0)[0][-1].text == "thanks!"
+
+    def test_live_replies_never_answer_an_off_thread_question(self, rig):
+        rig.connector.replay()
+        rig.log.append(kind="question", text="lost?", source=comms.Source("platform"), off_thread=True)
+        question = rig.agent("question", "branch?", options=["main", "prep-release"])
+        rig.matrix.human_says("2")
+        assert rig.connector.sync_once() == 1
+        assert rig.log.read_since(0)[0][-1].in_reply_to == question.id
 
     def test_a_reply_to_the_question_event_binds_whatever_it_says(self, rig):
         """The relation matrix has and Slack does not: a human replying *to* the
@@ -829,6 +838,49 @@ def test_matrix_uncapped_history_follows_all_pages(monkeypatch):
     calls.clear()
     assert len(client.thread_events(ROOM, ROOT)) == 100
     assert len(calls) == 1, "the existing bounded read behavior is unchanged"
+
+
+class _Reply:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+        self.text = json.dumps(body) if body is not None else "<html>"
+        self.content = self.text.encode()
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+class _Homeserver:
+    def __init__(self, reply):
+        self.reply = reply
+
+    def request(self, method, url, **kwargs):
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+@pytest.mark.parametrize("reply, transient, retry_after", [
+    (requests.ConnectionError("refused"), True, None),
+    (_Reply(429, {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 2500}), True, 2.5),
+    (_Reply(429, {"errcode": "M_LIMIT_EXCEEDED"}), True, None),
+    (_Reply(429, {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": -1}), True, None),
+    (_Reply(503, None), True, None),
+    (_Reply(404, {"errcode": "M_NOT_FOUND"}), False, None),
+    (_Reply(200, {}), False, None),
+    (_Reply(200, None), False, None),
+], ids=["unreachable", "429-timed", "429-untimed", "429-nonsense", "503", "404", "no-room", "unreadable"])
+def test_only_a_transport_failure_is_worth_retrying(monkeypatch, reply, transient, retry_after):
+    """A definite answer without a status (no room, unreadable) is not transient."""
+    from matrix_chat.client import MatrixAccount, MatrixClient
+
+    monkeypatch.setattr("matrix_chat.client.time.sleep", lambda seconds: None)
+    client = MatrixClient(MatrixAccount("https://hs.example.org", BOT, "test-token"), session=_Homeserver(reply))
+    with pytest.raises(MatrixError) as caught:
+        client.resolve_room("#lmer:example.org")
+    assert (caught.value.transient, caught.value.retry_after) == (transient, retry_after)
 
 
 def test_matrix_replayed_history_is_never_an_answer_and_leaves_the_free_slot(rig):

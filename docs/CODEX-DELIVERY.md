@@ -83,6 +83,7 @@ Receipts distinguish these states:
 | pending | Original saved, no native acceptance yet |
 | accepted | Native API accepted input; model-context confirmation still pending |
 | confirmed | Native thread contains this client ID and exact original content |
+| retrying | `turn/start` never went out, and the adapter resubmits it itself (bus and startup input only) |
 | rejected | Discovery or explicit native rejection prevented acceptance |
 | uncertain | Response lost, content mismatch, or turn ended without confirmation |
 
@@ -92,11 +93,104 @@ unconsumed; it becomes uncertain and remains retained. No uncertain payload or n
 replayed automatically. Errors are published as supervisor notes, and the platform
 input client surfaces rejected/uncertain deliveries as failures.
 
-`GET /healthz` includes `codex_delivery.runtime` (native thread ID, model, effort,
-and mismatch against launch preset) and the latest 100 public receipts. Runtime metadata is
-observed every five seconds even with no pending receipts, including manual-start
-sessions. Pending receipt reads run every half second. RPCs have a three-second
-deadline; failures retain the last observation timestamp and expose an observation
+### Convergence
+
+Inputs the supervisor relays from the bus, and the startup inputs, have no caller
+that retries or reports them, so the adapter carries each to one of three ends:
+
+- **Confirmed** in the native thread.
+- **Retried with the same ID and text, then confirmed** — only while the receipt
+  is `retrying`, where `turn/start` provably never went out (discovery or
+  connection failed first). The receipt monitor retries every two seconds for
+  up to 120 seconds, stopping a tick at the first attempt that still cannot
+  connect. This is the only automatic resend, and it cannot duplicate.
+- **Escalated once**, never resent: at once on a native `turn/start` rejection or
+  a content mismatch; after 120 seconds of retrying without reaching Codex; once
+  the thread has been observed not running a turn (`Thread.status` other than
+  `active`) for 120 seconds with the input still absent; or 30 minutes after
+  submission in any case. The idle clock exists because Codex takes a steer sent
+  during a long tool call only when the call returns, so time since submission
+  says nothing while a turn runs. The supervisor posts a `question` on the
+  session bus, from the platform channel, naming the record ID and the first
+  line of the sender's own words (nothing of a peer message). It carries
+  `meta.off_thread`, so Slack and Matrix neither show it nor bind a human's reply
+  to it, but it still reaches uber lmer as a `live_question`; uber lmer decides
+  whether to tell the sender. Answering relays the answer to the model as a new
+  input. If the input confirms later, the supervisor closes the question itself.
+  When the stuck session is uber lmer itself, the question has no reader outside
+  it: Slack and Matrix skip it, project mode drops assistant session events, and
+  non-project mode spools it back to that session, so only the fleet view, the
+  web pane and the open-questions badge show it. An escalation that fails to post
+  is retried every two seconds under the same `source.ref`, so a retry cannot
+  post a second question.
+
+Inputs from `POST /input` (digest wake, idle reminder, wind-down) belong to their
+caller: a `rejected` receipt there is reported to the caller once and never
+resent behind its back, and an accepted one that cannot converge gets a bus
+note, not a question. A caller retrying a retryable receipt gets a fresh clock.
+
+Such a caller's `deliver()` is bounded: it waits at most two RPC deadlines for an
+observation to finish, then answers "not sent, retry with the same ID" with nothing
+submitted, so one submission takes at most seven RPC deadlines. The daemon's
+submitting `POST /input` to a Codex session reads for that long plus its
+five-second control timeout (75 s at the default; connecting still fails at five),
+computed from the `rpc_timeout` the session itself reports on `/healthz`
+(clamped to the 600-second maximum). It probes `/healthz` first to learn that.
+Any other harness keeps the five-second read; a session that does not answer
+the probe gets the budget from the daemon's own `LMER_CODEX_RPC_TIMEOUT`.
+
+Bus records posted to a Codex session's `/messages` are not relayed inside that
+request: the reply carries the `{"queued": true}` receipt as soon as the record is
+durable, and one worker relays queued records in sequence order (the bus watcher
+hands its records to the same worker). Order holds for first submissions only: a
+`retrying` record is resubmitted by the receipt monitor, so a later record can
+reach Codex before it. Other harnesses still relay inside the request. The
+receipt a Codex poster gets therefore never reports the native outcome: a peer
+send to a Codex session is `recorded`, never `delivery_refused` or `uncertain`,
+and what follows is the destination adapter's convergence or escalation. A
+record the adapter refuses outright (receipt capacity exhausted, or its original
+text could not be persisted) is not retried; it is escalated the same way, with
+the refusal as the reason. Once the adapter is closed the session is ending, and
+such a record gets only a bus note.
+
+If startup cannot identify the native thread within 120 seconds, or a startup
+input cannot converge (uncertain, rejected or escalated), inbound bus messages
+are released anyway; holding them would stall every later message, including the
+answer to an escalation. A startup input whose discovery failed goes through the
+same retry and escalation as any other; the follow-up startup prompt is sent only
+once the first input is accepted.
+
+A turn ending without the input is not a verdict. Codex carries a steer that
+raced its turn's end into a follow-up turn, so the receipt turns `uncertain`
+quietly and stays observed. Two consecutive observation failures make an outage:
+it gets one note naming the pending IDs, and one when observation recovers,
+instead of one note for the life of the run. A receipt monitor tick that fails
+is logged and noted; the monitor keeps running.
+
+Confirmation reads page recent turns through `thread/turns/list` (newest first,
+full items, 20 turns a page) back to the oldest unescalated pending input, at most
+ten pages, stopping once every one is found. Full-history `thread/read`
+hydration of a long chat thread is what Codex deprecates for paginated threads.
+Escalated inputs are only looked for in the newest page, so one
+Codex takes after more than 20 further turns is not closed automatically. A Codex
+build that answers "method not found" or "invalid request" to `thread/turns/list`
+falls back to the full read for the rest of the run.
+
+`GET /healthz` includes `codex_delivery`: `runtime` (native thread ID, model,
+effort, and mismatch against launch preset; `null` until discovery first
+succeeds), `rpc_timeout`, `rpc_latency`, and the latest 100 public receipts. It
+answers without waiting for the adapter, so a long observation does not make the
+session look unreachable. Runtime metadata is observed every five seconds even
+with no pending receipts, including manual-start sessions. Pending receipt reads
+run every half second, and every five seconds once an input has been escalated.
+Each RPC has a deadline of `LMER_CODEX_RPC_TIMEOUT` seconds (default 10).
+`rpc_timeout` is the effective value, and `rpc_latency` covers the last 200 RPCs
+(`count`, `max`, `p99`, and `timeouts`, how many hit the deadline; a timeout
+counts at its deadline in the others). Only single RPCs are counted: the connect
+deadline and thread discovery's own deadline are not, though a slow host produces
+those too. The default is provisional: no p99 was measured on the host that saw
+#460, and `timeouts` is what a re-derivation reads.
+Failures retain the last observation timestamp and expose an observation
 error. Native model changes produce a warning without overriding human controls. Original
 text stays out of this response. Receipt storage is bounded to 10,000 IDs per run;
 exhaustion refuses new submissions visibly. A private outbox is diagnostic recovery

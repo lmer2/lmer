@@ -221,6 +221,10 @@ class TestRendering:
         late = self._record("answer", "main", channel="platform", author="tester", in_reply_to="q1", meta={"late": True})
         assert connector.render_outbound(late, {"q1": question}).startswith("↩️ late answer")
 
+    def test_off_thread_records_are_skipped(self):
+        record = self._record("question", "lost?", channel="platform", meta={comms.META_OFF_THREAD: True})
+        assert connector.render_outbound(record) is None
+
     def test_slacks_own_records_are_skipped(self):
         assert connector.render_outbound(self._record("message", "hi", channel="slack", author="tester")) is None
 
@@ -397,6 +401,15 @@ class TestInbound:
         rig.connector._poll_thread()
         answer = rig.log.read_since(0)[0][-1]
         assert answer.in_reply_to == first.id and answer.text == "whatever you think"
+
+    def test_free_text_never_answers_an_off_thread_question(self, rig):
+        rig.connector._poll_thread(replay=True)
+        rig.log.append(kind="question", text="lost?", source=comms.Source("platform"), off_thread=True)
+        mine = rig.agent("question", "a?")
+        rig.slack.human_says("whatever you think")
+        rig.connector._poll_thread()
+        answer = rig.log.read_since(0)[0][-1]
+        assert answer.in_reply_to == mine.id
 
     def test_conversation_beside_an_open_question_is_not_its_answer(self, rig):
         """A human in a thread has not promised to be answering. Binding "hold

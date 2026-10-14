@@ -2616,7 +2616,7 @@ def create_app(
                 "queued": bool(relay.get("queued")),
                 "submit_confirmed": False,
                 "note": (
-                    "Accepted; typing is held until startup submission completes. "
+                    "Accepted and queued for delivery, after startup submission if that is still pending. "
                     if relay.get("queued") else ""
                 ) + _SUBMIT_VIA_BUS_NOTE,
                 "submit_text": relay.get("submit_text"),
