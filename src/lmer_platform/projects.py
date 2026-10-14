@@ -528,7 +528,8 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
                       "workspace_id": destination_id, "home_revision": home["revision"] + 1},
             )
             updates = {
-                expected_project: replace(source, pending=tuple(retained)),
+                expected_project: replace(source, pending=tuple(retained),
+                                          **({} if retained else assistant.ended_episode(source))),
                 destination_id: replace(target, pending=(*target.pending, *moved, notice),
                                         pending_since=target.pending_since or notice.at,
                                         pending_seq=target.pending_seq + (not target.pending)),

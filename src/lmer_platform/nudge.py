@@ -61,7 +61,7 @@ from .provenance import PLATFORM_PREFIX
 from .store import age_seconds
 
 __all__ = [
-    "PROMPT_ROUTE", "MAX_PROMPT_CHARS", "Nudge", "due", "prompt",
+    "PROMPT_ROUTE", "MAX_PROMPT_CHARS", "MAX_UNANSWERED_NUDGES", "Nudge", "due", "prompt",
 ]
 
 #: The route the nudge tells the assistant to call. An agent told "digests are
@@ -71,6 +71,10 @@ PROMPT_ROUTE = "POST /api/assistant/pending"
 #: Ceiling on the sentence. A regression guard, not a runtime limit: the text is a
 #: constant with two numbers in it, nothing truncates, and a test asserts it fits.
 MAX_PROMPT_CHARS = MAX_NOTE_CHARS
+
+#: Nudges an episode gets before the platform stops typing and tells the
+#: operator instead (#584, the operator's number).
+MAX_UNANSWERED_NUDGES = 3
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,9 @@ class Nudge:
     #: Whether a previous nudge about this accumulation is being repeated. For
     #: the log line; it changes nothing about the text.
     repeat: bool
+    #: :data:`MAX_UNANSWERED_NUDGES` have gone unanswered: what is due is the
+    #: operator signal, and nothing is typed.
+    backed_off: bool = False
 
     @property
     def waited_minutes(self) -> int:
@@ -115,6 +122,7 @@ def due(
     after_seconds: int,
     pending_threshold: int,
     produced_output: Optional[bool] = None,
+    session_id: Optional[str] = None,
     now=None,
 ) -> Optional[Nudge]:
     """The nudge this spool is owed, or ``None``. See the module docstring.
@@ -123,9 +131,12 @@ def due(
     mark it may write come from one read, the two readings because obtaining them
     is an HTTP call into a container, and *now* so no test has to sleep.
     *produced_output* is ``False`` only when the session is *known* never to have
-    drawn a byte, ``None`` when that is unknowable.
+    drawn a byte, ``None`` when that is unknowable. *session_id* is the running
+    incarnation, which the episode's count belongs to.
     """
     if after_seconds <= 0 or not running:
+        return None
+    if state.episode_stalled(session_id):
         return None
     count = len(state.pending)
     if count < max(1, pending_threshold):
@@ -148,6 +159,7 @@ def due(
         waited_seconds=waited,
         idle=idle_seconds,
         repeat=state.nudged_at is not None,
+        backed_off=state.episode_nudges(session_id) >= MAX_UNANSWERED_NUDGES,
     )
 
 

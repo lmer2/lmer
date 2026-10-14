@@ -505,7 +505,8 @@ def drain(state):
             db.execute("INSERT OR REPLACE INTO request_context VALUES (?,?)", (project_id, current))
         else:
             db.execute("DELETE FROM request_context WHERE project_id=?", (project_id,))
-        cleared = replace(state, pending=tuple(retained), pending_since=retained[0].at if retained else None, nudged_at=None)
+        cleared = replace(state, pending=tuple(retained), pending_since=retained[0].at if retained else None,
+                          **assistant.ended_episode(state))
         db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(cleared.to_dict()), project_id))
     return notes
 
