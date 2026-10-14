@@ -1,6 +1,8 @@
 """Tests for `gate-check --baseline` — reusing CI for the initial baseline (#452)."""
 
 import importlib.util
+import io
+import json
 import os
 import re
 import subprocess
@@ -12,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from lmer_cli import ci_baseline, gate_cache
+from lmer_cli import ci_baseline, gate_cache, gates
 from lmer_cli.ci_baseline import GitLabEvidence, SmokeResult
 from lmer_cli.gates import (
     BASELINE_CI_FAILED,
@@ -26,15 +28,19 @@ from lmer_cli.gates import (
     CheckStatus,
     GateSystem,
 )
-from lmer_cli.gitlab_pipeline import TokenNotFoundError
+from lmer_cli.gitlab_pipeline import GitLabPipelineClient, TokenNotFoundError
 from tests.conftest import strip_lmer_env
 from tests.test_ci_baseline import CI_YAML, PINS, FakeClient, config_routes
+from tests.test_lmer_env_file import REPO_URL, _run_main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_RUN_SMOKE = ci_baseline.run_smoke
 HOST = "gitlab.example.com"
 PROJECT = "group/project"
 PROJECT_ID = 414
+DEVELOPER_TOKEN = "developer-run-token-582"
+EVIDENCE_TOKEN = "maintainer-read-api-token-582"
+EVIDENCE_ENV = ci_baseline.evidence_token_env(HOST)
 MAPPING_YAML = (
     "ci_baseline:\n"
     "  provider: gitlab\n"
@@ -269,6 +275,171 @@ class TestOutcomes:
         outcome = harness.run()
         assert outcome.kind == BASELINE_FALLBACK
         assert "no GitLab API access" in outcome.reason
+
+
+class RoleForge(FakeClient):
+    """GitLab's rule for the pipeline-variables read: 403 below Maintainer."""
+
+    def __init__(self, host, token, routes, maintainers):
+        super().__init__(routes)
+        self.host, self.token, self.maintainers = host, token, maintainers
+
+    def request(self, endpoint, accept="application/json"):
+        if endpoint.split("?")[0].endswith("/variables") and self.token not in self.maintainers:
+            self.requests.append(endpoint)
+            return 403, '{"message":"403 Forbidden"}'
+        return super().request(endpoint, accept)
+
+
+class TestEvidenceToken:
+    """#582: a Developer run token plus a Maintainer read_api evidence token."""
+
+    @pytest.fixture
+    def forge(self, repo, monkeypatch):
+        sha = _sha(repo)
+        routes = _client(sha, passing_jobs(sha)).routes
+        self.maintainers = {EVIDENCE_TOKEN}
+        self.clients = []
+
+        def client(host, token):
+            made = RoleForge(host, token, routes, self.maintainers)
+            self.clients.append(made)
+            return made
+
+        monkeypatch.setattr(gates, "GitLabPipelineClient", client)
+        monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+        monkeypatch.setenv("GITLAB_TOKEN_gitlab_example_com", DEVELOPER_TOKEN)
+        harness = Harness(repo, monkeypatch)
+        monkeypatch.delattr(harness.gate, "_baseline_source")
+        return harness
+
+    def test_developer_run_token_falls_back_with_the_specific_reason(self, forge, capsys):
+        outcome = forge.run()
+        assert outcome.kind == BASELINE_FALLBACK
+        assert outcome.reason == (
+            "cannot read pipeline variables: GitLab refused the run token (403); "
+            f"it needs the Maintainer role, or set {EVIDENCE_ENV} to a Maintainer "
+            "read_api token (see docs/GATE-CI-BASELINE.md)")
+        out = capsys.readouterr().out
+        assert "Reading CI evidence with the run token" in out
+        assert f"CI baseline not used: {outcome.reason}" in out
+
+    def test_evidence_token_reuses_with_a_developer_run_token(self, forge, monkeypatch, capsys):
+        monkeypatch.setenv(EVIDENCE_ENV, EVIDENCE_TOKEN)
+        outcome = forge.run()
+        assert outcome.kind == BASELINE_REUSED, outcome.reason
+        assert [(client.host, client.token) for client in self.clients] == [
+            (HOST, EVIDENCE_TOKEN)]
+        receipt = forge.gate.baseline_receipt(outcome)
+        assert receipt["ci_baseline"]["evidence"]["credential"] == EVIDENCE_ENV
+        assert EVIDENCE_TOKEN not in json.dumps(receipt)
+        out = capsys.readouterr().out
+        assert f"Reading CI evidence with {EVIDENCE_ENV}" in out
+        assert EVIDENCE_TOKEN not in out
+
+    def test_evidence_token_below_maintainer_is_named(self, forge, monkeypatch):
+        self.maintainers.clear()
+        monkeypatch.setenv(EVIDENCE_ENV, EVIDENCE_TOKEN)
+        outcome = forge.run()
+        assert outcome.kind == BASELINE_FALLBACK
+        assert outcome.reason == (
+            f"cannot read pipeline variables: GitLab refused {EVIDENCE_ENV} (403); "
+            "it needs the Maintainer role (see docs/GATE-CI-BASELINE.md)")
+
+    def test_print_pins_reads_with_the_evidence_token(self, forge, repo, monkeypatch, capsys):
+        monkeypatch.setenv(EVIDENCE_ENV, EVIDENCE_TOKEN)
+        monkeypatch.chdir(repo)
+        module = _load_gate_check()
+        monkeypatch.setattr("sys.argv", ["gate-check", "--print-pins"])
+        assert module.main() == 0
+        assert [client.token for client in self.clients] == [EVIDENCE_TOKEN]
+        assert f'definition: "{PINS["pytest"]}"' in capsys.readouterr().out
+
+    def test_evidence_token_needs_no_run_token(self, forge, monkeypatch):
+        monkeypatch.delenv("GITLAB_TOKEN_gitlab_example_com")
+        monkeypatch.setenv(EVIDENCE_ENV, EVIDENCE_TOKEN)
+        assert forge.run().kind == BASELINE_REUSED
+
+    @pytest.mark.parametrize("run_token, evidence_token, credential", [
+        ("glpat-SECRETMARK\rX", None, "the run token"),
+        (DEVELOPER_TOKEN, "glpat-SECRETMARK\nX", EVIDENCE_ENV),
+        (DEVELOPER_TOKEN, "glpat-SECRETMARK\u200b", EVIDENCE_ENV),
+    ])
+    def test_a_token_that_is_not_header_text_is_never_shown(
+            self, forge, monkeypatch, capsys, run_token, evidence_token, credential):
+        """http.client quotes a token it cannot send in its exception (#582)."""
+        monkeypatch.setattr(gates, "GitLabPipelineClient", GitLabPipelineClient)
+        monkeypatch.setenv("GITLAB_TOKEN_gitlab_example_com", run_token)
+        if evidence_token:
+            monkeypatch.setenv(EVIDENCE_ENV, evidence_token)
+        outcome = forge.run()
+        assert outcome.kind == BASELINE_FALLBACK
+        assert outcome.reason == (f"no GitLab API access: {credential} is not a valid token "
+                                  "(control or non-latin-1 characters)")
+        shown = capsys.readouterr().out + json.dumps(forge.gate.baseline_receipt(outcome))
+        assert "SECRETMARK" not in shown
+
+    @pytest.mark.parametrize("name, value", [
+        (EVIDENCE_ENV, "   "),
+        ("LMER_CI_BASELINE_TOKEN_git_other_example_com", EVIDENCE_TOKEN),
+    ])
+    def test_blank_or_other_host_token_leaves_the_run_token(self, forge, monkeypatch,
+                                                           name, value):
+        monkeypatch.setenv(name, value)
+        outcome = forge.run()
+        assert outcome.kind == BASELINE_FALLBACK
+        assert [client.token for client in self.clients] == [DEVELOPER_TOKEN]
+        assert "refused the run token" in outcome.reason
+
+
+class FlushRecorder(io.StringIO):
+    """stdout that remembers what had been written at every flush."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushed = []
+
+    def flush(self):
+        self.flushed.append(self.getvalue())
+        super().flush()
+
+
+class TestDecisionIsFlushed:
+    """#582: a redirected gate-check is block-buffered, so an unflushed
+    decision line only appears when the hour-long full gate exits."""
+
+    def test_fallback_reason_is_flushed_when_decided(self, repo, monkeypatch):
+        stdout = FlushRecorder()
+        monkeypatch.setattr(sys, "stdout", stdout)
+        outcome = Harness(repo, monkeypatch, _client(_sha(repo), [])).run()
+        assert outcome.kind == BASELINE_FALLBACK
+        assert any(f"CI baseline not used: {outcome.reason}" in seen
+                   and "Running the full local gate instead." in seen
+                   for seen in stdout.flushed)
+
+    def test_evidence_is_flushed_before_the_smoke_check(self, repo, monkeypatch):
+        stdout = FlushRecorder()
+        monkeypatch.setattr(sys, "stdout", stdout)
+        harness = Harness(repo, monkeypatch, _client(_sha(repo), passing_jobs(_sha(repo))))
+        seen_at_smoke = []
+
+        def run_smoke(*_args, **_kwargs):
+            seen_at_smoke.append(stdout.flushed[-1] if stdout.flushed else "")
+            return SmokeResult(ci_baseline.SMOKE_PASS, 1.0, "collected: 1 test", "python3")
+
+        monkeypatch.setattr(ci_baseline, "run_smoke", run_smoke)
+        assert harness.run().kind == BASELINE_REUSED
+        assert "Reading CI evidence with the run token" in seen_at_smoke[0]
+        assert f"CI evidence for {PROJECT} @ {_sha(repo)}: passed" in seen_at_smoke[0]
+        assert "pytest [tests]: passed" in seen_at_smoke[0]
+
+    def test_ci_failure_is_flushed_when_decided(self, repo, monkeypatch):
+        stdout = FlushRecorder()
+        monkeypatch.setattr(sys, "stdout", stdout)
+        sha = _sha(repo)
+        jobs = [_job(1, "pre-commit", "success", sha), _job(2, "pytest", "failed", sha)]
+        assert Harness(repo, monkeypatch, _client(sha, jobs)).run().kind == BASELINE_CI_FAILED
+        assert "the local suite was not run" in stdout.flushed[-1]
 
 
 class TestPreconditions:
@@ -604,3 +775,19 @@ def test_cli_env_dict_passes_the_resolved_toggle():
     source = (REPO_ROOT / "src" / "lmer_cli" / "cli.py").read_text()
     assert re.search(r"""["']LMER_GATE_CI_BASELINE["']\s*:\s*ci_baseline\[0\]""", source)
     assert "ci_baseline = resolve_gate_ci_baseline(scope)" in source
+
+
+@pytest.mark.parametrize("toggle, delivered", [("1", True), ("0", False), (None, False)])
+def test_evidence_token_reaches_only_baseline_sessions(tmp_path, toggle, delivered):
+    """#582: the evidence token reads as a Maintainer, CI/CD variable values
+    included, so a session whose resolved baseline is off never receives it."""
+    env_file = tmp_path / "deploy.env"
+    env_file.write_text(f"{EVIDENCE_ENV}={EVIDENCE_TOKEN}\n"
+                        f"GITLAB_TOKEN_gitlab_example_com={DEVELOPER_TOKEN}\n")
+    captured: dict = {}
+    _run_main(["--env-file", str(env_file), "--no-task", "--exec", "true", REPO_URL],
+              env_in={"LMER_GATE_CI_BASELINE": toggle} if toggle else None,
+              captured_env=captured)
+    assert captured.get("GITLAB_TOKEN_gitlab_example_com") == DEVELOPER_TOKEN
+    assert (captured.get(EVIDENCE_ENV) == EVIDENCE_TOKEN) is delivered
+    assert (EVIDENCE_ENV in captured) is delivered

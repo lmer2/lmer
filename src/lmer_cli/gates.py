@@ -1990,11 +1990,22 @@ class GateSystem:
                            smoke: Optional[ci_baseline.SmokeResult] = None
                            ) -> BaselineOutcome:
         print(f"{Colors.CYAN}ℹ️  CI baseline not used: {reason}{Colors.NC}")
-        print("    Running the full local gate instead.")
+        # A redirected gate-check is block-buffered, and the full gate follows.
+        print("    Running the full local gate instead.", flush=True)
         return BaselineOutcome(BASELINE_FALLBACK, 0, reason, evidence, smoke)
 
     def _baseline_source(self, host: str) -> ci_baseline.GitLabEvidence:
-        return ci_baseline.GitLabEvidence(GitLabPipelineClient(host, get_token(host)))
+        env = ci_baseline.evidence_token_env(host)
+        token = os.environ.get(env, "").strip()
+        uses_evidence_token = bool(token)
+        if not uses_evidence_token:
+            token = get_token(host)
+        source = ci_baseline.GitLabEvidence(GitLabPipelineClient(host, token), evidence_env=env,
+                                            uses_evidence_token=uses_evidence_token)
+        if not ci_baseline.is_header_text(token):
+            raise GitLabPipelineError(f"{source.credential} is not a valid token "
+                                      "(control or non-latin-1 characters)")
+        return source
 
     def run_baseline_gate(self) -> BaselineOutcome:
         """The initial-baseline gate (#452): reuse CI that already ran the
@@ -2050,6 +2061,7 @@ class GateSystem:
             source = self._baseline_source(host)
         except GitLabPipelineError as exc:
             return self._baseline_fallback(f"no GitLab API access: {exc}")
+        print(f"Reading CI evidence with {source.credential}...", flush=True)
         evidence = ci_baseline.collect(mapping, source, host, project, sha)
         self._print_baseline_evidence(evidence)
 
@@ -2057,7 +2069,7 @@ class GateSystem:
             print(f"{Colors.RED}❌ CI already failed a required job at "
                   f"{sha}: {evidence.reason}{Colors.NC}")
             print("    This is the baseline failure; the local suite was not "
-                  "run to second-guess it.")
+                  "run to second-guess it.", flush=True)
             return BaselineOutcome(BASELINE_CI_FAILED, ci_baseline.EXIT_CI_FAILED,
                                    evidence.reason, evidence)
         if evidence.verdict != ci_baseline.PASSED:
@@ -2075,7 +2087,7 @@ class GateSystem:
         smoke = ci_baseline.run_smoke(
             candidates, BASELINE_COLLECT_ARGV, mapping.tools,
             mapping.smoke_timeout, str(self.project_root), self._suite_env())
-        print(f"    {smoke.outcome}: {smoke.detail}")
+        print(f"    {smoke.outcome}: {smoke.detail}", flush=True)
         if smoke.outcome == ci_baseline.SMOKE_TIMEOUT:
             return self._baseline_fallback(f"smoke check timed out: {smoke.detail}",
                                            evidence, smoke)
@@ -2168,6 +2180,7 @@ class GateSystem:
             for attempt in job.attempts:
                 print(f"        job {attempt.job_id} {attempt.status}: "
                       f"{attempt.web_url}")
+        sys.stdout.flush()
 
     def baseline_receipt(self, outcome: BaselineOutcome) -> Dict[str, Any]:
         """`emit_gate_event` kwargs for the gate-baseline receipt.

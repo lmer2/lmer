@@ -7,6 +7,7 @@ How `gate-check --baseline` lets a development run skip re-running the test suit
 - [The coverage mapping](#the-coverage-mapping)
 - [Definition pins](#definition-pins)
 - [The decision](#the-decision)
+- [The evidence token](#the-evidence-token)
 - [The smoke check](#the-smoke-check)
 - [Outcomes and exit codes](#outcomes-and-exit-codes)
 - [The receipt](#the-receipt)
@@ -114,6 +115,7 @@ The following are all UNVERIFIED and fall back to the normal gate:
 - the project uses its own test runner (`gate-check-run-tests.sh` or a parallel runner);
 - there is no `tests/` directory;
 - no token, an API or transport error, unreadable output, more records than the gate reads, or the evidence budget running out (below);
+- the pipeline-variables read refused with 403, which happens below the Maintainer role. This reason is specific, not a generic API failure: it names the refused credential and the fix (see [The evidence token](#the-evidence-token));
 - a passing job whose definition, trigger or variables fail the confirmation step (below);
 - an unexpected error anywhere in the evaluation before the local checks start;
 - no pipeline at the commit.
@@ -122,13 +124,48 @@ A PASSED verdict then has to survive a confirmation step, per declared job. A jo
 
 - **Definition.** The job's definition at this commit must equal its pin. A missing pin, a mismatch, or a job absent from the configuration all fail. The fallback message names the job and both digests.
 - **Trigger.** The pipeline holding the deciding attempt must come from a `push` or `merge_request_event`. Web, API, schedule, trigger and child pipelines fail, because they can run the job with inputs the commit does not record.
-- **Variables.** That pipeline must have been created with no pipeline variables (`GET /projects/:id/pipelines/:id/variables`). This also catches `git push -o ci.variable=…`. Only the variable names are recorded, never their values.
+- **Variables.** That pipeline must have been created with no pipeline variables (`GET /projects/:id/pipelines/:id/variables`). This also catches `git push -o ci.variable=…`. Only the variable names are recorded, never their values. GitLab answers this read with 403 to anyone below Maintainer, so a Developer run token always falls back here unless an [evidence token](#the-evidence-token) is set.
 
 Project-, group- and instance-level CI/CD variables are not read. They need the Maintainer role and are settings at the same trust level as the mapping itself. Variables given when a manual job is played are not read either. A pinned `when: manual` on a declared job shows that it can happen.
 
 The evidence read has one 120 s budget. No request starts after it, and an answer that completes after it is discarded, so the gate falls back. A request already in flight can still hold the gate past 120 s, for up to the client's 30 s socket timeout per read on a stalled connection.
 
 The decision reads only API facts: pipeline sha, project, source and variables; job name, status, `allow_failure` and id; and the CI configuration at the commit. Job logs are never read.
+
+The gate prints which credential it reads with before it starts, and prints the evidence, and any fallback reason, as soon as they are known. A redirected `gate-check --baseline` is block-buffered, so without that the reason would only appear when the full gate behind it exits.
+
+## The evidence token
+
+The variables read needs the Maintainer role. A run account should not need Maintainer, because that role also brings merge and protected-branch rights. Instead, give the gate a separate token that can read but not write:
+
+- **Variable:** `LMER_CI_BASELINE_TOKEN_<host>`, with the host sanitized as for `GITLAB_TOKEN_<host>`: lowercased, with dots and hyphens turned into underscores. For example, `git.example.com` becomes `LMER_CI_BASELINE_TOKEN_git_example_com`. There is no generic form; each variable names one host. As with `GITLAB_TOKEN_<host>`, two hosts that differ only by `.` versus `-` share a variable name.
+- **Use:** when it is set, it is used for **every** evidence read of `gate-check --baseline` and `--print-pins` (project, pipelines, jobs, CI lint and pipeline variables), and the run token is not used for the decision at all. When it is unset or blank, the gate uses the run token exactly as before. When a read made with it fails (an expired or revoked token answers 401 on the first read), the fallback reason names the variable. The gate never retries with the run token.
+- **Token:** role **Maintainer**, scope **`read_api` only**. `read_api` permits only `GET` requests, so the token cannot push, merge or change settings. Either:
+  - a **project access token** (project → Settings → Access tokens), which reads only that project. **Prefer this.**
+  - a **group access token** (group → Settings → Access tokens), which reads every project in the group. Use it only when several projects on the host use the baseline, since there is one variable per host.
+
+  Give it an expiry date and rotate it like any other access token.
+- **What it can read:** read-only does not mean harmless. A Maintainer can read things a Developer cannot, among them the **values of the project's CI/CD variables**, masked and protected ones included (`GET /projects/:id/variables`). With a group token, that covers every project in the group. Treat it as a secret at that level.
+- **Where:** in `~/.lmer/.env`, beside `GITLAB_TOKEN_<host>`:
+
+  ```bash
+  LMER_CI_BASELINE_TOKEN_git_example_com=<the token>
+  ```
+
+  lmer merges `.env` files into the session environment, but passes `LMER_CI_BASELINE_TOKEN_*` only into a session whose **resolved** `LMER_GATE_CI_BASELINE` is on (see [Turning it on](#turning-it-on)). Which sessions those are depends on the tier you turned it on at. The bare global `LMER_GATE_CI_BASELINE=1` turns it on for every session that no narrower tier switches off, chat and review included, and so hands each of them the token. Turn it on with a task-scoped form instead, such as `LMER_DEVELOP_GATE_CI_BASELINE=1` or `LMER_DEVELOP__<REPO>__GATE_CI_BASELINE=1`. A baseline session does receive the token, and any agent in it could read what the token can read. A variable that is only exported in the host shell does not reach the session.
+
+  Do **not** put it in the lmer checkout's own `.env`. In developer mode that file is mounted into every session at `/Agents/global/.env`, whatever the toggle says, and the environment filter cannot reach a mounted file.
+
+The gate shows only the variable's name: on the `Reading CI evidence with …` line, in fallback reasons, and as `credential` in the receipt. A token, evidence or run, that is not printable latin-1 text (a control character inside the value, such as a pasted CR, or a non-latin-1 character) is refused before any request, with `no GitLab API access: … is not a valid token (control or non-latin-1 characters)` and no value. The evidence token is trimmed of surrounding whitespace first; the run token is checked as given, so a trailing CR or TAB on it is refused too.
+
+When the variables read is refused, the fallback reason says which credential was refused and what to do:
+
+```text
+cannot read pipeline variables: GitLab refused the run token (403); it needs the Maintainer role, or set LMER_CI_BASELINE_TOKEN_git_example_com to a Maintainer read_api token (see docs/GATE-CI-BASELINE.md)
+cannot read pipeline variables: GitLab refused LMER_CI_BASELINE_TOKEN_git_example_com (403); it needs the Maintainer role (see docs/GATE-CI-BASELINE.md)
+```
+
+The variables guard itself is unchanged: with or without the evidence token, the deciding pipeline's variables are read, and a pipeline that has any is unverified.
 
 ## The smoke check
 
@@ -158,7 +195,7 @@ A CI failure is the baseline failure itself. Treat it as you would a failing cle
 Every `--baseline` run that reaches a decision records a gate receipt named **`gate-baseline`**, deliberately not `gate-check`, with outcome `pass`, `fail` or `fallback`. Its `ci_baseline` field carries:
 
 - `decision` and `reason`;
-- `evidence`: provider, host, project, project id, full sha, `completed_at` (when the last deciding job finished), the pipelines (id, status, source, ref, link), and per job its `covers`, verdict, the deciding attempt and **every** attempt (job id, pipeline id, status, `allow_failure`, finished time, link), plus, once confirmed, its `definition`, `pinned` digest and `pipeline_source`;
+- `evidence`: provider, host, project, project id, full sha, `credential` (the evidence token's variable name, or `the run token`), `completed_at` (when the last deciding job finished), the pipelines (id, status, source, ref, link), and per job its `covers`, verdict, the deciding attempt and **every** attempt (job id, pipeline id, status, `allow_failure`, finished time, link), plus, once confirmed, its `definition`, `pinned` digest and `pipeline_source`;
 - `smoke`: outcome, duration, detail and interpreter.
 
 A reused receipt sets `test_scope: ci baseline` and `test_cache_verdict: not-applicable`. It never claims the suite ran locally. A fallback is followed by the ordinary `gate-check` receipt of the full gate that ran.
