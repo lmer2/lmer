@@ -1,0 +1,4 @@
+added:
+- "`gate-check --baseline` can reuse CI under a Developer run token when `LMER_CI_BASELINE_TOKEN_<host>` holds a Maintainer `read_api` token."
+fixed:
+- "A refused pipeline-variables read now gives its own fallback reason, and the baseline decision prints immediately instead of at exit."
