@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 
-from . import assistant, projects, runs, store
+from . import assistant, projects, runs, spool_merge, store
 
 
 def enqueue(session, message, run=None, session_kind=None):
@@ -46,10 +46,12 @@ def flush():
                     message = payload["message"]
                     who = (message.get("source") or {}).get("channel", "?")
                     lines.append(f"[{who}] {message.get('kind')}: {str(message.get('text') or '')[:300]}")
-                entry = assistant.PendingNote(at=store.utc_now_iso(), kind="session_comms",
-                                              note=(f"Session {session}: " + " | ".join(lines))[:assistant.MAX_NOTE_CHARS], data=data)
-                updated = replace(state, pending=(*state.pending, entry),
-                                  pending_since=state.pending_since or entry.at,
+                routine = spool_merge.routine(payload["message"] for _identity, payload in records)
+                at = store.utc_now_iso()
+                pending = spool_merge.add_comms(list(state.pending), at=at, session=session,
+                                                lines=lines, routine=routine, data=data)
+                updated = replace(state, pending=tuple(pending),
+                                  pending_since=state.pending_since or at,
                                   pending_seq=state.pending_seq + (not state.pending))
                 db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(updated.to_dict()), owner))
                 db.executemany("UPDATE event_queue SET done=1 WHERE id=?", [(identity,) for identity, _ in records])
