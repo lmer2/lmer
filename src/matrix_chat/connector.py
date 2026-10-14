@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from ask_channel import bus
 from lmer_cli import thread_posts
+from lmer_cli.comms import off_thread
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -549,7 +550,7 @@ class MatrixConnector(ConnectorLifecycle):
                 raise ValueError("Matrix input has no event identity")
             source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": event_id}
             kind, in_reply_to = "message", None
-            states = self.bus.questions()
+            states = [state for state in self.bus.questions() if not off_thread(state["question"])]
             related = next((state["question"] for state in states
                             if self._replies_to(content, state["question"])), None)
             oldest = min((state["question"] for state in states if state["state"] == "open"),

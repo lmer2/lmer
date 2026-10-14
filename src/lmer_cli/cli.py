@@ -3311,6 +3311,8 @@ def main(argv: list[str] | None = None) -> int:
         # so host-set values reach the supervisor running inside the container.
         "LMER_AUTO_START_SETTLE_DELAY": os.environ.get("LMER_AUTO_START_SETTLE_DELAY"),
         "LMER_WINSIZE_RECHECK_DELAY": os.environ.get("LMER_WINSIZE_RECHECK_DELAY"),
+        # The Codex delivery adapter runs inside the container (issue #460).
+        "LMER_CODEX_RPC_TIMEOUT": os.environ.get("LMER_CODEX_RPC_TIMEOUT"),
         # Forward the harness-profile overrides for the injected start command
         # and the self-shutdown quit sequence — HARNESSES.md promises every
         # profile field can be patched via env without a release, which needs

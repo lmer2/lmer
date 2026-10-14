@@ -27,10 +27,16 @@ _REQUEST_TIMEOUT = 30.0
 
 
 class MatrixError(RuntimeError):
-    def __init__(self, message: str, status: Optional[int] = None, errcode: Optional[str] = None) -> None:
+    def __init__(self, message: str, status: Optional[int] = None, errcode: Optional[str] = None,
+                 *, transient: bool = False, retry_after: Optional[float] = None) -> None:
         super().__init__(message)
         self.status = status
         self.errcode = errcode
+        #: No answer, a 429 or a 5xx: worth retrying later. Set where the
+        #: transport failed, since a definite answer can lack a status too.
+        self.transient = transient
+        #: A 429's ``retry_after_ms`` in seconds, when the homeserver sent one.
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,8 @@ class MatrixClient:
                 timeout=self._timeout if timeout is None else timeout, stream=stream,
             )
         except requests.RequestException as exc:
-            raise MatrixError(f"cannot reach the homeserver at {self.account.base} ({exc.__class__.__name__})") from exc
+            raise MatrixError(f"cannot reach the homeserver at {self.account.base} ({exc.__class__.__name__})",
+                              transient=True) from exc
         if response.status_code >= 400:
             errcode = None
             detail = ""
@@ -78,16 +85,20 @@ class MatrixClient:
                 detail = body.get("error") or ""
             except ValueError:
                 detail = (response.text or "")[:200]
+            retry = None
             if response.status_code == 429:
-                retry = 1.0
                 try:
-                    retry = float(response.json().get("retry_after_ms", 1000)) / 1000.0
-                except (ValueError, TypeError, AttributeError):
+                    retry = float(response.json()["retry_after_ms"]) / 1000.0
+                except (KeyError, ValueError, TypeError, AttributeError):
                     pass
-                time.sleep(min(retry, 10.0))
+                if retry is not None and not 0 <= retry <= 86400:
+                    retry = None
+                time.sleep(min(1.0 if retry is None else retry, 10.0))
             raise MatrixError(
                 f"{method} {path} → {response.status_code} {errcode or ''} {detail}".strip(),
                 status=response.status_code, errcode=errcode,
+                transient=response.status_code == 429 or response.status_code >= 500,
+                retry_after=retry,
             )
         if raw:
             return response
