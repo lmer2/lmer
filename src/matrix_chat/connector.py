@@ -22,8 +22,9 @@ from lmer_cli import thread_posts
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
+from lmer_cli.thread_access import UploadStore, outbound_file, withheld_note
 from lmer_cli.util import get_bool_env
-from matrix_bridge.scrub import scrub_bytes, scrub_text
+from matrix_bridge.scrub import scrub_text
 from slack_chat.connector import (
     ATTACH_ACK, ATTACH_ACK_ENV, ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV, DETACH_NOTE,
     _int_env, _with_references, answer_binding, attachment_notice, option_for,
@@ -311,6 +312,8 @@ class MatrixConnector(ConnectorLifecycle):
                            lambda: self.matrix.send_thread_text(
                                self.room_id, self.config.thread_event, text,
                                last_event_id=self._last_event_id, extra=self._mirror_content()), remember)
+        if (record.get("meta") or {}).get("thread"):
+            return True  # its files went to the thread it names
         for index, item in enumerate(record.get("attachments") or []):
             if isinstance(item, dict):
                 self._post_attachment(item, record=record, index=index)
@@ -320,7 +323,7 @@ class MatrixConnector(ConnectorLifecycle):
         self._ensure_ready()
         source = record if record is not None else {"attachment": item}
         part = f"file:{index}"
-        name = str(item.get("name") or "file")
+        name = scrub_text(str(item.get("name") or "file"))
         def remember(receipt):
             self._seen.add(receipt)
             self._posters.wrote(receipt)
@@ -334,18 +337,15 @@ class MatrixConnector(ConnectorLifecycle):
                 note = None
                 media_type = str(item.get("media_type") or "application/octet-stream")
                 if not self.config.authenticated_media:
-                    note = f"📎 {name} withheld: set {AUTHENTICATED_MEDIA_ENV}=1 once the homeserver requires authentication for media"
+                    note = withheld_note(name, f"set {AUTHENTICATED_MEDIA_ENV}=1 once the homeserver requires authentication for media")
                 else:
-                    try:
-                        data = self._attachment_bytes(item)
-                    except Exception:
-                        note = f"📎 {name} withheld: it is not a readable file in this session's upload store"
+                    prepared = outbound_file(
+                        item, UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir),
+                    )
+                    if prepared.withheld is not None:
+                        note = prepared.note
                     else:
-                        scrubbed = scrub_bytes(data, media_type)
-                        if scrubbed.refused:
-                            note = f"📎 {name} withheld: it carries something that looks like a credential"
-                        else:
-                            clean = scrubbed.data
+                        clean = prepared.data
                 if note is not None:
                     payload = {"text": note, "index": index}
                 else:
@@ -374,16 +374,6 @@ class MatrixConnector(ConnectorLifecycle):
             self._deliver_part(source, part, payload, send, remember)
             if record is None:
                 self._state.finish(lambda: None)
-
-    def _attachment_bytes(self, item: dict) -> bytes:
-        """The bytes of one of the agent's attachments, read the way the host
-        side reads any file the session named — on a descriptor, never by name
-        (:func:`lmer_cli.thread_access.read_from_store`)."""
-        from lmer_cli.thread_access import UploadStore, read_from_store
-
-        return read_from_store(
-            item, UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
-        )
 
     def _note(self, text, *, connection_notice=False):
         self._ensure_ready()

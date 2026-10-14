@@ -282,7 +282,17 @@ def poster_from_slack(channel: str, message: object) -> Optional[Poster]:
     ts = message.get("ts")
     if not isinstance(ts, str) or not ts:
         return None
-    return lookup(channel, ts)
+    found = lookup(channel, ts)
+    if found is not None:
+        return found
+    # A file share's ts is never returned to its poster, so it is recorded by file id.
+    for item in message.get("files") or []:
+        file_id = item.get("id") if isinstance(item, dict) else None
+        if isinstance(file_id, str) and file_id:
+            found = lookup(channel, file_id)
+            if found is not None:
+                return found
+    return None
 
 
 # ---------------------------------------------------------------------------
