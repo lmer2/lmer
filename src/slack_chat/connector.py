@@ -16,7 +16,7 @@ import shlex
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Mapping, Optional
 
@@ -24,13 +24,15 @@ import requests
 
 from ask_channel import bus
 from lmer_cli import thread_posts
+from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
+from lmer_cli.thread_access import UploadStore, outbound_file, slack_upload_refusal, withheld_note
 from lmer_cli.thread_requests import MAX_READ_LIMIT
 from lmer_cli.util import get_bool_env
 from matrix_bridge.scrub import scrub_text
 
-from .client import CONNECTION_NOTICE_BLOCK_PREFIX, SlackClient, SlackError
+from .client import COMPLETE_UPLOAD_REFUSALS, CONNECTION_NOTICE_BLOCK_PREFIX, SlackClient, SlackError
 from .permalink import slack_thread_link
 from lmer_cli.assistant_mentions import route_connected_mention
 
@@ -345,6 +347,11 @@ def option_for(text: str, options: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _share_refused(exc: Exception) -> bool:
+    """A share Slack refused becomes a note; any other failure freezes like a text send."""
+    return verified_rejection(exc) or getattr(exc, "code", None) in COMPLETE_UPLOAD_REFUSALS
+
+
 # ---------------------------------------------------------------------------
 # The connector
 # ---------------------------------------------------------------------------
@@ -401,6 +408,8 @@ class SlackConnector(ConnectorLifecycle):
         )
         self.failures = 0
         self._accepted_inbound = set()
+        #: Slack file ids this connector uploaded, to know their share as its own echo.
+        self._uploaded: set = set()
         self._init_lifecycle()
 
     # -- clients, resolved lazily so construction never touches the network --
@@ -472,6 +481,8 @@ class SlackConnector(ConnectorLifecycle):
                         if self._is_human(message):
                             inbound.append((message, None))
                         elif message.get("user") == self._bot_user_id:
+                            if self._own_upload(message):
+                                self._mirrored(message.get("ts"))
                             verdict, poster = self._posters.decide(message)
                             if verdict == thread_posts.INGEST:
                                 inbound.append((message, poster))
@@ -641,10 +652,95 @@ class SlackConnector(ConnectorLifecycle):
 
     def _send_record(self, record):
         text = render_outbound(record, self._questions)
-        if text is not None:
-            self._deliver_part(record, "text", {"text": text},
-                               lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, text),
-                               self._mirrored)
+        if text is None:
+            return
+        self._deliver_part(record, "text", {"text": text},
+                           lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, text),
+                           self._mirrored)
+        if (record.get("meta") or {}).get("thread"):
+            return  # its files went to the thread it names
+        for index, item in enumerate(record.get("attachments") or []):
+            if isinstance(item, dict):
+                self._post_attachment(record, item, index)
+
+    def _post_attachment(self, record, item, index):
+        """One of the agent's files into the thread, or the note saying why not.
+
+        The upload is persisted before the share that makes it visible, so a
+        retry shares the same file rather than uploading it twice.
+        """
+        part = f"file:{index}"
+        with self._state.outbound:
+            pending = self._state.begin(record)
+            existing = pending["parts"].get(part)
+            if existing:
+                payload = existing["payload"]
+            else:
+                prepared = outbound_file(
+                    item, UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir),
+                )
+                payload = None
+                if prepared.withheld is None:
+                    clean = prepared.data
+                    identity = {"index": index, "name": prepared.name,
+                                "sha256": hashlib.sha256(clean).hexdigest(), "size": len(clean)}
+                    with self._state.lock:
+                        upload = pending.setdefault("uploads", {}).get(part)
+                        if upload and upload["identity"] != identity:
+                            raise RecoveryRequired("pending attachment bytes changed")
+                    if upload is None:
+                        try:
+                            file_id = self.slack.upload_external(clean, filename=prepared.name)
+                        except SlackError as exc:
+                            reason = slack_upload_refusal(exc)
+                            if reason is None:
+                                raise
+                            logger.warning("slack_connector_upload_refused name=%s code=%s",
+                                           prepared.name, exc.code)
+                            prepared = replace(prepared, withheld=reason)
+                        else:
+                            upload = {"identity": identity, "file_id": file_id}
+                            with self._state.lock:
+                                pending["uploads"][part] = upload
+                                self._state.save()
+                    if upload is not None:
+                        payload = {**identity, "file_id": upload["file_id"]}
+                if payload is None:
+                    payload = {"text": scrub_text(prepared.note), "index": index}
+            if "file_id" in payload:
+                self._uploaded.add(payload["file_id"])
+                poster = thread_posts.Poster.for_session(self._posters.session)
+                if poster is not None:
+                    thread_posts.record(self.config.channel, payload["file_id"], poster)
+
+            def send():
+                if "text" in payload:
+                    return self.slack.post_message(self.config.channel, self.config.thread_ts, payload["text"])
+                return self.slack.complete_upload(payload["file_id"], self.config.channel,
+                                                  self.config.thread_ts, title=payload["name"])
+
+            def remember(receipt):
+                if "text" in payload:
+                    self._mirrored(receipt)
+
+            try:
+                self._deliver_part(record, part, payload, send, remember,
+                                   rejected=_share_refused if "file_id" in payload else verified_rejection)
+            except SlackError as exc:
+                reason = slack_upload_refusal(exc) if "file_id" in payload else None
+                if reason is None:
+                    raise
+                note = scrub_text(withheld_note(payload["name"], reason))
+                self._deliver_part(
+                    record, part + ":note", {"text": note, "index": index},
+                    lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, note),
+                    self._mirrored,
+                )
+
+    def _own_upload(self, message: dict) -> bool:
+        """Whether a bot message is the share of a file this connector uploaded."""
+        return any(isinstance(item, dict) and item.get("id") in self._uploaded
+                   for item in message.get("files") or [])
 
     def _send_receipt(self, ref, transaction):
         self.slack.add_reaction(self.config.channel, ref, "inbox_tray")

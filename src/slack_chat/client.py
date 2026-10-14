@@ -22,6 +22,24 @@ _REACTION_WORKER = Path(__file__).with_name("_reaction_request.py")
 # Slack's replies response schema includes messages[].blocks[].block_id;
 # the upstream references for this transport marker are in docs/COMMS.md §9.
 CONNECTION_NOTICE_BLOCK_PREFIX = "lmer-connection-status:"
+# The files.* upload methods take form fields, not the JSON body the session defaults to.
+_FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
+_UPLOAD_TIMEOUT = 120.0
+# files.completeUploadExternal's documented errors that refuse the request; the
+# share step also takes verified_rejection's. Left out: internal_error and
+# fatal_error ("part of the operation may have succeeded"), the temporary ones,
+# file_update_failed, and rate limits.
+COMPLETE_UPLOAD_REFUSALS = frozenset({
+    "access_denied", "accesslimited", "account_inactive", "channel_not_found",
+    "channels_limit_exceeded", "deprecated_endpoint", "ekm_access_denied",
+    "enterprise_is_restricted", "file_not_found", "file_type_not_allowed",
+    "file_uploads_except_images_disabled", "invalid_arg_name", "invalid_arguments",
+    "invalid_array_arg", "invalid_auth", "invalid_blocks", "invalid_channel",
+    "invalid_charset", "invalid_form_data", "invalid_post_type", "method_deprecated",
+    "missing_post_type", "missing_scope", "no_permission", "not_allowed_token_type",
+    "not_authed", "not_in_channel", "posting_to_channel_denied", "team_access_not_granted",
+    "token_expired", "token_revoked", "two_factor_setup_required", "user_is_external_guest",
+})
 
 
 def strip_run_references(text: str) -> str:
@@ -220,6 +238,43 @@ class SlackClient:
         if ts is None:
             raise SlackError("Slack chat.postMessage response missing 'ts' field")
         return ts
+
+    def upload_external(self, data: bytes, *, filename: str) -> str:
+        """Upload *data* without sharing it anywhere yet; return its file id.
+
+        The first two of Slack's three upload steps (``files.getUploadURLExternal``
+        and the byte POST). Nothing is visible until :meth:`complete_upload`.
+        Needs ``files:write``; Slack answers ``missing_scope`` without it.
+        """
+        reply = self._request(
+            "POST", "files.getUploadURLExternal", data={"filename": filename, "length": len(data)},
+            headers=_FORM_HEADERS,
+        )
+        upload_url, file_id = reply.get("upload_url"), reply.get("file_id")
+        if not isinstance(upload_url, str) or not isinstance(file_id, str):
+            raise SlackError("Slack files.getUploadURLExternal response missing 'upload_url' or 'file_id'")
+        try:
+            # A pre-signed URL: the bot token is not sent to it.
+            response = requests.post(
+                upload_url, data=data, headers={"Content-Type": "application/octet-stream"},
+                timeout=self.timeout or _UPLOAD_TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise SlackError(f"Slack file upload failed: {exc.__class__.__name__}") from exc
+        return file_id
+
+    def complete_upload(self, file_id: str, channel: str, thread_ts: str, *, title: str) -> str:
+        """Share an uploaded file into a thread; return the file id as the receipt."""
+        data = self._request(
+            "POST", "files.completeUploadExternal",
+            data={"files": json.dumps([{"id": file_id, "title": title}]),
+                  "channel_id": channel, "thread_ts": thread_ts},
+            headers=_FORM_HEADERS,
+        )
+        if not any(isinstance(item, dict) and item.get("id") == file_id for item in data.get("files") or []):
+            raise SlackError("Slack files.completeUploadExternal response does not name the file")
+        return file_id
 
     def post_root(self, channel: str, text: str) -> Dict[str, Any]:
         """Post a message that is not a reply, opening a thread on it (#429).

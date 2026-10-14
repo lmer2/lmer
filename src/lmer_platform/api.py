@@ -3715,16 +3715,38 @@ def create_app(
         limit: int = Query(
             default=thread_queue.DEFAULT_READ_LIMIT, ge=1, le=thread_queue.MAX_READ_LIMIT
         ),
+        caller: Caller = Depends(require_secret),
     ) -> dict:
         """A thread's most recent messages, as the records a session would see.
 
-        No upload store: no session is behind this call, so a file is described
-        rather than copied anywhere.
+        Files are copied into the calling assistant's upload store (#550); for any
+        other caller they are described, with the command that copies them in.
         """
+        store = _assistant_store(caller)
         try:
-            return thread_access.read_thread(permalink, limit=limit)
+            return thread_access.read_thread(
+                permalink, limit=limit, store=store,
+                unstored=(
+                    "not copied on this route: no upload store is behind this caller; "
+                    f"`lmer-signal read {permalink}` in a session copies it into that "
+                    "session's store"
+                ),
+            )
         except ThreadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    def _assistant_store(caller: Caller) -> Optional[thread_access.UploadStore]:
+        """The calling assistant's mounted upload store, or ``None``."""
+        if not caller.is_assistant or not caller.session_id:
+            return None
+        try:
+            directory = uploads.mounted_store(
+                caller.session_id, session_io.require_session(caller.session_id),
+            )
+        except (SessionIOError, UploadError) as exc:
+            logger.info("comms_thread_read_no_store session=%s error=%s", caller.session_id, exc)
+            return None
+        return thread_access.UploadStore(str(directory), uploads.CONTAINER_UPLOADS_DIR)
 
     @app.post("/api/comms/thread", dependencies=guard)
     def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:

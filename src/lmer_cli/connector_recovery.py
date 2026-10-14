@@ -190,8 +190,13 @@ class Recovery:
             messages = remote.get_replies(self.key.conversation, self.key.root)
             message = next((item for item in messages if item.get("ts") == reference), None)
             if (not message or reference == self.key.root or message.get("user") != remote.auth_test()
-                    or message.get("thread_ts", self.key.root) != self.key.root
-                    or _slack_text(message.get("text", "")) != _slack_text(payload.get("text", ""))):
+                    or message.get("thread_ts", self.key.root) != self.key.root):
+                raise RecoveryRequired("Slack reference does not match this operation's thread, sender and content")
+            if "file_id" in payload:
+                if not any(isinstance(item, dict) and item.get("id") == payload["file_id"]
+                           for item in message.get("files") or []):
+                    raise RecoveryRequired("Slack reference does not share this operation's file")
+            elif _slack_text(message.get("text", "")) != _slack_text(payload.get("text", "")):
                 raise RecoveryRequired("Slack reference does not match this operation's thread, sender and content")
             return
         event = remote.get_event(self.key.conversation, reference)

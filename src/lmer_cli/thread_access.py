@@ -27,7 +27,7 @@ import re
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -140,6 +140,25 @@ _SLACK_UNSEEABLE = frozenset({
 MAX_READ_BYTES = 100 * 1024 * 1024
 
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+#: Why a file read from a thread was described rather than copied in.
+NO_STORE = "this session has no upload store"
+
+# Why an agent's attachment was withheld, as posted into a thread. Fixed phrases:
+# an exception's own text carries host paths and server URLs into a room the run
+# may not own; the detail goes to the log.
+WITHHELD_UNREADABLE = "it is not a readable file in this session's upload store"
+WITHHELD_TOO_LARGE = f"it is over the {MAX_FILE_BYTES // (1024 * 1024)} MiB a thread is sent"
+WITHHELD_CREDENTIAL = "it carries something that looks like a credential"
+SLACK_FILES_WRITE = "files:write"
+WITHHELD_SLACK_SCOPE = f"the Slack app lacks the {SLACK_FILES_WRITE} scope"
+
+_SLACK_CODE = re.compile(r"^[a-z_]{1,64}$")
+#: Slack's codes for a failure on its side or a temporary outage: retried, never a refusal.
+_SLACK_TRANSIENT = frozenset({
+    "ratelimited", "rate_limited", "internal_error", "fatal_error",
+    "service_unavailable", "request_timeout", "team_added_to_org", "org_login_required",
+})
 
 
 @dataclass(frozen=True)
@@ -416,6 +435,10 @@ def stored_name_of(item: dict, store: Optional[UploadStore]) -> Optional[str]:
     return name
 
 
+class FileTooLarge(ThreadError):
+    """:func:`read_from_store` refused a file for its size alone."""
+
+
 def read_from_store(
     item: dict, store: Optional[UploadStore], *, max_bytes: int = MAX_FILE_BYTES,
 ) -> bytes:
@@ -447,14 +470,70 @@ def read_from_store(
         if not stat.S_ISREG(info.st_mode):
             raise ThreadError("not a regular file in this session's upload store", status=400)
         if info.st_size > max_bytes:
-            raise ThreadError(
+            raise FileTooLarge(
                 f"{info.st_size} bytes; this posts at most {max_bytes}", status=400
             )
-    except BaseException:
+    except BaseException as exc:
         os.close(descriptor)
+        if isinstance(exc, OSError):
+            raise ThreadError(f"not readable in this session's upload store ({exc.strerror})", status=400) from None
         raise
-    with os.fdopen(descriptor, "rb") as handle:
-        return handle.read(max_bytes)
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            return handle.read(max_bytes)
+    except OSError as exc:
+        raise ThreadError(f"not readable in this session's upload store ({exc.strerror})", status=400) from None
+
+
+def withheld_note(name: str, reason: str) -> str:
+    """The line a thread gets in place of a file it was not sent."""
+    return f"📎 {name} withheld: {reason}"
+
+
+@dataclass(frozen=True)
+class OutboundFile:
+    """One of the session's attachments, ready to send or withheld with a reason."""
+
+    name: str
+    media_type: str
+    data: Optional[bytes] = None
+    withheld: Optional[str] = None
+
+    @property
+    def note(self) -> str:
+        return withheld_note(self.name, self.withheld or "")
+
+
+def outbound_file(item: dict, store: Optional[UploadStore]) -> OutboundFile:
+    """Read, bound and scrub one attachment the session sent, for any transport."""
+    # Deferred: the scrub imports lmer_platform.transcripts, ~0.6 s this module avoids.
+    from matrix_bridge.scrub import scrub_bytes, scrub_text
+
+    name = scrub_text(str(item.get("name") or "file"))
+    media_type = str(item.get("media_type") or "application/octet-stream")
+    try:
+        data = read_from_store(item, store)
+    except FileTooLarge as exc:
+        logger.info("thread_attachment_too_large name=%s error=%s", name, exc)
+        return OutboundFile(name, media_type, withheld=WITHHELD_TOO_LARGE)
+    except ThreadError as exc:
+        logger.info("thread_attachment_unreadable name=%s error=%s", name, exc)
+        return OutboundFile(name, media_type, withheld=WITHHELD_UNREADABLE)
+    scrubbed = scrub_bytes(data, media_type)
+    if scrubbed.refused:
+        return OutboundFile(name, media_type, withheld=WITHHELD_CREDENTIAL)
+    return OutboundFile(name, media_type, data=scrubbed.data)
+
+
+def slack_upload_refusal(exc: Exception) -> Optional[str]:
+    """Why Slack's definitive refusal of an upload withholds the file, or ``None``
+    for a failure worth retrying (transport, rate limit)."""
+    code = getattr(exc, "code", None)
+    if not isinstance(code, str) or code in _SLACK_TRANSIENT:
+        return None
+    if code == "missing_scope":
+        return WITHHELD_SLACK_SCOPE
+    return f"Slack refused the upload ({code if _SLACK_CODE.match(code) else 'unknown error'})"
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +589,7 @@ def read_thread(
     where: str = DAEMON_ENVIRONMENT,
     client=None,
     ref: Optional[ThreadRef] = None,
+    unstored: str = NO_STORE,
 ) -> dict:
     """Read up to *limit* messages as bus-style records; pagination is transport-specific."""
     limit = max(1, min(int(limit or _requests.DEFAULT_READ_LIMIT), _requests.MAX_READ_LIMIT))
@@ -521,10 +601,13 @@ def read_thread(
     budget = [MAX_READ_BYTES]
     if ref.channel == CHANNEL_SLACK:
         records = _read_slack(
-            ref, client, limit=limit, store=store, budget=budget, fetched=fetched
+            ref, client, limit=limit, store=store, budget=budget, fetched=fetched,
+            unstored=unstored,
         )
     else:
-        records = _read_matrix(ref, client, limit=limit, store=store, budget=budget)
+        records = _read_matrix(
+            ref, client, limit=limit, store=store, budget=budget, unstored=unstored,
+        )
     return {"thread": _thread_summary(ref), "messages": records}
 
 
@@ -539,7 +622,7 @@ def _thread_summary(ref: ThreadRef) -> dict:
 
 def _read_slack(
     ref: ThreadRef, client, *, limit: int, store: Optional[UploadStore], budget: list,
-    fetched: Optional[list] = None,
+    fetched: Optional[list] = None, unstored: str = NO_STORE,
 ) -> list:
     channel, thread_ts = ref.key["channel"], ref.key["thread_ts"]
     messages = fetched
@@ -561,7 +644,7 @@ def _read_slack(
             "ref": f"{channel}:{thread_ts}:{ts}" if ts else None,
             "at": _iso_from_slack_ts(ts),
             "attachments": _stage_slack_files(
-                client, message.get("files") or [], store, budget
+                client, message.get("files") or [], store, budget, unstored=unstored,
             ),
         })
     return records
@@ -602,7 +685,9 @@ def _slack_author(client, message: dict, names: dict) -> Optional[str]:
     return slack_display_name(client, user, names)
 
 
-def _stage_slack_files(client, files: list, store: Optional[UploadStore], budget: list) -> list:
+def _stage_slack_files(
+    client, files: list, store: Optional[UploadStore], budget: list, *, unstored: str = NO_STORE,
+) -> list:
     """Describe every file on a message, and copy it in when there is a store.
 
     Described either way: a read served to the platform's own routes has no
@@ -620,7 +705,7 @@ def _stage_slack_files(client, files: list, store: Optional[UploadStore], budget
         url = item.get("url_private_download") or item.get("url_private")
         record = {"name": name, "media_type": media_type, "bytes": item.get("size")}
         if store is None:
-            record["reason"] = "this session has no upload store"
+            record["reason"] = unstored
         elif not url:
             record["reason"] = "the thread does not say where to fetch it"
         elif budget[0] <= 0:
@@ -678,6 +763,7 @@ def fetch_slack_file(
 
 def _read_matrix(
     ref: ThreadRef, client, *, limit: int, store: Optional[UploadStore], budget: list,
+    unstored: str = NO_STORE,
 ) -> list:
     room, event = ref.key["room"], ref.key["event"]
     try:
@@ -702,12 +788,14 @@ def _read_matrix(
             "text": str(content.get("body") or ""),
             "ref": item.get("event_id"),
             "at": _iso_from_millis(item.get("origin_server_ts")),
-            "attachments": _stage_matrix_file(client, content, store, budget),
+            "attachments": _stage_matrix_file(client, content, store, budget, unstored=unstored),
         })
     return records
 
 
-def _stage_matrix_file(client, content: dict, store: Optional[UploadStore], budget: list) -> list:
+def _stage_matrix_file(
+    client, content: dict, store: Optional[UploadStore], budget: list, *, unstored: str = NO_STORE,
+) -> list:
     """The message's file, described, and copied in when there is room for it."""
     mxc = content.get("url")
     if not isinstance(mxc, str) or not mxc.startswith("mxc://"):
@@ -720,7 +808,7 @@ def _stage_matrix_file(client, content: dict, store: Optional[UploadStore], budg
         "bytes": info.get("size"),
     }
     if store is None:
-        return [{**described, "reason": "this session has no upload store"}]
+        return [{**described, "reason": unstored}]
     if budget[0] <= 0:
         return [{**described, "reason": "this read has already copied in as much as it will"}]
     declared = info.get("size")
@@ -774,7 +862,7 @@ def post_thread(
     composed = f"[{label}] {body}" if label else body
     named = list(attachments or [])
     if ref.channel == CHANNEL_SLACK:
-        posted = _post_slack(ref, client, composed, named, poster=poster)
+        posted = _post_slack(ref, client, composed, named, store=store, poster=poster)
     else:
         posted = _post_matrix(ref, client, composed, named, store=store, env=env, poster=poster)
     return {"thread": _thread_summary(ref), "posted": posted}
@@ -794,10 +882,9 @@ def _clip(text: str) -> tuple[str, bool]:
 
 
 def _post_slack(
-    ref: ThreadRef, client, text: str, attachments: list, *, poster: Optional[Poster] = None,
+    ref: ThreadRef, client, text: str, attachments: list, *,
+    store: Optional[UploadStore] = None, poster: Optional[Poster] = None,
 ) -> dict:
-    # Named, not uploaded: the connector's own outbound rule (docs/COMMS.md §9).
-    # The file is in the session's store, not in the thread's workspace.
     for item in attachments:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
@@ -814,6 +901,32 @@ def _post_slack(
         # After the post: the id being recorded is the one Slack just assigned.
         # A connector polling inside that gap holds the message (§9).
         thread_posts.record(channel, ts, poster)
+    withheld = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        prepared = outbound_file(item, store)
+        if prepared.withheld is None:
+            try:
+                file_id = client.upload_external(prepared.data, filename=prepared.name)
+                if poster is not None:
+                    thread_posts.record(channel, file_id, poster)
+                client.complete_upload(file_id, channel, thread_ts, title=prepared.name)
+            except Exception as exc:
+                logger.warning("thread_attachment_upload_failed name=%s error=%s", prepared.name, exc)
+                prepared = replace(
+                    prepared, withheld=slack_upload_refusal(exc) or "Slack would not take it",
+                )
+        if prepared.withheld is not None:
+            withheld.append(prepared.note)
+    if withheld:
+        try:
+            note_ts = client.post_message(channel, thread_ts, "\n".join(withheld))
+        except Exception as exc:
+            logger.warning("thread_post_note_failed channel=%s error=%s", channel, exc)
+        else:
+            if poster is not None:
+                thread_posts.record(channel, note_ts, poster)
     return {
         "ref": f"{channel}:{thread_ts}:{ts}",
         "at": _iso_from_slack_ts(ts),
@@ -825,7 +938,7 @@ def _post_matrix(
     ref: ThreadRef, client, text: str, attachments: list, *,
     store: Optional[UploadStore], env: Optional[dict], poster: Optional[Poster] = None,
 ) -> dict:
-    from matrix_bridge.scrub import scrub_bytes, scrub_text
+    from matrix_bridge.scrub import scrub_text
     from matrix_chat.connector import AUTHENTICATED_MEDIA_ENV
 
     from .util import get_bool_env
@@ -845,13 +958,13 @@ def _post_matrix(
     for item in attachments:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or "file")
+        name = scrub_text(str(item.get("name") or "file"))
         reason = _matrix_attachment(
             client, ref, item, store=store, authenticated=authenticated,
-            scrub_bytes=scrub_bytes, last_event_id=event_id, stamp=stamp,
+            last_event_id=event_id, stamp=stamp,
         )
         if reason:
-            withheld.append(f"📎 {name} withheld: {reason}")
+            withheld.append(withheld_note(name, reason))
     if withheld:
         with_note = "\n".join(withheld)
         try:
@@ -865,15 +978,10 @@ def _post_matrix(
 
 
 def _matrix_attachment(
-    client, ref: ThreadRef, item: dict, *, store, authenticated: bool, scrub_bytes,
+    client, ref: ThreadRef, item: dict, *, store, authenticated: bool,
     last_event_id, stamp: Optional[dict] = None,
 ) -> Optional[str]:
-    """Upload one attachment; return why it was withheld, or ``None``.
-
-    Every reason is a fixed phrase: this string is posted into a thread the run
-    does not own, and an exception's own text carries host paths and homeserver
-    URLs into somebody else's room. The detail goes to the log.
-    """
+    """Upload one attachment; return why it was withheld, or ``None``."""
     from matrix_chat.connector import AUTHENTICATED_MEDIA_ENV
 
     if not authenticated:
@@ -881,25 +989,18 @@ def _matrix_attachment(
             f"set {AUTHENTICATED_MEDIA_ENV}=1 once the homeserver requires "
             "authentication for media"
         )
+    prepared = outbound_file(item, store)
+    if prepared.withheld is not None:
+        return prepared.withheld
     try:
-        data = read_from_store(item, store)
-    except ThreadError as exc:
-        logger.info("thread_attachment_unreadable error=%s", exc)
-        return "it is not a readable file in this session's upload store"
-    media_type = str(item.get("media_type") or "application/octet-stream")
-    scrubbed = scrub_bytes(data, media_type)
-    if scrubbed.refused:
-        return "it carries something that looks like a credential"
-    name = str(item.get("name") or "file")
-    try:
-        mxc = client.upload(scrubbed.data, content_type=media_type, filename=name)
+        mxc = client.upload(prepared.data, content_type=prepared.media_type, filename=prepared.name)
         client.send_thread_file(
-            ref.key["room"], ref.key["event"], mxc=mxc, name=name,
-            media_type=media_type, size=len(scrubbed.data), last_event_id=last_event_id,
+            ref.key["room"], ref.key["event"], mxc=mxc, name=prepared.name,
+            media_type=prepared.media_type, size=len(prepared.data), last_event_id=last_event_id,
             extra=stamp,
         )
     except Exception as exc:
-        logger.warning("thread_attachment_upload_failed name=%s error=%s", name, exc)
+        logger.warning("thread_attachment_upload_failed name=%s error=%s", prepared.name, exc)
         return "the homeserver would not take it"
     return None
 

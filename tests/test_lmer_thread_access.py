@@ -490,6 +490,17 @@ class TestPosting:
         )
         assert [name for _mxc, name, _size in matrix.uploaded] == ["notes.md"]
 
+    def test_matrix_scrubs_a_credential_shaped_name_in_the_withheld_note(self, matrix, store, tmp_path):
+        shaped = "ghp_" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8"
+        (tmp_path / "uploads" / "notes.md").write_text("hi")
+        item = {"name": f"{shaped}.md", "path": "/home/developer/.lmer-uploads/notes.md",
+                "media_type": "text/plain"}
+        post_thread(MATRIX_LINK, "here it is", label="run", env=MATRIX_ENV,
+                    attachments=[item], store=store)
+        notes = [text for text, msgtype in matrix.sent if msgtype == "m.notice"]
+        assert len(notes) == 1 and "withheld" in notes[0]
+        assert all(shaped not in text for text, _msgtype in matrix.sent)
+
 
 class TestWhoPostedIt:
     """The machine-readable half of a post's attribution (#427)."""

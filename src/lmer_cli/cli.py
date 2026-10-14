@@ -167,6 +167,7 @@ from .service import (
 )
 from .container.target_switch import DEFAULT_TARGET_FILE as CONTAINER_SERVICE_TARGET_FILE
 from .tokens import (
+    EVIDENCE_TOKEN_PREFIX,
     _get_gitlab_token,
     _prefer_ssh,
     _convert_ssh_to_https_if_token_available,
@@ -3828,6 +3829,12 @@ def main(argv: list[str] | None = None) -> int:
         except ProviderConfigError as exc:
             error(f"❌ {exc}")
             return 2
+
+    # The CI-baseline evidence token reads as a Maintainer, CI/CD variable
+    # values included, so only a session whose baseline is on receives it.
+    if ci_baseline[0] != "1":
+        for name in [key for key in env if key.startswith(EVIDENCE_TOKEN_PREFIX)]:
+            del env[name]
 
     # Container environment. Values ride a mode-0600 --env-file (plus bare
     # -e NAME inheritance markers for the few that a line-oriented file

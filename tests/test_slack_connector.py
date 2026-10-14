@@ -1082,8 +1082,10 @@ class TestOutboundRedaction:
         record["source"] = {"channel": "terminal", "author": _ENV_VALUE}
         record["meta"] = {"fidelity": "confirmed"}
         rig.connector._send_record(record)
-        (_, _, posted), = rig.slack.posted
-        assert _SHAPED not in posted and _ENV_VALUE not in posted
+        (_, _, posted), (_, _, note) = rig.slack.posted
+        assert "withheld" in note, "the file is not in the store, so it is withheld (#459)"
+        for text in (posted, note):
+            assert _SHAPED not in text and _ENV_VALUE not in text
 
     def test_the_quoted_question_in_an_answer_line_is_redacted(self, rig):
         question = self._record("question", f"use {_SHAPED}?", id="q1")

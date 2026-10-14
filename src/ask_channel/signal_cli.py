@@ -258,8 +258,11 @@ def _add_attach(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         dest="attachments",
         help=(
-            "Attach a file (repeatable). Copied into this session's upload store, "
-            "which the connectors deliver or link; refused when the session has none."
+            "Attach a file (repeatable). Copied into this session's upload store; "
+            "connected Slack and matrix threads get the file itself, or a "
+            "'withheld' note saying why (over 25 MiB, credential-shaped, the Slack "
+            "app lacking files:write, matrix media not asserted authenticated). "
+            "Refused when the session has no store."
         ),
     )
 

@@ -462,7 +462,8 @@ every channel for mentions and needs no public HTTP endpoint.
 - Grant `app_mentions:read` and `im:history`, plus the existing history scopes
   for context reads (`channels:history` for public channels and `groups:history`
   for private channels). Keep `chat:write` for replies and `im:write` to start
-  assistant DMs. Reinstall the app after changing its granted scopes.
+  assistant DMs. Add `files:write` so runs' `--attach` files upload into their
+  threads. Reinstall the app after changing its granted scopes.
 - Invite the bot to the channels where it should receive mentions. Membership
   still controls access to history; `not_in_channel` in the daemon log identifies
   a refused context read.
@@ -606,6 +607,69 @@ the nudge in memory for the accumulation it was about, which matters because the
 outage that stops it recording a nudge also stops uber lmer draining the spool —
 without that memory, an unwritable `assistant.json` turned the interval into the
 30-second tick.
+
+### When the assistant is not taking its spool
+
+A reminder can't help an assistant that can't act, for example one whose
+harness login expired overnight. Repeating it every interval used to mean
+hundreds of inputs a day into a session that could do nothing with them, while
+the operator heard nothing. So the nudge backs off (#584):
+
+- **After 3 unanswered nudges, typing stops.** A nudge counts as unanswered
+  once its own interval has passed without a take. The back-off decision still
+  needs every condition above, so a busy assistant is neither nudged nor
+  reported.
+- **Then the operator gets one message.** The daemon posts it itself into the
+  assistant's standing threads: the project's `threads` setting, or
+  `assistant_threads` outside projects mode. It gives the waiting count and the
+  wait, and says that reminders have stopped. The post carries no
+  session attribution, so a connector watching the thread treats it as its own
+  echo and doesn't type it into the assistant.
+- **It names a known marker, never a diagnosis and never terminal text.** The
+  daemon searches the tail of the assistant's terminal for a fixed list of
+  markers (`Login expired`, `Please run /login`, `authentication_failed`,
+  `rate_limit`) and names only the one it saw last, for example "its terminal
+  shows `Login expired`". Nothing else the terminal drew leaves the host. When no
+  marker is there, the message says the platform saw no known reason.
+- **Once per episode.** An episode ends when a new assistant incarnation starts,
+  when the spool is taken, or when moving a run empties the spool. Any of these
+  restores the 3 nudges and allows one more message. The count and the signal
+  stamp are stored beside `nudged_at`: in `assistant.json`, or in the project
+  database in projects mode. The daemon also records them in memory before each
+  write, so a store that refuses writes can't turn the message into a post every
+  tick. A count or stamp written after a take has landed is refused, so it can't
+  carry over into the next backlog.
+- **Codex counts 3 too.** The one native wake a codex assistant gets per
+  accumulation comes before the reminders and doesn't count, so it sees 4 inputs
+  before typing stops.
+
+If no standing thread exists, the `assistant_stalled` event in `events.jsonl` and
+the `platform_assistant_stalled` warning are the whole signal. If every thread
+refuses the post, the episode stays unsignalled and the daemon tries again one
+interval later. Every attempt is recorded in an `assistant_stalled` event with
+the threads it reached, the failures (scrubbed) and the marker.
+
+### Projects mode: merged digests
+
+A project's spool is never truncated, unlike the 50-note spool outside projects
+mode. Instead, the two digest classes that repeat on a quiet fleet are merged
+as they arrive:
+
+- A new `stale_runs` check-in absorbs the project's earlier ones. The merged note
+  names every run any of them named, uses the newest details for each, and counts
+  the check-ins it absorbed in `data.check_ins`.
+- A routine `session_comms` batch absorbs that session's earlier routine note.
+  A batch is routine only when every record in it is a `note`. Connector-health
+  notices, such as delivery retrying or recovered, are filtered out before the
+  spool and never reach a batch. The counts add up and the note keeps the latest
+  lines. The full record is still in the session's comms feed.
+
+Questions, conversation requests and attention digests are never merged or
+dropped. A comms batch holding anything other than notes stays a note of its
+own: a question, a milestone, a close, a relayed command or answer, a record
+with no kind, or a kind added later. Notes
+spooled before this change carry no `routine` tag and are left as they are until
+they are taken.
 
 ### Confirming a crash
 

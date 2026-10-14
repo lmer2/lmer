@@ -742,6 +742,108 @@ class TestConfirm:
         assert evidence.verdict == UNVERIFIED
         assert "403" in evidence.reason
 
+    def test_variables_refused_to_the_run_token_names_the_fix(self):
+        """GitLab answers the variables read 403 below Maintainer (#582)."""
+        client = passing()
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/10/variables"] = (403, "")
+        env = ci_baseline.evidence_token_env("gitlab.example.com")
+        evidence = collect(MAPPING, GitLabEvidence(client, evidence_env=env),
+                           "gitlab.example.com", PROJECT, SHA)
+        assert evidence.verdict == UNVERIFIED
+        assert evidence.reason == (
+            "cannot read pipeline variables: GitLab refused the run token (403); "
+            "it needs the Maintainer role, or set LMER_CI_BASELINE_TOKEN_gitlab_example_com "
+            "to a Maintainer read_api token (see docs/GATE-CI-BASELINE.md)")
+
+    def test_variables_refused_to_the_evidence_token_names_it(self):
+        client = passing()
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/10/variables"] = (403, "")
+        env = ci_baseline.evidence_token_env("gitlab.example.com")
+        evidence = collect(MAPPING, GitLabEvidence(client, evidence_env=env, uses_evidence_token=True),
+                           "gitlab.example.com", PROJECT, SHA)
+        assert evidence.verdict == UNVERIFIED
+        assert evidence.reason == (
+            f"cannot read pipeline variables: GitLab refused {env} (403); "
+            "it needs the Maintainer role (see docs/GATE-CI-BASELINE.md)")
+        assert evidence.as_dict()["credential"] == env
+
+    def test_variables_refused_without_a_host_still_points_at_the_evidence_token(self):
+        client = passing()
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/10/variables"] = (403, "")
+        evidence = gather(client)
+        assert "or set LMER_CI_BASELINE_TOKEN_<host> to a Maintainer" in evidence.reason
+        assert evidence.as_dict()["credential"] == ci_baseline.RUN_CREDENTIAL
+
+    def test_an_evidence_token_refused_anywhere_is_named(self):
+        """An expired or revoked evidence token fails the first read, not the
+        variables read."""
+        client = passing()
+        client.failures[f"/projects/{urllib.parse.quote(PROJECT, safe='')}"] = (401, "")
+        env = ci_baseline.evidence_token_env("gitlab.example.com")
+        evidence = collect(MAPPING, GitLabEvidence(client, evidence_env=env, uses_evidence_token=True),
+                           "gitlab.example.com", PROJECT, SHA)
+        assert evidence.verdict == UNVERIFIED
+        assert evidence.reason.endswith(f"answered 401 to {env}")
+
+    def test_an_answer_that_is_not_utf8_blames_no_token(self):
+        """A proxy's latin-1 error page fails the decode in GitLabPipelineClient."""
+        class Latin1Page(FakeClient):
+            def request(self, endpoint, accept="application/json"):
+                return 502, b"<html>Passerelle d\xe9faillante</html>".decode("utf-8")
+
+        env = ci_baseline.evidence_token_env("gitlab.example.com")
+        evidence = collect(MAPPING, GitLabEvidence(Latin1Page({}), evidence_env=env,
+                                                   uses_evidence_token=True),
+                           "gitlab.example.com", PROJECT, SHA)
+        assert evidence.verdict == UNVERIFIED
+        assert evidence.reason == (
+            f"GitLab API /projects/{urllib.parse.quote(PROJECT, safe='')}: answer is not UTF-8")
+
+    @pytest.mark.parametrize("token, sendable", [
+        ("glpat-AbC_123-xyz", True),
+        ("glpat-secret\rX", False),
+        ("glpat-secret\nX", False),
+        ("glpat-secret\x00", False),
+        ("glpat-secret\x85", False),
+        ("glpat-secret\u200b", False),
+        ("glpat-secret\u0100", False),
+    ])
+    def test_header_text(self, token, sendable):
+        assert ci_baseline.is_header_text(token) is sendable
+
+    def test_refused_variables_leave_no_job_claiming_a_pass(self):
+        """Seen live on #582: pre-commit printed "no variables" for a pipeline
+        whose variables were never read."""
+        client = passing()
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/10/variables"] = (403, "")
+        evidence = gather(client)
+        assert [job.verdict for job in evidence.jobs] == [UNVERIFIED, UNVERIFIED]
+        assert all(job.reason == evidence.reason for job in evidence.jobs)
+
+    def test_a_job_confirmed_before_the_refusal_keeps_its_pass(self):
+        client = FakeClient(routes(
+            [pipeline(10), pipeline(11)],
+            {10: [job(1, "pre-commit", "success", 10)],
+             11: [job(2, "pytest", "success", 11)]}))
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/11/variables"] = (403, "")
+        evidence = gather(client)
+        assert evidence.verdict == UNVERIFIED
+        verdicts = {job.name: job.verdict for job in evidence.jobs}
+        assert verdicts == {"pre-commit": PASSED, "pytest": UNVERIFIED}
+
+    @pytest.mark.parametrize("status", [401, 404, 500])
+    def test_other_variables_errors_stay_generic(self, status):
+        client = passing()
+        client.failures[f"/projects/{PROJECT_ID}/pipelines/10/variables"] = (status, "")
+        evidence = gather(client)
+        assert evidence.verdict == UNVERIFIED
+        assert evidence.reason == (f"GitLab API /projects/{PROJECT_ID}/pipelines/10/"
+                                   f"variables answered {status}")
+
+    def test_evidence_token_env_is_per_host(self):
+        assert ci_baseline.evidence_token_env("Git.Example-Host.com") == (
+            "LMER_CI_BASELINE_TOKEN_git_example_host_com")
+
     def test_failed_verdict_reads_no_configuration(self):
         client = FakeClient(routes([pipeline(10, source="web")],
                                    {10: [job(1, "pre-commit", "success", 10),
