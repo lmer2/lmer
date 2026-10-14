@@ -447,6 +447,26 @@ def test_the_digest_carries_what_the_assistant_needs_to_act(config):
     }
 
 
+def test_a_schema_2_digest_names_its_execution_uid(config):
+    """The ref stays slug-spelled, but the payload carries the uid the UI keys by."""
+    uid = "b" * 32
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet({**row("develop-141", reason="question", note=QUESTION,
+                     state="waiting_on_you", since="2026-07-28T10:00:00Z"), "uid": uid}),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    call = spool.calls[0]
+
+    assert call["note"].startswith("gitlab.example.com/group/project/develop-141 ")
+    assert call["data"]["uid"] == uid
+
+
 def test_a_row_with_no_run_identity_yet_is_skipped(config):
     """A session spawned seconds ago has no ``<host>/<project>/<slug>``.
 

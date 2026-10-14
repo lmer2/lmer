@@ -3864,7 +3864,8 @@ def main(argv: list[str] | None = None) -> int:
         platform_instance=os.environ.get("LMER_PLATFORM_INSTANCE") or None,
     )
     name_slug = os.environ.get("LMER_PLATFORM_RUN_SLUG") or _cli_run_slug(
-        None if ns.no_task else task_id, primary_target
+        None if ns.no_task else task_id,
+        container_task_target(primary_target, target_class),
     )
     name = container_name(name_slug, platform_session)
     run += ["--name", name]

@@ -530,6 +530,10 @@ class Signal:
     label: Optional[str] = None
     state: Optional[str] = None
     session: Optional[str] = None
+    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. Only on
+    #: :meth:`data`: ``ref`` and ``key`` stay slug-spelled, but a link built from
+    #: the digest must key to this execution, not to its slug group.
+    uid: Optional[str] = None
 
     @property
     def ref(self) -> str:
@@ -598,7 +602,15 @@ class Signal:
         }
         if self.session:
             data["session"] = self.session
+        if self.uid:
+            data["uid"] = self.uid
         return data
+
+
+def _row_uid(row: dict) -> Optional[str]:
+    """The fleet row's execution uid, or ``None`` for a slug-keyed row."""
+    uid = row.get("uid")
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -646,6 +658,7 @@ def _signals_of_row(row: object) -> list:
 
     state = _text(row.get("state"))
     label = _text(row.get("label"))
+    uid = _row_uid(row)
     found = []
 
     attention = row.get("attention")
@@ -656,13 +669,13 @@ def _signals_of_row(row: object) -> list:
                 host=host, project=project, slug=slug, kind=reason,
                 note=_text(attention.get("note")),
                 since=_text(attention.get("since")),
-                label=label, state=state,
+                label=label, state=state, uid=uid,
             ))
 
     if state in MATERIAL_STATES:
         found.append(Signal(
             host=host, project=project, slug=slug, kind=state,
-            since=_text(row.get("updated")), label=label, state=state,
+            since=_text(row.get("updated")), label=label, state=state, uid=uid,
         ))
     return found
 
