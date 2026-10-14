@@ -43,7 +43,7 @@ def flush():
         with projects.database() as db:
             for (owner, session), records in groups.items():
                 row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (owner,)).fetchone()
-                state = assistant.AssistantState.from_dict(json.loads(row[0]))
+                state = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=owner)
                 data = {**records[-1][1]["data"], "workspace_id": owner, "count": len(records)}
                 lines = []
                 for _identity, payload in records[-8:]:

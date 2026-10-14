@@ -3,7 +3,7 @@ import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
 import ForgetCompleted from '../src/components/ForgetCompleted.vue'
 import { fetchProjects, fetchRunRelations, fetchState, forgetRun } from '../src/api.js'
-import { mountPane, deferred } from './mount.js'
+import { chooseProject, mountPane, deferred } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
   fetchState: vi.fn(),
@@ -111,8 +111,7 @@ it('selects completed runs outside the listing search and removes only successfu
   forgetRun.mockRejectedValueOnce(new Error('Request refused'))
   const wrapper = mountPane(App, {}, { global: { stubs: { RunCard: true, RunNav: true } } })
   await flushPromises()
-  await wrapper.get('[role=tab][value=general]').trigger('click')
-  await flushPromises()
+  await chooseProject(wrapper, 'General')
   const search = wrapper.get('input[placeholder="name, taskdef, project, state, ticket…"]')
   await search.setValue('no matching runs')
   const choose = wrapper.findAll('button').find((button) => button.text().trim() === 'Forget all completed')
@@ -137,7 +136,7 @@ it('forgets both project scopes from All projects while preserving active and he
   fetchState.mockResolvedValue({ runs: rows, attention: [], totals: {}, relations: [] })
   const wrapper = mountPane(App, {}, { global: { stubs: { RunCard: true } } })
   await flushPromises()
-  await wrapper.findAll('[role="tab"]').find(tab => tab.text() === 'All projects').trigger('click')
+  await chooseProject(wrapper, 'All projects')
   await flushPromises()
   await wrapper.getComponent(ForgetCompleted).get('button').trigger('click')
   await flushPromises()
@@ -162,7 +161,7 @@ it('disposes a completed-run confirmation when the project scope changes', async
   await wrapper.getComponent(ForgetCompleted).get('button').trigger('click')
   await flushPromises()
   const oldConfirm = dialogButton('Forget 1 run')
-  await wrapper.findAll('[role="tab"]').find(tab => tab.text() === 'All projects').trigger('click')
+  await chooseProject(wrapper, 'All projects')
   await flushPromises()
   oldConfirm.click()
   await flushPromises()

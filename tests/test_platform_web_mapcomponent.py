@@ -173,6 +173,14 @@ def test_the_bar_control_carries_the_orchestrators_state_and_what_it_needs():
     assert ':color="orchestratorTone"' in button.group(0), (
         "the bar control is not painted from the orchestrator's state"
     )
+    # A project-colored bar (#547) would swallow the tone, so there a toned control
+    # sits on the theme surface the tones were chosen against; untoned, no disc.
+    assert ":class=\"{ 'robot-on-surface': barColor && orchestratorTone }\"" in button.group(0), (
+        "on a project-colored bar the orchestrator's tone has no surface it can be read on"
+    )
+    assert re.search(r"\.robot-on-surface\.v-btn \{\s*background: rgb\(var\(--v-theme-surface\)\);", markup), (
+        "the disc the robot's tone is read on is no longer drawn"
+    )
     tooltip = next(block for block in re.findall(r"<v-tooltip\b.*?</v-tooltip>", markup, re.S) if button.group(0) in block)
     assert ':text="orchestratorHint"' in tooltip and 'open-on-focus' in tooltip, (
         "the bar control says nothing on hover/focus about what the orchestrator is doing"

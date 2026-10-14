@@ -2354,18 +2354,39 @@ def active_connectors() -> dict:
     return found
 
 
-def binding_notice(config: PlatformConfig) -> str:
+def _bind_source(field: str, env_var: str, overrides: Optional[dict]) -> str:
+    """Which layer of :func:`load`'s chain supplied one bind value."""
+    if (overrides or {}).get(field) is not None:
+        return "command line"
+    if _env_str(env_var):
+        return "environment"
+    try:
+        stored = read_json(config_path())
+    except StoreError:
+        stored = None
+    if stored and stored.get(field) is not None:
+        return "config.json"
+    return "default"
+
+
+def binding_notice(config: PlatformConfig, overrides: Optional[dict] = None) -> str:
     """The one-line startup notice about where the daemon bound (spec D14).
 
     Names the *source* of the bind values, because an export shadowing what the
     UI wrote is otherwise invisible, and states plainly that a non-loopback bind
     serves plaintext — the daemon terminates no TLS (D9), and an operator who
     wants HTTPS puts a reverse proxy in front.
+
+    *overrides* is what was passed to :func:`load`; address and port are
+    attributed separately because each can come from a different layer.
     """
-    source = "environment" if os.environ.get(ENV_BIND_ADDRESS, "").strip() else (
-        "config.json" if config_path().exists() else "default"
+    address = _bind_source("bind_address", ENV_BIND_ADDRESS, overrides)
+    port = _bind_source("bind_port", ENV_BIND_PORT, overrides)
+    source = (
+        f"bind from {address}" if address == port
+        else f"address from {address}, port from {port}"
     )
-    where = f"🛰  Platform listening on {config.base_url} (bind from {source})"
+    where = f"🛰  Platform listening on {config.base_url} ({source})"
     if config.is_loopback:
         return f"{where} — loopback only; put a reverse proxy in front to reach it remotely"
     return f"{where} — reachable over the network in PLAINTEXT (no TLS); front it with nginx for HTTPS"

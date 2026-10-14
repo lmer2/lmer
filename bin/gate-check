@@ -11,7 +11,13 @@ import time
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
-from lmer_cli.gates import GateSystem, commit_gate, receipt_argv
+from lmer_cli.gates import (
+    BASELINE_FALLBACK,
+    BASELINE_GATE,
+    GateSystem,
+    commit_gate,
+    receipt_argv,
+)
 
 try:
     from work_repo.run_state import emit_gate_event
@@ -32,12 +38,38 @@ except ImportError:  # lock wiring must never break a gate, like receipts
 def main() -> int:
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
     debug = '--debug' in sys.argv
+    baseline = '--baseline' in sys.argv
+    if '--print-pins' in sys.argv:
+        following = sys.argv[sys.argv.index('--print-pins') + 1:]
+        revision = following[0] if following and not following[0].startswith('-') else "HEAD"
+        return GateSystem(verbose=verbose, debug=debug).print_baseline_pins(revision)
     started = time.monotonic()
     # The marker covers the WHOLE command, receipt included (issue #201): a
     # work-repo commit landing anywhere in this window would move tracked
     # files under the running suite and fail its /work isolation guard.
     with hold_gate_lock("gate-check"):
         gate = GateSystem(verbose=verbose, debug=debug)
+        if baseline:
+            # The initial-baseline form (#452). Only a fallback goes on to the
+            # normal gate below, which then records its own ordinary receipt.
+            outcome = gate.run_baseline_gate()
+            final = outcome.kind != BASELINE_FALLBACK
+            try:
+                emit_gate_event(
+                    BASELINE_GATE,
+                    BASELINE_FALLBACK if not final
+                    else ("pass" if outcome.exit_code == 0 else "fail"),
+                    exit_code=outcome.exit_code if final else None,
+                    duration_s=time.monotonic() - started,
+                    argv=receipt_argv(),
+                    **gate.baseline_receipt(outcome),
+                )
+            except Exception:
+                pass
+            if final:
+                return outcome.exit_code
+            gate = GateSystem(verbose=verbose, debug=debug)
+            started = time.monotonic()
         rc = commit_gate(verbose=verbose, debug=debug, gate=gate)
         try:
             # Receipt assembly AND append are fail-soft: no receipt problem may

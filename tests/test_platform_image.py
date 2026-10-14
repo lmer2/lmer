@@ -161,6 +161,13 @@ def test_git_and_a_docker_client_are_installed(content, commands):
     )
 
 
+def test_the_container_runtime_is_pinned_to_the_docker_client(content):
+    """The host's LMER_CONTAINER_RUNTIME (e.g. podman) rides the mounted
+    ~/.lmer/.env; image ENV is in os.environ first, so the first-wins load
+    cannot apply it here, however the container is started."""
+    assert re.search(r"^ENV\s+LMER_CONTAINER_RUNTIME=docker\s*$", content, re.MULTILINE)
+
+
 def test_the_uid_and_gid_are_build_args_defaulting_to_the_first_host_user(content, commands):
     """The state dir is bind-mounted, so the user inside owns files outside."""
     for arg in ("BUILD_UID", "BUILD_GID"):

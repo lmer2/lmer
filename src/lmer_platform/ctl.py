@@ -788,8 +788,8 @@ def create_parser() -> argparse.ArgumentParser:
     options = sub.add_parser(
         "spawn-options",
         help=(
-            "Taskdefs and presets this host can see — suggestions, not a "
-            "vocabulary (GET /api/spawn-options)."
+            "Taskdefs, presets and provider models this host can see — "
+            "suggestions, not a vocabulary (GET /api/spawn-options)."
         ),
     )
     options.add_argument("--target", help="The spawn being composed, if you have one.")

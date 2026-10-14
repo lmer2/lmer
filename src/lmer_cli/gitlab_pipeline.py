@@ -129,6 +129,13 @@ class GitLabPipelineClient:
         except urllib.error.URLError as e:
             return 0, str(e.reason)
 
+    def request(
+        self, endpoint: str, accept: str = "application/json"
+    ) -> tuple[int, str]:
+        """Status and body, for callers that must tell an error from an empty
+        answer (`_get_json` folds every non-200 into None)."""
+        return self._request(endpoint, accept=accept)
+
     def _get_json(self, endpoint: str) -> Optional[dict[str, Any]]:
         """Make API request and return parsed JSON."""
         status, body = self._request(endpoint)

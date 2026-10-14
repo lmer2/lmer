@@ -319,7 +319,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, runs, teardown, transcripts,
+    ask, assistant, checkin, nudge, registry, rotation, runs, statusline, teardown,
+    transcripts,
 )
 from .api import build_state
 from . import config as config_module
@@ -529,6 +530,10 @@ class Signal:
     label: Optional[str] = None
     state: Optional[str] = None
     session: Optional[str] = None
+    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. Only on
+    #: :meth:`data`: ``ref`` and ``key`` stay slug-spelled, but a link built from
+    #: the digest must key to this execution, not to its slug group.
+    uid: Optional[str] = None
 
     @property
     def ref(self) -> str:
@@ -597,7 +602,15 @@ class Signal:
         }
         if self.session:
             data["session"] = self.session
+        if self.uid:
+            data["uid"] = self.uid
         return data
+
+
+def _row_uid(row: dict) -> Optional[str]:
+    """The fleet row's execution uid, or ``None`` for a slug-keyed row."""
+    uid = row.get("uid")
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -621,10 +634,10 @@ def _identity(row: object) -> Optional[tuple]:
 def _signals_of_row(row: object) -> list:
     """Every material condition one fleet row carries, or an empty list.
 
-    A row can in principle contribute both an attention reason and a material
-    state; today's :func:`lmer_platform.inventory._derive` never returns both at
-    once (a ``complete`` run has no attention record), and this does not depend on
-    that staying true.
+    A row can contribute both an attention reason and a material state: a
+    ``complete`` run whose live session still holds an open question carries a
+    ``live_question`` attention record (:func:`lmer_platform.inventory._derive`,
+    #308), and a finished run with nothing outstanding carries none.
     """
     identity = _identity(row)
     if isinstance(row, dict):
@@ -645,6 +658,7 @@ def _signals_of_row(row: object) -> list:
 
     state = _text(row.get("state"))
     label = _text(row.get("label"))
+    uid = _row_uid(row)
     found = []
 
     attention = row.get("attention")
@@ -655,13 +669,13 @@ def _signals_of_row(row: object) -> list:
                 host=host, project=project, slug=slug, kind=reason,
                 note=_text(attention.get("note")),
                 since=_text(attention.get("since")),
-                label=label, state=state,
+                label=label, state=state, uid=uid,
             ))
 
     if state in MATERIAL_STATES:
         found.append(Signal(
             host=host, project=project, slug=slug, kind=state,
-            since=_text(row.get("updated")), label=label, state=state,
+            since=_text(row.get("updated")), label=label, state=state, uid=uid,
         ))
     return found
 
@@ -1801,13 +1815,18 @@ class Detector:
                 # them apart afterwards.
                 "document": status.statusline is not None,
                 "session_age_seconds": age,
+                # A third absence (#507): the operator switched the strip off,
+                # which removes the document the threshold reads.
+                "status_strip_off": not statusline.enabled(),
             },
         )
         logger.warning(
             "platform_assistant_rotation_unreadable session=%s threshold=%d "
             "document=%s — no context figure to compare the threshold against, "
-            "so the rotation reminder cannot fire; said once until one arrives",
+            "so the rotation reminder cannot fire; said once until one arrives%s",
             session_id, threshold, status.statusline is not None,
+            "" if statusline.enabled() else
+            f" ({statusline.ENABLED_ENV} is off, so no session publishes one)",
         )
 
     def codex_wake_once(self) -> None:

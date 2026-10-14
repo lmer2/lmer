@@ -390,14 +390,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     ensure_ca_bundle()
     ingress = Ingress()
-    config = load_config(_overrides(args))
+    overrides = _overrides(args)
+    config = load_config(overrides)
     secret = ensure_secret(config)
 
     # flush=True throughout: stdout is a pipe under nohup/systemd, so Python
     # block-buffers it while uvicorn logs to stderr unbuffered. Without the
     # flush the operator sees uvicorn's "running on ..." but not the bind notice
     # or how to authenticate — exactly the two things they need at startup.
-    print(binding_notice(config), flush=True)
+    print(binding_notice(config, overrides), flush=True)
     if read_secret(config):
         print(
             "🔑 Authenticate with the shared secret: "
@@ -427,7 +428,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # last, and with it the thread that fed each session's log. Re-attaching here
     # means the first request for a survivor's scrollback already sees the seam
     # and the recovered output, rather than a file that stopped growing (T36).
-    notice = startup_notice(reattach_all())
+    notice = startup_notice(reattach_all(config=config))
     if notice:
         print(notice, flush=True)
 

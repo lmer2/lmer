@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -75,6 +76,7 @@ from .mounts import (
     resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
+from .keep_id import image_id as remap_image_id, record_remap, remap_recorded
 from .harness import (
     HARNESS_ENV,
     HARNESSES,
@@ -102,6 +104,13 @@ from .model_aliases import (
     expand_model_alias,
     load_model_aliases,
 )
+from .pi_providers import (
+    PROVIDERS_ENV,
+    ProviderConfigError,
+    container_provider_env,
+    load_providers,
+    validate_host_registry_file,
+)
 from .presets import (
     AGENTS_CONFIG_ENV,
     AGENTS_ENV,
@@ -115,23 +124,39 @@ from .presets import (
     select_preset_name,
     task_preset_env_name,
 )
+from .container_follow import (
+    create as create_container,
+    follow as follow_container,
+    main as follow_main,
+    read_container_id,
+    remove as remove_container,
+)
 from .runtime import (
+    ambient_container_user,
     apply_env_file_defaults,
     base_run_args,
     build_container_env,
+    container_labels,
+    container_name,
     ContainerEnvError,
     CPUS_HINT,
     default_env_file_candidates,
     detect_runtime,
     gpu_grant_plan,
     gpu_remediation,
+    engine_is_rootless,
+    is_root_container_user,
+    keep_id_applies,
     LaunchScope,
     lmer_state_dir,
     MEMORY_HINT,
     repo_root_path,
+    resolve_gate_ci_baseline,
     resource_limit_plan,
+    RUNTIME_ENV,
     _valid_cpus,
     _valid_memory,
+    ROOT_CONTAINER_USER,
 )
 from .service import (
     ServiceError,
@@ -330,6 +355,10 @@ def _make_sigterm_cleanup_handler(container_env):
     strands the session's mode-0600 env file in ``$TMPDIR`` holding the
     tokenized work-repo URL and every forwarded token (issue #158).
 
+    Active while the container is being created; once it exists,
+    :func:`lmer_cli.container_follow.follow` installs its own handler, which
+    stops the container instead.
+
     It deliberately does NOT raise. ``subprocess.call`` is::
 
         with Popen(...) as p:
@@ -340,13 +369,10 @@ def _make_sigterm_cleanup_handler(container_env):
                 raise
 
     so raising ``SystemExit`` here would unwind through that bare ``except``
-    and SIGKILL the ``docker``/``podman run`` client. In a non-TTY spawn the
-    client forwarding SIGTERM is exactly what stops the container (docker's
-    ``--sig-proxy`` is non-TTY-only), and ``--rm`` removal is daemon-side and
-    conditional on that exit — so killing the client leaves a running
-    container behind. That is why this restores the default disposition and
-    re-raises the signal at itself instead: process semantics stay identical
-    to having no handler at all, and the file still gets deleted.
+    and SIGKILL the runtime client mid-create. That is why this restores the
+    default disposition and re-raises the signal at itself instead: process
+    semantics stay identical to having no handler at all, and the file still
+    gets deleted.
 
     "Identical to having no handler" is exact for the CLI, whose SIGTERM
     disposition IS the default. It is not exact for a hypothetical in-process
@@ -614,6 +640,7 @@ def parse_args(
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
     parser.add_argument("--memory", dest="memory", help="Container memory cap for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__MEMORY, LMER_<TASK>_MEMORY, LMER_MEMORY). Same grammar as LMER_MEMORY — an integer with an optional b/k/m/g suffix, at least 6m. Unlike the environment tiers, an invalid value here aborts the run rather than falling through: an explicit request is not something to silently substitute.")
     parser.add_argument("--cpus", dest="cpus", help="Container CPU quota for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__CPUS, LMER_<TASK>_CPUS, LMER_CPUS). Same grammar as LMER_CPUS — a positive number of cores, integer or fractional. Invalid values abort the run, as with --memory.")
+    parser.add_argument("--root-userns", dest="root_userns", action="store_true", help="Run as container root under the default rootless-podman map (skips the keep-id UID remap for a fast cold start; the agent is root inside the container). Env: LMER_ROOT_USERNS")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging (same as LMER_VERBOSE=1).")
     parser.add_argument("--debug", action="store_true",
@@ -1231,7 +1258,7 @@ def _display_env_config_cli(
     print("---")
 
 
-def _announce_resource_limits(limits: "list", gpu=None) -> None:
+def _announce_resource_limits(limits: "list", gpu=None, ci_baseline=None) -> None:
     """Say what bounds this container gets and what set each one (issue #453).
 
     Rendered from the plan the run arguments are built from, so the line and
@@ -1241,13 +1268,16 @@ def _announce_resource_limits(limits: "list", gpu=None) -> None:
     ladder, or ``default``; with three tiers per knob, which one won is the
     thing an operator cannot infer from the value alone.
     """
-    if not limits and gpu is None:
+    if not limits and gpu is None and ci_baseline is None:
         return
     shown = [
         f"{limit.flag.lstrip('-')}={limit.value} ({limit.source})" for limit in limits
     ]
     if gpu is not None:
         shown.append(f"gpu={gpu.value or 'none'} ({gpu.source})")
+    if ci_baseline is not None:
+        value, source = ci_baseline
+        shown.append(f"gate-ci-baseline={'on' if value == '1' else 'off'} ({source})")
     info(f"📐 Limits: {', '.join(shown)}")
 
 
@@ -1578,6 +1608,9 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
         return 2
     if ns.user and ns.match_uid:
         error("Cannot specify both --user and --match-uid")
+        return 2
+    if ns.root_userns and (ns.user or ns.match_uid):
+        error("Cannot combine --root-userns with --user or --match-uid")
         return 2
     if ns.no_task and not ns.exec_mode:
         error("--no-task requires --exec mode")
@@ -2269,6 +2302,29 @@ def _handle_build(argv: list[str]) -> int:
     if args.update_claude:
         update_harnesses.add("claude")
 
+    # `build` is dispatched before main()'s .env load, so without this the
+    # settings that steer a build — the runtime (LMER_CONTAINER_RUNTIME, which
+    # decides the image store), the keep-id pre-warm toggles
+    # (LMER_ROOT_USERNS / LMER_CONTAINER_USER, LMER_NO_PREWARM,
+    # LMER_PREWARM_TIMEOUT) and LMER_IMAGE — would be honoured from an exported
+    # shell variable but silently ignored from the very ~/.lmer/.env the docs
+    # point users at (!309 adversarial review, F4; the runtime key is
+    # prep-release's LMER_CONTAINER_RUNTIME override). Same candidates and same
+    # first-wins precedence as a launch, so an exported variable still beats
+    # the file. An explicit allow-list rather than a full load: only variables
+    # the build path actually reads are seeded, so an unrelated .env key cannot
+    # steer it.
+    apply_env_file_defaults(
+        default_env_file_candidates(state_dir=lmer_state_dir(), cwd=Path.cwd()),
+        only=(
+            RUNTIME_ENV,
+            "LMER_IMAGE",
+            "LMER_ROOT_USERNS",
+            "LMER_CONTAINER_USER",
+            "LMER_NO_PREWARM",
+            "LMER_PREWARM_TIMEOUT",
+        ),
+    )
     try:
         runtime = detect_runtime()
     except Exception as e:
@@ -2288,6 +2344,24 @@ def _handle_build(argv: list[str]) -> int:
     if build_image(runtime, image, build_root, force=args.force, pull=not args.no_pull, update_harnesses=sorted(update_harnesses)):
         return 0
     return 1
+
+
+def _resolve_container_user(ns) -> tuple[str, bool]:
+    """Resolve the container user spec, and whether --root-userns selected it.
+
+    --root-userns (env: LMER_ROOT_USERNS) opts into container root under the
+    default rootless-podman map — a fast cold start, because base_run_args
+    then skips --userns=keep-id and podman never chowns the rootfs
+    (issue #351). An explicit --user/--match-uid beats the ambient env
+    toggle; combining one with the FLAG is rejected in _validate_parsed_args.
+    """
+    if ns.match_uid:
+        return f"{os.getuid()}:{os.getgid()}", False
+    if ns.user:
+        return ns.user, False
+    if ns.root_userns or get_bool_env("LMER_ROOT_USERNS"):
+        return ROOT_CONTAINER_USER, True
+    return ambient_container_user(), False
 
 
 def _resolve_napkin_path(napkin_repo_url: str, work_repo_path: str) -> str:
@@ -2400,6 +2474,8 @@ def main(argv: list[str] | None = None) -> int:
     # Handle build subcommand early (before normal arg parsing)
     if argv and argv[0] == "build":
         return _handle_build(argv[1:])
+    if argv and argv[0] == "follow":
+        return follow_main(argv[1:])
     if argv and argv[0] == "rebuild":
         error("'lmer rebuild' has been renamed to 'lmer build'. Please use 'lmer build' instead.")
         return 1
@@ -2496,15 +2572,10 @@ def main(argv: list[str] | None = None) -> int:
     if validation_error is not None:
         return validation_error
 
-    # Determine container user
-    if ns.match_uid:
-        uid = os.getuid()
-        gid = os.getgid()
-        container_user = f"{uid}:{gid}"
-    elif ns.user:
-        container_user = ns.user
-    else:
-        container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
+    # Determine container user (see _resolve_container_user). The
+    # --root-userns premise only holds under rootless podman, which is
+    # checked once the runtime is detected below.
+    container_user, root_userns_active = _resolve_container_user(ns)
 
     # The flag wins over preset env and can select the harness that serves it.
     session_model = _apply_model_selection(ns.model, early_env_file_sources)
@@ -2830,12 +2901,58 @@ def main(argv: list[str] | None = None) -> int:
         error(f"❌ {e}")
         return 2
 
+    if root_userns_active:
+        # The whole premise — container root IS the invoking host uid — only
+        # holds under the default rootless-podman user namespace. Under
+        # docker (root daemon) or a rootful podman, "--user 0:0" would be
+        # actual root against the host, so refuse rather than degrade.
+        #
+        # The question is about the ENGINE, not this process: a non-root
+        # client can be pointed at a rootful podman service (CONTAINER_HOST,
+        # CONTAINER_CONNECTION, an ssh connection), and a local euid check
+        # cannot see that (!309 adversarial review, F1). So ask the engine,
+        # and refuse when it will not answer — an unestablished premise is
+        # not a satisfied one, and IS_SANDBOX=1 hangs off this branch.
+        if runtime != "podman":
+            error("❌ --root-userns/LMER_ROOT_USERNS requires rootless podman")
+            return 2
+        rootless = engine_is_rootless(runtime)
+        if rootless is False:
+            error(
+                "❌ --root-userns/LMER_ROOT_USERNS requires rootless podman: "
+                "the podman engine this client is talking to is rootful, so "
+                "container root would be host root"
+            )
+            return 2
+        if rootless is None:
+            error(
+                "❌ --root-userns/LMER_ROOT_USERNS: could not establish that "
+                "the podman engine is rootless (`podman info` did not answer), "
+                "so refusing to run the agent as container root"
+            )
+            return 2
+        warning(
+            "⚠️  --root-userns: the agent runs as root inside the container "
+            "(no non-root 'developer' guardrail; it can write anywhere in the "
+            "container rootfs). Host blast radius unchanged: still your uid, "
+            "no-new-privileges. keep-id UID remap skipped."
+        )
+    elif is_root_container_user(container_user):
+        warning("⚠️  Container user is root inside the container")
+
     # Resolve image name and ensure it exists (auto-build or pull if missing)
     image = os.environ.get("LMER_IMAGE") or resolve_image_tag(repo_root)
     if not image:
         error("Could not determine image version. Set LMER_IMAGE or fix your installation.")
         return 1
-    if not ensure_image(runtime, image, repo_root, skip_build=ns.skip_build):
+    image_readiness = ensure_image(
+        runtime, image, repo_root,
+        skip_build=ns.skip_build,
+        # --root-userns skips keep-id, so a build on this launch has no remap
+        # to pre-warm and must not spend minutes paying one (issue #351).
+        container_root=is_root_container_user(container_user),
+    )
+    if not image_readiness.available:
         return 1
 
     # Build docker/podman run args
@@ -2859,7 +2976,10 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     gpu = gpu_grant_plan(runtime, scope)
-    _announce_resource_limits(limits, gpu)
+    # Resolved on the host for the same scope (#452): the session's gate only
+    # ever sees this one value, never the scoped spellings.
+    ci_baseline = resolve_gate_ci_baseline(scope)
+    _announce_resource_limits(limits, gpu, ci_baseline)
     run += base_run_args(runtime, exec_mode, container_user, limits, gpu)
 
     # In developer mode, mount local repo dirs into the container to override
@@ -3230,6 +3350,13 @@ def main(argv: list[str] | None = None) -> int:
     env = {
         "HOME": "/home/developer",
         "LMER_GPU_GRANTED": gpu.value,
+        # --root-userns only (issue #351): Claude Code refuses
+        # --dangerously-skip-permissions as root; IS_SANDBOX=1 is its
+        # documented sandbox escape, asserted here ONLY for the explicit
+        # opt-in whose rootless-podman premise was checked above — never
+        # for an ad-hoc --user 0:0, which established no such sandbox.
+        # None (dropped) otherwise.
+        "IS_SANDBOX": "1" if root_userns_active else None,
         # Which agent harness the container should run (resolved above from
         # --harness/LMER_HARNESS/LMER_LLM_NAME model hint; default claude).
         # Consumed by clone_and_exec.py (runner selection) and lmer-supervisor
@@ -3302,12 +3429,20 @@ def main(argv: list[str] | None = None) -> int:
         # which is exactly the ambient value the scoped pair exists to avoid.
         AGENTS_ENV: None,
         AGENTS_CONFIG_ENV: None,
+        # pi provider metadata (issue #490) is host-generated only: seed None so
+        # a .env value cannot inject a registry. The pi block below fills it in
+        # for a pi session; for every other harness it is dropped.
+        PROVIDERS_ENV: None,
         # DM permissions are decided by host-side listeners and servicers.
         # Block .env and preset seeding from carrying these lists into a run.
         "LMER_SLACK_DM_ALLOWED_USERS": None,
         "LMER_MATRIX_ALLOWED_USERS": None,
+        # Names the *host's* runtime; the session image ships only the docker
+        # client. Seeded None so neither .env nor preset seeding forwards it.
+        "LMER_CONTAINER_RUNTIME": None,
         DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        "LMER_GATE_CI_BASELINE": ci_baseline[0],
         # User-installed harnesses (issue #132): where the host mounted
         # ~/.lmer/harnesses inside the container (consumed by
         # clone_and_exec.py runner dispatch, lmer-supervisor, and
@@ -3674,6 +3809,26 @@ def main(argv: list[str] | None = None) -> int:
     if port_rc is not None:
         return port_rc
 
+    # pi provider model discovery (issue #490). Only the pi harness reads these
+    # variables, so the definitions and the operator's key ride along whenever
+    # pi runs: the session harness itself, or a ``--agents`` child routed to pi
+    # (which execs the binary directly and cannot render its own registry). The
+    # host file is validated here — before the container starts — so an obvious
+    # apiKey placeholder aborts with the file named instead of producing a
+    # session that sends the placeholder as a bearer token.
+    pi_in_play = harness.name == "pi" or any(
+        child.name == "pi" for child in agent_extra_harnesses
+    )
+    if pi_in_play:
+        try:
+            # The key may be exported or live in a .env file; the exported
+            # value wins, matching the CLI's normal precedence.
+            env.update(container_provider_env(load_providers(), {**env, **os.environ}))
+            validate_host_registry_file(environ={**env, **os.environ})
+        except ProviderConfigError as exc:
+            error(f"❌ {exc}")
+            return 2
+
     # Container environment. Values ride a mode-0600 --env-file (plus bare
     # -e NAME inheritance markers for the few that a line-oriented file
     # cannot carry), never argv — /proc/<pid>/cmdline is world-readable and
@@ -3698,8 +3853,32 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         previous_sigterm = None
     run += container_env.args
+    # The platform names the session and run it spawned; a plain CLI run has
+    # neither (#444).
+    platform_session = os.environ.get("LMER_PLATFORM_SESSION_ID") or None
+    run += container_labels(
+        repo_host=repo_host,
+        repo_project=repo_project,
+        run_slug=os.environ.get("LMER_PLATFORM_RUN_SLUG") or None,
+        platform_session=platform_session,
+        platform_instance=os.environ.get("LMER_PLATFORM_INSTANCE") or None,
+    )
+    name_slug = os.environ.get("LMER_PLATFORM_RUN_SLUG") or _cli_run_slug(
+        None if ns.no_task else task_id,
+        container_task_target(primary_target, target_class),
+    )
+    name = container_name(name_slug, platform_session)
+    run += ["--name", name]
+    cid_dir = None
     try:
-        # Image name was resolved earlier (before ensure_image)
+        cid_dir = Path(tempfile.mkdtemp(prefix="lmer-cid-"))
+        cid_file = cid_dir / "cid"
+        run += ["--cidfile", str(cid_file)]
+        # Image name was resolved earlier (before ensure_image). Remember where
+        # it lands: under keep-id the launch re-resolves it to an ID below and
+        # substitutes it here, so the marker and the container name the same
+        # image (!309 adversarial review, F6).
+        image_argv_index = len(run)
         run += [image]
 
         # Container command
@@ -3761,14 +3940,70 @@ def main(argv: list[str] | None = None) -> int:
                     chat_uploads_host, chat_uploads_container, task_id,
                 )
 
-        success(f"🚀 Launching container ({runtime} run {image})")
-        if runtime == "podman":
+        success(f"🚀 Launching container {name} ({runtime} create {image})")
+        # Warn when this launch faces the remap, which is a question about the
+        # IMAGE and not about this process: `lmer build` then a separate spawn
+        # is cold with materialized=False, and that is the longest wait there
+        # is (issue #384). The marker survives across processes; absent means
+        # warn, because a missing notice reads as a hang.
+        keep_id = keep_id_applies(runtime, container_user)
+        # Bind the notice, the container and the marker to ONE image ID.
+        # ensure_image resolved an ID at the top of session setup, but the
+        # argv above names the mutable TAG — so a rebuild or pull retagging
+        # inside the setup window meant the notice was decided about A,
+        # podman ran B, and A was then recorded warm on the strength of a run
+        # of B. A retained A is silently cold after that: one multi-minute
+        # wait with no notice, which is #384's own symptom
+        # (!309 adversarial review, F6 — the launch half of it; `prewarm`
+        # already binds this way). Re-resolving as late as possible and
+        # putting the ID into argv closes the window rather than narrowing
+        # it: whatever the tag becomes, podman runs the image we recorded.
+        # One extra `image inspect`, and only where keep-id applies.
+        # No late answer means there is nothing to bind to, so leave both the
+        # argv and the marker exactly where they were — the same fallback
+        # `prewarm` takes, and no worse than the behaviour this replaces.
+        launch_image_id = image_readiness.image_id
+        if keep_id:
+            late_image_id = remap_image_id(runtime, image)
+            if late_image_id:
+                launch_image_id = late_image_id
+                run[image_argv_index] = late_image_id
+        if keep_id and not remap_recorded(launch_image_id):
             success(
-                "   (first run with this image may take several minutes "
-                "while podman remaps UIDs for --userns=keep-id)"
+                "   (this image has not been remapped yet; podman remaps UIDs "
+                "for --userns=keep-id on first use, which can take several "
+                "minutes)"
             )
         try:
-            rc = subprocess.call(run, env=container_env.subprocess_env())
+            try:
+                rc, container, name = create_container(
+                    runtime, run, cid_file,
+                    rename=lambda: container_name(name_slug, platform_session, retry=True),
+                    env=container_env.subprocess_env(),
+                )
+            finally:
+                # The runtime has read the env file once create returns, so the
+                # secrets in it need not outlive this call (#444).
+                container_env.cleanup()
+            # podman pays the keep-id remap while create builds the container's
+            # storage, so a successful create is the evidence the marker needs.
+            if keep_id and rc == 0:
+                record_remap(launch_image_id)
+            if rc != 0:
+                if container:
+                    remove_container(runtime, container)
+            elif not container:
+                error(f"❌ {runtime} create reported success but no container id")
+                return 125
+            else:
+                _record_platform_facts(container={"id": container, "name": name})
+                # 125 from here means the start never ran — where a runtime
+                # rejects a GPU it cannot grant.
+                rc = follow_container(
+                    runtime, container, started=False, interactive=sys.stdin.isatty(),
+                    detach_note=_detach_note(announce_session, special_targets, thread_servicer),
+                    name=name,
+                )
             if gpu.value and rc == 125:
                 error(
                     "❌ The GPU-enabled container invocation failed before its "
@@ -3778,6 +4013,11 @@ def main(argv: list[str] | None = None) -> int:
                 error(f"   To fix GPU support, {gpu_remediation(runtime)}.")
             return rc
         except KeyboardInterrupt:
+            # Interrupted mid-create, or a Ctrl-C that escaped the follow: a
+            # container may exist that nothing will follow any more.
+            container = read_container_id(cid_file)
+            if container:
+                remove_container(runtime, container)
             return 130
         finally:
             if announce_session:
@@ -3792,8 +4032,37 @@ def main(argv: list[str] | None = None) -> int:
         # guaranteed to still exist, and the reaper's ladder makes a second
         # SIGTERM unexceptional.
         container_env.cleanup()
+        if cid_dir is not None:
+            shutil.rmtree(cid_dir, ignore_errors=True)
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def _detach_note(announce_session, special_targets, thread_servicer) -> str | None:
+    """What a detach costs a session whose thread services this process hosts:
+    they stop with it, and `lmer follow` does not restart them."""
+    hosting = announce_session and (
+        thread_servicer is not None
+        or any(getattr(h, "hosts_connectors", False) for h in special_targets)
+    )
+    if not hosting:
+        return None
+    return (
+        "this session's Slack/Matrix thread connection and `lmer-signal` thread "
+        "service end with this process; the agent keeps running without them"
+    )
+
+
+def _cli_run_slug(task: str | None, target: str | None) -> str | None:
+    """The run slug the container will derive for itself, for a CLI run's
+    container name; ``None`` for a run with no task."""
+    if not task:
+        return None
+    # Here rather than at the top: work_repo takes ~180 ms to import, and only a
+    # launch needs it.
+    from work_repo.run_state import derive_slug
+
+    return derive_slug(task, target or "")
 
 
 if __name__ == "__main__":

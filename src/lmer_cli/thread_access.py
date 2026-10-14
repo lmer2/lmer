@@ -802,7 +802,9 @@ def _post_slack(
         name = item.get("name") if isinstance(item, dict) else None
         if name:
             text += f"\n📎 {name}"
-    body, clipped = _clip(text)
+    from matrix_bridge.scrub import scrub_text
+
+    body, clipped = _clip(scrub_text(text))
     channel, thread_ts = ref.key["channel"], ref.key["thread_ts"]
     try:
         ts = client.post_message(channel, thread_ts, body)
@@ -1147,7 +1149,9 @@ def _open_slack(
         raise _slack_failure(exc, ref.target) from None
     _refuse_unverifiable_membership(workspace.get("scopes"), ref.target)
     host = workspace["host"]
-    body, clipped = _clip(text)
+    from matrix_bridge.scrub import scrub_text
+
+    body, clipped = _clip(scrub_text(text))
     try:
         opened = client.post_root(ref.target, body)
     except Exception as exc:

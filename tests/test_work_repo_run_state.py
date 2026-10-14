@@ -1136,6 +1136,27 @@ class TestEmitGateEvent:
         data = run_state.read_events(rdir, last_n=0)[-1]["data"]
         assert data["test_scope"] == scope
 
+    def test_ci_baseline_evidence_is_recorded_and_redacted(self, run_env, monkeypatch):
+        """A gate-baseline receipt carries the CI evidence it rests on (#452),
+        through the same redaction as every other receipt field."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        evidence = {"decision": "reused", "evidence": {"sha": "a" * 40, "jobs": [
+            {"name": "pytest", "attempts": [{"job_id": 2, "status": "failed"},
+                                            {"job_id": 3, "status": "success"}]}]}}
+        run_state.emit_gate_event("gate-baseline", "pass", exit_code=0,
+                                  test_scope="ci baseline", ci_baseline=evidence)
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["gate"] == "gate-baseline"
+        assert data["ci_baseline"] == evidence
+
+        monkeypatch.setattr(run_state, "redact_secrets",
+                            lambda s: s.replace("token=hunter2", "<redacted>"))
+        run_state.emit_gate_event("gate-baseline", "fail",
+                                  ci_baseline={"reason": "token=hunter2"})
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["ci_baseline"] == {"reason": "<redacted>"}
+
     def test_a_caller_that_measured_no_scope_records_none(self, run_env):
         """Existing callers pass neither; absent must stay absent, since a
         default would be a coverage claim nobody made."""

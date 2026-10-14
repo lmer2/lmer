@@ -4,6 +4,7 @@ import Chat from '../src/components/Chat.vue'
 import { fetchAssistantHistory, fetchSessionMessages, sessionUploadUrl } from '../src/api.js'
 import { historyWithoutOutboundCopies, mergeHistory } from '../src/assistantHistory.js'
 import { mountPane, deferred } from './mount.js'
+import { onRunRef } from '../src/runref.js'
 
 vi.mock('../src/api.js', () => ({
   fetchAssistantHistory: vi.fn(), fetchSessionMessages: vi.fn(),
@@ -132,6 +133,35 @@ it('pages backward without duplicates and reconciles one bounded predecessor tai
   expect(new Set(wrapper.findAll('.turn').map((turn) => turn.text())).size).toBe(wrapper.findAll('.turn').length)
 })
 
+it('keeps the tail cursor when an older page finishes after polling advanced it', async () => {
+  vi.useFakeTimers()
+  pages.set(3, Array.from({ length: 100 }, (_, i) => row(3, i, `row ${i}`)))
+  const wrapper = await open()
+  const delayed = deferred()
+  let requested
+  fetchAssistantHistory.mockImplementationOnce((session, request) => {
+    requested = page(3, request)
+    return delayed.promise
+  })
+  await wrapper.findAll('button').find((button) => button.text() === 'earlier messages').trigger('click')
+  pages.set(3, Array.from({ length: 200 }, (_, i) => row(3, i, `row ${i}`)))
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(wrapper.text()).toContain('row 199')
+  delayed.resolve(requested)
+  await flushPromises()
+  expect(requested.total).toBe(100)
+  expect(wrapper.text()).toContain('row 20')
+  pages.set(3, [...pages.get(3), row(3, 200, 'late reply')])
+  fetchAssistantHistory.mockClear()
+  await vi.advanceTimersByTimeAsync(10000)
+  const tail = fetchAssistantHistory.mock.calls.filter(([session]) => session === 's-3')
+  expect(tail.length).toBeGreaterThan(0)
+  expect(tail[0][1].since).toBe(200 - 40)
+  expect(wrapper.text()).toContain('late reply')
+  const texts = wrapper.findAll('.turn').map((turn) => turn.text())
+  expect(new Set(texts).size).toBe(texts.length)
+})
+
 it('ignores an old response that arrives after rotation', async () => {
   const pending = deferred()
   fetchAssistantHistory.mockImplementationOnce(() => pending.promise)
@@ -159,7 +189,30 @@ it('ignores a predecessor tail response after the history view changes', async (
   expect(wrapper.text()).toContain('Decision 2')
 })
 
-it('catches up large predecessor tails in bounded pages without starving the active generation', async () => {
+// A per-test budget rather than the 10s default, for this file only.
+//
+// This is the one case in the suite that renders 600 rows and then asserts on
+// all 608 of them, so it is minutes-of-CPU work measured against a wall clock —
+// and vitest runs these files with `maxWorkers: 1` on a host that is otherwise
+// busy. It passes at 3-4s on an idle machine and lands at 10.4-11.7s under
+// load, which is a stopwatch on the host rather than a property of the code:
+// nothing here races a real timer, since `useFakeTimers` means every clock the
+// component sees is advanced by the test itself.
+//
+// The bound is the default multiplied, not a free pass: the work is ~4s, so 30s
+// still refuses a genuine 10x regression. It is a per-test option rather than a
+// global `testTimeout` so every other case here keeps the tight default and a
+// slowdown in the paging logic still shows up as a failure.
+//
+// Worth saying plainly how this got here: the wrapper that runs these files from
+// pytest (`tests/test_platform_web_mounted_suites.py`) was added in the same
+// commit as this test, so it never ran in CI — it has only ever been seen by
+// whoever ran it by hand. Raising the budget is not a fix for a defect and none
+// is claimed; the assertions are unchanged, and a run of this file on an idle
+// host is the evidence to trust about the work itself.
+const CATCH_UP_TIMEOUT = 30000
+
+it('catches up large predecessor tails in bounded pages without starving the active generation', { timeout: CATCH_UP_TIMEOUT }, async () => {
   vi.useFakeTimers()
   const wrapper = await open()
   pages.set(2, [...data(2), ...Array.from({ length: 600 }, (_, i) => row(2, i + 3, `late backlog ${i}`))])
@@ -220,4 +273,62 @@ it('never spends a new generation’s post on an old generation’s tool call', 
   const call = row(1, 0, '', { via: null, tools: [{ name: 'Bash', command: 'lmer-signal post "same"', detail: 'lmer-signal post "same"', status: 'ok' }] })
   const post = row(2, 0, 'same', { comms_kind: 'message' })
   expect(historyWithoutOutboundCopies([call, post])[0].tools).toHaveLength(1)
+})
+
+it('draws platform digests as compact, attributed rows that open their run', async () => {
+  const run = { host: 'gitlab.example.com', project: 'group/app', slug: 'run-1', label: 'Fix the widget' }
+  const body = 'gitlab.example.com/group/app/run-1 needs you — live_question: May I proceed?\n\nThis needs your approval because it is project-wide.'
+  pages.set(3, [
+    ...data(3),
+    row(3, 2, body, { id: 'digest-1', role: 'platform', source: { channel: 'platform' }, comms_kind: 'digest: live_question',
+      digest: { kind: 'live_question', run } }),
+    row(3, 3, 'old record without a run', { id: 'digest-2', role: 'platform', source: { channel: 'platform' },
+      comms_kind: 'digest: complete', digest: { kind: 'complete', run: null } }),
+  ])
+  const opened = []
+  const stop = onRunRef((ref) => opened.push(ref.key))
+  const wrapper = await open()
+  const digests = wrapper.findAll('.turn-digest')
+  expect(digests).toHaveLength(2)
+  const header = digests[0].find('.d-flex').text()
+  expect(header).toContain('lmer platform')
+  expect(header).not.toMatch(/\byou\b/)
+  expect(header).toContain('digest: live_question')
+  const toggle = digests[0].find('button.digest-toggle')
+  const full = digests[0].find('p.said')
+  expect(toggle.text()).toBe('needs you — live_question: May I proceed?')
+  expect(toggle.attributes('aria-expanded')).toBe('false')
+  expect(full.isVisible()).toBe(false)
+  await toggle.trigger('click')
+  expect(toggle.attributes('aria-expanded')).toBe('true')
+  expect(full.isVisible()).toBe(true)
+  expect(full.text()).toContain('This needs your approval')
+  await toggle.trigger('click')
+  expect(full.isVisible()).toBe(false)
+  await digests[0].find('button.digest-run').trigger('click')
+  expect(opened).toEqual(['gitlab.example.com/group/app/run-1'])
+  expect(digests[1].find('button.digest-run').exists()).toBe(false)
+  expect(digests[1].find('.d-flex').text()).toContain('lmer platform')
+  expect(wrapper.findAll('.turn').filter((turn) => turn.classes('turn-digest')).every(
+    (turn) => !turn.classes('ground-operator'))).toBe(true)
+  stop()
+})
+
+it('opens a schema-2 digest at its execution, not its slug group', async () => {
+  const uid = 'a'.repeat(32)
+  const run = { host: 'gitlab.example.com', project: 'group/app', slug: 'run-1', label: 'Fix the widget', uid }
+  const body = 'gitlab.example.com/group/app/run-1 is now complete'
+  pages.set(3, [
+    ...data(3),
+    row(3, 2, body, { id: 'digest-uid', role: 'platform', source: { channel: 'platform' }, comms_kind: 'digest: complete',
+      digest: { kind: 'complete', run } }),
+  ])
+  const opened = []
+  const stop = onRunRef((ref) => opened.push(ref.key))
+  const wrapper = await open()
+  const digest = wrapper.find('.turn-digest')
+  expect(digest.find('button.digest-toggle').text()).toBe('is now complete')
+  await digest.find('button.digest-run').trigger('click')
+  expect(opened).toEqual([`gitlab.example.com/group/app/${uid}`])
+  stop()
 })

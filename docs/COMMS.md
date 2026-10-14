@@ -523,7 +523,7 @@ next config refresh in every browser. The run chat keeps its older rendering
 | a bus record: the operator's message from any channel, the agent's `post`/`note`/`ask`/answer/milestone, a platform `command` | `via: comms` | drawn as speech, with source and kind | drawn as speech |
 | a reply to a conversation request, sent with `lmer-ctl thread post` | assistant credential; platform-only conversation journal, `via: comms` | drawn with destination link; no broadcast to other threads | drawn |
 | a private DM reply | delivery fact only; body never journalled | drawn without body | drawn without body |
-| a question (`question`/`live_question`), crash (`crashed`), or completion (`complete`) digest | structured event kind; platform-only journal, `via: comms`, platform role | drawn even before the assistant drains its spool | drawn |
+| a question (`question`/`live_question`), crash (`crashed`), or completion (`complete`) digest | structured event kind; platform-only journal, `via: comms`, platform role, a `digest` field naming its kind and owning run | drawn even before the assistant drains its spool, as one compact *lmer platform* row: kind, the run's label (opens the run), a one-line preview that expands to the full text when tapped | drawn the same |
 | routine check-ins, wake traffic and other digest categories | excluded from the platform-only journal | hidden unless explicitly posted | any harness copy is muted |
 | the legacy ask-channel exchange, on a session with no bus | `via: ask` | drawn | drawn |
 | the agent's unposted prose | `role: assistant`, no `via` | hidden | drawn muted, chipped `transcript` |
@@ -910,7 +910,12 @@ is never blindly replayed. The connector runs until stopped:
   and records from its own channel, and posts the rest (a question with numbered options,
   an answer from another channel with who gave it, milestones with a
   glyph, other channels' messages tagged `[uber lmer] …`), and acks its
-  position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`);
+  position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`).
+  Every posted text, Slack's and matrix's alike, goes through the shared
+  value-and-shape credential scrub *before* it is clipped, so options display
+  redacted; the bus record stays raw, and replying by number still routes to the
+  original option. `post_thread` and `open_thread` scrub the same way on both
+  transports. Direct messages to a person are not scrubbed (tracked separately);
 - **inbound**: Slack polls `conversations.replies` every
   `LMER_SLACK_POLL_SECONDS` (default 3); matrix `/sync`s with a filter on the
   one room. Each new human message — and each post another run or the platform

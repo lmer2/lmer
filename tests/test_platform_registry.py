@@ -9,6 +9,7 @@ it belonged to rather than outliving it as an unexplained credential.
 
 import json
 import os
+import subprocess
 import threading
 from unittest.mock import patch
 
@@ -410,8 +411,6 @@ def test_prune_dead_leaves_no_orphan_tokens(platform_root, live_pid):
 # session keep reporting as running.
 
 def test_zombie_process_is_not_live():
-    import subprocess
-
     child = subprocess.Popen(["/bin/true"])
     try:
         # Do not wait(): the child becomes a zombie that kill(pid, 0) still finds.
@@ -433,6 +432,27 @@ def test_live_process_is_not_a_zombie():
     assert registry._pid_alive(os.getpid()) is True
 
 
+def test_a_pid_reaped_between_the_probe_and_the_proc_read_is_not_live(monkeypatch):
+    """#525: the spawn waiter reaps after kill(pid, 0) succeeded, so /proc is gone."""
+    child = subprocess.Popen(["/bin/true"])
+    stat = f"/proc/{child.pid}/stat"
+    real_open = open
+    reaped = []
+
+    def reaping_open(path, *args, **kwargs):
+        if path == stat and not reaped:
+            reaped.append(os.waitpid(child.pid, 0))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", reaping_open)
+    try:
+        assert registry._pid_alive(child.pid) is False
+        assert reaped, "the reap never landed inside the window"
+    finally:
+        monkeypatch.undo()
+        child.wait()
+
+
 def test_zombie_check_degrades_when_proc_is_unavailable(monkeypatch):
     """No /proc (macOS): fall back to the kill() answer rather than erroring."""
     def no_proc(*_args, **_kwargs):
@@ -440,6 +460,7 @@ def test_zombie_check_degrades_when_proc_is_unavailable(monkeypatch):
 
     monkeypatch.setattr("builtins.open", no_proc)
     assert registry._is_zombie(os.getpid()) is False
+    assert registry._pid_alive(os.getpid()) is True
 
 
 def test_zombie_check_tolerates_a_comm_containing_parens(monkeypatch, tmp_path):

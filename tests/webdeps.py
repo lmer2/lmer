@@ -10,17 +10,20 @@ gate run. Two sessions paid that toll on the same day before this existed.
 So the resolver every node-using test already goes through calls
 :func:`ensure_web_deps` first: packages present and current → a stat and
 nothing else; missing or stale against the lockfile → one loud ``npm ci``,
-memoized for the process. The deliberate trade: a test that only pipes a
-snippet through ``node -e`` (no packages) still triggers the install in a
-fresh container — accepted, because the alternative is per-test knowledge of
-which tests need packages, which is exactly the kind of distinction the next
-test author gets wrong silently. ``npm`` absent while Node exists is reported
+memoized for the process and serialised across processes by :func:`web_lock`
+(pytest-xdist workers share one ``web/``, #479). The deliberate trade: a test
+that only pipes a snippet through ``node -e`` (no packages) still triggers the
+install in a fresh container — accepted, because the alternative is per-test
+knowledge of which tests need packages, which is exactly the kind of
+distinction the next test author gets wrong silently. ``npm`` absent while Node exists is reported
 once and left to the test's own failure, which now names the real problem.
 """
 from __future__ import annotations
 
+import fcntl
 import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -30,6 +33,18 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 INSTALL_TIMEOUT_SECONDS = 600
 
 _done: dict = {"checked": False}
+
+
+@contextmanager
+def web_lock():
+    """Hold the cross-process lock for writes under ``web/``.
+
+    Beside ``node_modules``, which ``npm ci`` deletes before installing. Not
+    re-entrant: a holder must not call :func:`ensure_web_deps`.
+    """
+    with open(WEB_DIR / ".test-deps.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def _stale() -> bool:
@@ -67,6 +82,17 @@ def ensure_web_deps() -> None:
               "node-dependent tests will fail; install Node+npm or run npm ci "
               "in web/ yourself")
         return
+    try:
+        with web_lock():
+            # Another worker may have installed while this one waited.
+            if _stale():
+                _install(npm)
+    except OSError as exc:
+        print(f"webdeps: cannot lock web/ for npm ci ({exc}) — node-dependent "
+              "tests will fail; run npm ci in web/ yourself")
+
+
+def _install(npm: str) -> None:
     print("webdeps: web/node_modules missing or stale — running npm ci once "
           "(first node-dependent test in a fresh container pays ~1 minute)")
     try:

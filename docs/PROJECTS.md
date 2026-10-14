@@ -6,19 +6,27 @@ home project, recorded under its existing `host/project/slug` identity.
 
 Create a project with **New project**, supplying only a name. Names are unique
 ignoring case. Its chat opens immediately; its assistant starts when capacity is
-available. Rename, repositories, one of 20 named colors, execution overrides and
-thread connections live in Project settings. Repository associations supply
+available. Rename, repositories, color, execution overrides and
+thread connections live in Project settings. The color picker accepts any hex
+color, and the 20 named colors are its swatches. Picking one of them stores its
+name, so preset projects look the same as before. Repository associations supply
 launch suggestions and never adopt existing runs. Expand Standing instructions
-in Project settings to edit them; the project's assistant chat shows a read-only copy.
+in Project settings to edit them; uber lmer's standing-orders button opens them there.
 
-Project tabs select the main view; the sidebar keeps every active project visible,
+The project switcher at the left of the app header selects the main view. It
+shows the selected project's name (or **All projects**); on a phone it takes a
+row of its own inside the header. Its menu lists All
+projects and every active project, each with its color and Needs you count, plus
+**Project settings** for the selected project and **New project**. While a project
+is selected, the header stays in place when the page scrolls and is painted in the
+project's color. The header's text is black or white, whichever has the higher
+WCAG contrast against that color, in both themes. All projects and unavailable
+project links keep the theme's own header.
+The sidebar keeps every active project visible,
 including empty projects, with independent collapse controls and project-local
 Needs you/status counts from the full fleet. The compact robot button on each
 project header opens that project's chat and shows its assistant lifecycle/queue
 status, even when the section is collapsed. **New project** is above these groups.
-Above the main tabs, the project name stays a colored text badge. Compact chat,
-project settings and new-project icons expose their labels on hover and keyboard
-focus; chat and project-settings labels name the selected project.
 All projects is grouped monitoring. Its selection does
 not grant a combined assistant: a chat header always names that pane's project.
 The URL retains the selected project. Drafts and outstanding requests retain
@@ -166,7 +174,7 @@ The existing forge `project` parameter continues to mean the repository path.
 | --- | --- |
 | `GET /api/projects` | Projects and lifecycle/queue status; assistants see their own project |
 | `POST /api/projects` | `{name}` creates and queues a project |
-| `PATCH /api/projects/{workspace_id}` | Name, named color, repository URLs and execution `settings` |
+| `PATCH /api/projects/{workspace_id}` | Name, color (a named color or `#rrggbb`, stored lowercase), repository URLs and execution `settings` |
 | `POST /api/projects/{workspace_id}/archive` | Stop/archive an eligible project |
 | `POST /api/projects/{workspace_id}/restore` | Restore its identity/history, stopped |
 | `GET`, `POST /api/settings` | Platform defaults and shared capacity |
@@ -494,9 +502,9 @@ projects collapse independently; ordinary runs appear directly below the project
 header. Attention rows precede ordinary rows without subgroup headings; status
 icons and a divider distinguish the groups when both exist. Assistant selection
 includes its project, so equal assistant names
-in different projects do not highlight together. The toolbar retains the colored
-project badge; run detail repeats it only if the toolbar does not identify the
-same destination.
+in different projects do not highlight together. The header's project switcher
+names the selected project; run detail repeats the project as a colored badge
+only if the header does not identify the same destination.
 
 Fleet views include read-only Service slots summaries. All projects shows held
 slots with the owning project names, including shared-service conflicts. A
@@ -517,8 +525,10 @@ editing through the existing scoped instruction endpoint; Save project is kept
 at the top of the form. Collapsing preserves the draft. Unedited, unavailable or
 still-loading instructions are never posted as empty text when other settings
 are saved. Existing non-empty-text and length validation still applies, and a
-refused write leaves the edit visible for correction. The assistant chat continues
-to show a read-only copy.
+refused write leaves the edit visible for correction. The section says when the
+stored orders last changed, says when there are none, and notes that they are
+usually set by telling uber lmer in chat, which confirms the wording before
+storing them.
 
 Archived project rows and Restore stopped use the stored project color. Fleet
 worker and assistant capacity use adjacent integer inputs; existing limits,

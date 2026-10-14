@@ -193,6 +193,8 @@ Both mechanisms fail toward running everything. The full suite runs when:
 - a declared subset path no longer exists (the gate warns and falls back);
 - either kill switch is set.
 
+The initial clean-state baseline of a development run has one more route, `gate-check --baseline`, which can reuse CI evidence for the exact starting commit instead of running the suite. It never reads or writes this cache; see [GATE-CI-BASELINE.md](./GATE-CI-BASELINE.md).
+
 ## Kill switches
 
 | Variable | Effect |

@@ -447,6 +447,26 @@ def test_the_digest_carries_what_the_assistant_needs_to_act(config):
     }
 
 
+def test_a_schema_2_digest_names_its_execution_uid(config):
+    """The ref stays slug-spelled, but the payload carries the uid the UI keys by."""
+    uid = "b" * 32
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet({**row("develop-141", reason="question", note=QUESTION,
+                     state="waiting_on_you", since="2026-07-28T10:00:00Z"), "uid": uid}),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    call = spool.calls[0]
+
+    assert call["note"].startswith("gitlab.example.com/group/project/develop-141 ")
+    assert call["data"]["uid"] == uid
+
+
 def test_a_row_with_no_run_identity_yet_is_skipped(config):
     """A session spawned seconds ago has no ``<host>/<project>/<slug>``.
 
@@ -922,9 +942,14 @@ def test_a_predecessor_s_stale_entry_stops_being_a_crashed_row(config, platform_
 
     assert detect.sweep_finished_sessions(config) == [finished]
 
-    assert [row.state for row in fleet_rows(config)] == ["running"], (
+    remaining = fleet_rows(config)
+    assert [row.state for row in remaining] == ["complete"], (
         "the crashed row outlived the session that was never reaped"
     )
+    # The run committed ``complete`` and its live session is still up, so the row
+    # reads ``complete`` rather than ``running`` (#308) — the predecessor's crash
+    # is gone, and the remaining row is the live session's.
+    assert remaining[0].session["id"] == "s-live"
     assert registry.read_session("s-live") is not None, (
         "the live session's own entry must not be swept with its predecessor's"
     )

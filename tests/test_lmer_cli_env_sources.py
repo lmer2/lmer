@@ -68,6 +68,13 @@ class TestCliEnvDictDeclaresNapkinTaskdef:
         source = CLI_PY.read_text()
         assert re.search(r"""["']LMER_NAPKIN_TOKEN["']\s*:\s*None""", source)
 
+    def test_container_runtime_seeded_none(self):
+        """LMER_CONTAINER_RUNTIME names the host's runtime; the session image
+        ships only the docker client, so .env and preset seeding must not
+        carry the host's value in."""
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_CONTAINER_RUNTIME["']\s*:\s*None""", source)
+
     def test_taskdef_token_seeded_none(self):
         source = CLI_PY.read_text()
         assert re.search(r"""["']LMER_TASKDEF_TOKEN["']\s*:\s*None""", source)
@@ -280,6 +287,19 @@ class TestDisplayEnvConfigCli:
         assert "environment" in output
         assert "LMER_TRUST_MISE" in output
         assert ".env (lmer state dir)" in output
+
+    def test_scoped_ci_baseline_toggle_is_listed_with_its_source(self, monkeypatch):
+        monkeypatch.setenv("LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE", "1")
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_env_config_cli(
+                host_lmer_vars=set(),
+                env_file_sources={
+                    "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": ".env (lmer state dir)"},
+            )
+        line = next(l for l in f.getvalue().splitlines()
+                    if "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE" in l)
+        assert ".env (lmer state dir)" in line
 
     def test_table_has_fenced_delimiters(self, monkeypatch):
         monkeypatch.setenv("LMER_TASK", "review")

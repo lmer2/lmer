@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 
 const usageDetails = ref()
+const assistantHidden = ref()
 </script>
 
 <script setup>
@@ -24,6 +25,9 @@ const props = defineProps({
   // Date.now() itself drifts from the ages beside it.
   now: { type: Number, default: () => Date.now() },
   compact: { type: Boolean, default: false },
+  meterColor: { type: String, default: 'tone-idle' },
+  // uber lmer's pane only (issue 507): offer hide/show, remembered in this browser.
+  hideable: { type: Boolean, default: false },
 })
 
 const USAGE_DETAILS_STORAGE_KEY = 'lmer:usage-details'
@@ -35,6 +39,17 @@ const hasDetails = computed(() => props.status?.harness === 'codex'
   && statusSegments(props.status, { details: true }).some((each) => each.detailOnly))
 const segments = computed(() => statusSegments(props.status, { details: details.value }))
 const age = computed(() => statusAge(props.status, segments.value))
+
+const ASSISTANT_STRIP_STORAGE_KEY = 'lmer:assistant-status-strip'
+if (assistantHidden.value === undefined) {
+  assistantHidden.value = storedFlag(() => window.localStorage.getItem(ASSISTANT_STRIP_STORAGE_KEY), false)
+}
+const hidden = computed(() => props.hideable && assistantHidden.value)
+
+function toggleHidden() {
+  assistantHidden.value = !assistantHidden.value
+  rememberFlag((value) => window.localStorage.setItem(ASSISTANT_STRIP_STORAGE_KEY, value), assistantHidden.value)
+}
 
 function toggleDetails() {
   details.value = !details.value
@@ -69,6 +84,14 @@ function title(segment) {
     :title="reading"
   >{{ printed }}</span>
 
+  <button
+    v-else-if="hidden && (segments.length || hasDetails)"
+    type="button"
+    class="text-body-small text-medium-emphasis usage-details strip-toggle"
+    :aria-expanded="false"
+    aria-label="Show the status strip"
+    @click="toggleHidden"
+  >show status</button>
   <div v-else-if="segments.length || (!compact && hasDetails)" class="d-flex flex-wrap align-center ga-2">
     <div
       v-for="segment in segments"
@@ -82,13 +105,14 @@ function title(segment) {
         <span class="font-weight-medium">{{ segment.value }}</span>
       </div>
       <div v-if="segment.age" class="text-body-small text-medium-emphasis">{{ segment.age }}</div>
-      <!-- `tone-idle` is this app's own neutral, so a meter cannot be mistaken
-           for the urgency ramp. A segment that is not a proportion (effort)
-           draws no meter at all rather than a full one. -->
+      <!-- `tone-idle` by default, this app's own neutral, so a meter cannot be
+           mistaken for the urgency ramp; uber lmer's pane passes its orange
+           accent (issue 507). A segment that is not a proportion (effort) draws no
+           meter at all rather than a full one. -->
       <v-progress-linear
         v-if="segment.percent !== undefined"
         :model-value="segment.percent"
-        color="tone-idle"
+        :color="meterColor"
         height="4"
         rounded
       />
@@ -101,6 +125,14 @@ function title(segment) {
       :aria-label="details ? 'Hide usage details' : 'Show usage details'"
       @click.stop="toggleDetails"
     >{{ details ? 'less' : 'details' }}</button>
+    <button
+      v-if="hideable"
+      type="button"
+      class="text-body-small text-medium-emphasis usage-details strip-toggle"
+      :aria-expanded="true"
+      aria-label="Hide the status strip"
+      @click="toggleHidden"
+    >hide</button>
     <!-- Its own line under the meters, because it qualifies all of them. -->
     <div
       v-if="age"

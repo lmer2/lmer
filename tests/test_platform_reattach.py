@@ -1165,7 +1165,7 @@ def test_the_daemon_reattaches_before_it_serves(platform_root, monkeypatch):
 
     order = []
     monkeypatch.setattr(
-        daemon, "reattach_all", lambda: order.append("reattach") or []
+        daemon, "reattach_all", lambda **_: order.append("reattach") or []
     )
 
     class NoSupervisor:

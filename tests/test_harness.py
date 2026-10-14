@@ -324,16 +324,21 @@ class TestCredentialMounts:
             for a in args
         )
 
-    def test_pi_models_json_mounted_read_only_when_present(self, tmp_path, monkeypatch):
+    def test_pi_models_json_mounted_read_only_at_side_path(self, tmp_path, monkeypatch):
         # pi's custom provider/model registry (e.g. a local llama.cpp
-        # endpoint) must reach the container, or in-container pi rejects
-        # models that only exist in the host's registry. It is hand-authored
+        # endpoint) must reach the container, but at a side path (issue #490):
+        # the pi runner discovers the provider models at launch and writes the
+        # real models.json, merging this host overlay in. It is hand-authored
         # config pi only reads, so it mounts ro (auth.json stays rw for
         # token refresh).
         self._fake_home(tmp_path, monkeypatch, [".pi/agent/models.json"])
         args, _ = build_user_mounts("docker", get_harness("pi"))
         assert any(
-            ".pi/agent/models.json:/home/developer/.pi/agent/models.json:ro" in a
+            ".pi/agent/models.json:/home/developer/.pi/agent/models.host.json:ro" in a
+            for a in args
+        )
+        assert not any(
+            ".pi/agent/models.json:/home/developer/.pi/agent/models.json" in a
             for a in args
         )
 

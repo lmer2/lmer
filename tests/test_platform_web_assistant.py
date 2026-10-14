@@ -169,15 +169,35 @@ def test_the_supervisor_is_called_uber_lmer_and_never_an_assistant():
     assert '{{ workspace.name }} · uber lmer' in text
     assert 'agent-label="uber lmer"' in text
     assert 'Waiting to start — assistant limit reached' in text
-    assert 'this chat belong to this project' in ' '.join(text.split())
+    # Issue 575: the pane's colour and toolbar say whose it is; the intro lines went.
+    assert 'this chat belong to this project' not in ' '.join(text.split())
 
 
 def test_the_composer_says_who_is_at_the_other_end():
     text = _read(DRAWER)
-    assert 'You are talking to {{ workspace.name }} · uber lmer.' in text
+    assert 'You are talking to' not in text
     assert ':composer-label="`Say something to ${workspace.name} · uber lmer`"' in text
     assert ':workspace-id="workspace.id"' in text
     assert 'say something to this session' in _read(CHAT)
+
+
+def test_the_pane_fills_the_window_and_the_run_view_keeps_its_bound():
+    """Issue 575: at 4K the transcript stopped at half the window. The pane is a
+    full-height column and Chat's ``fill`` mode lets the conversation take what is
+    left; the run view's chat keeps its viewport-share bound, which it needs as a
+    tab panel with a composer under it."""
+    drawer = _read(DRAWER)
+    assert re.search(r"<Chat\b[^>]*\bfill\b", drawer, re.S), "the pane's chat is not in fill mode"
+    assert re.search(r"\.uber-pane \{[^}]*min-height: 100%", drawer), "the pane is not a full-height column"
+    assert ".uber-pane-slot {\n  height: 100%;" in _read(APP), "the drawer's wrapper does not pass the height on"
+    chat = _read(CHAT)
+    assert re.search(r"\.chat-fill \.chat \{[^}]*flex: 1 1 0;[^}]*max-height: none;", chat), (
+        "fill mode does not lift the transcript's bound"
+    )
+    assert "max-height: 50dvh;" in chat, "the run view lost its bound"
+    run_view = _read(WEB / "src" / "components" / "RunDetail.vue")
+    tag = run_view[run_view.index("<Chat"):]
+    assert not re.search(r"\bfill\b", tag[:tag.index(">")]), "the run view's chat is in fill mode"
 
 
 def test_the_conversation_is_the_shared_chat_pointed_at_the_supervisor():
@@ -258,73 +278,77 @@ def test_a_daemon_that_did_not_answer_degrades_instead_of_resetting():
     )
 
 
-def test_the_supervisors_generation_and_age_are_shown_from_the_status():
+def test_the_supervisors_generation_and_age_are_on_the_toolbar_tooltip_not_the_body():
     """Which incarnation you are talking to is not cosmetic: a rotation (§8.3) is
     a fresh context window, so a note it "already has" may be a note the one
-    before it had."""
+    before it had.
+
+    Issue 578 took the line out of the pane body ("nothing visible in the pane
+    body"), so it lives in the robot icon's tooltip on the toolbar instead.
+    """
     text = _read(DRAWER)
-    assert "status.generation" in text, "nothing says which incarnation this is"
-    assert "ago(status.started_at, now)" in text, (
+    script = text[:text.index("<template>")]
+    identity = script[script.index("const identity = computed("):]
+    identity = identity[:identity.index("\n})\n")]
+    assert "status.value.generation" in identity, "nothing says which incarnation this is"
+    assert "ago(status.value.started_at, props.now)" in identity, (
         "how long this one has been up is not shown, or is computed here rather "
         "than by the one helper that formats a relative time"
+    )
+    markup = _template(DRAWER)
+    toolbar = markup[markup.index("<v-toolbar"):markup.index("</v-toolbar>")]
+    tooltip = re.search(r'<v-tooltip\s[^>]*v-model="identityShown"[^>]*:text="identity"[^>]*>', toolbar, re.S)
+    assert tooltip, "the incarnation is not on the toolbar's robot tooltip"
+    # A tap's compatibility mouseenter opens it first, so a toggle on the click closes it.
+    assert "open-on-click" not in tooltip.group(0), "a phone tap opens the tooltip and closes it again"
+    assert '@click="identityShown = true"' in toolbar, "a phone, which has no hover, cannot open it"
+    assert ':aria-label="identity"' in toolbar and 'tabindex="0"' in toolbar, (
+        "the incarnation is out of reach of a screen reader or a keyboard"
+    )
+    body = markup[markup.index('<div class="uber-body'):]
+    assert "generation" not in body and "started_at" not in body, (
+        "the generation line is back in the pane body"
     )
 
 
 # --- the lifecycle controls (T126) --------------------------------------------
 
-def test_the_header_offers_a_restart_and_hides_the_verb_the_daemon_would_refuse():
+def test_the_toolbar_offers_restart_and_stop_and_hides_the_verbs_the_daemon_would_refuse():
     """The operator asked for it in those words — "a way to restart the uber lmer
     process from the ux" — after a wedged incarnation could only be cleared by
     restarting the daemon on the host, which takes the fleet view down with it.
 
-    Restart is the primary control because it is the only one of the three that
-    always leaves something running: the route replaces a live incarnation and starts
-    one when nothing is up, in a single call. Stop leaves nothing, so it sits in the
-    overflow; start is offered only while nothing is running, because against a live
-    one the route answers 409 to protect the incumbent's context window, and an
-    affordance whose only outcome is a refusal is worse than none.
+    Issue 575 put stop beside restart on the compact toolbar and removed the
+    overflow menu: both ask before acting, so a mis-aimed tap costs a cancel. Both
+    are offered only while uber lmer runs. Start is not on the toolbar at all: the
+    pane's own Start button is drawn whenever nothing is running, and against a live
+    one the route answers 409 to protect the incumbent's context window.
     """
     text = _read(DRAWER)
-    header = text[text.index("<v-toolbar"):text.index("</v-toolbar>")]
+    toolbar = text[text.index("<v-toolbar"):text.index("</v-toolbar>")]
 
-    restart = re.search(r"<v-btn\b[^>]*mdiRestart.*?</v-btn>", header, re.S)
-    assert restart, "the header has no restart control"
-    assert 'v-if="running"' in restart.group(0), (
-        "restart is offered against an uber lmer that is not running, where what it "
-        "means is a start with a different name"
-    )
-    assert "confirmingRestart = true" in restart.group(0), (
-        "restart fires straight at the daemon instead of asking first"
-    )
+    for icon, confirm in (("mdiRestart", "confirmingRestart = true"),
+                          ("mdiStopCircleOutline", "confirmingStop = true")):
+        button = re.search(rf"<v-btn\b[^>]*{icon}[^>]*/>", toolbar, re.S)
+        assert button, f"the toolbar has no {icon} control"
+        assert 'v-if="running"' in button.group(0), (
+            f"{icon} is offered against an uber lmer that is not running"
+        )
+        assert confirm in button.group(0), f"{icon} fires straight at the daemon instead of asking first"
 
-    assert "<v-menu" in header, (
-        "stop sits beside restart rather than behind an overflow, one mis-aimed tap "
-        "from ending the supervisor when the operator meant to replace it"
-    )
-    stop_item = re.search(r"<v-list-item\b[^>]*mdiStopCircleOutline[^>]*>", header, re.S)
-    assert stop_item and 'v-if="running"' in stop_item.group(0), (
-        "the overflow offers a stop with nothing running, which stops nothing"
-    )
-    assert "confirmingStop = true" in stop_item.group(0), (
-        "stop fires straight at the daemon instead of asking first"
-    )
-    start_item = re.search(
-        r"<v-list-item\b[^>]*mdiPlayCircleOutline[^>]*>", header, re.S,
-    )
-    assert start_item and 'v-else' in start_item.group(0), (
-        "the overflow offers a start against a live uber lmer, whose only possible "
-        "answer is the 409 the route hands out to keep the incumbent's window"
+    assert "<v-menu" not in toolbar, "the overflow menu is back (issue 575 removed it)"
+    assert "mdiPlayCircleOutline" not in toolbar, (
+        "the toolbar offers a start, which duplicates the pane's Start button and, "
+        "against a live uber lmer, can only earn the route's 409"
     )
 
     # Nothing is drawn before the daemon has answered: a control cluster for a state
     # nobody has read yet is a guess at which verbs apply.
-    assert 'v-if="status || problem"' in header, (
+    assert 'v-if="status || problem"' in toolbar, (
         "the cluster is drawn before the first status arrives"
     )
-    words = _operator_words(DRAWER)
-    assert "stop uber lmer" in words and "start uber lmer" in words, (
-        "the overflow's entries are unnamed or misnamed"
-    )
+    assert 'aria-label="restart uber lmer"' in toolbar
+    assert 'aria-label="stop uber lmer"' in toolbar
 
 
 def test_restart_is_the_rotate_route_and_the_other_two_are_their_own():
@@ -578,41 +602,67 @@ def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
 
 # --- the standing orders ------------------------------------------------------
 
-def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
-    """The chat drawer reads standing orders; Project settings owns direct edits."""
+def test_the_standing_orders_button_opens_them_in_project_settings():
+    """Issue 575 replaced the drawer's read-only panel with a toolbar button: the
+    orders are read and edited in one place, Project settings, which the button
+    opens with that panel expanded. Kept that simple because #448 (temporary
+    standing orders) will rework this UI."""
     text = _read(DRAWER)
-    words = _operator_words(DRAWER)
-
-    assert "fetchAssistantInstructions" in text and (
-        "fetchAssistantInstructions" in _read(API_JS)
-    ), "the standing orders are read from somewhere other than the daemon's route"
-    assert "request(workspacePath('api/assistant/instructions', workspaceId))" in _read(API_JS), (
-        "the read route is no longer the GET the daemon serves"
+    toolbar = text[text.index("<v-toolbar"):text.index("</v-toolbar>")]
+    button = re.search(r"<v-btn\b[^>]*aria-label=\"standing orders\"[^>]*/>", toolbar, re.S)
+    assert button and "emit('settings', 'orders')" in button.group(0), (
+        "the standing-orders button does not ask the shell for that settings section"
     )
-    assert "standing orders" in words, "the panel is unnamed, or named something else"
-    assert "orders.instructions" in text, (
-        "the document shown comes from somewhere other than the daemon's reply"
+    assert "fetchAssistantInstructions" not in text, (
+        "the drawer still reads the orders itself, a second view of one document"
     )
-    assert "nothing to edit here on purpose" in words, (
-        "the panel does not say why it is read-only, so its absence of a form "
-        "reads as an unfinished feature"
-    )
-    assert "uber lmer confirms the wording" in words, (
-        "nothing tells the operator what happens when they state a rule in the chat"
-    )
-
-    # Project settings owns the editor; the chat drawer remains a read-only view.
-    for affordance in ("v-textarea", "v-text-field", "v-form", "v-switch"):
-        assert affordance not in text[text.index('<v-expansion-panel title="standing orders"'):text.index('</v-expansion-panels>')], (
-            f"the drawer grew a {affordance}: editing the standing orders here "
-            "bypasses the confirm-the-wording step that makes them the operator's"
-        )
     assert 'setAssistantInstructions' not in text, 'the chat drawer must remain a reader'
+
+    app = _read(APP)
+    assert '@settings="openProjectSettings(project.id, $event)"' in app
+    assert ':focus="projectSettingsFocus"' in app
+    opener = app[app.index("function openProjectSettings("):]
+    opener = opener[:opener.index("\n}\n")]
+    assert "if (mobile.value) uberOpen.value = false" in opener, (
+        "on a phone the drawer stays over the settings it just opened"
+    )
+
     editor = _read(WEB / 'src/components/ProjectSettings.vue')
+    assert "props.focus?.section !== 'orders'" in editor
+    assert "ordersOpen.value = 0" in editor
     assert 'setAssistantInstructions(id, instructions.value)' in editor
     client = _read(API_JS)
     assert "export function setAssistantInstructions(workspaceId, instructions)" in client
     assert "request(workspacePath('api/assistant/instructions', workspaceId), {" in client
+
+
+def test_project_settings_says_how_standing_orders_are_usually_set_and_when_they_changed():
+    """Issue 578 restores what the drawer's read-only panel said and the settings
+    section did not.
+
+    - The hint. The chat stays the usual write path because uber lmer confirms the
+      wording there before it stores it, which this textarea skips.
+    - An empty state, from the stored document rather than the draft.
+    - The last-changed time. ``instructions_at`` is the daemon's own stamp, aged by
+      the shell's clock.
+
+    The hint names the permanent document only, so #448's temporary orders can sit
+    beside it without contradicting it.
+    """
+    editor = WEB / "src" / "components" / "ProjectSettings.vue"
+    words = _words(editor)
+    assert ('Usually set by telling uber lmer in chat — "from now on…", "always…" — '
+            "and it confirms the wording before storing them.") in words
+    assert "No standing instructions yet." in words
+    assert "last changed" in words
+    text = _read(editor)
+    assert 'v-if="orders && !savedInstructions"' in text, (
+        "the empty state follows the draft, or shows before the orders were read"
+    )
+    assert "ago(orders.instructions_at, now)" in text
+    assert re.search(r"<ProjectSettings\b[^>]*:now=\"now\"", _read(APP), re.S), (
+        "Project settings is not given the shell's clock, so last changed stops ageing"
+    )
 
 
 def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
@@ -664,32 +714,6 @@ def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
         "the all-shadowed save does not tell the operator the restart is "
         "pointless"
     )
-
-
-def test_the_standing_orders_are_fetched_on_demand_and_not_polled():
-    """The drawer's cost is one status poll every ten seconds, and standing orders
-    change a few times a month — so they are read when the panel is expanded.
-
-    Re-read on every expand rather than cached forever, because uber lmer rewrites
-    the document from the chat: a panel showing the rules from the last time it was
-    opened is a read-only view of the wrong document, which is worse than none.
-    """
-    text = _read(DRAWER)
-    assert "@update:model-value=\"onOrdersToggle\"" in text, (
-        "nothing loads the document when the panel is opened"
-    )
-    assert re.search(
-        r"function onOrdersToggle\(value\) \{\s*\n"
-        r"\s*if \(value !== undefined\) loadOrders\(\)",
-        text,
-    ), "collapsing the panel refetches, or expanding it does not"
-    # Not on the status timer: that would make an unopened panel cost a request
-    # every ten seconds for a document nobody is reading.
-    poll = text[text.index("onMounted("):text.index("onBeforeUnmount(")]
-    assert "loadOrders" not in poll, (
-        "the standing orders are fetched on the drawer's timer rather than on demand"
-    )
-    assert "setInterval(loadOrders" not in text
 
 
 # --- what the fleet view pays -------------------------------------------------
@@ -773,15 +797,22 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
 def test_the_drawer_takes_its_colour_from_the_theme():
     """A hex here is a colour the theme cannot change (main.js owns the palette).
 
-    The accent header is what makes this panel unmistakably not the run navigator,
-    so it is the one place most likely to reach for a literal.
+    The toolbar is the place most likely to reach for a literal. Since issue 578 it
+    is a neutral theme surface, `uber-toolbar`, rather than the project colour. What
+    sets the drawer apart from the run navigator is its edge and its "uber lmer"
+    name, both pinned above.
     """
     text = _read(DRAWER)
     hexes = re.findall(r"#[0-9a-fA-F]{3,8}\b", text)
     assert not hexes, f"the drawer hardcodes {hexes} instead of naming a theme colour"
-    assert 'color="primary"' in text, (
-        "the drawer has no accent, so it reads as the same panel as the run "
-        "navigator on the other edge"
+    toolbar = re.search(r"<v-toolbar\b[^>]*>", text, re.S).group(0)
+    assert 'color="uber-toolbar"' in toolbar, "the toolbar does not take the theme's neutral surface"
+    assert "projectColor" not in text and ":style" not in toolbar, (
+        "the toolbar is painted with the project colour again"
+    )
+    theme = _read(WEB / "src" / "main.js")
+    assert len(re.findall(r"'uber-toolbar': '#[0-9a-f]{6}'", theme)) == 2, (
+        "uber-toolbar is not defined in both colour schemes"
     )
 
 

@@ -194,17 +194,33 @@ STATE_DIR="$HOST_HOME/.lmer"
     "secret, registry and session logs all live there, and it has to be" \
     "owned by uid $HOST_UID"
 
+# --runtime, else LMER_CONTAINER_RUNTIME, under lmer_cli.runtime.detect_runtime()'s
+# rule: trimmed, case-insensitive, docker or podman only. A path would run, but
+# the podman checks below compare names, so it would lose --userns=keep-id.
+RUNTIME_FROM="--runtime"
 if [ -z "$RUNTIME" ]; then
-    # Same order as lmer_cli.runtime.detect_runtime(), so the helper and the
-    # in-container CLI cannot disagree about which engine this host has.
-    if command -v docker >/dev/null 2>&1; then
-        RUNTIME="docker"
-    elif command -v podman >/dev/null 2>&1; then
-        RUNTIME="podman"
-    else
-        die "neither docker nor podman on PATH"
-    fi
+    RUNTIME="${LMER_CONTAINER_RUNTIME:-}"
+    RUNTIME_FROM="LMER_CONTAINER_RUNTIME"
 fi
+RUNTIME_GIVEN="$RUNTIME"
+RUNTIME="${RUNTIME#"${RUNTIME%%[![:space:]]*}"}"
+RUNTIME="${RUNTIME%"${RUNTIME##*[![:space:]]}"}"
+RUNTIME="${RUNTIME,,}"
+case "$RUNTIME" in
+    docker|podman) ;;
+    "")
+        # Same order as lmer_cli.runtime.detect_runtime(), so the helper and the
+        # in-container CLI cannot disagree about which engine this host has.
+        if command -v docker >/dev/null 2>&1; then
+            RUNTIME="docker"
+        elif command -v podman >/dev/null 2>&1; then
+            RUNTIME="podman"
+        else
+            die "neither docker nor podman on PATH"
+        fi
+        ;;
+    *) die "$RUNTIME_FROM '$RUNTIME_GIVEN' is not supported; use docker or podman" ;;
+esac
 command -v "$RUNTIME" >/dev/null 2>&1 || die "$RUNTIME is not on PATH"
 
 # Socket candidates, mirroring mounts._find_container_socket. Always mounted at
@@ -516,6 +532,12 @@ add_env() {
     cmd+=("--env" "$name")
 }
 
+# In here the runtime is always the docker client on the mounted socket. Set by
+# value so a host-only LMER_CONTAINER_RUNTIME=podman in the mounted ~/.lmer/.env
+# loses to it (first-wins), and marked forwarded so --env cannot override it.
+cmd+=("--env" "LMER_CONTAINER_RUNTIME=docker")
+forwarded+=("LMER_CONTAINER_RUNTIME")
+
 for name in $(compgen -e | sort || true); do
     case "$name" in
         # Host-specific target-repo tokens, plus the deprecated
@@ -534,7 +556,10 @@ for name in $(compgen -e | sort || true); do
         # above. Listed after LMER_PLATFORM_* so those keep the blocked and
         # path-checked handling below. ~/.lmer/.env remains the alternative:
         # the daemon loads it and it rides the state mount.
+        # The CI-baseline toggle (#452) rides the same ladder for the same
+        # reason.
         LMER_MEMORY|LMER_CPUS|LMER_GPU|LMER_*_MEMORY|LMER_*_CPUS|LMER_*_GPU) add_env "$name"; continue ;;
+        LMER_GATE_CI_BASELINE|LMER_*_GATE_CI_BASELINE) add_env "$name"; continue ;;
         *) continue ;;
     esac
     blocked=0

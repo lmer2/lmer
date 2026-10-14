@@ -43,7 +43,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.call("Page.navigate", url=url)
         await browser.wait("document.querySelectorAll('.project-nav').length === 3")
-        await browser.click(alpha["name"], '[role="tab"]')
+        await browser.choose_project(alpha["name"])
         await browser.click("read the fleet as a constellation map")
         await browser.wait("document.querySelectorAll('.fleet-map__core').length === 2")
         assert not await browser.evaluate("document.querySelector('.fleet-map__group-ring') !== null")
