@@ -95,7 +95,7 @@ write failed. That exact-operation receipt prohibits retry and can complete
 bookkeeping without a remote resend or a supplied remote reference. Conflicting
 receipt records remain blocked with their state preserved.
 Ledger files are retained for the thread's lifetime; deleting them would remove
-receipt-ownership evidence. Text and each Matrix attachment have separate receipts. File
+receipt-ownership evidence. Text and each attachment have separate receipts. File
 parts are indexed, even when names match, and retain their content hash, size,
 media type and uploaded URI. A retry uses the saved original payload. Confirmed
 parts finish bookkeeping without another remote send; remaining parts resume in
@@ -203,7 +203,8 @@ When a confirmed remote reference is available but was not saved, select it:
 python -m lmer_cli.connector_recovery --permalink "$THREAD" receipt --operation "$OPERATION" --remote-ref "$REMOTE_REF"
 ```
 
-The command verifies thread, sender and content (including attachment bytes).
+The command verifies thread, sender and content: a Matrix attachment's bytes, or
+that a Slack message shares the operation's file id.
 It rejects a receipt assigned to any other operation in the durable thread ledger,
 as well as receipts in retained attribution or another pending part. It also validates the
 current supervisor and the retained source record before changing state.
@@ -214,6 +215,13 @@ retry after inspecting the remote thread. **That retry may create a duplicate.**
 ```bash
 python -m lmer_cli.connector_recovery --permalink "$THREAD" retry --operation "$OPERATION" --inspected-thread --accept-possible-duplicate
 ```
+
+**A held Slack file share.** Slack returns no `ts` for a share, so there is none
+to save. Look in the thread for the bot's message carrying the payload's
+`file_id`. If it is there, select it with `receipt --remote-ref <its ts>`; the
+command checks the shared file id. Use `retry` only when the file is absent: a
+retry of a share that landed calls `files.completeUploadExternal` a second time
+on a completed file id, and Slack does not document what that returns.
 
 The authorization applies only to that operation. Other receipts, the source,
 question context, attribution and remaining attachments stay intact. Confirmed
@@ -248,6 +256,7 @@ a running owner waiting on recovery can resume through its normal retry loop.
 | Recovery CLI | Actual CLI, wrong/stale IDs, 257 completed sends before receipt-reuse rejection, interrupted retry then interrupted receipt; ledger-only confirmation refuses retry and resumes receipt recovery without a resend |
 | Marker publication | Process exit during temporary creation and after complete publication; no empty live JSON or automatic uncertain replay |
 | Matrix files | Same names with distinct indices/content, partial receipts, selected retry and remaining attachments |
+| Slack files | A receipt naming the message that shares the file is accepted; another file's share is refused |
 
 Tests use real supervisor HTTP paths and real child processes with controlled
 remote adapters. Timing tests scale the polling/drain constants to keep runs

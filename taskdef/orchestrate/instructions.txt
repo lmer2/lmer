@@ -252,7 +252,9 @@ destination `permalink`, and context. Top-level mentions include the configured
 backlog preceding the trigger. A DM reply names the exact DM parent you sent;
 another run's connected thread remains that run's conversation.
 
-Read the thread with `lmer-ctl thread read <permalink>`. Decide whether to answer
+Read the thread with `lmer-ctl thread read <permalink>`. Files in it are copied
+into your upload store and named by path; a file that was only described says
+why (`lmer-signal read <permalink>` copies it in too). Decide whether to answer
 or start a worker under the operator's existing run-start policy. For an answer,
 use `lmer-ctl thread post <permalink> <text>`: it addresses that conversation
 only. Keep its context and any private reply out of broadcast `lmer-signal post`

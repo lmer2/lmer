@@ -10,7 +10,7 @@ import threading
 import time
 
 from ask_channel import bus
-from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired
+from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired, verified_rejection
 from .connector_ownership import Lease, same_process
 from .connector_receipts import ReceiptReactions
 
@@ -209,10 +209,10 @@ class ConnectorLifecycle:
     def _backoff(self):
         self._stop.wait(min(30.0, 0.5 * 2 ** min(self.failures, 6)))
 
-    def _deliver_part(self, source, part, payload, send, bookkeeping):
+    def _deliver_part(self, source, part, payload, send, bookkeeping, *, rejected=verified_rejection):
         self._ensure_ready()
         with self._state.outbound:
-            receipt = self._state.send(source, part, payload, send)
+            receipt = self._state.send(source, part, payload, send, rejected=rejected)
             with self._state.lock:
                 if not self._state.part_done(part):
                     bookkeeping(receipt)

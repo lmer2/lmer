@@ -104,6 +104,69 @@ class TestReading:
         assert "daemon" in refused.json()["detail"]
 
 
+class TestFilesOnARead:
+    """#550: the assistant gets a thread's files in its own upload store, the way
+    `lmer-signal read` gives them; other callers are told which command does."""
+
+    PNG = b"\x89PNG\r\n\x1a\n"
+
+    @pytest.fixture
+    def with_file(self, monkeypatch):
+        client = FakeSlack(messages=[{
+            "ts": "1712345678.000900", "user": "U1", "text": "see the screenshot",
+            "files": [{"name": "shot.png", "mimetype": "image/png", "url_private": "https://files.slack/x"}],
+        }])
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
+        monkeypatch.setattr(thread_access, "fetch_slack_file", lambda url, token, max_bytes: self.PNG)
+        return client
+
+    @pytest.fixture
+    def assistant_store(self, tmp_path, monkeypatch):
+        from lmer_platform import assistant, session_io, uploads
+
+        directory = tmp_path / "assistant-uploads"
+        directory.mkdir()
+        monkeypatch.setattr(assistant, "authenticated_generation", lambda minted: {"session": "assist-1"})
+        monkeypatch.setattr(session_io, "require_session", lambda session_id: {"uploads": {"path": "x"}})
+        monkeypatch.setattr(
+            uploads, "mounted_store",
+            lambda session_id, entry: directory if session_id == "assist-1" else None,
+        )
+        return directory
+
+    def _attachment(self, client, headers):
+        response = client.get("/api/comms/thread", params={"permalink": SLACK_LINK}, headers=headers)
+        assert response.status_code == 200, response.text
+        (message,) = response.json()["messages"]
+        (attachment,) = message["attachments"]
+        return attachment
+
+    def test_the_assistant_gets_the_file_in_its_store(self, client, with_file, assistant_store):
+        attachment = self._attachment(client, bearer(cfg.mint_assistant_credential()))
+        assert attachment["path"].startswith("/home/developer/.lmer-uploads/")
+        (written,) = assistant_store.iterdir()
+        assert written.read_bytes() == self.PNG
+        assert attachment["path"].endswith("/" + written.name)
+
+    def test_the_operator_is_told_the_command_that_copies_it(self, client, with_file, assistant_store):
+        attachment = self._attachment(client, auth())
+        assert "path" not in attachment
+        assert f"lmer-signal read {SLACK_LINK}" in attachment["reason"]
+        assert list(assistant_store.iterdir()) == []
+
+    def test_an_assistant_without_a_store_is_told_too(self, client, with_file, monkeypatch):
+        from lmer_platform import assistant, session_io
+        from lmer_platform.uploads import StoreUnavailable
+
+        def unavailable(session_id):
+            raise StoreUnavailable("this session has no upload store")
+
+        monkeypatch.setattr(assistant, "authenticated_generation", lambda minted: {"session": "assist-1"})
+        monkeypatch.setattr(session_io, "require_session", unavailable)
+        attachment = self._attachment(client, bearer(cfg.mint_assistant_credential()))
+        assert "lmer-signal read" in attachment["reason"]
+
+
 class TestPosting:
     def test_the_operator_posts_as_the_operator(self, client, slack):
         posted = client.post(

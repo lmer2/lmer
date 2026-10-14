@@ -14,6 +14,11 @@ import re
 import sys
 from urllib.parse import urlparse
 
+#: ``<prefix><sanitized host>``: a Maintainer read_api token the CI baseline
+#: reads evidence with (#582). GitLab answers the pipeline-variables read 403
+#: below Maintainer, and the run account should not need that role.
+EVIDENCE_TOKEN_PREFIX = "LMER_CI_BASELINE_TOKEN_"
+
 #: Refusal notices already printed by :func:`_get_gitlab_token`. One session
 #: credentials many URLs against the same host, so without this the same
 #: diagnostic would repeat once per lookup.

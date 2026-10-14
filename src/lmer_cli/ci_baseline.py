@@ -36,6 +36,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
+from lmer_cli.tokens import EVIDENCE_TOKEN_PREFIX, _sanitize_hostname
+
 PASSED = "passed"
 FAILED = "failed"
 UNVERIFIED = "unverified"
@@ -67,6 +69,9 @@ MAX_PAGES = 5
 # in full (schedule variables are not pipeline variables), and child pipelines
 # run another configuration.
 TRUSTED_SOURCES = ("push", "merge_request_event")
+
+DOCS_HINT = "see docs/GATE-CI-BASELINE.md"
+RUN_CREDENTIAL = "the run token"
 
 PIN_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 # Top-level keys that can change what every job runs without touching the job
@@ -122,6 +127,7 @@ class JobEvidence:
     definition: Optional[str] = None
     pinned: Optional[str] = None
     pipeline_source: Optional[str] = None
+    confirmed: bool = False
 
     @property
     def deciding(self) -> Optional[Attempt]:
@@ -154,6 +160,7 @@ class Evidence:
     sha: Optional[str] = None
     pipelines: List[Dict[str, Any]] = field(default_factory=list)
     jobs: List[JobEvidence] = field(default_factory=list)
+    credential: Optional[str] = None
 
     @property
     def completed_at(self) -> Optional[str]:
@@ -171,6 +178,7 @@ class Evidence:
             "project": self.project,
             "project_id": self.project_id,
             "sha": self.sha,
+            "credential": self.credential,
             "completed_at": self.completed_at,
             "pipelines": list(self.pipelines),
             "jobs": [job.as_dict() for job in self.jobs],
@@ -384,6 +392,16 @@ def judge(mapping: CoverageMapping, jobs: Sequence[Dict[str, Any]]
     return PASSED, "every required job's latest attempt succeeded", evidence
 
 
+def evidence_token_env(host: str) -> str:
+    return EVIDENCE_TOKEN_PREFIX + _sanitize_hostname(host)
+
+
+def is_header_text(token: str) -> bool:
+    """Printable latin-1 only, deliberately stricter than http.client: nothing
+    that passes can raise in `putheader`, whose exception quotes the token."""
+    return token.isprintable() and all(ord(char) < 256 for char in token)
+
+
 class GitLabEvidence:
     """Reads one commit's pipelines, jobs and CI configuration from the GitLab
     REST API, inside one overall deadline: the per-request socket timeout alone
@@ -391,11 +409,18 @@ class GitLabEvidence:
     deadline, and an answer that arrives past it is discarded."""
 
     def __init__(self, client: Any, budget_s: float = EVIDENCE_BUDGET_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 evidence_env: Optional[str] = None, uses_evidence_token: bool = False):
         self.client = client
         self.clock = clock
         self.deadline = clock() + budget_s
         self.budget_s = budget_s
+        self.evidence_env = evidence_env
+        self.uses_evidence_token = uses_evidence_token
+
+    @property
+    def credential(self) -> str:
+        return self.evidence_env if self.uses_evidence_token else RUN_CREDENTIAL
 
     def _call(self, endpoint: str, fetch: Callable[[], Tuple[int, Any]]) -> Tuple[int, Any]:
         if self.clock() > self.deadline:
@@ -406,16 +431,24 @@ class GitLabEvidence:
         except (OSError, http.client.HTTPException) as exc:
             raise EvidenceUnavailable(
                 f"GitLab API {endpoint.split('?')[0]}: {exc!r}") from exc
+        except UnicodeDecodeError:
+            # Its repr would carry the whole body, often a proxy's error page.
+            raise EvidenceUnavailable(
+                f"GitLab API {endpoint.split('?')[0]}: answer is not UTF-8") from None
         if self.clock() > self.deadline:
             raise EvidenceUnavailable(
                 f"CI evidence not read within {self.budget_s:g}s")
         return result
 
-    def _get(self, endpoint: str) -> Any:
+    def _get(self, endpoint: str, forbidden: Optional[str] = None) -> Any:
         status, body = self._call(endpoint, lambda: self.client.request(endpoint))
+        if status == 403 and forbidden:
+            raise EvidenceUnavailable(forbidden)
         if status != 200:
+            # An expired or revoked evidence token must be recognisable as such.
+            to = f" to {self.credential}" if self.uses_evidence_token else ""
             raise EvidenceUnavailable(
-                f"GitLab API {endpoint.split('?')[0]} answered {status or 'no response'}")
+                f"GitLab API {endpoint.split('?')[0]} answered {status or 'no response'}{to}")
         try:
             return json.loads(body)
         except ValueError as exc:
@@ -459,8 +492,19 @@ class GitLabEvidence:
         except (yaml.YAMLError, ValueError) as exc:
             raise EvidenceUnavailable(f"unreadable CI configuration: {exc}") from exc
 
+    def variables_forbidden(self) -> str:
+        """Why a 403 on the pipeline-variables read is a role problem with a
+        known fix, not a generic API failure."""
+        reason = (f"cannot read pipeline variables: GitLab refused {self.credential} "
+                  f"(403); it needs the Maintainer role")
+        if self.uses_evidence_token:
+            return f"{reason} ({DOCS_HINT})"
+        token = self.evidence_env or f"{EVIDENCE_TOKEN_PREFIX}<host>"
+        return f"{reason}, or set {token} to a Maintainer read_api token ({DOCS_HINT})"
+
     def pipeline_variables(self, project_id: int, pipeline_id: int) -> List[Dict[str, Any]]:
-        data = self._get(f"/projects/{project_id}/pipelines/{pipeline_id}/variables")
+        data = self._get(f"/projects/{project_id}/pipelines/{pipeline_id}/variables",
+                         forbidden=self.variables_forbidden())
         if not isinstance(data, list):
             raise EvidenceUnavailable("GitLab pipeline variables: expected a list")
         return data
@@ -510,6 +554,8 @@ def confirm(mapping: CoverageMapping, source: GitLabEvidence,
         if problems:
             job.verdict = UNVERIFIED
             job.reason = "; ".join(problems)
+        else:
+            job.confirmed = True
     unverified = [job for job in evidence.jobs if job.verdict != PASSED]
     if unverified:
         evidence.verdict = UNVERIFIED
@@ -534,7 +580,7 @@ def collect(mapping: CoverageMapping, source: GitLabEvidence, host: str,
     """Evidence for `sha` in `project`. Never raises: anything that cannot be
     read becomes UNVERIFIED with the reason."""
     evidence = Evidence(UNVERIFIED, "", provider=mapping.provider, host=host,
-                        project=project, sha=sha)
+                        project=project, sha=sha, credential=source.credential)
     try:
         info = source.project(project)
         project_id = int(info["id"])
@@ -590,6 +636,11 @@ def collect(mapping: CoverageMapping, source: GitLabEvidence, host: str,
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         evidence.verdict = UNVERIFIED
         evidence.reason = f"unexpected GitLab API shape: {exc!r}"
+    if evidence.verdict != PASSED:
+        # A confirmation cut short leaves jobs it never finished marked passed.
+        for job in evidence.jobs:
+            if job.verdict == PASSED and not job.confirmed:
+                job.verdict, job.reason = UNVERIFIED, evidence.reason
     return evidence
 
 

@@ -462,6 +462,11 @@ STOP_REASONS = ("operator", "rotation", "replaced")
 #: assistant needs, and the full history is in ``events.jsonl``.
 MAX_PENDING = 50
 
+def ended_episode(state: "AssistantState") -> dict:
+    """The fields a take resets: the nudge clock and its episode (#317, #584)."""
+    return {"nudged_at": None, "nudges": 0, "nudge_session": None, "stalled_at": None,
+            "episode": state.episode + 1}
+
 #: Caps on caller-supplied text. Both values reach this module from reachable
 #: input (the assistant writes its own handoff through the API), and both end up
 #: in a state file the daemon reads on every start.
@@ -669,8 +674,26 @@ class AssistantState:
     #: :func:`take_pending`; a future value is durably bounded to the current
     #: time by :func:`clamp_future_nudged_at` before the detector reads it.
     nudged_at: Optional[str] = None
+    #: Nudges typed in this episode, and the incarnation they were typed into
+    #: (#584). An episode ends at a take or a new incarnation, so a count that
+    #: names another session is zero. Cleared by :func:`take_pending`.
+    nudges: int = 0
+    nudge_session: Optional[str] = None
+    #: Advanced by every take (:func:`ended_episode`), so a mark computed before
+    #: a take can tell it landed after one and refuse.
+    episode: int = 0
+    #: When the one "not taking its spool" signal went out for this episode.
+    stalled_at: Optional[str] = None
     codex_wake: Optional[str] = None
     conversation_seen: tuple = ()
+
+    def episode_nudges(self, session_id: Optional[str]) -> int:
+        """Nudges already typed into *session_id* during this episode."""
+        return self.nudges if self.nudge_session == session_id else 0
+
+    def episode_stalled(self, session_id: Optional[str]) -> bool:
+        """Whether this episode's stall signal has gone out for *session_id*."""
+        return self.stalled_at is not None and self.nudge_session == session_id
 
     def to_dict(self) -> dict:
         return {
@@ -687,6 +710,10 @@ class AssistantState:
             "pending_since": self.pending_since,
             "pending_seq": self.pending_seq,
             "nudged_at": self.nudged_at,
+            "nudges": self.nudges,
+            "nudge_session": self.nudge_session,
+            "episode": self.episode,
+            "stalled_at": self.stalled_at,
             "codex_wake": self.codex_wake,
             "conversation_seen": list(self.conversation_seen),
         }
@@ -729,6 +756,8 @@ class AssistantState:
             or pending_seq < 0
         ):
             pending_seq = 0
+        nudges = _count(payload.get("nudges"))
+        episode = _count(payload.get("episode"))
         raw_pending = payload.get("pending")
         pending = _pending_notes(raw_pending if isinstance(raw_pending, list) else [], memo_spool)
         return cls(
@@ -745,6 +774,10 @@ class AssistantState:
             pending_since=_opt_str(payload.get("pending_since")),
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
+            nudges=nudges,
+            nudge_session=_opt_str(payload.get("nudge_session")),
+            episode=episode,
+            stalled_at=_opt_str(payload.get("stalled_at")),
             codex_wake=_opt_str(payload.get("codex_wake")),
             conversation_seen=tuple(
                 item for item in (payload.get("conversation_seen")
@@ -880,6 +913,11 @@ def _pending_notes(raw: list, memo_spool: Optional[str]) -> tuple:
 def _opt_str(value: object) -> Optional[str]:
     """A non-empty string, or ``None`` for anything else."""
     return value if isinstance(value, str) and value else None
+
+
+def _count(value: object) -> int:
+    """A non-negative int, or ``0`` for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _opt_scrubbed(value: object) -> Optional[str]:
@@ -2648,10 +2686,15 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
             note=text,
             data=payload,
         )
-        pending = list(state.pending) + [entry]
-        dropped = max(0, len(pending) - MAX_PENDING)
         if projects.enabled():
+            # Imported here: spool_merge imports this module (directly and via checkin).
+            from . import spool_merge
+
+            pending = spool_merge.add_check_in(list(state.pending), entry)
             dropped = 0
+        else:
+            pending = list(state.pending) + [entry]
+            dropped = max(0, len(pending) - MAX_PENDING)
         if dropped:
             discard = next((i for i, item in enumerate(pending)
                             if item.kind != "conversation_request"), len(pending) - 1)
@@ -2720,8 +2763,15 @@ def mark_codex_wake(session_id: str, pending_seq: int, delivery_id: str) -> bool
         return _write_state(replace(state, codex_wake=delivery_id, nudged_at=utc_now_iso()))
 
 
-def mark_nudged() -> Optional[str]:
+def mark_nudged(session_id: Optional[str] = None, *, counted: bool = True,
+                episode: Optional[int] = None, nudges: Optional[int] = None) -> Optional[str]:
     """Record that the platform has just nudged about the current spool (#317).
+
+    *counted* records *nudges* (default: one more than stored) as *session_id*'s
+    count for this episode (#584); ``counted=False`` only restarts the interval
+    clock. Given *episode*, a take that landed since the caller read the state
+    makes this a no-op returning ``None``: the nudge belonged to a spool that is
+    gone, and its count must not leak into the next one.
 
     Returns the stamp it wrote, or ``None`` when the write failed — best-effort
     like :func:`notify` and for a sharper reason: the nudge has already been
@@ -2735,8 +2785,38 @@ def mark_nudged() -> Optional[str]:
     """
     with _LOCK:
         state = read_state()
+        if episode is not None and state.episode != episode:
+            return None
         stamped = utc_now_iso()
-        if not _write_state(replace(state, nudged_at=stamped)):
+        updated = replace(state, nudged_at=stamped)
+        if counted:
+            same = state.nudge_session == session_id
+            updated = replace(
+                updated,
+                nudges=nudges if nudges is not None else state.episode_nudges(session_id) + 1,
+                nudge_session=session_id,
+                stalled_at=state.stalled_at if same else None,
+            )
+        if not _write_state(updated):
+            return None
+        return stamped
+
+
+def mark_stalled(session_id: Optional[str], *, episode: Optional[int] = None) -> Optional[str]:
+    """Record that this episode's stall signal went out (#584).
+
+    Returns the stamp, or ``None`` when the write failed or *episode* has ended
+    since the caller read it; the caller bounds the episode in memory either way.
+    """
+    with _LOCK:
+        state = read_state()
+        if episode is not None and state.episode != episode:
+            return None
+        stamped = utc_now_iso()
+        if not _write_state(replace(
+            state, stalled_at=stamped, nudge_session=session_id,
+            nudges=state.episode_nudges(session_id),
+        )):
             return None
         return stamped
 
@@ -2808,12 +2888,13 @@ def take_pending() -> list:
         if projects.enabled():
             return project_requests.drain(state)
         if not state.pending:
-            if state.nudged_at is not None or state.pending_since is not None:
-                _write_state(replace(state, nudged_at=None, pending_since=None))
+            if (state.nudged_at is not None or state.pending_since is not None
+                    or state.nudges or state.stalled_at is not None):
+                _write_state(replace(state, pending_since=None, **ended_episode(state)))
             return []
         notes = [note.to_dict() for note in state.pending]
         _write_state(
-            replace(state, pending=(), nudged_at=None, pending_since=None)
+            replace(state, pending=(), pending_since=None, **ended_episode(state))
         )
         return notes
 

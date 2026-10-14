@@ -598,7 +598,7 @@ def test_a_send_whose_mark_cannot_be_written_still_bounds_the_window(
     `assistant.json` typed a reminder into a live terminal every tick — measured
     at five sends in five consecutive ticks, while the same outage stops the
     assistant draining the spool at all."""
-    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda: None)
+    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda *_a, **_k: None)
     sender = _Sender()
     instance = detector(sender=sender)
     assistant.notify("a question opened")
@@ -698,7 +698,7 @@ def test_the_in_memory_bound_does_not_outlive_its_accumulation(
     `min(accumulation_age, since_nudge)` and the memory stamp never materially
     precedes the new accumulation. So this pins exactness, not a rescue.
     """
-    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda: None)
+    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda *_a, **_k: None)
     sender = _Sender()
     instance = detector(sender=sender)
     assistant.notify("first")
@@ -970,7 +970,7 @@ def test_an_unusable_stored_mark_does_not_defeat_the_in_memory_bound(
     fold reverted as well as with it, i.e. a test that would pass with the fix
     dropped.
     """
-    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda: None)
+    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda *_a, **_k: None)
     sender = _Sender()
     instance = detector(sender=sender)
     assistant.notify("a question opened")
@@ -1406,3 +1406,283 @@ def test_codex_mark_recovery_cannot_replace_outstanding_idle_identity(
     assert not receipt['submit_confirmed'] and not receipt['retryable']
     assert assistant.read_state().nudged_at == recovered.nudged_at
     assert [item.note for item in assistant.read_state().pending] == ['pending original', 'burst after pending idle']
+
+
+# --- back-off and the one operator signal (issue #584) -----------------------
+
+class _Deliver:
+    """A stand-in for ``stall.deliver``: every thread takes the post unless told."""
+
+    def __init__(self, *, fail=False):
+        self.calls = []
+        self._fail = fail
+
+    def __call__(self, text, threads):
+        self.calls.append((text, list(threads)))
+        if self._fail:
+            return [], [{"thread": t, "error": "slack said no"} for t in threads]
+        return list(threads), []
+
+
+@pytest.fixture
+def stalling(detector, monkeypatch):
+    """A detector whose stall signal goes to one standing thread, recorded."""
+    def _build(*, threads=("https://example.slack.com/archives/C1/p1",),
+               reason="Login expired", deliver=None, **kwargs):
+        posted = deliver or _Deliver()
+        monkeypatch.setattr(detect.stall, "deliver", posted)
+        monkeypatch.setattr(detect.stall, "terminal_reason", lambda session_id: reason)
+        monkeypatch.setattr(detect.assistant, "_stored_threads", lambda: list(threads))
+        return detector(**kwargs), posted
+
+    return _build
+
+
+def _age_nudge(instance, **delta):
+    """Move the last nudge one window into the past, durably and in memory."""
+    payload = store.read_json(assistant.state_path()) or {}
+    if payload.get("nudged_at"):
+        payload["nudged_at"] = iso(**delta)
+        store.write_json(assistant.state_path(), payload)
+    if instance._nudged is not None:
+        instance._nudged = (instance._nudged[0], iso(**delta))
+
+
+def _ignored_windows(instance, count):
+    for _ in range(count):
+        instance.nudge_once()
+        _age_nudge(instance, minutes=10)
+
+
+def _as_session(monkeypatch, session_id):
+    real = detect.assistant.status
+    monkeypatch.setattr(detect.assistant, "status",
+                        lambda: replace(real(), session_id=session_id))
+
+
+def test_three_unanswered_nudges_end_typing_and_tell_the_operator_once(
+    stalling, platform_root
+):
+    sender = _Sender()
+    instance, posted = stalling(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES)
+    assert len(sender.calls) == nudge.MAX_UNANSWERED_NUDGES
+    assert posted.calls == []
+
+    _ignored_windows(instance, 5)
+
+    assert len(sender.calls) == nudge.MAX_UNANSWERED_NUDGES, "no more typing"
+    assert len(posted.calls) == 1, "once per episode, not once per interval"
+    text, threads = posted.calls[0]
+    assert threads == ["https://example.slack.com/archives/C1/p1"]
+    assert "Its terminal shows `Login expired`." in text
+    assert "3 reminders" in text
+    assert assistant.read_state().stalled_at is not None
+    assert instance.stalled == 1
+
+
+def test_the_third_nudge_is_only_unanswered_after_its_own_window(
+    stalling, platform_root
+):
+    instance, posted = stalling()
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES - 1)
+
+    instance.nudge_once()
+    instance.nudge_once()
+
+    assert posted.calls == []
+
+
+def test_a_working_assistant_is_not_reported(stalling, platform_root):
+    instance, posted = stalling()
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES)
+
+    busy, posted = stalling(idle=5.0)
+    busy.nudge_once()
+
+    assert posted.calls == []
+
+
+def test_a_take_ends_the_episode(stalling, platform_root):
+    sender = _Sender()
+    instance, posted = stalling(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 1)
+    assert len(posted.calls) == 1
+
+    assistant.take_pending()
+    cleared = assistant.read_state()
+    assert (cleared.nudges, cleared.nudge_session, cleared.stalled_at) == (0, None, None)
+    assistant.notify("a new backlog")
+    _age_spool(minutes=40)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 1)
+
+    assert len(sender.calls) == 2 * nudge.MAX_UNANSWERED_NUDGES
+    assert len(posted.calls) == 2
+
+
+def test_a_new_incarnation_starts_a_new_episode(stalling, platform_root, monkeypatch):
+    sender = _Sender()
+    instance, posted = stalling(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 1)
+    assert len(posted.calls) == 1
+
+    _as_session(monkeypatch, "assistant-2")
+    instance.nudge_once()
+
+    assert len(sender.calls) == nudge.MAX_UNANSWERED_NUDGES + 1
+    assert sender.calls[-1][0] == "assistant-2"
+    state_ = assistant.read_state()
+    assert (state_.nudges, state_.nudge_session, state_.stalled_at) == (1, "assistant-2", None)
+
+
+def test_an_unwritable_state_file_cannot_turn_the_signal_into_a_flood(
+    stalling, platform_root, monkeypatch
+):
+    monkeypatch.setattr(detect.assistant, "mark_nudged", lambda *_a, **_k: None)
+    monkeypatch.setattr(detect.assistant, "mark_stalled", lambda *_a, **_k: None)
+    sender = _Sender()
+    instance, posted = stalling(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+
+    _ignored_windows(instance, 10)
+
+    assert len(sender.calls) == nudge.MAX_UNANSWERED_NUDGES
+    assert len(posted.calls) == 1
+
+
+def test_a_signal_no_thread_took_is_retried_a_window_later(stalling, platform_root):
+    instance, posted = stalling(deliver=_Deliver(fail=True))
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES)
+
+    instance.nudge_once()
+    instance.nudge_once()
+    assert len(posted.calls) == 1, "a refused post waits a window, not a tick"
+    assert assistant.read_state().stalled_at is None
+
+    _age_nudge(instance, minutes=10)
+    instance.nudge_once()
+    assert len(posted.calls) == 2
+
+
+def test_with_no_standing_thread_the_event_is_the_signal(stalling, platform_root):
+    instance, posted = stalling(threads=(), reason=None)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 3)
+
+    assert [threads for _text, threads in posted.calls] == [[]]
+    events = [
+        json.loads(line)["data"] for line in store.events_path().read_text().splitlines()
+        if detect.ASSISTANT_STALLED in line
+    ]
+    assert len(events) == 1
+    assert events[0]["signalled"] is True
+    assert events[0]["threads"] == [] and events[0]["reason"] is None
+    assert events[0]["nudges"] == nudge.MAX_UNANSWERED_NUDGES
+
+
+def test_the_episode_survives_a_reread_of_the_state_file(platform_root):
+    assistant.notify("a question opened")
+    assistant.mark_nudged("assistant-1")
+    assistant.mark_nudged("assistant-1")
+    assistant.mark_stalled("assistant-1")
+
+    state_ = assistant.read_state()
+
+    assert state_.episode_nudges("assistant-1") == 2
+    assert state_.episode_stalled("assistant-1")
+    assert state_.episode_nudges("assistant-2") == 0
+    assert not state_.episode_stalled("assistant-2")
+
+
+def test_due_reports_the_back_off_and_then_nothing():
+    spool = replace(state(oldest=iso(minutes=30)), nudges=3, nudge_session="s1")
+
+    assert nudge.due(spool, running=True, idle_seconds=600, after_seconds=AFTER,
+                     pending_threshold=1, session_id="s1").backed_off
+    assert not nudge.due(spool, running=True, idle_seconds=600, after_seconds=AFTER,
+                         pending_threshold=1, session_id="s2").backed_off
+    stalled = replace(spool, stalled_at=iso(minutes=1))
+    assert nudge.due(stalled, running=True, idle_seconds=600, after_seconds=AFTER,
+                     pending_threshold=1, session_id="s1") is None
+
+
+class _TakingDeliver(_Deliver):
+    """The operator re-authenticates and the assistant takes while the post is out."""
+
+    def __call__(self, text, threads):
+        assistant.take_pending()
+        assistant.notify("a new backlog")
+        return super().__call__(text, threads)
+
+
+def test_a_take_during_the_stall_post_does_not_silence_the_next_backlog(
+    stalling, platform_root
+):
+    sender = _Sender()
+    instance, posted = stalling(sender=sender, deliver=_TakingDeliver())
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 1)
+    assert len(posted.calls) == 1
+    assert assistant.read_state().stalled_at is None
+
+    _age_spool(minutes=40)
+    _ignored_windows(instance, nudge.MAX_UNANSWERED_NUDGES + 1)
+
+    assert len(sender.calls) == 2 * nudge.MAX_UNANSWERED_NUDGES
+    assert len(posted.calls) == 2
+
+
+def test_a_take_during_the_nudge_send_does_not_carry_the_count_over(
+    stalling, platform_root
+):
+    class _TakingSender(_Sender):
+        def __call__(self, session_id, data, *, append_newline=False):
+            assistant.take_pending()
+            assistant.notify("a new backlog")
+            return super().__call__(session_id, data, append_newline=append_newline)
+
+    instance, _posted = stalling(sender=_TakingSender())
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+
+    instance.nudge_once()
+
+    state_ = assistant.read_state()
+    assert (state_.nudges, state_.nudge_session) == (0, None)
+
+
+@pytest.mark.parametrize("failing", ["mark_nudged", "mark_stalled"])
+def test_a_raising_state_store_cannot_turn_the_signal_into_a_flood(
+    stalling, platform_root, monkeypatch, failing
+):
+    """The projects store raises sqlite errors where the file store returns False."""
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(detect.assistant, failing, refuse)
+    sender = _Sender()
+    instance, posted = stalling(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=30)
+
+    _ignored_windows(instance, 10)
+
+    assert len(sender.calls) == nudge.MAX_UNANSWERED_NUDGES
+    assert len(posted.calls) == 1
