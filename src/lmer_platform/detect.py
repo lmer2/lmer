@@ -534,9 +534,9 @@ class Signal:
     label: Optional[str] = None
     state: Optional[str] = None
     session: Optional[str] = None
-    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. Only on
-    #: :meth:`data`: ``ref`` and ``key`` stay slug-spelled, but a link built from
-    #: the digest must key to this execution, not to its slug group.
+    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. ``ref``
+    #: stays slug-spelled for the digest text; :attr:`run` is what tells two
+    #: executions of one slug group apart.
     uid: Optional[str] = None
 
     @property
@@ -547,9 +547,18 @@ class Signal:
         return runref.compose(self.host, self.project, self.slug)
 
     @property
+    def run(self) -> tuple:
+        """Which run this is: its execution uid in schema 2, its ref in schema 1.
+
+        Schema 2 lets two executions share host/project/slug, so the ref alone
+        would merge their conditions and read one's presence as the other's.
+        """
+        return (self.ref, self.uid)
+
+    @property
     def key(self) -> tuple:
         """What makes two observations the same condition."""
-        return (self.ref, self.kind, self.since or "")
+        return (self.run, self.kind, self.since or "")
 
     @property
     def digest(self) -> str:
@@ -710,7 +719,7 @@ def _question_refs(signals: dict) -> set:
     person.
     """
     return {
-        signal.ref for signal in signals.values() if signal.kind in QUESTION_KINDS
+        signal.run for signal in signals.values() if signal.kind in QUESTION_KINDS
     }
 
 
@@ -742,7 +751,8 @@ def _refs(payload: object) -> set:
     for row in rows if isinstance(rows, list) else []:
         identity = _identity(row)
         if identity is not None:
-            found.add("/".join(identity))
+            # :attr:`Signal.run`'s spelling, so membership is per execution.
+            found.add((runref.compose(*identity), _row_uid(row)))
     return found
 
 
@@ -2143,11 +2153,11 @@ class Detector:
         for signal in baseline.values():
             if signal.kind not in QUESTION_KINDS:
                 continue
-            if signal.ref in outstanding or signal.ref not in refs:
+            if signal.run in outstanding or signal.run not in refs:
                 continue
-            previous = cleared.get(signal.ref)
+            previous = cleared.get(signal.run)
             if previous is None or _question_rank(signal) > _question_rank(previous):
-                cleared[signal.ref] = signal
+                cleared[signal.run] = signal
         # Baseline order, which is the inventory's own sort (:func:`_signals`).
         return list(cleared.values())
 
