@@ -9,6 +9,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -24,6 +25,7 @@ COLORS = (
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
     "Pink", "Rose", "Brown", "Slate", "Gray",
 )
+_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
 _ADMISSION = ContextVar("assistant_admission", default=None)
@@ -325,6 +327,14 @@ def create(name):
     return get(identifier)
 
 
+def _color(value):
+    if value in COLORS:
+        return value
+    if isinstance(value, str) and _HEX_COLOR.fullmatch(value):
+        return value.lower()
+    raise ProjectError("Choose one of the 20 named project colors or a #rrggbb hex color.")
+
+
 @serialized
 def update(workspace_id, values):
     from .config import ASSISTANT_SETTING_KEYS, validate_assistant_override
@@ -334,9 +344,7 @@ def update(workspace_id, values):
         raise ProjectError("Unknown project setting.")
     current = get(workspace_id, active=True)
     name = _name(values.get("name", current["name"]))
-    color = values.get("color", current["color"])
-    if color not in COLORS:
-        raise ProjectError("Choose one of the 20 named project colors.")
+    color = _color(values.get("color", current["color"]))
     settings = values.get("settings", current["settings"])
     if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS):
         raise ProjectError("Invalid assistant overrides.")
@@ -497,7 +505,7 @@ def _assign(key, destination_id):
                    "(SELECT session FROM sessions WHERE run_key=?) OR json_extract(payload,'$.data.run_key')=?)",
                    (destination_id, key, key))
         row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (destination_id,)).fetchone()
-        state = assistant.AssistantState.from_dict(json.loads(row[0]))
+        state = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=destination_id)
         notice = assistant.PendingNote(
             at=store.utc_now_iso(), kind="run_assigned",
             note=f"Run {key} was assigned to this project.",
@@ -533,7 +541,7 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
             states = {}
             for project_id in (expected_project, destination_id):
                 row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (project_id,)).fetchone()
-                states[project_id] = assistant.AssistantState.from_dict(json.loads(row[0]))
+                states[project_id] = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=project_id)
             source, target = states[expected_project], states[destination_id]
             moved, retained = [], []
             for note in source.pending:

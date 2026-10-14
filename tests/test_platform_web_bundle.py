@@ -53,6 +53,7 @@ Rendering, the flash of a turn with no body, and how any of it feels one-handed 
 verified by building the bundle and by live test LT3 on a real phone.
 """
 
+import contextlib
 import inspect
 import json
 import os
@@ -67,6 +68,7 @@ import pytest
 # that forgot the second root would not fail, it would skip everywhere. In
 # conftest because five modules want it, this one included.
 from tests.conftest import node_binary, require_node_toolchain
+from tests.webdeps import web_lock
 
 WEB = Path(__file__).resolve().parent.parent / "web"
 COMPONENTS = WEB / "src" / "components"
@@ -231,16 +233,24 @@ class Bundle:
 
 @pytest.fixture(scope="module")
 def bundle():
-    if _needs_building():
-        node = node_binary()
-        if not node:
-            require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
-        if not (WEB / "node_modules" / "vite").is_dir():
-            require_node_toolchain(
-                "web dependencies are not installed (run `npm ci` in web/)"
-            )
-        _build(node)
-    return Bundle()
+    # Before the lock: node_binary() takes it itself to install web deps.
+    node = node_binary()
+    # Under xdist each worker runs this fixture; the check, the build and the
+    # read share the lock so no worker reads dist/ while another rebuilds it.
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(web_lock())
+        except OSError:
+            pass  # a read-only web/ cannot be rebuilt, so nothing races the read
+        if _needs_building():
+            if not node:
+                require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+            if not (WEB / "node_modules" / "vite").is_dir():
+                require_node_toolchain(
+                    "web dependencies are not installed (run `npm ci` in web/)"
+                )
+            _build(node)
+        return Bundle()
 
 
 # --- what the first load is --------------------------------------------------

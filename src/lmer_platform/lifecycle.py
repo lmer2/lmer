@@ -43,23 +43,21 @@ textarea is the obvious source of a newline.
 
 Why exit signals the process **group**
 --------------------------------------
-``lmer`` is not the thing holding the container. It runs ``podman run`` as its own
-child and installs no signal handler of its own
-(``lmer_cli.cli``), so a SIGTERM delivered to the session's pid alone kills the
-bookkeeping and leaves a container running with nothing watching it. The session is
-spawned with ``start_new_session=True``
-(:func:`lmer_platform.spawn.spawn_session`), so its pid *is* a process-group id, and
-signalling the group reaches ``podman run`` too — which is what actually stops and
-removes the container. Group leadership is checked rather than assumed, because
+Since #444 ``lmer`` creates its container detached and follows it
+(:mod:`lmer_cli.container_follow`): on SIGTERM it asks the runtime to stop the
+container, then records the exit and removes it. Nothing else stops a detached
+container — the attach client holds nothing up. The session is spawned with
+``start_new_session=True`` (:func:`lmer_platform.spawn.spawn_session`), so its pid
+*is* a process-group id, and signalling the group reaches the follower and its
+attach client together. Group leadership is checked rather than assumed, because
 ``killpg`` on a pid that does not lead one signals whatever group happens to carry
 that id. Same discipline as ``lmer_cli.container.spawn_harness``'s group kill and
 :func:`lmer_platform.assistant.stop`.
 
 The ladder is SIGTERM, then SIGKILL, and the first step is the one that matters:
-SIGTERM lets ``podman run`` tear the container down, while SIGKILL only guarantees
-that the *session* ends and can leave the container behind (the lingering-grandchild
-case :func:`lmer_platform.spawn._scrub_transcripts` describes). So SIGTERM gets a
-generous grace and SIGKILL is the backstop.
+SIGTERM lets the follower stop the container, while SIGKILL only ends the follower
+and leaves the container running, to be found by label at the next daemon start.
+So SIGTERM gets a generous grace and SIGKILL is the backstop.
 
 Which sessions may be signalled at all
 --------------------------------------
@@ -122,7 +120,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from . import registry
+from . import containers, registry
 from .assistant import KIND as ASSISTANT_KIND
 from .provenance import PLATFORM_PREFIX
 from .reattach import detached_record
@@ -627,6 +625,9 @@ def exit_session(session_id: str) -> ExitReport:
             "it is still listed as running, which is the truth"
         )
 
+    # A follower stops its container on SIGTERM, but one that was killed first —
+    # or had not yet installed its handler — leaves it running, detached (#444).
+    containers.stop_for_session(session_id)
     removed = registry.remove(session_id)
     logger.info(
         "platform_session_exited_on_request id=%s pid=%s signals=%s removed=%s",

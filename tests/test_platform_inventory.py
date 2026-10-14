@@ -176,6 +176,45 @@ def test_terminal_status_is_complete(tmp_path, status):
     assert run.attention is None
 
 
+@pytest.mark.parametrize("status", ["complete", "archived"])
+def test_terminal_status_outranks_a_live_session(tmp_path, status):
+    """A finished run is not ``running`` just because its session is up (#308).
+
+    The session staying at its prompt after the run recorded completion is
+    ordinary — it can still add artifacts — but reporting ``running`` is what kept
+    a finished run drawing check-ins for hours. The row keeps the live session, so
+    "complete, session still up" stays distinguishable from "still working".
+    """
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status=status,
+                                                          stop_reason="complete"))
+    run = inventory.build_inventory([ref], [session("r1", live=True)]).runs[0]
+
+    assert run.state == "complete"
+    assert run.live is True
+    assert run.attention is None
+
+
+def test_a_live_question_still_surfaces_on_a_terminal_run(tmp_path):
+    """Terminal state must not silently drop a question a human still owes.
+
+    The two axes are independent (spec D23): the state is the run's own record of
+    finishing, the attention record is what the live session is waiting on. A run
+    that recorded complete while its session holds an open question reads
+    ``complete`` *and* ``live_question``, never one at the cost of the other.
+    """
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="complete",
+                                                          stop_reason="complete"))
+    run = inventory.build_inventory(
+        [ref], [session("r1", live=True)],
+        questions={"s-r1": [{"text": "one more thing?",
+                              "at": "2026-08-06T20:00:00Z"}]},
+    ).runs[0]
+
+    assert run.state == "complete"
+    assert run.attention.reason == "live_question"
+    assert run.attention.note == "one more thing?"
+
+
 def test_in_progress_without_session_is_dormant_not_crashed(tmp_path):
     """The mirror is full of old in-progress runs; calling them crashed is noise."""
     ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
@@ -855,6 +894,8 @@ SESSION_FIELD_READERS = {
               "the record that decides crashed-vs-dormant beside a wind-down mark",
     "activity": "RunCard.vue: 'idle 22m' beside the run's age (idle_seconds), "
                 "with last_output_at as its tooltip",
+    "container_name": "RunDetail.vue: the live-session card's container, the name "
+                      "to give `podman ps` or `lmer follow` (#444)",
 }
 
 #: Stands in for the token file's path, which is what the entry carries — the
@@ -879,6 +920,7 @@ def full_entry(**extra):
         control={"host": "127.0.0.1", "port": 8931, "token_ref": TOKEN_REF},
         transcript={"path": "/home/dev/.claude/projects/-work/abc.jsonl"},
         container_id="9f3ca1b2c3d4",
+        container_name="lmer-r1-ff2b",
         slot="slot-1",
         ports=[{"host": 30021, "container": 3000}],
         log_path="/home/dev/.lmer/platform/logs/s-full.log",
@@ -952,6 +994,7 @@ def test_the_detail_view_still_gets_every_field_it_reads(tmp_path, platform_root
     assert block["started_at"] == entry["started_at"]
     assert block["log_path"] == "/home/dev/.lmer/platform/logs/s-full.log"
     assert block["lifecycle"]["verb"] == "wind_down"
+    assert block["container_name"] == "lmer-r1-ff2b"
 
 
 @pytest.mark.parametrize("exited, served", [

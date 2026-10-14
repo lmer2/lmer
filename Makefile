@@ -4,8 +4,27 @@
 IMAGE_NAME := lmer
 FULL_IMAGE := $(IMAGE_NAME)
 
-# Detect container runtime (Docker or Podman)
+# Detect container runtime (Docker or Podman). LMER_CONTAINER_RUNTIME overrides,
+# with lmer_cli.runtime.detect_runtime()'s rule: trimmed, case-insensitive,
+# docker or podman only. Only the letters of those two names are lowercased;
+# any other letter fails the filter either way.
+lower_runtime = $(subst D,d,$(subst O,o,$(subst C,c,$(subst K,k,$(subst E,e,$(subst R,r,$(subst P,p,$(subst M,m,$(subst A,a,$(subst N,n,$(1)))))))))))
+RUNTIME_OVERRIDE := $(strip $(LMER_CONTAINER_RUNTIME))
+ifneq ($(RUNTIME_OVERRIDE),)
+RUNTIME_NAME := $(if $(filter 1,$(words $(RUNTIME_OVERRIDE))),$(filter docker podman,$(call lower_runtime,$(RUNTIME_OVERRIDE))))
+ifeq ($(RUNTIME_NAME),)
+CONTAINER_CMD :=
+CONTAINER_ERROR := LMER_CONTAINER_RUNTIME=$(RUNTIME_OVERRIDE) is not supported; use docker or podman
+else
+CONTAINER_CMD := $(shell command -v $(RUNTIME_NAME) 2>/dev/null)
+CONTAINER_ERROR := LMER_CONTAINER_RUNTIME=$(RUNTIME_NAME) but $(RUNTIME_NAME) is not on PATH
+endif
+else
 CONTAINER_CMD := $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
+CONTAINER_ERROR := Neither docker nor podman found. Please install Docker or Podman to continue
+endif
+# Expanded when a recipe runs, so only targets that use the runtime fail.
+REQUIRE_RUNTIME = $(if $(CONTAINER_CMD),,$(error $(CONTAINER_ERROR)))
 
 # Platform detection for multi-arch support
 PLATFORM :=
@@ -56,12 +75,8 @@ claude-shell: lmer-shell ## Alias for lmer-shell
 
 ## Build
 build: ## Build the container image
+	$(REQUIRE_RUNTIME)
 	@echo "$(GREEN)🔨 Building lmer container...$(NC)"
-	@if [ -z "$(CONTAINER_CMD)" ]; then \
-		echo "$(RED)❌ ERROR: Neither docker nor podman found$(NC)"; \
-		echo "Please install Docker or Podman to continue"; \
-		exit 1; \
-	fi
 	@echo "📦 Using container command: $(CONTAINER_CMD)"
 	@BUILD_ARGS=""; \
 	if [ -z "$$BUILD_UID" ]; then BUILD_UID=$$(id -u); fi; \
@@ -82,6 +97,7 @@ build: ## Build the container image
 	@echo "$(GREEN)✅ Container built successfully!$(NC)"
 
 build-nocache: ## Build the container image without cache
+	$(REQUIRE_RUNTIME)
 	@echo "$(GREEN)🔨 Building container (no cache)...$(NC)"
 	@BUILD_ARGS=""; \
 	if [ -z "$$BUILD_UID" ]; then BUILD_UID=$$(id -u); fi; \
@@ -116,6 +132,7 @@ test-all: ## Run all tests including container build tests
 
 ## Security and compliance
 fips-check: ## Verify FIPS mode in container
+	$(REQUIRE_RUNTIME)
 	@echo "$(GREEN)🔒 Checking FIPS status...$(NC)"
 	@$(CONTAINER_CMD) run --rm $(FULL_IMAGE) bash -c " \
 		echo '🔒 FIPS Kernel Status:' && \
@@ -128,6 +145,9 @@ fips-check: ## Verify FIPS mode in container
 		python3 -c 'import hashlib; print(\"SHA-256: OK\"); hashlib.sha256(b\"test\").hexdigest()' \
 	"
 
+# The message carries the raw override value, so it reaches the shell through
+# the environment rather than being pasted into the recipe text.
+security-scan: export CONTAINER_ERROR := $(CONTAINER_ERROR)
 security-scan: ## Run security scan on image
 	@echo "$(GREEN)🔍 Running security scan...$(NC)"
 	@if command -v trivy >/dev/null 2>&1; then \
@@ -135,6 +155,7 @@ security-scan: ## Run security scan on image
 	else \
 		echo "$(YELLOW)⚠️  Trivy not installed. Install with: brew install trivy$(NC)"; \
 		echo "Attempting to use container-based scanner..."; \
+		[ -n "$(CONTAINER_CMD)" ] || { echo "$(RED)❌ $$CONTAINER_ERROR$(NC)" >&2; exit 1; }; \
 		$(CONTAINER_CMD) run --rm \
 			-v /var/run/docker.sock:/var/run/docker.sock \
 			aquasec/trivy image --severity HIGH,CRITICAL $(FULL_IMAGE); \
@@ -153,6 +174,7 @@ rebuild: build-nocache ## Full rebuild from scratch (no cache)
 
 ## Information
 info: ## Show environment information
+	$(REQUIRE_RUNTIME)
 	@echo "$(GREEN)📋 Environment Information$(NC)"
 	@echo "=========================="
 	@echo "Container Runtime: $(CONTAINER_CMD)"

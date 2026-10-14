@@ -65,6 +65,7 @@ def _git_config(key: str) -> str | None:
 # by get_bool_env and lmer_cli.container.masterplan's task-manifest parsing so
 # the accepted set cannot drift between the env toggle and the manifest.
 TRUTHY_VALUES = frozenset({"1", "yes", "true"})
+FALSY_VALUES = frozenset({"0", "no", "false"})
 
 
 def get_bool_env(var_name: str, default: bool = False, *, env=None) -> bool:
@@ -90,11 +91,9 @@ def get_bool_env(var_name: str, default: bool = False, *, env=None) -> bool:
     if not value:
         return default
 
-    falsy_values = {"0", "no", "false"}
-
     if value in TRUTHY_VALUES:
         return True
-    elif value in falsy_values:
+    elif value in FALSY_VALUES:
         return False
     else:
         # Invalid value, return default

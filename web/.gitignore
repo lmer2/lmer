@@ -2,3 +2,5 @@
 # `lmer platform setup-ui`, which fetches a pinned standalone Node itself.
 dist/
 node_modules/
+# Test-suite lock serialising npm ci and the bundle build across workers.
+.test-deps.lock

@@ -81,6 +81,7 @@ from lmer_cli.harness import (
     known_harnesses,
     missing_credential_mounts,
 )
+from lmer_cli.pi_providers import ProviderConfigError, render as render_pi_registry
 
 # Both halves of the fan-out env contract live in lmer_cli.presets (the
 # host-side writer) so the writer and this consumer can never drift apart.
@@ -395,6 +396,28 @@ def prepend_user_harness_path(child_env: Dict[str, str], harness: Harness) -> No
     path = child_env.get("PATH", "")
     if cache_bin not in path.split(":"):
         child_env["PATH"] = f"{cache_bin}:{path}" if path else cache_bin
+
+
+def prepare_pi_registry(parent_harness: str, child_env: Dict[str, str]) -> None:
+    """Render pi's registry for a directly-exec'd pi child (issue #490).
+
+    A pi child of a non-pi parent execs ``pi`` directly: ``pi-runner.sh``,
+    which renders the merged registry at session start, never runs, and the
+    host overlay is mounted at the side path ``models.host.json`` rather than
+    pi's ``models.json``. Without this the child cannot read the host's custom
+    models or the session's discovered providers. The
+    parent pi case already rendered at session start, so it is left alone.
+
+    The child's own environment is rendered, not the parent's, so a
+    ``<provider>/<model>`` the child selects is validated against the registry
+    it will actually use.
+    """
+    if parent_harness.strip().lower() == "pi":
+        return
+    try:
+        render_pi_registry(environ=child_env)
+    except ProviderConfigError as exc:
+        raise _fail(f"pi model registry could not be prepared: {exc}") from None
 
 
 def warn_missing_credentials(
@@ -1106,6 +1129,10 @@ def main(argv: Optional[list] = None) -> None:
     apply_harness_extra_env(child_env, harness)
     child_env["LMER_HARNESS"] = harness.name
     prepend_user_harness_path(child_env, harness)
+    if harness.name == "pi":
+        prepare_pi_registry(
+            (os.environ.get(HARNESS_ENV) or ""), child_env
+        )
 
     try:
         child_argv, warnings = build_exec_argv(

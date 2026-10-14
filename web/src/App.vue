@@ -32,8 +32,9 @@ import PlatformSettings from './components/PlatformSettings.vue'
 import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
+import ProjectSwitcher from './components/ProjectSwitcher.vue'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
-import { projectColor } from './projects.js'
+import { projectColor, projectTextColor } from './projects.js'
 import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef, toneColor,
 } from './format.js'
@@ -130,9 +131,28 @@ const projectName = ref('')
 const projectError = ref(null)
 const creatingProject = ref(false)
 const platformSection = ref(null)
+const projectSettingsFocus = ref(null)
 const seenChats = ref([])
 const chatProject = ref(activeProject.value)
 const chatWorkspace = computed(() => projects.value.find(project => project.id === chatProject.value))
+// The bar wears the selected project, so which project the page belongs to is on
+// screen at every scroll position. No project (All projects, or a link to one that
+// is gone) leaves the theme's own bar.
+const barProject = computed(() => (workspace.value && !workspace.value.archived ? workspace.value : null))
+const barColor = computed(() => (barProject.value ? projectColor(barProject.value.color) : undefined))
+const barStyle = computed(() => (barProject.value ? { color: projectTextColor(barProject.value.color) } : undefined))
+const switcherEvents = {
+  choose: chooseProject,
+  settings: () => { projectSettingsFocus.value = null; view.value = 'project-settings' },
+  create: () => { projectDialog.value = true },
+}
+const switcherProps = computed(() => ({
+  projects: projectGroups.value,
+  activeProject: activeProject.value,
+  label: activeProject.value ? workspace.value?.name || 'Unavailable project' : 'All projects',
+  current: barProject.value,
+  attention: projectAttention,
+}))
 const openedChats = computed(() => projects.value.filter(project => seenChats.value.includes(project.id) && !project.archived))
 
 function chooseProject(id) { activeProject.value = id; view.value = 'fleet' }
@@ -642,6 +662,7 @@ async function doPrune() {
 function open(run) {
   activeProject.value = run.workspace_id || ''
   selectedKey.value = keyOf(run)
+  questionsFocus.value = null
   view.value = 'detail'
   // On a phone the drawer is an overlay sitting on top of the run it was just
   // used to open.
@@ -657,6 +678,36 @@ function open(run) {
 // instead.
 const runRefNotice = ref(null)
 let stopRunRefs = null
+
+// On a phone the drawer would cover the settings it opens.
+let settingsNonce = 0
+
+function openProjectSettings(id, section) {
+  activeProject.value = id
+  view.value = 'project-settings'
+  settingsNonce += 1
+  projectSettingsFocus.value = section ? { id, section, nonce: settingsNonce } : null
+  if (mobile.value) uberOpen.value = false
+}
+
+// uber lmer's question badge (issue 507): open its own fleet row and point the run
+// view at the ask dock. A nonce, so a second tap on the same run focuses again.
+const questionsFocus = ref(null)
+let questionsNonce = 0
+
+function openAssistantQuestions(sessionId) {
+  const run = (state.value?.runs || []).find((candidate) => candidate.orchestrator
+    && sessionId && (candidate.session?.id === sessionId || candidate.last_session_id === sessionId))
+  if (!run) {
+    runRefNotice.value = 'uber lmer\'s session is not in the fleet view yet — its questions will be answerable there once it is'
+    return
+  }
+  runRefNotice.value = null
+  open(run)
+  questionsNonce += 1
+  questionsFocus.value = { key: keyOf(run), nonce: questionsNonce }
+  if (mobile.value) uberOpen.value = false
+}
 
 function openRunRef(ref) {
   const run = (state.value?.runs || []).find((candidate) => keyOf(candidate) === ref.key)
@@ -717,7 +768,7 @@ onUnmounted(() => {
        `position: fixed`, which no `max-width` on an ancestor can reach. The rules
        are at the bottom of this file. -->
   <v-app :class="{ 'app-narrow': narrow, 'app-mobile': mobile }">
-    <v-app-bar :elevation="1" density="comfortable">
+    <v-app-bar :elevation="1" density="comfortable" :color="barColor" :style="barStyle">
       <v-tooltip v-if="mobile" text="show the run list" location="bottom" open-on-focus>
         <template #activator="{ props: tooltip }">
           <v-app-bar-nav-icon v-bind="tooltip" aria-label="show the run list" @click="navOpen = !navOpen" />
@@ -728,11 +779,15 @@ onUnmounted(() => {
           <v-btn v-bind="tooltip" :icon="mdiArrowLeft" variant="text" aria-label="back to the fleet" @click="view = 'fleet'" />
         </template>
       </v-tooltip>
+      <div v-if="!mobile" class="bar-switcher">
+        <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
+      </div>
       <v-app-bar-title class="text-title-medium">{{ title }}</v-app-bar-title>
       <div class="bar-cluster" :class="{ 'bar-cluster-centered': !mobile }">
         <v-tooltip :text="orchestratorHint" location="bottom" open-on-focus>
           <template #activator="{ props: tooltip }">
             <v-btn v-bind="tooltip" :icon="mdiRobot" :color="orchestratorTone" variant="text"
+              :class="{ 'robot-on-surface': barColor && orchestratorTone }"
               :aria-label="orchestratorHint" @click="toggleProjectChat" />
           </template>
         </v-tooltip>
@@ -789,6 +844,11 @@ onUnmounted(() => {
           </v-tooltip>
         </template>
       </div>
+      <!-- A phone's bar has no width left for a name beside its controls, so the
+           switcher takes a row of its own there, inside the bar and so still fixed. -->
+      <template v-if="mobile" #extension>
+        <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
+      </template>
     </v-app-bar>
 
     <!-- The run list, reachable from wherever you are. Without it the detail
@@ -821,8 +881,8 @@ onUnmounted(() => {
          operator has two conversations — with an lmer working in a repository and
          with the uber lmer watching all of them — and telling the second to stop
          something while typing at the first is the mistake worth designing
-         against. So they never share an edge, and this one carries the accent
-         header its component draws.
+         against. So they never share an edge, and this one carries the project-colour
+         toolbar its component draws.
          No `permanent` and no `temporary`: Vuetify reads the same `mobile`
          breakpoint the left drawer is given, so it sits beside the content on a
          desktop and comes over it with a scrim on a phone, and the two drawers
@@ -830,50 +890,22 @@ onUnmounted(() => {
     <!-- Twice the navigator's width: this drawer holds a conversation, not a
          list, and prose in a 360px column wraps too hard to read. -->
     <v-navigation-drawer v-model="uberOpen" location="right" width="720">
-      <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject">
+      <div v-for="project in openedChats" :key="project.id" v-show="project.id === chatProject" class="uber-pane-slot">
         <AssistantChat v-if="uberSeen" :workspace="project" :now="now"
-          @settings="activeProject = project.id; view = 'project-settings'" @close="uberOpen = false" />
+          @settings="openProjectSettings(project.id, $event)" @close="uberOpen = false"
+          @questions="openAssistantQuestions" />
       </div>
       <p v-if="!chatWorkspace || chatWorkspace.archived" class="pa-4">Choose an active project to open its assistant chat.</p>
     </v-navigation-drawer>
 
     <v-main>
       <v-container max-width="900" class="pa-3">
-        <div class="project-identity d-flex flex-wrap align-center ga-2 mb-2">
-          <v-chip :color="workspace ? projectColor(workspace.color) : undefined" variant="flat">
-            {{ activeProject ? workspace?.name || 'Unavailable project' : 'All projects' }}
-          </v-chip>
-          <v-tooltip v-if="workspace && !workspace.archived" :text="`Chat with ${workspace.name}`" location="bottom" open-on-focus>
-            <template #activator="{ props: tooltip }">
-              <v-btn v-bind="tooltip" :icon="mdiRobot" size="40" variant="text"
-                :aria-label="`Chat with ${workspace.name}`" @click="showProjectChat(workspace)" />
-            </template>
-          </v-tooltip>
-          <v-tooltip v-if="workspace && !workspace.archived" :text="`Project settings for ${workspace.name}`" location="bottom" open-on-focus>
-            <template #activator="{ props: tooltip }">
-              <v-btn v-bind="tooltip" :icon="mdiCogOutline" size="40" variant="text"
-                :aria-label="`Project settings for ${workspace.name}`" @click="view = 'project-settings'" />
-            </template>
-          </v-tooltip>
-          <v-tooltip text="New project" location="bottom" open-on-focus>
-            <template #activator="{ props: tooltip }">
-              <v-btn v-bind="tooltip" :icon="mdiPlus" size="40" variant="text"
-                aria-label="New project" @click="projectDialog = true" />
-            </template>
-          </v-tooltip>
-        </div>
-        <v-tabs v-if="projects.length" :mandatory="true" :model-value="activeProject" show-arrows class="mb-3" @update:model-value="chooseProject">
-          <v-tab value="">All projects</v-tab>
-          <v-tab v-for="project in projects.filter(row => !row.archived)" :key="project.id" :value="project.id" :aria-label="project.name"
-            :style="{ borderBottom: `3px solid ${projectColor(project.color)}` }">
-            {{ project.name }} <v-badge v-if="projectAttention(project.id).length" :content="projectAttention(project.id).length" inline />
-          </v-tab>
-        </v-tabs>
         <v-alert v-if="!loading && activeProject && (!workspace || workspace.archived)" type="warning" class="mb-3">
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
         </v-alert>
         <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
-          :project="workspace" @changed="load" @close="view = 'fleet'" />
+          :project="workspace" :focus="projectSettingsFocus" :now="now" @changed="load" @close="view = 'fleet'"
+          @focused="projectSettingsFocus = null" />
         <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail
@@ -888,6 +920,7 @@ onUnmounted(() => {
           :slots="slots"
           :now="now"
           :projects="projects"
+          :focus-questions="questionsFocus?.key === selectedKey ? questionsFocus.nonce : 0"
           @close="view = 'fleet'"
           @changed="load"
           @open="open"
@@ -1125,6 +1158,27 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.uber-pane-slot {
+  height: 100%;
+}
+
+/* The tone palette was chosen against the theme's surface, not a project's color
+   (green "running" vanishes on a green project), so on a project bar a toned robot
+   keeps its tone and sits on a disc of that surface. Untoned, it is bar text. */
+.robot-on-surface.v-btn {
+  background: rgb(var(--v-theme-surface));
+}
+
+.app-mobile .bar-cluster .robot-on-surface.v-btn {
+  height: 36px;
+}
+
+/* Vuetify paints a button group in the theme's on-surface color, which on a
+   project-colored bar can be black on navy; it follows the bar like its siblings. */
+.bar-cluster :deep(.v-btn-group) {
+  color: inherit;
+}
+
 /* The bar's controls, at the bar's centre on a desktop. Absolute because the
    v-app-bar is itself positioned, so 50% here is the viewport's middle — a
    flex-spacer approach would centre on what the title leaves over, which moves
@@ -1139,6 +1193,12 @@ onUnmounted(() => {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
+}
+
+.bar-switcher {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 240px;
 }
 
 .project-create {

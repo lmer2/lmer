@@ -226,9 +226,26 @@ class TestBuildGlobalMount:
         """Helper to create subdirectories that build_global_mount expects."""
         for d in ["bin", "src", "hooks", "Ctl", "libexec"]:
             (repo_path / d).mkdir(parents=True, exist_ok=True)
-        for d in [".claude", "rules", "taskdef"]:
+        for d in [".claude", "prompts", "rules", "taskdef"]:
             (repo_path / d).mkdir(parents=True, exist_ok=True)
         (repo_path / "AGENTS.md").write_text("")
+
+    def test_global_mount_shadows_baked_prompts(self):
+        """prompts/ is baked into the image and read via the mounted libexec's
+        relative path; without this mount the input-hash image tag (#351)
+        would pin sessions to stale prompt fragments until a dependency bump."""
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_path = Path(tmpdir) / "global"
+                repo_path.mkdir()
+                self._create_repo_dirs(repo_path)
+
+                args = build_global_mount("podman", repo_path)
+
+                assert any(
+                    f"{repo_path}/prompts:/Agents/global/prompts:ro" in a for a in args
+                )
 
     def test_global_mount_lmer_directory_without_selinux(self):
         """Test mounting ~/.lmer subdirectories as global without SELinux"""

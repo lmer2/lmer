@@ -517,6 +517,26 @@ class TestResourceLimitDiagnostic:
         out = buffer.getvalue()
         assert "cpus=2 (LMER_CPUS), gpu=0,1 (LMER_DEVELOP_GPU)" in out
 
+    def test_ci_baseline_toggle_is_shown_with_its_source(self):
+        import contextlib
+        import io
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import ResourceLimit
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits(
+                    [ResourceLimit("--cpus", "2", "LMER_CPUS")], None,
+                    ("1", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE"),
+                )
+                _announce_resource_limits([], None, ("0", "default"))
+        out = buffer.getvalue()
+        assert ("cpus=2 (LMER_CPUS), gate-ci-baseline=on "
+                "(LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE)") in out
+        assert "gate-ci-baseline=off (default)" in out
+
     def test_unsupported_gpu_request_is_shown_as_no_grant(self):
         import contextlib
         import io
@@ -529,3 +549,170 @@ class TestResourceLimitDiagnostic:
             with contextlib.redirect_stdout(buffer):
                 _announce_resource_limits([], GPUGrant(None, "LMER_GPU; unsupported"))
         assert "gpu=none (LMER_GPU; unsupported)" in buffer.getvalue()
+class TestRootUsernsFlag:
+    """--root-userns / LMER_ROOT_USERNS opt-in (issue #351)."""
+
+    def test_flag_parses(self):
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--root-userns"], quiet=True)
+        assert ns.root_userns is True
+
+    def test_defaults_to_off(self):
+        ns, _ = parse_args(["chat", "https://example.com/x/y"], quiet=True)
+        assert ns.root_userns is False
+
+    def test_conflicts_with_user(self, capsys):
+        from lmer_cli.cli import _validate_parsed_args
+
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--root-userns", "--user", "developer"], quiet=True)
+        assert _validate_parsed_args(ns) == 2
+        assert "--root-userns" in capsys.readouterr().out
+
+    def test_conflicts_with_match_uid(self, capsys):
+        from lmer_cli.cli import _validate_parsed_args
+
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--root-userns", "--match-uid"], quiet=True)
+        assert _validate_parsed_args(ns) == 2
+        assert "--root-userns" in capsys.readouterr().out
+
+    def test_alone_passes_validation(self):
+        from lmer_cli.cli import _validate_parsed_args
+
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--root-userns"], quiet=True)
+        assert _validate_parsed_args(ns) is None
+
+    def test_env_dict_injects_is_sandbox_only_for_root_userns_optin(self):
+        """Claude Code refuses --dangerously-skip-permissions as root;
+        IS_SANDBOX=1 is its documented bypass. It must be asserted ONLY for
+        the explicit --root-userns opt-in (whose rootless-podman sandbox
+        premise is checked at launch) — never for an ad-hoc root --user, and
+        never as a host passthrough (source-level guard, per the
+        container-passthrough convention)."""
+        source = CLI_PY.read_text()
+        assert re.search(
+            r'"IS_SANDBOX":\s*"1"\s*if\s*root_userns_active\s*else\s*None',
+            source,
+        ), "container env dict no longer scopes IS_SANDBOX to the --root-userns opt-in"
+
+    def test_resolution_flag_selects_root_user(self):
+        from lmer_cli.cli import _resolve_container_user
+
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--root-userns"], quiet=True)
+        assert _resolve_container_user(ns) == ("0:0", True)
+
+    def test_resolution_env_selects_root_user(self, monkeypatch):
+        from lmer_cli.cli import _resolve_container_user
+
+        monkeypatch.setenv("LMER_ROOT_USERNS", "1")
+        ns, _ = parse_args(["chat", "https://example.com/x/y"], quiet=True)
+        assert _resolve_container_user(ns) == ("0:0", True)
+
+    def test_resolution_explicit_user_beats_env(self, monkeypatch):
+        from lmer_cli.cli import _resolve_container_user
+
+        monkeypatch.setenv("LMER_ROOT_USERNS", "1")
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--user", "developer"], quiet=True)
+        assert _resolve_container_user(ns) == ("developer", False)
+
+    def test_resolution_default_is_developer_and_not_root_userns(self, monkeypatch):
+        from lmer_cli.cli import _resolve_container_user
+
+        monkeypatch.delenv("LMER_ROOT_USERNS", raising=False)
+        monkeypatch.delenv("LMER_CONTAINER_USER", raising=False)
+        ns, _ = parse_args(["chat", "https://example.com/x/y"], quiet=True)
+        assert _resolve_container_user(ns) == ("developer", False)
+
+    def test_resolution_adhoc_root_user_is_not_the_optin(self):
+        """--user 0:0 skips keep-id but must NOT claim the IS_SANDBOX opt-in."""
+        from lmer_cli.cli import _resolve_container_user
+
+        ns, _ = parse_args(["chat", "https://example.com/x/y", "--user", "0:0"], quiet=True)
+        assert _resolve_container_user(ns) == ("0:0", False)
+
+
+class TestRootUsernsRuntimeGate:
+    """MR !249 review (cli.py:2240): the rootless-podman refusal is the
+    security premise the IS_SANDBOX bypass relies on — pin the condition AND
+    its position ahead of any image build."""
+
+    def _run_main(self, runtime, euid, ensure, engine_rootless=True):
+        import os
+
+        from unittest.mock import patch as _patch
+
+        from tests.test_lmer_cli_slack_target import (
+            _BASE_ENV,
+            _make_main_mocks,
+            REPO_URL,
+        )
+
+        argv = ["chat", "--root-userns", "--no-task", "--exec", "true", REPO_URL]
+        with _patch.dict(os.environ, _BASE_ENV, clear=True):
+            with _make_main_mocks():
+                with _patch("lmer_cli.cli.detect_runtime", return_value=runtime), \
+                     _patch("lmer_cli.cli.os.geteuid", return_value=euid), \
+                     _patch("lmer_cli.cli.engine_is_rootless", return_value=engine_rootless), \
+                     _patch("lmer_cli.cli.ensure_image", ensure):
+                    from lmer_cli.cli import main
+
+                    return main(argv)
+
+    def test_docker_runtime_refused_before_any_build(self):
+        from unittest.mock import MagicMock
+
+        ensure = MagicMock(
+            side_effect=AssertionError(
+                "ensure_image ran after a refused --root-userns"
+            )
+        )
+        assert self._run_main("docker", 1000, ensure) == 2
+        ensure.assert_not_called()
+
+    def test_rootful_engine_refused_before_any_build(self):
+        """A root-run podman reports `Host.Security.Rootless: false`. The gate
+        asks the engine rather than reading euid, because a non-root client can
+        also be pointed at a rootful *service* — !309 adversarial review F1."""
+        from unittest.mock import MagicMock
+
+        ensure = MagicMock(
+            side_effect=AssertionError(
+                "ensure_image ran after a refused --root-userns"
+            )
+        )
+        assert self._run_main("podman", 0, ensure, engine_rootless=False) == 2
+        ensure.assert_not_called()
+
+    def test_a_non_root_client_on_a_rootful_engine_is_refused(self):
+        """The case euid alone cannot see: local uid 1000, rootful engine."""
+        from unittest.mock import MagicMock
+
+        ensure = MagicMock(
+            side_effect=AssertionError(
+                "ensure_image ran after a refused --root-userns"
+            )
+        )
+        assert self._run_main("podman", 1000, ensure, engine_rootless=False) == 2
+        ensure.assert_not_called()
+
+    def test_an_unanswerable_engine_is_refused_before_any_build(self):
+        """`podman info` not answering leaves the premise unestablished, which
+        must refuse — IS_SANDBOX=1 hangs off this branch."""
+        from unittest.mock import MagicMock
+
+        ensure = MagicMock(
+            side_effect=AssertionError(
+                "ensure_image ran after a refused --root-userns"
+            )
+        )
+        assert self._run_main("podman", 1000, ensure, engine_rootless=None) == 2
+        ensure.assert_not_called()
+
+    def test_rootless_podman_accepted(self):
+        """Positive control: the same harness passes the gate under rootless
+        podman, so the refusals above are the gate and not a broken setup."""
+        from unittest.mock import MagicMock
+
+        from lmer_cli.build import ImageReadiness
+
+        ensure = MagicMock(return_value=ImageReadiness(available=True))
+        assert self._run_main("podman", 1000, ensure) == 0
+        ensure.assert_called_once()

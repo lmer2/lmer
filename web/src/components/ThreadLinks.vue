@@ -4,7 +4,7 @@
 // it (issue #429).
 //
 // One component, three homes: the fleet row, the run view header and the uber
-// lmer pane header. They differ only in what they hand it, which is why the
+// lmer pane's toolbar. They differ only in what they hand it, which is why the
 // component owns no polling: it renders `run.threads` off the fleet payload (or
 // the assistant status), and asks its parent to refresh after a write. A copy
 // that polled would poll once per row.

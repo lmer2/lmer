@@ -160,6 +160,13 @@ consult relevant prior exchanges when context is missing.
   positional; it lands in the same run, whose slug is the taskdef either way.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
+- **Finished but still live** — a run whose `state.yaml` records a terminal
+  status (`complete`/`archived`) reads `complete` even while its session is still
+  up. The run's own record is a deliberate act by `work state set`, and a session
+  sitting at its prompt afterwards can still add artifacts; reporting it as
+  `running` kept a finished run drawing check-ins for hours (#308). The row keeps
+  reporting the live session, so "complete, session still up" is distinguishable
+  from a run that is still working.
 - **Wound down, not crashed** — a dead session's leftover registry entry is
   normally the only evidence that something died, so the fleet reads it as a
   crash. The exception is an ending the operator asked for: a wind-down leaves a
@@ -181,6 +188,16 @@ consult relevant prior exchanges when context is missing.
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
   remains available across rotations, reloads, and daemon restarts.
+  The drawer's one compact toolbar, on a neutral surface a shade darker than the
+  pane, holds the Slack and matrix icons, restart, stop, project settings,
+  standing orders (opens project settings with **Standing instructions**
+  expanded), the count of loaded messages, earlier messages, and close. Hover, tap
+  or focus the robot icon for the incarnation's generation and how long ago it
+  started; a tap elsewhere puts it away. The
+  conversation fills the window's height at every size, from a phone to a 4K
+  screen. **Standing instructions** in project settings shows when the orders
+  last changed, says when there are none, and reminds you that they are usually
+  set by telling uber lmer in chat, which confirms the wording before storing them.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>` (`<uid>` in place of the slug
   for a schema-2 run), and tapping it opens that run's view. Details worth
@@ -228,8 +245,10 @@ consult relevant prior exchanges when context is missing.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
 - **uber lmer settings** — how its session is *run* (model, harness, preset,
-  agents fan-out, Slack/matrix threads), per platform instance: the settings entry in the drawer's
-  overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
+  agents fan-out, Slack/matrix threads), per platform instance: **Execution and chat
+  defaults** in Platform settings, or `GET`/`POST /api/assistant/config`. The dialog groups its
+  fields as **Session launch**, **Conversation** and **Reminders**, each with a line
+  saying when its changes apply. Each value shows which
   layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
   dialog persists to `config.json`, and the dialog says so). Changes apply to
   the **next** incarnation — the running one keeps its context window until
@@ -246,8 +265,22 @@ consult relevant prior exchanges when context is missing.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
+- **Open-question badge** — uber lmer's message box shows a bell, in its right-hand
+  corner, with the number
+  of its own questions to you that are neither answered nor withdrawn
+  (`open_questions` on `GET /api/assistant`, counted from its ask channel exactly as
+  the run view's ask dock counts them). It updates on the pane's status poll,
+  whichever channel answered, and disappears at zero. Tapping it opens uber lmer's
+  own run view and focuses the open questions there, answerable with an option or
+  free text. The corner's space is kept while the bell is absent, so the box does
+  not shift when it appears or clears, and tapping the bell does not focus the box.
+- **Status strip** — uber lmer's pane draws its strip with orange meters and a
+  **hide** / **show status** control remembered in this browser; run views and the
+  run list are unaffected. `LMER_PLATFORM_STATUS_STRIP=0` on the daemon turns the
+  strip off fleet-wide, and with it the context-rotation reminder, which reads the
+  same figure ([LMER-CLI.md](LMER-CLI.md#lmer-specific-environment-variables)).
 - **Thread icons** — every run row, the run view header and the uber lmer chat
-  pane header carry two small icons, Slack and matrix. A dim one opens a
+  pane's toolbar carry two small icons, Slack and matrix. A dim one opens a
   one-field prompt for a thread permalink; a coloured one names the threads on
   hover, carries a count when there is more than one, and offers a link and a
   disconnect for each. Connecting and disconnecting happen **while the session

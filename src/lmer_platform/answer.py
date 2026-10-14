@@ -141,10 +141,12 @@ MAX_ANSWER_CHARS = 16384
 
 #: Statuses that mean the run is over — the members of ``run_state.STATUSES``
 #: that are not ``in-progress``. A run in one of these is ``complete`` in the fleet
-#: view with no attention record, so the UI never offers an answer for it and the
-#: API must not accept one either: ``answer_question`` deliberately leaves
-#: ``status`` alone, so the respawned session would arrive holding the answer and
-#: the completed-run directive telling it not to act on anything.
+#: view, and the only attention it can carry is a ``live_question``, whose reply
+#: goes to the live session's ask channel rather than through here. So the UI
+#: never offers an answer for it and the API must not accept one either:
+#: ``answer_question`` deliberately leaves ``status`` alone, so the respawned
+#: session would arrive holding the answer and the completed-run directive telling
+#: it not to act on anything.
 _FINISHED_STATUSES = ("complete", "archived")
 
 #: Identity components are joined into a filesystem path under the mirror

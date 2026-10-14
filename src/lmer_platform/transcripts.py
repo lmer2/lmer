@@ -268,6 +268,8 @@ import logging
 import os
 import re
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -641,6 +643,10 @@ _MAX_NAME_CHARS = 64
 
 _REDACTED = "<redacted>"
 
+#: The values :func:`scrub_pass` resolved for the pass in progress, or ``None``
+#: outside one.
+_SCRUB_PASS: ContextVar[Optional[tuple]] = ContextVar("lmer_transcript_scrub_pass", default=None)
+
 #: Credential shapes stripped from everything this module emits. Not a hunch: a
 #: real transcript on this codebase recorded a browser tool navigating to
 #: ``http://x:<the platform's shared secret>@127.0.0.1:8620/`` — the agent had put
@@ -858,6 +864,10 @@ class Message:
     #: the pane shows them as a message to whoever is reading it.
     thread: Optional[str] = None
     peer: Optional[dict] = None
+    #: For a platform digest record (issue #507): ``{"kind", "run"}``, where
+    #: ``run`` is the owning run's ``host/project/slug/label`` or ``None`` on a
+    #: record written before the run was kept. The view draws these compactly.
+    digest: Optional[dict] = None
 
     @property
     def empty(self) -> bool:
@@ -886,6 +896,7 @@ class Message:
             "fidelity": self.fidelity,
             "thread": self.thread,
             **({"peer": self.peer} if self.peer else {}),
+            **({"digest": self.digest} if self.digest else {}),
         }
 
 
@@ -1212,16 +1223,52 @@ def _scrub(text: str) -> str:
     substitution that rewrote the text around one could leave the value itself
     behind in a form no later pattern recognises.
     """
-    for known in (_platform_secret(), _assistant_credential()):
-        if known:
-            text = text.replace(known, _REDACTED)
-    if projects.enabled():
-        for known in active_assistant_credentials():
-            if len(known) >= 8:
-                text = text.replace(known, _REDACTED)
+    known_values = _SCRUB_PASS.get()
+    if known_values is None:
+        known_values = _known_credentials()
+    for known in known_values:
+        text = text.replace(known, _REDACTED)
     for pattern, replacement in _CREDENTIAL_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _known_credentials() -> tuple:
+    """The credentials :func:`_scrub` strikes out by value, longest first.
+
+    Longest first because a credential that contains another must be struck out
+    before the shorter one splits it and leaves its remainder in the text. The
+    order depends on the values alone, so every project context resolves the
+    same tuple.
+
+    Resolving them opens ``projects.sqlite3`` and globs every project's
+    credential file, which is why a caller about to scrub many strings resolves
+    them once through :func:`scrub_pass` (issue #583).
+    """
+    known = {value for value in (_platform_secret(), _assistant_credential()) if value}
+    if projects.enabled():
+        known.update(value for value in active_assistant_credentials() if len(value) >= 8)
+    return tuple(sorted(known, key=lambda value: (-len(value), value)))
+
+
+@contextmanager
+def scrub_pass():
+    """Resolve the by-value credentials once for every :func:`_scrub` inside.
+
+    Yields the resolved tuple, which identifies the pass's masking rule for a
+    caller that memoizes scrub results. A nested pass reuses the outer one. A
+    credential minted while a pass is open is masked from the next pass on.
+    """
+    current = _SCRUB_PASS.get()
+    if current is not None:
+        yield current
+        return
+    known = _known_credentials()
+    token = _SCRUB_PASS.set(known)
+    try:
+        yield known
+    finally:
+        _SCRUB_PASS.reset(token)
 
 
 def _present(text: str, limit: int, *, keep: str = "head") -> tuple:
@@ -2358,6 +2405,7 @@ def _tail_source(source: Source) -> tuple:
     return messages, vocabulary, modified
 
 
+@scrub_pass()
 def last_turn(session_id: str) -> Optional["Message"]:
     """The newest turn in *session_id*'s transcript, or ``None``.
 
@@ -2738,6 +2786,7 @@ def _comms_messages(session_id: str) -> tuple:
 
 def _comms_turns(events: list, session_id: str) -> tuple:
     from lmer_cli import comms as bus
+    from .assistant_conversation import digest_run
 
     questions: dict = {}
     turns: list = []
@@ -2783,6 +2832,10 @@ def _comms_turns(events: list, session_id: str) -> tuple:
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
                 peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
+                digest={
+                    "kind": str(meta.get("digest_kind") or "event"),
+                    "run": digest_run(meta.get("run")),
+                } if kind == "digest" else None,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``
@@ -3129,6 +3182,7 @@ def _source_name(session_id: str, path: Path) -> str:
     return hashlib.blake2b(str(path).encode("utf-8"), digest_size=8).hexdigest()
 
 
+@scrub_pass()
 def collect_messages(session_id: str) -> tuple:
     """Normalize the named conversation without choosing a response page."""
     _validated(session_id)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lmer_cli import assistant_mentions
-from lmer_platform import api, assistant, ingress, mention_routing
+from lmer_platform import api, assistant, ingress, ingress_store, mention_routing
 from lmer_platform import config as cfg
 from matrix_chat.client import MatrixError
 from slack_chat.client import SlackError
@@ -274,34 +276,70 @@ async def test_shutdown_cancels_sdk_reconnect_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket):
-    import threading
+@pytest.mark.parametrize("owner", ["callback", "loop"])
+async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, owner):
+    """The socket callback and the supervise loop's 1s replay race for a stored
+    event (#524); each case pins one winner. Only a callback-owned admission lets
+    the socket close first, because the loop is the task shutdown cancels."""
     component = manager(monkeypatch)
-    entered, release = threading.Event(), threading.Event()
+    entered, release, admitted = threading.Event(), threading.Event(), threading.Event()
+    replayer = contextvars.ContextVar("replayer", default=None)
     original = mention_routing.receive
+    owners = []
     def receive(*args, **kwargs):
+        owners.append(replayer.get())
         entered.set()
         assert release.wait(5), "test did not release admission"
-        return original(*args, **kwargs)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            admitted.set()
     monkeypatch.setattr(mention_routing, "receive", receive)
+    callback = {}
+    replay = component._replay
+    async def tagged(transport, client):
+        replayer.set("callback" if asyncio.current_task() is callback.get("task") else "loop")
+        return await replay(transport, client)
+    monkeypatch.setattr(component, "_replay", tagged)
+    stored = ingress_store.pending
+    def pending(transport):
+        # to_thread carries the replayer's context, so the loser sees no row.
+        if replayer.get() != owner and not entered.is_set():
+            return []
+        return stored(transport)
+    monkeypatch.setattr(ingress_store, "pending", pending)
     lifetime = component.lifespan(None)
     await lifetime.__aenter__()
+    stopping = event = None
+    finished_after_admission = []
     try:
         await until(lambda: component.snapshot()["slack"]["up"])
-        event = asyncio.create_task(fake_socket[0][0].emit(slack_event()))
+        event = callback["task"] = asyncio.create_task(fake_socket[0][0].emit(slack_event()))
         await until(entered.is_set)
         stopping = asyncio.create_task(lifetime.__aexit__(None, None, None))
-        await until(lambda: fake_socket[0][0].closed)
+        stopping.add_done_callback(lambda _: finished_after_admission.append(admitted.is_set()))
+        if owner == "callback":
+            await until(lambda: fake_socket[0][0].closed)
+        else:
+            await until(lambda: stopping.done()
+                        or any(task.cancelling() for task in component._tasks))
         assert not stopping.done()
         release.set()
         await asyncio.wait_for(stopping, 5)
         await event
+        assert owners == [owner], "the pin did not decide which replay admitted"
+        assert finished_after_admission == [True]
+        assert fake_socket[0][0].closed
         assert len(assistant.read_state().pending) == 1
         assert not component._events
     finally:
         release.set()
-        if component._tasks:
+        if stopping is None:
             await lifetime.__aexit__(None, None, None)
+        else:
+            await asyncio.wait_for(asyncio.gather(stopping, return_exceptions=True), 5)
+        if event is not None:
+            await asyncio.wait_for(asyncio.gather(event, return_exceptions=True), 5)
 
 
 @pytest.mark.asyncio
@@ -592,7 +630,7 @@ def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket,
         monkeypatch.setattr(daemon, name, lambda *a: noop)
     for name in ("_subscribe_to_comms", "_run_thread_connectors", "_serve_thread_requests"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
-    monkeypatch.setattr(daemon, "reattach_all", lambda: [])
+    monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     seen = []
     build = api.create_app
     def create(*args, **kwargs):

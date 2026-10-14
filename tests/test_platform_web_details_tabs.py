@@ -1523,3 +1523,16 @@ def test_the_link_gate_is_format_js_and_not_a_second_test_in_the_view():
         assert grammar not in stripped, (
             f"RunDetail.vue decides for itself what a link is ({grammar})"
         )
+
+
+def test_the_live_session_card_names_the_container():
+    """#444: the name an operator gives `podman ps` or `lmer follow`, beside the
+    session's id and pid, and nothing at all for a session with none yet."""
+    overview = _panels("tab")["overview"]
+    card = overview[overview.index("live session"):]
+    card = card[:card.index("</dl>")]
+    assert "{{ session.container_name }}" in card
+    assert card.count('v-if="session.container_name"') == 2, (
+        "the label and the value must disappear together"
+    )
+    assert card.index("session.pid") < card.index("session.container_name")

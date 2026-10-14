@@ -28,6 +28,7 @@ from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.thread_requests import MAX_READ_LIMIT
 from lmer_cli.util import get_bool_env
+from matrix_bridge.scrub import scrub_text
 
 from .client import CONNECTION_NOTICE_BLOCK_PREFIX, SlackClient, SlackError
 from .permalink import slack_thread_link
@@ -76,7 +77,7 @@ def attachment_notice(launch_settings: Optional[dict], *, slack_markup: bool = T
         value = launch_settings.get(key)
         if not isinstance(value, str) or not value.strip():
             return unset
-        text = " ".join(value.split())[:160]
+        text = " ".join(scrub_text(value).split())[:160]
         return html.escape(text, quote=False) if slack_markup else text
 
     return ATTACH_ACK + f" Preset: {label('preset', 'none')}; model: {label('model', 'harness default')}."
@@ -191,7 +192,8 @@ def _who(source: dict) -> str:
 
 
 def _head(text: str, limit: int = 80) -> str:
-    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    text = scrub_text(text or "")
+    line = text.strip().splitlines()[0] if text.strip() else ""
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
@@ -253,6 +255,8 @@ def render_outbound(
         name = item.get("name") if isinstance(item, dict) else None
         if name:
             body += f"\n📎 {name}"
+    # Before the clip: a token cut in half no longer matches its shape.
+    body = scrub_text(body)
     if len(body) > MAX_SLACK_CHARS:
         body = body[: MAX_SLACK_CHARS - 1] + "…"
     return body
@@ -628,6 +632,7 @@ class SlackConnector(ConnectorLifecycle):
         return attachment_notice(self._launch_settings)
 
     def _send_notice(self, text):
+        text = scrub_text(text)
         return self.slack.post_message(self.config.channel, self.config.thread_ts, text,
                                        connection_notice=True)
 

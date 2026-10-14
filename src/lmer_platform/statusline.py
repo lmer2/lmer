@@ -24,13 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from lmer_cli.util import get_bool_env
+
 from . import registry, store
 from .store import TS_FORMAT, age_seconds, clamp_text, logs_dir
 
 logger = logging.getLogger("lmer_platform.statusline")
 
 __all__ = [
-    "CONTAINER_STATUS_DIR", "STATUS_DIR_ENV", "STATUS_FILENAME",
+    "CONTAINER_STATUS_DIR", "STATUS_DIR_ENV", "STATUS_FILENAME", "ENABLED_ENV", "enabled",
     "SESSION_DIR_SUFFIX", "SCHEMA_VERSION", "DIR_MODE",
     "MAX_DOCUMENT_BYTES", "MAX_LIMITS",
     "MAX_NAME_CHARS", "MAX_STAMP_CHARS",
@@ -48,6 +50,16 @@ CONTAINER_STATUS_DIR = "/home/developer/.lmer-status"
 #: was actually prepared, exactly as ``LMER_ASK_DIR`` is: a value without the
 #: matching mount points the writer at a container-private directory.
 STATUS_DIR_ENV = "LMER_STATUS_DIR"
+
+#: The daemon's fleet-wide off switch (issue #507). Documented in
+#: docs/LMER-CLI.md beside ``LMER_STATUS_DIR``.
+ENABLED_ENV = "LMER_PLATFORM_STATUS_STRIP"
+
+
+def enabled() -> bool:
+    """Whether sessions get a status directory and the platform serves strips."""
+    return get_bool_env(ENABLED_ENV, default=True)
+
 
 #: The document's name inside that directory. Spelled again in
 #: ``hooks/statusline.py`` — that renderer is stdlib-only by constraint, so the
@@ -107,8 +119,11 @@ def prepare_status_dir(session_id: str) -> Optional[Path]:
     Created with the mode and then chmod'ed, for the reason
     :func:`lmer_platform.ask.prepare_ask_dir` gives. Fail-soft: a session
     without the directory publishes nothing and shows no strip, which is every
-    session that ran before this feature existed.
+    session that ran before this feature existed. ``None`` too when the
+    feature is switched off (:func:`enabled`).
     """
+    if not enabled():
+        return None
     try:
         directory = session_status_dir(session_id)
     except registry.RegistryError as exc:
@@ -442,6 +457,8 @@ def _codex(value, *, now):
 
 def for_session(session_id: str, *, now=None) -> Optional[dict]:
     """The status one session last published, or ``None``."""
+    if not enabled():
+        return None
     try:
         path = status_file_for(session_id)
     except registry.RegistryError:
@@ -458,6 +475,8 @@ def by_session(sessions: Iterable[dict], *, now=None) -> dict:
     same bargain.
     """
     statuses: dict = {}
+    if not enabled():
+        return statuses
     for entry in sessions:
         if not isinstance(entry, dict) or not entry.get("live"):
             continue

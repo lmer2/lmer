@@ -305,7 +305,7 @@ class TestGateReceiptStubs:
         accepted = set(inspect.signature(emit_gate_event).parameters)
         assert {"exit_code", "duration_s", "summary", "argv", "commit_sha",
                 "test_scope", "test_targets", "test_cache_verdict",
-                "test_cache_reason"} <= accepted
+                "test_cache_reason", "ci_baseline"} <= accepted
 
     def test_bins_pass_receipt_fields(self):
         for name in self.GATE_BINS:

@@ -157,6 +157,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
+from lmer_cli.connector_ownership import OwnershipError, process_identity, same_process
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from work_repo.utils import (
     classify_target, is_work_item, repository_of, sanitize_task_target,
@@ -183,7 +184,8 @@ from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state, session_record
 
 from . import (
-    ask, codex_config, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
+    ask, codex_config, containers, memory, meta, registry, runs, slots, statusline,
+    uploads, workrepo,
 )
 from .config import (
     assistant_resource_settings,
@@ -1562,6 +1564,25 @@ def _transcripts():
     return transcripts
 
 
+def exit_file_for(session_id: str) -> Path:
+    """Where ``lmer`` records its container's exit code (#444).
+
+    Read when no daemon heard the exit: the container ended while the platform
+    was down, and the follower that saw it — a restart does not end it — removed
+    the container, so the runtime can no longer say.
+    """
+    return logs_dir() / f"{session_id}.exit.json"
+
+
+def read_exit_file(session_id: str) -> Optional[int]:
+    try:
+        record = json.loads(exit_file_for(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    code = record.get("exit_code") if isinstance(record, dict) else None
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def transcript_dir_for(session_id: str) -> Path:
     """Host directory a session's harness transcripts land in.
 
@@ -2355,10 +2376,11 @@ def absorb_ports(sessions: list) -> list:
     """Fold what running sessions reported about themselves into their entries.
 
     Facts from :func:`ports_file_for`: the published port mapping, model,
-    harness and effort the session resolved. Called on the read path because they
-    appear *after* the spawn returns — ``lmer`` publishes ports while starting the
-    container and settles the model just before that, which is strictly later than
-    the moment the registry entry is written.
+    harness and effort the session resolved, and its container's id and name
+    (#444). Called on the read path because they appear *after* the spawn returns
+    — ``lmer`` publishes ports while starting the container, settles the model
+    just before that and reports the container once ``create`` returns, all
+    strictly later than the moment the registry entry is written.
 
     Each fact is folded only when the entry lacks it, which is what makes this
     converge and then stop doing work — and, for model/harness, what keeps the
@@ -2387,8 +2409,12 @@ def absorb_ports(sessions: list) -> list:
         wants_model = isinstance(task, dict) and not task.get("model")
         wants_harness = isinstance(task, dict) and not task.get("harness")
         wants_effort = isinstance(task, dict) and not task.get("effort")
+        # Live only: a session that died before create never reports one.
+        wants_container = not entry.get("container_name") and entry.get("live") is not False
         # Nothing left to learn about this session: stop reading its file.
-        if not session_id or not (wants_ports or wants_model or wants_harness or wants_effort):
+        if not session_id or not (
+            wants_ports or wants_model or wants_harness or wants_effort or wants_container
+        ):
             updated.append(entry)
             continue
         path = ports_file_for(session_id)
@@ -2411,6 +2437,11 @@ def absorb_ports(sessions: list) -> list:
         ports = payload.get("ports")
         if wants_ports and isinstance(ports, list) and ports:
             changes["ports"] = ports
+        container = payload.get("container")
+        if wants_container and isinstance(container, dict):
+            if isinstance(container.get("id"), str) and isinstance(container.get("name"), str):
+                changes["container_id"] = container["id"]
+                changes["container_name"] = container["name"]
         model = _reported_model(payload)
         harness = _reported_harness(payload)
         effort = _reported_effort(payload)
@@ -3191,7 +3222,13 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     except OSError as exc:  # pragma: no cover - wait failing is pathological
         logger.warning("platform_session_wait_failed id=%s error=%s", session_id, exc)
         code = None
+    record_exit(session_id, code)
 
+
+def record_exit(session_id: str, code: Optional[int]) -> None:
+    """Record how a session ended: :func:`_watch`'s bookkeeping, also used for a
+    session whose container exited while no daemon was up
+    (:mod:`lmer_platform.reattach`)."""
     clean = code == 0
     append_event(
         "session_exited",
@@ -3233,6 +3270,11 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
             "crash signal", session_id, code,
         )
 
+    # Recorded now, so a later daemon must not record it again.
+    try:
+        exit_file_for(session_id).unlink()
+    except OSError:
+        pass
     # Outside the branch, because it belongs to both endings: a crashed session's
     # entry is kept deliberately, its raw credentials are not.
     _scrub_transcripts(session_id)
@@ -3244,6 +3286,105 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     # a waiter a half-finished answer — the entry still present, the scrub still
     # running. A waiter blocked on this is released here or by its own timeout.
     _exit_event(session_id).set()
+
+
+def pid_identity(pid: int) -> Optional[str]:
+    """Boot id and start time of *pid*, or ``None`` where that is unknowable
+    (no ``/proc``, as on macOS)."""
+    try:
+        return process_identity(pid)
+    except OwnershipError:
+        return None
+
+
+def end_stale_follower(entry: dict) -> bool:
+    """SIGKILL the follower an earlier daemon left behind, if it is provably the
+    same process. Returns whether it did.
+
+    After a restart that follower is still waiting on the container: it has no
+    controlling terminal, so the master closing sends it no SIGHUP. Left alone it
+    would read the exit and remove the container before the new one could.
+    SIGKILL rather than SIGTERM: a follower stops its container on SIGTERM. Off
+    Linux there is no identity to check, both followers run, and the exit file
+    still carries the code.
+    """
+    pid, identity = entry.get("pid"), entry.get("pid_identity")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    try:
+        if not same_process(pid, identity):
+            return False
+    except OwnershipError:
+        return False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return False
+    logger.info("platform_stale_follower_ended id=%s pid=%s", entry.get("id"), pid)
+    return True
+
+
+def follow_session(
+    config: PlatformConfig,
+    session_id: str,
+    container_id: str,
+    *,
+    since: Optional[str] = None,
+    container_name: Optional[str] = None,
+) -> int:
+    """Follow a session whose container outlived the ``lmer`` that started it.
+
+    After a restart the container is still running (#444); this starts
+    ``lmer follow`` on it in a PTY of this daemon's, exactly as a spawn does, so
+    the log, the exit code and the exit verb all work as for a fresh session.
+    *since* replays the output nobody was attached for. Returns the new pid,
+    which becomes the entry's.
+    """
+    command = [resolve_lmer_bin(config), "follow", container_id]
+    if since:
+        command += ["--since", since]
+    log_file = log_path_for(session_id)
+    with _LAUNCH_LOCK:
+        master_fd, slave_fd = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env={
+                    **os.environ,
+                    "LMER_PLATFORM_SESSION_ID": session_id,
+                    "LMER_PLATFORM_EXIT_FILE": str(exit_file_for(session_id)),
+                },
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            os.close(master_fd)
+            raise SpawnError(f"cannot follow container {container_id} ({exc})") from exc
+        finally:
+            os.close(slave_fd)
+        registry.update(
+            session_id, pid=process.pid, pid_identity=pid_identity(process.pid),
+            container_id=container_id, container_name=container_name, detached=None,
+        )
+    threading.Thread(
+        target=_drain,
+        args=(master_fd, log_file, session_id),
+        name=f"lmer-platform-drain-{session_id}",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_watch,
+        args=(process, session_id),
+        name=f"lmer-platform-watch-{session_id}",
+        daemon=True,
+    ).start()
+    logger.info(
+        "platform_session_followed id=%s container=%s pid=%s",
+        session_id, container_id, process.pid,
+    )
+    return process.pid
 
 
 def _claim_slot(
@@ -3404,6 +3545,9 @@ class _UnpublishedLaunch:
             except ProcessLookupError:
                 pass
             self.process.wait()
+            # The container is detached (#444), so it outlives the lmer that
+            # created it; a thrown-away launch must not leave it running.
+            containers.remove_for_session(self.session_id)
             self.stopped = True
         if self.master_fd is not None:
             os.close(self.master_fd)
@@ -3595,6 +3739,12 @@ def _spawn_session(
         session_record.METADATA_ENV: json.dumps(
             _session_metadata(request), ensure_ascii=False, separators=(",", ":")
         ),
+        # Become labels on the session's container, which is how a restarted
+        # platform finds it again (#444).
+        "LMER_PLATFORM_SESSION_ID": session_id,
+        "LMER_PLATFORM_RUN_SLUG": slug or "",
+        "LMER_PLATFORM_EXIT_FILE": str(exit_file_for(session_id)),
+        "LMER_PLATFORM_INSTANCE": containers.platform_instance(),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
             terminal_settings()["confirm_seconds"].value
         ),
@@ -3665,6 +3815,7 @@ def _spawn_session(
             session_id,
             kind=kind,
             pid=process.pid,
+            pid_identity=pid_identity(process.pid),
             task={
                 "taskdef": request.taskdef,
                 "target": request.target,

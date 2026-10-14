@@ -583,6 +583,19 @@ def test_notify_reports_that_one_is_live(config, long_lived):
         assert assistant.notify("develop-issue-141 opened an MR") is True
 
 
+def test_notify_keeps_the_runs_identity_on_the_conversation_record(platform_root):
+    from lmer_platform import assistant_conversation
+
+    data = {"host": "gitlab.example.com", "project": "group/app", "slug": "run-1",
+            "label": "Fix the widget", "kind": "live_question"}
+    assistant.notify("gitlab.example.com/group/app/run-1 needs you — live_question: ok?",
+                     kind="live_question", data=data)
+    meta = assistant_conversation.events()[-1].message["meta"]
+    assert meta["digest_kind"] == "live_question"
+    assert meta["run"]["slug"] == "run-1"
+    assert meta["run"]["label"] == "Fix the widget"
+
+
 def test_notify_records_the_digest_in_history(platform_root):
     assistant.notify("s-1 crashed", kind="crashed", data={"session": "s-1"})
     event = events_of("assistant_notified")[-1]

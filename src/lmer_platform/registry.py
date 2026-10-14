@@ -159,6 +159,19 @@ def _is_zombie(pid: int) -> bool:
     return bool(fields) and fields[0] == "Z"
 
 
+def _kill_probe(pid: int) -> Optional[bool]:
+    """``kill(pid, 0)``: ``True`` reached it, ``None`` it is another user's, ``False`` gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return False
+    return True
+
+
 def _pid_alive(pid: object) -> bool:
     """Whether *pid* names a live process.
 
@@ -169,18 +182,20 @@ def _pid_alive(pid: object) -> bool:
     ``PermissionError`` means the process exists but belongs to another user, which
     counts as alive — the platform would rather show a session it cannot signal
     than silently drop a running one from the inventory.
+
+    The zombie check reads ``/proc``, and the spawn waiter can reap the process
+    between the probe and that read (#525). The read then finds nothing, which
+    :func:`_is_zombie` must call "not a zombie" for hosts without ``/proc``; so
+    the probe is asked again, and a reaped pid answers gone.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    reached = _kill_probe(pid)
+    if reached is not True:
+        return reached is None
+    if _is_zombie(pid):
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return not _is_zombie(pid)
+    return _kill_probe(pid) is not False
 
 
 def is_live(entry: Optional[dict]) -> bool:
@@ -217,10 +232,12 @@ def register(
     transcript: Optional[dict] = None,
     uploads: Optional[dict] = None,
     container_id: Optional[str] = None,
+    container_name: Optional[str] = None,
     slot: Optional[str] = None,
     slack: Optional[dict] = None,
     started_at: Optional[str] = None,
     log_path: Optional[str] = None,
+    pid_identity: Optional[str] = None,
 ) -> dict:
     """Record a live session and return the entry as written.
 
@@ -249,6 +266,8 @@ def register(
         "owner_pid": os.getpid(),
         "started_at": started_at or utc_now_iso(),
         "container_id": container_id,
+        # For humans: lmer finds containers by label and id (#444).
+        "container_name": container_name,
         "task": task or {},
         "run": run or {},
         "control": control or {},
@@ -263,6 +282,9 @@ def register(
         "log_path": log_path,
         "slot": slot,
         "slack": slack or {},
+        # Boot id and start time of ``pid``, so a later daemon can tell this
+        # process from one that reused its pid (#444).
+        "pid_identity": pid_identity,
     }
     write_json(session_path(session_id), entry)
     logger.debug(

@@ -1,0 +1,2 @@
+added:
+- "Added `gate-check --baseline`: with the scoped `GATE_CI_BASELINE` toggle on and a work-repo CI mapping, a run's initial baseline reuses passing CI on the exact commit when each declared job still matches its audited definition pin (`gate-check --baseline --print-pins` prints them)."

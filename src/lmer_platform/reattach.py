@@ -1,5 +1,12 @@
 """Recovering a session whose host PTY died with the daemon (issue #141, T36).
 
+Since #444 a session's container is created detached and labelled, so it
+survives the daemon, and :func:`reattach_all` first finds those containers by
+label (:mod:`lmer_platform.containers`) and follows them again — a running one
+through a new ``lmer follow``, an exited one by recording its real exit code.
+Everything below is the recovery for a session with no such container: one
+started before #444.
+
 What actually breaks when the daemon restarts
 ---------------------------------------------
 The platform runs each session as ``lmer`` in a PTY it opened on the host, and a
@@ -202,6 +209,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from . import registry
@@ -214,14 +222,17 @@ from .session_io import (
     probe_health,
     read_control_output,
 )
-from .spawn import log_path_for
+from . import containers
+from .spawn import (
+    end_stale_follower, follow_session, log_path_for, read_exit_file, record_exit,
+)
 from .store import utc_now_iso
 
 logger = logging.getLogger("lmer_platform.reattach")
 
 __all__ = [
-    "DETACH_REASON_DAEMON_RESTART", "OUTPUT_CONTROL_PLANE", "OUTPUT_NONE",
-    "OUTPUT_SESSION_LOG",
+    "DETACH_REASON_DAEMON_RESTART", "OUTPUT_CONTROL_PLANE", "OUTPUT_CONTAINER",
+    "OUTPUT_NONE", "OUTPUT_SESSION_LOG",
     "OUTPUT_POLL_SECONDS", "FAILURE_BACKOFF_SECONDS", "MAX_CONSECUTIVE_FAILURES",
     "REATTACH_ROWS", "REATTACH_COLS",
     "ReattachReport", "ControlDrain",
@@ -246,6 +257,11 @@ OUTPUT_CONTROL_PLANE = "control_plane"
 #: was nothing to recover", and an operator looking at a seam-free log after a
 #: restart deserves to be told which.
 OUTPUT_SESSION_LOG = "session_log"
+
+#: :attr:`ReattachReport.output` for a session whose container was found by
+#: label and followed again (#444). Never written to an entry: such a session is
+#: not detached, a new ``lmer follow`` owns its terminal and its exit.
+OUTPUT_CONTAINER = "container"
 
 #: ``detached.output``: nothing appends to this session's log any more. The
 #: process may well be working; the platform has no way to see it.
@@ -313,6 +329,8 @@ class ReattachReport:
     cursor: Optional[int] = None
     detail: str = ""
     output: str = OUTPUT_NONE
+    #: For a container session: it exited while no daemon was up.
+    ended: bool = False
 
 
 def detached_record(entry: Optional[dict]) -> Optional[dict]:
@@ -811,8 +829,154 @@ def reattach_session(
     )
 
 
-def reattach_all(*, poll: float = OUTPUT_POLL_SECONDS) -> list:
+def _log_mtime(session_id: str) -> Optional[str]:
+    """When the session's host log last grew, as RFC 3339: where a replay of the
+    container's own log should start."""
+    try:
+        mtime = log_path_for(session_id).stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _replay_missed(session_id: str, container_id: str) -> None:
+    """Append what an exited container printed after the host log last grew —
+    for a nonzero exit, the diagnostic."""
+    since = _log_mtime(session_id)
+    if since is None:
+        return
+    output = containers.logs_since(container_id, since)
+    if output is None:
+        output = (
+            f"\r\n── lmer platform: the container's output since {since} could "
+            "not be recovered ──\r\n"
+        ).encode("utf-8")
+    _append(session_id, output)
+
+
+def _adopt_container(config, found) -> Optional[ReattachReport]:
+    """Follow one labelled container again, or record how it ended."""
+    entry = registry.read_session(found.session_id)
+    if not found.started:
+        # Its lmer is between create and start — or died there, leaving a
+        # container that holds the session's environment and will never run.
+        if entry is None or not registry.is_live(entry):
+            containers.remove(found.id)
+        return None
+    if entry is None:
+        # This platform's own orphan: nothing tracks it any more.
+        if found.running:
+            logger.warning(
+                "platform_reattach_untracked_container id=%s session=%s — stopping it",
+                found.id, found.session_id,
+            )
+            containers.stop_container(found.id)
+        else:
+            containers.remove(found.id)
+        return None
+    if end_stale_follower(entry):
+        # It may have seen the exit and removed the container meanwhile.
+        try:
+            refreshed = containers.inspect_one(found.id)
+        except containers.DiscoveryError as exc:
+            # Unknown is not gone: follow it, and `lmer follow` copes if it is.
+            logger.warning(
+                "platform_reattach_reinspect_failed id=%s error=%s", found.id, exc
+            )
+            refreshed = found
+        if refreshed is None:
+            return _record_from_exit_file(entry)
+        found = refreshed
+    if found.running:
+        follow_session(
+            config, found.session_id, found.id,
+            since=_log_mtime(found.session_id), container_name=found.name,
+        )
+        return ReattachReport(
+            session_id=found.session_id, detached=False, draining=False,
+            detail="its container kept running and is followed again",
+            output=OUTPUT_CONTAINER,
+        )
+    if entry.get("exited"):
+        containers.remove(found.id)
+        return None
+    _replay_missed(found.session_id, found.id)
+    _append(found.session_id, (
+        f"\r\n── lmer platform: container exited with code {found.exit_code} "
+        "while no daemon was running ──\r\n"
+    ).encode("utf-8"))
+    record_exit(found.session_id, found.exit_code)
+    containers.remove(found.id)
+    return ReattachReport(
+        session_id=found.session_id, detached=False, draining=False,
+        detail=f"exit code {found.exit_code}", output=OUTPUT_CONTAINER, ended=True,
+    )
+
+
+def _record_from_exit_file(entry: dict) -> Optional[ReattachReport]:
+    """A session whose follower recorded the exit and removed the container
+    while no daemon was up: the runtime no longer knows, the exit file does."""
+    session_id = entry.get("id")
+    if not isinstance(session_id, str) or entry.get("exited"):
+        return None
+    code = read_exit_file(session_id)
+    if code is None:
+        return None
+    # The follower that wrote it may still be on its way out.
+    end_stale_follower(entry)
+    _append(session_id, (
+        f"\r\n── lmer platform: container exited with code {code} while no "
+        "daemon was running ──\r\n"
+    ).encode("utf-8"))
+    record_exit(session_id, code)
+    return ReattachReport(
+        session_id=session_id, detached=False, draining=False,
+        detail=f"exit code {code}", output=OUTPUT_CONTAINER, ended=True,
+    )
+
+
+def _adopt_containers(config) -> list:
+    try:
+        found = containers.discover()
+    except containers.DiscoveryError as exc:
+        # The exit files below need no runtime, so they are still read.
+        logger.warning("platform_reattach_discovery_failed error=%s", exc)
+        found = []
+    reports = []
+    for container in found:
+        try:
+            report = _adopt_container(config, container)
+        except Exception as exc:
+            logger.warning(
+                "platform_reattach_container_failed id=%s session=%s error=%r",
+                container.id, container.session_id, exc,
+            )
+            continue
+        if report is not None:
+            reports.append(report)
+    handled = {container.session_id for container in found}
+    for entry in registry.list_sessions(live_only=False):
+        if entry.get("id") in handled:
+            continue
+        try:
+            report = _record_from_exit_file(entry)
+        except Exception as exc:
+            logger.warning(
+                "platform_reattach_exit_file_failed id=%s error=%r", entry.get("id"), exc
+            )
+            continue
+        if report is not None:
+            reports.append(report)
+    return reports
+
+
+def reattach_all(*, poll: float = OUTPUT_POLL_SECONDS, config=None) -> list:
     """Re-attach every session that survived the daemon. Returns one report each.
+
+    With *config*, the platform's labelled containers are adopted first
+    (:func:`_adopt_container`) and the steps below apply only to sessions with
+    none — ones started before #444. ``None`` skips the containers, for callers
+    exercising only the older path.
 
     Scoped to :func:`registry.list_sessions` with ``live_only=True``, which is
     the registry's own liveness rule — ``kill(pid, 0)`` plus the ``/proc`` zombie
@@ -825,10 +989,11 @@ def reattach_all(*, poll: float = OUTPUT_POLL_SECONDS) -> list:
     (:mod:`lmer_platform.inventory`), and marking a corpse ``detached`` would
     overwrite evidence of a death with a claim about a terminal.
     """
-    reports = []
+    reports = _adopt_containers(config) if config is not None else []
+    adopted = {r.session_id for r in reports}
     for entry in registry.list_sessions(live_only=True):
         session_id = entry.get("id")
-        if not isinstance(session_id, str):
+        if not isinstance(session_id, str) or session_id in adopted:
             continue
         try:
             reports.append(reattach_session(session_id, poll=poll))
@@ -859,9 +1024,22 @@ def startup_notice(reports: list) -> Optional[str]:
     telling an operator to expect a seam in it would send them looking for a break
     that is not there.
     """
+    followed = [r for r in reports if r.output == OUTPUT_CONTAINER and not r.ended]
+    ended = [r for r in reports if r.output == OUTPUT_CONTAINER and r.ended]
+    container_parts = []
+    if followed:
+        container_parts.append(
+            f"🔌 {len(followed)} session(s) kept running in their containers and "
+            "are followed again: " + ", ".join(r.session_id for r in followed)
+        )
+    if ended:
+        container_parts.append(
+            f"🔌 {len(ended)} session(s) ended while the daemon was down: "
+            + ", ".join(f"{r.session_id} ({r.detail})" for r in ended)
+        )
     survivors = [r for r in reports if r.detached]
     if not survivors:
-        return None
+        return "\n".join(container_parts) or None
     recorded = [r for r in survivors if r.output == OUTPUT_SESSION_LOG]
     draining = [r for r in survivors if r.draining]
     blind = [
@@ -888,4 +1066,4 @@ def startup_notice(reports: list) -> Optional[str]:
             f"   {len(blind)} unreachable — alive, but nothing is recorded: "
             + ", ".join(r.session_id for r in blind)
         )
-    return "\n".join(parts)
+    return "\n".join(container_parts + parts)

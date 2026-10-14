@@ -4,6 +4,43 @@
 ## Unreleased
 
 
+## 0.11.0
+### Added
+- Added opt-in --root-userns / LMER_ROOT_USERNS: sub-second container start under rootless podman by skipping the keep-id UID remap (agent runs as container root)
+- pi providers are configured once in ~/.lmer/pi-providers.json; the model list is discovered from each provider at launch instead of hand-pinned, with context windows from LiteLLM's /model/info where the model list lacks them
+- `GET /api/spawn-options` / `lmer-ctl spawn-options` now list the models each configured pi provider currently advertises (probed in parallel under a short deadline and cached for a minute)
+- uber lmer's chat header shows a badge counting its open questions to you; tapping it opens them in its run view
+- `LMER_PLATFORM_STATUS_STRIP=0` turns the status strip, and the context-rotation reminder reading it, off fleet-wide; uber lmer's pane can hide its strip
+- Platform UI header now shows the selected project in its color with a project switcher, replacing the in-page project tabs.
+- Project settings offer a color picker accepting any hex color, with the 20 named colors as swatches.
+- `LMER_CONTAINER_RUNTIME=docker|podman` selects the host container runtime when both are installed, read by lmer (including `lmer build`), the Makefile, `bin/lmer-reset` and `scripts/platform-container-run.sh`. It stays on the host: it is never forwarded into session containers, and the platform image sets it to `docker` inside.
+### Fixed
+- The keep-id UID remap notice now fires whenever the image has not been remapped yet, so a spawn after a separate `lmer build` no longer waits in silence
+- `--root-userns`/`LMER_ROOT_USERNS` now verifies that the podman engine it is talking to is rootless, instead of only checking the local user id: a non-root client pointed at a rootful podman service was granted container root plus the Claude Code sandbox bypass
+- A root container user under podman is now given an explicit `--userns=host` rather than no namespace flag, so an ambient `PODMAN_USERNS`/`containers.conf` `userns` cannot reinstate the keep-id remap lmer just reported skipping
+- An unreadable `~/.lmer/remapped` no longer aborts a launch; the remap marker is advisory, so a lookup that cannot be performed reads as 'not recorded'
+- `lmer build` now loads `.env` files, so `LMER_NO_PREWARM`, `LMER_ROOT_USERNS`, `LMER_CONTAINER_USER`, `LMER_PREWARM_TIMEOUT` and `LMER_IMAGE` work there as they do for a launch
+- A container runtime killed by a signal no longer records the keep-id remap as paid
+- The keep-id pre-warm now runs the resolved image ID rather than the tag, so a concurrent rebuild cannot make it warm one image and certify another
+- `verify-keep-id-chown.sh --measure-build` now refuses when `lmer build` would use a different runtime, and honours `LMER_IMAGE`, so it can no longer rebuild one image or store and time another
+- A launch now re-resolves the image ID immediately before starting the container and uses that one ID for the keep-id notice, the container and the remap marker, so a rebuild retagging during session setup can no longer record a remap against an image podman never ran
+- A finished run now reads `complete` in the fleet view even while its session is still up, instead of staying `running` and drawing check-ins.
+- A pi session started on `<provider>/<model>` that the configured provider no longer offers, or whose key it rejects, now aborts before starting instead of running live and unable to act; built-in, fuzzy and `:<thinking>` names, and any model of a provider pi ships itself, are left to pi, and a provider that is down or has no key is skipped and aborts only launches that name it
+- A masked apiKey placeholder in ~/.pi/agent/models.json is refused at launch instead of being sent as a bearer token
+- Concurrent pi children no longer race on the shared registry: it is published atomically, so a launch never reads the empty or half-written file a truncating rewrite could leave behind
+- A successful retry of a blocked-request release clears the earlier error banner
+- A late older-history page no longer rewinds the chat's tail cursor and replays old rows
+- The daemon's startup notice now names where the bind address and port actually came from, including command-line overrides
+### Changed
+- Developer-mode images are now tagged by build-input hash instead of commit SHA, so source-only commits reuse the existing image and skip podman's multi-minute UID remap
+- podman's multi-minute keep-id UID remap is now paid during `lmer build` (and any auto-build or pull) instead of at the first session start; LMER_NO_PREWARM=1 opts out
+- Platform digests in uber lmer's chat are compact, collapsible lmer platform rows that link to their run
+- uber lmer settings are grouped with readable labels and persistent hints; uber lmer's status meters use its orange accent
+- `scripts/platform-container-run.sh --runtime` now accepts only `docker` or `podman` (trimmed, any case); a path or any other name is rejected instead of being run.
+### Security
+- Slack mirroring and thread posts now redact credentials from messages, question options and notices before posting; Matrix no longer lets a clipped token escape redaction.
+
+
 ## 0.10.1
 ### Fixed
 - Graph groups use platform configuration with a simple settings editor, safe literal text matching, and empty defaults that retain repository clusters.

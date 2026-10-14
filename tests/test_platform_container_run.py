@@ -30,6 +30,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER = REPO_ROOT / "scripts" / "platform-container-run.sh"
 
+#: Absolute, so a test can hand the helper a stub-only PATH.
+BASH = shutil.which("bash")
+
 #: The helper is bash (``compgen -e``, ``${var,,}``, arrays), not POSIX sh.
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None, reason="the helper is a bash script"
@@ -98,7 +101,10 @@ class _Host:
         self.socket = runtime_socket
         self.bin_dir = tmp_path / "bin"
         self.bin_dir.mkdir()
-        stub = self.bin_dir / "docker"
+        self.stub("docker")
+
+    def stub(self, name):
+        stub = self.bin_dir / name
         stub.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         stub.chmod(0o755)
 
@@ -118,7 +124,7 @@ class _Host:
             **(env or {}),
         }
         completed = subprocess.run(
-            ["bash", str(HELPER), "--print", "--socket", str(self.socket), *args],
+            [BASH, str(HELPER), "--print", "--socket", str(self.socket), *args],
             capture_output=True, text=True, timeout=60, env=environ,
         )
         if check:
@@ -343,6 +349,21 @@ def test_container_resource_limits_are_forwarded_including_scoped_spellings(host
         assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
 
 
+def test_ci_baseline_toggle_is_forwarded_including_scoped_spellings(host):
+    """#452's toggle is resolved by the ``lmer`` inside this container, on the
+    same ladder as the resources, so every spelling has to arrive here."""
+    values = {
+        "LMER_GATE_CI_BASELINE": "1",
+        "LMER_DEVELOP_GATE_CI_BASELINE": "0",
+        "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "1",
+    }
+    run = host.run(env=values)
+    for name in values:
+        assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
+    assert "LMER_GATE_CI_BASELINE_NOTES" not in host.run(
+        env={"LMER_GATE_CI_BASELINE_NOTES": "x"}).env_names
+
+
 def test_the_assistants_own_allocation_still_forwards_on_the_platform_prefix(host):
     """The asymmetry #453's review found: both halves of the feature have to
     survive one shell. ``LMER_PLATFORM_ASSISTANT_MEMORY`` matches the
@@ -368,3 +389,56 @@ def test_an_unrelated_lmer_variable_is_still_not_forwarded(host):
     assert "LMER_SOMETHING_ELSE" not in run.env_names
     assert "LMER_MEMORY_LIMIT_NOTES" not in run.env_names
     assert "LMER_GPU_NOTES" not in run.env_names
+
+
+# --- runtime selection (LMER_CONTAINER_RUNTIME) --------------------------------
+
+def test_the_env_override_picks_podman_and_keeps_the_host_uid(host):
+    host.stub("podman")
+    run = host.run(env={"LMER_CONTAINER_RUNTIME": " PodMan "})
+    assert run.argv[0] == "podman"
+    assert "--userns=keep-id" in run.argv
+
+
+def test_the_runtime_flag_beats_the_env_override(host):
+    host.stub("podman")
+    run = host.run("--runtime", "docker", env={"LMER_CONTAINER_RUNTIME": "podman"})
+    assert run.argv[0] == "docker"
+    assert "--userns=keep-id" not in run.argv
+
+
+def test_an_override_naming_a_missing_runtime_dies(host):
+    # Stub-only PATH, so a host podman in /usr/bin cannot answer; `id` is the
+    # one tool the helper runs before the runtime check.
+    (host.bin_dir / "id").symlink_to(shutil.which("id"))
+    run = host.run(
+        env={"LMER_CONTAINER_RUNTIME": "podman", "PATH": str(host.bin_dir)},
+        check=False,
+    )
+    assert run.completed.returncode != 0
+    assert "podman is not on PATH" in run.notes
+
+
+@pytest.mark.parametrize("value", ["nerdctl", "/usr/bin/podman", "docker podman"])
+def test_an_unsupported_override_or_a_path_is_rejected(host, value):
+    host.stub("podman")
+    run = host.run(env={"LMER_CONTAINER_RUNTIME": value}, check=False)
+    assert run.completed.returncode != 0
+    assert "is not supported; use docker or podman" in run.notes
+
+
+def test_the_container_runtime_is_pinned_to_docker_inside(host):
+    """The value names the host's runtime; inside, the docker client drives the
+    mounted socket. Set by value so the mounted ~/.lmer/.env cannot win, and an
+    explicit --env cannot forward the host's value over it."""
+    host.stub("podman")
+    run = host.run(
+        "--env", "LMER_CONTAINER_RUNTIME",
+        env={"LMER_CONTAINER_RUNTIME": "podman"},
+    )
+    pins = [
+        run.argv[index + 1]
+        for index, arg in enumerate(run.argv)
+        if arg == "--env" and run.argv[index + 1].startswith("LMER_CONTAINER_RUNTIME")
+    ]
+    assert pins == ["LMER_CONTAINER_RUNTIME=docker"]

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from lmer_cli import cli
 from lmer_cli.runtime import (
     InstallMode,
     detect_runtime,
@@ -41,6 +42,63 @@ from lmer_cli.runtime import (
 
 class TestDetectRuntime:
     """Test container runtime detection"""
+
+    @pytest.fixture(autouse=True)
+    def _no_override(self, monkeypatch):
+        monkeypatch.delenv("LMER_CONTAINER_RUNTIME", raising=False)
+
+    def test_override_picks_podman_when_both_available(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "podman")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "podman"
+
+    def test_override_is_case_and_whitespace_insensitive(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", " Docker ")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "docker"
+
+    def test_empty_override_falls_back_to_detection(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            assert detect_runtime() == "docker"
+
+    def test_override_rejects_unknown_runtime(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "nerdctl")
+        with patch("shutil.which", return_value="/usr/bin/runtime"):
+            with pytest.raises(RuntimeErrorDetect, match="not supported"):
+                detect_runtime()
+
+    def test_override_missing_binary_does_not_fall_back(self, monkeypatch):
+        monkeypatch.setenv("LMER_CONTAINER_RUNTIME", "podman")
+        with patch("shutil.which") as mock_which:
+            mock_which.side_effect = lambda x: "/usr/bin/docker" if x == "docker" else None
+            with pytest.raises(RuntimeErrorDetect, match="podman is not on PATH"):
+                detect_runtime()
+
+    def test_build_takes_the_override_from_env_files(self, monkeypatch, tmp_path):
+        """`lmer build` runs before main()'s .env load, yet must build into the
+        store sessions run from; only the runtime key is loaded."""
+        (tmp_path / ".env").write_text(
+            "LMER_CONTAINER_RUNTIME=podman\nLMER_BUILD_ENV_PROBE=x\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LMER_BUILD_ENV_PROBE", raising=False)
+        monkeypatch.setenv("LMER_IMAGE", "img:test")
+        seen = {}
+
+        def fake_detect():
+            seen["runtime"] = os.environ.get("LMER_CONTAINER_RUNTIME")
+            return "podman"
+
+        # patch.dict: the load writes os.environ directly, which monkeypatch
+        # cannot undo for a variable that was absent when it was deleted.
+        with patch.dict(os.environ), \
+             patch.object(cli, "detect_runtime", side_effect=fake_detect), \
+             patch.object(cli, "build_image", return_value=True):
+            assert cli._handle_build([]) == 0
+            assert "LMER_BUILD_ENV_PROBE" not in os.environ
+        assert seen["runtime"] == "podman"
+        assert "LMER_CONTAINER_RUNTIME" not in os.environ
 
     def test_detect_docker_when_available(self):
         """Test Docker is detected when available"""
@@ -215,9 +273,12 @@ class TestBaseRunArgs:
             os.environ.pop("LMER_MEMORY", None)
             args = base_run_args("docker", False, "developer")
 
-        assert "docker" in args
-        assert "run" in args
-        assert "--rm" in args
+        assert args[:2] == ["docker", "create"]
+        # Detached (#444): the follower reads the exit code and removes the
+        # container, so --rm would race the code away.
+        assert "--rm" not in args
+        # Detach keys belong to the attaching client; docker's create rejects them.
+        assert "--detach-keys" not in args
         # PID 1 init: reaps zombies now that clone_and_exec.py keeps the
         # runner as a child (session-end backstop) instead of exec'ing it.
         assert "--init" in args
@@ -241,6 +302,19 @@ class TestBaseRunArgs:
 
         assert "podman" in args
         assert "--userns=keep-id" in args
+
+    def test_base_args_podman_nonroot_numeric_user_includes_userns(self):
+        args = base_run_args("podman", False, "1000:1000")
+
+        assert "--userns=keep-id" in args
+
+    def test_base_args_podman_root_user_skips_userns(self):
+        """Root under the default rootless map already IS the host uid, so
+        keep-id (and its whole-rootfs chown, issue #351) is skipped."""
+        for user in ("0:0", "0", "root", "root:root"):
+            args = base_run_args("podman", False, user)
+            assert "--userns=keep-id" not in args, user
+            assert args[args.index("--user") + 1] == user
 
     def test_base_args_docker_no_userns(self):
         """Test Docker args don't include --userns=keep-id"""
@@ -1228,3 +1302,74 @@ class TestResourceLimitPlan:
         assert [limit.flag for limit in plan] == ["--pids-limit"]
         args = base_run_args("podman", False, "developer", plan)
         assert "--memory" not in args and "--cpus" not in args
+
+
+class TestGateCiBaselineLadder:
+    """LMER_GATE_CI_BASELINE rides the #453 ladder (#452): most specific first,
+    blank and invalid fall through, default off."""
+
+    def _resolve(self, env, scope=LaunchScope("develop", "agents/global")):
+        from lmer_cli.runtime import resolve_gate_ci_baseline
+        with patch.dict(os.environ, env, clear=False):
+            for name in [n for n in os.environ if n.endswith("GATE_CI_BASELINE") and n not in env]:
+                os.environ.pop(name)
+            return resolve_gate_ci_baseline(scope)
+
+    def test_default_is_off(self):
+        assert self._resolve({}) == ("0", "default")
+
+    def test_names_follow_the_resource_derivation(self):
+        assert resource_env_names("GATE_CI_BASELINE", LaunchScope("develop", "agents/global")) == [
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE",
+            "LMER_DEVELOP_GATE_CI_BASELINE",
+            "LMER_GATE_CI_BASELINE",
+        ]
+
+    def test_repo_tier_beats_task_and_general(self):
+        assert self._resolve({
+            "LMER_GATE_CI_BASELINE": "0",
+            "LMER_DEVELOP_GATE_CI_BASELINE": "0",
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "yes",
+        }) == ("1", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE")
+
+    def test_explicit_off_at_a_specific_tier_wins(self):
+        assert self._resolve({
+            "LMER_GATE_CI_BASELINE": "1",
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "false",
+        }) == ("0", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE")
+
+    def test_task_tier_applies_to_any_repository(self):
+        assert self._resolve({"LMER_DEVELOP_GATE_CI_BASELINE": "TRUE"},
+                             LaunchScope("develop", "other/repo")) == (
+            "1", "LMER_DEVELOP_GATE_CI_BASELINE")
+
+    def test_blank_falls_through(self):
+        assert self._resolve({
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "  ",
+            "LMER_GATE_CI_BASELINE": "1",
+        }) == ("1", "LMER_GATE_CI_BASELINE")
+
+    def test_invalid_warns_and_falls_through_to_the_next_candidate(self, capsys):
+        assert self._resolve({
+            "LMER_DEVELOP_GATE_CI_BASELINE": "maybe",
+            "LMER_GATE_CI_BASELINE": "1",
+        }) == ("1", "LMER_GATE_CI_BASELINE")
+        captured = capsys.readouterr()
+        assert "LMER_DEVELOP_GATE_CI_BASELINE" in captured.out + captured.err
+
+    def test_invalid_with_nothing_else_stays_off(self):
+        assert self._resolve({"LMER_GATE_CI_BASELINE": "on"}) == ("0", "default")
+
+    def test_no_repo_session_has_no_repo_tier(self):
+        assert self._resolve({
+            "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": "1",
+        }, LaunchScope("develop", None)) == ("0", "default")
+
+    def test_no_task_session_reads_only_the_general_name(self):
+        assert self._resolve({
+            "LMER_DEVELOP_GATE_CI_BASELINE": "1",
+            "LMER_GATE_CI_BASELINE": "0",
+        }, None) == ("0", "LMER_GATE_CI_BASELINE")
+
+    def test_there_is_no_repo_only_tier(self):
+        assert self._resolve({"LMER_AGENTS_GLOBAL_GATE_CI_BASELINE": "1"}) == ("0", "default")

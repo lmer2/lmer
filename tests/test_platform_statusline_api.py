@@ -247,3 +247,70 @@ class TestTheAssistantRoute:
         before = sorted(path.name for path in directory.iterdir())
         client.get("/api/assistant", headers=auth())
         assert sorted(path.name for path in directory.iterdir()) == before
+
+
+class TestSwitchedOff:
+    """``LMER_PLATFORM_STATUS_STRIP=0`` (issue #507): a document a session
+    published before the switch was turned off is not served."""
+
+    def test_state_carries_null(self, monkeypatch, client):
+        TestTheFleetPayload().register("s-live", pid=os.getpid())
+        publish("s-live")
+        monkeypatch.setenv(statusline.ENABLED_ENV, "0")
+        reply = client.get("/api/state", headers=auth()).json()
+        rows = [row for row in reply["runs"] if row["slug"] == "r1"]
+        assert rows and rows[0]["statusline"] is None
+
+    def test_the_assistant_carries_null(self, monkeypatch, client):
+        monkeypatch.setattr(
+            assistant, "_live_assistant",
+            lambda: {"id": "s-uber", "pid": 4242, "kind": assistant.KIND,
+                     "started_at": "2026-09-03T14:00:00Z"},
+        )
+        publish("s-uber")
+        monkeypatch.setenv(statusline.ENABLED_ENV, "0")
+        reply = client.get("/api/assistant", headers=auth()).json()
+        assert "statusline" in reply and reply["statusline"] is None
+
+
+class TestTheOpenQuestionCount:
+    """``open_questions`` on /api/assistant (issue #507): the assistant's own
+    unanswered, unclosed asks, by the same rule the ask route serves."""
+
+    @pytest.fixture
+    def live(self, monkeypatch):
+        monkeypatch.setattr(
+            assistant, "_live_assistant",
+            lambda: {"id": "s-uber", "pid": 4242, "kind": assistant.KIND,
+                     "started_at": "2026-09-03T14:00:00Z"},
+        )
+
+    def test_counts_open_questions_and_drops_answered_and_closed(self, live, client):
+        from ask_channel import protocol
+        from lmer_platform import ask
+
+        directory = ask.prepare_ask_dir("s-uber")
+        assert client.get("/api/assistant", headers=auth()).json()["open_questions"] == 0
+        first = protocol.post_question(directory, "ship it?", ["yes", "no"])
+        second = protocol.post_question(directory, "which branch?")
+        third = protocol.post_question(directory, "rotate now?")
+        protocol.post_note(directory, "a note is not a question")
+        assert client.get("/api/assistant", headers=auth()).json()["open_questions"] == 3
+        protocol.write_answer(directory, first, "yes")
+        protocol.close_question(directory, second)
+        reply = client.get("/api/assistant", headers=auth()).json()
+        assert reply["open_questions"] == 1
+        assert [entry.id for entry in ask.pending_questions("s-uber")] == [third.id]
+
+    def test_nothing_running_counts_zero(self, monkeypatch, client):
+        monkeypatch.setattr(assistant, "_live_assistant", lambda: None)
+        assert client.get("/api/assistant", headers=auth()).json()["open_questions"] == 0
+
+    def test_an_unreadable_channel_counts_zero(self, live, monkeypatch, client):
+        from lmer_platform import ask
+
+        def boom(_session_id):
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(ask, "pending_questions", boom)
+        assert client.get("/api/assistant", headers=auth()).json()["open_questions"] == 0

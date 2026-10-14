@@ -190,8 +190,11 @@ def build_global_mount(runtime: str, repo_root: Path) -> List[str]:
     # Directories needed by the container (excludes .venv, cache, build artifacts)
     # Read-write directories
     rw_dirs = ["bin", "src", "hooks", "Ctl", "libexec"]
-    # Read-only directories
-    ro_dirs = [".claude", "agent-files", "rules", "taskdef"]
+    # Read-only directories. "prompts" must stay here: the runner scripts
+    # resolve prompt fragments relative to the mounted libexec/, and with the
+    # input-hash image tag (issue #351) a baked-only prompts/ would serve
+    # stale copies until the next dependency bump instead of the next commit.
+    ro_dirs = [".claude", "agent-files", "prompts", "rules", "taskdef"]
     # Individual files
     ro_files = ["AGENTS.md"]
     rw_files = [".env"]

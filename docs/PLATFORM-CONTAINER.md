@@ -355,8 +355,11 @@ question about host root. See
 [the bind address](#networking) for the one setting that widens it.
 
 One divergence specific to *this* image, which service mode does not have:
-`lmer_cli.runtime.detect_runtime()` picks a runtime by looking for a binary
-on `PATH`, and this image carries only the docker client. On a Podman host
+the image sets `LMER_CONTAINER_RUNTIME=docker`, so
+`lmer_cli.runtime.detect_runtime()` always answers docker here. That is the
+only client the image carries, and the image `ENV` beats a host-only
+`LMER_CONTAINER_RUNTIME=podman` in the mounted `~/.lmer/.env` (the daemon's
+`.env` load is first-wins), however the container is started. On a Podman host
 the in-container `lmer` therefore builds **docker-flavoured** run arguments
 (no `--userns=keep-id`) while a Podman engine executes them. Sessions on a
 Podman host are untested for that reason; treat them as part of the spike.
@@ -425,12 +428,12 @@ holds no schema-2 record — every schema-1 run — keep their slug key unchange
 
 ### Restart semantics, and what breaks today
 
-On a bare host, sessions survive a daemon restart. Each session has a
-host-side `lmer` client process that owns the PTY master, and those
-processes are not children of the daemon in any meaningful sense — the
-daemon restarts, re-attaches, and the fleet carries on (spec R11, T36).
+On a bare host, sessions survive a daemon restart. Each session's container
+is detached and labelled, so the daemon's death costs it nothing; the new
+daemon finds it by label and follows it again — see
+[CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md) (spec R11, T36).
 
-In this topology those client processes live **inside the platform
+In this topology the `lmer` followers live **inside the platform
 container**, in its PID namespace. So every platform upgrade — every
 `docker restart`, every stop/run — kills all of them. Two consequences,
 one benign and one not:
@@ -441,12 +444,16 @@ one benign and one not:
   `~/.lmer/platform/logs/<id>.session/`, and the read path prefers it when
   it holds anything (`session_io.canonical_log`). The host-side tee dying
   costs nothing for a session whose image writes its own log.
-- **Re-attach does not, yet.** `reattach_all`
+- **Re-attach does not, yet, for sessions started before #444.** Sessions
+  launched since are found by container label rather than by pid, which
+  sidesteps the namespace problem below
+  ([CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md)); that path has not
+  been verified in this topology yet. For the older sessions: `reattach_all`
   (`src/lmer_platform/reattach.py:814`) is scoped to
   `registry.list_sessions(live_only=True)`, and liveness is
   `kill(pid, 0)` plus a `/proc` zombie check against the pid recorded in
   the registry entry (`registry.is_live`,
-  `src/lmer_platform/registry.py:160-188`). Those pids were minted in the
+  `src/lmer_platform/registry.py:138-205`). Those pids were minted in the
   *previous* container's PID namespace. In the new namespace they are
   almost all absent — so the whole fleet is skipped, quietly, and
   `control_endpoint` refuses input for each session before it even reads

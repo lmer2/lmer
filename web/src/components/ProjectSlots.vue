@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { mdiCogOutline, mdiServerOutline } from '@mdi/js'
-import { projectColor } from '../projects.js'
+import { projectColor, projectTextColor } from '../projects.js'
 import { slotIsFree, slotMeta, toneColor } from '../format.js'
 // By the row key, not the slug: two uid rows of one group share a slug.
 import { runKey } from '../runref.js'
@@ -69,7 +69,8 @@ const empty = computed(() => !props.slots.length ? 'No service slots configured.
           <div v-for="held in slot.holders" :key="`${held.session}:${held.via || ''}`"
             class="slot-holder d-flex flex-wrap align-center ga-1 mt-1 text-body-small">
             <span>{{ held.via ? 'Service held by' : 'Held by' }}</span>
-            <v-chip v-if="held.project" :color="projectColor(held.project.color)" variant="tonal" size="small">{{ held.name }}</v-chip>
+            <v-chip v-if="held.project" :color="projectColor(held.project.color)"
+              :style="{ color: projectTextColor(held.project.color) }" variant="flat" size="small">{{ held.name }}</v-chip>
             <span v-else>{{ held.name }}</span>
             <span v-if="held.via">via slot {{ held.via }}</span>
           </div>

@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from lmer_cli.runtime import apply_env_file_defaults
 from tests.test_lmer_cli_slack_target import (
     _BASE_ENV,
     _make_main_mocks,
@@ -194,6 +195,17 @@ class TestInFileReferenceResolution:
         assert os.environ["LMER_ENVREF_DERIVED"] == "from_active/repo.git"
         assert "LMER_ENVREF_DERIVED" in sources
         assert "LMER_ENVREF_BASE" not in sources  # it came from the environment
+
+    def test_only_limits_the_load_and_refuses_environ_resolution(self, tmp_path):
+        sources = apply_env_file_defaults(
+            self._seeded(tmp_path), only=("LMER_ENVREF_FILEONLY",)
+        )
+        assert sources == {"LMER_ENVREF_FILEONLY": ".env (probe)"}
+        assert "LMER_ENVREF_BASE" not in os.environ
+        with pytest.raises(ValueError):
+            apply_env_file_defaults(
+                self._seeded(tmp_path), references_from_environ=True, only=("X",)
+            )
 
     def test_environ_resolution_still_falls_back_to_the_file(self, tmp_path):
         """A variable the environment does not carry resolves from the file, so

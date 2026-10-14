@@ -12,6 +12,7 @@ This module handles:
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -21,12 +22,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
 
 from .log import warning
-from .util import env_name_segment
+from .util import FALSY_VALUES, TRUTHY_VALUES, env_name_segment, get_bool_env
 
 
 class InstallMode(Enum):
@@ -141,23 +142,144 @@ def _available_controllers() -> "set[str] | None":
         return None
 
 
+#: Names the runtime explicitly instead of detecting it. The only way to pick
+#: podman on a host that also has docker: both usually live in ``/usr/bin``, so
+#: PATH cannot hide one without hiding the other.
+RUNTIME_ENV = "LMER_CONTAINER_RUNTIME"
+
+_SUPPORTED_RUNTIMES = ("docker", "podman")
+
+
 def detect_runtime() -> str:
     """
     Detect available container runtime on the system.
 
-    Checks PATH for docker and podman binaries, in that order.
+    ``LMER_CONTAINER_RUNTIME`` (``docker`` or ``podman``) wins when set and
+    must name a binary on PATH; an invalid or missing choice is an error rather
+    than a silent fallback, because the two runtimes get different run flags
+    (``--userns=keep-id``) and a quiet swap would surface later as ownership
+    failures. Otherwise checks PATH for docker and podman binaries, in that
+    order.
 
     Returns:
         'docker' or 'podman'
 
     Raises:
-        RuntimeErrorDetect: If neither Docker nor Podman is found
+        RuntimeErrorDetect: If the override is invalid or not on PATH, or
+            neither Docker nor Podman is found
     """
+    override = (os.environ.get(RUNTIME_ENV) or "").strip().lower()
+    if override:
+        if override not in _SUPPORTED_RUNTIMES:
+            raise RuntimeErrorDetect(
+                f"{RUNTIME_ENV}={os.environ[RUNTIME_ENV]!r} is not supported; "
+                f"use one of: {', '.join(_SUPPORTED_RUNTIMES)}"
+            )
+        if not shutil.which(override):
+            raise RuntimeErrorDetect(
+                f"{RUNTIME_ENV}={override} but {override} is not on PATH"
+            )
+        return override
     if shutil.which("docker"):
         return "docker"
     if shutil.which("podman"):
         return "podman"
     raise RuntimeErrorDetect("Neither Docker nor Podman found in PATH")
+
+
+#: The detach sequence on every console lmer attaches, replacing the runtimes'
+#: Ctrl-P Ctrl-Q, which swallows input (Ctrl-P is history-up in most TUIs).
+#: Detach keys belong to the attaching client (`start`/`attach`), not the
+#: container: docker's `create` has no such flag. Both runtimes need a sequence,
+#: since docker has no way to disable detaching.
+DETACH_KEYS = "ctrl-],ctrl-\\"
+
+#: Seconds a stop waits before killing a session container: room for the
+#: in-container session-end backstop
+#: (lmer_cli.container.clone_and_exec.SESSION_END_TIMEOUT_SECONDS) on every
+#: stop, rather than the runtimes' 10 s default.
+STOP_TIMEOUT_SECONDS = 200
+
+#: Labels lmer puts on every session container (#444). The platform finds its
+#: sessions by them after a restart.
+LABEL_MANAGED = "io.lmer.managed"
+LABEL_LAUNCHER = "io.lmer.launcher"
+LABEL_REPO_HOST = "io.lmer.repo.host"
+LABEL_REPO_PROJECT = "io.lmer.repo.project"
+LABEL_RUN_SLUG = "io.lmer.run.slug"
+LABEL_PLATFORM_SESSION = "io.lmer.platform.session"
+#: Which platform started it, so two platforms sharing one runtime never
+#: adopt or remove each other's containers.
+LABEL_PLATFORM_INSTANCE = "io.lmer.platform.instance"
+
+
+def container_labels(
+    *,
+    repo_host: Optional[str],
+    repo_project: Optional[str],
+    run_slug: Optional[str],
+    platform_session: Optional[str],
+    platform_instance: Optional[str] = None,
+) -> List[str]:
+    """``--label`` arguments identifying a session container's run. Never a
+    secret: labels are readable by anyone who can list containers."""
+    labels = {
+        LABEL_MANAGED: "1",
+        LABEL_LAUNCHER: "platform" if platform_session else "cli",
+        LABEL_PLATFORM_INSTANCE: platform_instance,
+        LABEL_REPO_HOST: repo_host,
+        LABEL_REPO_PROJECT: repo_project,
+        LABEL_RUN_SLUG: run_slug,
+        LABEL_PLATFORM_SESSION: platform_session,
+    }
+    args: List[str] = []
+    for key, value in labels.items():
+        if value:
+            args += ["--label", f"{key}={value}"]
+    return args
+
+
+#: Longest name lmer gives a container: a DNS label's length, short enough for
+#: a ``ps`` column. Only the slug is ever cut.
+NAME_MAX = 63
+NAME_PREFIX = "lmer"
+#: Hex digits of a random name suffix (a CLI run's, and any retry's).
+NAME_RANDOM_HEX = 6
+#: Most hex digits a session id lends the suffix, so the cap holds for any id.
+NAME_SESSION_HEX_MAX = 12
+_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
+_TRAILING_HEX = re.compile(r"-([0-9a-fA-F]+)$")
+
+
+def _name_part(text: Optional[str]) -> str:
+    """*text* in the runtimes' name charset (``[a-zA-Z0-9][a-zA-Z0-9_.-]*``)."""
+    return re.sub(r"-{2,}", "-", _NAME_UNSAFE.sub("-", text or "")).strip("-_.")
+
+
+def container_name(
+    run_slug: Optional[str], platform_session: Optional[str] = None, *, retry: bool = False
+) -> str:
+    """The ``--name`` of a session container: ``lmer-<run slug>-<suffix>``.
+
+    The suffix is the platform session id's trailing hex, or random for a CLI run
+    and for a *retry* after a name conflict. With no slug a platform session is
+    ``lmer-<session id>``, a CLI run ``lmer-<suffix>``. For humans reading
+    ``ps``; lmer itself finds its containers by label and id.
+    """
+    head = _name_part(run_slug)
+    session = _name_part(platform_session)
+    match = _TRAILING_HEX.search(session)
+    if retry or not session or (head and not match):
+        suffix = secrets.token_hex(NAME_RANDOM_HEX // 2)
+    elif head:
+        suffix = match.group(1).lower()[-NAME_SESSION_HEX_MAX:]
+    else:
+        head, suffix = session, ""
+    if retry and not head:
+        head = session
+    room = NAME_MAX - len(NAME_PREFIX) - 1 - (len(suffix) + 1 if suffix else 0)
+    head = head[:room].rstrip("-_.")
+    return "-".join(part for part in (NAME_PREFIX, head, suffix) if part)
 
 
 def tty_flags() -> List[str]:
@@ -241,6 +363,7 @@ def apply_env_file_defaults(
     candidates: "list[tuple[str, Path]]",
     *,
     references_from_environ: bool = False,
+    only: "tuple[str, ...] | None" = None,
 ) -> "dict[str, str]":
     """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
 
@@ -256,8 +379,13 @@ def apply_env_file_defaults(
     behaviour somebody depends on. The referenced variable itself obeys
     first-wins either way, so only composed values differ.
 
+    *only* limits the load to those names. ``load_dotenv`` cannot be limited,
+    so it cannot be combined with *references_from_environ*.
+
     Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
     """
+    if only is not None and references_from_environ:
+        raise ValueError("only= cannot be combined with references_from_environ=True")
     sources: "dict[str, str]" = {}
     for location, env_file in candidates:
         if not env_file.exists():
@@ -272,6 +400,8 @@ def apply_env_file_defaults(
                 sources[key] = f".env ({location})"
             continue
         for key, value in dotenv_values(dotenv_path=str(env_file)).items():
+            if only is not None and key not in only:
+                continue
             if key not in os.environ and value is not None:
                 os.environ[key] = value
                 sources[key] = f".env ({location})"
@@ -577,6 +707,39 @@ def _resolve_gpu(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
     )
 
 
+#: The knob `gate-check --baseline` reads inside the session (#452). It rides
+#: the scoped ladder like the resources so it can be switched on per taskdef
+#: and per repository, and only the resolved value enters the container.
+GATE_CI_BASELINE_KNOB = "GATE_CI_BASELINE"
+GATE_CI_BASELINE_ENV = f"LMER_{GATE_CI_BASELINE_KNOB}"
+GATE_CI_BASELINE_HINT = "must be 1/true/yes or 0/false/no"
+
+
+def _valid_toggle(raw: str) -> str | None:
+    """``"1"`` or ``"0"`` for get_bool_env's spellings, None for anything else.
+
+    An explicit off is a value, not a blank: it answers its tier and stops
+    the walk, so ``LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE=0`` turns one
+    repository off under a general ``LMER_GATE_CI_BASELINE=1``.
+    """
+    value = raw.lower()
+    if value in TRUTHY_VALUES:
+        return "1"
+    if value in FALSY_VALUES:
+        return "0"
+    return None
+
+
+def resolve_gate_ci_baseline(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
+    """The session's ``LMER_GATE_CI_BASELINE`` (``"1"``/``"0"``) and its source."""
+    return _resolve_limit_env(
+        resource_env_names(GATE_CI_BASELINE_KNOB, scope),
+        "0",
+        _valid_toggle,
+        GATE_CI_BASELINE_HINT,
+    )
+
+
 def gpu_remediation(runtime: str) -> str:
     """Operator action for enabling NVIDIA GPU support on ``runtime``."""
     if runtime == "docker":
@@ -760,6 +923,75 @@ def _resource_limit_args(plan: "List[ResourceLimit]") -> List[str]:
     return [arg for limit in plan for arg in (limit.flag, limit.value)]
 
 
+def is_root_container_user(user: str) -> bool:
+    """Whether a --user spec (``name``, ``uid`` or ``uid:gid``) means uid 0."""
+    return user.split(":", 1)[0] in ("0", "root")
+
+
+#: The container user ``--root-userns`` selects: uid 0, which under the default
+#: rootless-podman map is the invoking host uid.
+ROOT_CONTAINER_USER = "0:0"
+
+
+def ambient_container_user() -> str:
+    """The container user a launch would resolve from the environment alone.
+
+    ``lmer build`` has no ``--user`` or ``--root-userns`` flag of its own, so
+    the env toggles are the only signal it has about whether the image it is
+    building will ever be run under keep-id — and pre-warming a mapping that
+    host has opted out of costs the very minutes this exists to remove
+    (!309 review). :func:`lmer_cli.cli._resolve_container_user` layers the
+    command-line flags on top of this.
+    """
+    if get_bool_env("LMER_ROOT_USERNS"):
+        return ROOT_CONTAINER_USER
+    return os.environ.get("LMER_CONTAINER_USER", "developer")
+
+
+def engine_is_rootless(runtime: str) -> bool | None:
+    """Whether the podman ENGINE that will run the container is rootless.
+
+    ``--root-userns``'s whole premise — container root IS the invoking host
+    uid — is a property of the engine, not of the client process. A non-root
+    client can be pointed at a **rootful** service (``CONTAINER_HOST``,
+    ``CONTAINER_CONNECTION``, ``--remote``, an ssh connection), where
+    container root is host root; a local euid check cannot see that
+    (!309 adversarial review, F1). ``podman info`` answers for whichever
+    engine the client is actually talking to, so ask it.
+
+    ``None`` means the question could not be answered — which a caller
+    gating a privilege opt-in must treat as "not established", never as yes.
+    """
+    try:
+        result = subprocess.run(
+            [runtime, "info", "--format", "{{.Host.Security.Rootless}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    answer = result.stdout.strip().lower()
+    if answer == "true":
+        return True
+    if answer == "false":
+        return False
+    return None
+
+
+def keep_id_applies(runtime: str, user: str) -> bool:
+    """Whether a launch with these settings pays podman's keep-id UID remap.
+
+    The single source of truth for the ``--userns=keep-id`` condition:
+    :func:`base_run_args` passes the flag on it and the launch notice fires on
+    it (issue #384), so the two cannot drift into warning about a remap that
+    will not happen, or staying silent about one that will.
+    """
+    return runtime == "podman" and not is_root_container_user(user)
+
+
 def base_run_args(
     runtime: str,
     exec_mode: bool,
@@ -768,10 +1000,15 @@ def base_run_args(
     gpu: "GPUGrant | None" = None,
 ) -> List[str]:
     """
-    Build base container run arguments.
+    Build base container create arguments.
+
+    The container is created detached and followed separately
+    (:mod:`lmer_cli.container_follow`), so its lifetime is never tied to a
+    client's terminal (#444). No ``--rm``: the exit code has to outlive the exit,
+    and the follower removes the container once it has read it.
 
     Includes:
-    - Runtime and run command
+    - Runtime and create command
     - TTY flags
     - Resource limits (CPU, memory, PIDs)
     - Security options
@@ -789,13 +1026,14 @@ def base_run_args(
     Returns:
         List of base Docker/Podman arguments
     """
-    args: List[str] = [runtime, "run", "--rm"]
+    args: List[str] = [runtime, "create"]
     # PID 1 init (tini): reap orphaned grandchildren and forward signals.
     # clone_and_exec.py runs the claude-runner as a child (session-end
     # backstop) instead of exec'ing it, so without an init the Python
     # process is PID 1 and zombies accumulate unreaped.
     args += ["--init"]
     args += tty_flags()
+    args += ["--stop-timeout", str(STOP_TIMEOUT_SECONDS)]
     args += ["--security-opt", "no-new-privileges"]
     # Disable SELinux labeling to allow SSH agent socket access
     # Container processes (container_t) cannot connect to user sockets (unconfined_t) by default
@@ -809,9 +1047,25 @@ def base_run_args(
     )
     if gpu is not None:
         args += list(gpu.args)
-    if runtime == "podman":
-        # Podman-specific: maintain user ID mapping for SSH agent and file permissions
+    if keep_id_applies(runtime, user):
+        # Podman-specific: maintain user ID mapping for SSH agent and file
+        # permissions. Only needed for a non-root container user: under the
+        # default rootless map container root already IS the invoking host
+        # uid, so bind-mount ownership lines up with no remap — and skipping
+        # keep-id avoids podman's whole-rootfs chown on a cold image
+        # (issue #351).
         args += ["--userns=keep-id"]
+    elif runtime == "podman":
+        # A root container user wants the *default* rootless map, and saying
+        # so has to be explicit: omitting --userns does not select the
+        # default, it defers to PODMAN_USERNS and then containers.conf's
+        # `userns` (podman-run(1), --userns). An ambient `keep-id` there
+        # would silently reinstate the whole-rootfs chown lmer has just
+        # announced it skipped, and map container root to a subordinate uid
+        # instead of the invoking one (!309 adversarial review, F2).
+        # `host` is podman's own name for that default, and a no-op under a
+        # rootful engine, which already runs in the host user namespace.
+        args += ["--userns=host"]
 
     # User and workdir
     args += ["--user", user, "-w", "/workspace"]
