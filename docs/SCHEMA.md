@@ -36,7 +36,7 @@ is not a final form.
   - [record](#record)
   - [agents](#agents)
   - [Supporting surfaces](#supporting-surfaces)
-- [The manifest: `_plexus.yaml`](#the-manifest-_plexusyaml) — top-level keys,
+- [The manifest: `_lmer.yaml`](#the-manifest-_lmeryaml) — top-level keys,
   [the registry](#the-registry),
   [project resolution and host buckets](#project-resolution-and-host-buckets),
   [sources](#sources), [housekeeping policy](#housekeeping-policy)
@@ -62,7 +62,7 @@ targets, nor lmer's own configuration outside the plexus.
 There is exactly **one** schema and **one** form. A plexus conforms to schema 1
 when:
 
-1. its root carries a `_plexus.yaml` manifest declaring `schema: 1`, and
+1. its root carries a `_lmer.yaml` manifest declaring `schema: 1`, and
 2. `lmer-schema validate` reports no findings at ERROR severity.
 
 Warnings and informational findings never affect conformance. A tree without a
@@ -107,7 +107,7 @@ layout property this document does not state.
 ## Layout
 
 ```
-_plexus.yaml              # the manifest: schema int, name, registry, sources, policy
+_lmer.yaml                # the manifest: schema int, name, registry, sources, policy
 _knowledge/               # instance wiki, org/topic directories
 _napkin/                  # transient scratch, org/topic directories
 _taskdef/                 # instance-level task definitions
@@ -133,7 +133,7 @@ README.md                 # content namespace (human); MAY carry the generated i
 ```
 
 Every directory in the tree above is OPTIONAL; the only required entry is the
-`_plexus.yaml` file. A plexus with one registry entry and a plexus with fifty
+`_lmer.yaml` file. A plexus with one registry entry and a plexus with fifty
 are the same form; there is no other.
 
 ## Ownership namespaces
@@ -298,7 +298,7 @@ mountable, not runtime plumbing.
   project's `gate-check.yaml`. Prose is unchecked; `gate-check.yaml` keeps its
   existing shape.
 
-## The manifest: `_plexus.yaml`
+## The manifest: `_lmer.yaml`
 
 The manifest is a YAML file at the plexus root. Its presence is what makes a
 tree schema form; its absence makes a tree legacy. The registry inside it is
@@ -437,7 +437,7 @@ rules, same resolution against the environment overrides (see
 
 - **The key set is the name's, not the section's.** `ref:` is `taskdef`'s
   alone — there is no `LMER_NAPKIN_REF` and nothing pins any other area to a
-  ref — so a `ref:` under any other name is an unknown key in `_plexus.yaml`
+  ref — so a `ref:` under any other name is an unknown key in `_lmer.yaml`
   (`manifest.unknown-key`, WARN) and a refuse-start error in a standalone
   `sources.yaml`.
 - A mounted repository's **root is the area**: a napkin repository's root is
@@ -448,7 +448,7 @@ rules, same resolution against the environment overrides (see
   the operator-controlled escape hatch. Declarations MUST NOT contain
   credentials.
 - **Precedence:** the container reads all three tiers — environment
-  overrides, then `_plexus.yaml sources:`, then a legacy standalone
+  overrides, then `_lmer.yaml sources:`, then a legacy standalone
   `sources.yaml` (recognised with a stale-legacy warning; retires when the
   tree migrates). See the tier table in
   [Canonical Source Declarations](./LMER-CLI.md#canonical-source-declarations-sourcesyaml).
@@ -494,7 +494,7 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
 ### Tool writes
 
 The registry writer (`lmer_schema.writer`) is the ONE tool that rewrites
-`_plexus.yaml`. It writes canonical remotes (the same normalizer resolution
+`_lmer.yaml`. It writes canonical remotes (the same normalizer resolution
 uses), checks the registry's invariants BEFORE anything reaches disk (a
 non-canonical spelling is a WARN, a remote bound twice is an error, and an
 unusable manifest is refused with the file byte-identical), and replaces the
@@ -621,7 +621,7 @@ importable core.
 
 **Exit codes** are the validator's own: `0` clean (warnings and informational
 findings allowed), `1` one or more errors, `2` unusable input — no such path, a
-`_plexus.yaml` that cannot be read, or a `schema:` this lmer does not support
+`_lmer.yaml` that cannot be read, or a `schema:` this lmer does not support
 (see [Top-level keys](#top-level-keys)). A misuse of the command is `2` as
 well: the exact command surface is the CLI reference's,
 [LMER-CLI.md](./LMER-CLI.md#validating-a-plexus-lmer-schema-validate).
@@ -722,7 +722,7 @@ memory scope) but never shape findings.
 
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
-| `_plexus.yaml` | operator; adoption tooling writes it in canonical form | YAML mapping per [The manifest](#the-manifest-_plexusyaml): `schema` integer, `name`, `projects`, `sources`, `housekeeping` | required | machine |
+| `_lmer.yaml` | operator; adoption tooling writes it in canonical form | YAML mapping per [The manifest](#the-manifest-_lmeryaml): `schema` integer, `name`, `projects`, `sources`, `housekeeping` | required | machine |
 | `<short-name>/` | operator or adoption tooling creates it; a session creates it on first write for a registered project | directory; name matches `[a-z0-9][a-z0-9_-]*`; SHOULD have a registry entry and a registry entry SHOULD have the directory (either mismatch is a warning) | optional | machine |
 | `_knowledge/` | humans and agents | directory of `<org>/<topic>/` directories | optional | free-form |
 | `_knowledge/<org>/<topic>/*.md` | humans and agents; promotion from napkin | free-form markdown | optional | free-form |
@@ -732,7 +732,7 @@ memory scope) but never shape findings.
 | `_taskdef/` | operator, or the root of a mounted taskdef repository | the task-definition contract of [TASKDEFS.md](./TASKDEFS.md); validated by the taskdef loader, not by `lmer-schema` | optional | opaque |
 | `_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `_archive/` | housekeeping tooling; connectors' `archive_plan` and `forget` | mirror: `_archive/<relative path>`. A **`_`-prefixed** first component MUST be an area of this scope — `_agents`, `_knowledge`, `_napkin`, `_taskdef` — and anything else `_`-prefixed is a broken mirror path (an error). A content-namespace first component (`README.md`, a project's short name) is mirrored content and is never a finding; archived contents are not re-validated | optional | machine |
-| `README.md` | humans outside the markers; `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block rendered from `_plexus.yaml` (project list) plus a fixed legend; a block that differs from a fresh render is a warning; a block of a newer format than the tool is left alone; text outside the markers is never checked | optional | machine (the block only) |
+| `README.md` | humans outside the markers; `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block rendered from `_lmer.yaml` (project list) plus a fixed legend; a block that differs from a fresh render is a warning; a block of a newer format than the tool is left alone; text outside the markers is never checked | optional | machine (the block only) |
 | any other top-level name | humans | content namespace, never checked; a `_`-prefixed name is a warning; a dotless directory that is project-shaped and unregistered is a warning; a dotted directory is a host bucket | optional | free-form |
 
 ### Project tree
@@ -837,8 +837,8 @@ registered. Keeping the two in step is part of the
 
 | code | severity | legacy | tier | reports |
 |---|---|---|---|---|
-| `manifest.absent` | INFO | | legacy | no `_plexus.yaml` at the plexus root: the tree is [legacy form](#legacy-form), recognised and read in place — never an error |
-| `manifest.unparseable` | ERROR | | machine | a present `_plexus.yaml` that cannot be read or interpreted: unusable input, and never a demotion to legacy |
+| `manifest.absent` | INFO | | legacy | no `_lmer.yaml` at the plexus root: the tree is [legacy form](#legacy-form), recognised and read in place — never an error |
+| `manifest.unparseable` | ERROR | | machine | a present `_lmer.yaml` that cannot be read or interpreted: unusable input, and never a demotion to legacy |
 | `manifest.schema-not-int` | ERROR | | machine | `schema:` is missing or is not an integer (a YAML bool is not one) |
 | `manifest.schema-newer` | ERROR | | machine | `schema:` is newer than this lmer understands; tools refuse to write, and the tree is unusable input |
 | `manifest.schema-unsupported` | ERROR | | machine | `schema:` is an integer no version of this lmer supports |
@@ -935,7 +935,7 @@ clock-free, and a block of a newer format than this tool is never judged.
 | `index.entry-without-file` | ERROR | WARN | machine | a `PLANS.md` entry whose linked plan file does not exist |
 | `index.file-without-entry` | WARN | | machine | a `<project>/_plans/<slug>.md` plan file that no `PLANS.md` line carries |
 | `index.readme-missing` | INFO | | machine | a project holding run records whose `README.md` carries no generated index block (`<!-- lmer:index:start -->` … `<!-- lmer:index:end -->`); the project's next durability push or `lmer-schema index --write` creates it; the detail says when a conflict-marker line in the hand text is what keeps the generator away |
-| `index.readme-stale` | WARN | | machine | a `README.md` generated index block that no longer matches a fresh render of the records under `_runs/` (or, at the plexus root, of `_plexus.yaml`), whose markers are malformed, or whose hand text holds a conflict-marker line the generator refuses to stage; a block of a newer format than this tool is left alone; warnings never block |
+| `index.readme-stale` | WARN | | machine | a `README.md` generated index block that no longer matches a fresh render of the records under `_runs/` (or, at the plexus root, of `_lmer.yaml`), whose markers are malformed, or whose hand text holds a conflict-marker line the generator refuses to stage; a block of a newer format than this tool is left alone; warnings never block |
 
 #### `runner.*` — the run itself
 
@@ -950,7 +950,7 @@ what keeps a short report from reading as a clean one.
 
 ## Versioning and change process
 
-The schema is versioned by the single integer `schema:` in `_plexus.yaml`.
+The schema is versioned by the single integer `schema:` in `_lmer.yaml`.
 Schema `1` is this document.
 
 - **Additive or loosening** changes — a new optional key, a new `_` name, a
@@ -1005,7 +1005,7 @@ issues; there is no further governance at schema 1.
 
 ## Legacy form
 
-A tree with no `_plexus.yaml` is a **legacy tree**. lmer detects the form by
+A tree with no `_lmer.yaml` is a **legacy tree**. lmer detects the form by
 manifest presence; in a legacy tree it resolves a project by its
 `{host}/{project}/` path, reads and writes every area in place at its bare
 name (`runs/`, `specs/`, `info/`, `memory/`, `napkin/`, `taskdef/`,
@@ -1095,8 +1095,8 @@ path is a `legacy`-tier row there, or a host bucket.
 
 | legacy (no manifest) | schema form | note |
 |---|---|---|
-| `sources.yaml` at the root | `_plexus.yaml` `sources:` | same shape and rules; the standalone file retires on migration |
-| (none) | `_plexus.yaml` `projects:` | the registry; identity moves out of paths |
+| `sources.yaml` at the root | `_lmer.yaml` `sources:` | same shape and rules; the standalone file retires on migration |
+| (none) | `_lmer.yaml` `projects:` | the registry; identity moves out of paths |
 | `{host}/{project}/` | `<short-name>/` | by registry entry; the old path survives only as a host bucket for unnamed work or as a compatibility symlink |
 | `{host}/{project}/runs/<slug>/` | `<project>/_runs/<slug>/<session-id>/` | a legacy run dir maps to its first session's id; the shared dir becomes one session dir |
 | `{host}/{project}/runs/<slug>--<name>/` | `<project>/_runs/<slug>/<session-id>--<name>/` | the name suffix moves onto the session dir |

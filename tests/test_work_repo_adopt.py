@@ -260,7 +260,7 @@ class TestPlan:
         head = _git(work, "rev-parse", "HEAD")
         rc, text = _render(work)
         assert rc == 0, text
-        assert f"_plexus.yaml: add projects.{NAME}" in text
+        assert f"_lmer.yaml: add projects.{NAME}" in text
         assert f"repo: {BUCKET}" in text
         assert f"git mv {BUCKET} {NAME}" in text
         assert "commit message:" in text
@@ -281,7 +281,7 @@ class TestPlan:
         assert plan.tracked is True and plan.link is None
         assert plan.fix_list == () and plan.blockers() == ()
         assert plan.records == ()
-        assert plan.git_paths() == ["_plexus.yaml", BUCKET, NAME]
+        assert plan.git_paths() == ["_lmer.yaml", BUCKET, NAME]
 
     def test_remotes_and_description_land_in_the_entry_canonically(self, work):
         plan = adopt.plan_adoption(
@@ -416,9 +416,9 @@ class TestBootstrap:
         assert rc == 0, text
         notice = [line for line in text.splitlines() if "BOOTSTRAP" in line]
         assert len(notice) == 1, text
-        assert "_plexus.yaml" in notice[0] and "schema form" in notice[0] and "D20" in notice[0]
+        assert "_lmer.yaml" in notice[0] and "schema form" in notice[0] and "D20" in notice[0]
         assert "name: work" in notice[0]  # the instance name create() will write
-        assert not (legacy_work / "_plexus.yaml").exists()
+        assert not (legacy_work / "_lmer.yaml").exists()
         assert _snapshot(legacy_work) == before
 
     def test_the_apply_bootstraps_through_writer_create(self, legacy_work, commits, monkeypatch):
@@ -432,7 +432,7 @@ class TestBootstrap:
         monkeypatch.setattr(schema_writer, "create", spy)
         rc, text = _render(legacy_work, bucket=LEGACY_BUCKET, name="lmer", apply=True)
         assert rc == 0, text
-        assert created == [(legacy_work / "_plexus.yaml", "work")]
+        assert created == [(legacy_work / "_lmer.yaml", "work")]
         assert "BOOTSTRAP" in text
         manifest = load_manifest(legacy_work)
         assert manifest is not None and manifest.schema == 1 and manifest.name == "work"
@@ -447,7 +447,7 @@ class TestBootstrap:
         # A launch against the repo URL resolves the flat dir by registry.
         hit = resolve_project_dir(legacy_work, f"https://{LEGACY_BUCKET}.git")
         assert hit.how == REGISTRY_HIT and hit.path == legacy_work / "lmer"
-        assert "_plexus.yaml: created" in commits[0].message
+        assert "_lmer.yaml: created" in commits[0].message
 
     def test_a_refused_registration_after_create_rolls_the_bootstrap_back(self, legacy_work, commits, monkeypatch):
         def refuse(self, *args, **kwargs):
@@ -457,7 +457,7 @@ class TestBootstrap:
         before = _snapshot(legacy_work)
         rc, text = _render(legacy_work, bucket=LEGACY_BUCKET, name="lmer", apply=True)
         assert rc == 1 and "refused on purpose" in text and "nothing was changed" in text
-        assert not (legacy_work / "_plexus.yaml").exists()
+        assert not (legacy_work / "_lmer.yaml").exists()
         assert _snapshot(legacy_work) == before
         assert commits == []
 
@@ -486,13 +486,13 @@ class TestApply:
         status = _git(work, "status", "--porcelain")
         assert all(line[1] == " " for line in status.splitlines()), status
         assert f"R  {BUCKET}/_info/important.md -> {NAME}/_info/important.md" in status
-        assert "M  _plexus.yaml" in status
+        assert "M  _lmer.yaml" in status
         assert len(commits) == 1
         call = commits[0]
         assert call.message.startswith(f"work adopt {NAME}: {BUCKET} -> {NAME}/ (repo {BUCKET})")
         assert f"git mv {BUCKET} {NAME}" in call.message
         assert f"projects.{NAME}.repo: {BUCKET}" in call.message
-        assert call.paths[:3] == ["_plexus.yaml", BUCKET, NAME]
+        assert call.paths[:3] == ["_lmer.yaml", BUCKET, NAME]
 
     def test_the_manifest_is_written_only_through_the_writer(self, work, commits, monkeypatch):
         calls = []
@@ -542,7 +542,7 @@ class TestApply:
         assert subjects[-1] == "fixture"  # `git mv` kept the file's history
         assert subjects[0].startswith(f"work adopt {NAME}")
         shown = _git(root, "show", "--name-status", "--format=", "HEAD")
-        assert "M\t_plexus.yaml" in shown
+        assert "M\t_lmer.yaml" in shown
         assert f"R100\t{BUCKET}/_info/important.md\t{NAME}/_info/important.md" in shown
         assert validate(root).errors == ()
 
@@ -601,7 +601,7 @@ class TestApply:
         assert rc == 0
         assert "no session record here" in text
         assert f"git mv {BUCKET} {NAME}" in commits[0].message
-        assert commits[0].paths == ["_plexus.yaml", BUCKET, NAME]
+        assert commits[0].paths == ["_lmer.yaml", BUCKET, NAME]
 
 
 def _raise_writer(name):
@@ -755,7 +755,7 @@ class TestRefusals:
         self._refusal_leaves_everything(work, commits, "bound", remotes=(bound,))
 
     def test_the_buckets_own_remote_registered_elsewhere_is_a_split_tree(self, work, commits):
-        manifest = work / "_plexus.yaml"
+        manifest = work / "_lmer.yaml"
         # The fixture's `projects:` section ends where `sources:` begins.
         head, sep, tail = manifest.read_text(encoding="utf-8").partition("sources:")
         manifest.write_text(head + f"  gadgets:\n    repo: {BUCKET}\n" + sep + tail, encoding="utf-8")
@@ -779,7 +779,7 @@ class TestRefusals:
         assert "origin" in str(excinfo.value) and "not a repository URL" in str(excinfo.value)
 
     def test_a_newer_schema_int_is_not_writable(self, work, commits):
-        manifest = work / "_plexus.yaml"
+        manifest = work / "_lmer.yaml"
         manifest.write_text(manifest.read_text(encoding="utf-8").replace("schema: 1 ", "schema: 99"), encoding="utf-8")
         _commit_all(work, "a newer lmer wrote this manifest")
         with pytest.raises(adopt.AdoptError) as excinfo:
@@ -788,7 +788,7 @@ class TestRefusals:
         self._refusal_leaves_everything(work, commits, "not writable")
 
     def test_a_symlinked_manifest_is_not_writable(self, work, commits):
-        manifest = work / "_plexus.yaml"
+        manifest = work / "_lmer.yaml"
         real = work / "manifest-elsewhere.yaml"
         real.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
         manifest.unlink()
@@ -813,11 +813,11 @@ class TestRefusals:
         assert "notes.txt" in _git(work, "status", "--porcelain")
 
     def test_a_dirty_manifest_refuses_the_apply(self, work, commits):
-        manifest = work / "_plexus.yaml"
+        manifest = work / "_lmer.yaml"
         manifest.write_text(manifest.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
         before = _snapshot(work)
         rc, text = _render(work, apply=True)
-        assert rc == 1 and "dirty" in text and "_plexus.yaml" in text
+        assert rc == 1 and "dirty" in text and "_lmer.yaml" in text
         assert _snapshot(work) == before
         assert commits == []
 
@@ -861,17 +861,17 @@ class TestCliSeam:
 
     def test_write_rel_paths_names_the_manifest_both_paths_and_the_callers_run(self, work, monkeypatch):
         assert adopt.write_rel_paths(SimpleNamespace(bucket=BUCKET, name=NAME, apply=True)) == [
-            "_plexus.yaml", BUCKET, NAME,
+            "_lmer.yaml", BUCKET, NAME,
         ]
         monkeypatch.setattr(run_state, "run_rel_path_candidates", lambda *a, **k: ["lmer/_runs/chat"])
         assert adopt.write_rel_paths(SimpleNamespace(bucket=BUCKET, name=NAME, apply=True)) == [
-            "_plexus.yaml", BUCKET, NAME, "lmer/_runs/chat",
+            "_lmer.yaml", BUCKET, NAME, "lmer/_runs/chat",
         ]
 
     @pytest.mark.parametrize("bucket", ["../etc", "/abs/path", "lmer", "gitlab.example.com", "", None])
     def test_write_rel_paths_drops_a_malformed_bucket_and_name(self, work, bucket):
         assert adopt.write_rel_paths(SimpleNamespace(bucket=bucket, name="Bad.Name", apply=True)) == [
-            "_plexus.yaml",
+            "_lmer.yaml",
         ]
 
     def test_cmd_adopt_dry_run_prints_the_plan(self, work, capsys):

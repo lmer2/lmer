@@ -230,7 +230,7 @@ class TestRunsBaseRoutesByForm:
     ):
         """D20: no fallback to `{host}/{project}/runs/` — that is the split
         tree the validator flags, written one record at a time."""
-        (schema_tree.root / "_plexus.yaml").write_text(
+        (schema_tree.root / "_lmer.yaml").write_text(
             "schema: 1\nname: example\nprojects: [oops\n", encoding="utf-8"
         )
         _set_tree_context(monkeypatch, schema_tree)

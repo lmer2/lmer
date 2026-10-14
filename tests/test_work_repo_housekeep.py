@@ -24,7 +24,7 @@ def _args(**over):
 
 
 def _manifest_with(root, housekeeping):
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         "schema: 2\nname: example\nprojects:\n  lmer:\n"
         "    repo: gitlab.example.com/group/project\n"
         f"housekeeping:\n{housekeeping}"

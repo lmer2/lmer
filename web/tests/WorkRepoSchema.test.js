@@ -146,13 +146,13 @@ it('says an empty list is a clean tree', async () => {
 
 it('shows `unusable` in the header when the manifest could not be read', async () => {
   const reply = structuredClone(schemaGolden)
-  reply.document.unusable = 'plexus.yaml: not a mapping'
+  reply.document.unusable = '_lmer.yaml: not a mapping'
   reply.document.exit_code = 2
   fetchWorkRepoSchema.mockResolvedValue(reply)
   const wrapper = await mountApp(state('schema'))
   const header = wrapper.getComponent(ValidatorFindings).get('.findings-header')
   expect(header.text()).toContain('unusable')
-  expect(header.text()).toContain('plexus.yaml: not a mapping')
+  expect(header.text()).toContain('_lmer.yaml: not a mapping')
 })
 
 it('shows a failed read rather than empty panels', async () => {

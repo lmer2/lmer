@@ -152,7 +152,7 @@ def test_apply_from_a_bare_shell_is_not_refused_by_the_uid_gate(
     monkeypatch.delenv("LMER_SESSION_ID", raising=False)
     assert _run_cli(monkeypatch, ["adopt", BUCKET, NAME, "--apply"]) == 0
     # The gate only engages on a schema-2 tree; `adopt` bootstraps schema 1.
-    manifest = legacy_work / "_plexus.yaml"
+    manifest = legacy_work / "_lmer.yaml"
     manifest.write_text(
         manifest.read_text(encoding="utf-8").replace("schema: 1", "schema: 2", 1),
         encoding="utf-8",

@@ -56,7 +56,7 @@ Three levels of "something is too broken to continue", deliberately distinct:
 1. **No tree.** The target is not a directory: one ``runner.no-such-path``
    error, the report is unusable (exit 2) and NO check runs. There is nothing
    to say anything about.
-2. **An unusable manifest.** A present-but-broken ``_plexus.yaml``, or one
+2. **An unusable manifest.** A present-but-broken ``_lmer.yaml``, or one
    declaring a ``schema:`` int newer than this lmer understands, is unusable
    input (exit 2) — the manifest check marks it so. The runner then STOPS:
    the downstream checks do NOT run against an empty registry. Running them

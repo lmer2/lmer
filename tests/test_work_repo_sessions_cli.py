@@ -124,7 +124,7 @@ def _bare_schema_tree(monkeypatch, tmp_path, session=None, name="plexus-bare"):
     """A schema tree whose registered project has no run records yet."""
     root = tmp_path / name
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         f"schema: 1\nname: example\nprojects:\n  {PROJECT}:\n"
         f"    repo: {PRIMARY_REPO}\n",
         encoding="utf-8",
@@ -931,7 +931,7 @@ def _unreadable_manifest_tree(monkeypatch, tmp_path, body, *, context=True):
     """A schema tree whose manifest this build cannot use."""
     root = tmp_path / "plexus-broken"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(body, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(body, encoding="utf-8")
     host, path = PRIMARY_REPO.split("/", 1)
     if context:
         _set_context(monkeypatch, root, host=host, project=path, session=SID_RESUMED)
@@ -961,7 +961,7 @@ class TestTheRefusalNamesTheCause:
         root = _unreadable_manifest_tree(monkeypatch, tmp_path, _UNUSABLE_MANIFEST)
         assert _main(["state", "set", "--phase=implement"]) == 1
         err = capsys.readouterr().err
-        assert str(root / "_plexus.yaml") in err.split("No run context:")[1]
+        assert str(root / "_lmer.yaml") in err.split("No run context:")[1]
         assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
 
     @pytest.mark.parametrize(
@@ -981,7 +981,7 @@ class TestTheRefusalNamesTheCause:
         assert _main(argv) == 1
         err = capsys.readouterr().err
         assert "No run context:" in err
-        assert str(root / "_plexus.yaml") in err
+        assert str(root / "_lmer.yaml") in err
         assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
 
     def test_unset_context_still_blames_the_environment(
@@ -1027,7 +1027,7 @@ class TestTheRefusalNamesTheCause:
         payload = json.loads(capsys.readouterr().out)
         assert payload["form"] == "schema"
         assert payload["sessions"] == []
-        assert str(root / "_plexus.yaml") in payload["detail"]
+        assert str(root / "_lmer.yaml") in payload["detail"]
 
     def test_the_hook_facing_start_names_it_where_the_reader_looks(
         self, monkeypatch, tmp_path, capsys
@@ -1046,7 +1046,7 @@ class TestTheRefusalNamesTheCause:
         root = _unreadable_manifest_tree(monkeypatch, tmp_path, _UNUSABLE_MANIFEST)
         assert _main(["session-start"]) == 0
         out = capsys.readouterr().out
-        assert str(root / "_plexus.yaml") in out
+        assert str(root / "_lmer.yaml") in out
         assert "LMER_REPO_HOST" not in out
 
     def test_the_hook_facing_start_still_blames_unset_context_when_it_is(

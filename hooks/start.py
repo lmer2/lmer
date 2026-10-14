@@ -152,7 +152,7 @@ def _plexus_project_dir(work_root):
     """Schema-form project dir for the launch's repo: ``(dir, problem)``.
 
     Form detection is manifest presence (spec D20): with no
-    ``{work_root}/_plexus.yaml`` the tree is legacy and ``(None, None)`` is
+    ``{work_root}/_lmer.yaml`` the tree is legacy and ``(None, None)`` is
     returned without reading anything. In schema form the launch's repo —
     ``LMER_REPO_URL``, else ``https://{LMER_REPO_HOST}/{LMER_REPO_PROJECT}``
     — is normalized and looked up across every registry entry's ``repo:``
@@ -175,7 +175,7 @@ def _plexus_project_dir(work_root):
     A missing ``projects:`` is an empty registry, not a problem; an entry
     that is not a mapping is skipped (the validator's complaint, D19).
     """
-    manifest = work_root / "_plexus.yaml"
+    manifest = work_root / "_lmer.yaml"
     if not manifest.exists():
         return None, None
     try:
@@ -218,7 +218,7 @@ def _plexus_project_dir(work_root):
 
 
 def plexus_manifest_problem():
-    """Why ``{LMER_WORK_REPO_PATH}/_plexus.yaml`` cannot be used, or None.
+    """Why ``{LMER_WORK_REPO_PATH}/_lmer.yaml`` cannot be used, or None.
 
     The reason string ``_plexus_project_dir`` fails closed on, surfaced
     for callers that report rather than resolve: None when there is no
@@ -241,12 +241,12 @@ def work_repo_taskdef_dirs():
     Looks up:
       1. {LMER_WORK_REPO_PATH}/<shortname>/_taskdef/
          (project-scoped, schema form — <shortname> comes from the
-         ``_plexus.yaml`` registry via _plexus_project_dir(); absent when
+         ``_lmer.yaml`` registry via _plexus_project_dir(); absent when
          the tree is legacy or the repo is unregistered)
       2. {LMER_WORK_REPO_PATH}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}/taskdef/
          (project-scoped, legacy {host}/{project} — the host bucket an
          unnamed repo's work lives in, spec D9)
-      Both project tiers are dropped when a ``_plexus.yaml`` is present
+      Both project tiers are dropped when a ``_lmer.yaml`` is present
       but unusable (fail-closed, plan T6 — see _plexus_project_dir();
       plexus_manifest_problem() says why).
       3. {LMER_WORK_REPO_PATH}/_taskdef/ then {LMER_WORK_REPO_PATH}/taskdef/
@@ -429,7 +429,7 @@ def _shadow_tier_label(search_dir):
 
     Vocabulary — one unambiguous label per shadowing tier:
       - "work-repo project tier"  {work_repo}/<shortname>/_taskdef (schema
-        form, via the _plexus.yaml registry) or the legacy
+        form, via the _lmer.yaml registry) or the legacy
         {work_repo}/{host}/{project}/taskdef — either name of either root
       - "work-repo global tier"   {work_repo}/_taskdef or {work_repo}/taskdef
       - "LMER_TASKDEF_PATHS entry <dir>" for an earlier PATHS entry; the
@@ -536,13 +536,13 @@ def taskdef_shadow_warning_lines():
 
 
 def plexus_manifest_warning_lines():
-    """Warning line for a work-repo ``_plexus.yaml`` that is present but
+    """Warning line for a work-repo ``_lmer.yaml`` that is present but
     unusable — the fail-closed case of _plexus_project_dir(), which drops
     the whole project taskdef tier (schema AND legacy) rather than
     demoting the tree to legacy form (plan T6). One greppable line:
 
       ⚠️  PLEXUS MANIFEST: <path> present but unusable (<reason>);
-      project taskdef tier skipped — fix _plexus.yaml
+      project taskdef tier skipped — fix _lmer.yaml
 
     Same slot and posture as taskdef_shadow_warning_lines(): advisory,
     never alters the render, [] whenever there is nothing to say (no work
@@ -553,10 +553,10 @@ def plexus_manifest_warning_lines():
     problem = plexus_manifest_problem()
     if problem is None:
         return []
-    manifest = Path(os.environ.get("LMER_WORK_REPO_PATH", "")) / "_plexus.yaml"
+    manifest = Path(os.environ.get("LMER_WORK_REPO_PATH", "")) / "_lmer.yaml"
     return [
         f"⚠️  PLEXUS MANIFEST: {manifest} present but unusable ({problem}); "
-        "project taskdef tier skipped — fix _plexus.yaml"
+        "project taskdef tier skipped — fix _lmer.yaml"
     ]
 
 
@@ -871,7 +871,7 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
     # `taskdef source:` banner below the separator — impossible to miss,
     # and directly under the Location line they explain. Advisory only:
     # never alters the render, never returns False. Empty for legacy
-    # sessions (no LMER_TASKDEF_REPO, no _plexus.yaml), keeping their
+    # sessions (no LMER_TASKDEF_REPO, no _lmer.yaml), keeping their
     # output byte-identical. The manifest line comes first: a skipped
     # project tier explains any shadow reported after it.
     for line in plexus_manifest_warning_lines() + taskdef_shadow_warning_lines():

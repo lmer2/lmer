@@ -291,7 +291,7 @@ specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receip
   In a legacy tree the label is the run's name, slug when unnamed, and one
   target has one run directory — so distinct (run, spec) pairs never
   collide and entry names are exactly what they have always been. In a
-  **schema-form** tree (`_plexus.yaml`; see `docs/SCHEMA.md`) the session is
+  **schema-form** tree (`_lmer.yaml`; see `docs/SCHEMA.md`) the session is
   the unit of record, one `_runs/<slug>/` group holds several independent
   launches, and the label carries the launch's session id as well:
   `2026-07-15-gate-receipts-20260715-101500-1-11111--spec.md`. That suffix

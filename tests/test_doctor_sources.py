@@ -9,7 +9,7 @@ clone dir uses the existing LMER_DOCTOR_TASKDEF_DIR seam. One case drives
 the REAL helper end-to-end (LMER_PYTHON unset, PYTHONPATH=src/).
 
 The section also reports which declaration tier is in effect per source
-(spec §4 / issue #370: env override > `_plexus.yaml sources:` > legacy
+(spec §4 / issue #370: env override > `_lmer.yaml sources:` > legacy
 `sources.yaml`), resolved by the helper's `doctor` document (`tiers`) — never
 by shell-side YAML. A legacy file in effect is a WARN, so cases that put one
 in place assert on `_finding_warns` (the tier line excluded) rather than
@@ -54,9 +54,9 @@ WORK_REPO_URL = f"https://oauth2:{WORK_REPO_TOKEN}@git.example.com/group/work.gi
 # when the legacy standalone file is the tier in effect, the PASS it prints
 # when the manifest tier is, and the pre-loader wording that must be gone
 # now that the manifest tier is loaded (issue #370).
-PRECEDENCE_RULE = "env override > _plexus.yaml sources: > legacy sources.yaml"
+PRECEDENCE_RULE = "env override > _lmer.yaml sources: > legacy sources.yaml"
 LEGACY_TIER_WARN = "legacy sources.yaml tier in effect"
-MANIFEST_TIER_PASS = "_plexus.yaml sources: tier in effect"
+MANIFEST_TIER_PASS = "_lmer.yaml sources: tier in effect"
 DECLARED_ONLY = "declared-only"
 
 # Tree shapes for the real-helper cases. The manifest declares taskdef; the
@@ -142,7 +142,7 @@ def _helper_doc(clone_url, *, ref="main", repo=DECLARED_REPO, mode="https-userin
     """Canned `sources doctor --json --emit-clone-urls` document (frozen seam).
 
     `tier` is what the helper's `tiers` map says taskdef resolved from —
-    `legacy` (sources.yaml) or `manifest` (`_plexus.yaml sources:`).
+    `legacy` (sources.yaml) or `manifest` (`_lmer.yaml sources:`).
     """
     return {
         "ok": ok,
@@ -766,7 +766,7 @@ class TestDoctorDeclaredSources:
         if tree == "both":
             (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
         if tree in ("manifest", "both"):
-            (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+            (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         proc = _run_real_doctor(tmp_path, work)
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
@@ -801,7 +801,7 @@ class TestDoctorDeclaredSources:
 
 
 # ---------------------------------------------------------------------------
-# Sources precedence (spec §4): env override > _plexus.yaml sources: > legacy
+# Sources precedence (spec §4): env override > _lmer.yaml sources: > legacy
 # ---------------------------------------------------------------------------
 
 # A credentialed override value: doctor may name the VARIABLE, never its value.
@@ -954,14 +954,14 @@ class TestDoctorSourcesPrecedence:
     def test_manifest_sources_are_loaded_and_named_as_the_tier_in_effect(
         self, tmp_path
     ):
-        """_plexus.yaml sources: with no legacy file → the manifest tier is
+        """_lmer.yaml sources: with no legacy file → the manifest tier is
         in effect: the helper-backed reachability check runs against it and
         every pass line names the tier. (The inverse of the pre-loader case,
         which asserted 'declared-only' and that git was never called.)
         """
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO, tier="manifest"))
         git_dir = _write_fake_git(tmp_path, GIT_OK_MAIN)
         proc = _run_doctor(
@@ -973,7 +973,7 @@ class TestDoctorSourcesPrecedence:
         (tier_line,) = [line for line in block.splitlines() if MANIFEST_TIER_PASS in line]
         assert PASS_MARK in tier_line
         assert "for: taskdef" in tier_line
-        assert f"{work}/_plexus.yaml" in tier_line
+        assert f"{work}/_lmer.yaml" in tier_line
         assert PRECEDENCE_RULE in tier_line
         assert (
             f"taskdef source reachable: {DECLARED_REPO} "
@@ -994,7 +994,7 @@ class TestDoctorSourcesPrecedence:
         came from — the manifest, not the (absent) legacy file."""
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         stub = _write_stub_python(tmp_path, _helper_doc(DECLARED_REPO, tier="manifest"))
         git_dir = _write_fake_git(tmp_path, GIT_OK_OTHER_REFS)
         proc = _run_doctor(
@@ -1005,7 +1005,7 @@ class TestDoctorSourcesPrecedence:
         (warn,) = _warn_lines(_declared_sources_block(proc.stdout))
         assert "taskdef ref 'main' not found on" in warn
         assert "(tier: manifest)" in warn
-        assert f"fix sources.taskdef.ref in {work}/_plexus.yaml" in warn
+        assert f"fix sources.taskdef.ref in {work}/_lmer.yaml" in warn
 
     def test_both_tiers_report_manifest_for_the_outranked_key_and_the_stale_warn(
         self, tmp_path
@@ -1018,7 +1018,7 @@ class TestDoctorSourcesPrecedence:
         """
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
         proc = _run_real_doctor(tmp_path, work)
         assert proc.returncode != 2, proc.stderr
@@ -1033,7 +1033,7 @@ class TestDoctorSourcesPrecedence:
         (stale_warn,) = [w for w in warns if "stale" in w]
         assert "taskdef" in stale_warn
         assert f"{work}/sources.yaml" in stale_warn
-        assert f"{work}/_plexus.yaml" in stale_warn
+        assert f"{work}/_lmer.yaml" in stale_warn
         assert len(warns) == 2, block
         assert (
             f"taskdef source reachable: {DECLARED_REPO} "
@@ -1049,21 +1049,21 @@ class TestDoctorSourcesPrecedence:
         assert WORK_REPO_TOKEN not in proc.stdout + proc.stderr
 
     def test_broken_manifest_is_a_warning_naming_the_file(self, tmp_path):
-        """Real helper: a broken _plexus.yaml is the helper's refusal document
+        """Real helper: a broken _lmer.yaml is the helper's refusal document
         (exit 2 there), surfaced as ONE WARN naming the file — never an error,
         so doctor exits exactly as it does on an empty work root."""
         empty = tmp_path / "empty-work"
         empty.mkdir()
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text("projects: [broken\n")
+        (work / "_lmer.yaml").write_text("projects: [broken\n")
         baseline = _run_real_doctor(tmp_path, empty)
         proc = _run_real_doctor(tmp_path, work)
         assert baseline.returncode != 2, baseline.stderr
         assert proc.returncode == baseline.returncode, proc.stdout
         block = _declared_sources_block(proc.stdout)
         (warn,) = _warn_lines(block)
-        assert f"{work}/_plexus.yaml" in warn
+        assert f"{work}/_lmer.yaml" in warn
         assert "unparseable" in warn
         assert "PyYAML" not in warn
         assert "✗" not in block
@@ -1075,28 +1075,28 @@ class TestDoctorSourcesPrecedence:
         lmer-schema core)."""
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         proc = _run_real_doctor(tmp_path, work, no_yaml=True)
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
         (warn,) = _warn_lines(block)
         assert "PyYAML" in warn
-        assert f"{work}/_plexus.yaml" in warn
+        assert f"{work}/_lmer.yaml" in warn
         assert "unparseable" not in warn
         assert "lmer_schema" not in warn
         assert "source reachable" not in block
 
     def test_manifest_without_sources_section_is_silent(self, tmp_path):
-        """Real helper: a _plexus.yaml with no sources: key is not a
+        """Real helper: a _lmer.yaml with no sources: key is not a
         declaration — the section keeps the silent-legacy skip note."""
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text("schema: 1\nname: example\n")
+        (work / "_lmer.yaml").write_text("schema: 1\nname: example\n")
         proc = _run_real_doctor(tmp_path, work)
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
         assert _warn_lines(block) == [], block
-        assert "_plexus.yaml" not in block
+        assert "_lmer.yaml" not in block
         assert "silent legacy mode" in block
         assert _git_invocations(tmp_path) == []
 
@@ -1124,7 +1124,7 @@ class TestDoctorSourcesPrecedence:
         PyYAML-missing and manifest-unreadable."""
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         proc = _run_doctor(
             work=work, taskdef_dir=tmp_path / "no-taskdef",
             lmer_python="/bin/false",
@@ -1132,7 +1132,7 @@ class TestDoctorSourcesPrecedence:
         assert proc.returncode != 2, proc.stderr
         block = _declared_sources_block(proc.stdout)
         (warn,) = _warn_lines(block)
-        assert "_plexus.yaml present" in warn
+        assert "_lmer.yaml present" in warn
         assert "sources helper is unavailable" in warn
         assert "declared sources unchecked" in warn
         assert "no sources.yaml at" not in block
@@ -1149,11 +1149,11 @@ class TestDoctorSourcesPrecedence:
         empty.mkdir()
         work = tmp_path / "work"
         work.mkdir()
-        (work / "_plexus.yaml").write_text(PLEXUS_WITH_SOURCES)
+        (work / "_lmer.yaml").write_text(PLEXUS_WITH_SOURCES)
         (work / "sources.yaml").write_text(LEGACY_WITH_BOTH)
         stale = (
             f"{work}/sources.yaml: `sources.taskdef` is also declared in "
-            f"{work}/_plexus.yaml, which takes precedence; the sources.yaml "
+            f"{work}/_lmer.yaml, which takes precedence; the sources.yaml "
             "entry is stale and ignored — remove it"
         )
         doc = _helper_doc(DECLARED_REPO, tier="manifest", warnings=[stale])

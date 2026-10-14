@@ -21,7 +21,7 @@ or pushes. Legacy layout adoption remains separate.
 
 ``index <path> [--write] [--diff] [--json]`` renders the generated README
 index blocks (the legible-work-repo design): the root ``README.md``'s project
-list from ``_plexus.yaml`` and every project README's run table from the
+list from ``_lmer.yaml`` and every project README's run table from the
 records under ``_runs/``, through the kernel every durability push uses
 (``work_repo.project_index``, imported lazily inside the functions — the
 import direction is ``work_repo -> lmer_schema``). A dry run prints one

@@ -15,7 +15,7 @@ changed:
 - "on a schema-2 tree a finished record's resume brief names the continuation route (`lmer <taskdef> [<target>] --source-session <uid>`, target shell-quoted) instead of the schema-1 reopen, and the write refusal names the same route (#437)"
 - "a resume brief shows `(dir: <dir>)` when a post-freeze `work name` left the directory's `--<name>` suffix stale; `work name` on a frozen record says the directory will not be renamed; `run-state:` commit subjects carry the record's name label (#536)"
 - "on schema 2 a name is a label: two continuations of one source may carry the same label, and `work name`, `work seed --name` and a launch `--name` no longer refuse a label another record holds (#536)"
-- "`lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_plexus.yaml` is cached (#370)"
+- "`lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_lmer.yaml` is cached (#370)"
 fixed:
 - "answering an adopted plain-project run that needs both a repository URL and unsigned-source confirmation no longer loops between the two refusals; each retry now carries both options forward (#536)"
 - "`work commit` and `work session-end` now publish a record `work seed` wrote into another group; previously it was reported as a stray and left unpublished (#535)"

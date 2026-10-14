@@ -34,7 +34,7 @@ def test_package_imports_cleanly():
 #: deliberate change of this list — never a side effect of an edit inside a
 #: submodule.
 PUBLIC_SURFACE = [
-    # lmer_schema.manifest — the _plexus.yaml envelope
+    # lmer_schema.manifest — the _lmer.yaml envelope
     "CURRENT_SCHEMA",
     "MANIFEST_NAME",
     "SUPPORTED_SCHEMAS",
@@ -73,7 +73,7 @@ PUBLIC_SURFACE = [
     "detect_form",
     "find_plexus_root",
     "has_manifest",
-    # lmer_schema.writer — the _plexus.yaml write API (issue #366)
+    # lmer_schema.writer — the _lmer.yaml write API (issue #366)
     "ManifestWriter",
     "WriterError",
     "create",

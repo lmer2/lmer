@@ -468,7 +468,7 @@ LATER_SESSION_ID = "20260825-090000-2-31300"
 
 def plant_schema_two_question(config, *, signed_out=False):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
     )
     source = plant_run(
@@ -601,7 +601,7 @@ REPO = "https://gitlab.example.com/agents/global"
 
 def plant_schema_two_manifest(config):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
     )
 
@@ -878,7 +878,7 @@ def test_the_registrys_identity_spelling_is_refused_as_a_transport(config):
     folds to the run's own project through the registry, but nothing can
     clone from it."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 2\nname: example-plexus\nprojects:\n  global:\n"
         f"    repo: {HOST}/{PROJECT}\n",
         encoding="utf-8",

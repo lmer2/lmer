@@ -487,7 +487,7 @@ WIDGETS_SESSION_ID = "20260824-165230-2-31245"
 def _register_widgets(config):
     """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 1,
             "name": "example-plexus",
@@ -1485,7 +1485,7 @@ def test_a_fleet_poll_records_no_check_in(platform_root):
 # The daemon reads the operator's own taskdefs off its mirror (T73) by resolving
 # the project dir and joining the taskdef tier onto it. The work repo holds two
 # shapes at once (D16/D20), so "the project dir" has two answers: the registered
-# SHORT NAME the ``_plexus.yaml`` registry binds this repo to (D7/D8), and — for
+# SHORT NAME the ``_lmer.yaml`` registry binds this repo to (D7/D8), and — for
 # a repo nobody has named yet, or a tree with no manifest at all — the
 # ``{host}/{project}`` host bucket that has always held it (D9). Both are
 # offered, schema name first, exactly as the container's own resolver
@@ -1519,8 +1519,8 @@ def mirror(platform_root):
 
 
 def _plant_manifest(mirror, projects, *, name="example-plexus"):
-    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
-    (mirror / "_plexus.yaml").write_text(
+    """A ``_lmer.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    (mirror / "_lmer.yaml").write_text(
         yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
         encoding="utf-8",
     )
@@ -1611,7 +1611,7 @@ def test_an_unusable_manifest_drops_the_project_tiers_not_the_global_one(
     one-character typo must never quietly point the search back at the
     pre-migration bucket, which is the silent demotion the second form exists to
     make impossible. The global tier is not a project claim, so it stays."""
-    (mirror / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    (mirror / "_lmer.yaml").write_text("projects: [", encoding="utf-8")
     plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "schema-tier")
     plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "bucket-tier")
     plant_taskdefs(mirror / "_taskdef", "global-tier")
@@ -1920,7 +1920,7 @@ UID_PROJECT = ("gitlab.example.com", "acme/widgets")
 
 def _plant_uid_group(config):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 2, "name": "example-plexus",
             "projects": {"widgets": {"repo": "ssh://git@gitlab.example.com/acme/widgets.git"}},

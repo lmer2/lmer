@@ -34,7 +34,7 @@ def _git(root, *args, env=None):
 def _build(tmp_path, *, line="done", commit_date="2026-01-01T00:00:00Z",
            plan="done-plan.md", body="# Done plan\n"):
     tree = build_schema2_plexus(tmp_path / "plexus")
-    (tree.root / "_plexus.yaml").write_text(MANIFEST)
+    (tree.root / "_lmer.yaml").write_text(MANIFEST)
     plans = tree.project_dir() / "_plans"
     plans.mkdir(parents=True, exist_ok=True)
     (plans / plan).write_text(body)
@@ -107,7 +107,7 @@ def test_prose_or_a_residue_done_word_is_not_archived(tmp_path, line):
 
 def test_null_disables_the_area(tmp_path):
     tree = _build(tmp_path)
-    (tree.root / "_plexus.yaml").write_text(
+    (tree.root / "_lmer.yaml").write_text(
         MANIFEST.replace("archive_after: 30d", "archive_after: null")
     )
     assert [a for a in _plan(tree).actions if a.kind == "move"] == []

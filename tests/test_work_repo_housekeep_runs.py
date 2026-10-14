@@ -282,7 +282,7 @@ class TestLegacyRuns:
         tree.add(DEFAULT_PROJECT, RecordSpec(
             uid_for(1), "chat", stamp(1, month=1), stamp(1, month=1),
             status="complete", signed_out=True))
-        (tree.root / "_plexus.yaml").write_text(
+        (tree.root / "_lmer.yaml").write_text(
             "schema: 2\nname: example\nprojects:\n  widgets:\n"
             "    repo: git.example.test/acme/widgets\n"
             "housekeeping:\n  runs:\n    archive_after: null\n"

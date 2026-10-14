@@ -1,7 +1,7 @@
 """Shared plexus fixture trees for the lmer-schema tests (issue #353).
 
 Two trees, one API. ``build_schema_plexus`` lays out the spec's ONE form
-(§2: a ``_plexus.yaml`` manifest, ``_``-owned areas, flat short-name project
+(§2: a ``_lmer.yaml`` manifest, ``_``-owned areas, flat short-name project
 dirs, ``_agents/`` at both scopes, D22 session dirs under ``_runs/<slug>/``).
 ``build_legacy_plexus`` lays out the same content under today's bare names
 (§9: ``{host}/{project}/runs/<slug>/``, ``agent-files/``, ``mirrors/``,
@@ -57,7 +57,7 @@ import pytest
 SCHEMA_FORM = "schema"
 LEGACY_FORM = "legacy"
 
-MANIFEST_NAME = "_plexus.yaml"
+MANIFEST_NAME = "_lmer.yaml"
 INSTANCE_NAME = "example"
 
 #: The repo-backed project (D8): a short name, its PRIMARY remote, and the

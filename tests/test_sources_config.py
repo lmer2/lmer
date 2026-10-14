@@ -6,7 +6,7 @@ credential rejection (oauth2 tokens) vs the allowed bare git@ SSH forms;
 the same-host trust rule; ref valid under taskdef only; unknown-key
 forward-compat warnings; and absent file = silent legacy with zero output.
 
-Plus the manifest tier (issue #370): `_plexus.yaml sources:` handed in as the
+Plus the manifest tier (issue #370): `_lmer.yaml sources:` handed in as the
 raw dict lmer_schema.manifest already parsed (`manifest_sources=`), outranking
 the legacy file per key with the same trust rules at both tiers, validated
 through the ONE per-entry rule set (`validate_source_entry`); the `tiers` map
@@ -30,7 +30,7 @@ WORK_URL = "https://git.example.com/20c/worklog.git"
 
 # The manifest tier is handed over as the raw `Manifest.sources` dict; the path
 # is only ever a label in messages (load_sources never opens the file).
-MANIFEST_PATH = "/work/_plexus.yaml"
+MANIFEST_PATH = "/work/_lmer.yaml"
 
 MANIFEST_SOURCES = {
     "taskdef": {"repo": "https://git.example.com/agents/taskdefs.git", "ref": "v2"},
@@ -423,7 +423,7 @@ class TestForwardCompatWarnings:
 
 
 class TestManifestTier:
-    """#370 points 1-2: `_plexus.yaml sources:` outranks `sources.yaml` per key."""
+    """#370 points 1-2: `_lmer.yaml sources:` outranks `sources.yaml` per key."""
 
     def _load(self, tmp_path, manifest, **kw):
         kw.setdefault("work_repo_url", WORK_URL)
@@ -589,7 +589,7 @@ class TestManifestTier:
 
     def test_manifest_path_defaults_to_the_bare_filename(self, tmp_path):
         manifest = {"napkin": {"repo": "https://evil.example.org/20c/napkin.git"}}
-        with pytest.raises(SourcesConfigError, match=r"^_plexus\.yaml: "):
+        with pytest.raises(SourcesConfigError, match=r"^_lmer\.yaml: "):
             load_sources(
                 tmp_path / "sources.yaml", work_repo_url=WORK_URL, manifest_sources=manifest
             )

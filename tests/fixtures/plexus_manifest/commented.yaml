@@ -1,4 +1,4 @@
-# _plexus.yaml — the acme plexus (spec §4).
+# _lmer.yaml — the acme plexus (spec §4).
 # Hand-edited: every note in this file must survive a tool rewrite (issue #365).
 
 schema: 1  # an int, never a bool

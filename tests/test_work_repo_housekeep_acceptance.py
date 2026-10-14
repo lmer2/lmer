@@ -38,7 +38,7 @@ def _git(root, *args, env=None):
 
 def _build(tmp_path):
     tree = build_schema2_plexus(tmp_path / "plexus")
-    (tree.root / "_plexus.yaml").write_text(MANIFEST)
+    (tree.root / "_lmer.yaml").write_text(MANIFEST)
     # 1. over-TTL napkin note
     note = tree.root / "_napkin/acme/topic/note.md"
     note.parent.mkdir(parents=True)

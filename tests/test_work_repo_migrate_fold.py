@@ -86,7 +86,7 @@ def _build_adopted_legacy(root):
     """A registered project whose inside is still legacy: manifest present,
     flat short name, bare `runs/` holding the plain-session groups."""
     root.mkdir(parents=True)
-    (root / "_plexus.yaml").write_text(MANIFEST, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(MANIFEST, encoding="utf-8")
     project = root / PROJECT
     (project / "runs").mkdir(parents=True)
     pf.plant_plain_session_records(project, area="runs", nested=False)

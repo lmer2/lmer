@@ -39,7 +39,7 @@ def config(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
     config = cfg.load()
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 2, "name": "example-plexus",
             "projects": {"widgets": {"repo": "ssh://git@gitlab.example.com/acme/widgets.git"}},

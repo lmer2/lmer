@@ -1329,7 +1329,7 @@ def _display_sources_config_cli() -> None:
     # `declared:` line on the one surface an operator uses to understand
     # what their declaration is doing (review finding).
     load_warnings: "list[str]" = []
-    # A cached `_plexus.yaml` names the tier of every declared row (issue
+    # A cached `_lmer.yaml` names the tier of every declared row (issue
     # #370 point 4): the manifest tier is read here from the same clone
     # cache, through the ONE manifest parser, and handed to E.loader's
     # tiered `load_sources` so precedence, the stale-legacy WARN and every

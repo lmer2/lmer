@@ -1445,7 +1445,7 @@ def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]
 def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
     """``(schema-form project dir, problem)`` for *repo_url* in the mirror (D20).
 
-    The second tree shape (issue #353): with a ``_plexus.yaml`` at the mirror
+    The second tree shape (issue #353): with a ``_lmer.yaml`` at the mirror
     root the project dir is a flat top-level SHORT NAME (D7), and nothing in a
     repo URL says which name that is — only the registry does (D8). So the URL is
     looked up across every entry's ``repo:`` and ``remotes:`` through
@@ -1513,7 +1513,7 @@ def _mirror_project_dirs(
             "platform_mirror_manifest_unusable path=%s problem=%s — the project "
             "taskdef tier is dropped rather than resolved against the "
             "pre-migration path",
-            mirror / "_plexus.yaml", problem,
+            mirror / "_lmer.yaml", problem,
         )
         return []
     roots = [schema_dir] if schema_dir is not None else []
@@ -4186,7 +4186,7 @@ def create_app(
         # to close, reappearing one level up. A no-op in a legacy tree, and
         # for every row whose key is already the primary.
         # Read the registry ONCE for the whole listing: every row and every
-        # walked directory is folded, and re-parsing `_plexus.yaml` per fold
+        # walked directory is folded, and re-parsing `_lmer.yaml` per fold
         # meant twenty-odd reads of one unchanging file to answer one question.
         #
         # Membership is by key segment (spec §6.1): a schema-2 record is tracked

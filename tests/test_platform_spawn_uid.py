@@ -99,7 +99,7 @@ def schema_two(config):
 def schema_one(config):
     """A schema-1 manifest: records keyed by slug, as they always were."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 1, "name": "example",
             "projects": {"widgets": {"repo": f"{HOST}/{PROJECT}"}},
@@ -267,7 +267,7 @@ def test_launch_uid_in_extra_args_is_refused(schema_two, arg):
 
 def test_an_unreadable_manifest_is_a_spawn_error(config):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: [not, a, number\n", encoding="utf-8",
     )
     with pytest.raises(spawn.SpawnError, match="manifest"):

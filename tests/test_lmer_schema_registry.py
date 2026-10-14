@@ -89,7 +89,7 @@ def _hand_built(projects):
     """A ``Manifest`` built by hand, skipping the loader entirely — the API
     boundary ``build_registry`` has to defend on its own."""
     return Manifest(
-        path=Path("/x/_plexus.yaml"),
+        path=Path("/x/_lmer.yaml"),
         schema=1,
         name="hand-built",
         projects=projects,
@@ -309,9 +309,9 @@ def test_public_registry_constructor_keeps_the_schema_1_signature(use_keywords):
     index = {"git.example.test/acme/widgets": "widgets"}
 
     if use_keywords:
-        registry = Registry(path=Path("/_plexus.yaml"), projects=projects, index=index)
+        registry = Registry(path=Path("/_lmer.yaml"), projects=projects, index=index)
     else:
-        registry = Registry(Path("/_plexus.yaml"), projects, index)
+        registry = Registry(Path("/_lmer.yaml"), projects, index)
 
     assert registry.schema == 1
     assert registry.lookup("https://GIT.EXAMPLE.TEST/ACME/WIDGETS.git") is project
@@ -327,9 +327,9 @@ class TestRegistryError:
         # A broken registry is a broken manifest: callers that already treat
         # ManifestError as "schema form, unusable" (D20) need no second catch.
         assert issubclass(RegistryError, ManifestError)
-        err = RegistryError("/x/_plexus.yaml", "boom")
+        err = RegistryError("/x/_lmer.yaml", "boom")
         assert isinstance(err, ManifestError)
-        assert str(err).startswith("/x/_plexus.yaml: boom")
+        assert str(err).startswith("/x/_lmer.yaml: boom")
 
     def test_load_registry_raises_on_disk(self, schema_plexus):
         doc = _doc()

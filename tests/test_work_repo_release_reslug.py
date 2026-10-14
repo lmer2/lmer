@@ -536,7 +536,7 @@ def schema_runs(monkeypatch, tmp_path):
 
 class TestTheRollOverComposesInSchemaForm:
     """The claim-side roll-over, against the layout it will actually meet once
-    a tree adopts `_plexus.yaml` (MR !259 review).
+    a tree adopts `_lmer.yaml` (MR !259 review).
 
     Two levels have to be right and neither is `rdir.parent` any more: the
     address the aside slug is tested for occupancy at is the RUN AREA (the

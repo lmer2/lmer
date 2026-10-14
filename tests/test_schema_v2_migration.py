@@ -7,7 +7,7 @@ import pytest
 def schema_one(tmp_path):
     root = tmp_path / "plexus"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         "# retain this comment\nschema: 1\nname: example\n"
         "custom:\n  field: yes\nprojects:\n  widgets:\n"
         "    repo: git.example.test/acme/widgets\n"
@@ -30,7 +30,7 @@ def test_preview_then_apply_changes_only_version_token(schema_one):
     assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
     applied = migrate(root, apply=True)
     assert applied["applied"] is True
-    assert (root / "_plexus.yaml").read_bytes() == before[next(p for p in before if p.name == "_plexus.yaml")].replace(b"schema: 1", b"schema: 2")
+    assert (root / "_lmer.yaml").read_bytes() == before[next(p for p in before if p.name == "_lmer.yaml")].replace(b"schema: 1", b"schema: 2")
     assert (record / "state.yaml").read_bytes() == before[(record / "state.yaml").relative_to(root)]
     assert migrate(root, apply=True)["applied"] is False
 
@@ -118,18 +118,18 @@ def test_unsigned_active_record_blocks_cutover_without_mutation(schema_one):
 
     root, record = schema_one
     (record / "state.yaml").write_text("schema: 1\nstatus: in-progress\n")
-    before = (root / "_plexus.yaml").read_bytes()
+    before = (root / "_lmer.yaml").read_bytes()
     result = migrate(root, apply=True)
     assert result["applied"] is False
     assert any("sign-out" in item for item in result["blockers"])
-    assert (root / "_plexus.yaml").read_bytes() == before
+    assert (root / "_lmer.yaml").read_bytes() == before
 
 
 def test_portless_real_bucket_blocks_cutover_but_compatibility_link_does_not(schema_one):
     from lmer_schema.migration import migrate
 
     root, _record = schema_one
-    manifest = root / "_plexus.yaml"
+    manifest = root / "_lmer.yaml"
     manifest.write_text(manifest.read_text().replace("git.example.test/acme", "git.example.test:8443/acme"))
     old = root / "git.example.test" / "acme" / "widgets"
     marker = old / "_runs"
@@ -163,7 +163,7 @@ def test_anchored_schema_requires_explicit_review_without_rewriting_aliases(sche
     from lmer_schema.migration import migrate
 
     root, _record = schema_one
-    manifest = root / "_plexus.yaml"
+    manifest = root / "_lmer.yaml"
     manifest.write_text(declaration + "name: example\n")
     before = manifest.read_bytes()
     result = migrate(root, apply=True)

@@ -1,4 +1,4 @@
-"""``lmer_schema.writer`` — the one tool-side write path for ``_plexus.yaml``
+"""``lmer_schema.writer`` — the one tool-side write path for ``_lmer.yaml``
 (issue #366).
 
 The writer is the importable API ``work adopt`` and ``work migrate`` share so

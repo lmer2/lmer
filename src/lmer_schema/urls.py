@@ -20,7 +20,7 @@ credential-boundary fix there would silently not apply here.
 Three functions, two schema contracts:
 
 - ``normalize(url)`` is the canonical SPELLING — what the tool writer emits into
-  ``_plexus.yaml`` and what a "non-canonical spelling" WARN compares against.
+  ``_lmer.yaml`` and what a "non-canonical spelling" WARN compares against.
   It is ``normalize_repo_url`` verbatim: host lowered, path case preserved as
   written.
 - ``lookup_key(url, schema=1)`` is the COMPARISON key. Schema 1 folds the

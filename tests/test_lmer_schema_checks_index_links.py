@@ -38,7 +38,7 @@ codes to this module, gated on the ``manifest`` the runner passes:
 ``index.readme-missing`` (INFO: a project holding run records whose
 ``README.md`` carries no generated block) and ``index.readme-stale`` (WARN:
 a block that no longer equals a fresh render of the records — or, at the
-root, of ``_plexus.yaml`` — malformed markers, or hand text holding a line
+root, of ``_lmer.yaml`` — malformed markers, or hand text holding a line
 git reads as a conflict marker). The freshness oracle is the kernel's own
 render compared byte for byte: no git, no clock, no write.
 """

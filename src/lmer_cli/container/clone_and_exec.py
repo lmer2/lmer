@@ -39,7 +39,7 @@ normalized remotes (D8/D21), which has exactly one definition —
 Mirroring that here would be a second implementation of identity, so
 ``_resolve_work_repo_placement`` imports the core lazily and guarded,
 exactly as ``_import_yaml`` does, and answers "legacy" without importing
-anything when the tree carries no ``_plexus.yaml`` (a single stat — the
+anything when the tree carries no ``_lmer.yaml`` (a single stat — the
 same presence test the core itself uses). A tree that DOES carry one and a
 build that cannot import the core is a refusal to place anything, never a
 fall back to the legacy names: that fallback would write a schema-form
@@ -48,7 +48,7 @@ tree's record at ``{host}/{project}/runs/`` and split the tree in two
 a degrade-to-legacy exception, not a dependency.
 
 The same seam serves the manifest's ``sources:`` tier (issue #370): a
-present ``_plexus.yaml`` is the second declaration file, and
+present ``_lmer.yaml`` is the second declaration file, and
 ``_resolve_declared_sources`` reads it through the core's ONE manifest
 parser (``lmer_schema.manifest.load_manifest``, imported function-locally
 and guarded exactly like the placement code's) and hands the raw section
@@ -118,7 +118,7 @@ SOURCES_CONFIG_NAME = "sources.yaml"
 # it; the core owns the name for every read (lmer_schema.manifest), and the
 # probe is deliberately the same test the core's own detection uses
 # (is_symlink() first, so a dangling manifest symlink still reads as present).
-PLEXUS_MANIFEST_NAME = "_plexus.yaml"
+PLEXUS_MANIFEST_NAME = "_lmer.yaml"
 
 # The two project-scope area names container start creates in a schema-form
 # tree: the run area (D22 — a launch's session dir hangs under
@@ -172,7 +172,7 @@ _SOURCE_DESTS = {"taskdef": "/taskdef", "napkin": "/napkin"}
 # literally zero output (spec G5) — but stays in the shared vocabulary for
 # --show-env parity.
 # ORIGIN_DECLARED is the legacy-only spelling (mirrored by sources.py's
-# ORIGIN_DECLARED). Once a `_plexus.yaml` is present (issue #370) a declared
+# ORIGIN_DECLARED). Once a `_lmer.yaml` is present (issue #370) a declared
 # row names its tier instead — `declared (manifest)` / `declared
 # (sources.yaml)` — and that label is spelled by the standalone loader's
 # declared_origin_label, never by hand here, so the banner and --show-env
@@ -415,10 +415,10 @@ def _clear_lmer_git_credential_helper(
         )
 
 
-# --- Canonical source config (sources.yaml / _plexus.yaml, #105, #370) -------
+# --- Canonical source config (sources.yaml / _lmer.yaml, #105, #370) -------
 # {work_repo}/sources.yaml declares the canonical taskdef/napkin sources; in
 # a schema-form tree the same declaration is the manifest's `sources:`
-# section ({work_repo}/_plexus.yaml, issue #370), which outranks the legacy
+# section ({work_repo}/_lmer.yaml, issue #370), which outranks the legacy
 # file per source key. Reading either needs PyYAML — the one sanctioned
 # non-stdlib import in this module (see the docstring contract above) — and
 # the manifest additionally needs the lmer-schema core, imported lazily and
@@ -526,7 +526,7 @@ def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
 def _read_manifest_sources_tier(work_repo_path: Path) -> "tuple[int, object | None]":
     """Read the manifest for its ``sources:`` tier (issue #370).
 
-    Returns ``(0, None)`` when the work repo carries no ``_plexus.yaml`` —
+    Returns ``(0, None)`` when the work repo carries no ``_lmer.yaml`` —
     decided by the stdlib probe alone, so a legacy tree never imports the
     core — ``(0, manifest)`` with the parsed ``lmer_schema.manifest.Manifest``
     when it does, and ``(2, None)`` after printing a credential-scrubbed
@@ -623,7 +623,7 @@ def _prompt_source_choice(
     operator-visible. Kept separate from the matrix so a fake-TTY unit test
     can drive it via *input_fn* (and so the matrix stays pure-ish).
     *declared_in* names the file the declaration came from (issue #370: a
-    manifest-tier row prints ``_plexus.yaml``; the default is the legacy
+    manifest-tier row prints ``_lmer.yaml``; the default is the legacy
     spelling, byte for byte).
     """
     print(
@@ -1014,7 +1014,7 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
 
 def _declaration_file(tier, sources_mod) -> str:
     """The file a declared row came from, by tier (issue #370): the manifest
-    tier is ``_plexus.yaml``, the legacy tier ``sources.yaml``. What the
+    tier is ``_lmer.yaml``, the legacy tier ``sources.yaml``. What the
     mismatch prompt and error, the ref note and the declared-clone
     remediation name once a manifest is in play."""
     return PLEXUS_MANIFEST_NAME if tier == sources_mod.TIER_MANIFEST else SOURCES_CONFIG_NAME
@@ -1024,7 +1024,7 @@ def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=No
     """Container-side canonical source resolution (spec §2) — the seam
     main() calls between the work-repo clone and clone_aux_repos.
 
-    Neither ``sources.yaml`` nor ``_plexus.yaml`` present → silent legacy
+    Neither ``sources.yaml`` nor ``_lmer.yaml`` present → silent legacy
     mode: return 0 with literally zero output and no imports beyond stdlib
     (two stats). Either present → the PyYAML guard; then the manifest tier
     through the core's one parser (issue #370 — a legacy tree never reaches
@@ -2304,7 +2304,7 @@ def clone_secondary_mr(
 class WorkRepoPlacement:
     """Where this launch's work goes in the work repo, and in which form.
 
-    ``schema`` is True for a tree carrying a ``_plexus.yaml`` (spec D20);
+    ``schema`` is True for a tree carrying a ``_lmer.yaml`` (spec D20);
     ``base`` is the project dir the launch records under — the env trio's
     ``{host}/{project}`` in a legacy tree, the registry-resolved short name
     (or, for a repo nobody has named yet, its ``{host}/{project}`` host
@@ -2582,7 +2582,7 @@ def ensure_work_repo_directory(work_repo_path: Path, host: str | None, project: 
     """
     Ensure this launch's directories exist in the work repo, by FORM.
 
-    Legacy tree (no ``_plexus.yaml``) — unchanged, byte for byte:
+    Legacy tree (no ``_lmer.yaml``) — unchanged, byte for byte:
     {host}/{project}/{task_type}/{task_target}, plus info directories at
     - {host}/{project}/info/ (global project info)
     - {host}/{project}/{task_type}/info/ (project+task specific info)

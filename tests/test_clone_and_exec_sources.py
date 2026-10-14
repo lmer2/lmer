@@ -15,7 +15,7 @@ resolution wired between the work-repo clone and clone_aux_repos:
 - credential redaction of every prompt/error/banner line
 - zero-output silent legacy mode (spec G5)
 - the manifest tier (issue #370, "Manifest tier" section at the end): a
-  present ``_plexus.yaml`` is the second declaration file, read through the
+  present ``_lmer.yaml`` is the second declaration file, read through the
   core's one manifest parser and handed to the standalone loader; env beats
   manifest beats legacy; a tree without a manifest keeps every byte of
   today's output and never imports the core
@@ -1506,7 +1506,7 @@ class TestEndToEndAcceptance:
 
 
 # --- Manifest tier (issue #370) ----------------------------------------------
-# The second declaration file. A present `_plexus.yaml` is probed with the
+# The second declaration file. A present `_lmer.yaml` is probed with the
 # same stdlib test the placement code uses, read through the core's ONE
 # manifest parser (lmer_schema.manifest.load_manifest — a function-local,
 # guarded import, never module scope) and its raw `sources:` handed to the
@@ -1549,7 +1549,7 @@ DECLARED_CLONES = [
 
 
 def _manifest(sources_block=None, *, schema="1", extra=""):
-    """A `_plexus.yaml` document: `schema:` and `name:` (both required by the
+    """A `_lmer.yaml` document: `schema:` and `name:` (both required by the
     core), *extra* raw top-level lines, and a `sources:` section when given."""
     text = f"schema: {schema}\nname: example\n{extra}"
     if sources_block is not None:
@@ -1606,7 +1606,7 @@ def _without_core():
 
 class TestManifestTierGuards:
     """The refuse-start family extended to the manifest tier: a present
-    `_plexus.yaml` whose `sources:` cannot be read is never silently ignored
+    `_lmer.yaml` whose `sources:` cannot be read is never silently ignored
     (D20 — the same rule the PyYAML guard applies to a present sources.yaml),
     and a tree without one never consults the core."""
 
@@ -1840,7 +1840,7 @@ class TestManifestTierResolution:
         self, tmp_path, monkeypatch
     ):
         """R7's E half: ONE declaration read from sources.yaml; then folded
-        into `_plexus.yaml sources:` with sources.yaml removed (what `work
+        into `_lmer.yaml sources:` with sources.yaml removed (what `work
         migrate --instance` does); then a main() container start on that
         folded tree. All three produce identical env deltas and identical
         clones — the fold cannot switch declared sources off."""
@@ -2097,7 +2097,7 @@ class TestManifestTierResolution:
 
     def test_a_tree_without_a_manifest_keeps_the_legacy_vocabulary(self, tmp_path, capsys):
         """No manifest: the banner is the bare `(declared)`, the notes name
-        sources.yaml alone, and `_plexus.yaml` is never mentioned — today's
+        sources.yaml alone, and `_lmer.yaml` is never mentioned — today's
         output, byte for byte."""
         _write_tree(tmp_path, legacy=f"schema: 1\nsources:\n  taskdef:\n    repo: {DECLARED_TASKDEF}\n")
         env = {
@@ -2134,7 +2134,7 @@ class TestManifestTierDriftGuards:
 
     def test_load_manifest_is_the_only_reader_of_the_manifest(self, tmp_path, monkeypatch, capsys):
         """No second manifest parser on this path: with the core's
-        load_manifest monkeypatched, the on-disk `_plexus.yaml` can be
+        load_manifest monkeypatched, the on-disk `_lmer.yaml` can be
         unparseable and the fake's `sources:` is what resolves — nothing else
         opened the file. The fake's `warnings` never reach the output."""
         _write_tree(tmp_path, manifest="schema: 1\nname: example\nsources: [oops\n")

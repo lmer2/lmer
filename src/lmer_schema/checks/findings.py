@@ -88,7 +88,7 @@ Form
 ----
 :class:`Form` is the two-valued answer of form detection (D20: manifest
 present → ``SCHEMA``, absent → ``LEGACY``). This module never sniffs
-``_plexus.yaml``; the form is a parameter. ``Form.coerce`` also accepts the
+``_lmer.yaml``; the form is a parameter. ``Form.coerce`` also accepts the
 plain strings ``"schema"``/``"legacy"`` (the spelling of
 ``tests/plexus_fixtures.SCHEMA_FORM``/``LEGACY_FORM``) and any object
 carrying one of them as ``.value``, so the form-detection module can return

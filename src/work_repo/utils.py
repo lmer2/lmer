@@ -5,7 +5,7 @@ work repo's FORM (spec D20, issue #353). :func:`work_repo_layout` answers
 "which form is this tree written in, and where is this session's project
 dir"; every path helper here is built on it, and sibling modules
 (``run_state``, ``specs_index``, ``memory``) route through it rather than
-naming ``_plexus.yaml`` or an ``_``-prefixed area themselves. The tooling
+naming ``_lmer.yaml`` or an ``_``-prefixed area themselves. The tooling
 verbs that need the core's API itself (``adopt``, ``migrate``) get it from
 :func:`core_module`, so the core import is spelled here alone too. One module
 knowing the second set of names is the point: two would drift, and a drifted
@@ -34,7 +34,7 @@ class SchemaContextError(ValueError):
 def load_work_manifest(root: Optional[Path] = None) -> Optional["Manifest"]:
     """Shared version boundary for work-repo writers and metadata readers."""
     root = root if root is not None else work_repo_root()
-    path = root / "_plexus.yaml"
+    path = root / "_lmer.yaml"
     if not (path.exists() or path.is_symlink()):
         return None
     try:
@@ -715,7 +715,7 @@ LEGACY_FORM = "legacy"
 #: to be answerable WITHOUT the core — is anything schema-shaped present? —
 #: which is what separates "no core installed" from "the core is here and
 #: broken" (see :func:`_core_missing`).
-MANIFEST_NAME = "_plexus.yaml"
+MANIFEST_NAME = "_lmer.yaml"
 
 #: What a layout's ``problem`` is about. ``MANIFEST_PROBLEM``: the document
 #: itself is unusable (unparseable, unreadable, a schema int this build does
@@ -777,7 +777,7 @@ def work_repo_layout() -> WorkRepoLayout:
     THE accessor: every path helper here goes through it and so should every
     sibling module, which is what keeps the second set of names in one place.
 
-    **Legacy form** (no ``_plexus.yaml`` at the root) resolves exactly as it
+    **Legacy form** (no ``_lmer.yaml`` at the root) resolves exactly as it
     always has — ``{root}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}``, ``None``
     when either is unset. **Schema form** looks the launch's repo URL
     (``LMER_REPO_URL``, else ``https://{host}/{project}``) up across every
@@ -860,7 +860,7 @@ def work_repo_form() -> str:
 
 
 def work_repo_manifest_problem() -> Optional[str]:
-    """Why the work repo's ``_plexus.yaml`` cannot be used, or ``None``.
+    """Why the work repo's ``_lmer.yaml`` cannot be used, or ``None``.
 
     The reason surfaced for callers that report rather than resolve (a
     mutating verb refusing to write, a hook printing one line and exiting 0).
@@ -1062,7 +1062,7 @@ def _unusable(root, manifest, problem) -> WorkRepoLayout:
         manifest=manifest,
         problem=_announce(
             problem,
-            "Refusing to resolve a work-repo path: a present _plexus.yaml is "
+            "Refusing to resolve a work-repo path: a present _lmer.yaml is "
             "never read as a legacy tree (spec D20). Fix or remove the manifest.",
         ),
         problem_kind=MANIFEST_PROBLEM,

@@ -339,7 +339,7 @@ def _plant_uid_record(uid=UID, slug="chat", launcher=None):
 
     config = cfg.load()
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 2, "name": "example-plexus",
             "projects": {"widgets": {"repo": "ssh://git@gitlab.example.com/acme/widgets.git"}},
@@ -532,7 +532,7 @@ CANDIDATE_SECONDARY = "github.com/acme/widgets"
 def _register_widgets_for_daemon(config):
     """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 1\nname: example-plexus\nprojects:\n  widgets:\n"
         f"    repo: {CANDIDATE_PRIMARY}\n    remotes: [{CANDIDATE_SECONDARY}]\n",
         encoding="utf-8",

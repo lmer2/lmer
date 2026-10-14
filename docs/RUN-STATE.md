@@ -70,7 +70,7 @@ run name.
 ### Schema form: the run dir is the session dir
 
 In a work repo migrated to the lmer schema (a *plexus*, marked by a
-`_plexus.yaml` manifest) the unit of record is the **session**, and what
+`_lmer.yaml` manifest) the unit of record is the **session**, and what
 this document calls "the run dir" IS the session dir. The schema changes
 their location only: the file shapes documented here are unchanged
 (`state.yaml`, `events.jsonl`, `ledger.yaml`, `release.yaml`, `log.yaml`,

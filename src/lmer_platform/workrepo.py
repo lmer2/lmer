@@ -1171,7 +1171,7 @@ def fold_registry(config: Optional[PlatformConfig]):
     none to read.
 
     For a caller that folds MANY identities in one pass. Without it each fold
-    re-opens and re-parses ``_plexus.yaml``: the candidates listing folds both
+    re-opens and re-parses ``_lmer.yaml``: the candidates listing folds both
     the tracked rows and the walked directories, so ten of each meant twenty-odd
     manifest reads to answer one question about a file that did not change
     between them. The same shape :class:`_RegistryIdentities` already uses on the

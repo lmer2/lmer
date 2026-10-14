@@ -289,7 +289,7 @@ class TestTheBundleIsFlatInSchemaForm:
         self, monkeypatch, tmp_path
     ):
         """The routing question is the FORM's, not the registry's: a tree with
-        a present-but-broken `_plexus.yaml` is a schema tree that cannot be
+        a present-but-broken `_lmer.yaml` is a schema tree that cannot be
         read (`utils.work_repo_layout()`), so its records are session dirs and
         its bundles are flat. Reading such a tree at the legacy nesting would
         be the split-form record the validator flags. The specs index has no
@@ -298,7 +298,7 @@ class TestTheBundleIsFlatInSchemaForm:
         root = tmp_path / "plexus-broken"
         rdir = root / "lmer" / "_runs" / pf.SLUG / pf.SESSION_IDS[0]
         rdir.mkdir(parents=True)
-        (root / "_plexus.yaml").write_text("schema: 1\nprojects: [", encoding="utf-8")
+        (root / "_lmer.yaml").write_text("schema: 1\nprojects: [", encoding="utf-8")
         _flat_bundle(rdir, "spec.md")
         _nested_bundle(rdir, "mp-a", "plan.md")
         _launch(monkeypatch, root, session=pf.SESSION_IDS[0])

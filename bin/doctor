@@ -279,7 +279,7 @@ fi
 section "🔗 Declared Sources"
 
 # Reads the declared-source tiers at ${LMER_WORK_REPO_PATH:-/work} — the
-# plexus manifest's `_plexus.yaml sources:` section and the legacy standalone
+# plexus manifest's `_lmer.yaml sources:` section and the legacy standalone
 # sources.yaml — and reports which tier is in effect per source plus
 # declared-source reachability, via the frozen helper CLI
 # (lmer_cli.container.sources doctor; contract in that module's docstring).
@@ -294,16 +294,16 @@ section "🔗 Declared Sources"
 # else in this container) — git receives it through ephemeral GIT_CONFIG_*
 # env, the same never-in-argv rule the clone cache follows.
 SOURCES_YAML="${LMER_WORK_REPO_PATH:-/work}/sources.yaml"
-PLEXUS_MANIFEST="${LMER_WORK_REPO_PATH:-/work}/_plexus.yaml"
+PLEXUS_MANIFEST="${LMER_WORK_REPO_PATH:-/work}/_lmer.yaml"
 # --- Sources precedence (lmer schema spec §4) ---
-# env override > `_plexus.yaml sources:` > legacy standalone sources.yaml.
+# env override > `_lmer.yaml sources:` > legacy standalone sources.yaml.
 # Resolution is per source key: an env override covers its own key and the
 # declaration files cover the rest (clone_and_exec resolution matrix); the
 # helper's `tiers` map says which file each declared key resolved from.
 # The env var names mirror lmer_cli.container.sources.SOURCE_ENV_OVERRIDES
 # (pinned by tests/test_doctor_sources.py). Only the NAMES are printed: an
 # override value can carry a credential and never reaches output.
-SOURCES_PRECEDENCE_RULE="env override > _plexus.yaml sources: > legacy sources.yaml"
+SOURCES_PRECEDENCE_RULE="env override > _lmer.yaml sources: > legacy sources.yaml"
 SOURCES_ENV_OVERRIDE_VARS="LMER_TASKDEF_REPO LMER_NAPKIN_REPO"
 SOURCES_ENV_IN_EFFECT=""
 for var in $SOURCES_ENV_OVERRIDE_VARS; do
@@ -322,7 +322,7 @@ if [[ -f "$SOURCES_YAML" ]]; then
     DECLARED_FILES_PRESENT="sources.yaml"
 fi
 if [[ -e "$PLEXUS_MANIFEST" || -L "$PLEXUS_MANIFEST" ]]; then
-    DECLARED_FILES_PRESENT="${DECLARED_FILES_PRESENT:+$DECLARED_FILES_PRESENT and }_plexus.yaml"
+    DECLARED_FILES_PRESENT="${DECLARED_FILES_PRESENT:+$DECLARED_FILES_PRESENT and }_lmer.yaml"
 fi
 # Renderer-supported taskdef schemas, captured from the helper's doctor
 # document (supported_taskdef_schemas) — never re-derived in shell. Filled
@@ -446,7 +446,7 @@ for row in rows:
                         pass "sources.yaml valid (schema $REC_2)"
                     fi
                     if [[ -n "$REC_5" ]]; then
-                        pass "_plexus.yaml sources: tier in effect for: ${REC_5//,/, } ($PLEXUS_MANIFEST) — precedence: $SOURCES_PRECEDENCE_RULE"
+                        pass "_lmer.yaml sources: tier in effect for: ${REC_5//,/, } ($PLEXUS_MANIFEST) — precedence: $SOURCES_PRECEDENCE_RULE"
                     fi
                     # The legacy standalone file is the tier in effect only
                     # for the keys it resolves: those the helper attributes

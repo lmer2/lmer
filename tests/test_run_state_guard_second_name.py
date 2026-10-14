@@ -1,6 +1,6 @@
 """Second-name (schema-form) run-dir resolution in hooks/run_state_guard.py.
 
-In a plexus with a ``_plexus.yaml`` manifest the project is a flat short-name
+In a plexus with a ``_lmer.yaml`` manifest the project is a flat short-name
 dir resolved from the manifest's registry (spec §4, D7/D8/D20) and runs live at
 ``{work}/{shortname}/_runs/{slug}/`` (D22). The hook must find that dir — and
 keep finding the legacy ``{host}/{project}/runs/{slug}`` one — without

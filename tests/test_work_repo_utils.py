@@ -277,7 +277,7 @@ class TestInfoDirHelpers:
 
 class TestLegacyFormHelpers:
     """The dual-read accessors (issue #353 D20) answering for a tree with no
-    `_plexus.yaml` — the only form these env-only tests build. Schema form
+    `_lmer.yaml` — the only form these env-only tests build. Schema form
     and the failure modes live in tests/test_work_repo_schema_base.py."""
 
     def test_layout_is_legacy_and_names_no_manifest(self, clean_info_env, tmp_path):
