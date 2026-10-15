@@ -716,7 +716,7 @@ to `lmer-signal ask` as its exit-0 stdout.
 `true` is neither posted to Slack or matrix nor ever a candidate for binding. The
 supervisor alone sets it, on the question and on every answer or close to it. An
 open one still counts as open, so it
-reaches uber lmer as a `live_question` and the chat pane shows it. The Codex
+reaches Ratchet as a `live_question` and the chat pane shows it. The Codex
 delivery escalation (docs/CODEX-DELIVERY.md) is the one producer: as a thread
 question it captured the human's next reply meant for the agent's own question.
 
@@ -1813,7 +1813,6 @@ lmer-ctl thread read <permalink> [--limit N]
 lmer-ctl thread post <permalink> "<text>"
 ```
 
-The same work, in the daemon, with the daemon's credentials — for the UI and for
 The same work, in the daemon, with the daemon's credentials — for the UI and for
 Ratchet. No connection is involved. A file in the thread is copied into the
 calling assistant's upload store. For any other caller it is described, with
