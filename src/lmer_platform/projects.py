@@ -197,6 +197,11 @@ def database():
                 fingerprint TEXT NOT NULL, state TEXT NOT NULL, result TEXT,
                 PRIMARY KEY(project_id, ref)
             );
+            CREATE TABLE IF NOT EXISTS channel_routes (
+                transport TEXT NOT NULL, conversation TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id), label TEXT NOT NULL,
+                PRIMARY KEY(transport, conversation)
+            );
         """)
         if "run_key" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
             db.execute("ALTER TABLE sessions ADD COLUMN run_key TEXT")

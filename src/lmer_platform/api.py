@@ -196,7 +196,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, project_context as project_scope, project_requests, project_threads
+from . import channel_routes, projects, project_context as project_scope, project_requests, project_threads
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -2261,6 +2261,9 @@ def create_app(
             "  PATCH /api/projects/{workspace_id}  change name, color, repositories, settings\n"
             "  POST /api/projects/{workspace_id}/archive  archive eligible project\n"
             "  POST /api/projects/{workspace_id}/restore  restore stopped\n"
+            "  GET  /api/channel-routes    Slack channel / Matrix room → project mention routes\n"
+            "  PUT  /api/projects/{workspace_id}/channel-routes  replace its {channels}\n"
+            "  DELETE /api/channel-routes?channel=  drop one route, archived holders included\n"
             "  GET|POST /api/settings      fleet assistant capacity\n"
             "  POST /api/runs/move         inactive run: assign/transfer to destination_id,\n"
             "                               with workspace_id and home_revision\n"
@@ -2322,6 +2325,24 @@ def create_app(
     @app.post("/api/projects/{workspace_id}/restore", dependencies=guard)
     def project_restore(workspace_id: str) -> dict:
         return project_api.public_project(projects.restore(workspace_id))
+
+    @app.get("/api/channel-routes", dependencies=guard)
+    def channel_route_list() -> dict:
+        return {"routes": channel_routes.listing()}
+
+    @app.put("/api/projects/{workspace_id}/channel-routes", dependencies=guard)
+    def channel_route_replace(workspace_id: str, body: dict) -> dict:
+        try:
+            return {"routes": channel_routes.replace(workspace_id, body.get("channels"))}
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.delete("/api/channel-routes", dependencies=guard)
+    def channel_route_remove(channel: str) -> dict:
+        try:
+            return {"routes": channel_routes.remove(channel)}
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     @app.post("/api/runs/move", dependencies=guard)
     def move_run(body: dict) -> dict:

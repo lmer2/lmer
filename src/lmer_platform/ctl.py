@@ -728,6 +728,17 @@ def create_parser() -> argparse.ArgumentParser:
     move.add_argument("destination_id")
     move.add_argument("--home-revision", type=int, required=True)
     move.set_defaults(call=lambda args: Call("POST", "/api/runs/move", body={**_run_fields(args.key), "destination_id": args.destination_id, "home_revision": args.home_revision}))
+    channels = workspace_sub.add_parser("channels", help="Slack channels / Matrix rooms whose bot mentions route to a project.")
+    channels_sub = channels.add_subparsers(dest="channels_command")
+    channels_sub.add_parser("list").set_defaults(call=lambda _args: Call("GET", "/api/channel-routes"))
+    channels_set = channels_sub.add_parser("set", help="Replace PROJECT's channels; none clears them.")
+    channels_set.add_argument("identity", metavar="PROJECT")
+    channels_set.add_argument("channel", nargs="*", help="Channel ID, #name or link; Matrix room ID, alias or link.")
+    channels_set.set_defaults(call=lambda args: Call("PUT", f"/api/projects/{args.identity}/channel-routes",
+                                                     body={"channels": args.channel}))
+    channels_remove = channels_sub.add_parser("remove", help="Drop one channel's route, whichever project holds it.")
+    channels_remove.add_argument("channel")
+    channels_remove.set_defaults(call=lambda args: Call("DELETE", "/api/channel-routes", params={"channel": args.channel}))
 
     requests = sub.add_parser("requests", help="Source-bound conversation requests.")
     requests_sub = requests.add_subparsers(dest="requests_command")

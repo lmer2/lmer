@@ -38,6 +38,9 @@ request. Ordinary connected-run delivery is independent of the setting.
   thread root. Include up to N preceding messages, oldest first, followed by the
   trigger. The first assistant or worker reply establishes the reply thread;
   ingestion does not post a second root or a public acknowledgement.
+  With projects enabled, a channel or room mapped to a project sends such a
+  mention to that project unless it names another one (see
+  [Channel → project mapping](PROJECTS.md#channel--project-mapping)).
 - **Reply to an assistant DM:** match Slack `thread_ts`, or the Matrix `m.thread`
   relation, to the exact parent receipt recorded when the assistant sent its DM.
   The receipt contains identifiers, recipient and originating assistant session;

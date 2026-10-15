@@ -837,6 +837,12 @@ thread while a run is up*, below). From the control CLI:
 lmer-ctl spawn develop ISSUE_URL --target-thread SLACK_THREAD --target-thread MATRIX_THREAD
 ```
 
+A non-`chat` taskdef can take the thread itself as its target when `--repo-url`
+names the repository: `lmer-ctl spawn triage SLACK_THREAD --repo-url URL`
+connects that thread as if it were also given with `--target-thread`, and the
+run's slug derives from the thread, so every thread is its own run (see
+[LMER-CLI.md](./LMER-CLI.md#per-request-targets-with---repo-url)).
+
 For **uber lmer**, open its settings beside model/harness/preset, enter the
 thread permalinks **one per line**, save, then restart (rotate). The equivalent
 API is `POST /api/assistant/config {"threads": ["<permalink>"]}`; it stores
