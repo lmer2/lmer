@@ -4702,21 +4702,27 @@ def test_an_empty_target_spawn_clones_from_repo(config):
     "feature/x",
     "https://gitlab.example.com/agents/global/-/issues/7",
 ])
-def test_a_work_item_beside_a_repo_url_keeps_its_argv(config, target):
+def test_a_work_item_beside_a_repo_url_keeps_its_argv(config, target, tmp_path, monkeypatch):
     """§9.4: a shape that launched before §6.5 gains no ``--repo``.
 
     A bare word that names no path in the daemon's working directory is also
     #545's label, so it carries ``--repo-url`` (:func:`spawn._passes_repo_url`);
     a URL target never does.
     """
+    monkeypatch.chdir(tmp_path)
     validated = request_for(
         target=target, repo_url="https://gitlab.example.com/agents/global.git"
     ).validate()
 
     command = spawn._build_command(config, validated)
     assert not any(arg.startswith(f"{spawn.REPO_FLAG}=") for arg in command)
+    repo_url_args = [arg for arg in command if arg.startswith(f"{spawn.REPO_URL_FLAG}=")]
     if target.startswith("https://"):
-        assert not any(arg.startswith(spawn.REPO_URL_FLAG) for arg in command)
+        assert repo_url_args == []
+    else:
+        assert repo_url_args == [
+            f"{spawn.REPO_URL_FLAG}=https://gitlab.example.com/agents/global.git"
+        ]
 
 
 def test_an_other_target_without_a_repo_url_is_refused(config):

@@ -808,7 +808,7 @@ When no repository target is given, lmer first tries to infer a repo from the cu
 
 #### Per-request targets with `--repo-url`
 
-`--repo-url URL` names the repository to clone separately from the target, so the positional target is only the task's target: what `$LMER_TASK_TARGET` carries and what the run slug derives from. It is never read as a local path. This is how a thread-driven taskdef other than `chat` gets one run per request:
+`--repo-url URL` names the repository to clone separately from the target, so the positional target is only the task's target: what `$LMER_TASK_TARGET` carries and what the run slug derives from. A bare word is never probed as a local checkout; a target spelled as a path (`/x`, `./x`, `../x`) or a repository URL is refused as `two repositories named`. This is how a thread-driven taskdef other than `chat` gets one run per request:
 
 ```bash
 # The thread is the target and is connected as usual; slug: triage-p1700000000123456

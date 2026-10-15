@@ -631,7 +631,7 @@ def parse_args(
     parser.add_argument("--branch", dest="branch")
     parser.add_argument("--ref", dest="ref")
     parser.add_argument("--remote", dest="remote", help="Git remote name to use (required when local repo has multiple remotes)")
-    parser.add_argument("--repo-url", dest="repo_url", help="Repository URL to clone, independent of the target. The primary target is then only the task's target (LMER_TASK_TARGET and the run slug): a label, an issue/MR URL, or a Slack/matrix thread permalink, which lets a non-chat task run per thread. Never read as a local path.")
+    parser.add_argument("--repo-url", dest="repo_url", help="Repository URL to clone, independent of the target. The primary target is then only the task's target (LMER_TASK_TARGET and the run slug): a label, an issue/MR URL, or a Slack/matrix thread permalink, which lets a non-chat task run per thread. A bare word is never probed as a local checkout; a target spelled as a path (/x, ./x, ../x) or a repository URL is refused as a second repository, as is --repo beside --repo-url.")
     parser.add_argument("--exec", dest="exec_mode", action="store_true", help="Run an arbitrary command in the container")
     parser.add_argument("--no-clone", dest="no_clone", action="store_true", help="Skip git clone, just run command (requires --exec)")
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
@@ -2798,7 +2798,8 @@ def main(argv: list[str] | None = None) -> int:
         # path; a target that names an existing entry which is not a checkout
         # (a plain directory, a file) is refused, never read as a branch.
         # Beside --repo-url the positional is only the task's target and is
-        # never read as a local path (#545).
+        # never probed as a local checkout (#545); one spelled as a path still
+        # classifies as a repository and is refused below.
         if (
             primary_target
             and not ns.repo_url

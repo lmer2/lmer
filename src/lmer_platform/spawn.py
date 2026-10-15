@@ -2788,10 +2788,12 @@ def _build_command(
         # One token, like the other prose-valued flags: a URL can never be
         # read as a flag of its own.
         cmd += [f"{REPO_FLAG}={request.repo_url}"]
+    elif _passes_repo_url(request):
+        # Never both: ``lmer`` refuses --repo beside --repo-url as two
+        # repositories named (#591 tracks folding them into one flag).
+        cmd += [f"{REPO_URL_FLAG}={_clone_url_without_secrets(request.repo_url)}"]
     if request.ports:
         cmd += ["--ports", str(request.ports)]
-    if _passes_repo_url(request):
-        cmd += [f"{REPO_URL_FLAG}={_clone_url_without_secrets(request.repo_url)}"]
     if request.session_id:
         cmd += [f"{SESSION_FLAG}={request.session_id}"]
     if request.source_session_id:

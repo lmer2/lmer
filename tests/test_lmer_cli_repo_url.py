@@ -2,6 +2,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from lmer_cli import resolve
 from lmer_cli.cli import main, parse_args
 from tests.test_lmer_cli_slack_target import (
@@ -92,3 +94,10 @@ def test_repo_and_repo_url_together_name_two_repositories(capsys):
     rc, _env = _launch(["triage", "request-123", "--repo", REPO, "--repo-url", REPO])
     assert rc == 2
     assert "two repositories named: --repo" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("target", ["./checkout", "/srv/checkout", "https://git.example.com/other/repo.git"])
+def test_a_path_or_repository_target_beside_a_repo_url_is_a_second_repository(target, capsys):
+    rc, _env = _launch(["triage", target, "--repo-url", REPO])
+    assert rc == 2
+    assert "two repositories named: the positional" in capsys.readouterr().out
