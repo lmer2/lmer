@@ -404,7 +404,7 @@ line. The same data is available through the API and `lmer-ctl`:
 
 Each listed route carries `transport`, `conversation`, `label` (as entered or
 resolved), `project_id`, `project_name` and `archived`. Every project's assistant
-can read the whole list, so an uber lmer can report it; that includes other
+can read the whole list, so a Ratchet can report it; that includes other
 projects' channel IDs and labels. A stored label or ID is matched against the
 project's own routes before anything is looked up, so re-saving `#name` after the
 channel was renamed keeps the channel it was mapped to rather than following the
