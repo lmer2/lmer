@@ -120,7 +120,7 @@ def bind(request, caller, body):
         "/api/state", "/api/rescan", "/api", "/", "/api/assistant/config",
         "/api/comms/feed", "/api/comms/questions", "/api/comms/connectors", "/api/spawn-options",
         "/api/prune", "/api/runs/forget",
-        "/api/assistant/peers", "/api/workrepo/schema",
+        "/api/assistant/peers", "/api/workrepo/schema", "/api/channel-routes",
     } or path.startswith(("/assets/", "/api/slots"))
     operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
         f"/api/sessions/{session}/messages", f"/api/sessions/{session}/log", f"/api/sessions/{session}/ask",
@@ -134,7 +134,7 @@ def bind(request, caller, body):
         moving_out = path == "/api/runs/move" and home and chosen == home["project_id"]
         projects.get(chosen, active=request.method not in ("GET", "HEAD")
                      and not path.endswith("/restore") and not moving_out)
-    if caller.kind != "operator" and (path.startswith("/api/projects") or path == "/api/settings"
+    if caller.kind != "operator" and (path.startswith("/api/projects") or path in ("/api/settings", "/api/channel-routes")
                                        or path.startswith("/api/slots") or path in ("/api/runs/move", "/api/prune")) and request.method != "GET":
         raise projects.ProjectError("Only an operator may change platform or project settings.", status=403)
     expected = body.get("home_revision", query.get("home_revision"))

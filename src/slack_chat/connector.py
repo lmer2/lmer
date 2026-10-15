@@ -24,6 +24,7 @@ import requests
 
 from ask_channel import bus
 from lmer_cli import thread_posts
+from lmer_cli.comms import off_thread
 from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -211,6 +212,8 @@ def render_outbound(
     """
     source = record.get("source") or {}
     if source.get("channel") in (own_channel, "peer-ul") or record.get("kind") == "note":
+        return None
+    if off_thread(record):
         return None
     kind = record.get("kind")
     text = str(record.get("text") or "")
@@ -592,7 +595,8 @@ class SlackConnector(ConnectorLifecycle):
         return bool(qid and qid not in self._answered_freely)
 
     def _oldest_open_question(self) -> Optional[dict]:
-        states = self.bus.questions(open_only=True)
+        states = [state for state in self.bus.questions(open_only=True)
+                  if not off_thread(state.get("question"))]
         if not states:
             return None
         states.sort(key=lambda state: (state.get("question") or {}).get("seq", 0))

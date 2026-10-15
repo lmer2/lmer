@@ -159,6 +159,7 @@ from uuid import uuid4
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.connector_ownership import OwnershipError, process_identity, same_process
 from lmer_cli.container.clone_and_exec import _scrub_credentials
+from lmer_cli.container.sources import url_has_embedded_credential
 from work_repo.utils import (
     classify_target, is_work_item, repository_of, sanitize_task_target,
 )
@@ -173,6 +174,7 @@ from lmer_cli.mounts import (
     MOUNT_LINKS_ENV,
     format_mount_links,
 )
+from lmer_cli.resolve import is_likely_url
 from lmer_cli.supervisor import (
     CONTAINER_SESSION_LOG_DIR,
     DEFAULT_PORT_RANGE,
@@ -180,6 +182,7 @@ from lmer_cli.supervisor import (
     _pick_port,
 )
 from lmer_cli.service import ServiceError
+from lmer_cli.targets import partition_targets
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state, session_record
 
@@ -325,6 +328,9 @@ _LAUNCH_UID_ATTEMPTS = 8
 #: subscribers on the bus and two copies of every reply in the thread (#412).
 NO_THREAD_CONNECTORS_FLAG = "--no-thread-connectors"
 
+#: The repository apart from the target (issue #545); see :func:`_passes_repo_url`.
+REPO_URL_FLAG = "--repo-url"
+
 #: How ``lmer`` is told a session deliberately has no repository (spec D17).
 #: Passed in the child's environment rather than as a flag because that is where
 #: ``lmer`` reads it — the host CLI skips repo resolution on it and the
@@ -429,6 +435,9 @@ _RESERVED_ARGS = (
     # record under a uid the platform never checked — possibly one that
     # already names another record.
     LAUNCH_UID_FLAG,
+    # Emitted from ``repo_url`` and recorded as the run's repo; a second spelling
+    # would clone something the entry does not name.
+    REPO_URL_FLAG,
 )
 
 
@@ -785,6 +794,14 @@ class SpawnRequest:
                 "a spawn needs a target or a repo_url (or no_repo): name the "
                 "work, the repository, or that there is neither"
             )
+        if _passes_repo_url(request):
+            if not is_likely_url(request.repo_url):
+                raise SpawnError(f"repo_url must be a repository URL for target {request.target!r}")
+            if _clone_url_without_secrets(request.repo_url) is None:
+                raise SpawnError("repo_url embeds a credential; use a credential helper or an SSH key")
+            if _thread_target(request.target) and request.target not in (request.targets or []):
+                # Connected like any other thread target, so the daemon owns its connector.
+                return replace(request, targets=[*(request.targets or []), request.target]).validate()
         if request.targets is not None:
             try:
                 validate_thread_targets(request.targets)
@@ -2662,6 +2679,41 @@ def _needs_repo_flag(request: SpawnRequest) -> bool:
     return classify_target(request.target) in ("reference", "other")
 
 
+def _thread_target(target: str) -> bool:
+    return bool(partition_targets([target])[1])
+
+
+def _passes_repo_url(request: "SpawnRequest") -> bool:
+    """Whether ``repo_url`` reaches ``lmer`` as :data:`REPO_URL_FLAG`.
+
+    Only for a thread whose task has no repo-less mode, or a target ``lmer``
+    would fail on as a missing local path (the child inherits this working
+    directory) that is not spelled as one. The field cannot say whether the
+    caller chose it for this launch — resume and answer send the recorded repo,
+    the web form pre-fills ``LMER_REPO_URL`` — so every other target keeps the
+    argv it always had, and a missing ``/abs``, ``./x`` or ``~/x`` still fails.
+    """
+    target = request.target
+    if not request.repo_url or not isinstance(target, str):
+        return False
+    _targets, handlers = partition_targets([target])
+    if handlers:
+        return not handlers[0].supports_repoless_session(request.taskdef)
+    if is_likely_url(target) or os.path.isabs(target) or target.startswith(("./", "../", "~")):
+        return False
+    return not (Path.cwd() / target).resolve().exists()
+
+
+def _clone_url_without_secrets(url: str) -> Optional[str]:
+    """*url* with HTTP(S) userinfo scrubbed, or ``None`` when a secret survives that.
+
+    A bare SSH user (``git@``, ``ssh://git@…``) is part of the address and stays.
+    """
+    if url.lower().startswith(("http://", "https://")):
+        url = _scrub_credentials(url)
+    return None if url_has_embedded_credential(url) else url
+
+
 def _build_command(
     config: PlatformConfig, request: SpawnRequest, *, launch_uid: Optional[str] = None
 ) -> list:
@@ -2713,7 +2765,8 @@ def _build_command(
     cmd += [request.taskdef]
     if request.target:
         cmd += [request.target]
-    cmd += [*(request.targets or []), "--fastapi"]
+    cmd += [*(target for target in request.targets or [] if target != request.target),
+            "--fastapi"]
     # The thread permalinks stay positional — they are what sets the container's
     # chat context and what lets a repo-less `chat` session start — but the
     # connectors for them are the daemon's, so they can be added and removed
@@ -2737,6 +2790,8 @@ def _build_command(
         cmd += [f"{REPO_FLAG}={request.repo_url}"]
     if request.ports:
         cmd += ["--ports", str(request.ports)]
+    if _passes_repo_url(request):
+        cmd += [f"{REPO_URL_FLAG}={_clone_url_without_secrets(request.repo_url)}"]
     if request.session_id:
         cmd += [f"{SESSION_FLAG}={request.session_id}"]
     if request.source_session_id:

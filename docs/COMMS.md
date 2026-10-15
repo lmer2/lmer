@@ -104,7 +104,7 @@ line in the log and the same object on the wire.
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
 | `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
-| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), and `session_origin` on a session's own record posted for it. Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, and `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
 
 ### Kinds
 
@@ -710,6 +710,14 @@ everything else is an ordinary message that leaves the question open:
 under first-answer-wins, told every channel who answered, and handed the words
 to `lmer-signal ask` as its exit-0 stdout.
 
+**A question can stay off the threads.** A record whose `meta.off_thread` is
+`true` is neither posted to Slack or matrix nor ever a candidate for binding. The
+supervisor alone sets it, on the question and on every answer or close to it. An
+open one still counts as open, so it
+reaches uber lmer as a `live_question` and the chat pane shows it. The Codex
+delivery escalation (docs/CODEX-DELIVERY.md) is the one producer: as a thread
+question it captured the human's next reply meant for the agent's own question.
+
 **Delivery is guaranteed one way or the other** — the waiting CLI's stdout, or
 the harness's PTY — and the claim that decides which is durable rather than
 "a request happens to be open". `ask` claims the answer as it posts the
@@ -828,6 +836,12 @@ thread while a run is up*, below). From the control CLI:
 ```sh
 lmer-ctl spawn develop ISSUE_URL --target-thread SLACK_THREAD --target-thread MATRIX_THREAD
 ```
+
+A non-`chat` taskdef can take the thread itself as its target when `--repo-url`
+names the repository: `lmer-ctl spawn triage SLACK_THREAD --repo-url URL`
+connects that thread as if it were also given with `--target-thread`, and the
+run's slug derives from the thread, so every thread is its own run (see
+[LMER-CLI.md](./LMER-CLI.md#per-request-targets-with---repo-url)).
 
 For **uber lmer**, open its settings beside model/harness/preset, enter the
 thread permalinks **one per line**, save, then restart (rotate). The equivalent
@@ -1341,6 +1355,23 @@ is told not to ask again. Were it asked again, a thread taken in that moment
 would answer "no assistant at all", which is exactly what the standing-list
 deferral exists to prevent; instead the thread comes back as a deferred
 connection, and attaches when it is free.
+
+**The held-thread check asks the transport nothing for the incumbent's own
+threads** (issue #557). A thread the incumbent already holds is checked with that
+record's identity as it stands, so a rotation reads no history from Slack for it:
+on a 2,000-message thread that read was what a 429 refused for seven hours, while
+posts to the same thread went through. (The successor's launch adoption still
+resolves its targets best-effort, as every launch does; a failure there only
+logs.) Any other named thread must still resolve, and a failure refuses the
+launch with a message naming the method (`conversations.replies`, or the matrix
+alias lookup) and the error. When the transport said "not now" (an HTTP 429 or
+5xx, or no answer at all) rather than "no", the message adds the wait a 429 asked
+for (Slack's `Retry-After`, matrix's `retry_after_ms`) or says that none was
+given. A definite answer without a status, such as an alias that names no room,
+is not "not now". Reused records
+include ones a launch adopted best-effort, and the check on them cannot see
+another live session holding the same conversation under a different spelling
+(a reply link rather than its root, an alias rather than the `!room` id).
 
 **Where the connectors run.** For a session the platform spawned — uber lmer
 included — the **daemon** runs them, one process per connection, with the

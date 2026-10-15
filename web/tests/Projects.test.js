@@ -21,6 +21,7 @@ vi.mock('../src/api.js', async importOriginal => ({
   fetchPlatformSettings: vi.fn(), fetchConversationRequests: vi.fn(), parkConversationRequest: vi.fn(),
   setAssistantInstructions: vi.fn(), updateProject: vi.fn(), archiveProject: vi.fn(), setPlatformSettings: vi.fn(),
   fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(), uploadSessionFile: vi.fn(),
+  fetchChannelRoutes: vi.fn(), setProjectChannels: vi.fn(),
 }))
 
 const projects = [
@@ -52,6 +53,8 @@ beforeEach(() => {
   api.fetchConversationRequests.mockResolvedValue({ requests: [] })
   api.setPlatformSettings.mockResolvedValue({})
   api.archiveProject.mockResolvedValue({})
+  api.fetchChannelRoutes.mockResolvedValue({ routes: [] })
+  api.setProjectChannels.mockImplementation((_id, channels) => Promise.resolve({ routes: channels.map(label => ({ label })) }))
 })
 
 it('groups every All-project status locally and keeps the actual chat destination through list switches', async () => {
@@ -584,6 +587,46 @@ it.each(['alpha', 'beta', null])('shows run identity only when the toolbar does 
   })
   expect(wrapper.find('.run-project-identity').exists()).toBe(identifiedWorkspaceId !== 'alpha')
   if (identifiedWorkspaceId !== 'alpha') expect(wrapper.get('.run-project-identity').text()).toBe(projects[0].name)
+})
+
+it('shows only this project\'s mention channels and saves them only when edited', async () => {
+  api.fetchChannelRoutes.mockResolvedValue({ routes: [
+    { project_id: 'alpha', label: '#i-alpha', archived: false }, { project_id: 'beta', label: 'C0BETA123', archived: false },
+    { project_id: 'alpha', label: '!room:example.org', archived: false }] })
+  const wrapper = mountPane(ProjectSettings, { project: projects[0] })
+  await flushPromises()
+  const field = wrapper.get('.mention-channels textarea')
+  expect(field.element.value).toBe('#i-alpha\n!room:example.org')
+  const save = wrapper.findAll('button').find(button => button.text() === 'Save project')
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).not.toHaveBeenCalled()
+  await field.setValue(' #i-alpha \n\nhttps://example.slack.com/archives/C0NEW1234\n')
+  api.setProjectChannels.mockRejectedValueOnce(new Error('C0NEW1234 is already mapped to project Beta; remove it there first.'))
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).toHaveBeenLastCalledWith('alpha', ['#i-alpha', 'https://example.slack.com/archives/C0NEW1234'])
+  expect(wrapper.text()).toContain('already mapped to project Beta')
+  expect(field.element.value).toContain('C0NEW1234')
+  await field.setValue('')
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).toHaveBeenLastCalledWith('alpha', [])
+  expect(field.element.value).toBe('')
+})
+
+it('does not offer the mention channels for editing before they load', async () => {
+  const pending = deferred()
+  api.fetchChannelRoutes.mockReturnValueOnce(pending.promise)
+  const wrapper = mountPane(ProjectSettings, { project: projects[0] })
+  await flushPromises()
+  expect(wrapper.get('.mention-channels textarea').attributes('disabled')).toBeDefined()
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).not.toHaveBeenCalled()
+  pending.resolve({ routes: [{ project_id: 'alpha', label: 'C0ALPHA12' }] })
+  await flushPromises()
+  expect(wrapper.get('.mention-channels textarea').element.value).toBe('C0ALPHA12')
 })
 
 it('keeps standing instructions collapsed and untouched when only project metadata is saved', async () => {

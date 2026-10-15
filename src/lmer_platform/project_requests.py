@@ -7,7 +7,7 @@ import re
 
 from lmer_cli import thread_access
 from lmer_cli.threads import ThreadError
-from . import assistant, project_context as scope, project_threads, projects, store
+from . import assistant, channel_routes, project_context as scope, project_threads, projects, store
 from .transcripts import scrub_credentials
 from . import assistant_conversation
 
@@ -309,6 +309,7 @@ def admit(identity, payload, client):
                 _queue(db, original, selected, ownership)
             return _accepted(original["id"], selected, original["payload"]["permalink"])
         text = row["payload"]["message"]["text"].lstrip()
+        routed = None
         matches = _named_projects(text) if payload["entry"] == "mention" else []
         if len(matches) > 1:
             selected = None
@@ -324,13 +325,16 @@ def admit(identity, payload, client):
                 message.setdefault("original_text", message["text"])
                 message["text"] = remainder
         elif not owners and payload["entry"] == "mention":
-            selected = projects.GENERAL
+            routed = channel_routes.project_for(row["transport"], row["conversation"])
+            selected = routed or projects.GENERAL
         state = "choice"
         if selected:
             project = projects.get(selected)
             if project["archived"]:
                 state = "invalid"
-                row["error"] = f"Project {project['name']} is archived; restore it before sending a new request."
+                row["error"] = (f"This channel is mapped to project {project['name']}, which is archived; "
+                                "restore it or remap the channel before sending a new request." if routed else
+                                f"Project {project['name']} is archived; restore it before sending a new request.")
             elif not ownership:
                 project_threads.choose_unbound(payload["permalink"], selected)
                 ownership = _current(row)

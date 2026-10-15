@@ -323,6 +323,7 @@ class TestTargetHandlerContract:
         reason = SlackThreadTargets().repoless_unsupported_reason("review")
         assert "'chat'" in reason
         assert "'review'" in reason
+        assert "--repo-url" in reason
 
     def test_validate_environment_requires_bot_token(self):
         """Missing SLACK_BOT_TOKEN produces an error naming the variable."""
@@ -379,6 +380,7 @@ class TestTargetHandlerContract:
         assert handler.supports_repoless_session("chat") is False
         reason = handler.repoless_unsupported_reason("chat")
         assert "repository target" in reason
+        assert "--repo-url" in reason
         assert "'chat'" in reason
 
 

@@ -12,6 +12,7 @@ import json
 import os
 import time
 import pytest
+import requests
 from unittest.mock import MagicMock, call
 
 # Deferred import — collected regardless; fails at runtime until impl lands.
@@ -484,8 +485,56 @@ class TestHttp429Retry:
         monkeypatch.setattr(client.session, "request", always_429)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
-        with pytest.raises(SlackError):
+        with pytest.raises(SlackError) as caught:
             client.post_message("C12345", "1700000000.123456", "exhausted retries")
+        assert caught.value.transient is True
+        assert caught.value.retry_after == 1, "the wait Slack asked for reaches the caller"
+
+    @pytest.mark.parametrize("header", [{}, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}, {"Retry-After": "-5"}])
+    def test_a_429_without_a_usable_retry_after_names_no_wait(self, monkeypatch, header):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+
+        def always_429(method, url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 429
+            resp.headers = header
+            resp.raise_for_status.side_effect = requests.HTTPError(response=resp)
+            return resp
+
+        monkeypatch.setattr(client.session, "request", always_429)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        with pytest.raises(SlackError) as caught:
+            client.post_message("C12345", "1700000000.123456", "x")
+        assert (caught.value.transient, caught.value.retry_after) == (True, None)
+
+    @pytest.mark.parametrize("status, transient", [(503, True), (404, False)])
+    def test_an_http_failure_says_whether_it_is_worth_retrying(self, monkeypatch, status, transient):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+
+        def failing(method, url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = status
+            resp.raise_for_status.side_effect = requests.HTTPError(response=resp)
+            return resp
+
+        monkeypatch.setattr(client.session, "request", failing)
+        with pytest.raises(SlackError) as caught:
+            client.post_message("C12345", "1700000000.123456", "x")
+        assert caught.value.transient is transient
+
+    def test_no_answer_at_all_is_worth_retrying(self, monkeypatch):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+
+        def unreachable(method, url, **kwargs):
+            raise requests.ConnectionError("connection refused")
+
+        monkeypatch.setattr(client.session, "request", unreachable)
+        with pytest.raises(SlackError) as caught:
+            client.post_message("C12345", "1700000000.123456", "x")
+        assert caught.value.transient is True
 
     def test_429_retry_after_header_respected(self, monkeypatch):
         """Retry-After value from header is passed to sleep()."""

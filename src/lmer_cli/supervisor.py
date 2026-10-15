@@ -55,6 +55,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import functools
 import hashlib
 import logging
 import math
@@ -1443,7 +1444,7 @@ def _relay_message(
         "tagged": tagged,
     }
     if codex_delivery is not None:
-        return {**receipt, **codex_delivery.deliver(text, client_id=message.id)}
+        return {**receipt, **codex_delivery.deliver(text, client_id=message.id, adapter_converges=True)}
     try:
         written, verdict = submit(text)
     except OSError as exc:
@@ -1466,6 +1467,8 @@ class _InboundRelay:
         self._submit_lock = threading.Lock()
         self._pending: list[tuple[_comms.Message, dict]] = []
         self._ready = not startup_pending
+        self._wake = threading.Event()
+        self._worker: Optional[threading.Thread] = None
 
     def enqueue(self, message: _comms.Message) -> dict:
         with self.lock:
@@ -1484,17 +1487,64 @@ class _InboundRelay:
                         return
                     self._pending.sort(key=lambda item: item[0].seq)
                     message, receipt = self._pending.pop(0)
-                delivered = _relay_message(
-                    self.log, message, self.submit, self.harness, self.codex_delivery,
-                )
+                try:
+                    delivered = _relay_message(
+                        self.log, message, self.submit, self.harness, self.codex_delivery,
+                    )
+                except Exception as exc:
+                    if self.codex_delivery is None:
+                        raise  # Inside the request: the poster's 500 says it.
+                    delivered = self._refused(message, exc)
                 with self.lock:
                     receipt.clear()
                     receipt.update(delivered)
+
+    def _refused(self, message: _comms.Message, exc: Exception) -> dict:
+        """A record the Codex adapter would not take, whose poster holds only ``queued``.
+
+        It is raised to uber lmer like any record that cannot converge, unless
+        the adapter is closed: then the session is ending and a note is all.
+        """
+        logging.getLogger(__name__).exception("inbound_relay_failed id=%s", message.id)
+        delivery = self.codex_delivery
+        if not delivery.closed and delivery.escalate is not None:
+            try:
+                delivery.escalate({"delivery_id": message.id}, f"the adapter refused it ({exc})", "")
+            except Exception:
+                logging.getLogger(__name__).exception("inbound_relay_escalation_failed id=%s", message.id)
+            else:
+                return {"bytes_written": 0, "error": str(exc), "note": "Not sent; raised to uber lmer."}
+        with contextlib.suppress(Exception):
+            delivery.notify(f"Bus record {message.id} was not sent: {exc}.")
+        return {"bytes_written": 0, "error": str(exc),
+                "note": "Not sent and not retried; the record stays on the bus."}
 
     def startup_submitted(self) -> None:
         with self.lock:
             self._ready = True
         self.flush()
+
+    def flush_soon(self) -> None:
+        """Flush now, or for Codex on one worker: its submission can outlast the caller."""
+        if self.codex_delivery is None:
+            self.flush()
+            return
+        with self.lock:
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._drain, name="lmer-inbound-relay", daemon=True,
+                )
+                self._worker.start()
+        self._wake.set()
+
+    def _drain(self) -> None:
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            try:
+                self.flush()
+            except Exception:
+                logging.getLogger(__name__).exception("inbound_relay_flush_failed")
 
 
 def _build_fastapi_app(
@@ -1736,10 +1786,17 @@ def _build_fastapi_app(
             relay = None
             if accepted != _comms.ACCEPTED_DUPLICATE and _relay_wanted(log, message):
                 relay = relay_inbound.enqueue(message)
+                if relay_inbound.codex_delivery is not None:
+                    # Copied before a running worker can fill it in: the adapter
+                    # converges or escalates the durable record without this caller.
+                    relay = dict(relay)
         if relay is not None:
-            relay_inbound.flush()
-            with relay_inbound.lock:
-                relay = dict(relay)
+            if relay_inbound.codex_delivery is None:
+                relay_inbound.flush()
+                with relay_inbound.lock:
+                    relay = dict(relay)
+            else:
+                relay_inbound.flush_soon()
         # The receipt (#197) over what was *received*, like `send_input` hashes
         # before `sanitize`: it answers "did my bytes reach the session?", and
         # an answer naming its option is stored as the option's text, which the
@@ -2678,6 +2735,49 @@ def _comms_ask_dir_env() -> str:
     return ASK_DIR_ENV
 
 
+_ESCALATION_QUOTE_LIMIT = 120
+
+
+def _escalate_codex_delivery(log: "_comms.MessageLog", receipt: dict, reason: str, text: str) -> str:
+    """Ask on the bus about an input Codex never confirmed; the question id.
+
+    Quotes the record's own words, never the relay tag *text* carries, and
+    nothing of a peer message. The ref makes a retried escalation idempotent.
+    """
+    ident = receipt["delivery_id"]
+    seq = _comms.parse_message_ref(ident, log.session)
+    record = log.get(seq) if seq is not None else None
+    if record is not None:
+        text = "" if record.source.channel == "peer-ul" else record.text
+    head = (text.strip().splitlines() or [""])[0]
+    if len(head) > _ESCALATION_QUOTE_LIMIT:
+        head = head[:_ESCALATION_QUOTE_LIMIT - 1] + "…"
+    message, _ = log.append(
+        kind=_comms.KIND_QUESTION,
+        text=(
+            f"The session may not have seen {ident}"
+            + (f" (“{head}”)" if head else "")
+            + f": {reason}. It was not resent. Answering relays your answer to the "
+            "session; tell the sender to repeat it if the reply shows it was missed."
+        ),
+        source=_comms.Source(_comms.CHANNEL_PLATFORM, ref=f"codex-escalation:{ident}"),
+        off_thread=True,
+    )
+    return message.id
+
+
+def _deescalate_codex_delivery(log: "_comms.MessageLog", handle: str, receipt: dict) -> None:
+    try:
+        log.append(
+            kind=_comms.KIND_CLOSE,
+            text=f"Codex confirmed {receipt['delivery_id']} after all",
+            in_reply_to=handle,
+            source=_comms.Source(_comms.CHANNEL_PLATFORM),
+        )
+    except _comms.CommsError:
+        pass  # Already answered or closed: nothing left open to retract.
+
+
 def run_supervisor(cmd, options, *, stdin_fd=None, stdout_fd=None, write_lock=None):
     kwargs = dict(stdin_fd=stdin_fd, stdout_fd=stdout_fd, write_lock=write_lock)
     if _active_harness_name() != "codex":
@@ -2765,6 +2865,8 @@ def _run_supervisor(
                 source=_comms.Source(_comms.CHANNEL_PLATFORM),
             )
         codex_delivery.notify = report_codex_delivery
+        codex_delivery.escalate = functools.partial(_escalate_codex_delivery, comms_log)
+        codex_delivery.deescalate = functools.partial(_deescalate_codex_delivery, comms_log)
     ask_projection = _open_ask_projection(comms_log)
 
     master_fd, slave_fd = os.openpty()
@@ -2905,7 +3007,7 @@ def _run_supervisor(
                     # answer reaches the agent one way or the other.
                     inbound_relay.enqueue(message)
 
-            inbound_relay.flush()
+            inbound_relay.flush_soon()
 
     watcher_thread = threading.Thread(
         target=_watch_bus, name="lmer-supervisor-bus-watch", daemon=True
