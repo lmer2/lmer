@@ -742,6 +742,20 @@ lmer chat "https://myworkspace.slack.com/archives/C0123456789/p1700000000123456"
 
 When no repository target is given, lmer first tries to infer a repo from the current directory's git origin (as usual); if the current directory is not a git repository, the session starts without a repository — the container skips the workspace clone (signalled via `LMER_NO_REPO=1`) and the chat task is the Slack conversation itself. This repo-less fallback is supported for the `chat` task only; every other task assumes code in `/workspace` and fails fast with an error if a Slack thread is its sole target outside a git checkout.
 
+#### Per-request targets with `--repo-url`
+
+`--repo-url URL` names the repository to clone separately from the target, so the positional target is only the task's target: what `$LMER_TASK_TARGET` carries and what the run slug derives from. It is never read as a local path. This is how a thread-driven taskdef other than `chat` gets one run per request:
+
+```bash
+# The thread is the target and is connected as usual; slug: triage-p1700000000123456
+lmer triage "https://myworkspace.slack.com/archives/C0123456789/p1700000000123456" \
+  --repo-url https://git.example.com/group/project
+# A label is the target; slug: triage-request-123
+lmer triage request-123 --repo-url https://git.example.com/group/project
+```
+
+Put the task and every target before the options. Outside `--exec`, lmer refuses a bare word after an option rather than ignore it. A word after an unknown flag, or after `--`, is still not read as a target. With an issue or MR URL as the target, `--repo-url` replaces the repository derived from it and the target keeps its own slug. `--repo-url` must be a URL. Without it nothing changes: a label is still a local path, and a non-`chat` task with only a thread target is refused with a message naming `--repo-url`. With an MR target, `GITLAB_MR_*` still come from the MR, so name the MR's own repository. On the platform, `lmer-ctl spawn TASK TARGET --repo-url URL` passes the URL through as this flag when the target is a thread permalink for a task without repo-less mode, or a target that is not a URL, is not spelled as a path (absolute, `./`, `../`, `~`), and does not resolve to an existing path in the daemon's working directory. Such a thread target is also connected the way `--target-thread` connects one. Every other target keeps the argv it always had, including `chat` threads, existing paths and missing paths spelled as paths, which lmer still refuses: the platform's `repo_url` is also the recorded repo that resume and answer pass back. HTTP(S) userinfo is dropped from the flag, and a `repo_url` whose secret survives that (any non-HTTP one included) is refused.
+
 To get the permalink, hover the thread's first message in Slack and choose **"Copy link"**.
 
 lmer parses the permalink into a channel ID and thread timestamp and injects them into the container as `LMER_SLACK_CHANNEL` / `LMER_SLACK_THREAD_TS` / `LMER_SLACK_PERMALINK`, with `LMER_CHAT_CHANNEL=slack`. The conversation itself runs over the **session bus** ([COMMS.md](./COMMS.md)): a Slack thread target turns the supervisor control plane on, and a **connector child** supervised by the host `lmer` process mirrors the thread onto the bus in both directions — every message a human writes in the thread reaches the agent as a turn tagged `[slack · <name>]`, and the agent's conversational messages, questions, and milestones land in the thread. Quiet `lmer-signal note` records remain on the bus/platform. `SLACK_BOT_TOKEN` is required on the host and **never enters the container**. Inside the container the agent's command is `lmer-signal`:
@@ -962,6 +976,7 @@ lmer records each remapped image under `~/.lmer/remapped/<image-id>`, and the "m
 - `--branch <branch>` - Checkout a specific branch (applies to primary target only)
 - `--ref <ref>` - Checkout a specific ref (tag or commit) (applies to primary target only)
 - `--remote <name>` - Git remote name to use (required when local repo has multiple remotes)
+- `--repo-url <url>` - Repository to clone, independent of the target; the target is then only `$LMER_TASK_TARGET` and the run slug (a label, an issue/MR URL or a thread permalink). See [Per-request targets with `--repo-url`](#per-request-targets-with---repo-url)
 - `--mount-file HOST:CONTAINER[:MODE]` - Mount a single host file into the container at an explicit destination (repeatable). `HOST` supports `~`/`$VAR` expansion and must be an existing file; `CONTAINER` must be an absolute path; `MODE` is `ro` (default) or `rw`. Motivating case: `--mount-file ~/.kube/config:/home/developer/.kube/config` puts a kubeconfig where `kubectl` looks by default (no `KUBECONFIG` needed). Merges with `LMER_MOUNT_FILES` (env entries first, flags override on the same destination, last wins with a warning); any invalid entry aborts the run (fail-fast — see the env var entry for the rationale) (env: `LMER_MOUNT_FILES`)
 - `--env-file <path>` - Load an additional `.env` file as the **highest-priority** `.env` source (above the working-directory `.env` and `~/.lmer/.env`, which still load; below variables already exported in the environment). Its variables are forwarded into the container like any other `.env`-sourced var. Useful when `lmer` is launched from a directory without the relevant `.env` — e.g. `lmer-slack-listener` spawns `lmer chat` from a scratch cwd and forwards its deployment `.env` this way (see `--lmer-env-file` / `LMER_SLACK_CHAT_ENV_FILE`). A path that does not exist is warned and skipped (non-fatal)
 - `--verbose` - Enable verbose output (same as `LMER_VERBOSE=1`)

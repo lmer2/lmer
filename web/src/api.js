@@ -71,6 +71,16 @@ export function archiveProject(workspaceId, restore = false) {
   return request(`api/projects/${encodeURIComponent(workspaceId)}/${restore ? 'restore' : 'archive'}`, { method: 'POST' })
 }
 
+export function fetchChannelRoutes() {
+  return request('api/channel-routes')
+}
+
+export function setProjectChannels(workspaceId, channels) {
+  return request(`api/projects/${encodeURIComponent(workspaceId)}/channel-routes`, {
+    method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ channels }),
+  })
+}
+
 export function moveRun(run, destinationId) {
   return request('api/runs/move', {
     method: 'POST', headers: jsonHeaders,

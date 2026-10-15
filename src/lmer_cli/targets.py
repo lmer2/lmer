@@ -130,7 +130,7 @@ class TargetHandler:
         """
         return (
             "This target type requires a repository target for the "
-            f"'{task_id}' task (or run it from inside a git checkout)."
+            f"'{task_id}' task: pass --repo-url URL (or run it from inside a git checkout)."
         )
 
     def container_env(self) -> dict[str, str | None]:
@@ -221,8 +221,8 @@ class SlackThreadTargets(TargetHandler):
     def repoless_unsupported_reason(self, task_id: str | None) -> str:
         return (
             "A Slack thread as the only target is supported for the 'chat' "
-            f"task only; the '{task_id}' task needs a repository target "
-            "(or run it from inside a git checkout)."
+            f"task only; the '{task_id}' task needs a repository: pass "
+            "--repo-url URL (or run it from inside a git checkout)."
         )
 
     def container_env(self) -> dict[str, str | None]:
@@ -324,8 +324,8 @@ class MatrixThreadTargets(TargetHandler):
     def repoless_unsupported_reason(self, task_id: str | None) -> str:
         return (
             "A matrix thread as the only target is supported for the 'chat' task "
-            f"only; the '{task_id}' task needs a repository target (or run it from "
-            "inside a git checkout)."
+            f"only; the '{task_id}' task needs a repository: pass --repo-url URL "
+            "(or run it from inside a git checkout)."
         )
 
     def container_env(self) -> dict[str, str | None]:

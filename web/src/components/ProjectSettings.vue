@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { archiveProject, fetchAssistantInstructions, setAssistantInstructions, updateProject } from '../api.js'
+import { archiveProject, fetchAssistantInstructions, fetchChannelRoutes, setAssistantInstructions, setProjectChannels,
+  updateProject } from '../api.js'
 import { ago } from '../format.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
 
@@ -17,6 +18,8 @@ const ordersPanel = ref(null)
 const error = ref(null)
 const ordersError = ref(null)
 const busy = ref(false)
+const channels = ref('')
+const savedChannels = ref(null)
 // The picker speaks hex; the form keeps the stored spelling, preset name or hex.
 const pickedColor = computed({
   get: () => projectColor(form.value.color),
@@ -52,7 +55,20 @@ watch(() => props.project.id, (id) => {
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
   readForNonce = props.focus?.nonce
   readOrders(id)
+  readChannels(id)
 }, { immediate: true })
+
+const channelList = (text) => text.split('\n').map(value => value.trim()).filter(Boolean)
+
+async function readChannels(id) {
+  channels.value = ''
+  savedChannels.value = null
+  try {
+    const { routes } = await fetchChannelRoutes()
+    if (id !== props.project.id) return
+    savedChannels.value = channels.value = routes.filter(route => route.project_id === id).map(route => route.label).join('\n')
+  } catch (exc) { if (id === props.project.id) error.value = exc.message }
+}
 
 // uber lmer rewrites the orders from the chat, so each tap re-reads them: saving a
 // stale copy would overwrite the newer wording. An unsaved edit is kept.
@@ -98,6 +114,10 @@ async function save() {
       repositories: form.value.repositories.split('\n').map(value => value.trim()).filter(Boolean),
       settings: Object.fromEntries(Object.entries(form.value.settings).map(([key, value]) => [key, value || null])) })
     emit('changed')
+    if (savedChannels.value !== null && channels.value !== savedChannels.value) {
+      const { routes } = await setProjectChannels(id, channelList(channels.value))
+      savedChannels.value = channels.value = routes.map(route => route.label).join('\n')
+    }
   } catch (exc) { error.value = exc.message } finally { busy.value = false }
 }
 
@@ -132,6 +152,9 @@ async function archive() {
       <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
         hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
       <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
+      <v-textarea v-model="channels" class="mention-channels mb-4" label="Mention channels (one per line)" rows="2"
+        :disabled="busy || savedChannels === null" persistent-hint spellcheck="false"
+        hint="Bot mentions here route to this project unless they name another one. Slack channel ID, #name or link; Matrix room ID, alias or link." />
       <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
         <v-expansion-panel title="Standing instructions">
           <v-expansion-panel-text>

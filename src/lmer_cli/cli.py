@@ -629,6 +629,7 @@ def parse_args(
     parser.add_argument("--branch", dest="branch")
     parser.add_argument("--ref", dest="ref")
     parser.add_argument("--remote", dest="remote", help="Git remote name to use (required when local repo has multiple remotes)")
+    parser.add_argument("--repo-url", dest="repo_url", help="Repository URL to clone, independent of the target. The primary target is then only the task's target (LMER_TASK_TARGET and the run slug): a label, an issue/MR URL, or a Slack/matrix thread permalink, which lets a non-chat task run per thread. Never read as a local path.")
     parser.add_argument("--exec", dest="exec_mode", action="store_true", help="Run an arbitrary command in the container")
     parser.add_argument("--no-clone", dest="no_clone", action="store_true", help="Skip git clone, just run command (requires --exec)")
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
@@ -674,6 +675,13 @@ def parse_args(
     parser.add_argument("--port-bind", dest="port_bind", help=f"Host bind address for --ports publishing (default {DEFAULT_PORT_BIND}; pass 0.0.0.0 to expose ports beyond loopback; env: LMER_PORT_BIND)")
 
     ns, extra = parser.parse_known_args(argv)
+    # argparse leaves a positional that follows an option in `extra`, where only
+    # --exec reads it; a value after an unknown flag is that flag's, not a target.
+    ns.stray_positionals = [
+        token for index, token in enumerate(extra)
+        if not token.startswith("-")
+        and not (index and extra[index - 1].startswith("-") and "=" not in extra[index - 1])
+    ]
     # Combine any extra unknown args with the -- separated rest
     rest = extra + rest
     return ns, rest
@@ -2438,8 +2446,18 @@ def main(argv: list[str] | None = None) -> int:
     # primary/secondary selection so the clone path (~repo resolution)
     # never sees them. Each claimed type is represented by a handler that
     # owns its type-specific behavior (see lmer_cli.targets).
+    if ns.stray_positionals and not ns.exec_mode:
+        error(f"❌ {len(ns.stray_positionals)} argument(s) after an option would be ignored: "
+              "put the task and every target before the options")
+        return 2
     _raw_targets: list[str] = ns.target if ns.target else []
     targets, special_targets = partition_targets(_raw_targets)
+    if ns.repo_url and not resolve.is_likely_url(ns.repo_url):
+        error("❌ --repo-url needs a repository URL (http(s)://, ssh://, git@ or file:///)")
+        return 2
+    if ns.repo_url and not targets and _raw_targets:
+        # The thread is then the target too; its handler still connects it.
+        targets = [_raw_targets[0]]
     primary_target: str | None = targets[0] if targets else None
     secondary_targets: list[str] = targets[1:] if len(targets) > 1 else []
 
@@ -2551,8 +2569,8 @@ def main(argv: list[str] | None = None) -> int:
 
         # If task provides a PR/MR/issue URL, try to derive base repo URL
         # Only use primary target for repo resolution
-        derived_repo_url = None
-        if primary_target and isinstance(primary_target, str):
+        derived_repo_url = ns.repo_url
+        if not derived_repo_url and primary_target and isinstance(primary_target, str):
             derived_repo_url = _derive_repo_url_from_task_target(primary_target)
 
         try:

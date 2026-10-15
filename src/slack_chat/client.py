@@ -357,6 +357,24 @@ class SlackClient:
             if not cursor:
                 return found
 
+    def find_channels(self, name: str) -> list:
+        """The id of every unarchived channel named *name*, as a list for the same reason as :meth:`find_user`.
+
+        Needs ``channels:read`` and ``groups:read``; Slack answers ``missing_scope`` without them.
+        """
+        wanted = name.lstrip("#").casefold()
+        found, cursor = [], None
+        while True:
+            params = {"limit": 200, "exclude_archived": "true", "types": "public_channel,private_channel"}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._request("GET", "conversations.list", params=params)
+            found += [channel.get("id") for channel in data.get("channels") or []
+                      if str(channel.get("name") or "").casefold() == wanted]
+            cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                return found
+
     def workspace(self) -> Dict[str, Any]:
         """``{"host": …, "scopes": [...]}`` — the workspace, and what this token may do.
 
