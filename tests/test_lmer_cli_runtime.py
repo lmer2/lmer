@@ -225,10 +225,22 @@ class TestRepoRootPath:
 class TestLmerStateDir:
     """Test LMER state directory"""
 
-    def test_returns_home_lmer(self):
-        """State dir should be ~/.lmer/"""
-        state = lmer_state_dir()
-        assert state == Path.home() / ".lmer"
+    def test_returns_home_lmer(self, tmp_path):
+        """Check the default before test fixtures override writable state."""
+        result = subprocess.run(
+            [sys.executable, "-c", (
+                "from lmer_cli.runtime import lmer_state_dir\n"
+                "print(lmer_state_dir())\n"
+            )],
+            env={
+                "HOME": str(tmp_path),
+                "PATH": os.defpath,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == str(tmp_path / ".lmer")
 
     def test_returns_path_object(self):
         """State dir should be a Path"""

@@ -473,7 +473,7 @@ def session_mirror(tmp_path):
     """
     root = tmp_path / "schema-mirror"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         "schema: 1\n"
         "name: example-plexus\n"
         "projects:\n"

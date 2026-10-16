@@ -98,6 +98,22 @@ reports the lost tracking (:func:`_untracked_run_warning`), and text ``meta``
 refuses comes back as a warning of its own (:func:`_write_run_meta`). A session
 killed over a label is the worse outcome in every one of those cases.
 
+A schema-2 launch's identity
+----------------------------
+On a schema-2 mirror (:func:`schema_two`) a launch founds a fresh record, and
+that record's identity is its execution uid rather than its slug (spec §6.2,
+D7). So the uid is minted here (:func:`_mint_launch_uid`), passed down as
+``--launch-uid``, and every store this module writes keys the run by it from the
+first instant: the registry's ``run.uid``, the tracked index, meta and
+references, the project binding. The slug stays as the group label. A
+schema-1 mirror, and a spawn continuing a named record (``session_id``), mint
+nothing and key by slug exactly as before.
+
+The same key decides liveness. A fresh uid is held by nobody, so a second chat
+on a schema-2 project starts, and what used to be a 409 becomes a surfaced
+note in :attr:`SpawnResult.warning` (:func:`concurrent_sessions_note`, spec
+§6.3, #311) — detected and said, never enforced.
+
 Minting the control plane's port and token here
 -----------------------------------------------
 ``lmer --fastapi`` is perfectly capable of choosing its own port and generating
@@ -138,11 +154,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, NamedTuple, Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.connector_ownership import OwnershipError, process_identity, same_process
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.container.sources import url_has_embedded_credential
+from work_repo.utils import (
+    classify_target, is_work_item, repository_of, sanitize_task_target,
+)
+from lmer_schema.manifest import ManifestError, load_manifest
 from lmer_cli.env_sources import env_with_overrides
 from lmer_cli.harness import HARNESSES, known_harnesses
 from lmer_cli.mounts import (
@@ -163,7 +184,7 @@ from lmer_cli.supervisor import (
 from lmer_cli.service import ServiceError
 from lmer_cli.targets import partition_targets
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
-from work_repo import run_state
+from work_repo import run_state, session_record
 
 from . import (
     ask, codex_config, containers, memory, meta, registry, runs, slots, statusline,
@@ -186,7 +207,8 @@ logger = logging.getLogger("lmer_platform.spawn")
 
 __all__ = [
     "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied", "ThreadHeld",
-    "live_session_for_run",
+    "live_session_for_run", "concurrent_sessions_note", "schema_two",
+    "LAUNCH_UID_FLAG",
     "SpawnRequest", "SpawnResult", "ANSWER_FLAG", "SESSION_FLAG",
     "wait_for_exit_recorded",
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
@@ -233,6 +255,8 @@ ANSWER_FLAG = "--answer"
 #: to verbs that check before they spawn — and emitted from a typed field for
 #: the same reason: which record a session lands in is not caller text.
 SESSION_FLAG = "--session"
+SOURCE_SESSION_FLAG = "--source-session"
+SOURCE_ACK_FLAG = "--allow-unsigned-source"
 
 #: The flag ``lmer`` selects a named startup preset with, spelled by
 #: :func:`_build_command` from :attr:`SpawnRequest.preset`. The name is resolved
@@ -278,6 +302,24 @@ HARNESS_FLAG = "--harness"
 #: assistant's setting, and a preset's env could shadow either.
 MEMORY_FLAG = "--memory"
 CPUS_FLAG = "--cpus"
+#: The repository of record, emitted from the typed ``repo_url`` field. Reserved
+#: like the flags below: a caller spelling it in ``extra_args`` would win by
+#: argv order and clone a repository the platform never recorded.
+REPO_FLAG = "--repo"
+
+#: The execution uid a schema-2 launch records under (spec §6.2, D7), minted
+#: here by :func:`_mint_launch_uid` and emitted as one ``--launch-uid=<uid>``
+#: token. The platform mints it rather than learning it from the container
+#: because everything it records about the launch — the registry entry, the
+#: tracked index, the meta and references stores — is keyed by it from the
+#: first instant; learning it later would mean re-keying all of those once the
+#: session reported back.
+LAUNCH_UID_FLAG = "--launch-uid"
+
+#: How many fresh uids :func:`_mint_launch_uid` draws before giving up. A
+#: 128-bit draw colliding once is already a broken random source; the bound is
+#: there so that case is a refusal rather than a spin.
+_LAUNCH_UID_ATTEMPTS = 8
 
 #: How ``lmer`` is told that something else runs the connectors for its thread
 #: targets. Emitted whenever this module passes thread permalinks: the daemon
@@ -343,6 +385,8 @@ _RESERVED_ARGS = (
     # A raw POST /api/sessions must not be able to do from argv what those verbs
     # will not do from a request body.
     SESSION_FLAG,
+    SOURCE_SESSION_FLAG,
+    SOURCE_ACK_FLAG,
     # The next four are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
     # four, from typed fields, and writes what it emitted into the registry
@@ -381,6 +425,16 @@ _RESERVED_ARGS = (
     # overrides per spawn are deliberately not a request field.
     MEMORY_FLAG,
     CPUS_FLAG,
+    # The repository of record: emitted from ``SpawnRequest.repo_url`` (spec §6.5),
+    # so a second spelling in extra_args would clone a repository the registry
+    # entry and the tracked index never name.
+    REPO_FLAG,
+    # The execution uid (spec §6.2): the platform mints it, checks it against
+    # every uid it has already handed out, and keys the run by it. A second
+    # spelling in extra_args would win by argv order and file the session's
+    # record under a uid the platform never checked — possibly one that
+    # already names another record.
+    LAUNCH_UID_FLAG,
     # Emitted from ``repo_url`` and recorded as the run's repo; a second spelling
     # would clone something the entry does not name.
     REPO_URL_FLAG,
@@ -467,7 +521,17 @@ def _reject_unsafe_taskdef(taskdef: str) -> None:
     a taskdef search path and never legitimately contains either character; and
     by the time the slug matters it is a *concatenation*, so there are no
     segments left to reason about.
+
+    A taskdef that is itself 32 lowercase hex is refused too: it would be
+    indistinguishable from an execution uid as the last segment of
+    ``host/project/<key>``, so ``host/project/<taskdef>`` could name either a
+    run group or a schema-2 execution (spec §6.5).
     """
+    if runs.UID_RE.match(taskdef):
+        raise SpawnError(
+            f"taskdef may not be 32 lowercase hex ({taskdef!r}): it would be "
+            "ambiguous with an execution uid as the last segment of a run key"
+        )
     for bad in ("/", "\\", ".."):
         if bad in taskdef:
             raise SpawnError(
@@ -644,7 +708,10 @@ class SpawnRequest:
     """
 
     taskdef: str
-    target: str
+    #: The primary task target. Optional because a spawn can name its repository
+    #: with ``repo_url`` alone (spec §6.5); ``validate`` moves a
+    #: repository-class target into ``repo_url``.
+    target: Optional[str] = None
     repo_url: Optional[str] = None
     preset: Optional[str] = None
     #: Comma-delimited preset names the session's agent may fan out to
@@ -669,6 +736,17 @@ class SpawnRequest:
     #: The two namespaces both get called a session and neither is derived from
     #: the other (:mod:`lmer_platform.resume`'s module docstring).
     session_id: Optional[str] = None
+    #: Read-only context for a schema-2 launch. Unlike ``session_id``, this never
+    #: chooses the record the new execution writes; the container mints that UID
+    #: after it has detected schema 2.
+    source_session_id: Optional[str] = None
+    #: An explicit decision to continue from a source that has no final
+    #: ``session_end``. The value is the selected source UID itself, never a
+    #: boolean force switch, so a retry cannot authorize a different record.
+    allow_unsigned_source: Optional[str] = None
+    #: Extensible launch metadata sent as JSON. Unknown fields survive and secret
+    #: values are scrubbed before the child process can record them.
+    session_metadata: Optional[dict] = None
     identity_repo_url: Optional[str] = None
     no_repo: bool = False
     #: What this orchestrator files the run under, one line
@@ -695,39 +773,52 @@ class SpawnRequest:
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
             raise SpawnError("taskdef is required")
-        if not isinstance(self.target, str) or not self.target.strip():
-            raise SpawnError("target is required")
-        # Both are argv positionals, and the taskdef is also a path segment.
-        # Neither is checked anywhere else on the way in: ``POST /api/sessions``
-        # takes both verbatim from the request body.
         _reject_positional_flag("taskdef", self.taskdef)
-        _reject_positional_flag("target", self.target)
         _reject_unsafe_taskdef(self.taskdef)
-        if _passes_repo_url(self):
-            if not is_likely_url(self.repo_url):
-                raise SpawnError(f"repo_url must be a repository URL for target {self.target!r}")
-            if _clone_url_without_secrets(self.repo_url) is None:
+        if self.target is not None and not isinstance(self.target, str):
+            raise SpawnError(f"target must be text, got {self.target!r}")
+        # A blank target is no target. Kept as text it would pass the "neither"
+        # check below by truthiness and be emitted as a whitespace positional.
+        request = self if (self.target or "").strip() else replace(self, target=None)
+        if request.target is not None:
+            _reject_positional_flag("target", request.target)
+        # Classify BEFORE the rest of the checks: a special target (a thread
+        # permalink) is the handler's claim and stays the target untouched, and
+        # a repository-class target moves into ``repo_url`` rather than being
+        # emitted as a positional.
+        request = request._classify_target()
+        if not request.no_repo and not (
+            request.target or request.repo_url or request.identity_repo_url
+        ):
+            raise SpawnError(
+                "a spawn needs a target or a repo_url (or no_repo): name the "
+                "work, the repository, or that there is neither"
+            )
+        if _passes_repo_url(request):
+            if not is_likely_url(request.repo_url):
+                raise SpawnError(f"repo_url must be a repository URL for target {request.target!r}")
+            if _clone_url_without_secrets(request.repo_url) is None:
                 raise SpawnError("repo_url embeds a credential; use a credential helper or an SSH key")
-            if _thread_target(self.target) and self.target not in (self.targets or []):
+            if _thread_target(request.target) and request.target not in (request.targets or []):
                 # Connected like any other thread target, so the daemon owns its connector.
-                return replace(self, targets=[*(self.targets or []), self.target]).validate()
-        if self.targets is not None:
+                return replace(request, targets=[*(request.targets or []), request.target]).validate()
+        if request.targets is not None:
             try:
-                validate_thread_targets(self.targets)
+                validate_thread_targets(request.targets)
             except ValueError as exc:
                 raise SpawnError(f"targets: {exc}") from exc
-        if self.references is not None:
+        if request.references is not None:
             # Shape here, thread-hood in `references.add`.
-            if not isinstance(self.references, list):
+            if not isinstance(request.references, list):
                 raise SpawnError("references: must be a list of {permalink, title?}")
-            for item in self.references:
+            for item in request.references:
                 if not isinstance(item, dict) or not item.get("permalink"):
                     raise SpawnError(
                         "references: each entry is an object naming a permalink"
                     )
             try:
                 validate_thread_targets(
-                    [item.get("permalink") for item in self.references]
+                    [item.get("permalink") for item in request.references]
                 )
             except ValueError as exc:
                 raise SpawnError(f"references: {exc}") from exc
@@ -735,30 +826,50 @@ class SpawnRequest:
             # up can only be logged.
             from . import references as run_references
 
-            for item in self.references:
+            for item in request.references:
                 try:
                     run_references.checked_title(item.get("title"))
                 except run_references.ThreadReferenceError as exc:
                     raise SpawnError(f"references: {exc}") from None
-        if not isinstance(self.ports, int) or isinstance(self.ports, bool) or self.ports < 0:
-            raise SpawnError(f"ports must be a non-negative integer, got {self.ports!r}")
+        if not isinstance(request.ports, int) or isinstance(request.ports, bool) or request.ports < 0:
+            raise SpawnError(f"ports must be a non-negative integer, got {request.ports!r}")
         # Not a second copy of the answer path's own checks (length, emptiness
         # after stripping): just enough that the flag is never spelled with
         # nothing — or with a repr — behind the ``=``.
-        if self.answer is not None and (
-            not isinstance(self.answer, str) or not self.answer.strip()
+        if request.answer is not None and (
+            not isinstance(request.answer, str) or not request.answer.strip()
         ):
-            raise SpawnError(f"answer must be non-empty text, got {self.answer!r}")
+            raise SpawnError(f"answer must be non-empty text, got {request.answer!r}")
         # A record's address, so it is checked as one: a blank or a repr would be
         # spelled behind the ``=`` like any other text, and the container would
         # take it as the directory to write this run's whole record in.
-        if self.session_id is not None:
-            if not isinstance(self.session_id, str) or not self.session_id.strip():
+        if request.session_id is not None:
+            if not isinstance(request.session_id, str) or not request.session_id.strip():
                 raise SpawnError(
-                    f"session_id must be non-empty text, got {self.session_id!r}"
+                    f"session_id must be non-empty text, got {request.session_id!r}"
                 )
-            _reject_option_value("session_id", self.session_id)
-            _reject_unsafe_session_id(self.session_id)
+            _reject_option_value("session_id", request.session_id)
+            _reject_unsafe_session_id(request.session_id)
+        if request.source_session_id is not None:
+            if (
+                not isinstance(request.source_session_id, str)
+                or not request.source_session_id.strip()
+            ):
+                raise SpawnError(
+                    "source_session_id must be non-empty text, got "
+                    f"{request.source_session_id!r}"
+                )
+            _reject_unsafe_session_id(request.source_session_id)
+        if request.allow_unsigned_source is not None:
+            if request.allow_unsigned_source != request.source_session_id:
+                raise SpawnError(
+                    "allow_unsigned_source must exactly match the selected "
+                    "source_session_id"
+                )
+        if request.session_metadata is not None and not isinstance(
+            request.session_metadata, dict
+        ):
+            raise SpawnError("session_metadata must be a JSON object")
         # The flag *arguments* the platform emits. Absent is the normal case
         # and says nothing; present and unusable is refused here rather than
         # discovered by the child, which can only report it by exiting 2 — after
@@ -773,36 +884,127 @@ class SpawnRequest:
         # which the ``(OSError, ValueError)`` handler around it does not catch:
         # a 500 with the master fd of the PTY leaked, once per request.
         for name in ("preset", "agents", "model", "harness"):
-            value = getattr(self, name)
+            value = getattr(request, name)
             if value is None:
                 continue
             if not isinstance(value, str) or not value.strip():
                 raise SpawnError(f"{name} must be non-empty text, got {value!r}")
             _reject_option_value(name, value)
-        if self.agents is not None:
-            _reject_empty_agent_selection(self.agents)
-        if self.slot is not None:
-            if not isinstance(self.slot, str) or not self.slot.strip():
-                raise SpawnError(f"slot must be non-empty text, got {self.slot!r}")
+        if request.agents is not None:
+            _reject_empty_agent_selection(request.agents)
+        if request.slot is not None:
+            if not isinstance(request.slot, str) or not request.slot.strip():
+                raise SpawnError(f"slot must be non-empty text, got {request.slot!r}")
             # A contradiction rather than a precedence question, like
             # ``no_repo`` beside a repo URL: dropping either one silently would
             # grant a slot against a service the session never opened.
-            if self.preset is not None:
+            if request.preset is not None:
                 raise SpawnError(
-                    f"slot {self.slot!r} is set together with preset "
-                    f"{self.preset!r}: a slot supplies its own preset, so name "
+                    f"slot {request.slot!r} is set together with preset "
+                    f"{request.preset!r}: a slot supplies its own preset, so name "
                     "one or the other"
                 )
         # A contradiction rather than a precedence question: silently dropping
         # one of the two would mean a caller believing it named a repository and
         # a session that has none, or the reverse.
-        if self.no_repo and (self.repo_url or self.identity_repo_url):
+        if request.no_repo and (request.repo_url or request.identity_repo_url):
+            named = _scrub_credentials(request.repo_url or request.identity_repo_url)
             raise SpawnError(
-                "no_repo is set together with a repo URL "
-                f"({self.repo_url or self.identity_repo_url!r}): a session either "
-                "has no repository (spec D17) or belongs to one, so say which"
+                f"no_repo is set together with a repo URL ({named!r}): a session "
+                "either has no repository (spec D17) or belongs to one, so say which"
             )
+        return request
+
+    def _classify_target(self) -> "SpawnRequest":
+        """Apply spec §6.5's target classification, returning the request to use.
+
+        Special targets pass through (the handler owns them). A repository-class
+        target moves into ``repo_url`` when that is unset, is dropped in favour
+        of ``repo_url`` when both name the same repository
+        (:func:`_same_repository`), and is refused as "two repositories named"
+        otherwise; a filesystem path is refused outright because the platform
+        has no filesystem to resolve it against. A reference target keeps its
+        place and gets ``repo_url`` from :func:`work_repo.utils.repository_of`,
+        so the clone comes from the repository and never from the document URL
+        (#523). An ``other`` target is kept only when there is a repository to
+        clone: ``repo_url``, or failing that the daemon's ``LMER_REPO_URL``
+        (:func:`lmer_platform.config.configured_repo_url`).
+
+        The daemon default stands in only for the repository a target needs. A
+        request with neither a target nor a ``repo_url`` is still refused
+        (spec §6.5) by :meth:`validate`, however the daemon was started.
+        """
+        target = self.target if isinstance(self.target, str) else None
+        klass = classify_target(target)
+        if klass == "special":
+            return self
+        if self.no_repo or self.identity_repo_url:
+            # ``no_repo`` means there is no repository at all (spec D17), so the
+            # target's class never becomes one. A caller-supplied
+            # ``identity_repo_url`` is a statement of where the run already
+            # belongs, so the target stays the clone positional and never
+            # becomes the repository of record.
+            return self
+        if klass == "repository":
+            if target is not None and target.startswith(("/", ".")):
+                raise SpawnError(
+                    f"target {_scrub_credentials(target)!r} is a local filesystem "
+                    "path: the platform has no filesystem to resolve it against, "
+                    "so name the repository with repo_url instead"
+                )
+            if self.repo_url and _same_repository(target, self.repo_url):
+                # The run dialog prefills repo_url, so typing the repository as
+                # the target too names one repository twice. The explicit
+                # repo_url is the spelling kept.
+                return replace(self, target=None)
+            if self.repo_url:
+                # Both are clone URLs, and either may carry a token; the
+                # refusal reaches an API reply and the event log.
+                raise SpawnError(
+                    f"two repositories named: the target "
+                    f"{_scrub_credentials(target)!r} is a repository and "
+                    f"repo_url {_scrub_credentials(self.repo_url)!r} is set"
+                )
+            recorded = _plain_repo_url_from_target(target) or target
+            return replace(self, target=None, repo_url=recorded)
+        if klass == "reference":
+            if self.repo_url:
+                return self
+            derived = repository_of(target)
+            return replace(self, repo_url=derived) if derived else self
+        if klass == "other":
+            # The daemon's ``LMER_REPO_URL`` counts: :func:`_repo_urls` already
+            # makes it the repository of record for every spawn that names none,
+            # and spec §6.5's ``repo_url`` is that repository. Folding it in here
+            # is what puts ``--repo`` on the command line, since the target
+            # cannot carry the clone.
+            fallback = None if self.repo_url else configured_repo_url()
+            if fallback:
+                return replace(self, repo_url=fallback)
+            if not self.repo_url:
+                raise SpawnError(
+                    f"target {_scrub_credentials(target)!r} is not a repository, "
+                    "a work item or a known thread: name the repository with "
+                    "repo_url"
+                )
+            return self
         return self
+
+
+def _session_metadata(request: SpawnRequest) -> dict:
+    """Compose platform metadata through the shared session-record policy."""
+    effort = os.environ.get("LMER_REASONING_EFFORT") or None
+    return session_record.compose_launch_metadata(
+        request.session_metadata,
+        harness=request.harness,
+        model=request.model,
+        effort=effort,
+        config={
+            "preset": request.preset,
+            "agents": request.agents,
+            "slot": request.slot,
+        },
+    )
 
 
 @dataclass
@@ -836,6 +1038,9 @@ class SpawnResult:
     control_port: Optional[int] = None
     warning: Optional[str] = None
     model: Optional[str] = None
+    #: The execution uid this spawn minted (spec §6.2) — the run's key segment
+    #: on a schema-2 mirror. ``None`` for a schema-1 launch, which keys by slug.
+    uid: Optional[str] = None
 
     def launch_settings(self) -> dict:
         """Read available launch facts without delaying the spawn acknowledgement."""
@@ -851,11 +1056,15 @@ class SpawnResult:
         }
 
     def to_dict(self) -> dict:
+        run = {"host": self.host, "project": self.project, "slug": self.slug}
+        # Only when minted, so a schema-1 reply is byte-identical to what it was.
+        if self.uid is not None:
+            run["uid"] = self.uid
         return {
             "session_id": self.session_id,
             "pid": self.pid,
             "log_path": str(self.log_path),
-            "run": {"host": self.host, "project": self.project, "slug": self.slug},
+            "run": run,
             # Present even when empty: a client that only renders a truthy value
             # needs no knowledge of which spawns can produce one.
             "warning": self.warning,
@@ -907,7 +1116,7 @@ def derive_run_identity(
     identity from one and recording one as the run's repo are separable; see
     :func:`_repo_urls` for which is which.
     """
-    slug = run_state.derive_slug(request.taskdef, request.target)
+    slug = run_state.derive_slug(request.taskdef, request.target or "")
     host, project = derive_repo_identity(repo_url, config)
     return host, project, slug
 
@@ -996,66 +1205,62 @@ def _identity_url_from_target(target: str) -> Optional[str]:
     return scrubbed
 
 
-_PLAIN_REPO_SCHEMES = frozenset({"http", "https", "ssh", "git"})
-_KNOWN_HTTP_FORGES = frozenset({
-    "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
-})
+def _repository_spelling(url: str) -> str:
+    """*url* reduced to what names a repository, for comparing two spellings.
+
+    Credentials off (transport material, :func:`_scrub_credentials`), a trailing
+    ``/`` and ``.git`` off, and the host lowercased — DNS names are
+    case-insensitive and nothing else in a URL is guaranteed to be. The scheme
+    is kept: ``ssh://`` and ``https://`` clone through different transports, and
+    deciding they are one repository is the forge's call, not this one's.
+    """
+    text = (_scrub_credentials(url) or "").strip().rstrip("/")
+    if text.endswith(".git"):
+        text = text[: -len(".git")].rstrip("/")
+    scheme, sep, rest = text.partition("://")
+    if sep:
+        host, slash, path = rest.partition("/")
+        return f"{scheme.lower()}://{host.lower()}{slash}{path}"
+    # scp-like ``user@host:path``.
+    user, at, rest = text.rpartition("@")
+    host, colon, path = rest.partition(":")
+    return f"{user}{at}{host.lower()}{colon}{path}"
 
 
-def _known_http_forge(host: str) -> bool:
-    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
-    host = host.lower()
-    first_label = host.split(".", 1)[0]
-    return (
-        host in _KNOWN_HTTP_FORGES
-        or first_label in {"git", "gitlab", "github", "bitbucket", "codeberg"}
-    )
-
-
-def _github_http_forge(host: str) -> bool:
-    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
-    host = host.lower()
-    return host == "github.com" or host.split(".", 1)[0] == "github"
+def _same_repository(target: str, repo_url: str) -> bool:
+    """Whether a repository-class *target* and *repo_url* name one repository."""
+    named = repository_of(target) or target
+    return _repository_spelling(named) == _repository_spelling(repo_url)
 
 
 def _plain_repo_url_from_target(target: str) -> Optional[str]:
     """Return a repository URL used directly as *target*, or ``None``.
 
-    Parsing a host and path does not prove a URL is cloneable: ordinary GitLab
-    file, pipeline and wiki pages have the same shape. This predicate therefore
-    accepts only Git transports, HTTPS URLs ending in ``.git``, or suffix-less
-    HTTP(S) roots on a recognisable forge host. GitLab's ``/-/`` web routes and
-    GitHub's routes below ``owner/repo`` are always excluded.
+    A thin call into :func:`work_repo.utils.classify_target`'s ``repository``
+    class and :func:`work_repo.utils.repository_of`, so the platform and the
+    container's copy of the classifier can never disagree about what a plain
+    repository URL is. The three deltas the classifier records apply here too:
+    ``.git`` is tested first (``github.com/a/b/c.git`` is a repository),
+    ``file:///path`` and ``git://`` are accepted.
 
     Embedded HTTP credentials are transport material, not repository identity,
     so they are stripped before the URL becomes the repository of record. Bare
     SSH userinfo (``git@``) is protocol plumbing and is preserved.
     """
-    if not target or _derive_repo_url_from_task_target(target):
+    if not target or classify_target(target) != "repository":
         return None
-    if target.startswith("git@"):
-        parsed = None
-    else:
+    recorded = repository_of(target)
+    if not recorded:
+        return None
+    parsed = None
+    if not recorded.startswith("git@"):
         try:
-            parsed = urlparse(target)
-            scheme = parsed.scheme.lower()
-            hostname = parsed.hostname or ""
+            parsed = urlparse(recorded)
         except ValueError:
-            return None
-        if scheme not in _PLAIN_REPO_SCHEMES:
-            return None
-        if parsed.query or parsed.fragment or "/-/" in parsed.path:
-            return None
-        path_parts = [part for part in parsed.path.split("/") if part]
-        if _github_http_forge(hostname) and len(path_parts) != 2:
-            return None
-        if scheme in {"http", "https"} and not (
-            parsed.path.rstrip("/").endswith(".git")
-            or _known_http_forge(hostname)
-        ):
-            return None
-    recorded = _clone_url_without_secrets(target)
-    if recorded is None:
+            parsed = None
+    if parsed is not None and parsed.scheme.lower() in {"http", "https"}:
+        recorded = _scrub_credentials(recorded) or None
+    if not recorded:
         return None
     host, project = _parse_repo_url(recorded)
     if not host or not project:
@@ -1094,20 +1299,35 @@ def _repo_urls(request: SpawnRequest) -> tuple:
 
     A plain repository-URL target is also evidence: it is the clone target the
     caller supplied, so it becomes both the record and identity when no stronger
-    source is present. A resource target remains the **last** source of identity
-    and never a source of record, because its URL is reconstructed. The ordering
-    keeps a supplied ``repo_url`` first, an exported ``LMER_REPO_URL`` next, and
-    a caller-supplied ``identity_repo_url`` ahead of either target shape.
+    source is present. The ordering keeps a supplied ``repo_url`` first, an
+    exported ``LMER_REPO_URL`` next, and a caller-supplied ``identity_repo_url``
+    ahead of either target shape.
 
-    A reconstructed resource URL is never recorded, for the reason
-    :func:`lmer_platform.answer._identity_repo_url` sets out at length: a
-    recorded reconstruction round-trips, so it satisfies every later identity
-    check, and a run whose repo was *derived once* would pass
-    :class:`lmer_platform.resume.RepoUrlRequired` forever after on a URL nobody
-    supplied — quietly undoing the decision that a missing repo URL is asked for
-    rather than guessed. It is also, in the ordinary GitLab case, a URL whose
-    clone transport was chosen by whichever token the daemon happened to hold,
-    which is no basis for the field every later verb clones from.
+    What a target contributes depends on its class (spec §6.5,
+    :func:`work_repo.utils.classify_target`):
+
+    - a **reference** target (a document URL) *is* recorded:
+      :meth:`SpawnRequest.validate` has already set ``repo_url`` to
+      :func:`work_repo.utils.repository_of` of it (#523), so it arrives here as
+      the request's own ``repo_url``. The clone must come from the repository,
+      not the page, and ``--repo`` is how ``lmer`` is told so — which needs a
+      repository of record;
+    - a **work-item** target (merge request, pull request, issue) remains the
+      **last** source of identity and never a source of record
+      (:func:`_identity_url_from_target`).
+
+    The concern that kept every derived URL out of the record —
+    :class:`lmer_platform.resume.RepoUrlRequired`, which
+    :func:`lmer_platform.answer._identity_repo_url` sets out at length — is about
+    a URL *reconstructed* from a host token: ``_derive_repo_url_from_task_target``
+    picks the clone transport by whichever token the daemon holds and can bake
+    that token in, and a recorded reconstruction round-trips, so a run whose
+    repo was derived once would pass ``RepoUrlRequired`` forever on a URL nobody
+    supplied. ``repository_of`` is neither: it is the one classifier's pure,
+    credential-free reading of the URL the caller typed — the same function the
+    container resolves the target with — so recording it records what was named,
+    not what a token chose. A work-item target still goes through the
+    token-driven derivation, which is why it still records nothing.
     """
     if request.no_repo:
         return None, None
@@ -1148,8 +1368,8 @@ def _untracked_run_warning(request: SpawnRequest, repo_url: Optional[str]) -> st
     else:
         cause = (
             f"no repository URL was given, {ENV_REPO_URL} is not set, and the "
-            f"target {request.target!r} is not a merge request, pull request or "
-            "issue URL to read one out of"
+            f"target {_scrub_credentials(request.target)!r} is not a merge "
+            "request, pull request or issue URL to read one out of"
         )
     warning = (
         f"this run has no identity ({cause}), so it is not tracked at all: the "
@@ -2442,6 +2662,23 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
             raise SpawnError(f"--mount-dir may not target {protected}: {reason}")
 
 
+def _needs_repo_flag(request: SpawnRequest) -> bool:
+    """Whether ``--repo=<repo_url>`` goes on the command line.
+
+    Only when the target positional cannot carry the launch on its own: there
+    is none (the plain project session, or a repository-class target
+    :meth:`SpawnRequest.validate` moved into ``repo_url``), it is a document
+    URL whose clone must come from the repository rather than the page (#523),
+    or it is an ``other`` URL that validate kept only because ``repo_url`` was
+    given.
+    """
+    if not request.repo_url:
+        return False
+    if not request.target:
+        return True
+    return classify_target(request.target) in ("reference", "other")
+
+
 def _thread_target(target: str) -> bool:
     return bool(partition_targets([target])[1])
 
@@ -2477,7 +2714,9 @@ def _clone_url_without_secrets(url: str) -> Optional[str]:
     return None if url_has_embedded_credential(url) else url
 
 
-def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
+def _build_command(
+    config: PlatformConfig, request: SpawnRequest, *, launch_uid: Optional[str] = None
+) -> list:
     """Assemble the ``lmer`` invocation.
 
     ``--fastapi`` is not conditional and has no request field turning it off: a
@@ -2497,6 +2736,17 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     name shaped like a flag is refused before it is built, and could not be read
     as one if it got here.
 
+    The target positional is emitted only when it is a non-empty string (spec
+    §6.5): a spawn whose repository lives in ``repo_url`` — an empty target, a
+    bare repository URL, a document URL — emits no empty positional for
+    ``argparse`` to choke on. ``--repo=<repo_url>`` is emitted only where no
+    argv worked before §6.5 (:func:`_needs_repo_flag`): an absent target, a
+    document (``reference``) URL and an ``other`` URL. That is the decision
+    between §6.5's "whenever repo_url is set" and §9.4's byte-identical
+    schema-1 argv: a work-item, branch or SHA target launches exactly as it did. A preset or slot whose checkout
+    the host refuses beside ``--repo`` is the host's refusal to raise, not a
+    shape this function papers over.
+
     ``--preset``, ``--agents``, ``--model`` and ``--harness`` stay two tokens
     rather than following that pattern, because they carry *names* rather than
     prose: a preset, agent, model or harness name that begins with a dash is not
@@ -2504,11 +2754,19 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     refuses outright.
     Everything the platform emits still goes ahead of ``extra_args``, for the
     same ``--`` reason.
+
+    *launch_uid* is a keyword here rather than a :class:`SpawnRequest` field
+    because no caller chooses it: :func:`_spawn_session` mints it
+    (:func:`_mint_launch_uid`) after checking it against every uid already
+    handed out, and a request field would be a way round that check.
     """
     _reject_reserved_args(request.extra_args)
     cmd = [resolve_lmer_bin(config)]
-    cmd += [request.taskdef, request.target,
-            *(target for target in request.targets or [] if target != request.target), "--fastapi"]
+    cmd += [request.taskdef]
+    if request.target:
+        cmd += [request.target]
+    cmd += [*(target for target in request.targets or [] if target != request.target),
+            "--fastapi"]
     # The thread permalinks stay positional — they are what sets the container's
     # chat context and what lets a repo-less `chat` session start — but the
     # connectors for them are the daemon's, so they can be added and removed
@@ -2526,14 +2784,26 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
         cmd += [HARNESS_FLAG, request.harness]
     if request.model:
         cmd += [MODEL_FLAG, request.model]
+    if _needs_repo_flag(request):
+        # One token, like the other prose-valued flags: a URL can never be
+        # read as a flag of its own.
+        cmd += [f"{REPO_FLAG}={request.repo_url}"]
+    elif _passes_repo_url(request):
+        # Never both: ``lmer`` refuses --repo beside --repo-url as two
+        # repositories named (#591 tracks folding them into one flag).
+        cmd += [f"{REPO_URL_FLAG}={_clone_url_without_secrets(request.repo_url)}"]
     if request.ports:
         cmd += ["--ports", str(request.ports)]
-    if _passes_repo_url(request):
-        cmd += [f"{REPO_URL_FLAG}={_clone_url_without_secrets(request.repo_url)}"]
     if request.session_id:
         cmd += [f"{SESSION_FLAG}={request.session_id}"]
+    if request.source_session_id:
+        cmd += [f"{SOURCE_SESSION_FLAG}={request.source_session_id}"]
+    if request.allow_unsigned_source:
+        cmd += [f"{SOURCE_ACK_FLAG}={request.allow_unsigned_source}"]
     if request.answer:
         cmd += [f"{ANSWER_FLAG}={request.answer}"]
+    if launch_uid:
+        cmd += [f"{LAUNCH_UID_FLAG}={launch_uid}"]
     cmd += [str(arg) for arg in request.extra_args]
     return cmd
 
@@ -2546,8 +2816,74 @@ def _live_worker_count() -> int:
     )
 
 
+def schema_two(config: PlatformConfig) -> bool:
+    """Whether the daemon's mirror is a schema-2 work repo (fresh execution records).
+
+    The one manifest test for every platform verb that has to know which form
+    it is launching into — a spawn deciding whether to mint a uid, a resume
+    deciding whether the selected record is a source or a writer. No manifest
+    is the legacy form (``False``).
+
+    An unreadable manifest is a :class:`SpawnError` rather than a guess: on
+    schema 2 the answer decides whether the launch gets a fresh record keyed by
+    a uid or writes where a slug points, and guessing schema 1 for a schema-2
+    work repo is a launch the platform keys by a slug the container never
+    records under.
+    """
+    try:
+        manifest = load_manifest(config.mirror_path)
+    except ManifestError as exc:
+        raise SpawnError(
+            f"the host mirror manifest cannot be read ({exc}); refusing to "
+            "guess whether this launch founds a schema-2 record or writes a "
+            "schema-1 run"
+        ) from exc
+    return manifest is not None and manifest.schema >= 2
+
+
+def _uids_in_use() -> set:
+    """Every execution uid this platform has already handed out or tracks.
+
+    The tracked index's keys and recorded uids, and the ``run.uid`` of every
+    registry entry — retained dead ones included, because an entry kept as a
+    crash signal still names a record a fresh launch must not reuse.
+    """
+    taken = set()
+    for key, entry in runs.load_index().items():
+        taken.add(str(key).rsplit("/", 1)[-1])
+        if isinstance(entry, dict) and isinstance(entry.get("uid"), str):
+            taken.add(entry["uid"])
+    for entry in registry.list_sessions(live_only=False):
+        run = entry.get("run")
+        if isinstance(run, dict) and isinstance(run.get("uid"), str):
+            taken.add(run["uid"])
+    return taken
+
+
+def _mint_launch_uid() -> str:
+    """A fresh execution uid nothing on this platform already carries (spec §6.2).
+
+    The container refuses a launch uid that already names a record in the work
+    repo; this is the platform's half (D7) — its own index and registry, which
+    the container cannot see. Re-drawn on a collision, at most
+    :data:`_LAUNCH_UID_ATTEMPTS` times, then refused.
+    """
+    taken = _uids_in_use()
+    for _ in range(_LAUNCH_UID_ATTEMPTS):
+        uid = uuid4().hex
+        if uid not in taken:
+            return uid
+    raise SpawnError(
+        f"could not mint a fresh execution uid in {_LAUNCH_UID_ATTEMPTS} draws: "
+        "every one was already carried by the tracked index or the registry"
+    )
+
+
 def live_session_for_run(
-    host: Optional[str], project: Optional[str], slug: Optional[str]
+    host: Optional[str],
+    project: Optional[str],
+    slug: Optional[str],
+    uid: Optional[str] = None,
 ) -> Optional[dict]:
     """The live registry entry filed under this run identity, or ``None``.
 
@@ -2580,19 +2916,79 @@ def live_session_for_run(
     An incomplete identity matches nothing in either direction — entries with no
     run recorded carry ``{}``, and a spawn with no repository (spec D17) has no run
     to hold.
+
+    With *uid* the run is one schema-2 execution (spec §6.3), so the entry must
+    carry that ``run.uid``: the slug is only the group label there, and two
+    executions under one label are two runs. Without it the triple matches as it
+    always did.
     """
-    if not (host and project and slug):
-        return None
-    wanted = (host, project, slug)
+    if uid is not None:
+        if not (host and project and uid):
+            return None
+        wanted = (host, project, uid)
+        by = "uid"
+    else:
+        if not (host and project and slug):
+            return None
+        wanted = (host, project, slug)
+        by = "slug"
     for entry in registry.list_sessions(live_only=True):
         run = entry.get("run") or {}
-        if (run.get("host"), run.get("project"), run.get("slug")) == wanted:
+        if (run.get("host"), run.get("project"), run.get(by)) == wanted:
             return entry
     return None
 
 
+def concurrent_sessions_note(
+    host: Optional[str], project: Optional[str], target: Optional[str]
+) -> Optional[str]:
+    """The live sessions already on this project, as a sentence — or ``None``.
+
+    The surfaced half of spec §6.3 (D8, #311): on schema 2 a second chat on a
+    project is a second record rather than a duplicate session, so nothing
+    refuses it — but two agents working one repository is something the
+    operator should hear about, so the spawn's reply says so. Detect and
+    surface; never enforce.
+
+    Narrowed to the same work item when *target* is one
+    (:func:`work_repo.utils.is_work_item`), compared after
+    :func:`work_repo.utils.sanitize_task_target` so two spellings of one issue
+    count as one; otherwise every live worker on the project counts. A dead
+    entry never counts (the registry's ``live_only`` reading), and neither does
+    the assistant, which works no repository. Exported so resume and answer can
+    carry the same note.
+    """
+    if not (host and project):
+        return None
+    narrowed = target if isinstance(target, str) and is_work_item(target) else None
+    wanted = sanitize_task_target(narrowed) if narrowed else None
+    holders = []
+    for entry in registry.list_sessions(live_only=True):
+        if entry.get("kind") == registry.ASSISTANT_KIND:
+            continue
+        run = entry.get("run") or {}
+        if (run.get("host"), run.get("project")) != (host, project):
+            continue
+        if wanted is not None:
+            other = (entry.get("task") or {}).get("target")
+            if not (isinstance(other, str) and other
+                    and sanitize_task_target(other) == wanted):
+                continue
+        holders.append(str(entry.get("id")))
+    if not holders:
+        return None
+    scope = f" for `{narrowed}`" if narrowed else ""
+    return (
+        f"{len(holders)} live session(s) already on `{host}/{project}`{scope}: "
+        f"{', '.join(holders)}"
+    )
+
+
 def _refuse_if_run_is_live(
-    host: Optional[str], project: Optional[str], slug: Optional[str]
+    host: Optional[str],
+    project: Optional[str],
+    slug: Optional[str],
+    uid: Optional[str] = None,
 ) -> None:
     """One run, one session — the invariant, enforced where every spawn passes.
 
@@ -2613,16 +3009,25 @@ def _refuse_if_run_is_live(
     (``no_repo``, spec D17, leaves host and project unset) rather than because it
     is named here — and its supervisor's respawn is unaffected for a second
     reason, that the entry a dead incarnation leaves behind is DEAD.
+
+    *uid* is the schema-2 spawn's freshly minted execution uid (spec §6.3), so
+    for that launch this is vacuous by construction — a uid nothing carries is
+    held by nobody — and same-project concurrency becomes
+    :func:`concurrent_sessions_note`'s warning instead. A schema-1 launch and a
+    ``session_id`` continuation pass no uid and stay one run, one session.
     """
-    entry = live_session_for_run(host, project, slug)
+    entry = live_session_for_run(host, project, slug, uid=uid)
     if entry is None:
         return
+    key = runs.run_key(*runs.key_parts(
+        {"host": host, "project": project, "slug": slug, "uid": uid}
+    ))
     raise RunAlreadyLive(
         # The run identity and the session id, because a caller reading a 409 has
         # to know *which* session holds the run before it can do anything about it
         # — an assistant included, since this is one of the refusals it has to act
         # on rather than retry.
-        f"{runs.run_key(host, project, slug)} already has a live session "
+        f"{key} already has a live session "
         f"({entry.get('id')}, pid {entry.get('pid')}) — a second session for one "
         "run would fight it over the run's owner claim and its state. Type into "
         f"that session instead (POST /api/sessions/{entry.get('id')}/input), or "
@@ -3311,15 +3716,41 @@ def _spawn_session(
     # derived from" are separable claims — only the first is recorded anywhere.
     repo_url, identity_url = _repo_urls(request)
     host, project, slug = derive_run_identity(request, identity_url, config)
-    if projects.enabled() and host and project and slug:
-        projects.check_home(runs.run_key(host, project, slug), workspace_id)
+    # On a schema-2 mirror the launch founds a fresh record, and its identity is
+    # the uid minted here (spec §6.2, D7) — so it is minted before anything is
+    # keyed. A ``session_id`` spawn continues a named schema-1 record and has
+    # nothing to mint; its manifest is not even read, so a continuation behaves
+    # exactly as it did.
+    launch_uid = (
+        _mint_launch_uid()
+        if request.session_id is None and schema_two(config) else None
+    )
+    run = {"host": host, "project": project, "slug": slug}
+    if launch_uid is not None:
+        run["uid"] = launch_uid
+    # Every keyed store below takes the key segment — the uid on schema 2, the
+    # slug otherwise — and the composed key; codex_config alone stays on the
+    # slug, as the run group's preference home.
+    parts = runs.key_parts(run) if host and project and slug else None
+    run_ref = runs.run_key(*parts) if parts else None
+    segment = parts[2] if parts else None
+    if projects.enabled() and run_ref:
+        projects.check_home(run_ref, workspace_id)
     # As early as the identity allows, and before the command is built: a spawn
     # refused for a run that is already running leaves nothing behind — no argv, no
     # port drawn, no directory made.
-    _refuse_if_run_is_live(host, project, slug)
+    _refuse_if_run_is_live(host, project, slug, uid=launch_uid)
     if refuse_held_targets:
         _refuse_if_threads_are_held(request.targets)
-    command = _build_command(config, request)
+    # Surfaced instead of refused (spec §6.3): only a schema-2 launch can share
+    # a project with a live session, and only it is told so — a schema-1 reply
+    # stays exactly what it was. Read before this session registers, so it names
+    # the others and never itself.
+    concurrency = (
+        concurrent_sessions_note(host, project, request.target)
+        if launch_uid is not None else None
+    )
+    command = _build_command(config, request, launch_uid=launch_uid)
 
     # Before anything is created on disk, so a range with no free port leaves no
     # trace of a session that was never started.
@@ -3360,6 +3791,11 @@ def _spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
         "LMER_SESSION_KIND": kind,
+        session_record.SOURCE_ENV: request.source_session_id or "",
+        session_record.SOURCE_ACK_ENV: request.allow_unsigned_source or "",
+        session_record.METADATA_ENV: json.dumps(
+            _session_metadata(request), ensure_ascii=False, separators=(",", ":")
+        ),
         # Become labels on the session's container, which is how a restarted
         # platform finds it again (#444).
         "LMER_PLATFORM_SESSION_ID": session_id,
@@ -3473,7 +3909,7 @@ def _spawn_session(
                 # namespace's "session" on an entry whose own key is the ``s-…``
                 # container session — the two this file already keeps apart.
             },
-            run={"host": host, "project": project, "slug": slug},
+            run=dict(run),
             # The *only* record that the slot is taken — nothing writes an occupancy
             # file — so a session that dies takes its claim with it (issue #245).
             slot=request.slot,
@@ -3494,11 +3930,10 @@ def _spawn_session(
             started_at=utc_now_iso(),
         )
         if projects.enabled():
-            projects.bind_session(session_id, workspace_id,
-                                  runs.run_key(host, project, slug) if host and project and slug else None)
-            if host and project and slug:
-                projects.bind_run(runs.run_key(host, project, slug), workspace_id)
-                projects.remember_launch(runs.run_key(host, project, slug), request.slot, request.preset)
+            projects.bind_session(session_id, workspace_id, run_ref)
+            if run_ref:
+                projects.bind_run(run_ref, workspace_id)
+                projects.remember_launch(run_ref, request.slot, request.preset)
 
     # Most sessions publish only their registry entry. The assistant also has a
     # lifecycle-state pointer that must become visible with that entry, so it
@@ -3543,9 +3978,10 @@ def _spawn_session(
     # still shows up via its registry entry — for as long as that entry exists,
     # which is the whole problem the warning below describes.
     warning: Optional[str] = None
-    if host and project and slug:
+    if run_ref:
         runs.track(
             host, project, slug,
+            uid=launch_uid,
             source="spawned",
             taskdef=request.taskdef,
             target=request.target,
@@ -3553,11 +3989,14 @@ def _spawn_session(
             session_id=session_id,
         )
         # Only now: until the call above, this was a run meta.write would refuse.
-        warning = _write_run_meta(request, host, project, slug)
+        warning = _write_run_meta(request, host, project, segment)
         # Same ordering and the same reason as the metadata above; both warnings
-        # reach the caller, because they are different losses.
-        lost_references = _write_run_references(request, host, project, slug)
-        warning = " ".join(part for part in (warning, lost_references) if part) or None
+        # reach the caller, because they are different losses — and so does the
+        # concurrency note, which is a third thing entirely.
+        lost_references = _write_run_references(request, host, project, segment)
+        warning = " ".join(
+            part for part in (warning, lost_references, concurrency) if part
+        ) or None
     elif request.no_repo:
         # Not the failure below, and kept apart from it deliberately: a session
         # with no repository (spec D17) has no run to file anywhere, so nothing
@@ -3599,7 +4038,7 @@ def _spawn_session(
             "pid": process.pid,
             "taskdef": request.taskdef,
             "target": request.target,
-            "run": {"host": host, "project": project, "slug": slug},
+            "run": dict(run),
         },
     )
     logger.info(
@@ -3619,4 +4058,5 @@ def _spawn_session(
         control_port=control_port,
         warning=warning,
         model=request.model,
+        uid=launch_uid,
     )

@@ -1,0 +1,3 @@
+fixed:
+- "schema 2 resume and answer launches now keep predecessor records read-only, bind unsigned-source approval to the selected UID, and carry scrubbed host launch provenance"
+- "a bare shell `work answer` on a schema 2 tree stays refused and now names the platform answer route; the run-state docs and taskdef no longer present it as the human's recording path"

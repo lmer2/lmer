@@ -1,7 +1,7 @@
 """``lmer_schema.form`` — which form is this tree in? (issue #353, spec D20).
 
 Form detection is the first question every dual-read consumer asks, and it has
-exactly TWO answers: a plexus root holding a ``_plexus.yaml`` is SCHEMA form,
+exactly TWO answers: a plexus root holding a ``_lmer.yaml`` is SCHEMA form,
 one without it is LEGACY form. These tests pin that contract against the two
 shared fixture trees:
 
@@ -366,11 +366,11 @@ class TestPresenceOnly:
         assert {"load_manifest", "parse_manifest"} & called == set()
 
     def test_the_manifest_name_comes_from_the_loader(self):
-        # One spelling of ``_plexus.yaml`` in the package, not a second
+        # One spelling of ``_lmer.yaml`` in the package, not a second
         # literal that can drift.
         assert form_module.manifest_path is manifest_module.manifest_path
-        assert "\"_plexus.yaml\"" not in inspect.getsource(form_module)
-        assert "'_plexus.yaml'" not in inspect.getsource(form_module)
+        assert "\"_lmer.yaml\"" not in inspect.getsource(form_module)
+        assert "'_lmer.yaml'" not in inspect.getsource(form_module)
 
 
 def test_module_exports_the_documented_surface():

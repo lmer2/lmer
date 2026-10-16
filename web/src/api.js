@@ -22,8 +22,10 @@ async function request(path, options = {}) {
   if (!response.ok) {
     let detail = `HTTP ${response.status}`
     let code = null
+    let errorBody = null
     try {
       const body = await response.json()
+      errorBody = body
       // Most routes answer with `detail` as a sentence. The resume route answers
       // with {code, message}, because two of its refusals are requests for one
       // more field rather than failures — a caller that had to match on the
@@ -44,6 +46,8 @@ async function request(path, options = {}) {
     // Null for every route that answers with a sentence, so a caller branching on
     // a code needs no knowledge of which routes can produce one.
     error.code = code
+    error.source = errorBody?.detail?.source || null
+    error.decisions = errorBody?.detail?.decisions || []
     throw error
   }
   return response.json()
@@ -84,8 +88,7 @@ export function setProjectChannels(workspaceId, channels) {
 export function moveRun(run, destinationId) {
   return request('api/runs/move', {
     method: 'POST', headers: jsonHeaders,
-    body: JSON.stringify({ ...runRef(run), workspace_id: run.workspace_id,
-      home_revision: run.home_revision, destination_id: destinationId }),
+    body: JSON.stringify({ ...runFields(run), destination_id: destinationId }),
   })
 }
 
@@ -125,23 +128,36 @@ export function prune() {
   return request('api/prune', { method: 'POST' })
 }
 
+// The validator's view of the work repo (#374): `{form, tier, document, buckets,
+// note}`, where `document` is exactly what `lmer-schema validate --json` prints.
+// Fleet-wide, not a project's: the work repo is shared by every workspace, so
+// this carries no workspace and the daemon binds it to none.
+//
+// The daemon caches the document per mirror HEAD for a bounded time, because
+// staleness findings move with the clock at an unchanged HEAD (astra PR7).
+// `refresh` is the way round that cache — the explicit re-validate control —
+// and is sent only when asked for, so the ordinary read stays one cheap hit.
+export function fetchWorkRepoSchema({ refresh = false } = {}) {
+  return request(refresh ? 'api/workrepo/schema?refresh=1' : 'api/workrepo/schema')
+}
+
 export function fetchCandidates() {
   return request('api/runs/candidates')
 }
 
-export function adoptRun({ host, project, slug, workspace_id, home_revision }) {
+export function adoptRun(run) {
   return request('api/runs/adopt', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision }),
+    body: JSON.stringify(runFields(run)),
   })
 }
 
-export function forgetRun({ host, project, slug, workspace_id, home_revision }) {
+export function forgetRun(run) {
   return request('api/runs/forget', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision }),
+    body: JSON.stringify(runFields(run)),
   })
 }
 
@@ -156,8 +172,8 @@ export function forgetRun({ host, project, slug, workspace_id, home_revision }) 
 // told — this is platform state, so it belongs to this orchestrator and not to
 // the run. It is invisible to anyone else's fleet view and it goes when the run
 // is forgotten.
-export function fetchRunMeta({ host, project, slug, workspace_id, home_revision }) {
-  const query = runQuery({ host, project, slug, workspace_id, home_revision })
+export function fetchRunMeta(run) {
+  const query = runQuery(runFields(run))
   return request(`api/runs/meta?${query}`)
 }
 
@@ -166,11 +182,11 @@ export function fetchRunMeta({ host, project, slug, workspace_id, home_revision 
 // which is what lets the orchestrator agent set a title without deleting a
 // description somebody wrote. The reply is what was *stored*, not what was sent:
 // the title comes back collapsed to the single line it will be shown as.
-export function setRunMeta({ host, project, slug, workspace_id, home_revision }, { title, description }) {
+export function setRunMeta(run, { title, description }) {
   return request('api/runs/meta', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, title, description }),
+    body: JSON.stringify({ ...runFields(run), title, description }),
   })
 }
 
@@ -183,24 +199,39 @@ export function setRunMeta({ host, project, slug, workspace_id, home_revision },
 // one is ordinary, not an error: relating a run before adopting it is allowed, and
 // forgetting a run leaves its relations alone. It is a key to show, never a run to
 // open — the shell selects out of the fleet, so opening one would land on nothing.
-export function fetchRunRelations({ host, project, slug, workspace_id, home_revision }) {
-  const query = runQuery({ host, project, slug, workspace_id, home_revision })
+export function fetchRunRelations(run) {
+  const query = runQuery(runFields(run))
   return request(`api/runs/relations?${query}`)
+}
+
+// Every launch of the run's `_runs/<slug>/` group (#374), in start order. Read
+// by query string for fetchRunMeta's reason, and with the same fields: the
+// project context binds the read the way it binds the run's other reads (#542).
+//
+// Each row in the reply carries its OWN `workspace_id`/`home_revision`/
+// `confirm_project`, which is what a resume of that launch must post — never the
+// row this was asked for, because two launches of one group can live in two
+// projects (astra PR6). A schema-1 row has no launches to list; the view that
+// calls this is not mounted for one, so a legacy fleet never sends it.
+export function fetchRunSessions(run) {
+  const query = runQuery(runFields(run))
+  return request(`api/runs/sessions?${query}`)
 }
 
 // Relating is symmetric and the daemon stores it once, so there is one call rather
 // than one per direction: both runs carry it afterwards, either order names the
 // same relation, and doing it twice is a no-op the reply reports (`created`). The
-// second run travels as an object of the same three fields as the first, because
-// what is being related is a run and this API has one spelling for that.
+// second run travels as an object of the same key fields as the first (runRef,
+// uid included when it has one), because what is being related is a run and this
+// API has one spelling for that.
 //
 // The reply is the *subject* run's relations as they now are, which is what the
 // view renders — nothing is patched locally.
-export function relateRun({ host, project, slug, workspace_id, home_revision }, related) {
+export function relateRun(run, related) {
   return request('api/runs/relate', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, related: runRef(related) }),
+    body: JSON.stringify({ ...runFields(run), related: runRef(related) }),
   })
 }
 
@@ -208,20 +239,33 @@ export function relateRun({ host, project, slug, workspace_id, home_revision }, 
 // this removes both directions at once and the order the runs are named in does
 // not matter. It needs no adoption, which is what makes it the way to clear a
 // relation naming a run this host no longer tracks.
-export function unrelateRun({ host, project, slug, workspace_id, home_revision }, related) {
+export function unrelateRun(run, related) {
   return request('api/runs/unrelate', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, related: runRef(related) }),
+    body: JSON.stringify({ ...runFields(run), related: runRef(related) }),
   })
 }
 
 // Narrowed on purpose: the caller passes a fleet row or a relation entry, and both
-// carry a good deal more than the three fields that identify a run. Sending the
-// whole object would put a whole run payload on the wire and invite the daemon to
-// start reading fields the sender did not mean as a request.
-function runRef({ host, project, slug }) {
-  return { host, project, slug }
+// carry a good deal more than the fields that identify a run. Sending the whole
+// object would put a whole run payload on the wire and invite the daemon to start
+// reading fields the sender did not mean as a request.
+//
+// `uid` is the key of a schema-2 row (spec §6.1): its directory is named by the
+// uid, so the slug alone cannot find it. A row without one — schema-1, or the
+// daemon's `uid: null` — sends no `uid` key at all rather than a null, so its
+// requests stay byte-identical to the ones every daemon already accepts.
+// `undefined` is what makes that true on both paths: JSON.stringify drops the
+// key and runQuery drops the parameter.
+function runRef({ host, project, slug, uid }) {
+  return { host, project, slug, uid: uid || undefined }
+}
+
+// The run plus the project fields (#542) every run-keyed write carries, in the
+// order they have always been sent.
+function runFields(run) {
+  return { ...runRef(run), workspace_id: run.workspace_id, home_revision: run.home_revision }
 }
 
 // Answering is a *run* action, not a session one, and the route says so: the
@@ -229,11 +273,24 @@ function runRef({ host, project, slug }) {
 // into — the daemon starts a fresh session carrying the answer. Nothing is
 // recorded when this resolves (the reply is a 202); the answer lands in the run's
 // state a moment later, which the next fleet poll picks up.
-export function answerRun({ host, project, slug, workspace_id, home_revision }, answer, { confirmProject = false, slot } = {}) {
+export function answerRun(
+  run, answer,
+  { allowUnsignedSource, confirmProject = false, slot, repoUrl } = {},
+) {
+  const body = {
+    ...runFields(run), answer,
+    confirm_project: confirmProject || undefined,
+    slot: slot || undefined,
+  }
+  // The daemon's `repo_url_required` refusal asks for this field: an adopted
+  // schema-2 plain-project run has no tracked repo, so answering it needs the
+  // transport URL. Same option `resumeRun` already serializes.
+  if (repoUrl?.trim()) body.repo_url = repoUrl.trim()
+  if (allowUnsignedSource) body.allow_unsigned_source = allowUnsignedSource
   return request('api/runs/answer', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, workspace_id, home_revision, answer, confirm_project: confirmProject || undefined, slot: slot || undefined }),
+    body: JSON.stringify(body),
   })
 }
 
@@ -249,12 +306,19 @@ export function answerRun({ host, project, slug, workspace_id, home_revision }, 
 // happened. `repoUrl` and `direction` are what the daemon's two "one more field"
 // refusals ask for — see the `code` on a rejected request.
 export function resumeRun(
-  { host, project, slug, workspace_id, home_revision }, { taskdef, repoUrl, direction, confirmProject = false, slot } = {},
+  run, {
+    taskdef, repoUrl, direction, allowUnsignedSource, confirmProject = false, slot,
+  } = {},
 ) {
-  const body = { host, project, slug, workspace_id, home_revision, confirm_project: confirmProject || undefined, slot: slot || undefined }
+  const body = {
+    ...runFields(run),
+    confirm_project: confirmProject || undefined,
+    slot: slot || undefined,
+  }
   if (taskdef?.trim()) body.taskdef = taskdef.trim()
   if (repoUrl?.trim()) body.repo_url = repoUrl.trim()
   if (direction?.trim()) body.direction = direction.trim()
+  if (allowUnsignedSource) body.allow_unsigned_source = allowUnsignedSource
   return request('api/runs/resume', {
     method: 'POST',
     headers: jsonHeaders,

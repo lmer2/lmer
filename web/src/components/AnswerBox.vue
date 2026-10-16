@@ -55,6 +55,20 @@ const selectedSlot = ref(null)
 const busy = ref(false)
 const error = ref(null)
 const startedSession = ref(null)
+// The daemon accepted the answer and started a session, but has something to say
+// about it — the concurrency note (spec §6.3), the same key the resume reply
+// carries and RunDetail renders as `resumeStarted.warning`.
+const startedWarning = ref(null)
+const unsignedSource = ref(null)
+// The source UID the operator explicitly approved. It is set only by
+// `continueUnsignedSource`, and travels with every later retry so a repository
+// URL asked for in between cannot drop the approval (and vice versa).
+const unsignedSourceAck = ref(null)
+// An adopted schema-2 plain-project run has no tracked repo: the daemon refuses
+// the answer with `repo_url_required` and asks for the transport URL. The URL is
+// held here and resent with the same draft.
+const repoUrlRequired = ref(false)
+const repoUrl = ref('')
 
 const note = computed(() => props.run.attention?.note || '')
 const questionRecorded = computed(
@@ -70,14 +84,30 @@ const canSend = computed(
     && (!props.run.confirm_project || projectConfirmed.value),
 )
 
-async function submit() {
+async function submitWithDecision() {
   if (!canSend.value) return
   busy.value = true
   error.value = null
   try {
-    const result = await answerRun(props.run, draft.value.trim(), { confirmProject: projectConfirmed.value, slot: selectedSlot.value })
+    const result = await answerRun(
+      props.run,
+      draft.value.trim(),
+      {
+        confirmProject: projectConfirmed.value,
+        slot: selectedSlot.value,
+        ...(repoUrl.value.trim() ? { repoUrl: repoUrl.value.trim() } : {}),
+        ...(unsignedSourceAck.value
+          ? { allowUnsignedSource: unsignedSourceAck.value }
+          : {}),
+      },
+    )
     startedSession.value = result.session?.session_id || 'a new session'
+    startedWarning.value = result.warning || null
     draft.value = ''
+    unsignedSource.value = null
+    unsignedSourceAck.value = null
+    repoUrlRequired.value = false
+    repoUrl.value = ''
     emit('answered')
   } catch (exc) {
     // Loud, and in the server's own words: every refusal names both the reason and
@@ -88,9 +118,36 @@ async function submit() {
     // so a failed respawn means the answer exists nowhere but this box; clearing it
     // would be the one way for an operator to actually lose what they typed.
     error.value = exc.message
+    unsignedSource.value = exc.code === 'unsigned_session' ? exc.source : null
+    repoUrlRequired.value = exc.code === 'repo_url_required'
   } finally {
     busy.value = false
   }
+}
+
+function retryWithRepoUrl() {
+  if (!repoUrl.value.trim()) return
+  return submitWithDecision()
+}
+
+function submit() {
+  return submitWithDecision()
+}
+
+function continueUnsignedSource() {
+  const uid = unsignedSource.value?.uid
+  if (!uid) return
+  // Bind the approval to this exact source UID, then resend carrying whatever
+  // repository URL the form already holds — the two refusals are independent and
+  // a source can need both.
+  unsignedSourceAck.value = uid
+  return submitWithDecision()
+}
+
+function cancelUnsignedSource() {
+  error.value = null
+  unsignedSource.value = null
+  unsignedSourceAck.value = null
 }
 </script>
 
@@ -127,14 +184,52 @@ async function submit() {
         before you answer.
       </v-alert>
 
-      <v-alert v-if="error" type="error" density="compact" class="mt-3">
+      <v-alert
+        v-if="error"
+        :type="unsignedSource ? 'warning' : 'error'"
+        density="compact"
+        class="mt-3"
+      >
         {{ error }}
+        <div v-if="unsignedSource?.uid" class="d-flex flex-wrap ga-2 mt-3">
+          <v-btn color="warning" variant="tonal" @click="continueUnsignedSource">
+            continue fresh
+          </v-btn>
+          <v-btn variant="text" @click="cancelUnsignedSource">
+            cancel and wait
+          </v-btn>
+        </div>
+        <!-- `repo_url_required`: the run records no repository, so the answer
+             needs a transport URL. The draft is kept; this adds the URL and
+             resends it. -->
+        <div v-if="repoUrlRequired" class="mt-3">
+          <v-text-field
+            v-model="repoUrl"
+            label="repository URL"
+            placeholder="https://gitlab.example.com/group/project.git"
+            density="compact"
+            hide-details="auto"
+          />
+          <v-btn
+            color="warning"
+            variant="tonal"
+            class="mt-3"
+            :disabled="!repoUrl.trim()"
+            @click="retryWithRepoUrl"
+          >answer with this repository</v-btn>
+        </div>
       </v-alert>
 
       <v-alert v-if="startedSession" type="success" density="compact" class="mt-3">
         Answer handed to {{ startedSession }}. It records the answer and clears the
         question at session start, so this run stays listed as waiting for another
         moment.
+      </v-alert>
+
+      <!-- Accepted and still worth a second look: a success with a note attached,
+           rendered the way the resume reply's warning is in RunDetail. -->
+      <v-alert v-if="startedWarning" type="warning" density="compact" class="mt-3">
+        {{ startedWarning }}
       </v-alert>
 
       <!-- Send is a labelled control on its own row (`.send-row`, style.css),

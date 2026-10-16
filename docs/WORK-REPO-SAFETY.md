@@ -23,10 +23,45 @@ for correction. An unsafe blob staged before the command remains staged and
 must be corrected or unstaged explicitly. Restoration failures are reported.
 
 The command commits locally, then pulls with rebase and pushes. A failed
-pull stops publication immediately. If that pull started a rebase which
-remains interrupted, the command aborts it, retaining the original local
-commits. An abort failure is reported too. Pushes have at most three
+pull stops publication immediately, unless every unmerged path is a
+generated project README block (see below). If that pull started a rebase
+which remains interrupted, the command aborts it, retaining the original
+local commits. An abort failure is reported too. Pushes have at most three
 attempts, with a fresh pull and rebase before each attempt.
+
+Generated index blocks. Before every durability commit the command
+re-renders the index block of each project README between
+`<!-- lmer:index:start -->` and `<!-- lmer:index:end -->` from the run
+records the commit will contain, and stages the file with the record; a
+generated README that a crashed session left uncommitted is swept into the
+next push instead of being carried by the autostash. A README whose text
+outside the markers holds a line git reads as a conflict marker (seven `<`,
+`=`, `>` or `|` at the start of a line) is skipped with a warning, because
+the marker gate below would otherwise refuse every push of the project; the
+record still publishes. A project directory that is a symlink, resolves
+outside the checkout or lies inside a `_runs/` record is never written
+through: the regeneration skips it with `project index skipped` before
+anything is written in it, the leftover sweep leaves its README unstaged
+with `project index leftover skipped`, and the record still publishes.
+Only project READMEs travel with a push: the root `README.md` is never staged
+here, so a root block `lmer-schema index --write` rendered needs its own
+explicit commit through the normal gated commit. When `pull --rebase` stops
+and every unmerged path is a project `README.md` whose text outside the
+markers is identical on both sides and whose upstream block is not of a
+newer format, the command keeps the upstream text, renders the block again
+from the merged tree, stages it and continues the rebase — this is the
+usual outcome when two sessions push in one project, and it prints
+`↻ regenerated project index on the merged head` rather than a pull
+failure. Any other conflict, or a README
+whose hand-written text differs between the two sides, still aborts and
+retains the local commit. This relies on git 2.26 or newer (the merge
+backend, which drops a replayed commit that the resolution emptied), and
+every git call `work_repo.git_ops` makes (the publication path: `pull
+--rebase`, `rebase --continue`, `commit`, `push`) runs with `GIT_EDITOR` and
+`GIT_SEQUENCE_EDITOR` pinned to `true`, so an exported
+editor can never leave the resumed rebase waiting. A generated README that a
+newer lmer wrote is never swept or rewritten by an older one; it is named on
+each push until that lmer is upgraded.
 
 Rebase uses autostash to preserve unrelated tracked edits, such as an uncommitted
 run log. Git can return success even when restoring those edits fails. The
@@ -72,10 +107,17 @@ abort it after preserving any manual conflict resolutions. For detached HEAD,
 preserve any local commits and check out the intended branch. The command
 does not choose a branch or discard commits on the operator's behalf.
 
-For a conflict raised by this command and successfully aborted, the local
-commit is retained on its original branch. Rebase it manually, resolve the
-reported files, stage those specific paths, and continue the rebase. Then
-retry `work commit` or `work memory persist` to publish and verify it.
+For a conflict raised by this command and successfully aborted, the outcome
+depends on the command. `work commit` retains the local commit on its
+original branch: rebase it manually, resolve the reported files, stage those
+specific paths, and continue the rebase, then retry `work commit` to publish
+and verify it. `work memory persist` instead takes its local commit back
+(drop-and-roll-back, never `--hard`, so the checkout stays publishable) and
+saves upstream's version of each conflicting memory as a
+`<stem>.conflict-<sid>.md` copy beside the agent's own file; reconcile that
+copy and persist again. A project README's generated block needs no hand
+resolution: a retried `work commit` re-renders it from the current records;
+only the text outside the markers is yours to merge.
 
 An autostash restoration failure is different from an aborted rebase: the
 rebase has finished, and the saved edits remain in the reported stash. Inspect
@@ -98,9 +140,16 @@ For a transport failure, repair access and retry the command. No new edit or
 empty commit is needed to retry an existing local commit.
 
 When recovering memory conflicts, inspect both `MEMORY.md` and the memory
-files, including deletions and content changes. These Git guards preserve
-the existing restore-manifest merge behavior; they do not implement a new
-memory merge or automatic conflict-resolution policy.
+files, including deletions and content changes. `work memory persist` pulls
+the published branch first (fast-forward only) before it merges, so a
+sibling's already-published add or edit is seen before the merge rather than
+colliding at the rebase. On a publication conflict it aborts the rebase
+cleanly and takes its local commit back, then writes upstream's version of
+each conflicting memory as a `<stem>.conflict-<sid>.md` copy in the agent's
+memory dir (D.conflict-api). Reconcile that copy into the session's own file,
+then persist again: the copy is not a memory and is skipped on the way out.
+The restore baseline is keyed by the launch's session id, so a manifest
+recorded under another session is not a baseline.
 
 Deploying these checks requires rebuilding and rolling the session container
 image. Existing containers retain their baked `work` implementation. Host-side

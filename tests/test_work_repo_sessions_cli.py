@@ -48,6 +48,7 @@ import yaml
 
 from lmer_cli.container import clone_and_exec
 from tests.conftest import strip_lmer_env
+from tests.schema2_fixtures import RecordSpec, build_schema2_plexus, make_env, stamp, uid_for
 from tests.plexus_fixtures import (
     PRIMARY_REPO,
     PROJECT,
@@ -123,7 +124,7 @@ def _bare_schema_tree(monkeypatch, tmp_path, session=None, name="plexus-bare"):
     """A schema tree whose registered project has no run records yet."""
     root = tmp_path / name
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         f"schema: 1\nname: example\nprojects:\n  {PROJECT}:\n"
         f"    repo: {PRIMARY_REPO}\n",
         encoding="utf-8",
@@ -359,6 +360,171 @@ class TestALegacyTreeAnswersTheSameQuestion:
         assert row["id"] is None
         assert row["dir_name"] == SLUG
         assert row["address"] == SLUG
+
+
+# ---------------------------------------------------------------------------
+# `work sessions` on a schema-2 work repo
+# ---------------------------------------------------------------------------
+
+#: A clock the header-bucket test hands to `list_sessions`, so the 14-day
+#: active/stale split is decided by the test and not by the day it runs.
+FIXED_NOW = "2026-09-20T00:00:00Z"
+
+#: The five derived states, one record each, in start order.
+STATE_WORDS = ("closed", "waiting on question", "ended, not closed", "stale", "active")
+
+
+def _one_record_per_state(active_updated=stamp(15), stale_updated=stamp(1)):
+    """Five schema-2 records that render the five `work sessions` states.
+
+    `stale_updated` is 19 days before `FIXED_NOW` and `active_updated` five
+    days before it; a caller listing under the real clock passes an
+    `active_updated` of now.
+    """
+    return [
+        RecordSpec(uid=uid_for(1), slug="chat", started_at=stamp(1), updated=stamp(1, 12),
+                   status="complete"),
+        RecordSpec(uid=uid_for(2), slug="chat", started_at=stamp(2), updated=stamp(2, 12),
+                   stop_reason="question"),
+        RecordSpec(uid=uid_for(3), slug="chat", started_at=stamp(3), updated=stamp(3, 12),
+                   signed_out=True),
+        RecordSpec(uid=uid_for(4), slug="chat", started_at=stamp(4), updated=stale_updated,
+                   signed_out=False),
+        RecordSpec(uid=uid_for(5), slug="chat", started_at=stamp(5), updated=active_updated,
+                   signed_out=False),
+    ]
+
+
+def _state_tail(line):
+    """The `state=<word>` tail of one text row."""
+    return line.rsplit("state=", 1)[1]
+
+
+class TestSchemaTwoRowsCarryADerivedState:
+    """A schema-2 record has no `owner` verdict, so the listing used to print
+    `⚠️  state unreadable` on every readable row. Each row now ends with the
+    state `list_sessions` derives from the record and its own clock, and the
+    header counts those states instead of the schema-1 running/orphaned pair;
+    a record whose state really cannot be read keeps its marker."""
+
+    @staticmethod
+    def _tree(tmp_path, monkeypatch, specs):
+        tree = build_schema2_plexus(tmp_path / "plexus2", {"widgets": specs})
+        make_env(monkeypatch, tree.root, "widgets")
+        return tree
+
+    def test_every_readable_row_ends_with_a_state_tail(self, monkeypatch, tmp_path, capsys):
+        self._tree(tmp_path, monkeypatch,
+                   _one_record_per_state(active_updated=run_state.utc_now_iso()))
+        assert _main(["sessions"]) == 0
+        out = capsys.readouterr().out
+        assert "state unreadable" not in out
+        header, *rows = out.splitlines()
+        assert [_state_tail(line) for line in rows] == list(STATE_WORDS)
+        assert header == (
+            "Sessions: 5 (1 active, 1 stale, 1 ended not closed, "
+            "1 waiting on question, 1 closed)"
+        )
+
+    def test_a_corrupt_state_file_still_prints_state_unreadable(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        self._tree(tmp_path, monkeypatch, [
+            RecordSpec(uid=uid_for(1), slug="chat", started_at=stamp(1), updated=stamp(1, 12),
+                       signed_out=True),
+            RecordSpec(uid=uid_for(2), slug="chat", started_at=stamp(2), updated=stamp(2, 12),
+                       readable=False),
+        ])
+        assert _main(["sessions"]) == 0
+        header, *rows = capsys.readouterr().out.splitlines()
+        readable = next(line for line in rows if uid_for(1) in line)
+        corrupt = next(line for line in rows if uid_for(2) in line)
+        assert readable.endswith("state=ended, not closed")
+        assert corrupt.endswith("⚠️  state unreadable")
+        assert "state=" not in corrupt
+        assert header == "Sessions: 2 (1 ended not closed)"
+
+    def test_header_buckets_count_the_states_derived_with_a_fixed_now(
+        self, monkeypatch, tmp_path
+    ):
+        self._tree(tmp_path, monkeypatch, _one_record_per_state())
+        rows = run_state.list_sessions(run_state.runs_base(), now=FIXED_NOW)
+        assert [row["state"] for row in rows] == list(STATE_WORDS)
+        assert [row["stop_reason"] for row in rows] == [None, "question", None, None, None]
+        text = work_cli._format_sessions(rows, running_only=False)
+        assert text.splitlines()[0] == (
+            "Sessions: 5 (1 active, 1 stale, 1 ended not closed, "
+            "1 waiting on question, 1 closed)"
+        )
+
+    def test_only_non_zero_buckets_are_listed(self, monkeypatch, tmp_path):
+        self._tree(tmp_path, monkeypatch, [
+            RecordSpec(uid=uid_for(1), slug="chat", started_at=stamp(1), updated=stamp(1, 12),
+                       status="complete"),
+            RecordSpec(uid=uid_for(2), slug="chat", started_at=stamp(2), updated=stamp(2, 12),
+                       status="archived"),
+        ])
+        rows = run_state.list_sessions(run_state.runs_base(), now=FIXED_NOW)
+        text = work_cli._format_sessions(rows, running_only=False)
+        assert text.splitlines()[0] == "Sessions: 2 (2 closed)"
+
+    def test_json_rows_carry_stop_reason_and_state_equal_to_the_text_row(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        self._tree(tmp_path, monkeypatch,
+                   _one_record_per_state(active_updated=run_state.utc_now_iso()))
+        assert _main(["sessions"]) == 0
+        text_rows = capsys.readouterr().out.splitlines()[1:]
+        by_id = {line.split()[1]: _state_tail(line) for line in text_rows}
+        assert _main(["sessions", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["count"] == 5
+        for entry in payload["sessions"]:
+            assert entry["state"] == by_id[entry["id"]]
+        stop_reasons = {entry["id"]: entry["stop_reason"] for entry in payload["sessions"]}
+        assert stop_reasons[uid_for(2)] == "question"
+        assert stop_reasons[uid_for(1)] is None
+
+    def test_an_unrepresentable_row_clears_state_and_stop_reason_too(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        tree = self._tree(tmp_path, monkeypatch, [
+            RecordSpec(uid=uid_for(1), slug="chat", started_at=stamp(1), updated=stamp(1, 12),
+                       stop_reason="question"),
+        ])
+        native = tree.record_dir("widgets", uid_for(1)) / run_state.STATE_FILE
+        native.write_text(
+            native.read_text(encoding="utf-8").replace(f"updated: '{stamp(1, 12)}'",
+                                                        f"updated: {stamp(1, 12)}"),
+            encoding="utf-8",
+        )
+        assert _main(["sessions", "--json"]) == 0
+        (entry,) = json.loads(capsys.readouterr().out)["sessions"]
+        assert entry["id"] == uid_for(1)
+        assert entry["state"] is None
+        assert entry["stop_reason"] is None
+
+    def test_running_is_still_in_progress_with_no_sign_out(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        self._tree(tmp_path, monkeypatch,
+                   _one_record_per_state(active_updated=run_state.utc_now_iso()))
+        assert _main(["sessions", "--running"]) == 0
+        header, *rows = capsys.readouterr().out.splitlines()
+        assert header == "Running sessions: 2"
+        assert sorted(line.split()[1] for line in rows) == sorted([uid_for(4), uid_for(5)])
+        assert sorted(_state_tail(line) for line in rows) == ["active", "stale"]
+
+    def test_a_schema_one_listing_is_unchanged(self, monkeypatch, schema_tree, capsys):
+        _launch(monkeypatch, schema_tree, session=SID_RESUMED)
+        assert _main(["sessions"]) == 0
+        out = capsys.readouterr().out
+        assert "state=" not in out
+        assert out.splitlines()[0] == "Sessions: 2 (0 running, 1 orphaned)"
+        assert _main(["sessions", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert all("state" not in entry for entry in payload["sessions"])
+        assert [entry["stop_reason"] for entry in payload["sessions"]] == ["complete", None]
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +931,7 @@ def _unreadable_manifest_tree(monkeypatch, tmp_path, body, *, context=True):
     """A schema tree whose manifest this build cannot use."""
     root = tmp_path / "plexus-broken"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(body, encoding="utf-8")
+    (root / "_lmer.yaml").write_text(body, encoding="utf-8")
     host, path = PRIMARY_REPO.split("/", 1)
     if context:
         _set_context(monkeypatch, root, host=host, project=path, session=SID_RESUMED)
@@ -775,7 +941,7 @@ def _unreadable_manifest_tree(monkeypatch, tmp_path, body, *, context=True):
 
 
 #: The document itself is unusable — nothing resolves (MANIFEST_PROBLEM).
-_UNUSABLE_MANIFEST = "schema: 2\nname: example\nprojects: {}\n"
+_UNUSABLE_MANIFEST = "schema: 3\nname: example\nprojects: {}\n"
 #: The document parsed; only its identity layer breaks a rule. The base
 #: still resolves — to the {host}/{project} host bucket (REGISTRY_PROBLEM).
 _BROKEN_REGISTRY = (
@@ -795,7 +961,7 @@ class TestTheRefusalNamesTheCause:
         root = _unreadable_manifest_tree(monkeypatch, tmp_path, _UNUSABLE_MANIFEST)
         assert _main(["state", "set", "--phase=implement"]) == 1
         err = capsys.readouterr().err
-        assert str(root / "_plexus.yaml") in err.split("No run context:")[1]
+        assert str(root / "_lmer.yaml") in err.split("No run context:")[1]
         assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
 
     @pytest.mark.parametrize(
@@ -815,7 +981,7 @@ class TestTheRefusalNamesTheCause:
         assert _main(argv) == 1
         err = capsys.readouterr().err
         assert "No run context:" in err
-        assert str(root / "_plexus.yaml") in err
+        assert str(root / "_lmer.yaml") in err
         assert "LMER_REPO_HOST and LMER_REPO_PROJECT must be set" not in err
 
     def test_unset_context_still_blames_the_environment(
@@ -861,7 +1027,7 @@ class TestTheRefusalNamesTheCause:
         payload = json.loads(capsys.readouterr().out)
         assert payload["form"] == "schema"
         assert payload["sessions"] == []
-        assert str(root / "_plexus.yaml") in payload["detail"]
+        assert str(root / "_lmer.yaml") in payload["detail"]
 
     def test_the_hook_facing_start_names_it_where_the_reader_looks(
         self, monkeypatch, tmp_path, capsys
@@ -880,7 +1046,7 @@ class TestTheRefusalNamesTheCause:
         root = _unreadable_manifest_tree(monkeypatch, tmp_path, _UNUSABLE_MANIFEST)
         assert _main(["session-start"]) == 0
         out = capsys.readouterr().out
-        assert str(root / "_plexus.yaml") in out
+        assert str(root / "_lmer.yaml") in out
         assert "LMER_REPO_HOST" not in out
 
     def test_the_hook_facing_start_still_blames_unset_context_when_it_is(

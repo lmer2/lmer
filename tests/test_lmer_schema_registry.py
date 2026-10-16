@@ -89,7 +89,7 @@ def _hand_built(projects):
     """A ``Manifest`` built by hand, skipping the loader entirely — the API
     boundary ``build_registry`` has to defend on its own."""
     return Manifest(
-        path=Path("/x/_plexus.yaml"),
+        path=Path("/x/_lmer.yaml"),
         schema=1,
         name="hand-built",
         projects=projects,
@@ -296,6 +296,27 @@ def test_model_is_frozen(schema_plexus):
         registry[pf.PROJECT].name = "other"
 
 
+@pytest.mark.parametrize("use_keywords", [False, True])
+def test_public_registry_constructor_keeps_the_schema_1_signature(use_keywords):
+    project = Project(
+        name="widgets",
+        repo="https://git.example.test/Acme/Widgets.git",
+        remotes=(),
+        description=None,
+        keys=("git.example.test/acme/widgets",),
+    )
+    projects = {"widgets": project}
+    index = {"git.example.test/acme/widgets": "widgets"}
+
+    if use_keywords:
+        registry = Registry(path=Path("/_lmer.yaml"), projects=projects, index=index)
+    else:
+        registry = Registry(Path("/_lmer.yaml"), projects, index)
+
+    assert registry.schema == 1
+    assert registry.lookup("https://GIT.EXAMPLE.TEST/ACME/WIDGETS.git") is project
+
+
 # ---------------------------------------------------------------------------
 # Identity errors — one repo binds to AT MOST one project
 # ---------------------------------------------------------------------------
@@ -306,9 +327,9 @@ class TestRegistryError:
         # A broken registry is a broken manifest: callers that already treat
         # ManifestError as "schema form, unusable" (D20) need no second catch.
         assert issubclass(RegistryError, ManifestError)
-        err = RegistryError("/x/_plexus.yaml", "boom")
+        err = RegistryError("/x/_lmer.yaml", "boom")
         assert isinstance(err, ManifestError)
-        assert str(err).startswith("/x/_plexus.yaml: boom")
+        assert str(err).startswith("/x/_lmer.yaml: boom")
 
     def test_load_registry_raises_on_disk(self, schema_plexus):
         doc = _doc()
@@ -390,6 +411,16 @@ class TestDuplicateAcrossProjects:
         doc = _doc()
         doc["projects"]["fork"] = {"repo": f"git@{HOST}:{PATH.upper()}.git"}
         _raises(doc, pf.PROJECT, "fork")
+
+    def test_schema_2_treats_path_case_as_repository_identity(self):
+        doc = _doc()
+        doc["schema"] = 2
+        doc["projects"]["fork"] = {"repo": f"https://{HOST}/{PATH.upper()}.git"}
+
+        registry = _registry_from(doc)
+
+        assert registry.lookup(pf.PRIMARY_REPO).name == pf.PROJECT
+        assert registry.lookup(f"https://{HOST}/{PATH.upper()}.git").name == "fork"
 
     def test_non_default_port_is_not_a_duplicate(self):
         doc = _doc()

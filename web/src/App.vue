@@ -31,6 +31,7 @@ import ProjectNav from './components/ProjectNav.vue'
 import PlatformSettings from './components/PlatformSettings.vue'
 import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
+import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
@@ -954,6 +955,13 @@ onUnmounted(() => {
             <RunNav :runs="unassignedRuns" :attention="unassignedAttention" :now="now" @open="open" />
           </section>
           <p v-if="!loading && !projects.length">Create a project to start.</p>
+          <!-- The work repo's own panels (#374): here once, in the all-projects
+               fleet, because the work repo is shared by every workspace and is
+               not any one project's. Only for a mirror in schema form — a legacy
+               tree is never validated, and a payload with no `form` (an older
+               daemon) is not assumed to be one — so a legacy fleet mounts nothing
+               and sends no request. -->
+          <WorkRepoSchema v-if="mirror?.form === 'schema'" :head-sha="mirror.head_sha || null" />
         </template>
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>

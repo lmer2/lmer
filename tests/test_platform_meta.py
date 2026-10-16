@@ -785,3 +785,85 @@ def test_the_meta_panel_stores_nothing_in_the_browser():
     text = _read(RUN_META)
 
     assert "localStorage" not in text and "sessionStorage" not in text
+
+
+# --- carrying a run's metadata to its new key (spec §6.1 transition) ---------
+#
+# A slug-keyed entry bound to its schema-2 record moves to host/project/<uid>,
+# and its title and description move with it. Lossless: what the new key lacks
+# is carried, equal values are a no-op, differing values are both kept and the
+# call says so.
+
+NEW = (RUN[0], RUN[1], "a" * 32)
+
+
+def _key(parts):
+    return runs.run_key(*parts)
+
+
+def _plant(parts, **entry):
+    entries = meta.load_all()
+    entries[_key(parts)] = entry
+    store.write_json(store.snapshot_path(meta.META_FILE), {"meta": entries})
+
+
+def test_rekey_moves_the_entry(tracked):
+    meta.write(*RUN, title="the title", description="the description")
+
+    result = meta.rekey(RUN, NEW)
+
+    assert result == {"moved": True, "conflict": False}
+    assert _key(RUN) not in meta.load_all()
+    moved = meta.read(*NEW)
+    assert (moved.title, moved.description) == ("the title", "the description")
+
+
+def test_rekey_is_idempotent(tracked):
+    meta.write(*RUN, title="the title")
+    meta.rekey(RUN, NEW)
+    before = meta.load_all()
+
+    assert meta.rekey(RUN, NEW) == {"moved": False, "conflict": False}
+    assert meta.load_all() == before
+
+
+def test_rekey_of_an_absent_old_key_is_a_no_op(platform_root):
+    _plant(NEW, title="already here", description="", updated_at="2026-01-01T00:00:00Z")
+    before = meta.load_all()
+
+    assert meta.rekey(RUN, NEW) == {"moved": False, "conflict": False}
+    assert meta.load_all() == before
+
+
+def test_rekey_carries_over_what_the_new_key_lacks(platform_root):
+    _plant(RUN, title="old title", updated_at="2026-01-01T00:00:00Z")
+    _plant(NEW, description="new description", updated_at="2026-01-01T00:00:00Z")
+
+    assert meta.rekey(RUN, NEW) == {"moved": True, "conflict": False}
+    merged = meta.read(*NEW)
+    assert (merged.title, merged.description) == ("old title", "new description")
+
+
+def test_rekey_keeps_both_differing_values_and_reports_the_conflict(platform_root):
+    _plant(RUN, title="old title", description="", updated_at="2026-01-01T00:00:00Z")
+    _plant(NEW, title="new title", description="", updated_at="2026-01-01T00:00:00Z")
+
+    assert meta.rekey(RUN, NEW) == {"moved": True, "conflict": True}
+    stored = meta.load_all()[_key(NEW)]
+    assert stored["title"] == {"old": "old title", "new": "new title"}
+    assert _key(RUN) not in meta.load_all()
+
+
+def test_a_later_write_of_one_field_keeps_the_other_fields_conflict(platform_root):
+    """A conflict pair stands until somebody writes that field: a description
+    edit must not blank a title that is holding both values."""
+    runs.track(*NEW[:2], "develop-1", uid=NEW[2])
+    _plant(RUN, title="old title", updated_at="2026-01-01T00:00:00Z")
+    _plant(NEW, title="new title", updated_at="2026-01-01T00:00:00Z")
+    meta.rekey(RUN, NEW)
+
+    meta.write(*NEW, description="written later")
+
+    stored = meta.load_all()[_key(NEW)]
+    assert stored["title"] == {"old": "old title", "new": "new title"}
+    assert stored["description"] == "written later"

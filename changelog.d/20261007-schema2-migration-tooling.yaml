@@ -1,0 +1,8 @@
+added:
+- "`work adopt <host>/<project> <shortname>` registers a host-bucket tree and moves it to its short name in one commit, dry-run by default"
+- "`work migrate <project>` moves a registered project's legacy areas to schema form in one commit, folding pre-A1 plain-session records (`chat-.`) into their taskdef group"
+- "`work migrate --instance` moves the instance surfaces and folds `sources.yaml` into `_lmer.yaml`; it refuses until the #370 release runs fleet-wide"
+- "Validator check `record.plain-session-slug` and a matching `lmer-schema migrate` blocker name `work migrate <project>` for obsolete plain-session slugs"
+- "The `_lmer.yaml` registry writer preserves comments and quoting and checks registry invariants before writing"
+changed:
+- "The validator's legacy task-tree prune (#379) keeps legacy `{task_type}/{target}/` directories out of the schema-form run-area walk"

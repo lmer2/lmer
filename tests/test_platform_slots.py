@@ -1530,3 +1530,17 @@ def test_group_members_raises_when_the_project_is_gone(presets_file):
     spawn gate has to hear about this rather than record a blank."""
     with pytest.raises(ServiceError):
         slots.group_members("not-running")
+
+
+def test_an_occupant_carries_a_schema_two_launch_s_uid_and_only_then():
+    """Two schema-2 launches of one group share a slug; the uid is what tells
+    the holder from its sibling. A schema-1 occupant keeps its exact shape."""
+    uid = "c" * 32
+    run = {"host": "h", "project": "p", "slug": "chat"}
+
+    assert slots._occupant_of({"id": "s-1", "run": {**run, "uid": uid}}) == {
+        "session_id": "s-1", "host": "h", "project": "p", "slug": "chat", "uid": uid,
+    }
+    assert slots._occupant_of({"id": "s-2", "run": run}) == {
+        "session_id": "s-2", "host": "h", "project": "p", "slug": "chat",
+    }

@@ -410,16 +410,14 @@ def _run_ref(session_id: str) -> Optional[str]:
     ``/api/runs/resume`` takes.
     """
     entry = registry.read_session(session_id)
-    run = entry.get("run") if isinstance(entry, dict) else None
-    if not isinstance(run, dict):
-        return None
-    try:
-        return runs.run_key(
-            run.get("host") or "", run.get("project") or "", run.get("slug") or ""
-        )
-    except runs.RunIndexError:
+    parts = runs.run_key_of_entry(entry)
+    if parts is None:
         # A session with no run identity yet — spawned, nothing committed. The
         # refusal simply names one less thing.
+        return None
+    try:
+        return runs.run_key(*parts)
+    except runs.RunIndexError:
         return None
 
 

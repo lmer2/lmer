@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 
-from . import assistant, projects, runs, spool_merge, store
+from . import assistant, projects, spool_merge, store
 
 
 def enqueue(session, message, run=None, session_kind=None):
@@ -15,8 +15,12 @@ def enqueue(session, message, run=None, session_kind=None):
             or meta.get("notification_class") == "connector_health" or session_kind == "assistant"):
         return
     data = {"session": session, **{key: (run or {}).get(key) for key in ("host", "project", "slug")}}
-    if all(data.get(key) for key in ("host", "project", "slug")):
-        data["run_key"] = runs.run_key(data["host"], data["project"], data["slug"])
+    # Only a run that has a uid carries one, so a schema-1 payload keeps its shape.
+    if (run or {}).get("uid"):
+        data["uid"] = run["uid"]
+    run_key = projects.key_of(data)
+    if run_key:
+        data["run_key"] = run_key
     owner = projects.destination(data)
     if not owner:
         return

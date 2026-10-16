@@ -1,4 +1,11 @@
-"""Thread ownership outlives connectors; worker bindings follow their run home."""
+"""Thread ownership outlives connectors; worker bindings follow their run home.
+
+A worker binding is keyed by its run twice — ``owner = run:<key>`` and
+``run_key`` — and the key is the tracked index's (uid for a schema-2 run, slug
+otherwise; :func:`lmer_platform.runs.key_parts`). When a run's key changes,
+:func:`lmer_platform.projects.rekey` moves both in the same transaction as the
+run's home, so a binding never points at a home that has moved on.
+"""
 import json
 
 from lmer_cli.threads import parse_thread

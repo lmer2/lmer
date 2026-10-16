@@ -2,6 +2,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from lmer_cli import resolve
 from lmer_cli.cli import main, parse_args
 from tests.test_lmer_cli_slack_target import (
@@ -62,10 +64,12 @@ def test_without_a_repo_url_a_non_chat_thread_is_refused_with_the_flag_named(cap
     assert "pass --repo-url URL" in capsys.readouterr().out
 
 
-def test_without_a_repo_url_a_label_is_still_a_local_path(tmp_path, monkeypatch, capsys):
+def test_without_a_repo_url_a_label_still_needs_a_repository(tmp_path, monkeypatch, capsys):
+    # Schema 2 classifies a missing non-URL positional as a work item (spec §2),
+    # so the refusal is the cwd-origin fallback's, not a missing local path.
     monkeypatch.chdir(tmp_path)
     assert _launch(["develop", "request-123"])[0] != 0
-    assert "Local path does not exist" in capsys.readouterr().out
+    assert "could not infer git origin" in capsys.readouterr().out
 
 
 def test_a_thread_after_the_repo_url_is_refused_rather_than_dropped(capsys):
@@ -84,3 +88,16 @@ def test_a_thread_before_the_repo_url_is_connected_beside_the_label():
 def test_only_a_bare_word_after_an_option_counts_as_a_stray_target():
     assert parse_args(["chat", REPO, "--exec", "ls", "-la"])[0].stray_positionals == ["ls"]
     assert parse_args(["chat", REPO, "--unknown", "value", "--other=x"])[0].stray_positionals == []
+
+
+def test_repo_and_repo_url_together_name_two_repositories(capsys):
+    rc, _env = _launch(["triage", "request-123", "--repo", REPO, "--repo-url", REPO])
+    assert rc == 2
+    assert "two repositories named: --repo" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("target", ["./checkout", "/srv/checkout", "https://git.example.com/other/repo.git"])
+def test_a_path_or_repository_target_beside_a_repo_url_is_a_second_repository(target, capsys):
+    rc, _env = _launch(["triage", target, "--repo-url", REPO])
+    assert rc == 2
+    assert "two repositories named: the positional" in capsys.readouterr().out

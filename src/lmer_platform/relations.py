@@ -114,7 +114,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from .runs import RunIndexError, load_index, run_key
+from .runs import RunIndexError, holds_conflict, key_parts, load_index, merge_values, run_key
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
 )
@@ -124,7 +124,7 @@ logger = logging.getLogger("lmer_platform.relations")
 __all__ = [
     "RELATIONS_FILE", "PAIR_SEPARATOR", "MAX_RELATIONS_PER_RUN", "LOCALITY_NOTE",
     "RelationError", "RelatedRun",
-    "load_all", "all_pairs", "list_for", "relate", "unrelate",
+    "load_all", "all_pairs", "list_for", "relate", "unrelate", "rekey",
 ]
 
 RELATIONS_FILE = "relations.json"
@@ -308,13 +308,14 @@ def _members(pair: str, payload) -> Optional[tuple]:
     for ref in refs:
         if not isinstance(ref, dict):
             return unusable("a run in the entry is not a mapping")
+        # Through ``key_parts``, so an end that names its run by uid as well as
+        # slug keys by the uid — the one rule every keyed store follows.
         try:
-            run_key(ref.get("host"), ref.get("project"), ref.get("slug"))
+            triple = key_parts(ref)
+            run_key(*triple)
         except RunIndexError as exc:
             return unusable(str(exc))
-        triples.append((
-            ref["host"].strip(), ref["project"].strip(), ref["slug"].strip(),
-        ))
+        triples.append(triple)
 
     keys = [run_key(*triple) for triple in triples]
     if keys[0] == keys[1]:
@@ -493,3 +494,101 @@ def unrelate(run, related) -> bool:
         _save(entries)
     logger.info("platform_run_unrelated pair=%s", pair)
     return True
+
+
+def rekey(old_parts: tuple, new_parts: tuple) -> dict:
+    """Carry every relation naming one run's key over to its new key (spec §6.1).
+
+    *old_parts* and *new_parts* are ``(host, project, key segment)`` triples —
+    in practice a slug-keyed entry being bound to its schema-2 record's uid.
+    Each pair naming the old key, at **either** end, is rewritten with that end
+    naming the new key in the shape :func:`relate` writes, and moved to the
+    pair key the two ends now sort to, so the other run keeps its switch.
+
+    Returns ``{"moved": bool, "conflict": bool}``, the shape every store's
+    ``rekey`` returns (see :func:`lmer_platform.meta.rekey`). A pair that already
+    exists under the recomputed key is merged with
+    :func:`lmer_platform.runs.merge_values` — the ``runs`` list names the same
+    two keys on both sides by construction, so only the entry's other fields can
+    differ, and a differing one is kept as both with ``conflict: True``.
+
+    Not bound by :data:`MAX_RELATIONS_PER_RUN`: that cap refuses a *request*,
+    and refusing here would drop a relation an operator already made. A pair
+    between the old key and the new one is left where it is — rewritten it would
+    relate a run to itself, which :func:`_members` treats as unusable.
+
+    Idempotent, and under the same lock as :func:`relate`. ``conflict`` is read
+    off the result (:func:`_conflicted`), so a second call still reports a pair
+    the first one kept — for the reason :func:`lmer_platform.meta.rekey` gives.
+    """
+    old_key = run_key(*old_parts)
+    new_key = run_key(*new_parts)
+    if old_key == new_key:
+        return {"moved": False, "conflict": False}
+    new_ref = {"host": new_parts[0].strip(), "project": new_parts[1].strip(),
+               "slug": new_parts[2].strip()}
+    moved = conflict = False
+    with mutating(_relations_path()):
+        entries = load_all()
+        for pair, payload in list(entries.items()):
+            members = _members(pair, payload)
+            if members is None:
+                continue
+            keys = [run_key(*member) for member in members]
+            if old_key not in keys:
+                continue
+            other_key = keys[1] if keys[0] == old_key else keys[0]
+            if other_key == new_key:
+                continue
+            target = _pair_key(new_key, other_key)
+            entry = dict(payload)
+            entry["runs"] = [
+                dict(new_ref) if key == old_key else ref
+                for key, ref in zip(keys, payload["runs"])
+            ]
+            existing = entries.get(target)
+            if existing is not None:
+                entry, clash = _merged_pair(target, entry, existing)
+                conflict = conflict or clash
+            entries.pop(pair)
+            entries[target] = entry
+            moved = True
+        if moved:
+            _save(entries)
+        conflict = conflict or _conflicted(entries, new_key)
+    if moved:
+        logger.info(
+            "platform_run_relations_rekeyed old=%s new=%s conflict=%s",
+            old_key, new_key, conflict,
+        )
+    return {"moved": moved, "conflict": conflict}
+
+
+def conflicted(parts: tuple) -> bool:
+    """Whether a relation of the run *parts* names still keeps a field
+    :func:`rekey` held two values of."""
+    return _conflicted(load_all(), run_key(*parts))
+
+
+def _conflicted(entries: dict, key: str) -> bool:
+    for pair, payload in entries.items():
+        members = _members(pair, payload)
+        if members is None or key not in (run_key(*member) for member in members):
+            continue
+        if holds_conflict({k: v for k, v in payload.items() if k != "runs"}):
+            return True
+    return False
+
+
+def _merged_pair(pair: str, carried: dict, existing) -> tuple:
+    """``(entry, conflict)`` for a carried relation landing on an existing one.
+
+    The ``runs`` lists are compared by the keys they name, not by their raw
+    order, which is call order and says nothing about the relation.
+    """
+    if _members(pair, existing) is None:
+        return merge_values(carried, existing)
+    rest_carried = {k: v for k, v in carried.items() if k != "runs"}
+    rest_existing = {k: v for k, v in existing.items() if k != "runs"}
+    merged, clash = merge_values(rest_carried, rest_existing)
+    return {**merged, "runs": existing["runs"]}, clash

@@ -1,0 +1,34 @@
+# _lmer.yaml — the acme plexus (spec §4).
+# Hand-edited: every note in this file must survive a tool rewrite (issue #365).
+
+schema: 1  # an int, never a bool
+name: acme  # the instance name
+
+# The registry: identity lives here, not in paths.
+projects:
+  widgets:
+    repo: https://git.example.com/acme/widgets.git  # the primary: cloned and pushed to by default
+    remotes:
+      # the GitHub mirror is read-only — never push here
+      - github.com/acme/widgets
+      - 'gitlab.com/acme/widgets'  # quoted on purpose
+  # gadgets moved to GitHub in 2025; the old GitLab remote is gone
+  gadgets:
+    repo: github.com/acme/gadgets
+  capacity-planning:  # a project with no repository (D19)
+    description: "Quarterly capacity planning workstream"
+
+sources:  # area mounts (sources.yaml folded in)
+  # taskdef tracks main; pin a tag before cutting a release
+  taskdef:
+    repo: https://git.example.com/agents/taskdef.git
+    ref: main
+  napkin: {repo: "https://git.example.com/agents/napkin.git"}
+
+# Per-area TTL policy; an absent area means the defaults.
+housekeeping:
+  napkin:
+    archive_after: 365d  # one year, then the archive
+  # plans are never auto-archived
+  plans:
+    archive_after: null

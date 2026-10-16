@@ -26,12 +26,14 @@ def _cidfile(run):
 _read_container_id = container_follow.read_container_id
 
 
-def launch(*, create_rc=0, write_cid=True, follow_rc=0, extra_env=None, conflict=False):
+def launch(*, create_rc=0, write_cid=True, follow_rc=0, extra_env=None, conflict=False,
+           argv=ARGV):
     """Run main() and return (rc, what was seen). With *conflict*, the first
     create finds its name taken."""
     seen = {"removed": [], "followed": [], "creates": []}
 
     def real_transport(env):
+        seen["env"] = dict(env)
         container_env = build_container_env({**env, "LMER_PROBE": "secret-ish"})
         seen["env_dir"] = container_env.env_file_dir
         return container_env
@@ -67,7 +69,7 @@ def launch(*, create_rc=0, write_cid=True, follow_rc=0, extra_env=None, conflict
                        side_effect=lambda rt, c: seen["removed"].append(c)):
                 from lmer_cli.cli import main
 
-                rc = main(list(ARGV))
+                rc = main(list(argv))
     return rc, seen
 
 
@@ -98,6 +100,18 @@ def test_a_cli_run_is_named_by_the_slug_the_container_will_derive():
     )
     assert cli._cli_run_slug("develop", None) == "develop"
     assert cli._cli_run_slug(None, "https://gitlab.example.com/a/b/-/issues/7") is None
+
+
+def test_a_local_checkout_target_names_the_container_by_the_exported_target():
+    """A bare word naming a local checkout is a repository target and exports an
+    empty task target, so the container's slug is the bare taskdef. The name must
+    say the same, not ``chat-myrepo`` from the word's spelling."""
+    assert run_state.derive_slug("chat", "myrepo") != run_state.derive_slug("chat", "")
+    with patch("lmer_cli.cli.resolve.probe_local_repo", return_value=Path("/src/myrepo")):
+        _, seen = launch(argv=["chat", "myrepo"])
+    run = seen["create"]
+    assert seen["env"]["LMER_TASK_TARGET"] == ""
+    assert re.fullmatch(r"lmer-chat-[0-9a-f]{6}", run[run.index("--name") + 1])
 
 
 def test_a_platform_launch_reports_its_container_to_the_platform(tmp_path):

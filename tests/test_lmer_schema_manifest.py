@@ -1,4 +1,4 @@
-"""``lmer_schema.manifest`` — parsing ``_plexus.yaml`` into a typed model (issue #353).
+"""``lmer_schema.manifest`` — parsing ``_lmer.yaml`` into a typed model (issue #353).
 
 The loader is the first thing every schema-form consumer touches (form
 detection, the registry, the validator's manifest checks, the work CLI's
@@ -75,15 +75,47 @@ def _sources_host(tree):
 
 
 def test_manifest_name_matches_the_fixture_and_spec():
-    assert MANIFEST_NAME == "_plexus.yaml"
+    assert MANIFEST_NAME == "_lmer.yaml"
     assert MANIFEST_NAME == pf.MANIFEST_NAME
 
 
-def test_supported_schemas_is_exactly_one():
-    """v1 understands schema 1 and nothing else; ``CURRENT_SCHEMA`` is what a
-    tool writes (the newest it understands)."""
-    assert SUPPORTED_SCHEMAS == (1,)
-    assert CURRENT_SCHEMA == 1
+def test_every_independent_spelling_of_the_manifest_name_agrees():
+    """The name is mirrored as a module-local constant wherever importing core
+    is not an option (#587). Each mirror must say what core says."""
+    from hooks.run_state_guard import PLEXUS_MANIFEST
+    from lmer_cli.container import clone_and_exec, sources
+    from tests import schema2_fixtures
+    from work_repo import utils
+
+    assert {
+        PLEXUS_MANIFEST,
+        clone_and_exec.PLEXUS_MANIFEST_NAME,
+        sources.MANIFEST_FILENAME,
+        schema2_fixtures.MANIFEST_NAME,
+        utils.MANIFEST_NAME,
+    } == {MANIFEST_NAME}
+
+
+def test_nothing_shipped_looks_for_the_old_manifest_name():
+    """The manifest's old name was replaced outright, with no fallback (#587):
+    no code, hook or doc may still read, accept or name it."""
+    old = "_plexus" + ".yaml"
+    shipped = [REPO_ROOT / "AGENTS.md"]
+    for tree in ("src", "hooks", "bin", "docs", "lmer-docs", "web/src"):
+        shipped += [p for p in (REPO_ROOT / tree).rglob("*") if p.is_file()]
+    offenders = [
+        str(path.relative_to(REPO_ROOT))
+        for path in shipped
+        if "__pycache__" not in path.parts
+        and old in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert not offenders, f"{offenders} still spell {old}"
+
+
+def test_supported_schemas_include_legacy_and_process_records():
+    """Both tree contracts remain readable; new manifests select schema 2."""
+    assert SUPPORTED_SCHEMAS == (1, 2)
+    assert CURRENT_SCHEMA == 2
     assert CURRENT_SCHEMA == max(SUPPORTED_SCHEMAS)
 
 
@@ -269,7 +301,7 @@ def test_unreadable_manifest_rejected(schema_plexus):
 
 
 def test_dangling_symlink_manifest_rejected(schema_plexus):
-    """A dangling ``_plexus.yaml`` symlink is a present, broken manifest —
+    """A dangling ``_lmer.yaml`` symlink is a present, broken manifest —
     ``Path.exists()`` alone would report it absent and demote the tree."""
     schema_plexus.manifest.unlink()
     schema_plexus.manifest.symlink_to("nowhere.yaml")

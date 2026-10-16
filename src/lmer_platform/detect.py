@@ -319,8 +319,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, stall, statusline, teardown,
-    transcripts,
+    ask, assistant, checkin, nudge, registry, rotation, runs, stall, statusline,
+    teardown, transcripts,
 )
 from .api import build_state
 from . import config as config_module
@@ -534,6 +534,10 @@ class Signal:
     label: Optional[str] = None
     state: Optional[str] = None
     session: Optional[str] = None
+    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. ``ref``
+    #: stays slug-spelled for the digest text; :attr:`run` is what tells two
+    #: executions of one slug group apart.
+    uid: Optional[str] = None
 
     @property
     def ref(self) -> str:
@@ -543,9 +547,18 @@ class Signal:
         return runref.compose(self.host, self.project, self.slug)
 
     @property
+    def run(self) -> tuple:
+        """Which run this is: its execution uid in schema 2, its ref in schema 1.
+
+        Schema 2 lets two executions share host/project/slug, so the ref alone
+        would merge their conditions and read one's presence as the other's.
+        """
+        return (self.ref, self.uid)
+
+    @property
     def key(self) -> tuple:
         """What makes two observations the same condition."""
-        return (self.ref, self.kind, self.since or "")
+        return (self.run, self.kind, self.since or "")
 
     @property
     def digest(self) -> str:
@@ -602,7 +615,15 @@ class Signal:
         }
         if self.session:
             data["session"] = self.session
+        if self.uid:
+            data["uid"] = self.uid
         return data
+
+
+def _row_uid(row: dict) -> Optional[str]:
+    """The fleet row's execution uid, or ``None`` for a slug-keyed row."""
+    uid = row.get("uid")
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -650,6 +671,7 @@ def _signals_of_row(row: object) -> list:
 
     state = _text(row.get("state"))
     label = _text(row.get("label"))
+    uid = _row_uid(row)
     found = []
 
     attention = row.get("attention")
@@ -660,13 +682,13 @@ def _signals_of_row(row: object) -> list:
                 host=host, project=project, slug=slug, kind=reason,
                 note=_text(attention.get("note")),
                 since=_text(attention.get("since")),
-                label=label, state=state,
+                label=label, state=state, uid=uid,
             ))
 
     if state in MATERIAL_STATES:
         found.append(Signal(
             host=host, project=project, slug=slug, kind=state,
-            since=_text(row.get("updated")), label=label, state=state,
+            since=_text(row.get("updated")), label=label, state=state, uid=uid,
         ))
     return found
 
@@ -697,7 +719,7 @@ def _question_refs(signals: dict) -> set:
     person.
     """
     return {
-        signal.ref for signal in signals.values() if signal.kind in QUESTION_KINDS
+        signal.run for signal in signals.values() if signal.kind in QUESTION_KINDS
     }
 
 
@@ -729,7 +751,8 @@ def _refs(payload: object) -> set:
     for row in rows if isinstance(rows, list) else []:
         identity = _identity(row)
         if identity is not None:
-            found.add("/".join(identity))
+            # :attr:`Signal.run`'s spelling, so membership is per execution.
+            found.add((runref.compose(*identity), _row_uid(row)))
     return found
 
 
@@ -755,7 +778,16 @@ def _run_identity(entry: dict) -> Optional[tuple]:
     return (host, project, slug)
 
 
-def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
+def _run_uid(entry: dict) -> Optional[str]:
+    """The registry entry's execution uid, or ``None`` for a schema-1 launch."""
+    run = entry.get("run")
+    uid = run.get("uid") if isinstance(run, dict) else None
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
+
+
+def _committed_status(
+    config: PlatformConfig, identity: tuple, uid: Optional[str] = None
+) -> Optional[str]:
     """The ``status`` in the run's committed state, or ``None`` if not knowable.
 
     Read out of the mirror as it stands, with no pull: the sweep is a read on the
@@ -768,7 +800,9 @@ def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
     ``unreadable``), a state file with no status. The bar for removing the evidence
     of a possible crash is a run that says it finished, and nothing less.
     """
-    ref = resolve_run_dir(config, *identity)
+    # By uid when the launch has one: the slug lookup answers with the group's
+    # newest record, which for a schema-2 group may be another launch entirely.
+    ref = resolve_run_dir(config, *identity, uid=uid)
     if ref is None:
         return None
     try:
@@ -902,7 +936,7 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
         identity = _run_identity(entry)
         if identity is None:
             continue
-        status = _committed_status(config, identity)
+        status = _committed_status(config, identity, _run_uid(entry))
         finished = status in _TERMINAL_STATUSES
         if not finished and not _ended_as_asked(entry):
             continue
@@ -2119,11 +2153,11 @@ class Detector:
         for signal in baseline.values():
             if signal.kind not in QUESTION_KINDS:
                 continue
-            if signal.ref in outstanding or signal.ref not in refs:
+            if signal.run in outstanding or signal.run not in refs:
                 continue
-            previous = cleared.get(signal.ref)
+            previous = cleared.get(signal.run)
             if previous is None or _question_rank(signal) > _question_rank(previous):
-                cleared[signal.ref] = signal
+                cleared[signal.run] = signal
         # Baseline order, which is the inventory's own sort (:func:`_signals`).
         return list(cleared.values())
 

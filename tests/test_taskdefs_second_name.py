@@ -1,6 +1,6 @@
 """Tests for the taskdef tier search's second name (schema-form project dir).
 
-In a plexus carrying a ``_plexus.yaml`` manifest (spec D7/D8/D20) a project
+In a plexus carrying a ``_lmer.yaml`` manifest (spec D7/D8/D20) a project
 is a flat top-level dir named by SHORT NAME and its identity is the
 registry's ``repo:`` + ``remotes:`` — never the ``{host}/{project}`` path.
 ``work_repo_taskdef_dirs`` therefore has to resolve the project-scoped tier
@@ -50,7 +50,7 @@ def _work_repo(tmp_path, manifest=MANIFEST):
     work = tmp_path / "work"
     work.mkdir()
     if manifest is not None:
-        (work / "_plexus.yaml").write_text(manifest)
+        (work / "_lmer.yaml").write_text(manifest)
     return work
 
 
@@ -164,7 +164,7 @@ def test_global_tier_second_name(mod, monkeypatch, tmp_path):
 
 @COPIES
 def test_no_manifest_legacy_only(mod, monkeypatch, tmp_path):
-    """No ``_plexus.yaml`` = legacy form: the registry is never consulted
+    """No ``_lmer.yaml`` = legacy form: the registry is never consulted
     and a short-name dir that happens to exist is NOT picked up."""
     work = _work_repo(tmp_path, manifest=None)
     _legacy_env(monkeypatch, work)
@@ -235,7 +235,7 @@ def test_manifest_that_is_a_directory_fails_closed(mod, monkeypatch, tmp_path):
     """Present-but-unreadable (a directory where the file should be) is
     the same diagnosis as unparseable — run_state_guard agrees."""
     work = _work_repo(tmp_path, manifest=None)
-    (work / "_plexus.yaml").mkdir()
+    (work / "_lmer.yaml").mkdir()
     _legacy_env(monkeypatch, work)
     _mk(work, "git.example.com", "group", "proj", "taskdef")
     global_dir = _mk(work, "taskdef")
@@ -274,7 +274,7 @@ def test_plexus_manifest_problem_reports_the_reason(mod, monkeypatch, tmp_path):
     _legacy_env(monkeypatch, work)
     assert mod.plexus_manifest_problem() is None
 
-    (work / "_plexus.yaml").write_text(MANIFEST)
+    (work / "_lmer.yaml").write_text(MANIFEST)
     assert mod.plexus_manifest_problem() is None
 
     for body, reason in [
@@ -283,7 +283,7 @@ def test_plexus_manifest_problem_reports_the_reason(mod, monkeypatch, tmp_path):
         ("", "document is not a mapping"),
         ("projects: [lmer]\n", "projects: is not a mapping"),
     ]:
-        (work / "_plexus.yaml").write_text(body)
+        (work / "_lmer.yaml").write_text(body)
         assert mod.plexus_manifest_problem() == reason, body
 
     monkeypatch.delenv("LMER_WORK_REPO_PATH")
@@ -297,11 +297,11 @@ def test_start_warns_when_manifest_is_unusable(monkeypatch, tmp_path):
     _legacy_env(monkeypatch, work)
 
     assert start_hook.plexus_manifest_warning_lines() == [
-        f"⚠️  PLEXUS MANIFEST: {work / '_plexus.yaml'} present but unusable "
-        "(projects: is not a mapping); project taskdef tier skipped — fix _plexus.yaml"
+        f"⚠️  PLEXUS MANIFEST: {work / '_lmer.yaml'} present but unusable "
+        "(projects: is not a mapping); project taskdef tier skipped — fix _lmer.yaml"
     ]
 
-    (work / "_plexus.yaml").write_text(MANIFEST)
+    (work / "_lmer.yaml").write_text(MANIFEST)
     assert start_hook.plexus_manifest_warning_lines() == []
 
 

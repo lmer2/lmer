@@ -1,0 +1,10 @@
+fixed:
+- "schema 2 platform continuations carry the explicit source and acknowledgement through the host CLI, and independent harness children own truthful records and lifecycle"
+- "shared-checkout release transactions serialize Git activity, preserve unrelated edits, and verify the published holder"
+- "deferred memory forget and revive publish complete transitions after retries, with scope-aware conflicts and instance-only routing"
+- "future-version log, report and checkpoint writes fail closed, and newest-session resolution ignores malformed directory names"
+- "a release claim already verified on the remote is reported as won even when restoring the saved unrelated edits conflicts; the retained stash is named instead of failing the claim"
+- "release claims publish through a temporary index and `commit-tree` instead of stashing the checkout, so a claim cannot capture, move or lose a sibling session's uncommitted record, and a lost race has nothing to roll back"
+- "`work release claim-status` reads the last fetched publication, so it is current even though the claim verb no longer writes the checkout"
+- "a cleanly ended release holder now releases its own claim: session end reads the published claim rather than the checkout copy the claim verb no longer writes"
+- "`work release abort` publishes the same way claim and unclaim do, so it no longer fails on a shared checkout when a sibling session has an uncommitted file"

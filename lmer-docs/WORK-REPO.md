@@ -291,7 +291,7 @@ specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receip
   In a legacy tree the label is the run's name, slug when unnamed, and one
   target has one run directory — so distinct (run, spec) pairs never
   collide and entry names are exactly what they have always been. In a
-  **schema-form** tree (`_plexus.yaml`; see `docs/SCHEMA.md`) the session is
+  **schema-form** tree (`_lmer.yaml`; see `docs/SCHEMA.md`) the session is
   the unit of record, one `_runs/<slug>/` group holds several independent
   launches, and the label carries the launch's session id as well:
   `2026-07-15-gate-receipts-20260715-101500-1-11111--spec.md`. That suffix
@@ -303,6 +303,9 @@ specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receip
   bundle specs the target is the bundle file itself, never the run-root
   convenience symlink. There is deliberately no `README.md`/index file
   beside the links: a directory listing IS the index (v1 is symlinks-only).
+  The human index of a project is the generated block in
+  `<project>/README.md`, which every durability push re-renders from the run
+  records (SCHEMA-V2.md, Project index).
 - **Spec-class predicate**: a Markdown file whose stem is exactly `spec`,
   starts with `spec` + separator, or ends with separator + `spec`
   (`-`/`_`/`.`, case-insensitive) — `spec.md`, `spec-auth.md`,
@@ -382,7 +385,9 @@ The `work` command uses the following environment variables (set automatically b
 - `LMER_REPO_HOST` - Git service host (e.g., `github.com`, `gitlab.example.com`)
 - `LMER_REPO_PROJECT` - Project path (e.g., `owner/repo`)
 - `LMER_TASK` - Task type (e.g., `review`, `develop`, `modernize`)
-- `LMER_TASK_TARGET` - Task target (e.g., `pr-123`, `mr-456`, branch name)
+- `LMER_TASK_TARGET` - Task target (e.g., `pr-123`, `mr-456`, branch name);
+  empty for a local filesystem path target (`lmer chat .`), which files the
+  run under the bare taskdef slug (`chat`, not `chat-.`)
 
 ## Common Workflows
 
@@ -530,7 +535,11 @@ its `name:` or its directory slug — is rejected with the conflicting slug
 named. Renaming is free (each rename appends a `run_named` event);
 re-setting the run's own current name is a no-op. Set the name early, once
 direction is clear — pick it yourself and record it without asking the
-user to confirm (renaming later is cheap).
+user to confirm (renaming later is cheap). A launch can carry both the name
+and the goal from the start — `lmer --name <kebab> --goal "<text>"`, applied
+once by `work session-start` on the call that opens the record's session
+(a name another run holds is a warning there, and the run stays unnamed) —
+and every push prints a one-line reminder while the run is unnamed.
 
 ### Record an event
 

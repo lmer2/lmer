@@ -20,12 +20,17 @@ else.
 
 If the state shows a COMPLETED run (`status: complete` or `archived`), do
 NOT resume it or invent work — finished runs only reopen on explicit
-direction:
+direction. The brief's direction contract above is authoritative and names
+the route for THIS record's tree form: on schema 2 it is a new execution
+(`lmer <taskdef> [<target>] --source-session <uid>`, or the platform's
+continue); on schema 1 it is a reopen. Follow the route the brief names,
+never the other one.
 
 - Seed provided (the brief shows a `Seed provided (LMER_START_PROMPT):`
-  line): record it as the goal (`work goal "<seed>"`), reopen with
-  `work state set --status=in-progress --stop-reason=none`, then proceed
-  on the seed.
+  line): on schema 2 the seed belongs to that new execution — record it as
+  the new execution's goal; on schema 1 record it as the goal
+  (`work goal "<seed>"`) and reopen with
+  `work state set --status=in-progress --stop-reason=none`.
 - No seed: ask the user whether this is a new target or a continuation of
   this run. If the question goes unanswered, record it —
   `work state set --stop-reason=question --question "<the question>"` —
@@ -48,9 +53,11 @@ Ground rules — these come before any work:
     judgment after the timeout.
 - **Once direction is clear, record it before starting:**
   `work goal "<one-line statement of the task>"`. A run with work happening
-  and no goal recorded is a contract violation, not a shortcut. Include an
-  estimate when you can size the work —
-  `work goal "..." --estimate-sessions 2 --estimate-time "3h"` — it is
+  and no goal recorded is a contract violation, not a shortcut. A goal
+  passed as `lmer --goal` is already recorded: the run state brief's
+  `Goal:` line is the current goal, and a predecessor's goal shown as
+  replaced is context only. Include an estimate when you can size the
+  work — `work goal "..." --estimate-sessions 2 --estimate-time "3h"` — it is
   compared against the actuals at completion. Re-recording the goal
   without the flags clears any prior estimate, so re-estimate when
   direction shifts.
@@ -58,8 +65,11 @@ Ground rules — these come before any work:
   kebab-case name from the task and record it with `work name <name>`.
   Do NOT ask the user to confirm the name — pick it yourself and move
   on (the user can rename at any time with `work name <new-name>`;
-  auto-slugs are unfindable later). Skip this if the resume brief
-  already shows a name.
+  auto-slugs are unfindable later). Skip this if the run state brief
+  already shows a name — a `Run: <name> (slug: …)` header, or a
+  `Run name:` line when `lmer --name` named the run at launch (already
+  recorded). A `<taskdef>-<yymmdd>-<uid4>` default label is not a name:
+  still run `work name`.
 - **HARD RULE — commit before every stop that awaits the human.** Every
   stop that awaits the human — a blocking question, a phasic yield, an
   approval gate — must be preceded by `work commit`: unpushed artifacts
@@ -78,14 +88,20 @@ the work, not optional bookkeeping:
   text too — `work state set --stop-reason=question --question "<the question>"`
   — then `work commit`, then END the session immediately. Never idle in-session
   waiting for an answer: the next session's resume brief surfaces the recorded
-  question first. Answers arrive via a FRESH session — the human relaunches
-  with `lmer ... --answer "<text>"` (or records `work answer "<text>"`) and
-  that session resumes seeded with the question+answer pair; never revive
-  the asking session.
+  question first. Answers arrive via a FRESH session — the human answers
+  through the platform (the run's answer card, `POST /api/runs/answer`) or
+  relaunches with `lmer ... --answer "<text>"`, and that session resumes
+  seeded with the question+answer pair; never revive the asking session.
+  (A bare shell `work answer "<text>"` records an answer only on a schema-1
+  work repo; on schema 2 a record must belong to a launch, so it is refused.)
 - At a phasic phase-end yield: `work state set --stop-reason=yield`
 - On completion: `work state set --status=complete --stop-reason=complete`
 - Only for a genuine unrecoverable failure: `work state set --stop-reason=critical_error --critical-error '{"summary": "...", "detail": "..."}'`
-- To resume work on the run (e.g. it was marked complete but new work arrived): `work state set --status=in-progress --stop-reason=none`
+- To resume work on the run (e.g. it was marked complete but new work
+  arrived): a schema-2 record is continued as a NEW execution — follow the
+  brief's `--source-session` direction, because the record is never reopened
+  in place. A schema-1 record reopens with
+  `work state set --status=in-progress --stop-reason=none`.
 - Persist durable artifacts (specs, plans, retros): `work artifact <name>.md --file <path>`.
   Specs, plans, and reports deliver as Markdown (`.md`) — never docx/pdf/binary
   documents (unreviewable, undiffable, unlinkable at line level).

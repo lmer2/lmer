@@ -39,6 +39,7 @@ from lmer_platform import (
 )
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
+from work_repo.utils import repository_of
 
 
 @pytest.fixture(autouse=True)
@@ -214,12 +215,27 @@ def wait_for(predicate, timeout=5.0):
 # --- request validation -----------------------------------------------------
 
 @pytest.mark.parametrize("overrides", [
-    {"taskdef": ""}, {"taskdef": "   "}, {"target": ""}, {"ports": -1},
+    {"taskdef": ""}, {"taskdef": "   "}, {"ports": -1},
     {"ports": "two"}, {"ports": True},
+    # Blank is no target, and with no repo_url there is nothing to launch.
+    {"target": " ", "repo_url": None}, {"target": "\t\n ", "repo_url": None},
 ])
 def test_invalid_requests_are_rejected(config, overrides):
     with pytest.raises(spawn.SpawnError):
         spawn.spawn_session(config, request_for(**overrides))
+
+
+@pytest.mark.parametrize("target", ["", " ", "\t\n "])
+def test_an_empty_target_is_valid_beside_a_repo_url(config, target):
+    """A spawn may name its repository with repo_url and carry no target
+    (spec §6.5): the target positional is omitted, not emitted empty — and a
+    blank target is no target, never a whitespace positional."""
+    repo_url = "https://gitlab.example.com/agents/global.git"
+    validated = request_for(target=target, repo_url=repo_url).validate()
+    assert validated.target is None
+    command = spawn._build_command(config, validated)
+    assert target not in command
+    assert f"{spawn.REPO_FLAG}={repo_url}" in command
 
 
 def test_invalid_kind_is_rejected(config):
@@ -302,13 +318,13 @@ WIDGETS_TARGET = "https://gitlab.example.com/acme/widgets/-/work_items/42"
 
 
 def plant_manifest(config, projects, *, name="example-plexus"):
-    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    """A ``_lmer.yaml`` at the mirror root — the registry IS the identity (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
         encoding="utf-8",
     )
-    return config.mirror_path / "_plexus.yaml"
+    return config.mirror_path / "_lmer.yaml"
 
 
 def register_widgets(config):
@@ -379,13 +395,13 @@ def _no_mirror(config):
 
 
 def _mirror_without_a_manifest(config):
-    """A legacy work repo: a mirror, and no ``_plexus.yaml`` anywhere in it."""
+    """A legacy work repo: a mirror, and no ``_lmer.yaml`` anywhere in it."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
 
 
 def _unusable_manifest(config):
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 1\nname: example\nprojects: [this is not a mapping]\n",
         encoding="utf-8",
     )
@@ -395,7 +411,7 @@ def _manifest_this_build_cannot_read(config):
     """A manifest from a newer writer: present, parseable, and refused."""
     plant_manifest(config, {"widgets": {"repo": REGISTERED_PRIMARY}},
                    name="example-plexus")
-    path = config.mirror_path / "_plexus.yaml"
+    path = config.mirror_path / "_lmer.yaml"
     path.write_text(
         path.read_text(encoding="utf-8").replace("schema: 1", "schema: 99"),
         encoding="utf-8",
@@ -736,15 +752,26 @@ PLAIN_REPO_TARGETS = [
     "ssh://git@gitlab.example.com/agents/global.git",
 ]
 
-#: URL-shaped targets that are not repository roots. Before #255 these remained
-#: untracked and produced the actionable warning; recognising repo targets must
-#: not turn web pages or unsupported transports into persistent clone records.
-NON_REPO_URL_TARGETS = [
+#: Content inside a repository — a tree, a file, a wiki page (#523; a
+#: ``reference`` to the classifier). Not a clone URL and not a work item, but
+#: the repository it belongs to is in the URL and the shared helper reads it
+#: out (``repository_of``), so these identify the run exactly as
+#: DERIVABLE_TARGETS do — and, like them, record no repository: the derived
+#: URL is a reconstruction, not evidence. Until A1-wave0.repository-of these
+#: were NON_REPO_URL_TARGETS and stayed untracked.
+REFERENCE_TARGETS = [
     "https://gitlab.example.com/agents/global/-/tree/main",
-    "https://gitlab.example.com/agents/global/-/pipelines/1691",
     "https://gitlab.example.com/agents/global/-/blob/main/README.md",
     "https://gitlab.example.com/agents/global/-/wikis/home",
     "https://github.com/owner/repo/tree/main",
+]
+
+#: URL-shaped targets that are neither repository roots nor content inside
+#: one. Before #255 these remained untracked and produced the actionable
+#: warning; recognising repo targets must not turn web pages or unsupported
+#: transports into persistent clone records.
+NON_REPO_URL_TARGETS = [
+    "https://gitlab.example.com/group/project/-/pipelines/1691",
     "https://docs.example.com/guide/getting-started",
     "ftp://gitlab.example.com/group/project",
 ]
@@ -852,15 +879,66 @@ def test_the_entry_records_a_plain_repo_url_target(config, monkeypatch):
         os.kill(result.pid, 9)
 
 
-@pytest.mark.parametrize("target", NON_REPO_URL_TARGETS)
-def test_a_url_shaped_non_repo_target_stays_untracked_and_warns(config, target):
-    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+@pytest.mark.parametrize("target", REFERENCE_TARGETS)
+@pytest.mark.parametrize("tokens", ["with a host token", "without one"])
+def test_a_reference_target_identifies_the_run_as_lmer_will_export_it(
+    config, monkeypatch, target, tokens, no_host_tokens
+):
+    """#523, from the platform's side: a document URL carries its repository.
 
-    assert spawn._plain_repo_url_from_target(target) is None
-    assert (result.host, result.project) == (None, None)
+    The DERIVABLE_TARGETS contract, on a third shape of target: the identity is
+    the one ``lmer`` exports (parity, under both token states, because the
+    helper answers in a different spelling for each), and nothing is recorded as
+    the repository of record — the derived URL is a reconstruction.
+    """
+    if tokens == "with a host token":
+        monkeypatch.setenv(TOKEN_ENV, HOST_TOKEN)
+    request = request_for(repo_url=None, target=target)
+
+    recorded, identity = spawn._repo_urls(request)
+    host, project, _slug = spawn.derive_run_identity(request, identity)
+
+    assert recorded is None
+    assert (host, project) != (None, None)
+    assert (host, project) == lmer_would_export(target), (
+        "the platform predicted a run directory the container will not create"
+    )
+
+
+@pytest.mark.parametrize("target", REFERENCE_TARGETS)
+def test_a_reference_target_tracks_the_run_and_clones_from_its_repository(
+    config, monkeypatch, target
+):
+    """And spawned for real: tracked under that identity, cloned from --repo.
+
+    A document URL names the repository its clone comes from (#523), so the
+    repository of record is that repository and the launch carries it as
+    ``--repo`` rather than making the container reconstruct it from the URL.
+    """
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        expected = repository_of(target)
+        assert (result.host, result.project) == lmer_would_export(target)
+        tracked = runs.get_tracked(result.host, result.project, result.slug)
+        assert tracked is not None
+        assert tracked.source == "spawned"
+        assert tracked.repo == expected
+        assert registry.read_session(result.session_id)["task"]["repo"] == expected
+        assert result.command[-1] != ""
+        assert target in result.command, "the document target stays the positional"
+        assert repository_of(target) == expected
+    finally:
+        os.kill(result.pid, 9)
+
+
+@pytest.mark.parametrize("target", NON_REPO_URL_TARGETS)
+def test_a_url_shaped_non_repo_target_is_refused(config, target):
+    """An ``other`` target is context only: without a repository it is refused
+    (spec §6.5), never spawned untracked."""
+    with pytest.raises(spawn.SpawnError, match="not a repository"):
+        spawn.spawn_session(config, request_for(repo_url=None, target=target))
     assert runs.list_tracked() == []
-    assert result.warning is not None
-    assert "not tracked" in result.warning
 
 
 @pytest.mark.parametrize(("target", "clean", "secret"), [
@@ -964,22 +1042,19 @@ def test_the_entry_of_a_target_identified_session_records_no_repo(
         os.kill(result.pid, 9)
 
 
-def test_the_daemon_s_own_repo_url_still_beats_the_target(config, monkeypatch):
-    """Evidence before reconstruction: the target is the *last* source, not the first.
-
-    An exported LMER_REPO_URL is the operator naming this daemon's repository, and
-    it is recorded; the target is only ever read for an identity. Deriving first
-    would file the run under the target's project and record nothing, quietly
-    dropping a URL the operator did supply.
+def test_a_repository_target_beats_the_daemon_s_own_repo_url(config, monkeypatch):
+    """A bare repository URL is the caller naming the clone source, so it becomes
+    the repository of record ahead of the daemon's exported LMER_REPO_URL
+    (spec §6.5: a repository-class target moves into repo_url).
     """
     monkeypatch.setenv("LMER_REPO_URL", "https://gitlab.example.com/agents/other.git")
     result = spawn.spawn_session(
         config, request_for(repo_url=None, target=PLAIN_REPO_TARGETS[0])
     )
 
-    assert result.project == "agents/other"
+    assert result.project == "agents/global"
     assert runs.get_tracked(result.host, result.project, result.slug).repo == (
-        "https://gitlab.example.com/agents/other.git"
+        "https://gitlab.example.com/agents/global"
     )
 
 
@@ -1741,6 +1816,56 @@ def test_child_env_carries_the_port_and_token_the_platform_chose(
         ), "the control vars must not have displaced the ports file"
     finally:
         os.kill(result.pid, 9)
+
+
+def test_schema_two_source_confirmation_and_metadata_reach_the_child(
+    platform_root, env_dumping_lmer, monkeypatch
+):
+    """A continuation reads one UID but never assigns that UID to its writer."""
+    script, dump = env_dumping_lmer
+    config = cfg.load({"lmer_bin": str(script)})
+    source_uid = "a" * 32
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+
+    result = spawn.spawn_session(config, request_for(
+        source_session_id=source_uid,
+        allow_unsigned_source=source_uid,
+        session_metadata={
+            "operator": "host-user",
+            "hostname": "host.example",
+            "model": "predecessor-model",
+            "effort": "predecessor-effort",
+            "config": {"future": {"enabled": True}, "api_token": "secret"},
+            "extension": [1, 2],
+        },
+        model="current-model",
+    ))
+    try:
+        assert wait_for(lambda: dump.is_file() and dump.stat().st_size)
+        child = env_from_dump(dump)
+        metadata = json.loads(child["LMER_SESSION_METADATA"])
+        assert child["LMER_SOURCE_SESSION_ID"] == source_uid
+        assert child["LMER_ALLOW_UNSIGNED_SOURCE"] == source_uid
+        assert child.get("LMER_SESSION_ID") in (None, "")
+        assert metadata["operator"] == "host-user"
+        assert metadata["hostname"] == "host.example"
+        assert metadata["model"] == "current-model"
+        assert metadata["effort"] is None
+        assert metadata["config"]["future"] == {"enabled": True}
+        assert metadata["config"]["api_token"] == "***REDACTED***"
+        assert metadata["extension"] == [1, 2]
+        assert metadata["launcher"]["pid"] == os.getpid()
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_unsigned_source_confirmation_must_equal_the_selected_source(config):
+    with pytest.raises(spawn.SpawnError, match="must exactly match"):
+        spawn.spawn_session(config, request_for(
+            source_session_id="a" * 32,
+            allow_unsigned_source="b" * 32,
+        ))
+    assert registry.list_sessions(live_only=False) == []
 
 
 def test_a_no_repo_session_is_told_so_in_its_environment(
@@ -3271,19 +3396,32 @@ def test_the_ask_mount_satisfies_lmer_s_own_validator(config):
     assert specs[0].mode == "rw", "the session writes its questions into it"
 
 
-def test_the_platform_mounts_do_not_collide(config):
-    """All of them handed to the real validator together, which rejects a clash.
+@pytest.mark.parametrize("kind", [registry.WORKER_KIND, registry.ASSISTANT_KIND])
+def test_the_platform_mounts_do_not_collide(config, monkeypatch, kind):
+    """Validate the actual launch mounts before the child can retire them.
 
     Two mounts at one destination is the container runtime aborting the launch,
-    and ``parse_dir_mount_specs`` is the check that catches it first — so they go
-    through it as a set rather than being eyeballed here.
+    so check the whole set with the real parser and reject its deduplication.
+    The immediately exiting stub can remove its status directory before spawn
+    returns: validating host paths after that races legitimate cleanup.
     """
-    result = spawn.spawn_session(config, request_for())
-    specs = parse_dir_mount_specs(mount_specs_in(result.command), "")
-    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS)
-    assert sorted(spec.container for spec in specs) == sorted(
-        PLATFORM_MOUNT_DESTINATIONS
-    )
+    real_popen = spawn.subprocess.Popen
+    specs = []
+
+    def validate_then_launch(command, **kwargs):
+        specs.extend(parse_dir_mount_specs(mount_specs_in(command), ""))
+        return real_popen(command, **kwargs)
+
+    with monkeypatch.context() as launch_patch:
+        launch_patch.setattr(spawn.subprocess, "Popen", validate_then_launch)
+        result = spawn.spawn_session(config, request_for(), kind=kind)
+    assert spawn.wait_for_exit_recorded(result.session_id)
+
+    expected = set(PLATFORM_MOUNT_DESTINATIONS)
+    if kind == registry.ASSISTANT_KIND:
+        expected.add(memory.CONTAINER_STAGED_DIR)
+    assert len(specs) == len(mount_specs_in(result.command)) == len(expected)
+    assert {spec.container for spec in specs} == expected
     assert all(spec.mode == "rw" for spec in specs)
 
 
@@ -4243,18 +4381,6 @@ def test_an_oversized_memory_store_is_reported_when_the_assistant_starts(
     assert (store_dir / "huge.md").is_file()
 
 
-def test_the_assistants_mounts_do_not_collide(config):
-    """The memory destination sits inside the staging area while the transcript
-    mount sits at claude's projects dir — different subtrees, but only the real
-    validator settles whether the whole set is acceptable to a runtime."""
-    result = spawn.spawn_session(
-        config, request_for(), kind=registry.ASSISTANT_KIND
-    )
-    specs = parse_dir_mount_specs(mount_specs_in(result.command), "")
-    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS) + 1
-    assert memory.CONTAINER_STAGED_DIR in [spec.container for spec in specs]
-
-
 def test_a_drop_in_cannot_claim_the_memory_store_path(
     config, _no_user_harnesses, caplog
 ):
@@ -4513,3 +4639,204 @@ class TestAssistantResourceFlags:
         bound nobody configured."""
         with pytest.raises(spawn.SpawnError):
             spawn.spawn_session(config, request_for(extra_args=(flag, "64g")))
+
+
+# --- SpawnRequest classification (A2.spawn-classifier, spec §6.5) ------------
+#
+# The target's class decides what the launch is: a repository moves into
+# repo_url, a document stays a positional and clones from repo_url, a path is
+# refused (the platform has no filesystem), an ``other`` URL is context only,
+# and a thread permalink is the handler's.
+
+PERMALINK_TARGET = "https://example.slack.com/archives/C0123ABCD/p1234567890123456"
+
+
+def test_a_bare_repository_url_moves_into_repo_url(config):
+    request = request_for(repo_url=None, target="https://gitlab.example.com/agents/global.git")
+    validated = request.validate()
+
+    assert validated.target is None
+    assert validated.repo_url == "https://gitlab.example.com/agents/global.git"
+
+
+def test_a_local_path_target_is_refused(config):
+    for path in (".", "./widgets", "/abs/widgets", "../widgets"):
+        with pytest.raises(spawn.SpawnError, match="filesystem path"):
+            spawn.spawn_session(config, request_for(repo_url=None, target=path))
+
+
+def test_a_thread_permalink_stays_the_target_untouched(config):
+    request = request_for(repo_url=None, target=PERMALINK_TARGET)
+    validated = request.validate()
+
+    assert validated.target == PERMALINK_TARGET
+    assert validated.repo_url is None
+
+
+def test_a_document_target_keeps_its_place_and_clones_from_its_repository(config):
+    target = "https://gitlab.example.com/agents/global/-/blob/main/README.md"
+    validated = request_for(repo_url=None, target=target).validate()
+
+    assert validated.target == target
+    assert validated.repo_url == "https://gitlab.example.com/agents/global"
+    command = spawn._build_command(config, validated)
+    assert target in command, "the document target is the positional"
+    assert "--repo=https://gitlab.example.com/agents/global" in command, (
+        "the clone comes from the repository, never from the document URL"
+    )
+
+
+def test_an_empty_target_spawn_clones_from_repo(config):
+    validated = request_for(
+        target=None, repo_url="https://gitlab.example.com/agents/global.git"
+    ).validate()
+
+    command = spawn._build_command(config, validated)
+    assert "--repo=https://gitlab.example.com/agents/global.git" in command
+    assert command[1:3] == [validated.taskdef, "--fastapi"], (
+        "no empty positional for argparse to choke on"
+    )
+
+
+@pytest.mark.parametrize("target", [
+    "feature/x",
+    "https://gitlab.example.com/agents/global/-/issues/7",
+])
+def test_a_work_item_beside_a_repo_url_keeps_its_argv(config, target, tmp_path, monkeypatch):
+    """§9.4: a shape that launched before §6.5 gains no ``--repo``.
+
+    A bare word that names no path in the daemon's working directory is also
+    #545's label, so it carries ``--repo-url`` (:func:`spawn._passes_repo_url`);
+    a URL target never does.
+    """
+    monkeypatch.chdir(tmp_path)
+    validated = request_for(
+        target=target, repo_url="https://gitlab.example.com/agents/global.git"
+    ).validate()
+
+    command = spawn._build_command(config, validated)
+    assert not any(arg.startswith(f"{spawn.REPO_FLAG}=") for arg in command)
+    repo_url_args = [arg for arg in command if arg.startswith(f"{spawn.REPO_URL_FLAG}=")]
+    if target.startswith("https://"):
+        assert repo_url_args == []
+    else:
+        assert repo_url_args == [
+            f"{spawn.REPO_URL_FLAG}=https://gitlab.example.com/agents/global.git"
+        ]
+
+
+def test_an_other_target_without_a_repo_url_is_refused(config):
+    with pytest.raises(spawn.SpawnError, match="not a repository"):
+        request_for(
+            repo_url=None, target="https://docs.example.com/guide/getting-started"
+        ).validate()
+
+
+def test_an_other_target_takes_the_daemon_s_repo_url_as_its_repository(config, monkeypatch):
+    """``LMER_REPO_URL`` is the repository of record for every spawn that names
+    none (:func:`spawn._repo_urls`), so it satisfies an ``other`` target too —
+    and it is emitted as ``--repo``, since the target cannot carry the clone."""
+    monkeypatch.setenv("LMER_REPO_URL", "https://oauth2:tok@gitlab.example.com/agents/global.git")
+    target = "https://gitlab.example.com/agents/global/-/pipelines/1"
+    validated = request_for(repo_url=None, target=target).validate()
+
+    assert validated.target == target
+    assert validated.repo_url == "https://gitlab.example.com/agents/global.git"
+    command = spawn._build_command(config, validated)
+    assert "--repo=https://gitlab.example.com/agents/global.git" in command
+
+
+def test_an_other_target_is_refused_with_neither_repo_url_nor_a_daemon_default(
+    config, monkeypatch
+):
+    monkeypatch.delenv("LMER_REPO_URL", raising=False)
+    with pytest.raises(spawn.SpawnError, match="not a repository"):
+        request_for(
+            repo_url=None, target="https://gitlab.example.com/agents/global/-/pipelines/1"
+        ).validate()
+
+
+@pytest.mark.parametrize("target", [None, "", "  "])
+def test_an_empty_target_with_only_the_daemon_default_is_refused(config, monkeypatch, target):
+    """§6.5: a request with neither a target nor a repo_url is refused — the
+    daemon's default stands in for a repository a target needs, not for the
+    request naming anything at all."""
+    monkeypatch.setenv("LMER_REPO_URL", "https://gitlab.example.com/agents/global.git")
+    with pytest.raises(spawn.SpawnError, match="target or a repo_url"):
+        spawn.SpawnRequest(taskdef="chat", target=target).validate()
+
+
+def test_an_other_target_with_a_repo_url_is_context(config):
+    target = "https://docs.example.com/guide/getting-started"
+    validated = request_for(
+        repo_url="https://gitlab.example.com/agents/global.git", target=target
+    ).validate()
+
+    assert validated.target == target
+    assert validated.repo_url == "https://gitlab.example.com/agents/global.git"
+    command = spawn._build_command(config, validated)
+    assert "--repo=https://gitlab.example.com/agents/global.git" in command
+
+
+def test_a_32_hex_taskdef_is_refused(config):
+    with pytest.raises(spawn.SpawnError, match="32 lowercase hex"):
+        request_for(taskdef="a" * 32).validate()
+
+
+def test_a_request_with_neither_target_nor_repo_url_is_refused(config):
+    with pytest.raises(spawn.SpawnError, match="target or a repo_url"):
+        spawn.SpawnRequest(taskdef="chat").validate()
+
+
+def test_two_repositories_named_is_refused(config):
+    with pytest.raises(spawn.SpawnError, match="two repositories named"):
+        request_for(
+            target="https://gitlab.example.com/agents/global",
+            repo_url="https://gitlab.example.com/agents/other.git",
+        ).validate()
+
+
+@pytest.mark.parametrize("target,repo_url", [
+    ("https://gitlab.example.com/agents/global", "https://gitlab.example.com/agents/global.git"),
+    ("https://gitlab.example.com/agents/global.git", "https://gitlab.example.com/agents/global"),
+    ("https://gitlab.example.com/agents/global/", "https://GitLab.Example.com/agents/global.git"),
+    ("https://oauth2:tok@gitlab.example.com/agents/global.git",
+     "https://gitlab.example.com/agents/global"),
+])
+def test_a_repository_target_naming_the_repo_url_s_repository_is_accepted(
+    config, target, repo_url
+):
+    """The run dialog prefills ``repo_url``, so an operator who types the same
+    repository as the target names it twice: one repository, not two. The
+    explicit ``repo_url`` is the one kept."""
+    validated = request_for(target=target, repo_url=repo_url).validate()
+
+    assert validated.target is None
+    assert validated.repo_url == repo_url
+    command = spawn._build_command(config, validated)
+    assert f"--repo={repo_url}" in command
+    assert target not in command
+
+
+@pytest.mark.parametrize("target,repo_url", [
+    ("https://oauth2:target-token@gitlab.example.com/agents/global.git",
+     "https://oauth2:repo-token@gitlab.example.com/agents/other.git"),
+    ("https://user:target-token@docs.example.com/guide/getting-started", None),
+])
+def test_a_target_refusal_never_repeats_a_credential(config, target, repo_url):
+    """Both URLs are quoted in the refusal, and a clone URL may carry a token:
+    the message reaches an API reply and the event log."""
+    with pytest.raises(spawn.SpawnError) as caught:
+        request_for(target=target, repo_url=repo_url).validate()
+
+    assert "target-token" not in str(caught.value)
+    assert "repo-token" not in str(caught.value)
+
+
+@pytest.mark.parametrize("target", [".", "https://h/g/p", "https://h/g/p/-/blob/main/x.md"])
+def test_derive_run_identity_slug_agrees_with_both_containers(config, target):
+    from lmer_cli.container.clone_and_exec import _derive_run_slug
+
+    request = request_for(taskdef="chat", target=target)
+    _host, _project, slug = spawn.derive_run_identity(request, None)
+    assert slug == run_state.derive_slug("chat", target) == _derive_run_slug("chat", target)

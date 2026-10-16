@@ -282,8 +282,9 @@ run had no identity to attach one to); the session is running regardless.
 
 **Write every run name as a link the operator can tap.** When you name a run in
 chat, make the name a markdown link whose href is
-`lmer://run/<host>/<project>/<slug>` — the same `host/project/slug` key the routes
-above take:
+`lmer://run/<host>/<project>/<uid or slug>` — the run's `uid` when its fleet row
+carries one, otherwise its `slug`. Two runs of one work item share a slug and
+never a uid, so a slug link to a run that has a uid opens nothing:
 
     [auth rate-limit fix](lmer://run/gitlab.example.com/acme/widget/develop-issue-412)
     is on its third review round.

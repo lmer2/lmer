@@ -10,6 +10,11 @@ sources.py must be loadable two ways (see its module docstring):
 Plus the PyYAML guard (spec N5): the module imports cleanly without PyYAML,
 and load_sources() on an *existing* sources.yaml without PyYAML raises the
 refuse-start error instead of silently skipping.
+
+Plus the manifest tier (issue #370): a tiered load_sources() call takes the
+manifest's ``sources:`` as a dict the caller already parsed, so it needs
+neither lmer_schema (the one manifest parser) nor PyYAML — the standalone
+copy resolves it with both absent and imports nothing new.
 """
 
 import subprocess
@@ -127,11 +132,108 @@ def test_standalone_load_survives_missing_pyyaml(tmp_path):
     assert "OK" in result.stdout
 
 
+def test_standalone_manifest_tier_call_needs_neither_lmer_schema_nor_pyyaml(tmp_path):
+    """A manifest-tier call resolves standalone with lmer_schema and PyYAML absent."""
+    result = _run_standalone(
+        """
+        assert mod.yaml is None, "yaml import should have been blocked"
+        work_url = "https://git.example.com/20c/worklog.git"
+        manifest = dict(taskdef=dict(repo="https://git.example.com/agents/taskdefs.git", ref="main"))
+        cfg, warnings = mod.load_sources(
+            {missing!r},
+            work_repo_url=work_url,
+            manifest_sources=manifest,
+            manifest_path="/work/_lmer.yaml",
+        )
+        assert warnings == [], warnings
+        assert cfg["sources"] == dict(taskdef=dict(repo="https://git.example.com/agents/taskdefs.git", ref="main")), cfg
+        assert cfg["tiers"] == dict(taskdef=mod.TIER_MANIFEST), cfg
+        assert mod.declared_origin_label(mod.TIER_MANIFEST) == "declared (manifest)"
+        assert mod.declared_origin_label(mod.TIER_LEGACY) == "declared (sources.yaml)"
+        # The trust rules fire through the same standalone path.
+        try:
+            mod.load_sources(
+                {missing!r},
+                work_repo_url=work_url,
+                manifest_sources=dict(napkin=dict(repo="https://evil.example.org/20c/napkin.git")),
+                manifest_path="/work/_lmer.yaml",
+            )
+        except mod.SourcesConfigError as exc:
+            assert "LMER_NAPKIN_REPO" in str(exc), exc
+        else:
+            raise AssertionError("manifest-tier trust rule did not fire")
+        # Nothing new was imported: not the manifest parser, not the package,
+        # not PyYAML (the None sentinels planted by the prelude are blocks,
+        # not imports).
+        loaded = sorted(
+            name
+            for name, module in sys.modules.items()
+            if name.split(".")[0] in ("lmer_schema", "lmer_cli", "yaml") and module is not None
+        )
+        assert loaded == [], loaded
+        print("OK")
+        """.format(missing=str(tmp_path / "no-such-sources.yaml")),
+        cwd=tmp_path,
+        # None in sys.modules makes any later import of the name raise
+        # ImportError: an interpreter with neither PyYAML nor lmer_schema.
+        prelude="import sys\nsys.modules['yaml'] = None\nsys.modules['lmer_schema'] = None\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
 def test_package_import_works():
     """The normal package import path exposes the same surface."""
     assert sources.__doc__ and "Import contract" in sources.__doc__
     assert sources.STANDALONE_MODULE_NAME == "lmer_container_sources"
     assert issubclass(sources.SourcesConfigError, Exception)
+
+
+def test_package_exposes_manifest_tier_marker():
+    """The version-floor capability marker (issue #370, plan task 60)."""
+    assert sources.MANIFEST_TIER_SUPPORTED is True
+
+
+def test_standalone_exposes_manifest_tier_marker(tmp_path):
+    """The marker is present under the -P standalone load too."""
+    result = _run_standalone(
+        """
+        assert mod.MANIFEST_TIER_SUPPORTED is True
+        print("OK")
+        """,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
+
+
+def test_the_marker_is_true_only_while_the_seam_reads_the_manifest(tmp_path):
+    """Honesty: the marker can never be True while clone_and_exec ignores
+    the manifest tier. On a manifest-only tree (no sources.yaml) the seam
+    plans the declared clone, so the assertion holds for the seam it names."""
+    from unittest.mock import patch
+
+    from lmer_cli.container import clone_and_exec
+
+    work_url = "https://git.example.com/org/work.git"
+    (tmp_path / clone_and_exec.PLEXUS_MANIFEST_NAME).write_text(
+        "schema: 2\nname: example\nsources:\n  taskdef:\n"
+        "    repo: https://git.example.com/org/taskdefs.git\n"
+    )
+    calls = []
+
+    def fake_clone(dest, url, branch, ref, *, manage_existing):
+        calls.append((str(dest), url, ref))
+
+    with patch.object(clone_and_exec, "ensure_clone", side_effect=fake_clone):
+        rc = clone_and_exec._resolve_declared_sources(
+            tmp_path, work_url,
+            env={"LMER_WORK_REPO_PATH": "/work"},
+            isatty=False, input_fn=lambda *a, **k: "",
+        )
+    assert rc == 0
+    assert calls and calls[0][0] == "/taskdef"
+    assert sources.MANIFEST_TIER_SUPPORTED is True
 
 
 def test_package_load_sources_absent_file_is_silent_legacy(tmp_path):

@@ -86,17 +86,25 @@ def test_the_flag_is_reserved_in_extra_args(config):
 
 
 @pytest.mark.parametrize("taskdef,target", [
-    ("chat", THREAD), ("chat", MATRIX), ("triage", "checkout"), ("triage", "./checkout"), ("triage", "{abs}"),
-    ("triage", "gone/.."), ("triage", "./gone"), ("triage", "../gone"), ("triage", "~/checkout"), ("triage", "/srv/gone"),
+    ("chat", THREAD), ("chat", MATRIX), ("triage", "checkout"), ("triage", "gone/.."), ("triage", "~/checkout"),
 ])
 def test_a_recorded_repo_url_leaves_chat_threads_and_paths_as_they_were(
         config, tmp_path, monkeypatch, taskdef, target):
     """Existing paths, and missing ones spelled as paths, keep their argv: lmer still fails on the latter."""
     (tmp_path / "checkout").mkdir()
     monkeypatch.chdir(tmp_path)
-    request, command = _argv(config, taskdef=taskdef, target=target.format(abs=tmp_path / "checkout"))
+    request, command = _argv(config, taskdef=taskdef, target=target)
     assert request.targets is None
     assert not any(arg.startswith(spawn.REPO_URL_FLAG) for arg in command)
+
+
+@pytest.mark.parametrize("target", ["./checkout", "{abs}", "./gone", "../gone", "/srv/gone"])
+def test_a_path_spelled_target_is_refused_before_any_repo_url(config, tmp_path, monkeypatch, target):
+    """Spec §6.5: a target starting with ``/`` or ``.`` is a filesystem path the platform cannot resolve."""
+    (tmp_path / "checkout").mkdir()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(spawn.SpawnError, match="local filesystem path"):
+        _argv(config, target=target.format(abs=tmp_path / "checkout"))
 
 
 @pytest.mark.parametrize("target", ["request-123", "2026-10/request-123", "checkout/gone"])
@@ -127,3 +135,31 @@ def test_a_non_http_repo_url_with_a_secret_is_refused_without_echoing_it(url):
 def test_a_repo_url_that_is_not_a_url_is_refused_before_the_spawn(config):
     with pytest.raises(spawn.SpawnError, match="repository URL"):
         spawn.SpawnRequest(taskdef="triage", target="label", repo_url="request-123").validate()
+
+
+def _repo_flags(command):
+    return [arg.split("=", 1)[0] for arg in command
+            if arg.startswith((f"{spawn.REPO_FLAG}=", f"{spawn.REPO_URL_FLAG}="))]
+
+
+@pytest.mark.parametrize("taskdef,target,expected", [
+    ("triage", None, [spawn.REPO_FLAG]),
+    ("triage", "https://gitlab.example.com/group/project/-/blob/main/README.md", [spawn.REPO_FLAG]),
+    ("triage", "https://docs.example.com/guide/getting-started", [spawn.REPO_FLAG]),
+    ("triage", "https://gitlab.example.com/group/project/-/issues/7", []),
+    ("triage", "feature/x", [spawn.REPO_URL_FLAG]),
+    ("triage", THREAD, [spawn.REPO_URL_FLAG]),
+    ("chat", THREAD, []),
+], ids=["none", "reference", "other", "work-item-url", "work-item-word", "thread", "chat-thread"])
+def test_at_most_one_repository_flag_reaches_lmer(config, tmp_path, monkeypatch, taskdef, target, expected):
+    """``lmer`` refuses --repo beside --repo-url, so a spawn emits one or neither (#591)."""
+    monkeypatch.chdir(tmp_path)
+    _request, command = _argv(config, taskdef=taskdef, target=target)
+    assert _repo_flags(command) == expected
+
+
+def test_both_rules_firing_still_emits_only_repo(config, monkeypatch):
+    """The guard does not rest on the two rules happening to be disjoint."""
+    monkeypatch.setattr(spawn, "_passes_repo_url", lambda request: True)
+    _request, command = _argv(config, target=None)
+    assert _repo_flags(command) == [spawn.REPO_FLAG]

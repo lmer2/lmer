@@ -27,6 +27,9 @@ Three properties are load-bearing and each has its own class here:
 from unittest.mock import patch
 
 import itertools
+import json
+import posixpath
+import threading
 
 import pytest
 
@@ -86,6 +89,15 @@ def schema_tree(tmp_path, monkeypatch):
     agent_dir = tmp_path / "agent-memory"
     agent_dir.mkdir()
     _set_context(monkeypatch, tree, agent_dir)
+    return tree, agent_dir
+
+
+@pytest.fixture
+def schema2_tree(schema_tree):
+    """The schema fixture at the schema-2 writer boundary."""
+    tree, agent_dir = schema_tree
+    text = tree.manifest.read_text()
+    tree.manifest.write_text(text.replace("schema: 1", "schema: 2", 1))
     return tree, agent_dir
 
 
@@ -443,12 +455,15 @@ class TestARetirementThatEmptiesAScopeStillCarries:
         # dir is exactly what a crash or a killed container leaves, and it is
         # indistinguishable from this. Under-deleting an index line loses
         # nothing; the lines go as soon as one session holds an index again.
-        assert PROJECT_MEMORY_FILE in (
-            tree.project_memory_dir / memory.MEMORY_INDEX
-        ).read_text()
-        assert USER_MEMORY_FILE in (
-            tree.instance_memory_dir / memory.MEMORY_INDEX
-        ).read_text()
+        # Gap (e) then reconciles each surviving entry with the now-empty
+        # scope: the line stays, non-lossily, as `archived <date>` rather
+        # than dangling (never a silent drop).
+        project_index = (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        instance_index = (tree.instance_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert "archived" in project_index, project_index
+        assert f"({PROJECT_MEMORY_FILE})" not in project_index, project_index
+        assert "archived" in instance_index, instance_index
+        assert f"({USER_MEMORY_FILE})" not in instance_index, instance_index
 
     def test_retiring_every_memory_carries_in_a_legacy_tree_too(self, legacy_tree):
         tree, agent_dir = legacy_tree
@@ -647,11 +662,15 @@ class TestLegacyFormIsUnchanged:
         assert rc == 0
         assert (tree.project_memory_dir / "prefs.md").exists()
         assert (tree.project_memory_dir / "gotcha.md").exists()
-        # The index is written verbatim, not rebuilt: one scope, nothing to
-        # split, and no reason for the bytes to change. It replaces the one
-        # in the work repo entirely because this session restored every line
-        # of it and then dropped them (issue #369) — the honest edit.
-        assert (tree.project_memory_dir / "MEMORY.md").read_text() == index
+        # The hand-written lines are kept verbatim, and the one scope's own
+        # index is reconciled against its live files (gap (e)): the unindexed
+        # `gotcha.md` — and every seeded live file whose entry this session
+        # dropped — gains a generated entry rather than staying invisible.
+        text = (tree.project_memory_dir / "MEMORY.md").read_text()
+        assert text.startswith(index), text
+        for path in tree.project_memory_dir.glob("*.md"):
+            if path.name != memory.MEMORY_INDEX:
+                assert f"({path.name})" in text, (path.name, text)
         assert staged == [f"{PRIMARY_REPO}/memory"]
         assert not (tree.root / "_agents").exists()
 
@@ -706,9 +725,12 @@ class TestWriteScopeNamesWhatIsWritten:
             f"{PROJECT}/_agents/memory",
             "_agents/memory",
         ]
+        # The push behind persist may also regenerate or sweep the project's
+        # README index block, so the journalled scope names it too.
         assert self._intent(command="memory", memory_action="persist") == [
             f"{PROJECT}/_agents/memory",
             "_agents/memory",
+            f"{PROJECT}/README.md",
         ]
 
     def test_no_run_context_names_nothing(self, monkeypatch, tmp_path):
@@ -738,7 +760,7 @@ class TestPersistRefusals:
         # silent demotion the resolver exists to prevent.
         tree, agent_dir = schema_tree
         (agent_dir / "prefs.md").write_text(_memory_file("prefs", "user"))
-        (tree.root / "_plexus.yaml").write_text("schema: [not, an, int]\n")
+        (tree.root / "_lmer.yaml").write_text("schema: [not, an, int]\n")
 
         rc, staged = _persist()
 
@@ -855,10 +877,13 @@ class TestTwoSessionsDoNotDeleteEachOther:
 
         Invariant, checked on the FILE and on its INDEX LINE uniformly after
         every persist: the scope holds the last thing some session
-        deliberately did — an edit, a removal, or a retirement (tombstoning
-        the index line while keeping the file). A session that merely held a
-        stale copy never reverts it, never deletes it, and never resurrects a
-        line another session retired.
+        deliberately did — an edit, a removal, or a retirement. Gap (e)
+        reconciles the entry with the live files, so a removal that carries
+        tombstones the line (``archived <date>``, never a silent drop) while
+        a retirement tombstones it and keeps the file; a removal the write
+        gate refuses leaves the file and its entry intact. A session that
+        merely held a stale copy never reverts it, never deletes it, and
+        never resurrects a line another session retired.
 
         The index half is here because `entry["index"]` had the mirror of the
         file-side bug: it recorded the surviving lines rather than the lines
@@ -878,11 +903,19 @@ class TestTwoSessionsDoNotDeleteEachOther:
             assert memory.restore_memory() == 0
 
         def retire(agent_dir):
-            """Tombstone the shared line: keep the file, drop the link."""
+            """Tombstone the shared line the way ``forget`` does: re-point the
+            entry at THIS file's archive mirror (the identity-bearing form).
+            A bare ``forgotten <date>`` word tombstone carries no identity and
+            gap (e) correctly re-indexes the live file."""
+            scope_rel = tree.project_memory_dir.relative_to(tree.root)
+            target = posixpath.relpath(
+                memory._archive_rel_for_key((scope_rel / "shared.md").as_posix()),
+                scope_rel.as_posix(),
+            )
             index = agent_dir / "MEMORY.md"
             index.write_text(
                 "".join(
-                    "- Shared — forgotten 2026-08-25 — s\n"
+                    f"- [Shared]({target}) — a fact\n"
                     if "shared.md" in line
                     else line
                     for line in index.read_text().splitlines(keepends=True)
@@ -890,7 +923,7 @@ class TestTwoSessionsDoNotDeleteEachOther:
             )
 
         expected = "a fact"
-        linked = True  # is the shared memory still LINKED in the scope's index?
+        retired = False  # has a session deliberately tombstoned the shared line?
         removed = False
         for name, action in zip(("s1", "s2", "s3"), actions):
             monkeypatch.setenv("LMER_AGENT_MEMORY_DIR", str(dirs[name]))
@@ -904,18 +937,33 @@ class TestTwoSessionsDoNotDeleteEachOther:
                 removed = True
             elif action == "retire":
                 retire(dirs[name])
-                linked = False
+                retired = True
 
             for cycle in ("one", "two"):
                 self._add(dirs[name], f"{name}-{cycle}", "project", f"{name} {cycle}")
-                assert _persist()[0] == 0
+                upstream_missing = not shared.is_file()
+                rc, _staged = _persist()
+                if action == "edit" and upstream_missing:
+                    # An edit based on restored bytes whose shared copy was
+                    # deleted is ambiguous: preserve it locally, but require
+                    # explicit revival rather than undoing the deletion.
+                    assert rc == 1
+                    assert not shared.exists()
+                    assert expected in (dirs[name] / "shared.md").read_text()
+                    break
+                assert rc == 0
                 index_text = (tree.project_memory_dir / "MEMORY.md").read_text()
 
-                # The index line: retired stays retired, on BOTH cycles and
-                # for every session after the one that retired it.
-                assert ("(shared.md)" in index_text) == linked, (
+                # The index line: gap (e) ties it to the live file. A
+                # retirement is a deliberate tombstone and stays unlinked
+                # while the file survives; a removal whose deletion carries
+                # leaves no file, so the line is tombstoned in place; a
+                # removal the write gate refuses (an upstream edit is newer)
+                # leaves the file live and the entry linked.
+                expected_linked = (not retired) and shared.is_file()
+                assert ("(shared.md)" in index_text) == expected_linked, (
                     f"{name}:{action} cycle {cycle} "
-                    f"{'lost' if linked else 'resurrected'} the shared index "
+                    f"{'lost' if expected_linked else 'resurrected'} the shared index "
                     f"line (actions={actions})"
                 )
 
@@ -1270,6 +1318,51 @@ class TestTwoSessionsDoNotDeleteEachOther:
             tree.instance_memory_dir / USER_MEMORY_FILE
         ).read_text()
 
+    def test_an_unchanged_restored_file_does_not_undo_upstream_deletion(
+        self, schema_tree
+    ):
+        """A stale session has no opinion when upstream removed its old bytes."""
+        tree, agent_dir = schema_tree
+        upstream = tree.project_memory_dir / PROJECT_MEMORY_FILE
+        assert memory.restore_memory() == 0
+        restored_text = (agent_dir / PROJECT_MEMORY_FILE).read_text()
+
+        # Another writer retires the memory after this session restored it.
+        upstream.unlink()
+        (agent_dir / "local.md").write_text(_memory_file("local", "project"))
+
+        assert _persist()[0] == 0
+
+        assert not upstream.exists(), "a stale unchanged copy revived the deletion"
+        assert (agent_dir / PROJECT_MEMORY_FILE).read_text() == restored_text
+        assert (tree.project_memory_dir / "local.md").is_file()
+
+    def test_a_local_edit_of_an_upstream_deletion_is_an_explicit_conflict(
+        self, schema_tree, capsys
+    ):
+        """A conflict preserves local content without accidentally reviving it."""
+        tree, agent_dir = schema_tree
+        upstream = tree.project_memory_dir / PROJECT_MEMORY_FILE
+        local = agent_dir / PROJECT_MEMORY_FILE
+        assert memory.restore_memory() == 0
+
+        local.write_text(
+            _memory_file(
+                "selfdev-pythonpath-gotcha",
+                "project",
+                body="locally corrected while upstream retired it\n",
+            )
+        )
+        upstream.unlink()
+
+        assert _persist()[0] == 1
+
+        assert not upstream.exists(), "a conflicted local edit revived the deletion"
+        assert "locally corrected" in local.read_text()
+        err = capsys.readouterr().err
+        assert "conflict" in err.lower()
+        assert PROJECT_MEMORY_FILE in err
+
     def test_the_manifest_is_not_work_repo_state(self, schema_tree):
         # It must survive the container and nothing else: not committed into
         # the work repo (where `lmer-schema validate` would have to learn it)
@@ -1284,3 +1377,424 @@ class TestTwoSessionsDoNotDeleteEachOther:
             assert not [
                 p for p in root.rglob("*") if p.name == memory.RESTORE_MANIFEST_NAME
             ]
+
+
+# ---------------------------------------------------------------------------
+# Schema 2: explicit memory retirement
+# ---------------------------------------------------------------------------
+
+
+class TestSchema2MemoryRetirement:
+    @staticmethod
+    def _project_key(tree):
+        return (tree.project_memory_dir / PROJECT_MEMORY_FILE).relative_to(
+            tree.root
+        ).as_posix()
+
+    def test_forget_archives_content_and_records_a_structured_retirement(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        source = tree.root / key
+        original = source.read_text()
+
+        changed = memory.forget_memory(
+            key, metadata={"reason": "superseded", "ticket": 7}
+        )
+
+        archive_rel = f"{PROJECT}/_archive/_agents/memory/{PROJECT_MEMORY_FILE}"
+        state = memory.read_memory_retirements()
+        entry = state["retired"][key]
+        assert not source.exists()
+        assert (tree.root / archive_rel).read_text() == original
+        assert entry == {
+            "archive": archive_rel,
+            "index_lines": [
+                (
+                    "- [Self-dev PYTHONPATH gotcha]"
+                    f"({PROJECT_MEMORY_FILE}) — bare pytest imports the "
+                    "operational install, prefix PYTHONPATH with the "
+                    "checkout's src/."
+                )
+            ],
+            "metadata": {"reason": "superseded", "ticket": 7},
+        }
+        index = (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert f"({PROJECT_MEMORY_FILE})" not in index
+        assert f"(../../_archive/_agents/memory/{PROJECT_MEMORY_FILE})" in index
+        assert set(changed) == {
+            key,
+            archive_rel,
+            f"{PROJECT}/_agents/memory/{memory.MEMORY_INDEX}",
+            memory.RETIREMENT_STATE_NAME,
+        }
+
+    def test_revive_restores_archived_content_and_index_in_one_change_set(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        original = (tree.root / key).read_text()
+        memory.forget_memory(key, metadata={"reason": "mistake"})
+
+        changed = memory.revive_memory(key)
+
+        state = memory.read_memory_retirements()
+        assert key not in state["retired"]
+        assert (tree.root / key).read_text() == original
+        assert not (
+            tree.project_dir / "_archive" / "_agents" / "memory" / PROJECT_MEMORY_FILE
+        ).exists()
+        index = (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert f"({PROJECT_MEMORY_FILE})" in index
+        assert f"(_archive/_agents/memory/{PROJECT_MEMORY_FILE})" not in index
+        assert memory.RETIREMENT_STATE_NAME in changed
+
+    def test_unknown_top_level_and_entry_metadata_survive_other_key_updates(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        project_key = self._project_key(tree)
+        instance_key = (
+            tree.instance_memory_dir / USER_MEMORY_FILE
+        ).relative_to(tree.root).as_posix()
+        memory.forget_memory(project_key)
+        memory.forget_memory(instance_key)
+        state_path = memory.retirement_state_path()
+        state = json.loads(state_path.read_text())
+        state["extension"] = {"owner": "future-writer"}
+        state["retired"][instance_key]["future"] = ["opaque", 2]
+        state_path.write_text(json.dumps(state))
+
+        memory.revive_memory(project_key)
+
+        after = json.loads(state_path.read_text())
+        assert after["extension"] == {"owner": "future-writer"}
+        assert after["retired"][instance_key]["future"] == ["opaque", 2]
+
+    def test_restore_filters_retired_content_even_if_an_old_writer_readded_it(
+        self, schema2_tree
+    ):
+        tree, agent_dir = schema2_tree
+        key = self._project_key(tree)
+        stale = (tree.root / key).read_text()
+        memory.forget_memory(key)
+        # Simulate an old client that cannot read the marker and copied stale
+        # bytes back into the live scope.
+        (tree.root / key).write_text(stale)
+
+        assert memory.restore_memory() == 0
+
+        assert not (agent_dir / PROJECT_MEMORY_FILE).exists()
+        index = (agent_dir / memory.MEMORY_INDEX).read_text()
+        assert f"({PROJECT_MEMORY_FILE})" not in index
+        assert f"_archive/_agents/memory/{PROJECT_MEMORY_FILE}" in index
+        assert (agent_dir / USER_MEMORY_FILE).is_file()
+
+    def test_persist_without_a_restore_baseline_cannot_revive_retired_content(
+        self, schema2_tree
+    ):
+        tree, agent_dir = schema2_tree
+        key = self._project_key(tree)
+        stale = (tree.root / key).read_text()
+        memory.forget_memory(key)
+        (agent_dir / PROJECT_MEMORY_FILE).write_text(stale)
+        (agent_dir / memory.MEMORY_INDEX).write_text(
+            _index_line("Stale", PROJECT_MEMORY_FILE)
+        )
+
+        assert _persist()[0] == 0
+
+        assert not (tree.root / key).exists()
+        index = (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert f"({PROJECT_MEMORY_FILE})" not in index
+
+    def test_empty_agent_persist_enforces_marker_against_old_writer_revival(
+        self, schema2_tree
+    ):
+        tree, agent_dir = schema2_tree
+        key = self._project_key(tree)
+        stale = (tree.root / key).read_text()
+        memory.forget_memory(key)
+        (tree.root / key).write_text(stale)
+        assert not list(agent_dir.iterdir())
+
+        assert _persist()[0] == 0
+
+        assert not (tree.root / key).exists()
+
+    def test_malformed_state_is_rejected_before_forget_mutates_anything(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        source = tree.root / key
+        index = tree.project_memory_dir / memory.MEMORY_INDEX
+        before_source = source.read_bytes()
+        before_index = index.read_bytes()
+        malformed = b'{"version": 1, "retired": [], "sentinel": "keep"}\n'
+        memory.retirement_state_path().write_bytes(malformed)
+
+        with pytest.raises(memory.MemoryRetirementError, match="retired"):
+            memory.forget_memory(key)
+
+        assert source.read_bytes() == before_source
+        assert index.read_bytes() == before_index
+        assert memory.retirement_state_path().read_bytes() == malformed
+        assert not (tree.project_dir / "_archive").exists()
+
+    def test_malformed_state_makes_restore_fail_without_mutating_agent_memory(
+        self, schema2_tree, capsys
+    ):
+        _tree, agent_dir = schema2_tree
+        sentinel = agent_dir / "sentinel.md"
+        sentinel.write_text("local content\n")
+        malformed = b'{"version": 1, "retired": {"/escape.md": {}}}\n'
+        memory.retirement_state_path().write_bytes(malformed)
+
+        assert memory.restore_memory() == 1
+
+        assert sentinel.read_text() == "local content\n"
+        assert memory.retirement_state_path().read_bytes() == malformed
+        assert "retirement" in capsys.readouterr().err.lower()
+
+    def test_schema1_restore_ignores_schema2_retirement_state(self, schema_tree):
+        tree, agent_dir = schema_tree
+        key = self._project_key(tree)
+        memory.retirement_state_path().write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "retired": {
+                        key: {
+                            "archive": (
+                                f"{PROJECT}/_archive/_agents/memory/"
+                                f"{PROJECT_MEMORY_FILE}"
+                            ),
+                            "index_lines": [],
+                        }
+                    },
+                }
+            )
+        )
+
+        assert memory.restore_memory() == 0
+
+        assert (agent_dir / PROJECT_MEMORY_FILE).is_file()
+
+    def test_non_json_metadata_is_rejected_before_forget_mutates_files(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        source = tree.root / key
+        index = tree.project_memory_dir / memory.MEMORY_INDEX
+        before_source = source.read_bytes()
+        before_index = index.read_bytes()
+
+        with pytest.raises(memory.MemoryRetirementError, match="JSON"):
+            memory.forget_memory(key, metadata={"not-json": {1, 2}})
+
+        assert source.read_bytes() == before_source
+        assert index.read_bytes() == before_index
+        assert not memory.retirement_state_path().exists()
+        assert not (tree.project_dir / "_archive").exists()
+
+    def test_forget_rolls_back_when_retirement_state_write_fails(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        source = tree.root / key
+        index = tree.project_memory_dir / memory.MEMORY_INDEX
+        before_source = source.read_bytes()
+        before_index = index.read_bytes()
+
+        with patch.object(
+            memory,
+            "_write_memory_retirements",
+            side_effect=OSError("state disk full"),
+        ):
+            with pytest.raises(memory.MemoryRetirementError, match="state disk full"):
+                memory.forget_memory(key)
+
+        assert source.read_bytes() == before_source
+        assert index.read_bytes() == before_index
+        assert not memory.retirement_state_path().exists()
+        assert not (
+            tree.project_dir / "_archive" / "_agents" / "memory" / source.name
+        ).exists()
+
+    def test_revive_rolls_back_when_retirement_state_write_fails(
+        self, schema2_tree
+    ):
+        tree, _agent_dir = schema2_tree
+        key = self._project_key(tree)
+        memory.forget_memory(key)
+        state_path = memory.retirement_state_path()
+        state_before = state_path.read_bytes()
+        index = tree.project_memory_dir / memory.MEMORY_INDEX
+        index_before = index.read_bytes()
+        archive = (
+            tree.project_dir
+            / "_archive"
+            / "_agents"
+            / "memory"
+            / PROJECT_MEMORY_FILE
+        )
+        archive_before = archive.read_bytes()
+
+        with patch.object(
+            memory,
+            "_write_memory_retirements",
+            side_effect=OSError("state read-only"),
+        ):
+            with pytest.raises(memory.MemoryRetirementError, match="state read-only"):
+                memory.revive_memory(key)
+
+        assert not (tree.root / key).exists()
+        assert archive.read_bytes() == archive_before
+        assert index.read_bytes() == index_before
+        assert state_path.read_bytes() == state_before
+
+    @staticmethod
+    def _delay_first_state_write(monkeypatch):
+        """Hold writer one until writer two publishes, exposing lost updates.
+
+        Under the per-root lock writer two cannot enter; the short timeout
+        releases writer one, after which writer two reads its completed state.
+        Without the lock writer two publishes immediately and writer one's
+        stale document overwrites it.
+        """
+        real_write = memory._write_memory_retirements
+        guard = threading.Lock()
+        first_entered = threading.Event()
+        second_published = threading.Event()
+        calls = 0
+
+        def delayed(payload, root):
+            nonlocal calls
+            with guard:
+                calls += 1
+                position = calls
+            if position == 1:
+                first_entered.set()
+                second_published.wait(timeout=0.2)
+            result = real_write(payload, root)
+            if position == 2:
+                second_published.set()
+            return result
+
+        monkeypatch.setattr(memory, "_write_memory_retirements", delayed)
+        return first_entered
+
+    def test_two_concurrent_forgets_preserve_both_retirement_markers(
+        self, schema2_tree, monkeypatch
+    ):
+        tree, _agent_dir = schema2_tree
+        project_key = self._project_key(tree)
+        instance_key = (
+            tree.instance_memory_dir / USER_MEMORY_FILE
+        ).relative_to(tree.root).as_posix()
+        first_entered = self._delay_first_state_write(monkeypatch)
+        errors = []
+
+        def forget(key):
+            try:
+                memory.forget_memory(key)
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        first = threading.Thread(target=forget, args=(project_key,))
+        second = threading.Thread(target=forget, args=(instance_key,))
+        first.start()
+        assert first_entered.wait(timeout=2), "first writer never reached state write"
+        second.start()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert not errors, errors
+        assert set(memory.read_memory_retirements()["retired"]) == {
+            project_key,
+            instance_key,
+        }
+
+    def test_forget_waits_for_conflicting_persist_mutation(
+        self, schema2_tree, monkeypatch
+    ):
+        tree, agent_dir = schema2_tree
+        key = self._project_key(tree)
+        assert memory.restore_memory() == 0
+        assert (agent_dir / PROJECT_MEMORY_FILE).is_file()
+        real_persist_scopes = memory._persist_scopes
+        persist_entered = threading.Event()
+        forget_finished = threading.Event()
+
+        def delayed_persist(source, scopes, retired):
+            persist_entered.set()
+            forget_finished.wait(timeout=0.2)
+            return real_persist_scopes(source, scopes, retired)
+
+        monkeypatch.setattr(memory, "_persist_scopes", delayed_persist)
+        monkeypatch.setattr(memory, "commit_work_path", lambda *_args: 0)
+        errors = []
+
+        def persist():
+            try:
+                assert memory.persist_memory() == 0
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        def forget():
+            try:
+                memory.forget_memory(key)
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+            finally:
+                forget_finished.set()
+
+        first = threading.Thread(target=persist)
+        second = threading.Thread(target=forget)
+        first.start()
+        assert persist_entered.wait(timeout=2), "persist never reached scope mutation"
+        second.start()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert not errors, errors
+        assert key in memory.read_memory_retirements()["retired"]
+        assert not (tree.root / key).exists()
+
+    def test_two_concurrent_revives_remove_both_retirement_markers(
+        self, schema2_tree, monkeypatch
+    ):
+        tree, _agent_dir = schema2_tree
+        project_key = self._project_key(tree)
+        instance_key = (
+            tree.instance_memory_dir / USER_MEMORY_FILE
+        ).relative_to(tree.root).as_posix()
+        memory.forget_memory(project_key)
+        memory.forget_memory(instance_key)
+        first_entered = self._delay_first_state_write(monkeypatch)
+        errors = []
+
+        def revive(key):
+            try:
+                memory.revive_memory(key)
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        first = threading.Thread(target=revive, args=(project_key,))
+        second = threading.Thread(target=revive, args=(instance_key,))
+        first.start()
+        assert first_entered.wait(timeout=2), "first writer never reached state write"
+        second.start()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert not errors, errors
+        assert memory.read_memory_retirements()["retired"] == {}

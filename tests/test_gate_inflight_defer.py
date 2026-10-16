@@ -304,7 +304,9 @@ class TestExemptionsAreDeclaredAtTheirCallSites:
         source = (Path(__file__).parent.parent / "src" / "work_repo" / "cli.py").read_text(
             encoding="utf-8"
         )
-        assert 'f"run-state: session end {state[\'slug\']}",\n            allow_during_gate=True,' in source
+        assert '"run-state: session end "' in source
+        assert '+ (f" {state[\'name\']}" if state.get("name") else ""),' in source
+        assert "allow_during_gate=True," in source
 
     def test_only_session_end_is_exempt(self):
         source = (Path(__file__).parent.parent / "src" / "work_repo" / "cli.py").read_text(

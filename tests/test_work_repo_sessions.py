@@ -94,7 +94,7 @@ def _empty_schema_tree(monkeypatch, tmp_path, session=None):
     """A schema tree whose registered project has no run records yet."""
     root = tmp_path / "plexus-empty"
     root.mkdir()
-    (root / "_plexus.yaml").write_text(
+    (root / "_lmer.yaml").write_text(
         f"schema: 1\nname: example\nprojects:\n  {PROJECT}:\n"
         f"    repo: {PRIMARY_REPO}\n",
         encoding="utf-8",
@@ -678,7 +678,7 @@ class TestResumeChainsTheLineage:
         rdir, _ = run_state.ensure_run()
         state = run_state.load_state(rdir)
         assert run_state.session_lineage(state) == (SID_A,)
-        assert state["schema"] == run_state.SCHEMA_VERSION == 1
+        assert state["schema"] == 1  # the existing schema-1 tree keeps its write format
         assert state["owner"] is None
 
     def test_a_resume_appends_the_new_harness_id(self, monkeypatch, tmp_path):

@@ -68,7 +68,7 @@ was never told about.
 
 Trigger 2 has to find the run dir under BOTH work-repo layouts (issue #353,
 spec D7/D20/D22). In a legacy tree it is ``{host}/{project}/runs/{slug}``.
-In a schema-form tree — one with a ``_plexus.yaml`` manifest at the work-repo
+In a schema-form tree — one with a ``_lmer.yaml`` manifest at the work-repo
 root — the project is a flat short-name dir named by the manifest's
 ``projects:`` registry, and the run dir is ``{shortname}/_runs/{slug}``. The
 short name is found by normalizing the launch's repo URL (``LMER_REPO_URL``,
@@ -146,7 +146,7 @@ _FALSY = {"0", "no", "false"}
 # Schema-form work repo (spec §4): the manifest at the work-repo root whose
 # ``projects:`` registry names the flat project dirs, and the per-project
 # runs dir beneath a short name (D22). Legacy trees have neither.
-PLEXUS_MANIFEST = "_plexus.yaml"
+PLEXUS_MANIFEST = "_lmer.yaml"
 SCHEMA_RUNS_DIR = "_runs"
 LEGACY_RUNS_DIR = "runs"
 
@@ -717,7 +717,7 @@ def read_run_events(run_dir: str) -> list | None:
 
 def read_plexus_registry(work_repo_path: str) -> dict | None:
     """
-    The ``projects:`` registry of the work repo's ``_plexus.yaml``.
+    The ``projects:`` registry of the work repo's ``_lmer.yaml``.
 
     ``None`` when there is no manifest (legacy tree); a dict — possibly empty,
     when the manifest declares no projects — when there is one. A manifest

@@ -196,6 +196,7 @@ MEMORY_FILE_WITHOUT_ENTRY = "agents.memory-file-without-entry"
 MEMORY_ENTRY_WITHOUT_FILE = "agents.memory-entry-without-file"
 MEMORY_SCOPE_MISMATCH = "agents.memory-scope-mismatch"
 LEGACY_SURFACE = "agents.legacy-surface"
+MEMORY_RETIREMENT = "agents.memory-retirement"
 
 #: Every code this module emits, in emit order — the module's contract.
 AGENT_CODES = (
@@ -209,6 +210,7 @@ AGENT_CODES = (
     MEMORY_ENTRY_WITHOUT_FILE,
     MEMORY_SCOPE_MISMATCH,
     LEGACY_SURFACE,
+    MEMORY_RETIREMENT,
 )
 
 
@@ -395,7 +397,15 @@ def iter_project_dirs(root) -> Tuple[ProjectDir, ...]:
 # ---------------------------------------------------------------------------
 
 
-def check_agents(root, report, *, project_dirs: Optional[Iterable] = None) -> None:
+_register(
+    MEMORY_RETIREMENT,
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary="schema-2 memory retirement state cannot be safely interpreted",
+)
+
+
+def check_agents(root, report, *, project_dirs: Optional[Iterable] = None, manifest=...) -> None:
     """Check the agent surface and memory of the plexus at *root*.
 
     Findings go into *report*, which carries the tree's form; nothing is
@@ -407,6 +417,12 @@ def check_agents(root, report, *, project_dirs: Optional[Iterable] = None) -> No
     check the instance scope only.
     """
     root = Path(root)
+    from work_repo.memory import MemoryRetirementError, read_memory_retirements
+
+    try:
+        read_memory_retirements(root, manifest=manifest)
+    except MemoryRetirementError as exc:
+        report.add("agents.memory-retirement", "_memory_retirements.json", str(exc))
     _check_instance(root, report)
     scopes = iter_project_dirs(root) if project_dirs is None else project_dirs
     for project in scopes:

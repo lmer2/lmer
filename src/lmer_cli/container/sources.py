@@ -1,7 +1,9 @@
 """Canonical source config (``{work_repo}/sources.yaml``) — container-side.
 
-Owns the schema-1 parse/validate/resolve logic for declared taskdef/napkin
-sources (spec: canonical-source-config, issue #105). Resolution runs
+Owns the parse/validate/resolve logic for declared taskdef/napkin sources
+(spec: canonical-source-config, issue #105) at both declaration tiers — the
+legacy schema-1 ``sources.yaml`` and the plexus manifest's ``sources:``
+section (issue #370, "Declaration tiers" below). Resolution runs
 inside ``clone_and_exec.py`` after the work-repo clone and before the
 aux clones, so this module must be loadable in that standalone context.
 The module carries the import contract, error taxonomy, and PyYAML guard
@@ -72,8 +74,9 @@ copy; everything else uses only the package import.
 Error taxonomy
 ==============
 - ``SourcesConfigError`` — the single refuse-start exception type. Raised
-  for any condition where a present ``sources.yaml`` cannot be trusted or
-  read (unreadable/unparseable file, unsupported schema version, embedded
+  for any condition where a present declaration — the legacy
+  ``sources.yaml`` or the manifest's ``sources:`` tier — cannot be trusted
+  or read (unreadable/unparseable file, unsupported schema version, embedded
   credentials, a declared URL with two incompatible readings (see
   ``_url_shape_is_ambiguous``), cross-host trust-rule violation, PyYAML
   missing while the file exists). The caller catches it and refuses start
@@ -81,6 +84,57 @@ Error taxonomy
 - Warnings channel — recoverable findings (unknown keys, forward-compat
   notices) never raise; loaders return them as a ``list[str]`` alongside
   the parsed config, and the caller decides how to surface them.
+
+Declaration tiers (issue #370)
+==============================
+A source is declared in one of two files and ``load_sources`` reads both:
+the plexus manifest's ``_lmer.yaml sources:`` section (the schema-form
+tier) and the legacy standalone ``sources.yaml``. Precedence is per source
+key, whole entry: an env-var override beats the manifest (the container's
+resolution matrix in ``clone_and_exec``), the manifest beats the legacy
+file, and a key only the legacy file declares keeps the legacy entry. A key
+declared in both means the manifest wins and ONE warning names the legacy
+file as stale for it. Both tiers are validated in full before the merge,
+through the ONE per-entry rule set ``validate_source_entry`` (non-empty
+``repo:``, no embedded credential, no ambiguous shape, the same-host trust
+rule naming the env-var override, ``ref:`` under ``taskdef`` only), so no
+trust rule exists twice and an untrustworthy declaration in EITHER tier
+refuses start — including an outranked legacy file, which keeps its
+``schema:`` int check and bool-trap. The manifest's own ``schema:`` check
+is ``lmer_schema.manifest``'s, and ``sources:`` carries no second version
+field.
+
+This module never opens or parses ``_lmer.yaml``: the caller hands in the
+raw ``Manifest.sources`` dict ``lmer_schema.manifest.load_manifest`` already
+returns (``manifest_sources=``) plus the path to name in messages
+(``manifest_path=``), so there is one manifest parser and the import
+contract above holds with ``lmer_schema`` absent (the tiered call needs
+neither it nor PyYAML). The tier each resolved source came from rides in a
+parallel ``tiers`` map on the returned config (``{"taskdef": TIER_MANIFEST,
+"napkin": TIER_LEGACY}``), present only when the manifest tier was
+consulted: a call without ``manifest_sources`` returns exactly the
+legacy-only value, shape included. The origin label the container banner
+and ``--show-env`` print for a declared source once a manifest is in play
+comes from ``declared_origin_label`` (``declared (manifest)`` /
+``declared (sources.yaml)``), so that vocabulary is spelled once.
+
+Manifest ``sources.knowledge`` / ``sources.plans`` are declared but not
+mounted by this release (no clone, no env var, no runner wiring): warned
+about by name and left out of the result.
+
+Capability marker (version floor)
+=================================
+``MANIFEST_TIER_SUPPORTED = True`` is a plain module constant and the ONE
+importable capability marker B's ``work migrate --instance`` checks as its
+version floor (spec §10 rollout E -> B; astra R7). What it asserts: this
+lmer's container start, ``--show-env`` and doctor read ``_lmer.yaml
+sources:`` with env > manifest > legacy precedence. Who reads it: the
+``--instance`` fold refuses when the marker is absent or false — absent
+means a pre-E release. What it cannot prove: it covers only the install
+running ``work migrate``, while every host that launches against that work
+repo must run a release carrying it. Hence the fleet-wide order: deploy E
+on every host before applying B's instance fold, because the fold removes
+``sources.yaml``.
 
 PyYAML guard (spec N5)
 ======================
@@ -126,7 +180,35 @@ changing any of it is a breaking change to doctor:
   * ``doctor [--path PATH] [--work-repo-url URL] [--emit-clone-urls]`` —
     aggregated machine-readable check document: declared sources with
     derived clone URLs, warnings, errors, ``supported_sources_schemas``
-    and ``supported_taskdef_schemas``.
+    and ``supported_taskdef_schemas``. Both declaration tiers resolve
+    through ``load_sources`` (issue #370; next bullet), so the document
+    also carries ``tiers`` (source name -> ``manifest`` | ``legacy``,
+    parallel to ``sources`` and ``null`` whenever ``sources`` is),
+    ``manifest_path`` and ``manifest_present``.
+
+- Manifest location (decision record, #370 point 4 — additive to the seam
+  above): ``doctor`` reads the manifest BESIDE ``--path``, at
+  ``<directory of --path>/_lmer.yaml``, rather than through a separate
+  ``--manifest PATH`` option. The two declaration files are siblings at
+  the work-repo root by definition (the manifest's ``sources:`` is the
+  folded-in ``sources.yaml``) and ``clone_and_exec`` resolves both from that
+  one root, so one path names the tree and a second flag could only
+  describe a pairing no container ever resolves; the canonical invocation
+  above is unchanged. The read goes through
+  ``lmer_schema.manifest.load_manifest`` — the ONE manifest parser, which
+  takes the root — via a function-local guarded import made only once a
+  manifest is known (by stat) to be present, never at module scope, so the
+  import contract above holds and a tree without a manifest never touches
+  the core. A ``ManifestError`` is an ``errors`` entry (the exit-2 refusal
+  document, exactly like a ``SourcesConfigError``; a present manifest this
+  helper cannot read is never demoted to the legacy tier, spec D20). An
+  unimportable core is a warning naming it, and PyYAML missing beneath it
+  is its own warning naming PyYAML, so the sh consumer keeps the "could not
+  look" diagnoses apart; in both the manifest tier is reported as unread,
+  not as absent. The manifest's own forward-compat warnings (unknown keys
+  in any section) are ``lmer-schema validate``'s and are not repeated here;
+  the ``sources:`` findings are ``load_sources``'s. Per-source entries, the
+  exit codes and the redaction rules are unchanged.
 
 - Derivation mode ``https-credential-file`` means the emitted clone URL is
   clean and the consumer may authenticate it with the in-container
@@ -196,9 +278,52 @@ SOURCE_ENV_OVERRIDES = {
     "napkin": "LMER_NAPKIN_REPO",
 }
 
-# Reserved-for-later keys under `sources:` — warned about by name so the
-# operator learns the key is known-but-unsupported, not a typo.
+# Reserved-for-later keys under a legacy `sources.yaml`'s `sources:` —
+# warned about by name so the operator learns the key is
+# known-but-unsupported, not a typo.
 _RESERVED_SOURCE_KEYS = ("masterplan_mirror",)
+
+# Filename of the plexus manifest, whose `sources:` section is the manifest
+# tier. MIRRORED from lmer_schema.manifest.MANIFEST_NAME (and
+# clone_and_exec.PLEXUS_MANIFEST_NAME) as a module-local constant — NEVER
+# import lmer_schema here: this module loads standalone with it absent (the
+# import contract above). Used only as the default message label when a
+# caller passes `manifest_sources` without `manifest_path`; this module never
+# opens the file. tests/test_sources_config.py drift-guards the mirror.
+MANIFEST_FILENAME = "_lmer.yaml"
+
+# Declaration tiers (issue #370): where a resolved source came from, carried
+# per source in the config's `tiers` map (module docstring, "Declaration
+# tiers"). The env-var override is not a tier — it is the resolution
+# matrix's business, above both.
+TIER_MANIFEST = "manifest"
+TIER_LEGACY = "legacy"
+SOURCE_TIERS = (TIER_MANIFEST, TIER_LEGACY)
+
+# The bare origin a declared source resolves to (clone_and_exec's
+# ORIGIN_DECLARED, --show-env's `declared` row) and how each tier is named
+# inside it once a manifest is in play — the manifest by its role, the
+# legacy file by its name: `declared (manifest)` / `declared (sources.yaml)`.
+# The ONE vocabulary for the container banner and --show-env; spelled by
+# declared_origin_label, never by hand.
+ORIGIN_DECLARED = "declared"
+TIER_LABELS = {TIER_MANIFEST: "manifest", TIER_LEGACY: SOURCES_FILENAME}
+
+#: The importable capability marker B's `work migrate --instance` checks as
+#: its version floor (issue #370, spec §10). Plain `True` — present and true
+#: only once the loader, the container seam and doctor all read the manifest
+#: tier. See the module docstring, "Capability marker".
+MANIFEST_TIER_SUPPORTED = True
+
+# Manifest `sources:` names this release does not mount (#370 point 5
+# boundary: no clone destination, no env override, no runner wiring). A
+# declaration under one is warned about by name and left out of the result;
+# nothing acts on the entry, so nothing in it is validated — an unmounted
+# declaration clones nothing and carries no credential anywhere (the same
+# reasoning as lmer_schema.checks.manifest). MIRRORED from
+# lmer_schema.manifest.RESERVED_SOURCE_NAMES — never import it here;
+# tests/test_sources_config.py drift-guards the mirror.
+UNMOUNTED_SOURCE_NAMES = ("knowledge", "plans")
 
 # Credential-derivation modes returned by derive_clone_url (second tuple
 # element). ANONYMOUS is the explicit marker for the credential-less
@@ -281,7 +406,8 @@ _AMBIGUOUS_SHAPE_REFUSAL = (
 
 
 class SourcesConfigError(Exception):
-    """Refuse-start error: a present sources.yaml cannot be read or trusted.
+    """Refuse-start error: a present declaration — the legacy sources.yaml or
+    the manifest's ``sources:`` tier — cannot be read or trusted.
 
     The single exception type in this module's taxonomy — callers treat any
     instance as "do not start the session" (headless: exit 2). Recoverable
@@ -656,26 +782,130 @@ def env_matches_declared(env_repo, declared_repo, work_repo_url=None) -> bool:
     return env_key == normalize_repo_url(derived)
 
 
-def load_sources(path, work_repo_url: Optional[str] = None) -> Tuple[Optional[dict], list]:
-    """Load and validate ``sources.yaml`` at ``path``.
+def validate_source_entry(key, entry, *, work_repo_url=None, origin) -> Tuple[dict, list]:
+    """Validate ONE declared source entry — the per-entry trust rules.
 
-    ``work_repo_url`` is the URL the work repo was cloned from; when given,
-    the schema-1 trust rule is enforced (declared repos must live on the
-    same host — the credential a declared URL receives is the one the
-    work-repo URL already carries for that host). ``None`` skips the host
-    check, for callers with no work-repo context.
+    The single rule set every tier runs: ``load_sources`` applies it to the
+    legacy file's map and to the manifest's map alike, so no trust rule
+    exists twice, and ``work migrate --instance`` validates legacy entries
+    through it before folding them into the manifest. *key* is the source
+    name (``taskdef`` / ``napkin``; the caller filters names it does not
+    mount), *entry* the raw mapping as written, *origin* what messages name
+    as the declaring file (the legacy path or the manifest path), and
+    *work_repo_url* the trust-rule host — ``None`` skips that one check, for
+    callers with no work-repo context.
 
-    Returns ``(config, warnings)``:
-    - ``(None, [])`` when no file exists — silent legacy mode, zero output.
-    - ``(dict, warnings)`` for a valid file: ``{"schema": 1, "sources":
-      {"taskdef": {"repo": ..., "ref": ...}, "napkin": {"repo": ...}}}``
-      with only declared sources present (``ref`` only when declared);
-      ``warnings`` is a list of human-readable strings (unknown keys etc.)
-      that never block start.
+    The rules, in order: the entry is a mapping with a non-empty string
+    ``repo:``; the URL embeds no credential (the message never echoes it);
+    it has one reading (``_url_shape_is_ambiguous``); it lives on the work
+    repo's host (the same-host trust rule, naming the source's env-var
+    override as the sanctioned cross-host escape); ``ref:`` is accepted
+    under ``taskdef`` only and must be a non-empty string.
 
-    Raises SourcesConfigError for anything a present file makes untrustable,
-    including PyYAML being unavailable while the file exists.
+    Returns ``(parsed, warnings)``: ``{"repo": ...}`` plus ``ref`` when
+    declared, values stripped, and the forward-compat warnings for unknown
+    keys inside the entry. Raises :class:`SourcesConfigError` on any
+    violation.
     """
+    if not isinstance(entry, dict):
+        raise SourcesConfigError(
+            f"{origin}: `sources.{key}` must be a mapping with a `repo:` key"
+        )
+    repo = entry.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        raise SourcesConfigError(
+            f"{origin}: `sources.{key}` must declare a non-empty string `repo:`"
+        )
+    repo = repo.strip()
+    if url_has_embedded_credential(repo):
+        # Never echo the credentialed URL — the message itself must be
+        # safe to print anywhere.
+        raise SourcesConfigError(
+            f"{origin}: `sources.{key}.repo` embeds a credential "
+            f"({scrub_credentials(repo)} carried userinfo with a secret "
+            "component). The work repo is shared — never commit tokens. "
+            "Strip the credential from the URL; auth is derived from the "
+            "work-repo URL at clone time."
+        )
+    if _url_shape_is_ambiguous(repo):
+        # Checked before the trust rule and independently of
+        # work_repo_url: an unreadable URL is never trustworthy, and the
+        # trust rule's own message ("host '' does not match …") is the
+        # wrong place to send an operator who committed a token.
+        raise SourcesConfigError(
+            f"{origin}: `sources.{key}.repo` cannot be read unambiguously — "
+            f"{_AMBIGUOUS_SHAPE_REFUSAL}"
+        )
+    if work_repo_url is not None:
+        declared_host = repo_url_host(repo)
+        work_host = repo_url_host(work_repo_url)
+        if declared_host != work_host:
+            # The same rule at every tier; the "schema-1" in its wording is
+            # the rule's name (tests/test_lmer_cli_env_sources.py pins it).
+            override = SOURCE_ENV_OVERRIDES.get(key)
+            hint = (
+                f" Use the {override} env var override for a cross-host source."
+                if override
+                else ""
+            )
+            raise SourcesConfigError(
+                f"{origin}: `sources.{key}.repo` host "
+                f"{declared_host or repr(scrub_credentials(repo))} does "
+                f"not match the work repo host {work_host} (schema-1 "
+                "trust rule: declared sources must live on the same host "
+                f"as the work repo).{hint}"
+            )
+    parsed = {"repo": repo}
+    warnings: list = []
+    for field in entry:
+        if field == "repo":
+            continue
+        if field == "ref":
+            if key != "taskdef":
+                raise SourcesConfigError(
+                    f"{origin}: `ref:` is valid under `sources.taskdef` "
+                    f"only in schema 1 (there is no LMER_NAPKIN_REF); "
+                    f"remove `sources.{key}.ref`."
+                )
+            ref = entry["ref"]
+            if isinstance(ref, bool) or not isinstance(ref, str) or not ref.strip():
+                raise SourcesConfigError(
+                    f"{origin}: `sources.taskdef.ref` must be a non-empty string"
+                )
+            parsed["ref"] = ref.strip()
+            continue
+        warnings.append(
+            f"{origin}: unknown key `{field}` under `sources.{key}` ignored "
+            "(forward-compat)"
+        )
+    return parsed, warnings
+
+
+def declared_origin_label(tier, *qualifiers) -> str:
+    """Origin label for a source declared at *tier*: ``declared (manifest)``
+    / ``declared (sources.yaml)``.
+
+    The ONE spelling of the tiered origin, for the container banner
+    (``source <name>: <url> (<origin>)``) and ``--show-env``'s origin
+    column alike, so the two surfaces cannot drift. *qualifiers* ride
+    inside the parentheses after the tier (``--show-env``'s cache caveat:
+    ``declared (manifest, cached, possibly stale)``). *tier* is a
+    ``SOURCE_TIERS`` value; anything else is a caller bug.
+    """
+    if tier not in TIER_LABELS:
+        raise ValueError(
+            f"unknown source tier {tier!r} (expected one of {', '.join(SOURCE_TIERS)})"
+        )
+    return f"{ORIGIN_DECLARED} ({', '.join((TIER_LABELS[tier], *qualifiers))})"
+
+
+def _load_legacy_tier(path, work_repo_url) -> Tuple[Optional[dict], list]:
+    """The legacy tier: parse and validate the standalone ``sources.yaml`` at
+    *path*. ``(None, [])`` when no file exists; otherwise the file-level
+    checks (readable, PyYAML present, a mapping, an integer ``schema:`` this
+    loader supports — booleans rejected first) and, per mountable name, the
+    one per-entry rule set. The pre-#370 ``load_sources`` body, shape
+    included."""
     path = Path(path)
     if not path.exists():
         # Silent legacy mode: the resolution matrix never engages (spec G5).
@@ -751,73 +981,130 @@ def load_sources(path, work_repo_url: Optional[str] = None) -> Tuple[Optional[di
                     "(forward-compat)"
                 )
             continue
-        if not isinstance(entry, dict):
-            raise SourcesConfigError(
-                f"{path}: `sources.{name}` must be a mapping with a `repo:` key"
-            )
-        repo = entry.get("repo")
-        if not isinstance(repo, str) or not repo.strip():
-            raise SourcesConfigError(
-                f"{path}: `sources.{name}` must declare a non-empty string `repo:`"
-            )
-        repo = repo.strip()
-        if url_has_embedded_credential(repo):
-            # Never echo the credentialed URL — the message itself must be
-            # safe to print anywhere.
-            raise SourcesConfigError(
-                f"{path}: `sources.{name}.repo` embeds a credential "
-                f"({scrub_credentials(repo)} carried userinfo with a secret "
-                "component). The work repo is shared — never commit tokens. "
-                "Strip the credential from the URL; auth is derived from the "
-                "work-repo URL at clone time."
-            )
-        if _url_shape_is_ambiguous(repo):
-            # Checked before the trust rule and independently of
-            # work_repo_url: an unreadable URL is never trustworthy, and the
-            # trust rule's own message ("host '' does not match …") is the
-            # wrong place to send an operator who committed a token.
-            raise SourcesConfigError(
-                f"{path}: `sources.{name}.repo` cannot be read unambiguously — "
-                f"{_AMBIGUOUS_SHAPE_REFUSAL}"
-            )
-        if work_repo_url is not None:
-            declared_host = repo_url_host(repo)
-            work_host = repo_url_host(work_repo_url)
-            if declared_host != work_host:
-                raise SourcesConfigError(
-                    f"{path}: `sources.{name}.repo` host "
-                    f"{declared_host or repr(scrub_credentials(repo))} does "
-                    f"not match the work repo host {work_host} (schema-1 "
-                    "trust rule: declared sources must live on the same host "
-                    "as the work repo). "
-                    f"Use the {SOURCE_ENV_OVERRIDES[name]} env var override "
-                    "for a cross-host source."
-                )
-        parsed = {"repo": repo}
-        for key in entry:
-            if key == "repo":
-                continue
-            if key == "ref":
-                if name != "taskdef":
-                    raise SourcesConfigError(
-                        f"{path}: `ref:` is valid under `sources.taskdef` "
-                        f"only in schema 1 (there is no LMER_NAPKIN_REF); "
-                        f"remove `sources.{name}.ref`."
-                    )
-                ref = entry["ref"]
-                if isinstance(ref, bool) or not isinstance(ref, str) or not ref.strip():
-                    raise SourcesConfigError(
-                        f"{path}: `sources.taskdef.ref` must be a non-empty string"
-                    )
-                parsed["ref"] = ref.strip()
-                continue
-            warnings.append(
-                f"{path}: unknown key `{key}` under `sources.{name}` ignored "
-                "(forward-compat)"
-            )
+        parsed, entry_warnings = validate_source_entry(
+            name, entry, work_repo_url=work_repo_url, origin=path
+        )
         config["sources"][name] = parsed
+        warnings.extend(entry_warnings)
     return config, warnings
 
+
+def _load_manifest_tier(manifest_sources, manifest_path, work_repo_url) -> Tuple[dict, list]:
+    """The manifest tier: the raw ``sources:`` section as
+    ``lmer_schema.manifest`` hands it over, filtered to the names this lmer
+    mounts and validated through the one per-entry rule set. Returns
+    ``(declared, warnings)``; the section's own shape and ``schema:`` were
+    the manifest parser's to check, and there is no second version field."""
+    if not isinstance(manifest_sources, dict):
+        raise SourcesConfigError(
+            f"{manifest_path}: `sources:` must be a mapping of source names "
+            f"({', '.join(SOURCE_ENV_OVERRIDES)}), got "
+            f"{type(manifest_sources).__name__}"
+        )
+    declared: dict = {}
+    warnings: list = []
+    for name, entry in manifest_sources.items():
+        if name not in SOURCE_ENV_OVERRIDES:
+            if name in UNMOUNTED_SOURCE_NAMES:
+                warnings.append(
+                    f"{manifest_path}: `sources.{name}` is declared but not "
+                    "mounted by this release (no clone, no env var); ignored"
+                )
+            else:
+                warnings.append(
+                    f"{manifest_path}: unknown key `{name}` under `sources:` "
+                    "ignored (forward-compat)"
+                )
+            continue
+        parsed, entry_warnings = validate_source_entry(
+            name, entry, work_repo_url=work_repo_url, origin=manifest_path
+        )
+        declared[name] = parsed
+        warnings.extend(entry_warnings)
+    return declared, warnings
+
+
+def load_sources(
+    path,
+    work_repo_url: Optional[str] = None,
+    *,
+    manifest_sources: Optional[dict] = None,
+    manifest_path=None,
+) -> Tuple[Optional[dict], list]:
+    """Load and validate the declared sources: the legacy ``sources.yaml`` at
+    ``path`` and, when given, the manifest tier.
+
+    ``work_repo_url`` is the URL the work repo was cloned from; when given,
+    the trust rule is enforced at every tier (declared repos must live on
+    the same host — the credential a declared URL receives is the one the
+    work-repo URL already carries for that host). ``None`` skips the host
+    check, for callers with no work-repo context.
+
+    ``manifest_sources`` is the manifest's raw ``sources:`` section — the
+    ``Manifest.sources`` dict ``lmer_schema.manifest.load_manifest``
+    returns — and ``manifest_path`` the manifest's path, named in messages
+    (default: the bare filename). This function never opens or parses
+    ``_lmer.yaml`` itself. Omit ``manifest_sources`` (``None``) on a tree
+    without a manifest: the result is then exactly the legacy-only value.
+
+    Returns ``(config, warnings)``:
+    - ``(None, [])`` when neither tier declares anything — no file and no
+      (or an empty) manifest section: silent legacy mode, zero output.
+    - ``(dict, warnings)`` otherwise: ``{"schema": 1, "sources":
+      {"taskdef": {"repo": ..., "ref": ...}, "napkin": {"repo": ...}}}``
+      with only declared sources present (``ref`` only when declared);
+      ``warnings`` is a list of human-readable strings (unknown keys etc.)
+      that never block start. With a manifest tier the dict also carries
+      ``"tiers"`` — source name -> ``TIER_MANIFEST`` / ``TIER_LEGACY``, the
+      tier each entry came from — and ``"schema"`` is the legacy file's
+      int, ``None`` when there is no legacy file (the manifest's own
+      ``schema:`` is ``lmer_schema.manifest``'s; ``sources:`` carries no
+      second version field).
+
+    Precedence is per source key, whole entry: the manifest wins, with ONE
+    warning naming the legacy file as stale for that key; a key only the
+    legacy file declares keeps the legacy entry. Both tiers are validated
+    in full first, so an untrustworthy declaration in EITHER refuses start
+    — including an outranked legacy file, which keeps its ``schema:``
+    check.
+
+    Raises SourcesConfigError for anything a present declaration makes
+    untrustable, including PyYAML being unavailable while the file exists.
+    """
+    if manifest_sources is None:
+        return _load_legacy_tier(path, work_repo_url)
+    if manifest_path is None:
+        manifest_path = MANIFEST_FILENAME
+    # The tier in effect first; the legacy file is still read and validated
+    # in full even where it is outranked (either tier can refuse start).
+    manifest_declared, warnings = _load_manifest_tier(
+        manifest_sources, manifest_path, work_repo_url
+    )
+    legacy, legacy_warnings = _load_legacy_tier(path, work_repo_url)
+    warnings.extend(legacy_warnings)
+    if legacy is None and not manifest_sources:
+        # Neither tier declares anything: silent legacy mode (spec G5).
+        return None, []
+    merged: dict = {}
+    tiers: dict = {}
+    for name, entry in (legacy["sources"] if legacy is not None else {}).items():
+        merged[name] = entry
+        tiers[name] = TIER_LEGACY
+    for name, entry in manifest_declared.items():
+        if name in merged:
+            warnings.append(
+                f"{Path(path)}: `sources.{name}` is also declared in "
+                f"{manifest_path}, which takes precedence; the "
+                f"{SOURCES_FILENAME} entry is stale and ignored — remove it"
+            )
+        merged[name] = entry
+        tiers[name] = TIER_MANIFEST
+    config = {
+        "schema": legacy["schema"] if legacy is not None else None,
+        "sources": merged,
+        "tiers": tiers,
+    }
+    return config, warnings
 
 # --- Doctor CLI (frozen seam, see module docstring) ---------------------------
 # One JSON document on stdout, human text on stderr, exit codes
@@ -1029,6 +1316,56 @@ def _cmd_validate(args) -> int:
     return EXIT_OK
 
 
+def _doctor_manifest_sources(root) -> Tuple[Optional[dict], bool, list, list]:
+    """The manifest tier for `doctor`: ``(manifest_sources, manifest_present,
+    warnings, errors)``, read from ``<root>/_lmer.yaml`` — the directory of
+    ``--path`` (decision record in the module docstring, "Doctor CLI").
+
+    Presence is a stat, ``is_symlink()`` first — the rule ``load_manifest``
+    and clone_and_exec's placement apply, so a dangling symlink is a present,
+    broken manifest rather than no manifest. Only then is the ONE manifest
+    parser, ``lmer_schema.manifest.load_manifest``, imported — here, guarded,
+    never at module scope — which is what keeps the import contract: a tree
+    without a manifest never touches the core, and the standalone copy still
+    loads with it absent. ``manifest_sources`` is ``None`` whenever the tier
+    could not be read, so the ``load_sources`` call is the legacy-only one.
+    """
+    manifest = Path(root) / MANIFEST_FILENAME
+    if not (manifest.is_symlink() or manifest.exists()):
+        return None, False, [], []
+    if yaml is None:
+        # Named apart from a missing core: the fix is the interpreter's
+        # PyYAML, not lmer_schema and not the manifest (the core imports
+        # PyYAML at module scope, so the ImportError below would otherwise
+        # blame it).
+        return None, True, [
+            f"{manifest}: present but PyYAML is not available to this "
+            "interpreter — the manifest `sources:` tier was not read (not a "
+            "manifest problem); install PyYAML (the container image "
+            "guarantees it)"
+        ], []
+    try:
+        from lmer_schema.manifest import ManifestError, load_manifest
+    except ImportError as exc:
+        return None, True, [
+            f"{manifest}: present, but the lmer-schema core API "
+            f"(lmer_schema.manifest) is not importable in this interpreter "
+            f"({exc}) — the manifest `sources:` tier was not read"
+        ], []
+    try:
+        parsed = load_manifest(root)
+    except ManifestError as exc:
+        # A present manifest this helper cannot read: a refusal, never a
+        # fall-back to the legacy file beside it (spec D20). Scrubbed like a
+        # SourcesConfigError — a YAML error can quote the offending line.
+        return None, True, [], [scrub_credentials(str(exc))]
+    if parsed is None:  # removed between the stat and the read
+        return None, False, [], []
+    # parsed.warnings (unknown keys in any section) are the validator's;
+    # the `sources:` findings come from load_sources, so nothing is repeated.
+    return parsed.sources, True, [], []
+
+
 def _cmd_doctor(args) -> int:
     """`doctor` — aggregated machine-readable check document."""
     work_repo_url = _resolve_doctor_work_repo_url(args)
@@ -1038,21 +1375,35 @@ def _cmd_doctor(args) -> int:
         and not args.work_repo_url
         and os.environ.get("LMER_WORK_REPO") == work_repo_url
     )
-    warnings: list = []
-    errors: list = []
+    root = Path(args.path).parent
+    manifest_path = root / MANIFEST_FILENAME
+    manifest_sources, manifest_present, warnings, errors = (
+        _doctor_manifest_sources(root)
+    )
     config = None
-    present = False
-    try:
-        config, load_warnings = load_sources(
-            args.path, work_repo_url=work_repo_url
-        )
-        warnings.extend(scrub_credentials(w) for w in load_warnings)
-        present = config is not None
-    except SourcesConfigError as exc:
-        errors.append(scrub_credentials(str(exc)))
-        present = True  # only a present file can raise
+    present = bool(errors)  # a manifest refusal: a present declaration
+    if not errors:
+        try:
+            config, load_warnings = load_sources(
+                args.path,
+                work_repo_url=work_repo_url,
+                manifest_sources=manifest_sources,
+                manifest_path=manifest_path,
+            )
+            warnings.extend(scrub_credentials(w) for w in load_warnings)
+            present = config is not None
+        except SourcesConfigError as exc:
+            errors.append(scrub_credentials(str(exc)))
+            present = True  # only a present declaration can raise
     declared = None
+    tiers = None
     if config is not None:
+        # The tier each entry came from, spelled for every entry: a
+        # legacy-only load carries no `tiers` map (its result is exactly the
+        # pre-#370 value), so the consumer gets the same shape either way.
+        tiers = dict(
+            config.get("tiers") or {name: TIER_LEGACY for name in config["sources"]}
+        )
         if work_repo_url is None:
             warnings.append(
                 "no work-repo URL (--work-repo-url / $LMER_WORK_REPO / "
@@ -1081,10 +1432,13 @@ def _cmd_doctor(args) -> int:
             "path": args.path,
             "present": present,
             "schema": config["schema"] if config is not None else None,
+            "manifest_path": str(manifest_path),
+            "manifest_present": manifest_present,
             "work_repo_url": scrub_credentials(work_repo_url)
             if work_repo_url
             else None,
             "sources": declared,
+            "tiers": tiers,
             "warnings": warnings,
             "errors": errors,
             "supported_sources_schemas": list(SUPPORTED_SOURCES_SCHEMAS),

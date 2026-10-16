@@ -1,0 +1,51 @@
+{
+  "form": "schema",
+  "group": "widgets/_runs/chat",
+  "note": "the session records of this run's _runs/<slug>/ group in this daemon's mirror, oldest start first. Each is one launch, addressed by its uid; live, tracked and the project fields are this orchestrator's own. No pull is forced, so a launch that pushed seconds ago can be missing for one interval.",
+  "run": {
+    "host": "git.example.test",
+    "project": "acme/widgets",
+    "slug": "chat",
+    "uid": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+  },
+  "sessions": [
+    {
+      "confirm_project": false,
+      "current": true,
+      "dir_name": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "home_revision": 1,
+      "live": false,
+      "live_session": null,
+      "name": null,
+      "name_suffix": null,
+      "record_state": "closed",
+      "rel_path": "widgets/_runs/chat/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "started_at": "2026-09-01T10:00:00Z",
+      "status": "complete",
+      "tracked": true,
+      "uid": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "workspace_color": "Blue",
+      "workspace_id": "<volatile>",
+      "workspace_name": "General"
+    },
+    {
+      "confirm_project": true,
+      "current": false,
+      "dir_name": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a--followup",
+      "home_revision": 2,
+      "live": true,
+      "live_session": "s-20260902-090000-0a0a",
+      "name": "followup",
+      "name_suffix": "followup",
+      "record_state": "active",
+      "rel_path": "widgets/_runs/chat/0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a--followup",
+      "started_at": "2026-09-02T09:00:00Z",
+      "status": "in-progress",
+      "tracked": false,
+      "uid": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "workspace_color": "Orange",
+      "workspace_id": "<volatile>",
+      "workspace_name": "Alpha"
+    }
+  ]
+}

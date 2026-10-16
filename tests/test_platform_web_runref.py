@@ -85,14 +85,16 @@ def test_the_dispatch_is_not_navigation():
 
 def test_the_reference_carries_no_action():
     """Three key segments and the key: a field that could name a verb, a URL or a
-    payload is what turns a view selector into a remote control."""
+    payload is what turns a view selector into a remote control. A `uid` is the
+    last key segment read as what it is (!387), not a field of its own."""
     lines = [
         line.strip() for line in _read(RUNREF).splitlines()
-        if line.strip().startswith("return { host")
+        if line.strip().startswith("return uid ?")
     ]
     assert lines == [
-        "return { host, project, slug, key: runKey({ host, project, slug }) }"
+        "return uid ? { host, project, slug, uid, key } : { host, project, slug, key }"
     ], lines
+    assert "const uid = UID_RE.test(slug) ? slug : null" in _read(RUNREF)
 
 
 def test_the_shell_registers_a_resolver_and_reports_an_untracked_run():
@@ -116,7 +118,7 @@ def test_the_assistant_is_told_to_write_them():
     """A carrier nobody writes references into changes nothing (#241's "done
     when")."""
     text = _read(TASKDEF)
-    assert "lmer://run/<host>/<project>/<slug>" in text
+    assert "lmer://run/<host>/<project>/<uid or slug>" in text
     # The two properties the note has to carry.
     assert "select a view" in text
     assert "Slack" in text

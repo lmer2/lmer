@@ -1,0 +1,9 @@
+added:
+- "`work memory persist` reconciles each scope's `MEMORY.md` with its live files: a missing entry is generated, and one whose file is gone is tombstoned (#369)"
+fixed:
+- "agent memory persists no longer lose a sibling session's add or edit: persist pulls the published branch first, fast-forward only (#369)"
+- "the restore baseline is keyed to the launch's session id, so a manifest recorded under another session no longer authorizes deletions (#369, #162)"
+- "a publication conflict now keeps upstream's version as a `.conflict-<sid>` copy and rolls the local memory commit back, instead of failing the rebase (#369)"
+changed:
+- "a persist with no restore baseline names the deletions it declined to propagate and requires `--allow-unbaselined-delete` to carry them (#369)"
+- "`work memory persist` prints every deletion with a count (#369)"

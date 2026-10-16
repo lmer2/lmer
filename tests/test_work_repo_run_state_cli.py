@@ -1265,7 +1265,8 @@ class TestSessionStart:
         state = run_state.seed_state("develop-issue-123", "develop", "t")
         state["schema"] = run_state.SCHEMA_VERSION + 1
         state["name"] = "kept-by-refusal"
-        run_state.write_state(run_env, state)
+        run_env.mkdir(parents=True, exist_ok=True)
+        (run_env / "state.yaml").write_text(yaml.safe_dump(state))
         assert _main(["session-start"]) == 0  # still fail-soft for the hook
         out = capsys.readouterr().out
         assert "read-only refusal" in out
@@ -1275,6 +1276,164 @@ class TestSessionStart:
         assert on_disk["name"] == "kept-by-refusal"
         assert on_disk.get("owner") is None  # not claimed either
         assert not (run_env / "events.jsonl").exists()  # no session_start event
+
+    # --- lmer --name / --goal (LMER_RUN_NAME / LMER_RUN_GOAL), legacy branch ---
+
+    @staticmethod
+    def _launch_identity(monkeypatch, name="Launch Name", goal="ship the thing"):
+        if name is not None:
+            monkeypatch.setenv("LMER_RUN_NAME", name)
+        if goal is not None:
+            monkeypatch.setenv("LMER_RUN_GOAL", goal)
+
+    @staticmethod
+    def _events_of(run_env, kind):
+        return [e for e in run_state.read_events(run_env, last_n=0) if e["type"] == kind]
+
+    def test_launch_name_and_goal_apply_once_at_the_opening_session_start(
+        self, run_env, capsys, monkeypatch
+    ):
+        self._launch_identity(monkeypatch)
+        assert _main(["session-start"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["name"] == "launch-name"
+        assert state["goal"] == "ship the thing"
+        (named,) = self._events_of(run_env, "run_named")
+        assert named["note"] == "launch-name"
+        assert named["data"] == {"source": "launch"}
+        (goal_set,) = self._events_of(run_env, "goal_set")
+        assert goal_set["note"] == "ship the thing"
+        assert goal_set["data"] == {"source": "launch"}
+        assert "not applied" not in capsys.readouterr().out
+
+        # A later session-start of the same launch re-applies nothing: the
+        # container-lived variables must not re-name or re-goal on every start.
+        assert _main(["session-start"]) == 0
+        assert len(self._events_of(run_env, "run_named")) == 1
+        assert len(self._events_of(run_env, "goal_set")) == 1
+        assert "not applied" not in capsys.readouterr().out
+
+    def test_a_held_launch_name_warns_on_stdout_and_the_run_stays_unnamed(
+        self, run_env, capsys, monkeypatch
+    ):
+        _seed_sibling(run_env.parent, "develop-issue-7", "taken")
+        self._launch_identity(monkeypatch, name="taken", goal=None)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert (
+            "⚠️  launch name 'taken' not applied: held by run 'develop-issue-7' "
+            "(names are unique per project); this run stays unnamed"
+        ) in out
+        assert "develop-issue-123" in out  # the brief still prints
+        assert run_state.load_state(run_env)["name"] is None
+        assert self._events_of(run_env, "run_named") == []
+
+        # Nor is the warning repeated by a later start of the same launch.
+        assert _main(["session-start"]) == 0
+        assert "not applied" not in capsys.readouterr().out
+
+    def test_an_invalid_launch_name_warns_and_the_run_stays_unnamed(
+        self, run_env, capsys, monkeypatch
+    ):
+        self._launch_identity(monkeypatch, name="!!!", goal=None)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "launch name '!!!' not applied" in out
+        assert "develop-issue-123" in out
+        assert run_state.load_state(run_env)["name"] is None
+        assert self._events_of(run_env, "run_named") == []
+
+    def test_a_raising_name_conflict_scan_never_refuses_the_session(
+        self, run_env, capsys, monkeypatch
+    ):
+        self._launch_identity(monkeypatch)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("scan exploded")
+
+        monkeypatch.setattr(work_cli, "_name_conflict", boom)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "⚠️  launch name/goal not applied (continuing): scan exploded" in out
+        assert "develop-issue-123" in out  # the brief still prints
+        state = run_state.load_state(run_env)
+        assert state["name"] is None
+        assert state["owner"]["session_id"] == "s-cli-1"  # still claimed
+        assert self._events_of(run_env, "run_named") == []
+
+    def test_a_raising_state_write_never_refuses_the_session(
+        self, run_env, capsys, monkeypatch
+    ):
+        self._launch_identity(monkeypatch)
+        real_write = run_state.write_state
+
+        def refuse_the_identity_write(rdir, state):
+            if state.get("name") == "launch-name":
+                raise RuntimeError("disk said no")
+            real_write(rdir, state)
+
+        monkeypatch.setattr(run_state, "write_state", refuse_the_identity_write)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "⚠️  launch name/goal not applied (continuing): disk said no" in out
+        assert "develop-issue-123" in out
+        state = run_state.load_state(run_env)
+        assert state["name"] is None
+        assert state["goal"] is None
+        assert state["owner"]["session_id"] == "s-cli-1"
+        assert self._events_of(run_env, "run_named") == []
+        assert self._events_of(run_env, "goal_set") == []
+
+    def test_the_claimed_by_other_branch_still_records_name_and_goal(
+        self, run_env, capsys, monkeypatch
+    ):
+        # The enforced-claim branch takes no owner and writes no state of its
+        # own, so the identity has to persist itself to land at all.
+        self._seed_release_claim(run_env, "s-holder", run_state.utc_now_iso())
+        self._launch_identity(monkeypatch)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "owner not taken" in out
+        after = run_state.load_state(run_env)
+        assert after["name"] == "launch-name"
+        assert after["goal"] == "ship the thing"
+        assert after["owner"] is None  # the claim rule is untouched
+        assert after["claim"]["session_id"] == "s-holder"
+        assert len(self._events_of(run_env, "run_named")) == 1
+        assert len(self._events_of(run_env, "goal_set")) == 1
+        # The brief this branch prints is decided after the identity landed.
+        assert "Run: launch-name (slug: develop-issue-123, status: in-progress)" in out
+        assert "Goal: ship the thing" in out.splitlines()
+
+    def test_the_printed_brief_carries_the_launch_name_and_goal(
+        self, run_env, capsys, monkeypatch
+    ):
+        # `hooks/start.py` hands the agent session-start's stdout, so the
+        # brief must be decided AFTER the identity lands: a brief built first
+        # shows the run unnamed (the agent names it again) and the old goal.
+        state = run_state.seed_state("develop-issue-123", "develop", "t")
+        state["goal"] = "the old goal"
+        run_state.write_state(run_env, state)
+        self._launch_identity(monkeypatch)
+        assert _main(["session-start"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert "Run: launch-name (slug: develop-issue-123, status: in-progress)" in lines
+        assert [line for line in lines if line.startswith("Goal:")] == [
+            "Goal: ship the thing"
+        ]
+        # The claim decision is untouched: this session took the owner.
+        assert run_state.load_state(run_env)["owner"]["session_id"] == "s-cli-1"
+
+    def test_a_held_launch_name_leaves_the_brief_unnamed_with_the_goal(
+        self, run_env, capsys, monkeypatch
+    ):
+        _seed_sibling(run_env.parent, "develop-issue-7", "taken")
+        self._launch_identity(monkeypatch, name="taken")
+        assert _main(["session-start"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert any(line.startswith("⚠️  launch name 'taken' not applied") for line in lines)
+        assert "Run: develop-issue-123 (status: in-progress)" in lines
+        assert "Goal: ship the thing" in lines
 
 
 class TestSessionEnd:

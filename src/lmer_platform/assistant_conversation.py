@@ -31,11 +31,15 @@ MAX_RUN_FIELD_CHARS = 200
 
 
 def digest_run(data: object) -> dict | None:
-    """``host/project/slug`` (+ ``label``) off a digest payload, or ``None``.
+    """``host/project/slug`` (+ ``label``, ``uid``) off a digest payload, or ``None``.
 
     Only the label is shortened: a cut identity field would name a run that
-    does not exist, so an over-long one drops the link instead.
+    does not exist, so an over-long one drops the link instead. A well-formed
+    ``uid`` is kept because the UI keys a schema-2 row by it; without it the
+    link resolves to the slug group, which may be another execution.
     """
+    from .runs import UID_RE
+
     if not isinstance(data, dict):
         return None
     run = {
@@ -48,6 +52,9 @@ def digest_run(data: object) -> dict | None:
         return None
     if "label" in run:
         run["label"] = run["label"][:MAX_RUN_FIELD_CHARS]
+    uid = data.get("uid")
+    if isinstance(uid, str) and UID_RE.fullmatch(uid):
+        run["uid"] = uid
     return run
 
 

@@ -5,19 +5,46 @@ work repo's FORM (spec D20, issue #353). :func:`work_repo_layout` answers
 "which form is this tree written in, and where is this session's project
 dir"; every path helper here is built on it, and sibling modules
 (``run_state``, ``specs_index``, ``memory``) route through it rather than
-naming ``_plexus.yaml`` or an ``_``-prefixed area themselves. One module
+naming ``_lmer.yaml`` or an ``_``-prefixed area themselves. The tooling
+verbs that need the core's API itself (``adopt``, ``migrate``) get it from
+:func:`core_module`, so the core import is spelled here alone too. One module
 knowing the second set of names is the point: two would drift, and a drifted
 pair writes half a session's record at the legacy names and half at the
 schema ones — the split tree the validator flags ERROR.
 """
 
+import importlib
 import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse, urlunparse
+from types import ModuleType
+from typing import Optional, TYPE_CHECKING
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
+
+if TYPE_CHECKING:
+    from lmer_schema.manifest import Manifest
+
+
+class SchemaContextError(ValueError):
+    """The work tree declares a schema this writer cannot safely use."""
+
+
+def load_work_manifest(root: Optional[Path] = None) -> Optional["Manifest"]:
+    """Shared version boundary for work-repo writers and metadata readers."""
+    root = root if root is not None else work_repo_root()
+    path = root / "_lmer.yaml"
+    if not (path.exists() or path.is_symlink()):
+        return None
+    try:
+        from lmer_schema.manifest import ManifestError, load_manifest
+    except ImportError as exc:
+        raise SchemaContextError("schema support is unavailable for this work tree") from exc
+    try:
+        return load_manifest(root)
+    except ManifestError as exc:
+        raise SchemaContextError(str(exc)) from exc
 
 # Minimum length for an env var value to be considered a secret worth redacting.
 # Very short values (e.g., "yes", "dev", "true") stored in secret-named env vars
@@ -55,6 +82,39 @@ _SECRET_VALUE_PREFIX_RE = re.compile(
     r"|xox[bp]-[A-Za-z0-9-]{10,}"  # Slack bot / user token
     r"|xapp-[A-Za-z0-9-]{10,}"  # Slack app-level token
     r")"
+)
+
+# NOTHING in either pattern may depend on what PRECEDES a prefix. Where a token
+# can start is not enumerable: it follows an ANSI colour code (whose final `m`
+# is a word character), a JSON-escaped newline (a literal `n`), a hyphen or an
+# underscore in a slug, a letter, a digit, a percent-escape. A left boundary
+# was tried to stop `lmer-task-worker-…` being recorded as
+# `lmer-ta***REDACTED***`, and it let real tokens through every one of those,
+# here and at every `redact_secrets` call site. A miss publishes a credential
+# to a shared repository; an over-redaction costs a readable hostname. False
+# positives may be reduced only by constraining what FOLLOWS a prefix (body
+# length and alphabet per provider), and only with proof that no real token is
+# excluded.
+#
+# Token SHAPES, for data that arrives from outside this process (the session
+# metadata envelope: platform `session_metadata`, a hand-set env value). The
+# prefix list above is tuned for prose — logs and reports — where a {20,} tail
+# keeps a sentence mentioning "glpat-" readable. Metadata is a record in a
+# shared repository, and a token there need not be one this process holds, so
+# the floor is the shape itself: a known prefix with any plausible tail, AWS
+# key ids, and PEM blocks holding a private key (through their END line when present).
+_TOKEN_SHAPE_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*)"  # PEM private key
+    r"|glpat-[A-Za-z0-9_\-.]{8,}"  # GitLab personal access token
+    r"|gl(?:rt|dt)-[A-Za-z0-9_\-.]{8,}"  # GitLab runner / deploy token
+    r"|github_pat_[A-Za-z0-9_]{8,}"  # GitHub fine-grained PAT
+    r"|gh[pousr]_[A-Za-z0-9]{8,}"  # GitHub classic PAT / OAuth / app tokens
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])"  # AWS access key id: exactly 20, judged by what follows
+    r"|xox[abprs]-[A-Za-z0-9-]{8,}"  # Slack app / bot / user tokens
+    r"|xapp-[A-Za-z0-9-]{8,}"  # Slack app-level token
+    r"|sk-[A-Za-z0-9_\-.]{20,}",  # LLM API key
+    re.DOTALL,
 )
 
 # Backstop for credentials embedded in URLs (https://oauth2:<token>@host/path).
@@ -137,6 +197,16 @@ def redact_secrets(text: str, secret_values: Optional[list[str]] = None) -> str:
         )
 
     return redacted
+
+
+def redact_token_shapes(text: str) -> str:
+    """Replace token-shaped substrings, whether or not this process holds them.
+
+    The complement of :func:`redact_secrets` for data supplied from outside:
+    that function knows the values in this process's environment; this one
+    knows what a credential looks like (:data:`_TOKEN_SHAPE_RE`).
+    """
+    return _TOKEN_SHAPE_RE.sub(_REDACTED, text) if text else text
 
 
 def is_secret_env_name(name: str) -> bool:
@@ -249,6 +319,387 @@ def sanitize_task_target(task_target: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The target classifier (run-identity spec §2, decision D2)
+# ---------------------------------------------------------------------------
+
+#: Row 3 of the §2 table — a URL naming ONE work item inside a forge
+#: repository — as ``(segment, id)`` pairs. ``segment`` is the path segment as
+#: both forges spell it, bare: ``issues`` reads GitLab's ``/-/issues/N`` and
+#: GitHub's ``/issues/N`` through one entry, because the ``/-/`` is GitLab's
+#: project/route separator and not part of the route. ``id`` is the regex the
+#: NEXT segment must match, and one is always required: this is the indicator
+#: set ``_derive_repo_url_from_task_target`` reads today made id-aware — the
+#: id-less list pages are :data:`REFERENCE_INDICATORS`. Tickets take a number;
+#: a commit or a compare range takes any one segment (``/-/commit/main`` names
+#: a commit by ref and derives a repository today, so it stays a work item
+#: rather than falling to ``other``). The segment is read in the forge's ROUTE
+#: position only (:func:`_forge_route`: the first segment after GitLab's
+#: ``/-/``, the third on GitHub's shape) — never later in the path, where
+#: ``issues/123`` is a filename (astra, !380).
+#:
+#: The shape is chosen so ONE definition can serve its three readers: the
+#: classifier (the regex below), the repository derivation (membership of a
+#: path segment, exactly the test it makes on its literal tuple today) and the
+#: web run card's vocabulary seam (``web/src/format.js`` ``TARGET_KINDS`` is
+#: keyed by the bare segment and ``tests/test_platform_web_runcard.py`` reads
+#: the Python list). Rewiring those readers is a later task: the literal
+#: ``indicators = (…)`` tuples in ``lmer_cli.cli`` and ``clone_and_exec`` stay
+#: in place until then.
+WORK_ITEM_INDICATORS = (
+    ("merge_requests", r"\d+"),
+    ("issues", r"\d+"),
+    ("work_items", r"\d+"),
+    ("pull", r"\d+"),
+    ("pulls", r"\d+"),
+    ("commit", r"[^/]+"),
+    ("compare", r"[^/]+"),
+)
+
+#: Row 4 — content inside a forge repository (#523, #391), read in the same
+#: route position as row 3. GitLab's ``-/`` spellings are the route after
+#: ``/-/``, with or without a tail, so the id-less list pages ``/-/issues``,
+#: ``/-/work_items`` and ``/-/merge_requests`` land here once row 3 has passed
+#: on them; the ``/-/`` is the forge's own marker, so they need no host rule.
+#: GitHub's bare spellings are the route in GitHub's ``/<owner>/<repo>/<route>``
+#: position AND need a known forge host (:func:`_known_http_forge`), so a
+#: MediaWiki ``/wiki/`` page or a docs site's ``/a/b/tree/x`` is not read as
+#: forge content and ``repository_of`` invents no clone URL for it. ``commits``
+#: (GitLab ``/-/commits/<ref>``, GitHub ``/commits/<ref>``) is a reference and
+#: not a work item: it names a listing the way ``/tree/`` does, and it derives
+#: a repository today, so it may not fall to ``other``.
+REFERENCE_INDICATORS = (
+    "-/blob", "-/tree", "-/raw", "-/wikis", "-/commits",
+    "-/issues", "-/work_items", "-/merge_requests",
+    "blob", "tree", "wiki", "commits", "issues", "pulls",
+)
+
+#: The two sets as the classifier reads them, by route: the id regex each
+#: work-item route requires of the segment after it, and the reference routes
+#: by forge shape — GitLab's after its ``/-/`` (the ``-/`` prefix dropped),
+#: GitHub's bare.
+_WORK_ITEM_IDS = {segment: re.compile(id_re) for segment, id_re in WORK_ITEM_INDICATORS}
+_GITLAB_REFERENCE_ROUTES = frozenset(
+    route.removeprefix("-/") for route in REFERENCE_INDICATORS if route.startswith("-/")
+)
+_GITHUB_REFERENCE_ROUTES = frozenset(
+    route for route in REFERENCE_INDICATORS if not route.startswith("-/")
+)
+
+#: A scheme URL (``scheme://…``) and git's scp form (``[user@]host:path``,
+#: with the user required here — the userless form is indistinguishable from
+#: free text with a colon in it).
+_TARGET_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_TARGET_RE = re.compile(r"^(?P<user>[^/@\s]+)@(?P<host>[^/:@\s]+):(?P<path>\S*)$")
+
+#: ``lmer_platform.spawn``'s forge rules, carried over: hosts on which a
+#: suffix-less HTTP project URL is unambiguous, by allowlist or first label.
+_KNOWN_HTTP_FORGES = frozenset({"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"})
+_FORGE_FIRST_LABELS = frozenset({"git", "gitlab", "github", "bitbucket", "codeberg"})
+
+#: The handlers' claims, re-encoded (``slack_chat.permalink`` and
+#: ``matrix_chat.permalink``): the Slack ``p<TS>`` token needs seven
+#: characters after the ``p`` (the length check the handler makes — it does
+#: not test that they are digits); a Matrix room is ``!id:server`` or
+#: ``#alias:server`` and an event ``$…``, read from the fragment.
+_SLACK_MIN_TS_DIGITS = 7
+_MATRIX_ROOM_RE = re.compile(r"^[!#][^/\s]+:[^/\s]+$")
+_MATRIX_EVENT_RE = re.compile(r"^\$[^/\s?#]+$")
+
+
+def _slack_thread_target(parsed) -> bool:
+    """``slack_chat.permalink.is_slack_thread_url`` on an already-parsed URL."""
+    if parsed.scheme != "https" or not parsed.netloc.endswith(".slack.com"):
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) < 2 or segments[0] != "archives":
+        return False
+    if "thread_ts" in parse_qs(parsed.query):
+        return True
+    if len(segments) < 3 or not segments[2].startswith("p"):
+        return False
+    return len(segments[2]) - 1 >= _SLACK_MIN_TS_DIGITS
+
+
+def _matrix_thread_target(parsed) -> bool:
+    """``matrix_chat.permalink.parse_matrix_permalink`` on an already-parsed URL:
+    the matrix.to form and the Element ``https://<host>/#/room/…`` form alike."""
+    if parsed.scheme not in ("https", "http") or not parsed.fragment:
+        return False
+    fragment = parsed.fragment.split("?", 1)[0]
+    parts = [unquote(part) for part in fragment.strip("/").split("/") if part]
+    if parts and parts[0] == "room":
+        parts = parts[1:]
+    return (
+        len(parts) == 2
+        and _MATRIX_ROOM_RE.match(parts[0]) is not None
+        and _MATRIX_EVENT_RE.match(parts[1]) is not None
+    )
+
+
+def _known_http_forge(host: str) -> bool:
+    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
+    host = host.lower()
+    return host in _KNOWN_HTTP_FORGES or host.split(".", 1)[0] in _FORGE_FIRST_LABELS
+
+
+def _github_http_forge(host: str) -> bool:
+    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
+    host = host.lower()
+    return host == "github.com" or host.split(".", 1)[0] == "github"
+
+
+def _forge_route(parsed) -> tuple[bool, str, str, list[str]] | None:
+    """Split a parsed http(s) URL at its forge's route boundary — the SHAPE
+    decided first, by host, then the route read where that shape puts it.
+
+    GitHub's shape (:func:`_github_http_forge`): the project is the fixed
+    ``/<owner>/<repo>`` (a ``.git`` on the repo dropped), the route the third
+    segment, and everything after it the route's payload — a later ``/-/``
+    included, so ``/blob/main/-/issues/123`` is a file. Elsewhere the first
+    ``/-/`` is GitLab's boundary: the project is everything before it (nested
+    groups included), the route the segment after it. A path with no ``/-/``
+    off GitHub is read in GitHub's position too (codeberg, every Gitea, an
+    unknown host). Returns ``(gitlab, project, route, payload)`` — which
+    boundary was read, the project path, the route lowercased, the segments
+    after it — or ``None`` for a path with no route (a project root, a bare
+    ``/-/``). :func:`repository_of` reads the same split, so a filename is
+    never a route for one reader and a project for the other (astra, !380).
+    """
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if _github_http_forge(parsed.hostname or "") or "/-/" not in parsed.path:
+        gitlab = False
+        project = "/".join(segments[:2]).removesuffix(".git")
+        segments = segments[2:]
+    else:
+        gitlab = True
+        project, _, tail = parsed.path.partition("/-/")
+        project = project.strip("/")
+        segments = [segment for segment in tail.split("/") if segment]
+    if not segments:
+        return None
+    return gitlab, project, segments[0].lower(), segments[1:]
+
+
+def _repository_url_target(parsed) -> bool:
+    """Row 5 for a scheme URL: ``spawn._plain_repo_url_from_target``'s rules
+    with §2's deltas (``.git`` first, ``file://`` and ``git://`` accepted)."""
+    if parsed.query or parsed.fragment or "/-/" in parsed.path:
+        return False
+    scheme = parsed.scheme.lower()
+    project = parsed.path.strip("/").removesuffix(".git")
+    if scheme == "file":
+        return bool(project)
+    if not parsed.hostname or not project:
+        return False
+    if scheme in ("http", "https"):
+        if parsed.path.rstrip("/").endswith(".git"):
+            return True
+        if _github_http_forge(parsed.hostname):
+            return len(project.split("/")) == 2
+        return _known_http_forge(parsed.hostname)
+    if scheme in ("ssh", "git"):
+        return parsed.password is None
+    return False
+
+
+def classify_target(target: str | None) -> str:
+    """Sort a task target into exactly one of six classes (spec §2, D2).
+
+    Pure — no filesystem, no environment. The host CLI resolves local
+    checkouts BEFORE calling this (a positional naming a checkout is the
+    repository and never reaches here); the platform, which has no
+    filesystem, classifies the raw string. Rows are tested in the table's
+    order and the first match wins:
+
+    ``none``        ``None``, ``""``, whitespace.
+    ``special``     a URL a ``TargetHandler`` claims — the handlers' own
+                    claims re-encoded (:func:`_slack_thread_target`: https,
+                    a host ending in ``.slack.com``, ``/archives/<channel>/``
+                    then either ``?thread_ts=`` or a ``p``-token;
+                    :func:`_matrix_thread_target`: http or https on ANY
+                    host, a fragment ``#/[room/]<!id|#alias>:<server>/
+                    $<event>`` read after percent-decoding, so the Element
+                    ``https://<host>/#/room/…`` form as much as matrix.to).
+                    The handler owns it; never a repository.
+    ``work-item``   an http(s) URL whose forge ROUTE (:func:`_forge_route`:
+                    the first segment after GitLab's ``/-/``, the third on
+                    GitHub's shape) is an id-bearing indicator
+                    (:data:`WORK_ITEM_INDICATORS`) followed by its id.
+    ``reference``   an http(s) URL whose route names content inside a forge
+                    repository (:data:`REFERENCE_INDICATORS`): a GitLab
+                    ``-/`` route on any host, a GitHub-position route on a
+                    known forge host — #523, #391.
+    ``repository``  a clone source: ``spawn._plain_repo_url_from_target``'s
+                    rules carried over (the ``_KNOWN_HTTP_FORGES`` allowlist
+                    and the first-label heuristic; exactly two path segments
+                    on a GitHub-shaped host; no query, fragment or ``/-/``)
+                    with §2's three deltas — ``.git`` is tested first, so
+                    ``github.com/a/b/c.git`` is a repository; ``file:///path``
+                    is accepted; ``git://`` is accepted — plus scp form
+                    ``git@host:path`` (the one scp user spawn and
+                    ``resolve.is_likely_url`` know), ``ssh://host/path``,
+                    and anything beginning with ``/`` or ``.`` (a path; git
+                    refuses ref names starting with either, so no branch is
+                    lost).
+    ``other``       any other URL: a non-forge host, a forge URL with a
+                    query or an unknown route (``/discussions/5``,
+                    ``/-/pipelines/1691``), a GitHub-position reference
+                    route off the forges (``docs.example.com/a/b/tree/x``),
+                    an unsupported transport.
+    ``work-item``   anything else — a commit SHA, a branch name, an
+                    ``mr-N``/``pr-N``/``issue-N`` shorthand, free text.
+
+    Decisions recorded here (A1-wave0.classifier):
+
+    - The indicator constant's shape: ``(segment, id)`` pairs with bare
+      segments and an id always required — see :data:`WORK_ITEM_INDICATORS`.
+    - GitHub ``/commits/<ref>`` joins the reference row beside GitLab's
+      ``/-/commits/`` — see :data:`REFERENCE_INDICATORS`.
+    - An embedded credential on a non-HTTP transport
+      (``ssh://user:secret@host/path``, ``user:secret@host:path``) is
+      ``other``: spawn refuses it as a plain repository and the container's
+      no-secrets rule (``sources.url_has_embedded_credential``) refuses it at
+      start, so it never becomes a repository of record and — ``other``
+      never reaching a slug — never a directory name either. An HTTP(S)
+      credential is transport material spawn already scrubs, so that URL
+      stays a repository; the scrub is the consumer's job, not this one's.
+    - A scp-form string with any user but ``git`` (``deploy@host:path``) or
+      with no path (``git@host:``) is ``other`` as well: spawn and
+      ``is_likely_url`` agree it is not a repository URL, and it is not a
+      work item.
+    - The route decides, by position (astra, !380): the path is split at the
+      forge's route boundary — GitLab's ``/-/``, or GitHub's fixed
+      ``/<owner>/<repo>/<route>`` — and only that segment, with the id rule
+      on the one after it, sorts work item from reference. Nothing later in
+      the path can: ``/blob/main/issues/123`` and
+      ``/-/blob/main/compare/result.md`` name files and are references, not
+      work items sharing a group with the issue they happen to spell.
+    - The shape is decided before the route, by host (round two): on a
+      GitHub-shaped host the route is the third segment and a later ``/-/``
+      is payload — ``/blob/main/-/issues/123`` is a file, not GitLab's
+      boundary — while elsewhere the FIRST ``/-/`` is that boundary, so a
+      nested group ``/g/sub/p/-/issues/1`` keeps its whole project and
+      ``/-/blob/main/-/issues/123`` still reads ``blob``. :func:`repository_of`
+      derives from the same split (:func:`_forge_route`), so no URL is a
+      reference here and a nonexistent repository there.
+    - A GitHub-position reference route (``tree``, ``blob``, ``wiki``,
+      ``commits``, the ``issues``/``pulls`` list pages) reads as forge
+      content on a known forge host only (:func:`_known_http_forge`), so
+      ``https://docs.example.com/a/b/tree/x`` is ``other`` and
+      :func:`repository_of` never invents a clone URL for a docs site.
+      GitLab's ``/-/`` is the forge's own marker and needs no host rule. An
+      id-bearing route in GitHub's position stays host-agnostic — codeberg
+      and every Gitea spell ``/o/r/issues/5`` that way, and an unknown
+      host's ``/pull/9`` derived a repository before this rule — so
+      ``https://x/org/p/pull/9`` is still a work item.
+
+    Mirrored verbatim in ``lmer_cli/container/clone_and_exec.py``, which runs
+    without this package; ``tests/test_work_repo_classify_target.py`` holds
+    the two copies AST-identical and runs the §2 table against both.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "none"
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (_slack_thread_target(parsed) or _matrix_thread_target(parsed)):
+        return "special"
+    if _TARGET_URL_RE.match(text):
+        if parsed is None:
+            return "other"
+        if parsed.scheme.lower() in ("http", "https"):
+            split = _forge_route(parsed)
+            if split is not None:
+                gitlab, _, name, payload = split
+                id_re = _WORK_ITEM_IDS.get(name)
+                if id_re is not None and payload and id_re.fullmatch(payload[0]):
+                    return "work-item"
+                if gitlab and name in _GITLAB_REFERENCE_ROUTES:
+                    return "reference"
+                if (
+                    not gitlab
+                    and name in _GITHUB_REFERENCE_ROUTES
+                    and _known_http_forge(parsed.hostname or "")
+                ):
+                    return "reference"
+        return "repository" if _repository_url_target(parsed) else "other"
+    scp = _SCP_TARGET_RE.match(text)
+    if scp is not None:
+        if scp.group("user") == "git" and scp.group("path"):
+            return "repository"
+        return "other"
+    if text.startswith(("/", ".")):
+        return "repository"
+    return "work-item"
+
+
+def is_work_item(target: str | None) -> bool:
+    """Whether *target* names a work unit: ``work-item`` or ``special`` (§2).
+
+    A thread permalink counts — the handler-owned chat IS the work, and its
+    slug is derived from the permalink as today.
+    """
+    return classify_target(target) in ("work-item", "special")
+
+
+def repository_of(url: str | None) -> str | None:
+    """The repository a ``work-item``, ``reference`` or ``repository`` URL
+    belongs to, as a URL — ``None`` when there is none (spec §2).
+
+    One answer behind every reader of "which repository is this": the clone
+    URL (``_derive_repo_url_from_task_target``, both copies), the identity
+    ``LMER_REPO_HOST``/``LMER_REPO_PROJECT`` are parsed from
+    (``lmer_cli.cli._parse_repo_url`` parses ``repository_of(url) or url``)
+    and, in A2, the platform's repository of record and its identity
+    prediction. So ``LMER_REPO_PROJECT`` never contains a ``/-/`` route or a
+    ``/pull/N`` tail (#391), and a document URL names the repository its
+    clone comes from (#523). By class (:func:`classify_target`):
+
+    ``work-item``, ``reference``
+        A derived answer, ``<scheme>://<host[:port]>/<project>`` with the
+        project the classifier's own split (:func:`_forge_route`, shape
+        first): on a GitHub-shaped host the fixed ``<owner>/<repo>``, a
+        ``.git`` on the repo segment dropped (what the derivation did) and
+        a later ``/-/`` being payload; elsewhere the path before the first
+        ``/-/``, nested groups included.
+        The host and port are the target's — the port is part of the
+        address; userinfo is NOT carried over: this answer is read into run
+        identities and platform logs, and a credential in a work-item link
+        is transport material that belongs to whoever clones. The query and
+        the fragment go with the route. A non-URL work item (a SHA, a
+        branch, ``mr-7``, free text) names no repository: ``None``. So does
+        a route with no project before it (``https://host/-/issues/5``).
+    ``repository``
+        Itself, as given (whitespace aside): the clone source in the
+        spelling the caller chose, a path included. A credential embedded
+        in it is the consumer's to scrub, as the classifier records.
+    ``none``, ``special``, ``other``
+        ``None`` — a thread permalink is the handler's; ``other`` is context
+        only when ``--repo`` names the repository.
+
+    Never adds a credential: no token lookup, no environment. Pure, like the
+    classifier, and mirrored with it in ``lmer_cli/container/clone_and_exec.py``
+    under the same AST guard.
+    """
+    text = (url or "").strip()
+    klass = classify_target(text)
+    if klass == "repository":
+        return text
+    if klass not in ("work-item", "reference") or not _TARGET_URL_RE.match(text):
+        return None
+    parsed = urlparse(text)
+    netloc = parsed.netloc.rpartition("@")[2]
+    # The classifier's own split: the project is whatever sits before the
+    # route it read, never a second guess at the path.
+    split = _forge_route(parsed)
+    if not netloc or split is None or not split[1]:
+        return None
+    return f"{parsed.scheme}://{netloc}/{split[1]}"
+
+
+# ---------------------------------------------------------------------------
 # Form detection and project-dir resolution (spec D20 — dual read)
 # ---------------------------------------------------------------------------
 
@@ -264,7 +715,7 @@ LEGACY_FORM = "legacy"
 #: to be answerable WITHOUT the core — is anything schema-shaped present? —
 #: which is what separates "no core installed" from "the core is here and
 #: broken" (see :func:`_core_missing`).
-MANIFEST_NAME = "_plexus.yaml"
+MANIFEST_NAME = "_lmer.yaml"
 
 #: What a layout's ``problem`` is about. ``MANIFEST_PROBLEM``: the document
 #: itself is unusable (unparseable, unreadable, a schema int this build does
@@ -326,7 +777,7 @@ def work_repo_layout() -> WorkRepoLayout:
     THE accessor: every path helper here goes through it and so should every
     sibling module, which is what keeps the second set of names in one place.
 
-    **Legacy form** (no ``_plexus.yaml`` at the root) resolves exactly as it
+    **Legacy form** (no ``_lmer.yaml`` at the root) resolves exactly as it
     always has — ``{root}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}``, ``None``
     when either is unset. **Schema form** looks the launch's repo URL
     (``LMER_REPO_URL``, else ``https://{host}/{project}``) up across every
@@ -409,7 +860,7 @@ def work_repo_form() -> str:
 
 
 def work_repo_manifest_problem() -> Optional[str]:
-    """Why the work repo's ``_plexus.yaml`` cannot be used, or ``None``.
+    """Why the work repo's ``_lmer.yaml`` cannot be used, or ``None``.
 
     The reason surfaced for callers that report rather than resolve (a
     mutating verb refusing to write, a hook printing one line and exiting 0).
@@ -419,6 +870,78 @@ def work_repo_manifest_problem() -> Optional[str]:
     :class:`WorkRepoLayout` for the two cases.
     """
     return work_repo_layout().problem
+
+
+#: The core API's package, spelled here and nowhere else in the work CLI
+#: (see :func:`core_module`).
+CORE_PACKAGE = "lmer_schema"
+
+
+class CoreUnavailableError(ImportError):
+    """The lmer-schema core API cannot be imported in this build.
+
+    The ONE error :func:`core_module` raises. An ``ImportError`` so that
+    ``str(exc)`` is the loader's own text — the version-floor refusals in
+    ``adopt``/``migrate`` quote it verbatim — and so that an
+    ``except ImportError`` written for a direct core import still catches
+    it. Not :class:`SchemaContextError`: that one is about the TREE (a
+    manifest this writer cannot safely use); this one is about the BUILD.
+    """
+
+
+def core_module(name: str) -> ModuleType:
+    """Import and return ``lmer_schema.<name>`` — THE core import for tooling.
+
+    The tooling verbs — ``adopt``, ``migrate``, and later ``housekeep`` and
+    ``knowledge`` — reach the core ONLY through this accessor
+    (``core_module("writer").load_for_write``, ``core_module("checks.walk")``,
+    *name* a dotted path under the package) and never spell the core's
+    import or the manifest's name themselves; one module knowing the second
+    set of names is the point (D20, and the source guard in
+    tests/test_work_repo_schema_base.py pins it). The accessor is an import
+    and nothing more: it never reads the manifest and never decides the
+    tree's form — that stays :func:`work_repo_layout` / :func:`project_area`.
+
+    Raises :class:`CoreUnavailableError` — one type, whatever failed — when
+    the core is absent, half-installed, or *name* is not a module of it. The
+    same reading :func:`_core_missing` gives a direct import: an
+    ``ImportError`` cannot tell "no core" from "a core with something broken
+    under it", and the accessor does not try; the message and the chained
+    cause carry the loader's detail. Callers that must never raise (a
+    journal seam, a hook path) catch it and fall back, exactly as they did
+    for ``ImportError``; mutating verbs turn it into their own refusal.
+
+    Lazy by design: call it inside the verb, never at module level, so
+    ``import work_repo.adopt`` still succeeds on a build without the core.
+    """
+    try:
+        return importlib.import_module(f"{CORE_PACKAGE}.{name}")
+    except ImportError as exc:
+        raise CoreUnavailableError(str(exc), name=exc.name, path=exc.path) from exc
+
+
+def work_repo_project_rels(root: Path) -> list[str]:
+    """Repo-relative dirs of every project of the plexus at *root*.
+
+    Registered projects first, in registry order, then the host buckets —
+    exactly what the core's walk yields for the tree's own registry — and
+    ``[]`` on a legacy tree (no manifest), where there is no project set to
+    speak of. This is the work CLI's one spelling of "which directories are
+    projects" (the publication choke point indexes exactly these), kept here
+    because naming the core's walk IS re-deriving the form (issue #353 D20).
+
+    A present manifest the core cannot use raises what the core raises
+    (``ManifestError``, ``RegistryError``), and a build without the core
+    raises ``ImportError``: the caller decides its own fallback, never this
+    function, which would otherwise have to guess at a project set.
+    """
+    from lmer_schema.checks.walk import project_dirs
+    from lmer_schema.registry import load_registry
+
+    registry = load_registry(root)
+    if registry is None:
+        return []
+    return [project.rel for project in project_dirs(root, registry=registry)]
 
 
 def _schema_layout(root, repo_host, repo_project, legacy_base):
@@ -435,7 +958,7 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
         # without it (or with it half-installed) degrades instead of dying on
         # a module-level import in a hook path.
         from lmer_schema.form import Form, detect_form
-        from lmer_schema.manifest import ManifestError, manifest_path
+        from lmer_schema.manifest import ManifestError, load_manifest, manifest_path
         from lmer_schema.registry import (
             RegistryError,
             load_registry,
@@ -450,6 +973,7 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
     manifest = manifest_path(root)
     registry, problem = None, None
     try:
+        manifest_schema = load_manifest(root).schema
         registry = load_registry(root)
     except RegistryError as exc:
         # The identity layer only: the document parsed, so the tree, its form
@@ -476,7 +1000,12 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
 
     base, project = legacy_base, None
     if url:
-        resolution = resolve_project_dir(root, url, registry=registry)
+        try:
+            resolution = resolve_project_dir(
+                root, url, registry=registry, schema=manifest_schema
+            )
+        except RegistryError as exc:
+            return _unusable(root, manifest, str(exc))
         if resolution.path is not None:
             base, project = resolution.path, resolution.project
         elif resolution.bucket_path is not None:
@@ -533,7 +1062,7 @@ def _unusable(root, manifest, problem) -> WorkRepoLayout:
         manifest=manifest,
         problem=_announce(
             problem,
-            "Refusing to resolve a work-repo path: a present _plexus.yaml is "
+            "Refusing to resolve a work-repo path: a present _lmer.yaml is "
             "never read as a legacy tree (spec D20). Fix or remove the manifest.",
         ),
         problem_kind=MANIFEST_PROBLEM,

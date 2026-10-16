@@ -487,7 +487,7 @@ WIDGETS_SESSION_ID = "20260824-165230-2-31245"
 def _register_widgets(config):
     """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         yaml.safe_dump({
             "schema": 1,
             "name": "example-plexus",
@@ -732,7 +732,7 @@ def test_spawn_with_a_bad_request_returns_400(client, platform_root):
         "/api/sessions", headers=bearer_header(), json={"taskdef": "develop"}
     )
     assert response.status_code == 400
-    assert "target is required" in response.json()["detail"]
+    assert "target or a repo_url" in response.json()["detail"]
 
 
 def test_spawn_requires_auth(client):
@@ -815,6 +815,58 @@ def test_the_answer_does_not_come_back_in_the_reply(client, answered):
     )
     assert ANSWER_BODY["answer"] not in response.text
     assert "command" not in response.text
+
+
+def test_the_answer_route_passes_a_repo_url_to_the_request(client, answered):
+    """`repo_url_required`: an adopted plain-project run is answered with the
+    transport URL the client now sends."""
+    response = client.post(
+        "/api/runs/answer",
+        headers=bearer_header(),
+        json={**ANSWER_BODY, "repo_url": "https://gitlab.example.com/example/repo.git"},
+    )
+    assert response.status_code == 202
+    assert answered.calls[0].repo_url == "https://gitlab.example.com/example/repo.git"
+
+
+def test_answer_confirmation_is_passed_as_the_exact_source_uid(client, answered):
+    source_uid = "a" * 32
+    response = client.post(
+        "/api/runs/answer",
+        headers=bearer_header(),
+        json={**ANSWER_BODY, "allow_unsigned_source": source_uid},
+    )
+    assert response.status_code == 202
+    assert answered.calls[0].allow_unsigned_source == source_uid
+
+
+def test_answer_unsigned_refusal_keeps_structured_provenance(
+    client, platform_root, monkeypatch
+):
+    from lmer_platform import resume as resume_mod
+
+    source = {
+        "uid": "a" * 32,
+        "operator": "alice",
+        "hostname": "build.example",
+        "started_at": "2026-09-17T12:00:00Z",
+        "last_activity": "2026-09-17T12:05:00Z",
+    }
+
+    def refuse(config, request):
+        raise resume_mod.UnsignedSessionSource("source has no sign-out", source)
+
+    monkeypatch.setattr(api, "answer_run", refuse)
+    response = client.post(
+        "/api/runs/answer", headers=bearer_header(), json=ANSWER_BODY
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "unsigned_session",
+        "message": "source has no sign-out",
+        "source": source,
+        "decisions": ["continue_fresh", "cancel"],
+    }
 
 
 def test_answer_refusals_keep_their_status(client, platform_root, monkeypatch):
@@ -1433,7 +1485,7 @@ def test_a_fleet_poll_records_no_check_in(platform_root):
 # The daemon reads the operator's own taskdefs off its mirror (T73) by resolving
 # the project dir and joining the taskdef tier onto it. The work repo holds two
 # shapes at once (D16/D20), so "the project dir" has two answers: the registered
-# SHORT NAME the ``_plexus.yaml`` registry binds this repo to (D7/D8), and — for
+# SHORT NAME the ``_lmer.yaml`` registry binds this repo to (D7/D8), and — for
 # a repo nobody has named yet, or a tree with no manifest at all — the
 # ``{host}/{project}`` host bucket that has always held it (D9). Both are
 # offered, schema name first, exactly as the container's own resolver
@@ -1467,8 +1519,8 @@ def mirror(platform_root):
 
 
 def _plant_manifest(mirror, projects, *, name="example-plexus"):
-    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
-    (mirror / "_plexus.yaml").write_text(
+    """A ``_lmer.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    (mirror / "_lmer.yaml").write_text(
         yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
         encoding="utf-8",
     )
@@ -1559,7 +1611,7 @@ def test_an_unusable_manifest_drops_the_project_tiers_not_the_global_one(
     one-character typo must never quietly point the search back at the
     pre-migration bucket, which is the silent demotion the second form exists to
     make impossible. The global tier is not a project claim, so it stays."""
-    (mirror / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    (mirror / "_lmer.yaml").write_text("projects: [", encoding="utf-8")
     plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "schema-tier")
     plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "bucket-tier")
     plant_taskdefs(mirror / "_taskdef", "global-tier")
@@ -1853,3 +1905,568 @@ def test_fleet_payload_keeps_an_edge_on_a_run_that_wants_the_operator(platform_r
     assert payload["relations"] == [{"a": first, "b": second}], (
         "an edge touching a run that wants the operator was dropped"
     )
+
+
+# --- the key segment (spec §6.1, A2.fleet) -----------------------------------
+#
+# A schema-2 run is tracked under its execution uid, and build_state resolves
+# its record by that uid — never "the newest record in the slug's group", which
+# for the older of two launches is somebody else's record.
+
+UID_OLDER = "a" * 32
+UID_NEWER = "b" * 32
+UID_PROJECT = ("gitlab.example.com", "acme/widgets")
+
+
+def _plant_uid_group(config):
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_lmer.yaml").write_text(
+        yaml.safe_dump({
+            "schema": 2, "name": "example-plexus",
+            "projects": {"widgets": {"repo": "ssh://git@gitlab.example.com/acme/widgets.git"}},
+        }),
+        encoding="utf-8",
+    )
+    for uid, started, goal in (
+        (UID_OLDER, "2026-01-01T00:00:00+00:00", "the older chat"),
+        (UID_NEWER, "2026-02-01T00:00:00+00:00", "the newer chat"),
+    ):
+        path = config.mirror_path / "widgets" / "_runs" / "chat" / uid
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "state.yaml").write_text(
+            yaml.safe_dump({
+                "schema": 2, "slug": "chat", "status": "in-progress", "goal": goal,
+                "session": {"started_at": started},
+            }),
+            encoding="utf-8",
+        )
+
+
+def test_state_shows_a_uid_tracked_entry_with_its_own_record_and_uid(
+    config, platform_root, fake_state
+):
+    from lmer_platform import runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER, taskdef="chat")
+    real_client = TestClient(api.create_app(config, SECRET, state_builder=api.build_state))
+
+    payload = real_client.get("/api/state", headers=bearer_header()).json()
+
+    assert payload["totals"]["runs"] == 1
+    row = payload["runs"][0]
+    assert row["uid"] == UID_OLDER
+    assert row["slug"] == "chat"
+    assert row["goal"] == "the older chat", "resolved to the group's newest record"
+    assert row["rel_path"] == f"widgets/_runs/chat/{UID_OLDER}"
+
+
+def test_two_uid_tracked_launches_of_one_group_are_two_rows(platform_root):
+    from lmer_platform import checkin, relations, runs as run_index
+
+    config = cfg.load()
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_NEWER)
+    checkin.record_check(*UID_PROJECT, UID_OLDER)
+    relations.relate((*UID_PROJECT, UID_OLDER), (*UID_PROJECT, UID_NEWER))
+
+    payload = api.build_state(config)
+
+    rows = {row["uid"]: row for row in payload["runs"]}
+    assert set(rows) == {UID_OLDER, UID_NEWER}
+    assert rows[UID_OLDER]["goal"] == "the older chat"
+    assert rows[UID_NEWER]["goal"] == "the newer chat"
+    assert rows[UID_OLDER]["checkin"]["checked_at"]
+    assert rows[UID_NEWER]["checkin"]["checked_at"] is None
+    older, newer = (run_index.run_key(*UID_PROJECT, uid) for uid in (UID_OLDER, UID_NEWER))
+    assert payload["relations"] == [{"a": older, "b": newer}]
+
+
+def test_the_references_fold_reads_a_flat_uid_row(platform_root, monkeypatch):
+    from lmer_platform import references, runs as run_index
+
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    references.add(
+        *UID_PROJECT, UID_OLDER,
+        "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900",
+        title="the design thread",
+    )
+    payload = {"runs": [
+        {"host": UID_PROJECT[0], "project": UID_PROJECT[1], "slug": "chat", "uid": UID_OLDER},
+        {"host": UID_PROJECT[0], "project": UID_PROJECT[1], "slug": "chat", "uid": UID_NEWER},
+    ]}
+
+    api._fold_references(payload)
+
+    assert [r["title"] for r in payload["runs"][0]["references"]] == ["the design thread"]
+    assert payload["runs"][1]["references"] == []
+
+
+# --- every run-keyed route by uid (spec §6.1, §6.4, A2.routes) -----------------
+#
+# A schema-2 launch is addressed by its execution uid, so each route that names
+# a run takes ``uid`` beside ``{host, project, slug}`` — on the body for a
+# write, on the query string for a read — and acts on the uid-keyed record.
+
+UID_HOST, UID_PROJ = UID_PROJECT
+
+
+def _uid_body(uid, **extra):
+    return {"host": UID_HOST, "project": UID_PROJ, "uid": uid, **extra}
+
+
+def test_adopt_by_uid_binds_an_unresolved_entry(config, platform_root, client):
+    """The operator's answer to a "re-adopt by uid" row: the slug-keyed entry
+    the transition could not bind is re-keyed to the chosen record, and what
+    the operator wrote about the run moves with it."""
+    from lmer_platform import meta, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat", taskdef="chat")
+    meta.write(*UID_PROJECT, "chat", title="the chat")
+    api.build_state(config)
+    slug_key = run_index.run_key(*UID_PROJECT, "chat")
+    assert run_index.load_index()[slug_key]["unresolved"], "precondition: two records"
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(), json=_uid_body(UID_OLDER)
+    )
+
+    assert response.status_code == 200, response.text
+    tracked = response.json()["tracked"]
+    uid_key = run_index.run_key(*UID_PROJECT, UID_OLDER)
+    assert tracked["key"] == uid_key
+    assert tracked["uid"] == UID_OLDER and tracked["slug"] == "chat"
+    assert tracked["source"] == "spawned", "binding is not a new adoption"
+    index = run_index.load_index()
+    assert set(index) == {uid_key}
+    assert "unresolved" not in index[uid_key]
+    assert index[uid_key]["aliases"] == [slug_key]
+    assert meta.read(*UID_PROJECT, UID_OLDER).title == "the chat"
+
+
+def test_re_adopting_by_uid_clears_a_conflict_once_its_pair_is_written(
+    config, platform_root, client
+):
+    """What clears a conflict mark (review !387, discussion 5): writing the
+    conflicted field replaces the pair, and re-adopting by uid then drops the
+    mark. Re-adopting while the pair is still there keeps it."""
+    from lmer_platform import meta, run_transition, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat")
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    meta.write(*UID_PROJECT, "chat", title="the slug title")
+    meta.write(*UID_PROJECT, UID_OLDER, title="the uid title")
+    run_transition.bind(config, *UID_PROJECT, "chat", UID_OLDER)
+    uid_key = run_index.run_key(*UID_PROJECT, UID_OLDER)
+    assert run_index.load_index()[uid_key]["conflict"] == {"stores": ["meta"]}
+
+    kept = client.post("/api/runs/adopt", headers=bearer_header(), json=_uid_body(UID_OLDER))
+    assert kept.status_code == 200, kept.text
+    assert run_index.load_index()[uid_key]["conflict"] == {"stores": ["meta"]}
+
+    client.post("/api/runs/meta", headers=bearer_header(),
+                json=_uid_body(UID_OLDER, title="the chosen title"))
+    cleared = client.post("/api/runs/adopt", headers=bearer_header(), json=_uid_body(UID_OLDER))
+
+    assert cleared.status_code == 200, cleared.text
+    assert "conflict" not in run_index.load_index()[uid_key]
+    assert run_index.readopt_marks() == {}
+
+
+def test_adopt_by_uid_tracks_a_record_with_its_slug_read_from_the_mirror(
+    config, platform_root, client
+):
+    from lmer_platform import runs as run_index
+
+    _plant_uid_group(config)
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(),
+        json=_uid_body(UID_NEWER, note="picked by uid"),
+    )
+
+    assert response.status_code == 200, response.text
+    tracked = response.json()["tracked"]
+    assert tracked["slug"] == "chat", "the group label comes from the record"
+    assert tracked["uid"] == UID_NEWER and tracked["source"] == "adopted"
+    assert tracked["note"] == "picked by uid"
+    assert set(run_index.load_index()) == {run_index.run_key(*UID_PROJECT, UID_NEWER)}
+
+
+def test_adopt_by_uid_beside_a_bound_launch_tracks_a_second_row(
+    config, platform_root, client
+):
+    """A slug that already resolves to one bound launch is not a reason to
+    re-key that launch: the other uid is a row of its own."""
+    from lmer_platform import runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+
+    client.post("/api/runs/adopt", headers=bearer_header(), json=_uid_body(UID_NEWER))
+
+    assert set(run_index.load_index()) == {
+        run_index.run_key(*UID_PROJECT, UID_OLDER),
+        run_index.run_key(*UID_PROJECT, UID_NEWER),
+    }
+
+
+def test_adopt_by_a_uid_with_no_record_and_no_slug_is_refused(config, platform_root, client):
+    from lmer_platform import runs as run_index
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(), json=_uid_body("c" * 32)
+    )
+
+    assert response.status_code == 400
+    assert "c" * 32 in response.json()["detail"]
+    assert run_index.load_index() == {}
+
+
+def test_a_malformed_uid_is_refused_rather_than_read_as_the_slug(client, platform_root):
+    """``key_parts`` would fall back to the slug, addressing the group's
+    slug-keyed entry — a different run than the caller named."""
+    from lmer_platform import runs as run_index
+
+    run_index.track(*UID_PROJECT, "chat")
+    for method, path, kwargs in (
+        ("post", "/api/runs/adopt", {"json": {**_uid_body("NOT-HEX"), "slug": "chat"}}),
+        ("post", "/api/runs/forget", {"json": {**_uid_body("NOT-HEX"), "slug": "chat"}}),
+        ("get", "/api/runs/meta", {"params": {**_uid_body("NOT-HEX"), "slug": "chat"}}),
+    ):
+        response = getattr(client, method)(path, headers=bearer_header(), **kwargs)
+        assert response.status_code == 400, (path, response.text)
+        assert "uid" in response.json()["detail"]
+    assert run_index.get_tracked(*UID_PROJECT, "chat") is not None
+
+
+def test_forget_by_uid_forgets_that_launch_and_drops_its_connections(
+    client, platform_root, monkeypatch
+):
+    from lmer_platform import runs as run_index
+
+    dropped = []
+
+    class _Connectors:
+        def drop_run(self, identity):
+            dropped.append(identity)
+            return 0
+
+    monkeypatch.setattr(connectors, "ensure_connectors", lambda: _Connectors())
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_NEWER)
+
+    response = client.post(
+        "/api/runs/forget", headers=bearer_header(), json=_uid_body(UID_OLDER)
+    )
+
+    assert response.json() == {"forgotten": True}
+    assert set(run_index.load_index()) == {run_index.run_key(*UID_PROJECT, UID_NEWER)}
+    # The key segment, which is what ``runs.run_for_session`` answers with.
+    assert dropped == [(UID_HOST, UID_PROJ, UID_OLDER)]
+
+
+def test_meta_by_uid_writes_and_reads_the_launch_and_echoes_the_uid(client, platform_root):
+    from lmer_platform import meta, runs as run_index
+
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_NEWER)
+
+    written = client.post(
+        "/api/runs/meta", headers=bearer_header(),
+        json=_uid_body(UID_OLDER, title="the older chat"),
+    )
+    read = client.get(
+        "/api/runs/meta", headers=bearer_header(), params=_uid_body(UID_OLDER)
+    )
+
+    assert written.status_code == 200, written.text
+    assert read.json()["meta"]["title"] == "the older chat"
+    assert read.json()["run"]["uid"] == UID_OLDER
+    assert meta.read(*UID_PROJECT, UID_NEWER).title == "", "the other launch is untouched"
+
+
+def test_a_uid_echo_carries_the_entrys_slug_not_the_callers(client, platform_root):
+    """The uid decides which run a request is about, so a ``slug`` sent beside
+    it that names another group is not echoed back as if it were this run's."""
+    from lmer_platform import runs as run_index
+
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+
+    tracked = client.get(
+        "/api/runs/meta", headers=bearer_header(),
+        params=_uid_body(UID_OLDER, slug="other"),
+    ).json()
+    untracked = client.get(
+        "/api/runs/meta", headers=bearer_header(),
+        params=_uid_body(UID_NEWER, slug="other"),
+    ).json()
+
+    assert tracked["run"] == {"host": UID_HOST, "project": UID_PROJ, "slug": "chat",
+                              "uid": UID_OLDER}
+    assert untracked["run"] == {"host": UID_HOST, "project": UID_PROJ, "slug": None,
+                                "uid": UID_NEWER}
+
+
+def test_meta_echo_of_a_slug_request_keeps_its_shape(client, platform_root):
+    """Schema-1 replies are byte-identical: no ``uid`` key appears."""
+    read = client.get(
+        "/api/runs/meta", headers=bearer_header(),
+        params={"host": UID_HOST, "project": UID_PROJ, "slug": "chat"},
+    )
+
+    assert read.json()["run"] == {"host": UID_HOST, "project": UID_PROJ, "slug": "chat"}
+
+
+def test_files_by_uid_lists_that_launch_not_the_newest(config, client, platform_root):
+    _plant_uid_group(config)
+
+    reply = client.get(
+        "/api/runs/files", headers=bearer_header(), params=_uid_body(UID_OLDER)
+    ).json()
+
+    assert reply["present"] is True
+    assert reply["rel_path"] == f"widgets/_runs/chat/{UID_OLDER}"
+    assert reply["run"]["uid"] == UID_OLDER
+
+
+def test_a_fleet_row_naming_slug_and_uid_acts_on_the_uid_key_not_the_slug_entry(
+    config, client, platform_root
+):
+    """A schema-2 fleet row carries both ``slug`` (the group label) and ``uid``;
+    a schema-1 ``chat`` entry beside it must not be the one meta, files or
+    forget reach (review !387, discussion 2)."""
+    from lmer_platform import meta, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat")
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    meta.write(*UID_PROJECT, "chat", title="the slug run")
+    row = _uid_body(UID_OLDER, slug="chat")
+
+    written = client.post(
+        "/api/runs/meta", headers=bearer_header(), json={**row, "title": "the older chat"}
+    )
+    files = client.get("/api/runs/files", headers=bearer_header(), params=row).json()
+
+    assert written.status_code == 200, written.text
+    assert meta.read(*UID_PROJECT, UID_OLDER).title == "the older chat"
+    assert meta.read(*UID_PROJECT, "chat").title == "the slug run"
+
+    forgotten = client.post("/api/runs/forget", headers=bearer_header(), json=row).json()
+
+    assert files["rel_path"] == f"widgets/_runs/chat/{UID_OLDER}"
+    assert forgotten == {"forgotten": True}
+    assert set(run_index.load_index()) == {run_index.run_key(*UID_PROJECT, "chat")}
+    assert meta.read(*UID_PROJECT, UID_OLDER).title == "", "forget dropped the uid's title"
+
+
+def test_relations_by_uid_relate_list_and_unrelate_two_launches(client, platform_root):
+    from lmer_platform import relations, runs as run_index
+
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_NEWER)
+    body = _uid_body(UID_OLDER, related=_uid_body(UID_NEWER))
+
+    related = client.post("/api/runs/relate", headers=bearer_header(), json=body)
+    listed = client.get(
+        "/api/runs/relations", headers=bearer_header(), params=_uid_body(UID_NEWER)
+    ).json()
+
+    assert related.status_code == 200, related.text
+    assert related.json()["created"] is True
+    assert related.json()["related"]["uid"] == UID_NEWER
+    assert relations.list_for(*UID_PROJECT, UID_OLDER)[0].key == run_index.run_key(
+        *UID_PROJECT, UID_NEWER
+    )
+    assert [entry["key"] for entry in listed["relations"]] == [
+        run_index.run_key(*UID_PROJECT, UID_OLDER)
+    ]
+    assert listed["relations"][0]["tracked"] is True
+
+    removed = client.post("/api/runs/unrelate", headers=bearer_header(), json=body)
+
+    assert removed.json()["removed"] is True
+    assert relations.load_all() == {}
+
+
+def test_candidates_carry_the_record_uid_and_match_a_uid_keyed_entry(
+    config, client, platform_root
+):
+    from lmer_platform import runs as run_index
+
+    _plant_uid_group(config)
+    solo = "c" * 32
+    path = config.mirror_path / "widgets" / "_runs" / "solo" / solo
+    path.mkdir(parents=True)
+    (path / "state.yaml").write_text(
+        yaml.safe_dump({"schema": 2, "slug": "solo", "status": "in-progress",
+                        "session": {"started_at": "2026-03-01T00:00:00+00:00"}}),
+        encoding="utf-8",
+    )
+
+    before = client.get("/api/runs/candidates", headers=bearer_header()).json()
+    run_index.track(*UID_PROJECT, "solo", uid=solo)
+    after = client.get("/api/runs/candidates", headers=bearer_header()).json()
+
+    (row,) = [c for c in before["candidates"] if c["slug"] == "solo"]
+    assert row["uid"] == solo
+    assert row["tracked"] is False
+    (row,) = [c for c in after["candidates"] if c["slug"] == "solo"]
+    assert row["tracked"] is True, "a uid-keyed entry tracks its own record"
+
+
+def test_a_legacy_candidate_carries_no_uid(client, platform_root, config):
+    _plant_mirror_run(config, "mine")
+
+    (row,) = client.get("/api/runs/candidates", headers=bearer_header()).json()["candidates"]
+
+    assert row["uid"] is None
+
+
+def test_move_composes_the_key_from_the_uid(client, platform_root, monkeypatch):
+    from lmer_platform import projects, runs as run_index
+
+    moved = []
+    monkeypatch.setattr(
+        projects, "move", lambda key, *_a, **_k: moved.append(key) or {"ok": True}
+    )
+
+    client.post(
+        "/api/runs/move", headers=bearer_header(),
+        json={**_uid_body(UID_OLDER, slug="chat"), "destination_id": None},
+    )
+
+    assert moved == [run_index.run_key(*UID_PROJECT, UID_OLDER)]
+
+
+def test_an_assistant_read_by_uid_checks_in_that_launch(config, client, platform_root):
+    """``_note_check`` stamps the key segment, so the check lands on the row
+    the assistant looked at and not on the slug the group shares."""
+    from lmer_platform import checkin, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat", uid=UID_OLDER)
+
+    reply = client.get(
+        "/api/runs/files", headers=bearer_header(cfg.mint_assistant_credential()),
+        params=_uid_body(UID_OLDER, slug="chat"),
+    )
+
+    assert reply.status_code == 200, reply.text
+    marks = checkin.read_marks()
+    assert run_index.run_key(*UID_PROJECT, UID_OLDER) in marks
+    assert run_index.run_key(*UID_PROJECT, "chat") not in marks
+
+
+def test_an_assistant_look_through_a_stale_slug_stamps_the_bound_entry(
+    config, client, platform_root
+):
+    """A slug reference that reaches a bound entry through its alias must not
+    re-create the slug-keyed mark the transition moved."""
+    from lmer_platform import checkin, run_transition, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat")
+    run_transition.bind(config, *UID_PROJECT, "chat", UID_NEWER)
+
+    reply = client.get(
+        "/api/runs/files", headers=bearer_header(cfg.mint_assistant_credential()),
+        params={"host": UID_HOST, "project": UID_PROJ, "slug": "chat"},
+    )
+
+    assert reply.status_code == 200, reply.text
+    marks = checkin.read_marks()
+    assert run_index.run_key(*UID_PROJECT, UID_NEWER) in marks
+    assert run_index.run_key(*UID_PROJECT, "chat") not in marks
+
+
+def test_adopt_by_uid_refuses_a_slug_naming_another_group(config, platform_root, client):
+    """The body's slug picks which slug-keyed entry is bound, so it must be the
+    record's own group: binding ``other`` to a ``chat`` launch would carry the
+    other run's meta, relations and home onto a record they never described."""
+    from lmer_platform import meta, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "other", taskdef="other")
+    meta.write(*UID_PROJECT, "other", title="the other run")
+    before = run_index.load_index()
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(),
+        json=_uid_body(UID_OLDER, slug="other"),
+    )
+
+    assert response.status_code == 400, response.text
+    assert "other" in response.json()["detail"]
+    assert run_index.load_index() == before, "nothing moved"
+    assert meta.read(*UID_PROJECT, "other").title == "the other run"
+
+
+def test_adopt_by_uid_binds_an_entry_naming_the_uid_as_a_candidate(
+    config, platform_root, client
+):
+    """The unresolved mark is the transition's own word that this entry may be
+    that record, whatever label the record now sits under."""
+    from lmer_platform import runs as run_index
+
+    _plant_uid_group(config)
+    entry = run_index.track(*UID_PROJECT, "renamed")
+    run_index.mark_unresolved(entry.key, [{"uid": UID_OLDER, "started_at": None,
+                                           "name": None}])
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(),
+        json=_uid_body(UID_OLDER, slug="renamed"),
+    )
+
+    assert response.status_code == 200, response.text
+    assert set(run_index.load_index()) == {run_index.run_key(*UID_PROJECT, UID_OLDER)}
+
+
+def test_adopt_by_uid_is_refused_on_a_legacy_mirror(config, platform_root, client):
+    """A schema-1 work repo has no execution records, so a uid there addresses
+    nothing the container will ever write."""
+    from lmer_platform import runs as run_index
+
+    _plant_mirror_run(config, "chat")
+
+    response = client.post(
+        "/api/runs/adopt", headers=bearer_header(),
+        json=_uid_body("c" * 32, slug="chat"),
+    )
+
+    assert response.status_code == 400, response.text
+    assert "schema" in response.json()["detail"]
+    assert run_index.load_index() == {}
+
+
+def test_a_stale_slug_reads_the_bound_record_not_the_groups_newest(
+    config, platform_root, client
+):
+    """Once ``chat`` is bound to the OLDER launch, a client still holding the
+    slug reference reads that launch — the slug alone would resolve to the
+    group's newest record, which is another launch's."""
+    from lmer_platform import meta, run_transition, runs as run_index
+
+    _plant_uid_group(config)
+    run_index.track(*UID_PROJECT, "chat")
+    run_transition.bind(config, *UID_PROJECT, "chat", UID_OLDER)
+    meta.write(*UID_PROJECT, UID_OLDER, title="the older chat")
+    by_slug = {"host": UID_HOST, "project": UID_PROJ, "slug": "chat"}
+
+    files = client.get("/api/runs/files", headers=bearer_header(), params=by_slug)
+    read = client.get("/api/runs/meta", headers=bearer_header(), params=by_slug)
+
+    assert files.json()["rel_path"] == f"widgets/_runs/chat/{UID_OLDER}"
+    assert read.json()["meta"]["title"] == "the older chat"
+    assert read.json()["run"] == by_slug, "echoed as sent"
+
+    client.post("/api/runs/meta", headers=bearer_header(),
+                json={**by_slug, "title": "renamed"})
+
+    assert meta.read(*UID_PROJECT, UID_OLDER).title == "renamed"
+    assert "chat" not in {key.rsplit("/", 1)[-1] for key in meta.load_all()}

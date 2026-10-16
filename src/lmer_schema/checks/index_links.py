@@ -1,7 +1,9 @@
-"""Index integrity: the ``_specs/``/``_plans/`` symlinks and the ``PLANS.md``
-line index (spec §3.2/§7, D11/D13/D14; SCHEMA.md "Inventory" / "Index lines").
+"""Index integrity: the ``_specs/``/``_plans/`` symlinks, the ``PLANS.md``
+line index and the generated ``README.md`` index blocks (spec §3.2/§7,
+D11/D13/D14; SCHEMA.md "Inventory" / "Index lines"; the legible-work-repo
+design).
 
-Two mechanics, one module, because they are the two halves of one promise —
+Three mechanics, one module, because they are the halves of one promise —
 "``ls`` the index and you see what is active" (D11):
 
 1. **Dated symlinks.** ``<project>/_specs/`` and ``<project>/_plans/`` hold
@@ -19,11 +21,30 @@ Two mechanics, one module, because they are the two halves of one promise —
    relative markdown link to a ``.md`` file (SCHEMA.md "Index lines"); an
    entry whose file is gone is an integrity finding and a plan file no line
    carries is a warning.
+3. **Generated README index blocks.** Every durability push renders one
+   Markdown block per project — one row per committed run record under
+   ``_runs/``, newest first — between ``<!-- lmer:index:start -->`` and
+   ``<!-- lmer:index:end -->`` in ``<project>/README.md``, and
+   ``lmer-schema index --write`` renders the root ``README.md``'s project
+   list from ``_lmer.yaml``. The block is the kernel's
+   (``work_repo.project_index``, imported lazily: the import direction is
+   ``work_repo -> lmer_schema``), and so is the freshness oracle here: the
+   existing block is compared byte for byte with a fresh render of what is
+   on disk. No git, no clock, no write — a checkout holding unpushed
+   records may therefore WARN where a clean clone is silent (SCHEMA-GUIDE
+   §5). ``index.readme-missing`` (INFO) names a project holding records
+   whose README carries no block; ``index.readme-stale`` (WARN) names a
+   block that differs from the render, markers that are malformed, or hand
+   text holding a line git reads as a conflict marker (the generator skips
+   such a file, so the block will never refresh). A block whose format
+   token is newer than this runtime's is left alone. Both codes are gated
+   on the manifest the runner passes: a legacy tree has no index.
 
 Severity comes from the D14 tier table in :mod:`lmer_schema.checks.findings`
-and is never chosen here. Four of the five codes are registered there because
-D14 names them by behaviour; this module registers only
-``index.file-without-entry``.
+and is never chosen here. Four of the five link codes are registered there
+because D14 names them by behaviour; this module registers
+``index.file-without-entry`` and the two README codes, none of which the
+legacy tier softens.
 
 The split that matters
 ======================
@@ -84,6 +105,7 @@ tested directly.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from pathlib import Path, PurePosixPath
@@ -99,15 +121,19 @@ __all__ = [
     "CODES",
     "INDEX_DIR_NAMES",
     "LINK_RE",
+    "MARKER_LINE_DETAIL",
     "PLANS_DIR_NAMES",
     "PLANS_INDEX",
+    "README_NAME",
     "IndexEntry",
     "check_index_links",
     "check_plans_index",
+    "check_readme_index",
     "check_symlinks",
     "index_entries",
     "iter_index_dirs",
     "iter_project_dirs",
+    "line_delta",
 ]
 
 #: The index dirs, schema names first, legacy bare twins second (§3.2, §9).
@@ -138,6 +164,26 @@ register(
         "carries (the index is expected once plan files exist)"
     ),
 )
+register(
+    "index.readme-missing",
+    Severity.INFO,
+    tier=Tier.MACHINE,
+    summary=(
+        "a project holding run records whose `README.md` carries no generated "
+        "index block (the project's next durability push or `lmer-schema index "
+        "--write` creates it)"
+    ),
+)
+register(
+    "index.readme-stale",
+    Severity.WARN,
+    tier=Tier.MACHINE,
+    summary=(
+        "a `README.md` generated index block that no longer matches a fresh "
+        "render of the records (or, at the plexus root, of `_lmer.yaml`), or "
+        "whose markers are malformed"
+    ),
+)
 
 #: Every code this module emits, in code order (the four D14 codes are
 #: registered by ``findings`` and consumed here).
@@ -147,6 +193,21 @@ CODES: Tuple[str, ...] = (
     "index.file-without-entry",
     "index.link-escapes",
     "index.link-not-relative",
+    "index.readme-missing",
+    "index.readme-stale",
+)
+
+#: The file the generated index block lives in, at the plexus root and at
+#: every project root (``work_repo.project_index.README_NAME``).
+README_NAME = "README.md"
+
+#: The detail both README codes carry when a conflict-marker line in the hand
+#: text is what keeps the generator away from the file: the publication
+#: path's staged-marker gate would otherwise refuse every push of the project,
+#: so the generator never stages such a README and its block never refreshes.
+MARKER_LINE_DETAIL = (
+    "hand text holds a conflict-marker line (seven = < > or |); the generator "
+    "skips this file — indent or lengthen the line"
 )
 
 
@@ -360,12 +421,18 @@ def _plan_files(plans_dir: Path) -> List[Path]:
 # ---------------------------------------------------------------------------
 
 
-def check_index_links(root, report: Report, *, projects: Optional[Iterable] = None) -> None:
+def check_index_links(
+    root, report: Report, *, projects: Optional[Iterable] = None, manifest=None
+) -> None:
     """Run the index checks over the plexus at *root*, adding to *report*.
 
     *projects* is the caller's project-dir list (the runner has one already);
-    omitted, the projects are discovered. A root that does not exist says
-    nothing: "there is no tree" is the runner's exit-2 call, not a finding.
+    omitted, the projects are discovered. *manifest* is the loaded
+    :class:`~lmer_schema.manifest.Manifest`, which gates the README index
+    codes (:func:`check_readme_index`): without one — a legacy tree, or a
+    caller that did not pass it — those say nothing. A root that does not
+    exist says nothing: "there is no tree" is the runner's exit-2 call, not
+    a finding.
     """
     root = Path(root)
     if not root.is_dir():
@@ -374,6 +441,165 @@ def check_index_links(root, report: Report, *, projects: Optional[Iterable] = No
         check_symlinks(root, report, index_dir)
         if index_dir.name in PLANS_DIR_NAMES:
             check_plans_index(root, report, index_dir)
+    check_readme_index(root, report, projects=projects, manifest=manifest)
+
+
+# ---------------------------------------------------------------------------
+# The generated README index blocks
+# ---------------------------------------------------------------------------
+
+
+def line_delta(old: str, new: str) -> Tuple[int, int]:
+    """``(added, removed)`` line counts between two texts (pure).
+
+    The ``+N/-M`` a stale finding's detail quotes and the ``lmer-schema
+    index`` action line prints — the same line-level matching
+    ``difflib.unified_diff`` groups into hunks, so the two never disagree.
+    """
+    matcher = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False)
+    added = removed = 0
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += old_end - old_start
+        if tag in ("replace", "insert"):
+            added += new_end - new_start
+    return added, removed
+
+
+def check_readme_index(
+    root, report: Report, *, projects: Optional[Iterable] = None, manifest=None
+) -> None:
+    """Compare every generated README index block with a fresh render.
+
+    Gated on *manifest*: the index exists only in schema form, so a legacy
+    tree — or a caller that passes none — hears nothing. For each project
+    dir (*projects*, else the shared walk) the records under ``_runs/`` are
+    read exactly as the generator reads them, from what is on disk with no
+    git, and rendered with the same kernel; the root ``README.md`` is
+    compared with the render of the manifest's project list, and only when
+    it already carries a block. Clock-free, lock-free, write-free.
+    """
+    if manifest is None:
+        return
+    root = Path(root)
+    if not root.is_dir():
+        return
+    from work_repo import project_index  # lazy: the import direction is work_repo -> lmer_schema
+
+    found = iter_project_dirs(root) if projects is None else _resolve_projects(root, projects)
+    for project in found:
+        _check_project_readme(root, report, Path(project), project_index)
+    _check_root_readme(root, report, manifest.document, project_index)
+
+
+def _check_project_readme(root: Path, report: Report, project: Path, project_index) -> None:
+    rel = f"{_rel(root, project)}/{README_NAME}"
+    form = _tier_form(root, project)
+    text, obstacle = _readme_text(project)
+    try:
+        block = None if text is None else project_index.extract_block(text)
+    except project_index.MalformedMarkers as exc:
+        _malformed(report, rel, exc, form)
+        return
+    if block is None:
+        if not project_index.scan_project(project):
+            return  # nothing to list: the block is created with the first record's push
+        if text is not None and project_index.hand_text_has_marker(text):
+            obstacle = MARKER_LINE_DETAIL
+        report.add(
+            "index.readme-missing",
+            rel,
+            f"project holds run records but its {README_NAME} carries no generated "
+            "index block; the project's next durability push or `lmer-schema index "
+            "--write` creates it",
+            detail=obstacle,
+            form=form,
+        )
+        return
+    token = project_index.block_format(block)
+    if token is not None and token > project_index.FORMAT:
+        return  # a newer runtime wrote it; this one neither rewrites nor judges it
+    if project_index.hand_text_has_marker(text):
+        report.add(
+            "index.readme-stale",
+            rel,
+            f"{README_NAME} hand text holds a conflict-marker line, so no push "
+            "will refresh its generated index block",
+            detail=MARKER_LINE_DETAIL,
+            form=form,
+        )
+        return
+    fresh = project_index.render_project_block(project_index.scan_project(project))
+    if block != fresh:
+        _stale(report, rel, block, fresh, "the run records under `_runs/`", form)
+
+
+def _check_root_readme(root: Path, report: Report, document, project_index) -> None:
+    text, _obstacle = _readme_text(root)
+    if text is None:
+        return  # the root block is optional: only a present block is judged
+    try:
+        block = project_index.extract_block(text)
+    except project_index.MalformedMarkers as exc:
+        _malformed(report, README_NAME, exc, None)
+        return
+    if block is None:
+        return
+    token = project_index.block_format(block)
+    if token is not None and token > project_index.FORMAT:
+        return
+    fresh = project_index.render_root_block(document)
+    if block != fresh:
+        _stale(report, README_NAME, block, fresh, "the manifest's project list", None)
+
+
+def _malformed(report: Report, rel: str, exc: Exception, form: Optional[Form]) -> None:
+    report.add(
+        "index.readme-stale",
+        rel,
+        "generated index block markers are malformed; the generator refuses the "
+        "file until one start and one end marker delimit one block",
+        detail=f"markers malformed ({exc})",
+        form=form,
+    )
+
+
+def _stale(
+    report: Report, rel: str, block: str, fresh: str, source: str, form: Optional[Form]
+) -> None:
+    added, removed = line_delta(block, fresh)
+    report.add(
+        "index.readme-stale",
+        rel,
+        f"generated index block no longer matches a fresh render of {source}",
+        detail=(
+            f"+{added}/-{removed} lines; lmer-schema index <root> --diff shows the "
+            "change, --write applies it"
+        ),
+        form=form,
+    )
+
+
+def _readme_text(directory: Path) -> Tuple[Optional[str], Optional[str]]:
+    """``(text, obstacle)`` for the README of *directory*: its text when it is
+    a regular UTF-8 file, else ``None`` and — unless it is simply absent —
+    why the generator could not write one there either."""
+    path = directory / README_NAME
+    if path.is_symlink():
+        return None, f"{README_NAME} is a symlink; the generator skips it"
+    if path.is_dir():
+        return None, f"{README_NAME} is a directory; the generator skips it"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        reason = exc.strerror or exc
+        return None, f"{README_NAME} is not readable ({reason}); the generator skips it"
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, f"{README_NAME} is not UTF-8 text; the generator skips it"
 
 
 # ---------------------------------------------------------------------------

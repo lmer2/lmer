@@ -9,15 +9,20 @@ main(argv) directly.
 """
 
 import json
+import sys
 
 import pytest
 
+from lmer_cli.container import sources
 from lmer_cli.container.sources import (
     EXIT_OK,
     EXIT_REFUSAL,
     EXIT_USAGE,
+    MANIFEST_FILENAME,
     SUPPORTED_SOURCES_SCHEMAS,
     SUPPORTED_TASKDEF_SCHEMAS,
+    TIER_LEGACY,
+    TIER_MANIFEST,
     _build_parser,
     _default_doctor_path,
     main,
@@ -36,6 +41,19 @@ sources:
   napkin:
     repo: https://git.example.com/20c/napkin.git
 """
+
+# The manifest tier (issue #370): a `_lmer.yaml` whose `sources:` declares
+# taskdef at a different URL than GOOD, so a test can tell which tier won.
+MANIFEST_TASKDEF_REPO = "https://git.example.com/agents/taskdefs-v2.git"
+MANIFEST_GOOD = f"""\
+schema: 1
+name: example
+sources:
+  taskdef:
+    repo: {MANIFEST_TASKDEF_REPO}
+    ref: main
+"""
+MANIFEST_NO_SOURCES = "schema: 1\nname: example\n"
 
 
 @pytest.fixture(autouse=True)
@@ -438,6 +456,265 @@ class TestDoctor:
         assert doc is None
         assert out == ""
         assert "usage" in err
+
+
+def _write_manifest(tmp_path, text):
+    path = tmp_path / MANIFEST_FILENAME
+    path.write_text(text)
+    return path
+
+
+class TestDoctorTiers:
+    """`doctor` resolves BOTH declaration tiers (issue #370) through
+    load_sources, reading the manifest beside --path (decision record in the
+    module docstring, "Doctor CLI").
+
+    Additive to the frozen seam: the document gains top-level `tiers`
+    (source name -> manifest | legacy, parallel to `sources`), `manifest_path`
+    and `manifest_present`. Per-source entries, the exit codes and the
+    redaction rules are the ones the legacy-only cases above pin.
+    """
+
+    def test_manifest_only_tree_reports_the_manifest_tier(self, capsys, tmp_path):
+        manifest = _write_manifest(tmp_path, MANIFEST_GOOD)
+        absent = tmp_path / "sources.yaml"
+        code, doc, out, err = _run(
+            capsys,
+            ["doctor", "--json", "--path", str(absent), "--work-repo-url", WORK_URL],
+        )
+        assert code == EXIT_OK
+        assert doc["ok"] is True
+        assert doc["present"] is True
+        # The manifest's own `schema:` belongs to lmer_schema.manifest;
+        # `schema` stays the legacy file's int, None without one.
+        assert doc["schema"] is None
+        assert doc["manifest_present"] is True
+        assert doc["manifest_path"] == str(manifest)
+        assert doc["path"] == str(absent)
+        assert doc["tiers"] == {"taskdef": TIER_MANIFEST}
+        taskdef = doc["sources"]["taskdef"]
+        assert taskdef["repo"] == MANIFEST_TASKDEF_REPO
+        assert taskdef["ref"] == "main"
+        assert taskdef["mode"] == "https-userinfo"
+        assert taskdef["anonymous"] is False
+        assert taskdef["clone_url_redacted"] is True
+        assert doc["warnings"] == [] and doc["errors"] == []
+        assert TOKEN not in out
+        assert TOKEN not in err
+
+    def test_both_tiers_manifest_wins_per_key_with_the_stale_warning(
+        self, capsys, tmp_path
+    ):
+        manifest = _write_manifest(tmp_path, MANIFEST_GOOD)
+        path = _write(tmp_path, GOOD)
+        code, doc, _, err = _run(
+            capsys,
+            ["doctor", "--json", "--path", str(path), "--work-repo-url", WORK_URL],
+        )
+        assert code == EXIT_OK
+        assert doc["ok"] is True
+        assert doc["schema"] == 1
+        assert doc["manifest_present"] is True
+        assert doc["tiers"] == {"taskdef": TIER_MANIFEST, "napkin": TIER_LEGACY}
+        # Whole entry per key: the manifest's taskdef, the legacy napkin.
+        assert doc["sources"]["taskdef"]["repo"] == MANIFEST_TASKDEF_REPO
+        assert doc["sources"]["napkin"]["repo"] == "https://git.example.com/20c/napkin.git"
+        (stale,) = doc["warnings"]
+        assert "stale" in stale
+        assert str(path) in stale and str(manifest) in stale
+        assert "warning:" in err
+
+    def test_legacy_only_tree_reports_legacy_for_every_key(self, capsys, tmp_path):
+        path = _write(tmp_path, GOOD)
+        code, doc, _, _ = _run(capsys, ["doctor", "--json", "--path", str(path)])
+        assert code == EXIT_OK
+        assert doc["manifest_present"] is False
+        # The sibling path is reported even when nothing is there, so the
+        # consumer can name where a manifest would have been read from.
+        assert doc["manifest_path"] == str(tmp_path / MANIFEST_FILENAME)
+        assert doc["tiers"] == {"taskdef": TIER_LEGACY, "napkin": TIER_LEGACY}
+        assert doc["schema"] == 1
+
+    def test_nothing_declared_has_no_tiers(self, capsys, tmp_path):
+        code, doc, _, err = _run(
+            capsys, ["doctor", "--json", "--path", str(tmp_path / "sources.yaml")]
+        )
+        assert code == EXIT_OK
+        assert doc["present"] is False
+        assert doc["manifest_present"] is False
+        assert doc["sources"] is None
+        assert doc["tiers"] is None
+        assert err == ""
+
+    def test_manifest_without_sources_section_is_not_a_declaration(
+        self, capsys, tmp_path
+    ):
+        _write_manifest(tmp_path, MANIFEST_NO_SOURCES)
+        code, doc, _, err = _run(
+            capsys, ["doctor", "--json", "--path", str(tmp_path / "sources.yaml")]
+        )
+        assert code == EXIT_OK
+        assert doc["ok"] is True
+        assert doc["manifest_present"] is True
+        # Present manifest, no sources: tier — silent legacy mode, exactly as
+        # load_sources reports it.
+        assert doc["present"] is False
+        assert doc["sources"] is None
+        assert doc["tiers"] is None
+        assert doc["warnings"] == [] and doc["errors"] == []
+        assert err == ""
+
+    def test_broken_manifest_is_a_refusal_naming_the_manifest(self, capsys, tmp_path):
+        manifest = _write_manifest(tmp_path, "projects: [broken\n")
+        code, doc, _, err = _run(
+            capsys, ["doctor", "--json", "--path", str(tmp_path / "sources.yaml")]
+        )
+        assert code == EXIT_REFUSAL
+        assert doc["ok"] is False
+        assert doc["present"] is True
+        assert doc["manifest_present"] is True
+        assert doc["manifest_path"] == str(manifest)
+        (error,) = doc["errors"]
+        assert str(manifest) in error
+        assert "unparseable" in error
+        assert doc["sources"] is None
+        assert doc["tiers"] is None
+        # supported-schema lists stay present even on refusal (as for a bad
+        # sources.yaml) so the sh consumer can always read them.
+        assert doc["supported_sources_schemas"] == list(SUPPORTED_SOURCES_SCHEMAS)
+        assert doc["supported_taskdef_schemas"] == list(SUPPORTED_TASKDEF_SCHEMAS)
+        assert "error:" in err
+
+    def test_broken_manifest_never_demotes_to_the_legacy_tier(self, capsys, tmp_path):
+        # Spec D20: a present manifest this helper cannot read is a refusal,
+        # never a fall-back to the legacy file sitting beside it.
+        _write_manifest(tmp_path, "projects: [broken\n")
+        path = _write(tmp_path, GOOD)
+        code, doc, _, _ = _run(capsys, ["doctor", "--json", "--path", str(path)])
+        assert code == EXIT_REFUSAL
+        assert doc["sources"] is None
+        assert doc["tiers"] is None
+        assert doc["schema"] is None
+
+    def test_manifest_tier_refusal_is_scrubbed(self, capsys, tmp_path):
+        manifest = _write_manifest(
+            tmp_path,
+            "schema: 1\nname: example\nsources:\n  taskdef:\n"
+            f"    repo: https://oauth2:{TOKEN}@git.example.com/a/b.git\n",
+        )
+        code, doc, out, err = _run(
+            capsys, ["doctor", "--json", "--path", str(tmp_path / "sources.yaml")]
+        )
+        assert code == EXIT_REFUSAL
+        assert doc["ok"] is False
+        assert str(manifest) in doc["errors"][0]
+        assert TOKEN not in out
+        assert TOKEN not in err
+
+    def test_manifest_tier_trust_rule_names_the_env_override(self, capsys, tmp_path):
+        manifest = _write_manifest(
+            tmp_path,
+            "schema: 1\nname: example\nsources:\n  napkin:\n"
+            "    repo: https://evil.example.org/20c/napkin.git\n",
+        )
+        code, doc, _, _ = _run(
+            capsys,
+            [
+                "doctor", "--json", "--path", str(tmp_path / "sources.yaml"),
+                "--work-repo-url", WORK_URL,
+            ],
+        )
+        assert code == EXIT_REFUSAL
+        (error,) = doc["errors"]
+        assert "LMER_NAPKIN_REPO" in error
+        assert str(manifest) in error
+
+    def test_unimportable_core_is_a_warning_naming_it(
+        self, capsys, tmp_path, monkeypatch
+    ):
+        manifest = _write_manifest(tmp_path, MANIFEST_GOOD)
+        path = _write(tmp_path, GOOD)
+        # None in sys.modules makes the function-local import raise
+        # ImportError — an lmer built without the lmer-schema core. Both the
+        # package and the submodule are blocked: an already-imported
+        # submodule would otherwise be served straight from the cache.
+        monkeypatch.setitem(sys.modules, "lmer_schema", None)
+        monkeypatch.setitem(sys.modules, "lmer_schema.manifest", None)
+        code, doc, _, err = _run(capsys, ["doctor", "--json", "--path", str(path)])
+        assert code == EXIT_OK
+        assert doc["ok"] is True
+        assert doc["manifest_present"] is True
+        (warning,) = [w for w in doc["warnings"] if str(manifest) in w]
+        assert "lmer_schema" in warning
+        assert "not read" in warning
+        assert "PyYAML" not in warning
+        assert "warning:" in err
+        # The legacy tier is still read; the manifest tier is unread, not absent.
+        assert doc["tiers"] == {"taskdef": TIER_LEGACY, "napkin": TIER_LEGACY}
+        assert doc["sources"]["taskdef"]["repo"] == "https://git.example.com/agents/taskdefs.git"
+
+    def test_pyyaml_missing_beneath_a_manifest_is_its_own_diagnosis(
+        self, capsys, tmp_path, monkeypatch
+    ):
+        manifest = _write_manifest(tmp_path, MANIFEST_GOOD)
+        monkeypatch.setattr(sources, "yaml", None)
+        code, doc, _, _ = _run(
+            capsys, ["doctor", "--json", "--path", str(tmp_path / "sources.yaml")]
+        )
+        # No legacy file, so nothing refuses: the manifest tier is simply
+        # reported as unread, blaming the interpreter and not the manifest.
+        assert code == EXIT_OK
+        assert doc["ok"] is True
+        assert doc["manifest_present"] is True
+        (warning,) = doc["warnings"]
+        assert "PyYAML" in warning
+        assert str(manifest) in warning
+        assert "lmer_schema" not in warning
+        assert "unparseable" not in warning
+        assert doc["present"] is False
+        assert doc["tiers"] is None
+
+    def test_manifest_is_read_beside_path_not_from_the_env_root(
+        self, capsys, tmp_path, monkeypatch
+    ):
+        """The decision record: `<dir of --path>/_lmer.yaml`, nothing else."""
+        other = tmp_path / "other"
+        other.mkdir()
+        _write_manifest(other, MANIFEST_GOOD)
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(other))
+        here = tmp_path / "here"
+        here.mkdir()
+        path = _write(here, GOOD)
+        code, doc, _, _ = _run(capsys, ["doctor", "--json", "--path", str(path)])
+        assert code == EXIT_OK
+        assert doc["manifest_present"] is False
+        assert doc["manifest_path"] == str(here / MANIFEST_FILENAME)
+        assert doc["tiers"] == {"taskdef": TIER_LEGACY, "napkin": TIER_LEGACY}
+        # The canonical no---path invocation reads the work repo's manifest.
+        code, doc, _, _ = _run(capsys, ["doctor", "--json"])
+        assert code == EXIT_OK
+        assert doc["path"] == str(other / "sources.yaml")
+        assert doc["manifest_present"] is True
+        assert doc["tiers"] == {"taskdef": TIER_MANIFEST}
+
+    def test_emit_clone_urls_unredacts_manifest_tier_clone_urls_only(
+        self, capsys, tmp_path
+    ):
+        _write_manifest(tmp_path, MANIFEST_GOOD)
+        code, doc, _, err = _run(
+            capsys,
+            [
+                "doctor", "--json", "--path", str(tmp_path / "sources.yaml"),
+                "--work-repo-url", WORK_URL, "--emit-clone-urls",
+            ],
+        )
+        assert code == EXIT_OK
+        taskdef = doc["sources"]["taskdef"]
+        assert TOKEN in taskdef["clone_url"]
+        assert taskdef["clone_url_redacted"] is False
+        assert TOKEN not in taskdef["repo"]
+        assert TOKEN not in doc["work_repo_url"]
+        assert TOKEN not in err
 
 
 class TestDoctorDefaultPath:

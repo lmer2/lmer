@@ -57,6 +57,8 @@ class TestConsistency:
         all_md_files = list(project_root.glob("*.md")) + list(project_root.glob("rules/*.md"))
 
         for md_file in all_md_files:
+            if md_file.name == "CHANGELOG.md":
+                continue  # historical entries legitimately name removed paths
             content = md_file.read_text()
 
             # Find file references

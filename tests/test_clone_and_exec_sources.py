@@ -14,18 +14,27 @@ resolution wired between the work-repo clone and clone_aux_repos:
   continue-legacy reverting that source's propagation mutations
 - credential redaction of every prompt/error/banner line
 - zero-output silent legacy mode (spec G5)
+- the manifest tier (issue #370, "Manifest tier" section at the end): a
+  present ``_lmer.yaml`` is the second declaration file, read through the
+  core's one manifest parser and handed to the standalone loader; env beats
+  manifest beats legacy; a tree without a manifest keeps every byte of
+  today's output and never imports the core
 """
 
 import io
 import os
 import subprocess
 import sys
+import textwrap
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from lmer_cli.container import clone_and_exec
 from lmer_cli.container import sources as sources_mod
+from lmer_schema import manifest as manifest_core
 
 
 def _with_yaml_available():
@@ -1494,3 +1503,743 @@ class TestEndToEndAcceptance:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
+
+
+# --- Manifest tier (issue #370) ----------------------------------------------
+# The second declaration file. A present `_lmer.yaml` is probed with the
+# same stdlib test the placement code uses, read through the core's ONE
+# manifest parser (lmer_schema.manifest.load_manifest — a function-local,
+# guarded import, never module scope) and its raw `sources:` handed to the
+# standalone loader's manifest tier. Precedence is env > manifest > legacy.
+# Visibility rule: once a manifest is present every declared row names its
+# tier (the loader's declared_origin_label) and the file it came from; a tree
+# without one keeps every byte of today's output and never imports the core.
+
+MANIFEST_NAME = clone_and_exec.PLEXUS_MANIFEST_NAME
+ENTRYPOINT_PATH = Path(clone_and_exec.__file__).resolve()
+# The credentialed clone URL derive_clone_url produces for DECLARED_NAPKIN.
+NAPKIN_CLONE_URL = f"https://oauth2:{TOKEN}@git.example.com/org/napkin.git"
+# ONE taskdef+napkin declaration, as the legacy file's `sources:` and as the
+# manifest's: the R7 fold moves exactly these bytes from one file to the other.
+SOURCES_BLOCK = (
+    "  taskdef:\n"
+    f"    repo: {DECLARED_TASKDEF}\n"
+    "    ref: main\n"
+    "  napkin:\n"
+    f"    repo: {DECLARED_NAPKIN}\n"
+)
+LEGACY_DECLARATION = "schema: 1\nsources:\n" + SOURCES_BLOCK
+SOURCE_ENV_VARS = (
+    "LMER_TASKDEF_REPO", "LMER_TASKDEF_REF", "LMER_TASKDEF_PATHS",
+    "LMER_NAPKIN_REPO", "LMER_NAPKIN_PATH",
+)
+# What that declaration propagates from a bare env, and what it clones —
+# the same at every tier (TestEnvDeltasPerRow pins the legacy half).
+DECLARED_DELTA = {
+    "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
+    "LMER_TASKDEF_REF": "main",
+    "LMER_TASKDEF_PATHS": "/taskdef",
+    "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
+    "LMER_NAPKIN_PATH": "/napkin",
+}
+DECLARED_CLONES = [
+    (Path("/taskdef"), ENV_TASKDEF_EQUAL, "main"),
+    (Path("/napkin"), NAPKIN_CLONE_URL, None),
+]
+
+
+def _manifest(sources_block=None, *, schema="1", extra=""):
+    """A `_lmer.yaml` document: `schema:` and `name:` (both required by the
+    core), *extra* raw top-level lines, and a `sources:` section when given."""
+    text = f"schema: {schema}\nname: example\n{extra}"
+    if sources_block is not None:
+        text += f"sources:\n{sources_block}"
+    return text
+
+
+def _write_tree(root, *, manifest=None, legacy=None):
+    root.mkdir(parents=True, exist_ok=True)
+    if manifest is not None:
+        (root / MANIFEST_NAME).write_text(manifest)
+    if legacy is not None:
+        (root / "sources.yaml").write_text(legacy)
+    return root
+
+
+def _recording_clone(calls, failing=None):
+    """An ensure_clone stand-in recording ``(dest, url, ref)`` per declared
+    clone, failing the one at *failing* when given."""
+
+    def clone(dest, url, branch, ref, *, manage_existing):
+        assert manage_existing is True
+        calls.append((Path(dest), url, ref))
+        if failing is not None and Path(dest) == Path(failing):
+            raise Exception("boom")
+
+    return clone
+
+
+def _resolve(root, env, isatty=False, input_fn=_no_input, clone=None):
+    with patch.object(clone_and_exec, "ensure_clone", side_effect=clone) as mock_clone:
+        rc = clone_and_exec._resolve_declared_sources(
+            root, WORK_URL, env=env, isatty=isatty, input_fn=input_fn
+        )
+    return rc, mock_clone
+
+
+def _without_core():
+    """Patch context making every ``lmer_schema`` import raise ImportError (a
+    build shipping without the core). Each submodule is nulled too: ``from
+    x.y import z`` consults ``sys.modules["x.y"]`` first, so nulling the
+    package alone would leave the import working in a run that already
+    imported it (tests/test_clone_and_exec_session_dir.py's helper)."""
+    return patch.dict(
+        sys.modules,
+        {
+            "lmer_schema": None,
+            "lmer_schema.form": None,
+            "lmer_schema.manifest": None,
+            "lmer_schema.registry": None,
+        },
+    )
+
+
+class TestManifestTierGuards:
+    """The refuse-start family extended to the manifest tier: a present
+    `_lmer.yaml` whose `sources:` cannot be read is never silently ignored
+    (D20 — the same rule the PyYAML guard applies to a present sources.yaml),
+    and a tree without one never consults the core."""
+
+    def test_pyyaml_missing_with_manifest_refuses_naming_the_manifest(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        with _with_yaml_missing():
+            rc = clone_and_exec._refuse_start_if_sources_unreadable(tmp_path)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert str(tmp_path / MANIFEST_NAME) in err
+        assert "PyYAML" in err and "lmer build" in err
+        # PyYAML is blamed, not the core (which imports PyYAML at module scope
+        # and would otherwise take the blame); removing sources.yaml is no fix.
+        assert "lmer_schema" not in err
+        assert "remove sources.yaml" not in err
+
+    def test_pyyaml_missing_with_both_files_names_both(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(), legacy="schema: 1\n")
+        with _with_yaml_missing():
+            rc = clone_and_exec._refuse_start_if_sources_unreadable(tmp_path)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert f"{tmp_path / MANIFEST_NAME} and {tmp_path / 'sources.yaml'} are present" in err
+
+    def test_legacy_only_pyyaml_refusal_keeps_todays_bytes(self, tmp_path, capsys):
+        (tmp_path / "sources.yaml").write_text("schema: 1\n")
+        with _with_yaml_missing():
+            rc = clone_and_exec._refuse_start_if_sources_unreadable(tmp_path)
+        assert rc == 2
+        assert capsys.readouterr().err == (
+            f"❌ {tmp_path / 'sources.yaml'} is present but PyYAML is not "
+            "importable in the container interpreter — refusing to start rather "
+            "than silently ignoring the declared sources. Rebuild the image with "
+            "a lmer version that guarantees PyYAML: lmer build. (Or remove "
+            "sources.yaml from the work repo to run without declarations.)\n"
+        )
+
+    def test_pyyaml_missing_with_manifest_refuses_through_the_seam(self, tmp_path, capsys):
+        """The seam refuses BEFORE the core import is attempted: with PyYAML
+        gone the core would fail to import too, and the message must name
+        the real cause."""
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        env = {}
+        with _with_yaml_missing():
+            rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert env == {}
+        err = capsys.readouterr().err
+        assert "PyYAML" in err
+        assert "lmer_schema" not in err
+        assert "Traceback" not in err
+
+    def test_core_missing_with_manifest_refuses_start(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        env = {}
+        with _without_core():
+            rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert env == {}
+        err = capsys.readouterr().err
+        assert str(tmp_path / MANIFEST_NAME) in err
+        assert "lmer_schema.manifest" in err
+        assert "lmer build" in err
+        # A refusal, never a fall back to the legacy file and never a traceback.
+        assert "Traceback" not in err
+
+    def test_core_missing_without_manifest_is_never_consulted(self, tmp_path, capsys):
+        """A legacy tree resolves with the core unimportable: the import is
+        gated on the manifest probe, exactly like the placement code's."""
+        _write_tree(tmp_path, legacy=LEGACY_DECLARATION)
+        env = {"LMER_WORK_REPO_PATH": "/work"}
+        calls = []
+        with _without_core():
+            rc, _ = _resolve(tmp_path, env, clone=_recording_clone(calls))
+        assert rc == 0
+        assert env == {"LMER_WORK_REPO_PATH": "/work", **DECLARED_DELTA}
+        assert calls == DECLARED_CLONES
+        assert "lmer_schema" not in capsys.readouterr().err
+
+    def test_resolver_unloadable_with_manifest_names_the_manifest(self, tmp_path, capsys):
+        """The sibling-module loader failure (TestSourcesModuleUnloadable)
+        names the declaration file actually present."""
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        boom = ModuleNotFoundError("No module named 'sources'")
+        with patch.object(clone_and_exec, "_load_sources_module", side_effect=boom):
+            rc, mock_clone = _resolve(tmp_path, {})
+        assert rc == 2
+        mock_clone.assert_not_called()
+        err = capsys.readouterr().err
+        assert f"{tmp_path / MANIFEST_NAME} is present" in err
+        assert "could not be loaded" in err
+        assert "Traceback" not in err
+
+
+class TestManifestRefusals:
+    """ManifestError (the core's taxonomy) and SourcesConfigError from the
+    manifest tier: exit 2, credential-scrubbed, nothing cloned, env untouched.
+    A present manifest this lmer cannot read is never demoted to legacy."""
+
+    @pytest.mark.parametrize(
+        "schema, needle",
+        [("true", "integer `schema:`"), ("99", "upgrade lmer")],
+        ids=["bool-trap", "newer-int"],
+    )
+    def test_unsupported_manifest_schema_exits_2(self, tmp_path, capsys, schema, needle):
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK, schema=schema))
+        env = {"LMER_WORK_REPO_PATH": "/work"}
+        rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert env == {"LMER_WORK_REPO_PATH": "/work"}
+        err = capsys.readouterr().err
+        assert needle in err
+        assert MANIFEST_NAME in err
+        assert "Traceback" not in err
+
+    def test_unparseable_manifest_exits_2(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest="schema: 1\nname: example\nsources: [oops\n")
+        rc, mock_clone = _resolve(tmp_path, {})
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert "unparseable" in capsys.readouterr().err
+
+    def test_dangling_manifest_symlink_is_present_and_refuses(self, tmp_path, capsys):
+        """is_symlink() first: someone put a manifest there, so the tree is
+        schema-shaped even though exists() follows the link and says no."""
+        (tmp_path / MANIFEST_NAME).symlink_to(tmp_path / "no-such-manifest.yaml")
+        rc, mock_clone = _resolve(tmp_path, {})
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert "unreadable" in capsys.readouterr().err
+
+    def test_same_host_violation_in_manifest_exits_2_naming_the_env_var(self, tmp_path, capsys):
+        _write_tree(
+            tmp_path,
+            manifest=_manifest("  napkin:\n    repo: https://evil.example.net/org/napkin.git\n"),
+        )
+        env = {}
+        rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert env == {}
+        err = capsys.readouterr().err
+        assert "LMER_NAPKIN_REPO" in err
+        # The message names the manifest, not the (absent) legacy file.
+        assert str(tmp_path / MANIFEST_NAME) in err
+        assert "sources.yaml" not in err
+        assert TOKEN not in err
+
+    def test_credential_in_manifest_refuses_and_scrubs(self, tmp_path, capsys):
+        _write_tree(
+            tmp_path,
+            manifest=_manifest(
+                f"  taskdef:\n    repo: https://oauth2:{TOKEN}@git.example.com/org/taskdefs.git\n"
+            ),
+        )
+        rc, mock_clone = _resolve(tmp_path, {})
+        assert rc == 2
+        mock_clone.assert_not_called()
+        err = capsys.readouterr().err
+        assert "embeds a credential" in err
+        assert TOKEN not in err
+
+    def test_an_outranked_legacy_file_is_still_validated(self, tmp_path, capsys):
+        """Both tiers are validated before the merge (the loader's rule): a
+        cross-host legacy entry the manifest overrides still refuses start."""
+        _write_tree(
+            tmp_path,
+            manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"),
+            legacy="schema: 1\nsources:\n  taskdef:\n    repo: https://evil.example.net/org/x.git\n",
+        )
+        rc, mock_clone = _resolve(tmp_path, {})
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert str(tmp_path / "sources.yaml") in capsys.readouterr().err
+
+
+class TestManifestTierResolution:
+    """The seam end to end with a manifest in play."""
+
+    def test_a_manifest_only_declaration_resolves_end_to_end(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        env = {"LMER_WORK_REPO_PATH": "/work"}
+        calls = []
+        rc, _ = _resolve(tmp_path, env, clone=_recording_clone(calls))
+        assert rc == 0
+        assert env == {"LMER_WORK_REPO_PATH": "/work", **DECLARED_DELTA}
+        assert calls == DECLARED_CLONES
+        err = capsys.readouterr().err
+        # Every declared row names its tier, through the loader's one label.
+        assert f"source taskdef: {DECLARED_TASKDEF} (declared (manifest))\n" in err
+        assert f"source napkin: {DECLARED_NAPKIN} (declared (manifest))\n" in err
+        assert TOKEN not in err
+        # No legacy file, no warning: nothing names sources.yaml.
+        assert "sources.yaml" not in err
+
+    def test_the_container_hands_the_manifest_tier_to_the_loader(self, tmp_path):
+        """g1 review MAJOR 1: bin/doctor and the lmer_schema comments say the
+        container reads the manifest tier — this is the call that makes it
+        true. The raw `sources:` dict and the manifest path reach the
+        standalone loader as `manifest_sources=` / `manifest_path=`."""
+        _write_tree(tmp_path, manifest=_manifest(SOURCES_BLOCK))
+        standalone = clone_and_exec._load_sources_module()
+        with patch.object(standalone, "load_sources", wraps=standalone.load_sources) as spy:
+            rc, _ = _resolve(tmp_path, {"LMER_WORK_REPO_PATH": "/work"})
+        assert rc == 0
+        spy.assert_called_once()
+        args, kwargs = spy.call_args
+        assert args == (tmp_path / "sources.yaml", WORK_URL)
+        assert kwargs == {
+            "manifest_sources": {
+                "taskdef": {"repo": DECLARED_TASKDEF, "ref": "main"},
+                "napkin": {"repo": DECLARED_NAPKIN},
+            },
+            "manifest_path": tmp_path / MANIFEST_NAME,
+        }
+
+    def test_a_tree_without_a_manifest_calls_the_loader_legacy_only(self, tmp_path):
+        """The other half of the honesty test: no manifest, no manifest tier
+        — the call is exactly today's, so the result is exactly today's."""
+        _write_tree(tmp_path, legacy=LEGACY_DECLARATION)
+        standalone = clone_and_exec._load_sources_module()
+        with patch.object(standalone, "load_sources", wraps=standalone.load_sources) as spy:
+            rc, _ = _resolve(tmp_path, {"LMER_WORK_REPO_PATH": "/work"})
+        assert rc == 0
+        spy.assert_called_once_with(tmp_path / "sources.yaml", WORK_URL)
+
+    def test_the_fold_keeps_env_deltas_and_clones_identical_through_main(
+        self, tmp_path, monkeypatch
+    ):
+        """R7's E half: ONE declaration read from sources.yaml; then folded
+        into `_lmer.yaml sources:` with sources.yaml removed (what `work
+        migrate --instance` does); then a main() container start on that
+        folded tree. All three produce identical env deltas and identical
+        clones — the fold cannot switch declared sources off."""
+        pre = {"LMER_WORK_REPO_PATH": "/work"}
+
+        # (1) The legacy file.
+        legacy = _write_tree(tmp_path / "legacy", legacy=LEGACY_DECLARATION)
+        env1, calls1 = dict(pre), []
+        rc, _ = _resolve(legacy, env1, clone=_recording_clone(calls1))
+        assert rc == 0
+        delta1 = {k: v for k, v in env1.items() if pre.get(k) != v}
+
+        # (2) Folded: the same bytes under the manifest, no sources.yaml.
+        folded = _write_tree(tmp_path / "folded", manifest=_manifest(SOURCES_BLOCK))
+        assert not (folded / "sources.yaml").exists()
+        env2, calls2 = dict(pre), []
+        rc, _ = _resolve(folded, env2, clone=_recording_clone(calls2))
+        assert rc == 0
+        delta2 = {k: v for k, v in env2.items() if pre.get(k) != v}
+        assert delta2 == delta1 == DECLARED_DELTA
+        assert calls2 == calls1 == DECLARED_CLONES
+
+        # (3) main() on the folded tree.
+        work = tmp_path / "work"
+        calls3 = []
+
+        def fake_ensure_clone(workspace, repo_url, branch, ref, **kwargs):
+            if Path(workspace) == work:
+                # Only the work repo is materialized; the declared /taskdef
+                # and /napkin clones must not touch the real filesystem root.
+                _write_tree(work, manifest=_manifest(SOURCES_BLOCK))
+                return None
+            calls3.append((Path(workspace), repo_url, ref))
+            return None
+
+        for var in (
+            "LMER_SERVICE_MODE", "LMER_REPO_URL", "LMER_CHECKOUT_BRANCH",
+            "LMER_CHECKOUT_REF", "GITLAB_MR_ID", "LMER_SECONDARY_TARGETS",
+            "LMER_NAPKIN_REPO", "LMER_TASKDEF_REPO", "LMER_TASKDEF_REF",
+            "LMER_TASKDEF_PATHS", "LMER_NAPKIN_PATH", "LMER_TRUST_MISE",
+            "LMER_REPO_HOST", "LMER_REPO_PROJECT", "LMER_TASK",
+            "LMER_TASK_TARGET",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("LMER_NO_REPO", "1")
+        monkeypatch.setenv("LMER_WORK_REPO", WORK_URL)
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        monkeypatch.setattr(sys, "stdin", io.StringIO())  # headless
+        monkeypatch.setattr(clone_and_exec, "ensure_clone", fake_ensure_clone)
+        monkeypatch.setattr(clone_and_exec, "clone_aux_repos", MagicMock())
+        monkeypatch.setattr(clone_and_exec, "setup_napkin_and_links", MagicMock())
+        monkeypatch.setattr(clone_and_exec, "ensure_work_repo_directory", MagicMock())
+        monkeypatch.setattr(clone_and_exec, "provision_documentation", MagicMock())
+        monkeypatch.setattr(clone_and_exec, "_trust_mise_config", MagicMock())
+        monkeypatch.setattr(clone_and_exec.os, "execv", MagicMock())
+
+        with patch.dict(os.environ):  # restore resolution's direct mutations
+            rc = clone_and_exec.main(["--", "true"])
+            delta3 = {k: os.environ.get(k) for k in SOURCE_ENV_VARS}
+
+        assert rc == 0
+        assert delta3 == delta1
+        assert calls3 == calls1
+
+    def test_manifest_with_no_sources_and_no_legacy_file_is_zero_output(self, tmp_path, capsys):
+        """The schema-form twin of a tree with no sources.yaml: a manifest
+        that declares nothing never engages the matrix — zero output and
+        the env byte-identical, even with a source env var set."""
+        _write_tree(tmp_path, manifest=_manifest())
+        pre = {"LMER_WORK_REPO_PATH": "/work", "LMER_TASKDEF_REPO": ENV_TASKDEF_OTHER}
+        env = dict(pre)
+        rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 0
+        assert env == pre
+        mock_clone.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_manifest_beats_legacy_with_the_stale_warning(self, tmp_path, capsys):
+        other_taskdef = "https://git.example.com/org/taskdefs-v2.git"
+        _write_tree(
+            tmp_path,
+            manifest=_manifest(f"  taskdef:\n    repo: {other_taskdef}\n"),
+            legacy=LEGACY_DECLARATION,
+        )
+        env = {"LMER_WORK_REPO_PATH": "/work"}
+        calls = []
+        rc, _ = _resolve(tmp_path, env, clone=_recording_clone(calls))
+        assert rc == 0
+        # Whole entry: the manifest's taskdef declares no ref, so the legacy
+        # ref is not inherited; napkin, legacy-only, keeps the legacy entry.
+        assert env == {
+            "LMER_WORK_REPO_PATH": "/work",
+            "LMER_TASKDEF_REPO": other_taskdef,
+            "LMER_TASKDEF_PATHS": "/taskdef",
+            "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
+            "LMER_NAPKIN_PATH": "/napkin",
+        }
+        assert calls == [
+            (Path("/taskdef"), f"https://oauth2:{TOKEN}@git.example.com/org/taskdefs-v2.git", None),
+            (Path("/napkin"), NAPKIN_CLONE_URL, None),
+        ]
+        err = capsys.readouterr().err
+        # The loader's stale-legacy WARN is printed...
+        assert (
+            f"⚠️  {tmp_path / 'sources.yaml'}: `sources.taskdef` is also declared in "
+            f"{tmp_path / MANIFEST_NAME}, which takes precedence"
+        ) in err
+        # ...and each row names the tier it came from.
+        assert f"source taskdef: {other_taskdef} (declared (manifest))\n" in err
+        assert f"source napkin: {DECLARED_NAPKIN} (declared (sources.yaml))\n" in err
+        assert TOKEN not in err
+
+    def test_manifest_warnings_are_the_validators_and_never_printed(self, tmp_path, capsys):
+        """`Manifest.warnings` (unknown keys anywhere in the manifest) belong
+        to `lmer-schema validate`; only the loader's `sources:` findings
+        are printed here, so nothing is repeated in two spellings."""
+        _write_tree(
+            tmp_path,
+            manifest=_manifest(
+                f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n    extra: 1\n",
+                extra="future_key: 1\n",
+            ),
+        )
+        rc, _ = _resolve(tmp_path, {"LMER_WORK_REPO_PATH": "/work"})
+        assert rc == 0
+        err = capsys.readouterr().err
+        # The loader's finding, in its spelling...
+        assert "unknown key `extra` under `sources.taskdef`" in err
+        # ...and neither of the core's.
+        assert "future_key" not in err
+        assert "sources.taskdef.extra" not in err
+
+    def test_env_equal_to_the_manifest_is_a_silent_env_match(self, tmp_path, capsys):
+        """Env beats manifest, row 2: the credentialed form of the manifest's
+        declaration wins silently — no prompt, env byte-identical, the env
+        URL cloned, the banner's origin env-match (no file named: the value
+        in effect came from the env)."""
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        pre = {
+            "LMER_WORK_REPO_PATH": "/work",
+            "LMER_TASKDEF_REPO": ENV_TASKDEF_EQUAL,
+            "LMER_TASKDEF_PATHS": "/mnt/td0:/taskdef",
+        }
+        env = dict(pre)
+        calls = []
+        rc, _ = _resolve(tmp_path, env, clone=_recording_clone(calls))
+        assert rc == 0
+        assert env == pre
+        assert calls == [(Path("/taskdef"), ENV_TASKDEF_EQUAL, None)]
+        err = capsys.readouterr().err
+        assert err == f"source taskdef: {DECLARED_TASKDEF} (env-match)\n"
+
+    def test_env_different_from_the_manifest_prompts_on_a_tty_naming_the_manifest(
+        self, tmp_path, capsys
+    ):
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        env = {"LMER_WORK_REPO_PATH": "/work", "LMER_TASKDEF_REPO": ENV_TASKDEF_OTHER}
+        calls = []
+        rc, _ = _resolve(
+            tmp_path, env, isatty=True, input_fn=_scripted_input(["d"]),
+            clone=_recording_clone(calls),
+        )
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert f"     {MANIFEST_NAME} declares: {DECLARED_TASKDEF}\n" in err
+        assert "sources.yaml declares" not in err
+        assert f"source taskdef: {DECLARED_TASKDEF} (declared (manifest))\n" in err
+        assert calls == [(Path("/taskdef"), ENV_TASKDEF_EQUAL, None)]
+        assert TOKEN not in err
+
+    def test_env_different_from_the_manifest_headless_exits_2_naming_the_manifest(
+        self, tmp_path, capsys
+    ):
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        pre = {"LMER_WORK_REPO_PATH": "/work", "LMER_TASKDEF_REPO": ENV_TASKDEF_OTHER}
+        env = dict(pre)
+        rc, mock_clone = _resolve(tmp_path, env)
+        assert rc == 2
+        mock_clone.assert_not_called()
+        assert env == pre
+        err = capsys.readouterr().err
+        assert err == (
+            f"❌ source taskdef: repo mismatch — {MANIFEST_NAME} declares "
+            f"{DECLARED_TASKDEF} but LMER_TASKDEF_REPO is set to "
+            f"https://git.example.com/org/other.git. Fix: update {MANIFEST_NAME}, "
+            "change or unset LMER_TASKDEF_REPO to match, or launch interactively "
+            "to choose.\n"
+        )
+
+    def test_env_only_note_names_both_files_searched_when_a_manifest_is_present(
+        self, tmp_path, capsys
+    ):
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        pre = {
+            "LMER_WORK_REPO_PATH": "/work",
+            "LMER_NAPKIN_REPO": ENV_NAPKIN_OTHER,
+            "LMER_NAPKIN_PATH": "/napkin",
+        }
+        env = dict(pre)
+        rc, _ = _resolve(tmp_path, env)
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert (
+            f"ℹ️  source napkin: no declaration in {MANIFEST_NAME} or sources.yaml — "
+            "using LMER_NAPKIN_REPO (env-only)\n"
+        ) in err
+        assert "source napkin: https://git.example.com/org/other-napkin.git (env-only)\n" in err
+        # The env-only row's env stays byte-identical.
+        assert {k: env[k] for k in ("LMER_NAPKIN_REPO", "LMER_NAPKIN_PATH")} == {
+            k: pre[k] for k in ("LMER_NAPKIN_REPO", "LMER_NAPKIN_PATH")
+        }
+
+    def test_ref_env_only_note_names_the_file_the_row_came_from(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        env = {"LMER_WORK_REPO_PATH": "/work", "LMER_TASKDEF_REF": "dev"}
+        rc, _ = _resolve(tmp_path, env)
+        assert rc == 0
+        assert env["LMER_TASKDEF_REF"] == "dev"
+        assert (
+            f"ℹ️  source taskdef: no ref declared in {MANIFEST_NAME} — using "
+            "LMER_TASKDEF_REF (env-only)\n"
+        ) in capsys.readouterr().err
+
+    def test_declared_clone_failure_remediation_names_the_manifest(self, tmp_path, capsys):
+        _write_tree(tmp_path, manifest=_manifest(f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n"))
+        rc, _ = _resolve(
+            tmp_path, {"LMER_WORK_REPO_PATH": "/work"},
+            clone=_recording_clone([], failing="/taskdef"),
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert f"or remove the taskdef declaration from {MANIFEST_NAME}." in err
+        assert "from sources.yaml" not in err
+
+    def test_a_legacy_row_under_a_manifest_names_the_legacy_file(self, tmp_path, capsys):
+        """Per row, not per tree: with a manifest present, a source only the
+        legacy file declares is labelled as the legacy file's."""
+        _write_tree(
+            tmp_path,
+            manifest=_manifest(f"  napkin:\n    repo: {DECLARED_NAPKIN}\n"),
+            legacy=f"schema: 1\nsources:\n  taskdef:\n    repo: {DECLARED_TASKDEF}\n",
+        )
+        rc, _ = _resolve(
+            tmp_path, {"LMER_WORK_REPO_PATH": "/work"},
+            clone=_recording_clone([], failing="/taskdef"),
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert f"source taskdef: {DECLARED_TASKDEF} (declared (sources.yaml))\n" in err
+        assert f"source napkin: {DECLARED_NAPKIN} (declared (manifest))\n" in err
+        assert "or remove the taskdef declaration from sources.yaml." in err
+
+    def test_a_tree_without_a_manifest_keeps_the_legacy_vocabulary(self, tmp_path, capsys):
+        """No manifest: the banner is the bare `(declared)`, the notes name
+        sources.yaml alone, and `_lmer.yaml` is never mentioned — today's
+        output, byte for byte."""
+        _write_tree(tmp_path, legacy=f"schema: 1\nsources:\n  taskdef:\n    repo: {DECLARED_TASKDEF}\n")
+        env = {
+            "LMER_WORK_REPO_PATH": "/work",
+            "LMER_TASKDEF_REF": "dev",
+            "LMER_NAPKIN_REPO": ENV_NAPKIN_OTHER,
+            "LMER_NAPKIN_PATH": "/napkin",
+        }
+        rc, _ = _resolve(tmp_path, env)
+        assert rc == 0
+        assert capsys.readouterr().err == (
+            "ℹ️  source taskdef: no ref declared in sources.yaml — using LMER_TASKDEF_REF (env-only)\n"
+            "ℹ️  source napkin: no declaration in sources.yaml — using LMER_NAPKIN_REPO (env-only)\n"
+            f"source taskdef: {DECLARED_TASKDEF} (declared)\n"
+            "source napkin: https://git.example.com/org/other-napkin.git (env-only)\n"
+        )
+
+
+class TestManifestTierDriftGuards:
+    def test_manifest_name_mirrors_the_core_and_the_loader(self):
+        """The stdlib probe spells the name the core owns; the loader's
+        message-label mirror is the same name."""
+        assert clone_and_exec.PLEXUS_MANIFEST_NAME == manifest_core.MANIFEST_NAME
+        assert clone_and_exec.PLEXUS_MANIFEST_NAME == sources_mod.MANIFEST_FILENAME
+
+    def test_declared_origin_mirrors_the_loader(self):
+        """ORIGIN_DECLARED is the legacy-only banner spelling; the tiered
+        label the loader spells wraps the same bare word."""
+        assert clone_and_exec.ORIGIN_DECLARED == sources_mod.ORIGIN_DECLARED
+        for tier in sources_mod.SOURCE_TIERS:
+            assert sources_mod.declared_origin_label(tier).startswith(
+                f"{clone_and_exec.ORIGIN_DECLARED} ("
+            )
+
+    def test_load_manifest_is_the_only_reader_of_the_manifest(self, tmp_path, monkeypatch, capsys):
+        """No second manifest parser on this path: with the core's
+        load_manifest monkeypatched, the on-disk `_lmer.yaml` can be
+        unparseable and the fake's `sources:` is what resolves — nothing else
+        opened the file. The fake's `warnings` never reach the output."""
+        _write_tree(tmp_path, manifest="schema: 1\nname: example\nsources: [oops\n")
+        seen = []
+
+        def fake_load_manifest(root):
+            seen.append(Path(root))
+            return manifest_core.Manifest(
+                path=Path(root) / MANIFEST_NAME,
+                schema=1,
+                name="example",
+                projects={},
+                sources={"taskdef": {"repo": DECLARED_TASKDEF}},
+                housekeeping={},
+                warnings=("VALIDATOR-ONLY-WARNING",),
+            )
+
+        monkeypatch.setattr(manifest_core, "load_manifest", fake_load_manifest)
+        env = {"LMER_WORK_REPO_PATH": "/work"}
+        calls = []
+        rc, _ = _resolve(tmp_path, env, clone=_recording_clone(calls))
+        assert rc == 0
+        assert seen == [tmp_path]
+        assert env == {
+            "LMER_WORK_REPO_PATH": "/work",
+            "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
+            "LMER_TASKDEF_PATHS": "/taskdef",
+        }
+        assert calls == [(Path("/taskdef"), ENV_TASKDEF_EQUAL, None)]
+        assert "VALIDATOR-ONLY-WARNING" not in capsys.readouterr().err
+
+
+class TestStandaloneEntrypointSources:
+    """The container runs this file BY PATH (``python3 .../clone_and_exec.py``)
+    — the context the module's import contract is about. Both tiers are
+    exercised once that way, in a ``-P`` subprocess that loads the file by
+    location (tests/test_clone_and_exec_session_dir.py's pattern)."""
+
+    def _run(self, tmp_path, root, expected_env, expected_clones, body):
+        script = textwrap.dedent(
+            f"""
+            import importlib.util
+            import sys
+            from pathlib import Path
+
+            spec = importlib.util.spec_from_file_location(
+                "lmer_container_entrypoint", {str(ENTRYPOINT_PATH)!r}
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["lmer_container_entrypoint"] = module
+            spec.loader.exec_module(module)
+            assert "lmer_cli" not in sys.modules, "loading the entrypoint imported the package"
+            assert "lmer_schema" not in sys.modules, "loading the entrypoint imported the core"
+
+            clones = []
+            module.ensure_clone = lambda dest, url, branch, ref, **kw: clones.append(
+                (str(dest), url, ref)
+            )
+            env = {{"LMER_WORK_REPO_PATH": "/work"}}
+            rc = module._resolve_declared_sources(
+                Path({str(root)!r}), {WORK_URL!r}, env=env, isatty=False
+            )
+            assert rc == 0, rc
+            assert env == {expected_env!r}, env
+            assert clones == {expected_clones!r}, clones
+            """
+        ) + textwrap.dedent(body) + "\nprint('OK')\n"
+        result = subprocess.run(
+            [sys.executable, "-P", "-c", script],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        return result
+
+    def test_a_legacy_tree_resolves_without_importing_the_core(self, tmp_path):
+        root = _write_tree(tmp_path / "work", legacy=LEGACY_DECLARATION)
+        self._run(
+            tmp_path, root,
+            {"LMER_WORK_REPO_PATH": "/work", **DECLARED_DELTA},
+            [(str(dest), url, ref) for dest, url, ref in DECLARED_CLONES],
+            """
+            assert "lmer_schema" not in sys.modules, "a legacy tree imported the core"
+            assert "lmer_cli" not in sys.modules, "a legacy tree imported the package"
+            """,
+        )
+
+    def test_a_manifest_tree_resolves_through_the_core_by_path(self, tmp_path):
+        """The guarded function-local import works in the by-path context
+        too (the core is installed in the image): the manifest tier resolves
+        through the core. The core's package body eagerly pulls
+        ``lmer_cli.container.sources`` (its D21 URL adapter — the dependency
+        points one way, by the core's own contract), so ``lmer_cli`` IS in
+        sys.modules afterwards; that is the core's import, not the
+        entrypoint's, whose own contract the AST guard and the legacy-tree
+        test above hold."""
+        root = _write_tree(tmp_path / "work", manifest=_manifest(SOURCES_BLOCK))
+        result = self._run(
+            tmp_path, root,
+            {"LMER_WORK_REPO_PATH": "/work", **DECLARED_DELTA},
+            [(str(dest), url, ref) for dest, url, ref in DECLARED_CLONES],
+            """
+            assert "lmer_schema.manifest" in sys.modules, "the manifest tier was not read through the core"
+            """,
+        )
+        assert f"source taskdef: {DECLARED_TASKDEF} (declared (manifest))" in result.stderr

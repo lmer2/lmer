@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Tests for work_repo.utils module"""
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from work_repo.utils import (
     LEGACY_FORM,
+    CoreUnavailableError,
+    core_module,
     instance_memory_dir,
     project_area,
     project_info_dir,
@@ -274,7 +277,7 @@ class TestInfoDirHelpers:
 
 class TestLegacyFormHelpers:
     """The dual-read accessors (issue #353 D20) answering for a tree with no
-    `_plexus.yaml` — the only form these env-only tests build. Schema form
+    `_lmer.yaml` — the only form these env-only tests build. Schema form
     and the failure modes live in tests/test_work_repo_schema_base.py."""
 
     def test_layout_is_legacy_and_names_no_manifest(self, clean_info_env, tmp_path):
@@ -320,3 +323,34 @@ class TestLegacyFormHelpers:
             clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
             clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
         assert instance_memory_dir() is None
+
+
+class TestCoreModule:
+    """The one core import for the tooling verbs (issue #353 D20): `adopt`,
+    `migrate` and their successors reach `lmer_schema` through
+    `core_module()`, so the import is spelled in `work_repo.utils` alone
+    (tests/test_work_repo_schema_base.py guards the siblings)."""
+
+    def test_returns_the_real_module(self):
+        import lmer_schema.checks.walk
+        import lmer_schema.writer
+
+        assert core_module("writer") is lmer_schema.writer
+        assert core_module("checks.walk") is lmer_schema.checks.walk
+
+    def test_a_missing_name_raises_the_one_type(self):
+        with pytest.raises(CoreUnavailableError) as info:
+            core_module("no_such_module")
+        assert "lmer_schema.no_such_module" in str(info.value)
+        assert isinstance(info.value.__cause__, ImportError)
+
+    def test_an_absent_core_raises_the_one_type(self, monkeypatch):
+        """An old checkout with no core: the single type, an `ImportError`
+        underneath so `str()` is still the loader's own text."""
+        for name in ("lmer_schema", "lmer_schema.writer"):
+            monkeypatch.setitem(sys.modules, name, None)
+        with pytest.raises(CoreUnavailableError) as info:
+            core_module("writer")
+        assert isinstance(info.value, ImportError)
+        assert "lmer_schema.writer" in str(info.value)
+        assert isinstance(info.value.__cause__, ImportError)

@@ -313,3 +313,22 @@ it('draws platform digests as compact, attributed rows that open their run', asy
     (turn) => !turn.classes('ground-operator'))).toBe(true)
   stop()
 })
+
+it('opens a schema-2 digest at its execution, not its slug group', async () => {
+  const uid = 'a'.repeat(32)
+  const run = { host: 'gitlab.example.com', project: 'group/app', slug: 'run-1', label: 'Fix the widget', uid }
+  const body = 'gitlab.example.com/group/app/run-1 is now complete'
+  pages.set(3, [
+    ...data(3),
+    row(3, 2, body, { id: 'digest-uid', role: 'platform', source: { channel: 'platform' }, comms_kind: 'digest: complete',
+      digest: { kind: 'complete', run } }),
+  ])
+  const opened = []
+  const stop = onRunRef((ref) => opened.push(ref.key))
+  const wrapper = await open()
+  const digest = wrapper.find('.turn-digest')
+  expect(digest.find('button.digest-toggle').text()).toBe('is now complete')
+  await digest.find('button.digest-run').trigger('click')
+  expect(opened).toEqual([`gitlab.example.com/group/app/${uid}`])
+  stop()
+})

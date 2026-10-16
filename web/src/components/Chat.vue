@@ -657,7 +657,8 @@ function digestRef(message) {
 function digestPreview(message) {
   const run = message.digest?.run
   let text = String(message.text || '')
-  const prefix = run ? `${runKey(run)} ` : null
+  // The digest text leads with the slug-spelled ref even when the link keys by uid.
+  const prefix = run ? `${runKey({ ...run, uid: undefined })} ` : null
   if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length)
   return text.split('\n', 1)[0]
 }
