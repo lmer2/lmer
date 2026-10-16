@@ -795,6 +795,61 @@ def test_the_harness_copy_of_a_relayed_record_is_hidden(platform_root):
     assert said(page).count(("user", "hello there")) == 2
 
 
+def test_the_new_assistant_tag_is_claimed(platform_root):
+    """A current worker types ``[Ratchet] …``; the bus record must not show twice."""
+    session_id = "s-bus-ratchet"
+    plant_rows(session_id, [
+        user_row("[Ratchet] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100)
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[Ratchet")]
+    assert harness_copies == [], "the harness's copy of the relayed record is still shown"
+    assert said(page).count(("user", "the review is posted")) == 1
+
+
+def test_a_legacy_assistant_tag_is_still_claimed(platform_root):
+    """A container started before the rename still types ``[uber lmer] …`` (#581)."""
+    session_id = "s-bus-legacy"
+    plant_rows(session_id, [
+        user_row("[uber lmer] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100)
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[uber lmer")]
+    assert harness_copies == [], "the legacy tag's harness copy is still shown"
+    assert said(page).count(("user", "the review is posted")) == 1
+
+
+def test_a_config_json_only_name_is_claimed(platform_root):
+    """The host's resolved name (config.assistant_name), not just its env, decides
+    which relay line is the harness's copy (review of !403)."""
+    session_id = "s-bus-sprocket"
+    plant_rows(session_id, [
+        user_row("[Sprocket] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100, assistant_name="Sprocket")
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[Sprocket")]
+    assert harness_copies == [], "a config-only name left the harness copy visible"
+    assert said(page).count(("user", "the review is posted")) == 1
+
+
+def test_a_renamed_assistant_still_claims_the_legacy_tag(platform_root):
+    session_id = "s-bus-renamed-legacy"
+    plant_rows(session_id, [
+        user_row("[uber lmer] the review is posted", at="2026-07-20T09:00:02.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "the review is posted", channel="uber-lmer",
+                 at="2026-07-20T09:00:01Z")
+    page = transcripts.read_messages(session_id, limit=100, assistant_name="Sprocket")
+    harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[uber lmer")]
+    assert harness_copies == [], "the legacy alias was dropped once the name changed"
+
+
 def test_a_late_answer_is_labelled_and_a_command_is_the_platforms(platform_root):
     session_id = "s-bus-late"
     registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
@@ -936,7 +991,7 @@ def test_a_thread_link_the_container_chose_never_becomes_an_href(platform_root):
 def test_the_view_names_the_source_and_the_kind():
     text = _chat()
     assert "sourceLabel(source)" in text and "message.comms_kind" in text
-    assert "'uber-lmer': 'uber lmer'" in text
+    assert "source.channel === 'uber-lmer' ? assistantName.value" in text
     api_js = (CHAT.parent.parent / "api.js").read_text(encoding="utf-8")
     send = api_js[api_js.index("export function sendSessionInput"):]
     send = send[:send.index("\n}\n")]

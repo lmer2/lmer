@@ -1414,11 +1414,11 @@ class Detector:
         if not threshold:
             return (
                 "context-fullness reminders are OFF on this host "
-                "(rotation_context_threshold is 0): uber lmer is never told its "
+                f"(rotation_context_threshold is 0): {self.config.assistant_name} is never told its "
                 "window is filling. POST /api/assistant/config to set a percent."
             )
         return (
-            f"context-fullness reminder ON: when uber lmer's own status line "
+            f"context-fullness reminder ON: when {self.config.assistant_name}'s own status line "
             f"reports {threshold}% of its context window used, it is told once "
             f"— and again at most every "
             f"{rotation.REMINDER_INTERVAL_SECONDS // 60}m while it stays there — "

@@ -85,7 +85,7 @@ DRAWER = WEB / "src" / "components" / "AssistantChat.vue"
 #: ``lmer`` and the one supervising them is ``uber lmer`` (operator request,
 #: 2026-07-27). Held here as the closed set because this is the component that
 #: renders whichever one it is handed.
-AGENT_NAMES = ("lmer", "uber lmer")
+AGENT_NAMES = ("lmer", "assistantName")
 
 #: The theme colour each class of turn is drawn on, and the class in Chat.vue's
 #: scoped stylesheet that reaches it. Here rather than inline because two modules
@@ -484,7 +484,7 @@ def test_every_consumer_of_the_conversation_titles_its_turns_deliberately():
 
     for name, tags in consumers.items():
         for tag in tags:
-            passed = re.search(r'\sagent-label="([^"]*)"', tag)
+            passed = re.search(r'\s:?agent-label="([^"]*)"', tag)
             if passed is None:
                 continue
             assert passed.group(1) in AGENT_NAMES, (
@@ -492,8 +492,8 @@ def test_every_consumer_of_the_conversation_titles_its_turns_deliberately():
                 "neither of the two names an lmer session goes by"
             )
 
-    drawer = re.search(r'<Chat\b[^>]*\sagent-label="([^"]*)"', _read(DRAWER), re.S)
-    assert drawer and drawer.group(1) == "uber lmer", (
+    drawer = re.search(r'<Chat\b[^>]*\s:agent-label="([^"]*)"', _read(DRAWER), re.S)
+    assert drawer and drawer.group(1) == "assistantName", (
         "the drawer leaves the shared conversation on its default name, so the "
         "supervisor's own turns are titled as a worker's"
     )

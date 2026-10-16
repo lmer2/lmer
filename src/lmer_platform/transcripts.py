@@ -2745,7 +2745,7 @@ def _interleave(transcript: list, channel: list) -> list:
     return [item[3] for item in ordered]
 
 
-def _comms_messages(session_id: str) -> tuple:
+def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """One session's bus records as turns, and the harness's copies to hide.
 
     Returns ``(turns, copies)``. *copies* holds ``(role, text)`` for every
@@ -2781,10 +2781,10 @@ def _comms_messages(session_id: str) -> tuple:
             "conversation is served without the bus's turns", session_id, exc,
         )
         return [], []
-    return _comms_turns(events, session_id)
+    return _comms_turns(events, session_id, assistant_name)
 
 
-def _comms_turns(events: list, session_id: str) -> tuple:
+def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = None) -> tuple:
     from lmer_cli import comms as bus
     from .assistant_conversation import digest_run
 
@@ -2847,10 +2847,19 @@ def _comms_turns(events: list, session_id: str) -> tuple:
                 continue
             asked = questions.get(record.get("in_reply_to"))
             line, tagged = bus.relay_payload(
-                message, bus.Message.from_dict(asked) if asked else None
+                message, bus.Message.from_dict(asked) if asked else None,
+                assistant_name=assistant_name,
             )
             if tagged:
                 copies.append(("user", _collapsed(line), None))
+                # A container started before a rename keeps typing the old tag
+                # (#581); claim every alias so the pane does not show the
+                # relayed message twice until that session rotates.
+                if message.source.channel == bus.CHANNEL_UBER:
+                    current = (assistant_name or "").strip() or bus.assistant_display_name()
+                    for alias in bus.assistant_label_aliases(name=assistant_name):
+                        if alias != current:
+                            copies.append(("user", _collapsed(line.replace(f"[{current}", f"[{alias}", 1)), None))
     return turns, copies
 
 
@@ -3058,7 +3067,7 @@ def _spend_by_tail(transcript, copies, wanted, claimed, spent) -> None:
             break
 
 
-def _merged_channel(session_id: str) -> tuple:
+def _merged_channel(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """The turns to merge into one session's transcript, and the copies to hide.
 
     The bus wins when it has anything: the ask directory is a projection of the
@@ -3066,7 +3075,7 @@ def _merged_channel(session_id: str) -> tuple:
     question twice. A session with no bus turns — an older image — keeps the ask
     channel's exchange exactly as before.
     """
-    turns, copies = _comms_messages(session_id)
+    turns, copies = _comms_messages(session_id, assistant_name)
     if turns:
         return turns, copies
     return _channel_messages(session_id), []
@@ -3183,7 +3192,7 @@ def _source_name(session_id: str, path: Path) -> str:
 
 
 @scrub_pass()
-def collect_messages(session_id: str) -> tuple:
+def collect_messages(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """Normalize the named conversation without choosing a response page."""
     _validated(session_id)
     messages: list = []
@@ -3205,7 +3214,7 @@ def collect_messages(session_id: str) -> tuple:
                 if message.id is None:
                     message.id = f"{member}:{name}#{index}"
                 found.append(message)
-        channel, copies = _merged_channel(member)
+        channel, copies = _merged_channel(member, assistant_name)
         joined = _interleave(_without_bus_copies(found, copies), channel)
         for message in joined:
             message.session = member
@@ -3218,7 +3227,7 @@ def collect_messages(session_id: str) -> tuple:
     if not archived and isinstance(entry, dict) and entry.get("kind") == "assistant":
         from . import assistant_conversation
 
-        channel, copies = _comms_turns(assistant_conversation.events(), session_id)
+        channel, copies = _comms_turns(assistant_conversation.events(), session_id, assistant_name)
         working = [message for message in messages if not message.via]
         conversation = [message for message in messages if message.via]
         messages = _interleave(
@@ -3239,6 +3248,7 @@ def read_messages(
     *,
     since: int = 0,
     limit: int = DEFAULT_MESSAGE_LIMIT,
+    assistant_name: Optional[str] = None,
 ) -> MessagePage:
     """The conversation of *session_id*'s run, as a page of normalised messages.
 
@@ -3259,7 +3269,7 @@ def read_messages(
     _validated(session_id)
     limit = max(1, min(int(limit), MAX_MESSAGE_LIMIT))
 
-    messages, read = collect_messages(session_id)
+    messages, read = collect_messages(session_id, assistant_name)
 
     total = len(messages)
     start = max(0, total + since) if since < 0 else min(since, total)

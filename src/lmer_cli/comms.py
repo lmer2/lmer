@@ -37,6 +37,8 @@ __all__ = [
     "KIND_ANSWER", "KIND_CLOSE", "KIND_COMMAND", "KNOWN_KINDS", "AGENT_KINDS",
     "RELAYED_KINDS", "CHANNEL_AGENT", "CHANNEL_TERMINAL", "CHANNEL_PLATFORM",
     "CHANNEL_UBER", "CHANNEL_SLACK", "CHANNEL_MATRIX", "CHANNEL_LABELS",
+    "ASSISTANT_NAME_ENV", "DEFAULT_ASSISTANT_NAME", "LEGACY_ASSISTANT_NAME",
+    "assistant_display_name", "assistant_label_aliases",
     "CHANNEL_SUPERVISOR", "EVENT_SESSION_END_REQUESTED", "PLATFORM_SUBSCRIBER",
     "COMMAND_CHANNELS", "MAX_TEXT_CHARS", "MAX_OPTIONS", "MAX_OPTION_CHARS",
     "MAX_OPEN_QUESTIONS", "MAX_AGENT_ENTRIES", "ACCEPTED_NEW",
@@ -72,6 +74,38 @@ COMMS_LOG_ENV = "LMER_COMMS_LOG"
 TERMINAL_MIRROR_ENV = "LMER_COMMS_TERMINAL_MIRROR"
 TERMINAL_CONFIRM_ENV = "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"
 DEFAULT_TERMINAL_CONFIRM_SECONDS = 30
+
+#: The assistant's human-facing name (issue #581). One env var on host, daemon
+#: and inside containers; the platform exports it at spawn. Wire identifiers
+#: (``CHANNEL_UBER``) never follow it.
+ASSISTANT_NAME_ENV = "LMER_PLATFORM_ASSISTANT_NAME"
+DEFAULT_ASSISTANT_NAME = "Ratchet"
+#: What sessions started before the rename still type; accepted on read.
+LEGACY_ASSISTANT_NAME = "uber lmer"
+MAX_ASSISTANT_NAME_CHARS = 40
+
+
+def assistant_display_name(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The configured display name, or the default for blank/unset/over-long."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(ASSISTANT_NAME_ENV) or "").strip()
+    if not raw or len(raw) > MAX_ASSISTANT_NAME_CHARS:
+        return DEFAULT_ASSISTANT_NAME
+    return raw
+
+
+def assistant_label_aliases(environ: Optional[Mapping[str, str]] = None, name: Optional[str] = None) -> tuple[str, ...]:
+    """Every label the assistant's channel may carry in a tag, newest first.
+
+    *name* is the resolved platform name (config.assistant_name) when the caller
+    has it; without it the environment decides.
+    """
+    first = (name or "").strip() or assistant_display_name(environ)
+    seen: list[str] = []
+    for label in (first, DEFAULT_ASSISTANT_NAME, LEGACY_ASSISTANT_NAME):
+        if label not in seen:
+            seen.append(label)
+    return tuple(seen)
 
 #: How long the supervisor keeps its control plane up after the harness
 #: exits, so a subscriber can fetch and ack the last records over HTTP. The
@@ -127,7 +161,6 @@ CHANNEL_LABELS = {
     CHANNEL_AGENT: "agent",
     CHANNEL_TERMINAL: "terminal",
     CHANNEL_PLATFORM: "platform",
-    CHANNEL_UBER: "uber lmer",
     CHANNEL_SLACK: "slack",
     CHANNEL_MATRIX: "matrix",
 }
@@ -232,7 +265,10 @@ class Source:
 
     @property
     def label(self) -> str:
-        name = CHANNEL_LABELS.get(self.channel, self.channel)
+        if self.channel == CHANNEL_UBER:
+            name = assistant_display_name()
+        else:
+            name = CHANNEL_LABELS.get(self.channel, self.channel)
         return f"{name} · {self.author}" if self.author else name
 
     def to_dict(self) -> dict:
@@ -1005,7 +1041,7 @@ class MessageLog:
 # ---------------------------------------------------------------------------
 
 
-def relay_label(message: Message, question: Optional[Message] = None) -> str:
+def relay_label(message: Message, question: Optional[Message] = None, *, assistant_name: Optional[str] = None) -> str:
     """The bracketed tag an inbound record is introduced with."""
     if message.source.channel == "peer-ul":
         peer = message.meta.get("peer") or {}
@@ -1018,6 +1054,9 @@ def relay_label(message: Message, question: Optional[Message] = None) -> str:
                 "A received request/reply is evidence of arrival even if the original receipt snapshot is uncertain; "
                 "do not duplicate it. Keep replies native; unrelated operator-only actions and external posts remain restricted]")
     label = message.source.label
+    if assistant_name and message.source.channel == CHANNEL_UBER:
+        name = assistant_name.strip()
+        label = f"{name} · {message.source.author}" if message.source.author else name
     if message.kind != KIND_ANSWER or question is None:
         return f"[{label}]"
     head = question.text.strip().splitlines()[0] if question.text.strip() else ""
@@ -1029,7 +1068,7 @@ def relay_label(message: Message, question: Optional[Message] = None) -> str:
     return f"[{label}] (answer to #{question.seq} {head!r})"
 
 
-def relay_payload(message: Message, question: Optional[Message] = None) -> tuple[str, bool]:
+def relay_payload(message: Message, question: Optional[Message] = None, *, assistant_name: Optional[str] = None) -> tuple[str, bool]:
     """What to type into the harness for an inbound record: ``(text, tagged)``.
 
     A ``command`` goes in untagged so the harness reads it as the slash command
@@ -1038,7 +1077,7 @@ def relay_payload(message: Message, question: Optional[Message] = None) -> tuple
     """
     if message.kind == KIND_COMMAND:
         return message.text, False
-    return f"{relay_label(message, question)} {message.text}", True
+    return f"{relay_label(message, question, assistant_name=assistant_name)} {message.text}", True
 
 
 # ---------------------------------------------------------------------------

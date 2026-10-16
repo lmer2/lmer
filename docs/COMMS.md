@@ -4,7 +4,7 @@ One channel, in both directions, with the supervisor as the single port.
 
 An agent in an lmer session has one command to talk to the world,
 `lmer-signal`, and does not know or care who is listening. Conversational messages
-reach every connected party — the platform's chat pane, uber lmer, a Slack
+reach every connected party — the platform's chat pane, Ratchet, a Slack
 thread, a matrix thread, a human at the terminal — and everything any of them
 says arrives in the harness as an ordinary message tagged with where it came
 from. The supervisor inside the container (`lmer-supervisor`) keeps the one
@@ -382,14 +382,15 @@ one submitted turn, through the same locked submit path `/input` uses:
 
 ```
 [slack · tester] which target branch?
-[uber lmer] the review is posted; fix the two majors and re-signal
+[Ratchet] the review is posted; fix the two majors and re-signal
 [matrix · @alice:example.org] (answer to #39 'target branch?') prep-release
 [matrix · @alice:example.org] (late answer to #39 'target branch?', already answered by 20260904-…/000040) main
 [terminal] ok go ahead
 ```
 
 The tag is `[<channel>]` or `[<channel> · <author>]`; `uber-lmer` renders as
-`uber lmer`. Because the tag always takes column one, a message starting with
+the configured assistant name, `Ratchet` by default (`LMER_PLATFORM_ASSISTANT_NAME`).
+Sessions started before a rename still show `[uber lmer]`. Because the tag always takes column one, a message starting with
 `!`, `#` or `/` can no longer reach the harness's first-column command
 escapes: **the tag is the defusal**. A `command` is relayed untagged so the
 harness reads it as the slash command it is; only `platform` and `uber-lmer`
@@ -508,11 +509,11 @@ transcript record per content block: a prose block, a tool call and the model's
 thinking are three records, so one turn is usually several. The normaliser turns
 every record that carries something into one served turn; a record that only
 feeds the model (a tool result) is folded into the call it answers and served as
-nothing. Measured on a recorded uber lmer session of 1,816 records: 132 assistant
+nothing. Measured on a recorded Ratchet session of 1,816 records: 132 assistant
 prose blocks in the file, 132 served, and a time-ordered replay of the pane's
 polling delivered all 491 served turns once each.
 
-The uber lmer pane has two views, chosen by the **Show uber lmer's working
+The Ratchet pane has two views, chosen by the **Show Ratchet's working
 transcript** switch in its settings dialog — `chat_show_transcript` on
 `GET`/`POST /api/assistant/config`, stored in `config.json`, applied on the pane's
 next config refresh in every browser. The run chat keeps its older rendering
@@ -715,7 +716,7 @@ to `lmer-signal ask` as its exit-0 stdout.
 `true` is neither posted to Slack or matrix nor ever a candidate for binding. The
 supervisor alone sets it, on the question and on every answer or close to it. An
 open one still counts as open, so it
-reaches uber lmer as a `live_question` and the chat pane shows it. The Codex
+reaches Ratchet as a `live_question` and the chat pane shows it. The Codex
 delivery escalation (docs/CODEX-DELIVERY.md) is the one producer: as a thread
 question it captured the human's next reply meant for the agent's own question.
 
@@ -844,7 +845,7 @@ connects that thread as if it were also given with `--target-thread`, and the
 run's slug derives from the thread, so every thread is its own run (see
 [LMER-CLI.md](./LMER-CLI.md#per-request-targets-with---repo-url)).
 
-For **uber lmer**, open its settings beside model/harness/preset, enter the
+For **Ratchet**, open its settings beside model/harness/preset, enter the
 thread permalinks **one per line**, save, then restart (rotate). The equivalent
 API is `POST /api/assistant/config {"threads": ["<permalink>"]}`; it stores
 `assistant_threads` in `config.json`. `GET /api/assistant/config` reports the
@@ -880,7 +881,7 @@ connectors as its own children, and a shell-launched `lmer chat` runs its own.
 The daemon also stamps `LMER_SESSION_KIND` from the session kind it owns.
 For posts authenticated with the session credential, the supervisor uses that
 launch identity to stamp its own outgoing records as `uber-lmer`, rendered
-`[uber lmer]`; workers remain `agent`.
+`[Ratchet]`; workers remain `agent`.
 The session credential still may claim only `agent`, may not name an author,
 may not post commands, and may not ack. The supervisor sets
 `meta.session_origin` on its own assistant records, discarding any caller's
@@ -924,7 +925,7 @@ is never blindly replayed. The connector runs until stopped:
 - **outbound**: long-polls the supervisor's `GET /messages`, omits quiet notes
   and records from its own channel, and posts the rest (a question with numbered options,
   an answer from another channel with who gave it, milestones with a
-  glyph, other channels' messages tagged `[uber lmer] …`), and acks its
+  glyph, other channels' messages tagged `[Ratchet] …`), and acks its
   position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`).
   Every posted text, Slack's and matrix's alike, goes through the shared
   value-and-shape credential scrub *before* it is clipped, so options display
@@ -1026,7 +1027,7 @@ registry, keyed by channel kind) and idle reaper; the `LMER_SLACK_CHAT_*`
 tunables apply to both.
 
 With `LMER_ASSISTANT_MENTION_ROUTING=true`, both listeners instead send eligible
-mentions and replies beneath assistant-sent DMs to Uber Lmer's private pending
+mentions and replies beneath assistant-sent DMs to Ratchet's private pending
 inbox. Existing connected threads keep their normal delivery. See
 [assistant mention routing](ASSISTANT-MENTIONS.md) for configuration, context,
 replay protection and explicit replies to the originating conversation.
@@ -1073,7 +1074,7 @@ bridge's scrub and nothing else.
 
 ### Posts from other runs, and from the platform
 
-A thread is where two runs, or uber lmer and a run, talk in front of the
+A thread is where two runs, or Ratchet and a run, talk in front of the
 humans, so a connector has to ingest a message its own app posted when
 *another* session posted it — and still skip its own (§7 rule 3). Every lmer
 session posts into Slack through one app and into matrix as one bot account, so
@@ -1085,7 +1086,7 @@ nobody.
 | origin | who posted | the label |
 |---|---|---|
 | `session` | a run's `lmer-signal post --thread`, through its thread servicer (§12) | the run's fleet-view title, else its slug, else absent |
-| `platform` | the daemon's own `POST /api/comms/thread` — `lmer-ctl thread post`, the UI's post button | from the caller's credential: `uber lmer`, `operator`, a connector's channel |
+| `platform` | the daemon's own `POST /api/comms/thread` — `lmer-ctl thread post`, the UI's post button | from the caller's credential: `Ratchet`, `operator`, a connector's channel |
 
 **matrix carries the stamp on the event**, under the content key
 `net.20c.lmer.session` (`{origin, session?, label?}`). Ordinary event content:
@@ -1186,7 +1187,7 @@ acknowledged `clear` are also available through `threads recover`; see
 duplicate-risk override and API contract.
 
 In the UI the same calls are two icons — Slack and matrix — on every run row, in
-the run view, and in the uber lmer chat pane header. An inactive icon opens a
+the run view, and in the Ratchet chat pane header. An inactive icon opens a
 one-field prompt that takes **either** a thread permalink or a channel to open a
 new thread in; an active one is coloured, carries a count when the run holds more
 than one thread on that transport, names the threads on hover, and offers a link
@@ -1284,7 +1285,7 @@ lmer joins nothing and invites nobody either way.
 **The order the failures decide.** Everything refusable without asking Slack or
 the homeserver anything is refused first, because a root message cannot be
 unposted: no control plane, no room for another thread on this run, and — on
-uber lmer — no room in its standing `threads` list, which is a **second,
+Ratchet — no room in its standing `threads` list, which is a **second,
 independent bound** (a session's connections and the launch list diverge, so a
 run with no connections can still have sixteen stored links). The 409s above are
 otherwise unchanged and apply to the connect half; if the connect fails after
@@ -1314,7 +1315,7 @@ run holds — `POST /api/sessions`, `lmer-ctl spawn --target-thread` — is refu
 a directory made: no session starts and the thread is posted nothing. The same
 409 answers an **explicit** `threads` override on `POST /api/assistant/start` or
 `/rotate`, and `lmer-ctl` relays status and text to the agent that asked. What
-does *not* refuse is uber lmer's **standing** `threads` list: a worker can take
+does *not* refuse is Ratchet's **standing** `threads` list: a worker can take
 one of those threads during the seconds a rotation is between incarnations, and
 an orchestrator that will not come back up over one thread is worse than one
 that comes back up without it — so a held standing thread is recorded as a
@@ -1331,7 +1332,7 @@ on one thread used to trade the connector back and forth, each reconcile
 stopping the other's and starting its own, which a human saw as "lmer has
 stopped listening" / "lmer is listening" several times a minute.
 
-**Rotating uber lmer.** A held-thread refusal before the incumbent is stopped is recorded as
+**Rotating Ratchet.** A held-thread refusal before the incumbent is stopped is recorded as
 `assistant_rotate_refused`, with its reason and detail; ordinary start refusals
 remain `assistant_start_refused`.
 
@@ -1374,7 +1375,7 @@ include ones a launch adopted best-effort, and the check on them cannot see
 another live session holding the same conversation under a different spelling
 (a reply link rather than its root, an alias rather than the `!room` id).
 
-**Where the connectors run.** For a session the platform spawned — uber lmer
+**Where the connectors run.** For a session the platform spawned — Ratchet
 included — the **daemon** runs them, one process per connection, with the
 session's control-plane token and the host credentials in the child's
 environment and never in its argv. The launch-time `targets` of such a session
@@ -1813,10 +1814,10 @@ lmer-ctl thread post <permalink> "<text>"
 ```
 
 The same work, in the daemon, with the daemon's credentials — for the UI and for
-uber lmer. No connection is involved. A file in the thread is copied into the
+Ratchet. No connection is involved. A file in the thread is copied into the
 calling assistant's upload store. For any other caller it is described, with
 `lmer-signal read <permalink>` named as the command that copies it in. The prefix
-comes from the **caller's credential** the way `source.channel` does: `uber lmer` for the assistant's,
+comes from the **caller's credential** the way `source.channel` does: `Ratchet` for the assistant's,
 `operator` for the shared secret, a connector's channel for a connector's.
 
 ### Refusals

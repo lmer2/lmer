@@ -3,7 +3,7 @@
 One host directory mounted into every assistant incarnation, so the harness's
 agent memory outlives the container it was written in. Design, deploy shape and
 what the reported counts do and do not mean:
-``docs/PLATFORM-QUICKSTART.md`` ("uber lmer's memory") and ``docs/HARNESSES.md``
+``docs/PLATFORM-QUICKSTART.md`` ("Ratchet's memory") and ``docs/HARNESSES.md``
 note 8.
 
 Two properties are load-bearing and easy to undo from here:
@@ -249,7 +249,7 @@ def link_state(directory: Optional[Path] = None) -> Optional[dict]:
     ``None`` means the fact is not available rather than that no link was made —
     a session image predating the marker leaves none, and so does a store no
     session has been given yet. It is the last incarnation's answer, not a live
-    probe. See docs/PLATFORM-QUICKSTART.md, "uber lmer's memory".
+    probe. See docs/PLATFORM-QUICKSTART.md, "Ratchet's memory".
     """
     root = memory_dir() if directory is None else directory
     return read_link_marker(root)

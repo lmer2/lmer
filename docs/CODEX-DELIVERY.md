@@ -114,10 +114,10 @@ that retries or reports them, so the adapter carries each to one of three ends:
   session bus, from the platform channel, naming the record ID and the first
   line of the sender's own words (nothing of a peer message). It carries
   `meta.off_thread`, so Slack and Matrix neither show it nor bind a human's reply
-  to it, but it still reaches uber lmer as a `live_question`; uber lmer decides
+  to it, but it still reaches Ratchet as a `live_question`; Ratchet decides
   whether to tell the sender. Answering relays the answer to the model as a new
   input. If the input confirms later, the supervisor closes the question itself.
-  When the stuck session is uber lmer itself, the question has no reader outside
+  When the stuck session is Ratchet itself, the question has no reader outside
   it: Slack and Matrix skip it, project mode drops assistant session events, and
   non-project mode spools it back to that session, so only the fleet view, the
   web pane and the open-questions badge show it. An escalation that fails to post

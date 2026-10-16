@@ -359,6 +359,7 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "work_repo_pull_interval": config.work_repo_pull_interval,
         "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions,
         "max_followup_rounds": config.max_followup_rounds,
+        "assistant_name": config.assistant_name,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
         **fleet_group_settings(),
@@ -2194,11 +2195,11 @@ def _author_of(caller: "Caller", requested: object) -> Optional[str]:
     return "operator" if caller.kind == CALLER_OPERATOR else None
 
 
-def _thread_label(caller: "Caller") -> str:
+def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
     """Who a thread is told wrote a post the platform made: from the credential,
     never from the body — the rule the bus already applies to ``source.channel``."""
     if caller.is_assistant:
-        return "uber lmer"
+        return config.assistant_name
     if caller.kind == CALLER_CONNECTOR and caller.channel:
         return caller.channel
     return CALLER_OPERATOR
@@ -3172,7 +3173,7 @@ def create_app(
         """
         try:
             session_io.require_session(session_id)
-            page = transcripts.read_messages(session_id, since=since, limit=limit)
+            page = transcripts.read_messages(session_id, since=since, limit=limit, assistant_name=config.assistant_name)
             live = session_io.session_is_live(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -3616,7 +3617,7 @@ def create_app(
                     # nobody's session wrote it, and the run this thread is being
                     # opened for should read it as the operator addressing it
                     # rather than as its own echo to skip.
-                    poster=thread_posts.Poster.for_platform(_thread_label(caller)),
+                    poster=thread_posts.Poster.for_platform(_thread_label(caller, config)),
                 )
             else:
                 record = session_threads.connect(session_id, permalink, by=by)
@@ -3772,7 +3773,7 @@ def create_app(
     @app.post("/api/comms/thread", dependencies=guard)
     def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Post once into a thread, attributed to whoever holds the credential."""
-        label = _thread_label(caller)
+        label = _thread_label(caller, config)
         from . import assistant_conversation
         from lmer_cli.routing_receipts import receipt
 

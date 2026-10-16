@@ -3,7 +3,7 @@
 For named workspaces, project-bound routing, capacity and General migration, see
 [Projects](PROJECTS.md).
 
-The platform daemon routes bot mentions to the existing Uber Lmer assistant.
+The platform daemon routes bot mentions to the existing Ratchet assistant.
 The assistant reads the request, answers in that conversation, or starts a worker
 under the operator's existing run-start policy. Receiving a mention does not
 start a worker or connect the conversation to the assistant's broadcast channel.

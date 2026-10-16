@@ -3,7 +3,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   mdiBellRingOutline,
-  mdiRobot,
   mdiClose,
   mdiCogOutline,
   mdiPlayCircleOutline,
@@ -14,6 +13,7 @@ import {
 } from '@mdi/js'
 import ThreadLinks from './ThreadLinks.vue'
 import Chat from './Chat.vue'
+import RatchetFace from './RatchetFace.vue'
 import {
   fetchAssistant,
   rotateAssistant,
@@ -24,14 +24,17 @@ import { ago } from '../format.js'
 import { readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
+import { assistantName, offReason } from '../ratchet.js'
 
 const props = defineProps({
   workspace: { type: Object, required: true },
   now: { type: Number, default: () => Date.now() },
+  mood: { type: String, default: 'loading' },
+  moodReason: { type: String, default: '' },
 })
 
 // `settings` carries the section to open: 'orders' for the standing-orders button.
-const emit = defineEmits(['close', 'settings', 'questions'])
+const emit = defineEmits(['close', 'settings', 'questions', 'replying', 'open-questions'])
 const POLL_MS = 10000
 
 const draftKey = `assistant:${props.workspace.id}`
@@ -60,6 +63,7 @@ const queued = computed(() => status.value?.pending || 0)
 // uber lmer's own unanswered asks to the operator (issue 507), counted by the daemon
 // from the same ask channel the run view answers them in.
 const openQuestions = computed(() => (running.value && status.value?.open_questions) || 0)
+watch(openQuestions, (value) => emit('open-questions', value), { immediate: true })
 const questionWords = computed(() => `${openQuestions.value} open ${openQuestions.value === 1 ? 'question' : 'questions'}`)
 const loaded = computed(() => chat.value?.total || 0)
 const canLoadEarlier = computed(() => !!chat.value?.canLoadEarlier)
@@ -67,12 +71,18 @@ const canLoadEarlier = computed(() => !!chat.value?.canLoadEarlier)
 // conversation, a failed or not-yet-read transcript), so it never vanishes.
 const bellOnToolbar = computed(() => !!openQuestions.value && !chat.value?.composerOpen)
 // A restart is a fresh context window, so which incarnation this is matters.
+// The displayed reason follows the displayed face: a stopped assistant gets the
+// off label, never a fleet mood it is not reporting on (spec §4.3).
+const displayReason = computed(() => running.value
+  ? props.moodReason
+  : offReason(status.value?.lifecycle || (rotating.value ? 'rotating' : 'stopped')))
 const identity = computed(() => {
-  const parts = [`${props.workspace.name} · uber lmer`]
+  const parts = [`${props.workspace.name} · ${assistantName.value}`]
   if (running.value) {
     parts.push(`generation ${status.value.generation}`)
     if (status.value.started_at) parts.push(`started ${ago(status.value.started_at, props.now)}`)
   }
+  if (displayReason.value) parts.push(displayReason.value)
   return parts.join(' · ')
 })
 // Shown, never toggled: a tap's compatibility mouseenter has already opened the
@@ -140,7 +150,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="uber-pane" role="region" :aria-label="`${workspace.name} · uber lmer`">
+  <div class="uber-pane" role="region" :aria-label="`${workspace.name} · ${assistantName}`">
     <v-toolbar color="uber-toolbar" density="compact" class="uber-toolbar">
       <!-- A tap target, not a `title` on the icon: Vuetify hides a non-clickable icon
            from screen readers, and a phone has no hover. -->
@@ -148,10 +158,13 @@ onBeforeUnmount(() => {
         <template #activator="{ props: tip }">
           <span v-bind="tip" class="uber-identity ms-3 me-1" role="button" tabindex="0" :aria-label="identity"
             @click="identityShown = true" @keydown.enter.space.prevent="identityShown = true">
-            <v-icon :icon="mdiRobot" size="small" />
+            <RatchetFace :mood="mood" :off="!running" :size="20" />
           </span>
         </template>
       </v-tooltip>
+      <!-- chadd's rule: a face alone is ambiguous, so the mood is always written
+           beside it, not only on hover. -->
+      <span v-if="displayReason" class="ratchet-mood-label text-body-small text-medium-emphasis me-1">{{ displayReason }}</span>
       <template v-if="status || problem">
         <ThreadLinks
           :session-id="sessionId"
@@ -168,8 +181,8 @@ onBeforeUnmount(() => {
           variant="text"
           size="small"
           density="comfortable"
-          aria-label="restart uber lmer"
-          title="restart uber lmer"
+          :aria-label="`restart ${assistantName}`"
+          :title="`restart ${assistantName}`"
           @click="confirmingRestart = true"
         />
         <v-btn
@@ -180,8 +193,8 @@ onBeforeUnmount(() => {
           variant="text"
           size="small"
           density="comfortable"
-          aria-label="stop uber lmer"
-          title="stop uber lmer"
+          :aria-label="`stop ${assistantName}`"
+          :title="`stop ${assistantName}`"
           @click="confirmingStop = true"
         />
       </template>
@@ -211,8 +224,8 @@ onBeforeUnmount(() => {
         density="comfortable"
         icon
         class="open-questions"
-        :aria-label="`${questionWords} from uber lmer — answer in its run view`"
-        :title="`${questionWords} — answer in uber lmer's run view`"
+        :aria-label="`${questionWords} from ${assistantName} — answer in its run view`"
+        :title="`${questionWords} — answer in ${assistantName}'s run view`"
         @click="emit('questions', sessionId)"
       >
         <v-badge :content="openQuestions" color="warning" floating>
@@ -235,18 +248,18 @@ onBeforeUnmount(() => {
         variant="text"
         size="small"
         density="comfortable"
-        aria-label="close the uber lmer chat"
+        :aria-label="`close the ${assistantName} chat`"
         @click="emit('close')"
       />
     </v-toolbar>
     <v-dialog v-model="confirmingRestart" max-width="480">
       <v-card>
         <v-card-text class="text-body-medium">
-          Restart uber lmer? This ends the incarnation you are talking to and starts a
+          Restart {{ assistantName }}? This ends the incarnation you are talking to and starts a
           fresh one, so its current context is lost. Your conversation history remains visible.
           Standing orders survive, and
           the new one starts from the handover note already on record — nothing here
-          writes a new one, so it is as recent as the last note uber lmer wrote.
+          writes a new one, so it is as recent as the last note {{ assistantName }} wrote.
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -259,7 +272,7 @@ onBeforeUnmount(() => {
     <v-dialog v-model="confirmingStop" max-width="480">
       <v-card>
         <v-card-text class="text-body-medium">
-          Stop uber lmer? This ends the incarnation and its current context.
+          Stop {{ assistantName }}? This ends the incarnation and its current context.
           Your conversation history and pending work remain in {{ workspace.name }}.
           It stays stopped until you choose Start.
         </v-card-text>
@@ -280,7 +293,7 @@ onBeforeUnmount(() => {
           <template v-if="status"> — showing what the daemon last reported.</template>
         </v-alert>
         <v-alert v-if="queued" type="info" density="compact" :icon="false" class="text-body-small mb-3">
-          {{ queued }} {{ queued === 1 ? 'digest' : 'digests' }} waiting for uber lmer
+          {{ queued }} {{ queued === 1 ? 'digest' : 'digests' }} waiting for {{ assistantName }}
           <template v-if="running">— read on its next check.</template>
           <template v-else>— nothing is reading them while none is running.</template>
         </v-alert>
@@ -302,7 +315,7 @@ onBeforeUnmount(() => {
           </p>
         </template>
 
-        <p v-else-if="rotating" class="text-body-small mb-3">Restarting {{ workspace.name }} · uber lmer. Your draft and attachments stay here; sending resumes when it is ready.</p>
+        <p v-else-if="rotating" class="text-body-small mb-3">Restarting {{ workspace.name }} · {{ assistantName }}. Your draft and attachments stay here; sending resumes when it is ready.</p>
         <v-card v-else class="mb-3">
           <v-card-text>
             <p class="text-body-medium mb-2">{{ workspace.name }} · {{ status?.lifecycle || 'Unavailable' }}</p>
@@ -315,7 +328,7 @@ onBeforeUnmount(() => {
           </v-card-text>
         </v-card>
         <div v-if="!composerActive" class="mt-3">
-          <v-textarea v-model="waitingDraft" :label="`Draft for ${workspace.name} · uber lmer`" />
+          <v-textarea v-model="waitingDraft" :label="`Draft for ${workspace.name} · ${assistantName}`" />
           <p class="text-body-small">Sending becomes available when this project's assistant is ready. Your draft stays here.</p>
         </div>
         <Chat
@@ -330,9 +343,10 @@ onBeforeUnmount(() => {
           :workspace-id="workspace.id"
           :now="now"
           :view="chatShowTranscript ? 'transcript' : 'conversation'"
-          :composer-label="`Say something to ${workspace.name} · uber lmer`"
+          :composer-label="`Say something to ${workspace.name} · ${assistantName}`"
           :conversation-key="composerActive ? draftKey : `${draftKey}:history`"
-          agent-label="uber lmer"
+          :agent-label="assistantName"
+          @replying="emit('replying', $event)"
         >
           <!-- The slot keeps its width without the bell, so the text never reflows.
                `.stop`: a click in the field focuses it and raises a phone keyboard. -->
@@ -345,8 +359,8 @@ onBeforeUnmount(() => {
                 density="comfortable"
                 icon
                 class="open-questions"
-                :aria-label="`${questionWords} from uber lmer — answer in its run view`"
-                :title="`${questionWords} — answer in uber lmer's run view`"
+                :aria-label="`${questionWords} from ${assistantName} — answer in its run view`"
+                :title="`${questionWords} — answer in ${assistantName}'s run view`"
                 @mousedown.stop
                 @click.stop="emit('questions', sessionId)"
               >
@@ -378,6 +392,14 @@ onBeforeUnmount(() => {
   flex: 1 1 0;
 }
 .loaded-count { white-space: nowrap; }
+/* chadd's rule: the face is never alone. Keep the reason on one line and let it
+   give way before the toolbar's controls do. */
+.ratchet-mood-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 34ch;
+}
 .uber-identity { display: inline-flex; cursor: default; }
 .question-slot {
   /* A disabled field (mid-send) sets `pointer-events: none` on its input. */

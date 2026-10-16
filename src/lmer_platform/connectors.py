@@ -960,7 +960,8 @@ class ThreadConnectors:
 
     def _upload_store(self, session_id: str) -> Optional[Path]:
         try:
-            return uploads.mounted_store(session_id, registry.read_session(session_id))
+            name = self._platform_config.assistant_name if self._platform_config is not None else None
+            return uploads.mounted_store(session_id, registry.read_session(session_id), name)
         except Exception:
             # A session with no store still gets a connector: what it loses is
             # files from the thread, not the conversation.
@@ -975,6 +976,9 @@ class ThreadConnectors:
             env[config.ENV_BIND_PORT] = str(self._platform_config.bind_port)
             # The child launches from its interpreter directory, not the daemon cwd.
             env[config.ENV_SECRET_FILE] = str(self._platform_config.secret_path.absolute())
+            # The connector renders the assistant's bus records and thread posts
+            # with this name; carry the resolved value, not the daemon's env (#581).
+            env[config.ENV_ASSISTANT_NAME] = self._platform_config.assistant_name
         for name in _THREAD_CONTEXT_ENV:
             env.pop(name, None)
         # Which kind of attachment this is, told to the one process that has to

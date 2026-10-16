@@ -184,7 +184,7 @@ class TestPosting:
             json={"permalink": SLACK_LINK, "text": "the review is posted"},
             headers=bearer(minted),
         )
-        assert slack.posted[0][2] == "[uber lmer] the review is posted"
+        assert slack.posted[0][2] == "[Ratchet] the review is posted"
 
     def test_the_body_cannot_choose_who_the_thread_thinks_wrote_it(self, client, slack):
         client.post(
@@ -196,7 +196,7 @@ class TestPosting:
 
     @pytest.mark.parametrize("headers, label", [
         (auth(), "operator"),
-        (None, "uber lmer"),
+        (None, "Ratchet"),
     ])
     def test_the_platform_s_own_post_reaches_a_connected_run(self, client, slack, headers, label):
         """The credential names it for the humans in the thread AND for the

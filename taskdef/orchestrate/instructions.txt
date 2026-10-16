@@ -178,7 +178,7 @@ a run is what it acts on.
 
 **Steering**
 - `POST /api/sessions/{id}/comms` `{kind,text}` (`lmer-ctl send <id> <text>`) —
-  say something to a live worker in your project. It arrives as a turn tagged `[uber lmer]`, and
+  say something to a live worker in your project. It arrives as a turn tagged `[{{ LMER_PLATFORM_ASSISTANT_NAME | default('Ratchet', true) }}]` (older workers may still show it as `[uber lmer]`), and
   every channel connected to that session sees it too. A leading shell escape is
   read as words; a message starting with `/` is refused, because the tag takes
   the first column and the harness would read the command as prose.

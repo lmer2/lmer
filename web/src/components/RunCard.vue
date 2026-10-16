@@ -10,6 +10,7 @@ import {
   ago, attentionLabel, checkinLabel, driverLabel, duration, ledgerSummary,
   portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
+import { assistantName } from '../ratchet.js'
 import StatusStrip from './StatusStrip.vue'
 import ThreadLinks from './ThreadLinks.vue'
 
@@ -221,7 +222,7 @@ const forgettable = computed(
           size="small"
           title="the platform's own orchestrating session, not one of the runs"
           variant="tonal"
-        >uber lmer</v-chip>
+        >{{ assistantName }}</v-chip>
         <!-- The title this orchestrator gave the run, where the run is named, and
              the label only when there is none: a title nobody sees outside its own
              tab is not something you can identify a run by, which is the entire
@@ -436,7 +437,7 @@ const forgettable = computed(
           size="small"
           color="primary"
           :prepend-icon="mdiRobot"
-          aria-label="talk to uber lmer"
+          :aria-label="`talk to ${assistantName}`"
           @click="$emit('open-chat')"
         >chat</v-btn>
         <!-- Which chat threads this run is mirrored into, and the way to change

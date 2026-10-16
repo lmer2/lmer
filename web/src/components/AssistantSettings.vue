@@ -36,6 +36,7 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { mdiRestart } from '@mdi/js'
 import { fetchAssistantConfig, setAssistantConfig } from '../api.js'
 import { applyChatSettings } from '../operatorChat.js'
+import { assistantName } from '../ratchet.js'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -346,7 +347,7 @@ onBeforeUnmount(() => {
 <template>
   <v-dialog v-model="open" max-width="560">
     <v-card>
-      <v-card-title class="text-title-medium">uber lmer settings</v-card-title>
+      <v-card-title class="text-title-medium">{{ assistantName }} settings</v-card-title>
       <v-card-text>
         <p class="text-body-small text-medium-emphasis mb-3">
           How the session is run — not what it is told (standing orders stay in
@@ -460,11 +461,11 @@ onBeforeUnmount(() => {
                 density="compact"
                 hide-details
                 :disabled="saving"
-                label="Show uber lmer's working transcript in the chat"
+                :label="`Show ${assistantName}'s working transcript in the chat`"
               />
               <p class="text-body-small text-medium-emphasis setting-source">
-                Off, the chat is the conversation only: your messages, and what uber
-                lmer posted, asked and answered. On, its tool calls, watch events, hook
+                Off, the chat is the conversation only: your messages, and what {{ assistantName }}
+                posted, asked and answered. On, its tool calls, watch events, hook
                 re-prompts and unposted working notes appear muted beside them.
               </p>
             </div>
@@ -548,13 +549,13 @@ onBeforeUnmount(() => {
                 <template v-else-if="reply.rotation?.context_threshold?.value">
                   In effect now: at
                   {{ reply.rotation.context_threshold.value }}% of the context
-                  window used, uber lmer is told once — and again at most every
+                  window used, {{ assistantName }} is told once — and again at most every
                   fifteen minutes while it stays there — to rotate itself at its
                   next breakpoint. It decides when; nothing here ends a session.
                   Needs the status strip, which LMER_PLATFORM_STATUS_STRIP=0 turns off.
                 </template>
                 <template v-else>
-                  In effect now: off — uber lmer is never told its context window is filling.
+                  In effect now: off — {{ assistantName }} is never told its context window is filling.
                   Needs a harness that publishes the reading on its status line, and the
                   status strip left on.
                 </template>
@@ -592,7 +593,7 @@ onBeforeUnmount(() => {
             </p>
           </v-alert>
           <v-alert v-else-if="saved" type="success" density="compact">
-            Saved. It applies when a fresh uber lmer starts — restart to apply it
+            Saved. It applies when a fresh {{ assistantName }} starts — restart to apply it
             from the project chat, or let the change wait for the next incarnation.
             <p v-if="savedDisplay">Operator chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>

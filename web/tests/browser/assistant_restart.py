@@ -60,8 +60,8 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.shot(output, "recovered-all-projects")
         for project in (alpha, beta):
             await browser.choose_project(project["name"])
-            assert await browser.evaluate("document.querySelectorAll('main [aria-label=\"talk to uber lmer\"]').length") == 1
-            assert await browser.evaluate("document.querySelector('header button[aria-label^=\"uber lmer\"]').getAttribute('aria-label').includes('running')")
+            assert await browser.evaluate("document.querySelectorAll('main [aria-label=\"talk to Ratchet\"]').length") == 1
+            assert await browser.evaluate("document.querySelector('header button[aria-label^=\"Ratchet\"]').getAttribute('aria-label').includes('running')")
         before = projects.status(alpha["id"])
         supervisor = projects.Supervisor(settings)
         supervisor.stop()
@@ -106,7 +106,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         assert await browser.evaluate(group + ".textContent.includes('died unexpectedly')")
         await browser.choose_project("Alpha")
         await browser.wait("document.querySelector('main').textContent.includes('died unexpectedly')")
-        assert await browser.evaluate("document.querySelector('header button[aria-label^=\"uber lmer\"]').getAttribute('aria-label').includes('crashed')")
+        assert await browser.evaluate("document.querySelector('header button[aria-label^=\"Ratchet\"]').getAttribute('aria-label').includes('crashed')")
         await browser.shot(output, "current-failure")
         await browser.call("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
         await browser.wait("document.querySelector('[aria-label=\"show the run list\"]')")

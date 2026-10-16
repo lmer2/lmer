@@ -3,7 +3,7 @@
 For named workspaces, project-bound routing, capacity and General migration, see
 [Projects](PROJECTS.md).
 
-The existing uber lmer conversation survives rotation, page reload, and daemon
+The existing Ratchet conversation survives rotation, page reload, and daemon
 restart. A generation keeps its original session identity. Its first displayed
 row explains the rotation and distinguishes the retained archive from the new
 assistant's context. The conversation view remains the default; the existing

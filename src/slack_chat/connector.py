@@ -24,7 +24,7 @@ import requests
 
 from ask_channel import bus
 from lmer_cli import thread_posts
-from lmer_cli.comms import off_thread
+from lmer_cli.comms import CHANNEL_UBER, assistant_display_name, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -180,9 +180,6 @@ class ConnectorConfig:
 # Rendering
 # ---------------------------------------------------------------------------
 
-_LABELS = {"uber-lmer": "uber lmer"}
-
-
 def _int_env(raw: object) -> Optional[int]:
     """A non-negative integer from an environment value, or ``None``."""
     text = (raw or "").strip() if isinstance(raw, str) else ""
@@ -190,7 +187,8 @@ def _int_env(raw: object) -> Optional[int]:
 
 
 def _who(source: dict) -> str:
-    name = _LABELS.get(source.get("channel"), source.get("channel") or "?")
+    channel = source.get("channel")
+    name = assistant_display_name() if channel == CHANNEL_UBER else (channel or "?")
     return f"{name} · {source['author']}" if source.get("author") else name
 
 

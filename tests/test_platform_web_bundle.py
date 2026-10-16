@@ -167,6 +167,7 @@ def _build_inputs():
     return [
         *_web_sources(),
         *(WEB / "src").rglob("*.css"),
+        *(WEB / "public").rglob("*"),
         WEB / "index.html",
         WEB / "package.json",
         WEB / "package-lock.json",
@@ -400,6 +401,25 @@ def test_every_chunk_lands_where_the_daemon_can_serve_it(bundle):
         f"{stray} sit outside dist/assets, where the daemon has no route to them"
     )
     assert bundle.files, "nothing was emitted into dist/assets at all"
+
+
+def test_ratchet_faces_are_served_from_the_assets_directory(bundle):
+    """The faces are copied verbatim under the one directory the daemon serves."""
+    served = ASSETS / "ratchet"
+    names = {path.name for path in served.iterdir()} if served.is_dir() else set()
+    expected = {
+        "ratchet_question.png", "ratchet_oops.png", "ratchet_panic.png",
+        "ratchet_strained.png", "ratchet_on_it.png", "ratchet_skeptical.png",
+        "ratchet_idle.png", "ratchet_yes.png", "ratchet_talking.png",
+        "ratchet_off.png",
+    }
+    assert expected <= names, f"missing from dist/assets/ratchet: {sorted(expected - names)}"
+
+
+def test_the_tab_icon_is_served_from_the_assets_directory(bundle):
+    index = (DIST / "index.html").read_text(encoding="utf-8")
+    assert 'rel="icon"' in index and "assets/ratchet/ratchet_talking.png" in index
+    assert (ASSETS / "ratchet" / "ratchet_talking.png").is_file()
 
 
 # --- the source decisions the build above is the consequence of --------------

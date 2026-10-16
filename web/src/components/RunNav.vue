@@ -10,6 +10,7 @@ import {
 } from '@mdi/js'
 import { ago, attentionLabel, stateMeta, toneColor } from '../format.js'
 import { runKey } from '../runref.js'
+import { assistantName } from '../ratchet.js'
 
 const STATE_ICONS = {
   running: mdiPlayCircleOutline,
@@ -128,7 +129,7 @@ function isOrchestrator(run) {
             size="x-small"
             title="the platform's own orchestrating session, not one of the runs"
             variant="tonal"
-          >uber lmer</v-chip>
+          >{{ assistantName }}</v-chip>
         </template>
       </v-list-item>
     </template>

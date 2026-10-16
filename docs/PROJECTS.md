@@ -11,7 +11,7 @@ thread connections live in Project settings. The color picker accepts any hex
 color, and the 20 named colors are its swatches. Picking one of them stores its
 name, so preset projects look the same as before. Repository associations supply
 launch suggestions and never adopt existing runs. Expand Standing instructions
-in Project settings to edit them; uber lmer's standing-orders button opens them there.
+in Project settings to edit them; Ratchet's standing-orders button opens them there.
 
 The project switcher at the left of the app header selects the main view. It
 shows the selected project's name (or **All projects**); on a phone it takes a
@@ -404,7 +404,7 @@ line. The same data is available through the API and `lmer-ctl`:
 
 Each listed route carries `transport`, `conversation`, `label` (as entered or
 resolved), `project_id`, `project_name` and `archived`. Every project's assistant
-can read the whole list, so an uber lmer can report it; that includes other
+can read the whole list, so a Ratchet can report it; that includes other
 projects' channel IDs and labels. A stored label or ID is matched against the
 project's own routes before anything is looked up, so re-saving `#name` after the
 channel was renamed keeps the channel it was mapped to rather than following the
@@ -581,7 +581,7 @@ still-loading instructions are never posted as empty text when other settings
 are saved. Existing non-empty-text and length validation still applies, and a
 refused write leaves the edit visible for correction. The section says when the
 stored orders last changed, says when there are none, and notes that they are
-usually set by telling uber lmer in chat, which confirms the wording before
+usually set by telling Ratchet in chat, which confirms the wording before
 storing them.
 
 Archived project rows and Restore stopped use the stored project color. Fleet
