@@ -150,7 +150,7 @@ const said = (id, seq, extra = {}) => ({ id, seq, role: 'assistant', kind: 'said
 const session = () => [
   said('prose', 0, { text: prose }),
   said('spool', 1, { tools: [tool('curl -sS -X POST http://127.0.0.1:8700/api/assistant/pending')] }),
-  { id: 'watch', seq: 2, role: 'monitor', kind: 'said', via: 'monitor', text: 'uber lmer spool: pending digests > 0\nSPOOL pending=1', tools: [] },
+  { id: 'watch', seq: 2, role: 'monitor', kind: 'said', via: 'monitor', text: 'Ratchet spool: pending digests > 0\nSPOOL pending=1', tools: [] },
   { id: 'hook', seq: 3, role: 'user', kind: 'injected', text: 'Stop hook feedback: Reply-routing check: this turn produced visible reply text…', tools: [] },
   said('filler', 4, { text: 'Working output only.' }),
   said('post', 5, { via: 'comms', source: { channel: 'uber-lmer' }, comms_kind: 'message', text: posted }),

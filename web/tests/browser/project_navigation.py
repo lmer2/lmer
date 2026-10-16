@@ -111,7 +111,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         assert await browser.evaluate(toggle + ".getAttribute('aria-expanded')") == 'false'
         assert await browser.evaluate("location.search") == "?workspace=" + alpha["id"]
         await browser.shot(output, "collapsed-project-chat-desktop")
-        await browser.click("close the uber lmer chat")
+        await browser.click("close the Ratchet chat")
         await browser.wait("document.querySelector('.v-navigation-drawer--right').getBoundingClientRect().left >= innerWidth")
         await browser.choose_project("Beta")
         with scope.bound(alpha["id"]):

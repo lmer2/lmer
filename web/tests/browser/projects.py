@@ -165,7 +165,7 @@ async def rotating_composer(browser, output, project, settings):
             assert await asyncio.to_thread(entered.wait, 20)
             during = projects.status(project['id'])
             assert not during['running'] and during['lifecycle'] == 'rotating' and during['history_session']
-            await browser.wait("document.body.textContent.includes('Restarting Beta · uber lmer')")
+            await browser.wait("document.body.textContent.includes('Restarting Beta · Ratchet')")
             assert await browser.evaluate("[...document.querySelectorAll('.attachments')].some(e => e.checkVisibility() && e.textContent.includes('rotation.txt'))")
             assert await browser.evaluate("[...document.querySelectorAll('[aria-label=\"send to this session\"]')].filter(e => e.checkVisibility()).every(e => e.disabled)")
             await browser.shot(output, 'rotation-gap-attachment')
@@ -173,7 +173,7 @@ async def rotating_composer(browser, output, project, settings):
             release.set()
         after = rotation.result(timeout=20)
     assert after['running'] and after['session_id'] != during['history_session']
-    await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart uber lmer\"]')].some(e => e.checkVisibility())")
+    await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart Ratchet\"]')].some(e => e.checkVisibility())")
     await browser.wait("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && !e.disabled)")
     assert await browser.evaluate("[...document.querySelectorAll('.attachments')].some(e => e.checkVisibility() && e.textContent.includes('rotation.txt'))")
     assert await browser.evaluate("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && e.value === 'Beta draft retained through admission')")
@@ -284,9 +284,11 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.choose_project("All projects")
         assert await browser.evaluate("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
         await browser.shot(output, "all-projects-bound-chat")
-        await browser.evaluate("document.querySelector('[aria-label=\"close the uber lmer chat\"]').click()")
+        await browser.evaluate("document.querySelector('[aria-label=\"close the Ratchet chat\"]').click()")
         await browser.choose_project("Beta")
-        await browser.click("talk to uber lmer")
+        # The bar control's aria-label carries the mood reason after the name
+        # ("talk to Ratchet · idle: …"), so match it by prefix.
+        await browser.click_element("[...document.querySelectorAll('header button')].find(e => e.checkVisibility() && (e.getAttribute('aria-label') || '').startsWith('talk to Ratchet'))")
         await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Beta'))")
         await browser.wait("document.body.textContent.includes('Waiting to start — assistant limit reached')")
         assert projects.status(beta["id"])["history_session"]
@@ -300,7 +302,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.wait("document.body.textContent.includes('Waiting to start — assistant limit reached')")
         projects.stop(alpha["id"])
         projects.reconcile(settings)
-        await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart uber lmer\"]')].some(e => e.checkVisibility())")
+        await browser.wait("[...document.querySelectorAll('.uber-pane[aria-label^=\"Beta\"] [aria-label=\"restart Ratchet\"]')].some(e => e.checkVisibility())")
         await browser.wait("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && !e.disabled)")
         assert await browser.evaluate("[...document.querySelectorAll('textarea')].filter(e => e.checkVisibility() && !e.disabled).some(e => e.value === 'Beta draft retained through admission')")
         await browser.shot(output, "historical-draft-admitted")
@@ -318,7 +320,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await identity_on_hover(browser)
         assert cleared["slot"] == 36 and not cleared["badge"], cleared
         fill["1440x1000"] = cleared
-        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
+        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the Ratchet chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.switcher_entry("Project settings for Beta")
         swatches = "[...document.querySelectorAll('.project-color .v-color-picker-swatches__color')]"
         await browser.wait(swatches + ".length === " + str(len(projects.COLORS)))
@@ -349,7 +351,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             fill["390x844"] = await fills_the_window(browser, "phone")
             await identity_on_touch(chrome, output, secret, await browser.evaluate("location.href"))
             await browser.shot(output, "beta-phone")
-        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
+        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the Ratchet chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.choose_project(alpha["name"])
         await sidebar_chat(browser, alpha["name"])
         await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
@@ -366,7 +368,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         assert toolbars["light"]["background"] != toolbars["dark"]["background"], toolbars
         for toolbar in toolbars.values():
             assert toolbar["background"] != toolbar["bar"] and toolbar["contrast"] >= 4.5, toolbars
-        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
+        await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the Ratchet chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
         for name in ("Browser Gamma", "Browser Delta"):
@@ -380,7 +382,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             assert len(created) == 1 and created[0]["repositories"] == []
             await asyncio.sleep(.5)
             await browser.shot(output, "new-project-dark-desktop")
-            await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the uber lmer chat\"]')].find(e => e.checkVisibility()).click()")
+            await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the Ratchet chat\"]')].find(e => e.checkVisibility()).click()")
         assert not browser.errors, browser.errors
         (output / "browser-results.json").write_text(json.dumps({
             "result": "pass", "viewports": ["1440x1000", "390x844", "3840x2160"], "fill": fill, "colors_saved": list(projects.COLORS), "label_contrast": contrasts, "uber_toolbar": toolbars,
