@@ -228,6 +228,12 @@ class TestRendering:
     def test_slacks_own_records_are_skipped(self):
         assert connector.render_outbound(self._record("message", "hi", channel="slack", author="tester")) is None
 
+    def test_close_records_are_not_posted_to_the_thread(self):
+        # Issue #579: the close is bookkeeping the humans already know about, so
+        # it stays on the bus/platform/transcript and never reaches the thread.
+        assert connector.render_outbound(self._record("close", "")) is None
+        assert connector.render_outbound(self._record("close", "withdrawn — already answered")) is None
+
     def test_the_agents_message_is_plain_and_other_channels_are_tagged(self):
         assert connector.render_outbound(self._record("message", "done")) == "done"
         assert connector.render_outbound(self._record("message", "go", channel="uber-lmer")) == "💬 [uber lmer] go"
@@ -1074,7 +1080,7 @@ class TestOutboundRedaction:
                 "source": {"channel": "agent"}, "meta": {}, **extra}
 
     @pytest.mark.parametrize("secret", [_SHAPED, _ENV_VALUE], ids=["shape", "env-value"])
-    @pytest.mark.parametrize("kind", ["message", "milestone", "command", "close"])
+    @pytest.mark.parametrize("kind", ["message", "milestone", "command"])
     def test_every_kind_reaches_slack_redacted(self, rig, kind, secret):
         rig.connector._send_record(self._record(kind, f"using {secret} now"))
         (_, _, posted), = rig.slack.posted

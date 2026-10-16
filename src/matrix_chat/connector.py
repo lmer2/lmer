@@ -156,7 +156,8 @@ def render_outbound(record: dict, questions: Optional[dict] = None) -> Optional[
     The same rendering the Slack connector uses (numbered options, who answered
     from where, kind glyphs) keyed on *this* channel — a Slack record belongs in
     a matrix thread, and only matrix's own does not — scrubbed the way the fleet
-    bridge scrubs everything it posts.
+    bridge scrubs everything it posts. A ``close`` renders as ``None`` here too:
+    it stays on the bus, the platform and the transcript (issue #579).
     """
     text = _render_slack(record, questions, own_channel=CHANNEL)
     if text is None:
