@@ -1361,7 +1361,7 @@ def _slack_failure(exc: Exception, channel: str) -> ThreadError:
     code = getattr(exc, "code", None)
     if isinstance(code, str) and code in _SLACK_HINTS:
         return ThreadError(f"Slack refused {channel}: {code} — {_SLACK_HINTS[code]}", status=403)
-    return ThreadError(f"Slack refused {channel}: {exc}", status=502)
+    return ThreadError(f"Slack refused {channel}: {exc}", status=502, **retry_hint(exc))
 
 
 def _matrix_failure(exc: Exception, room: str) -> ThreadError:
@@ -1372,7 +1372,15 @@ def _matrix_failure(exc: Exception, room: str) -> ThreadError:
             "not be in that room",
             status=403,
         )
-    return ThreadError(f"the homeserver refused {room}: {exc}", status=502)
+    return ThreadError(f"the homeserver refused {room}: {exc}", status=502, **retry_hint(exc))
+
+
+def retry_hint(exc: Exception) -> dict:
+    """``transient`` and ``retry_after`` for a :class:`ThreadError`, as a Slack or Matrix error set them."""
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
+        retry_after = None
+    return {"transient": getattr(exc, "transient", False) is True, "retry_after": retry_after}
 
 
 # ---------------------------------------------------------------------------

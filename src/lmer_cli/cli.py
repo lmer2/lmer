@@ -631,6 +631,7 @@ def parse_args(
     parser.add_argument("--branch", dest="branch")
     parser.add_argument("--ref", dest="ref")
     parser.add_argument("--remote", dest="remote", help="Git remote name to use (required when local repo has multiple remotes)")
+    parser.add_argument("--repo-url", dest="repo_url", help="Repository URL to clone, independent of the target. The primary target is then only the task's target (LMER_TASK_TARGET and the run slug): a label, an issue/MR URL, or a Slack/matrix thread permalink, which lets a non-chat task run per thread. A bare word is never probed as a local checkout; a target spelled as a path (/x, ./x, ../x) or a repository URL is refused as a second repository, as is --repo beside --repo-url.")
     parser.add_argument("--exec", dest="exec_mode", action="store_true", help="Run an arbitrary command in the container")
     parser.add_argument("--no-clone", dest="no_clone", action="store_true", help="Skip git clone, just run command (requires --exec)")
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
@@ -682,6 +683,13 @@ def parse_args(
     parser.add_argument("--port-bind", dest="port_bind", help=f"Host bind address for --ports publishing (default {DEFAULT_PORT_BIND}; pass 0.0.0.0 to expose ports beyond loopback; env: LMER_PORT_BIND)")
 
     ns, extra = parser.parse_known_args(argv)
+    # argparse leaves a positional that follows an option in `extra`, where only
+    # --exec reads it; a value after an unknown flag is that flag's, not a target.
+    ns.stray_positionals = [
+        token for index, token in enumerate(extra)
+        if not token.startswith("-")
+        and not (index and extra[index - 1].startswith("-") and "=" not in extra[index - 1])
+    ]
     # Combine any extra unknown args with the -- separated rest
     rest = extra + rest
     return ns, rest
@@ -2649,8 +2657,18 @@ def main(argv: list[str] | None = None) -> int:
     # primary/secondary selection so the clone path (~repo resolution)
     # never sees them. Each claimed type is represented by a handler that
     # owns its type-specific behavior (see lmer_cli.targets).
+    if ns.stray_positionals and not ns.exec_mode:
+        error(f"❌ {len(ns.stray_positionals)} argument(s) after an option would be ignored: "
+              "put the task and every target before the options")
+        return 2
     _raw_targets: list[str] = ns.target if ns.target else []
     targets, special_targets = partition_targets(_raw_targets)
+    if ns.repo_url and not resolve.is_likely_url(ns.repo_url):
+        error("❌ --repo-url needs a repository URL (http(s)://, ssh://, git@ or file:///)")
+        return 2
+    if ns.repo_url and not targets and _raw_targets:
+        # The thread is then the target too; its handler still connects it.
+        targets = [_raw_targets[0]]
     primary_target: str | None = targets[0] if targets else None
     secondary_targets: list[str] = targets[1:] if len(targets) > 1 else []
 
@@ -2763,13 +2781,30 @@ def main(argv: list[str] | None = None) -> int:
     if not skip_repo_resolve:
         cwd = Path.cwd()
 
+        # --repo (spec §6.5) and --repo-url (#545) each name the repository;
+        # both at once name two.
+        if ns.repo and ns.repo_url:
+            error(
+                "❌ two repositories named: --repo "
+                f"{strip_url_credentials(ns.repo)} and --repo-url "
+                f"{strip_url_credentials(ns.repo_url)}"
+            )
+            return 2
+
         # A non-URL positional that names an existing local checkout is the
         # repository, exactly as before. The probe returns None for a target
         # that names no filesystem entry, so a branch, a SHA, a shorthand or a
         # document URL reaches the classifier instead of failing as a missing
         # path; a target that names an existing entry which is not a checkout
         # (a plain directory, a file) is refused, never read as a branch.
-        if primary_target and not resolve.is_likely_url(primary_target):
+        # Beside --repo-url the positional is only the task's target and is
+        # never probed as a local checkout (#545); one spelled as a path still
+        # classifies as a repository and is refused below.
+        if (
+            primary_target
+            and not ns.repo_url
+            and not resolve.is_likely_url(primary_target)
+        ):
             try:
                 local_checkout = resolve.probe_local_repo(primary_target, cwd)
             except resolve.NotACheckoutError as exc:
@@ -2806,18 +2841,20 @@ def main(argv: list[str] | None = None) -> int:
         # --repo names the repository explicitly. It is refused beside a
         # repository-class positional ('two repositories named'); the flag
         # refusals that need no classification are in _validate_parsed_args.
-        if ns.repo and target_class == "repository":
+        named_repo = ns.repo or ns.repo_url
+        if named_repo and target_class == "repository":
+            flag = "--repo" if ns.repo else "--repo-url"
             error(
                 "❌ two repositories named: the positional "
-                f"{strip_url_credentials(primary_target)} and --repo "
-                f"{strip_url_credentials(ns.repo)}"
+                f"{strip_url_credentials(primary_target)} and {flag} "
+                f"{strip_url_credentials(named_repo)}"
             )
             return 2
 
         # `other` is a URL that is neither a repository, a work item nor a
         # known thread. Without --repo there is nothing to clone; with it the
         # URL stays the session's target as context.
-        if target_class == "other" and not ns.repo:
+        if target_class == "other" and not named_repo:
             error(
                 "❌ not a repository, a work item or a known thread: "
                 f"{strip_url_credentials(primary_target)}. "
@@ -2834,6 +2871,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if ns.repo:
                 target_to_resolve = ns.repo
+            elif ns.repo_url:
+                # The target keeps its own identity; the clone is the named
+                # repository, not one derived from the target (#545).
+                target_to_resolve = ns.repo_url
             elif target_class == "repository":
                 target_to_resolve = primary_target or ""
             elif target_class in ("work-item", "reference"):
@@ -3647,6 +3688,8 @@ def main(argv: list[str] | None = None) -> int:
         # so host-set values reach the supervisor running inside the container.
         "LMER_AUTO_START_SETTLE_DELAY": os.environ.get("LMER_AUTO_START_SETTLE_DELAY"),
         "LMER_WINSIZE_RECHECK_DELAY": os.environ.get("LMER_WINSIZE_RECHECK_DELAY"),
+        # The Codex delivery adapter runs inside the container (issue #460).
+        "LMER_CODEX_RPC_TIMEOUT": os.environ.get("LMER_CODEX_RPC_TIMEOUT"),
         # Forward the harness-profile overrides for the injected start command
         # and the self-shutdown quit sequence — HARNESSES.md promises every
         # profile field can be patched via env without a release, which needs

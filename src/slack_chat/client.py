@@ -69,9 +69,14 @@ class SlackError(Exception):
     and the message text is not a contract anything should match on.
     """
 
-    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+    def __init__(self, message: str, *, code: Optional[str] = None,
+                 transient: bool = False, retry_after: Optional[int] = None) -> None:
         super().__init__(message)
         self.code = code
+        #: HTTP 429 or 5xx, or no answer at all: worth retrying later.
+        self.transient = transient
+        #: The last 429's ``Retry-After`` in seconds, when Slack sent one.
+        self.retry_after = retry_after
 
 
 class SlackClient:
@@ -144,22 +149,28 @@ class SlackClient:
             except requests.HTTPError as exc:
                 resp = exc.response
                 if resp is not None and resp.status_code == 429:
+                    # Slack sends integer seconds, but Retry-After may
+                    # legally be an HTTP-date — fall back rather than raise.
+                    try:
+                        retry_after = int(resp.headers["Retry-After"])
+                    except (KeyError, ValueError):
+                        retry_after = None
+                    if retry_after is not None and not 0 <= retry_after <= 86400:
+                        retry_after = None
                     if attempt < self.retries:
-                        # Slack sends integer seconds, but Retry-After may
-                        # legally be an HTTP-date — fall back rather than raise.
-                        try:
-                            retry_after = int(resp.headers.get("Retry-After", 1))
-                        except ValueError:
-                            retry_after = 1
-                        time.sleep(retry_after)
+                        time.sleep(1 if retry_after is None else retry_after)
                         continue
                     raise SlackError(
                         f"Slack API rate limited after {self.retries} retries "
-                        f"(HTTP 429)", code="ratelimited",
+                        f"(HTTP 429)", code="ratelimited", transient=True,
+                        retry_after=retry_after,
                     ) from exc
-                raise SlackError(f"Slack API HTTP error: {exc}") from exc
+                raise SlackError(
+                    f"Slack API HTTP error: {exc}",
+                    transient=resp is not None and resp.status_code >= 500,
+                ) from exc
             except requests.RequestException as exc:
-                raise SlackError(f"Request failed: {exc}") from exc
+                raise SlackError(f"Request failed: {exc}", transient=True) from exc
 
             data: Dict[str, Any] = response.json()
             if not data.get("ok"):
@@ -342,6 +353,24 @@ class SlackClient:
                 }
                 if wanted in names - {""}:
                     found.append({"id": member.get("id"), "name": member.get("name")})
+            cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                return found
+
+    def find_channels(self, name: str) -> list:
+        """The id of every unarchived channel named *name*, as a list for the same reason as :meth:`find_user`.
+
+        Needs ``channels:read`` and ``groups:read``; Slack answers ``missing_scope`` without them.
+        """
+        wanted = name.lstrip("#").casefold()
+        found, cursor = [], None
+        while True:
+            params = {"limit": 200, "exclude_archived": "true", "types": "public_channel,private_channel"}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._request("GET", "conversations.list", params=params)
+            found += [channel.get("id") for channel in data.get("channels") or []
+                      if str(channel.get("name") or "").casefold() == wanted]
             cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
             if not cursor:
                 return found

@@ -356,6 +356,60 @@ assistant activity never choose the destination.
 DM replies retain their exact recorded assistant parent; they do not use name
 matching or the General default when that parent's project cannot be resolved.
 
+### Channel → project mapping
+
+A Slack channel or Matrix room can be mapped to one project, so that a plain
+`@bot hi` there routes as if it began with that project's name. Precedence for a
+top-level mention is:
+
+1. thread ownership (an owned thread stays with its owner);
+2. an explicit leading project name, which may name a different project than
+   the channel's;
+3. the channel mapping;
+4. General.
+
+DM replies and connected-thread routing are unchanged, and the sender allow
+list applies first as always. A channel maps to at most one project: mapping it
+to a second project is refused (HTTP 409, naming the current holder) until it is
+removed from the first. The mapping lives in `projects.sqlite3` (table
+`channel_routes`), never in the work repo, and every mention reads it, so a
+change takes effect without a daemon restart.
+
+Archiving a project keeps its mappings but disables them. A mention in such a
+channel gets a source-thread notice ("This channel is mapped to project X,
+which is archived; restore it or remap the channel …") and never falls back to
+General. Restore the project, or remove the mapping with
+`lmer-ctl projects channels remove CHANNEL`. Removal works whichever project
+holds the channel, archived or not.
+
+Channels are given as:
+
+- **Slack**: a channel ID (`C…`/`G…`), a channel or message link
+  (`https://<workspace>.slack.com/archives/C…[/p…]`, `https://app.slack.com/client/T…/C…`),
+  or `#name`. A `#name` is resolved with `conversations.list`, which needs the bot
+  token's `channels:read`/`groups:read` scopes; without them the name is refused
+  with a request for the ID or a link. DM conversations (`D…`) are refused.
+- **Matrix**: a room ID (`!room:server`), an alias (`#alias:server`, resolved
+  through the room directory), or a `https://matrix.to/#/…` or Element
+  `https://<host>/#/room/…` link to either.
+
+Edit a project's channels in **Project settings → Mention channels**, one per
+line. The same data is available through the API and `lmer-ctl`:
+
+| | API | lmer-ctl |
+|---|---|---|
+| List all (any caller) | `GET /api/channel-routes` | `lmer-ctl projects channels list` |
+| Replace a project's set (operator) | `PUT /api/projects/{id}/channel-routes {"channels": [...]}` | `lmer-ctl projects channels set PROJECT [CHANNEL...]` |
+| Remove one (operator) | `DELETE /api/channel-routes?channel=CHANNEL` | `lmer-ctl projects channels remove CHANNEL` |
+
+Each listed route carries `transport`, `conversation`, `label` (as entered or
+resolved), `project_id`, `project_name` and `archived`. Every project's assistant
+can read the whole list, so an uber lmer can report it; that includes other
+projects' channel IDs and labels. A stored label or ID is matched against the
+project's own routes before anything is looked up, so re-saving `#name` after the
+channel was renamed keeps the channel it was mapped to rather than following the
+name to a different one, and `remove` takes exactly what `list` shows.
+
 Queued requests retain project, source conversation/root, sender, message and
 ownership revision. A stopped/unavailable/waiting assistant leaves the request
 at that destination. Admission, draining, actions and replies recheck ownership.

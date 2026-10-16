@@ -1126,6 +1126,8 @@ def native_wake_adapter(tmp_path, monkeypatch):
             return {'data': ['t']}
         if method == 'thread/read':
             return {'thread': thread}
+        if method == 'thread/turns/list':
+            return {'data': list(reversed(thread['turns'])), 'nextCursor': None}
         assert method == 'turn/start'
         starts.append(params)
         return {'turn': {'id': 'turn'}}
