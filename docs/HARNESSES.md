@@ -184,6 +184,21 @@ variable:
 | `codex`    | `~/.codex/auth.json` (`codex login` on the host)        | `CODEX_API_KEY` (non-interactive only) |
 | `pi`       | `~/.pi/agent/auth.json` (pi's in-TUI `/login`), `~/.pi/agent/models.json` (custom provider/model registry) | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, … |
 
+Fan-out children authenticate the way the session does. Claude Code removes
+`CLAUDE_CODE_OAUTH_TOKEN` from its shell tools' environment, so the shell
+`spawn-harness` runs in can lack a token the container was started with. For a
+claude child, `spawn-harness` then takes the variable from the container's
+initial environment (`/proc/1/environ`). It fills the variable only when the
+child env lacks it, or the parent shell holds it empty; a value in the shell,
+the agent preset or `--env` still wins. A blank set by the preset or `--env`
+(`--env CLAUDE_CODE_OAUTH_TOKEN=`) stays blank: that child gets no token from
+`spawn-harness`. The value travels in the child's
+environment only; stderr names the variable, never its value, and warns when
+the source cannot be read. `spawn-harness` never adds the token for a child on
+another harness; such a child still inherits whatever the parent shell holds.
+The variables a harness declares this way are its registry `credential_env`;
+only claude declares one.
+
 ### Custom models (pi)
 
 pi resolves model names against its built-in catalog plus a custom

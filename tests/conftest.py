@@ -12,6 +12,7 @@ from unittest import mock
 import pytest
 
 from lmer_cli import gate_lock, precommit_cache, runtime, user_harnesses
+from lmer_cli.container import spawn_harness
 
 # Read-only toolchain lookup still uses the installed runtime root after the
 # session fixture isolates writable state and credential-bearing defaults.
@@ -844,6 +845,19 @@ def _isolate_user_harnesses(tmp_path_factory):
     user_harnesses.DEFAULT_HARNESSES_DIR = empty
     yield
     user_harnesses.DEFAULT_HARNESSES_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_container_environ(tmp_path_factory):
+    """Keep the real ``/proc/1/environ``, and any credential in it, out of every
+    in-process spawn-harness run (issue #588): a stub child dumps its env to a
+    file, and a failing assertion prints it. Subprocess runs pass a fake token."""
+    original = spawn_harness.CONTAINER_ENVIRON
+    empty = tmp_path_factory.mktemp("container-environ") / "environ"
+    empty.write_bytes(b"")
+    spawn_harness.CONTAINER_ENVIRON = empty
+    yield
+    spawn_harness.CONTAINER_ENVIRON = original
 
 
 @pytest.fixture(autouse=True, scope="session")
