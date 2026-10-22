@@ -226,6 +226,11 @@ class Harness:
     #: Extra fixed environment for the container when this harness is active.
     #: (e.g. disable self-updates inside ephemeral containers)
     extra_env: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
+    #: Environment variables that authenticate this harness. ``spawn-harness``
+    #: fills one a child lacks from the container's initial environment,
+    #: because a harness may scrub its own credential from its shell tools
+    #: (issue #588).
+    credential_env: Tuple[str, ...] = field(default_factory=tuple)
     #: Absolute CONTAINER directory this harness writes its session JSONL
     #: under. Declared here so an orchestrator can mount each harness's
     #: transcripts out to the host instead of only claude's (issue #280):
@@ -279,6 +284,7 @@ HARNESSES: dict[str, Harness] = {
             dashdash_before_prompt=True,
         ),
         description="Claude Code (Anthropic) — full feature tier",
+        credential_env=("CLAUDE_CODE_OAUTH_TOKEN",),
         # The platform's transcript mount destination since T22 — one fact with
         # lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR, which
         # lmer_platform.spawn refuses to spawn without agreeing with.

@@ -1,0 +1,2 @@
+fixed:
+- "Claude fan-out children now use the session's CLAUDE_CODE_OAUTH_TOKEN instead of falling back to the shared credentials file."

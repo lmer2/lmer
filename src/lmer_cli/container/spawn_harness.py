@@ -108,6 +108,9 @@ STDERR_TAIL_LINES = 40
 #: Only the tally is kept, so this batches syscalls rather than holding an answer.
 STDOUT_CHUNK_BYTES = 65536
 
+#: The container's initial environment, as the runtime started it.
+CONTAINER_ENVIRON = Path("/proc/1/environ")
+
 #: Below this many non-whitespace-padded characters, a successful child's
 #: output counts as degenerate. Deliberately low: a legitimately terse answer
 #: ("no findings", 11 characters) must survive, so the floor only catches
@@ -362,6 +365,49 @@ def select_harness(
             child_env.pop(LLM_NAME_ENV, None)
     child_env[HARNESS_ENV] = name
     return registry[name]
+
+
+def restore_credential_env(
+    child_env: Dict[str, str], harness: Harness, overlay: Dict[str, str]
+) -> None:
+    """Fill the child harness's credential variables from the container env.
+
+    Claude Code strips ``CLAUDE_CODE_OAUTH_TOKEN`` from its shell tools, and
+    ``spawn-harness`` runs from such a shell, so a claude child would silently
+    fall back to the shared credentials file (issue #588). A key the preset or
+    ``--env`` *overlay* sets is the caller's choice, even when blank; only the
+    inherited shell layer's blank counts as stripped, since a blanked and a
+    deleted variable look the same there. An unreadable source warns and
+    leaves the child as it was. stderr names the variable, never its value.
+    """
+    missing = [
+        key
+        for key in harness.credential_env
+        if key not in overlay and not child_env.get(key)
+    ]
+    if not missing:
+        return
+    try:
+        raw = CONTAINER_ENVIRON.read_bytes()
+    except OSError as exc:
+        print(
+            f"⚠️  spawn-harness: cannot read {CONTAINER_ENVIRON} "
+            f"({exc.strerror}); {', '.join(missing)} not restored",
+            file=sys.stderr,
+        )
+        return
+    initial = {}
+    for entry in raw.split(b"\0"):
+        key, sep, value = entry.partition(b"=")
+        if sep:
+            initial[os.fsdecode(key)] = value
+    for key in missing:
+        if initial.get(key):
+            child_env[key] = os.fsdecode(initial[key])
+            print(
+                f"🔑 spawn-harness: {key} taken from the container environment",
+                file=sys.stderr,
+            )
 
 
 def apply_harness_extra_env(child_env: Dict[str, str], harness: Harness) -> None:
@@ -1126,6 +1172,7 @@ def main(argv: Optional[list] = None) -> None:
         dict(os.environ),
     )
     warn_missing_credentials(ns.agent, harness, dict(os.environ))
+    restore_credential_env(child_env, harness, {**agent_env, **extra_env})
     apply_harness_extra_env(child_env, harness)
     child_env["LMER_HARNESS"] = harness.name
     prepend_user_harness_path(child_env, harness)
