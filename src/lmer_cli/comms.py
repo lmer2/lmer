@@ -46,8 +46,9 @@ __all__ = [
     "STATE_OPEN", "STATE_ANSWERED", "STATE_CLOSED", "CommsError", "Source",
     "Message", "QuestionState", "MessageLog", "TerminalTracker",
     "AskDirProjection", "message_id", "parse_message_ref", "option_index",
-    "option_conflict", "RESERVED_META_KEYS", "relay_payload", "relay_label",
-    "utc_now_iso",
+    "option_conflict", "RESERVED_META_KEYS", "relay_payload", "relay_label", "one_turn",
+    "utc_now_iso", "SUPERVISOR_AUTHORITY_LEVELS", "AUTHORITY_NONE",
+    "META_AUTHORITY", "META_OPERATOR_ONLY", "ASSISTANT_CHANNELS", "CHANNEL_PEER_UL",
 ]
 
 SCHEMA_VERSION = 1
@@ -56,7 +57,16 @@ SCHEMA_VERSION = 1
 #: dropped rather than stored, and ``docs/COMMS.md`` §1 lists exactly these.
 RESERVED_META_KEYS = (
     "late", "answered_by", "delivered", "session_origin", "option", "off_thread",
+    "authority",
 )
+
+#: The operator's standing delegation to the assistant (issue #594), weakest
+#: first. Only the daemon stamps one, on the assistant's own records.
+SUPERVISOR_AUTHORITY_LEVELS = ("none", "approvals", "full")
+AUTHORITY_NONE = "none"
+META_AUTHORITY = "authority"
+#: On a question the agent asked: no assistant may answer or close it (#518).
+META_OPERATOR_ONLY = "operator_only"
 
 #: File name inside the mounted session directory
 #: (:data:`lmer_cli.supervisor.CONTAINER_SESSION_LOG_DIR`). A cross-version
@@ -142,6 +152,11 @@ CHANNEL_UBER = "uber-lmer"
 CHANNEL_SLACK = "slack"
 CHANNEL_MATRIX = "matrix"
 CHANNEL_SUPERVISOR = "supervisor"
+CHANNEL_PEER_UL = "peer-ul"
+
+#: The channels an assistant speaks on: this project's own, and a peer
+#: project's. Neither may answer an operator-only question.
+ASSISTANT_CHANNELS = frozenset({CHANNEL_UBER, CHANNEL_PEER_UL})
 
 #: ``meta`` flag for a record the Slack/Matrix threads neither show nor bind a
 #: reply to. An open question so flagged still reaches uber lmer as live.
@@ -216,6 +231,22 @@ QUESTION_HEAD_CHARS = 80
 _ID_WIDTH = 6
 _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _SEQ_RE = re.compile(r"^[0-9]{1,12}$")
+#: Characters a terminal input box edits on: C0 and C1 controls, ESC and DEL.
+#: A relayed record is typed after the tag the daemon chose, so one of these
+#: could erase that tag and type another in its place (#594). Prose keeps its
+#: newlines and tabs; a command, an author and an option keep neither.
+_TYPED_CONTROLS_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_LINE_BREAKS_RE = re.compile("[\t\n\u2028\u2029]")
+#: The escape sequences a pasted log or a terminal line carries (colours, cursor
+#: moves, titles): CSI to its final byte, OSC to its terminator, or ESC and one
+#: character. Removed whole, so the words around them arrive as written. An OSC
+#: cut short ends at its line: a truncated title in a pasted log must not take
+#: every line after it.
+_ANSI_SEQUENCE_RE = re.compile(
+    "(?:\x1b\\[|\x9b)[0-?]*[ -/]*[@-~]"
+    "|(?:\x1b\\]|\x9d)[^\x07\x1b\x9c\n\x85\u2028\u2029]*(?:\x07|\x1b\\\\|\x9c)?"
+    "|\x1b[@-_]"
+)
 
 
 class CommsError(ValueError):
@@ -408,10 +439,34 @@ def _optional_text(value: object, limit: int, label: str) -> Optional[str]:
     return cleaned
 
 
-def _clean_text(value: object, kind: str, *, allow_empty: bool = False) -> str:
+def holds_typed_controls(value: str) -> bool:
+    """Whether *value* holds a character a terminal input box edits on."""
+    return bool(_TYPED_CONTROLS_RE.search(value))
+
+
+def _refuse_typed_controls(value: str, label: str, *, one_line: bool = False) -> None:
+    if holds_typed_controls(value) or (one_line and _LINE_BREAKS_RE.search(value)):
+        allowed = "no control characters or line breaks" if one_line else "no control characters but newline and tab"
+        raise CommsError(f"{label} may hold {allowed}")
+
+
+def visible_controls(value: str) -> str:
+    """*value* with each typed control written out as an escape, ESC as ``\\x1b``."""
+    return _TYPED_CONTROLS_RE.sub(lambda match: f"\\x{ord(match.group()):02x}", value)
+
+
+def _clean_text(value: object, kind: str, *, allow_empty: bool = False, refuse_controls: bool = False) -> str:
+    """*refuse_controls* is for a sender who chose every character, the assistant;
+    a human's paste or a terminal line has its escapes removed or written out
+    instead, because refusing it would stop a connector on the one post."""
     if not isinstance(value, str):
         raise CommsError("text must be a string")
-    cleaned = value.strip()
+    cleaned = value.replace("\r\n", "\n")
+    if refuse_controls or kind == KIND_COMMAND:
+        cleaned = cleaned.strip()
+        _refuse_typed_controls(cleaned, "text", one_line=kind == KIND_COMMAND)
+    else:
+        cleaned = visible_controls(_ANSI_SEQUENCE_RE.sub("", cleaned.replace("\r", "\n"))).strip()
     limit = MAX_TEXT_CHARS.get(kind, MAX_TEXT_CHARS[KIND_MESSAGE])
     if not cleaned and kind != KIND_CLOSE and not allow_empty:
         raise CommsError("text is empty")
@@ -681,6 +736,7 @@ class MessageLog:
         session_caller: bool = False,
         local_only: bool = False,
         off_thread: bool = False,
+        authority: Optional[str] = None,
     ) -> tuple[Message, str]:
         """Validate, arbitrate, persist and publish one record.
 
@@ -700,6 +756,9 @@ class MessageLog:
 
         *off_thread* (supervisor only) keeps a question off the chat threads;
         an answer or close to it inherits the flag.
+
+        *authority* (daemon only, issue #594) is the assistant's delegated
+        level, stamped on a record from the assistant's own channel.
         """
         if not isinstance(kind, str) or not kind:
             raise CommsError("kind is required")
@@ -709,16 +768,35 @@ class MessageLog:
             raise CommsError(f"the agent may post {sorted(AGENT_KINDS)}, not {kind!r}")
         if kind == KIND_COMMAND and source.channel not in COMMAND_CHANNELS:
             raise CommsError(f"a command may only come from {sorted(COMMAND_CHANNELS)}")
+        # A command is typed untagged, so anything else would put a sender's
+        # own words at the start of a turn, where a stamped tag goes (#594).
+        if kind == KIND_COMMAND and not str(text).startswith("/"):
+            raise CommsError("a command is one line starting with '/'")
         picked = _clean_option(option, kind)
         # An answer that names its option by index carries no words of its own.
-        body = _clean_text(text, kind, allow_empty=picked is not None)
+        body = _clean_text(text, kind, allow_empty=picked is not None,
+                           refuse_controls=source.channel in ASSISTANT_CHANNELS)
         choices = _clean_options(options) if kind == KIND_QUESTION else ()
+        if source.author:
+            _refuse_typed_controls(source.author, "source.author", one_line=True)
+        for choice in choices:
+            _refuse_typed_controls(choice, "an option", one_line=True)
         files = _clean_attachments(attachments)
         extra = _clean_meta(meta)
         for reserved in RESERVED_META_KEYS:
             extra.pop(reserved, None)
         if off_thread:
             extra[META_OFF_THREAD] = True
+        if authority is not None:
+            if source.channel != CHANNEL_UBER:
+                raise CommsError("only the assistant's own records carry an authority")
+            if authority not in SUPERVISOR_AUTHORITY_LEVELS:
+                raise CommsError(
+                    f"authority must be one of {list(SUPERVISOR_AUTHORITY_LEVELS)}, not {authority!r}"
+                )
+            extra[META_AUTHORITY] = authority
+        if kind != KIND_QUESTION or extra.get(META_OPERATOR_ONLY) is not True:
+            extra.pop(META_OPERATOR_ONLY, None)
 
         with self._cond:
             if source.ref:
@@ -740,6 +818,13 @@ class MessageLog:
                 reply_to = target
                 if state.question.meta.get(META_OFF_THREAD) is True:
                     extra[META_OFF_THREAD] = True
+                if (source.channel in ASSISTANT_CHANNELS
+                        and state.question.meta.get(META_OPERATOR_ONLY) is True):
+                    raise CommsError(
+                        f"question {target} is operator-only: an assistant may not "
+                        f"{'answer' if kind == KIND_ANSWER else 'close'} it, whatever "
+                        "authority it holds — it stays open for a human"
+                    )
                 if kind == KIND_ANSWER:
                     offered = state.question.options
                     if picked is not None:
@@ -1057,6 +1142,8 @@ def relay_label(message: Message, question: Optional[Message] = None, *, assista
     if assistant_name and message.source.channel == CHANNEL_UBER:
         name = assistant_name.strip()
         label = f"{name} · {message.source.author}" if message.source.author else name
+    if message.source.channel == CHANNEL_UBER and message.meta.get(META_AUTHORITY):
+        label = f"{label} · authority={message.meta[META_AUTHORITY]}"
     if message.kind != KIND_ANSWER or question is None:
         return f"[{label}]"
     head = question.text.strip().splitlines()[0] if question.text.strip() else ""
@@ -1075,9 +1162,25 @@ def relay_payload(message: Message, question: Optional[Message] = None, *, assis
     it is. Everything else is prefixed with its source tag, which also takes
     the first column away from the harness's command escapes.
     """
+    # Written out again here, for what intake never checked: a record from a
+    # journal kept before the check, or a question head inside the tag.
     if message.kind == KIND_COMMAND:
-        return message.text, False
-    return f"{relay_label(message, question, assistant_name=assistant_name)} {message.text}", True
+        return _LINE_BREAKS_RE.sub(" ", visible_controls(message.text)), False
+    return visible_controls(f"{relay_label(message, question, assistant_name=assistant_name)} {message.text}"), True
+
+
+def one_turn(text: str) -> str:
+    """Typed *text* for a harness that takes it as raw keystrokes (#594).
+
+    With no paste framing, a line break can submit, and the next line opens a
+    turn of its own behind whatever tag it starts with. Every tagged record is
+    written on one line, whatever its channel or stamp, since a sender can
+    reach a worker by more than one route (the assistant's post into the
+    worker's connected thread arrives as ``slack``), and the container cannot
+    know the level live. A human's lines were already split into separate
+    turns on such a harness.
+    """
+    return _LINE_BREAKS_RE.sub(" ", text)
 
 
 # ---------------------------------------------------------------------------
@@ -1531,7 +1634,10 @@ class AskDirProjection:
             return {
                 "kind": KIND_ANSWER, "text": answer.text, "in_reply_to": question,
                 "option": self._provenance_option(answer.option, answer.text, question),
-                "source": {"channel": CHANNEL_PLATFORM, "author": answer.source or "operator"},
+                "source": (
+                    {"channel": CHANNEL_UBER} if answer.source == CHANNEL_UBER
+                    else {"channel": CHANNEL_PLATFORM, "author": answer.source or "operator"}
+                ),
             }
         if kind == KIND_CLOSE:
             closure = protocol.load_closure(self.directory, stem)

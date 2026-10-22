@@ -559,7 +559,8 @@ class MatrixConnector(ConnectorLifecycle):
             question = related or oldest
             if question is not None:
                 bound = answer_binding(text, question, replies_to_question=related is not None,
-                                       first_since_question=self._first_since(question))
+                                       first_since_question=self._first_since(question),
+                                       refuse_operator_only=poster is not None or event.get("sender") == self.config.user_id)
                 if bound is not None:
                     kind, in_reply_to, text = "answer", question["id"], bound
             return {"question": question["id"] if question else None,

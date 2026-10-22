@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from lmer_cli import thread_requests as _threads
+from lmer_cli.comms import CHANNEL_UBER, META_AUTHORITY, META_OPERATOR_ONLY
 from lmer_cli.routing_receipts import emit as routing_receipt
 
 from . import bus
@@ -212,6 +213,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     ask_p.add_argument(
         "--no-wait", action="store_true", help="Post the question, print its id, and exit 0 without waiting."
+    )
+    ask_p.add_argument(
+        "--operator-only", action="store_true", dest="operator_only",
+        help=(
+            "A gate only a human may pass (spec approval, a merge, a new repository). "
+            "The bus refuses an answer to it from any assistant, whatever authority it holds."
+        ),
     )
     _add_attach(ask_p)
     add_wait_flags(ask_p)
@@ -575,6 +583,7 @@ def _cmd_ask(args: argparse.Namespace, client: bus.BusClient) -> int:
     result = client.post(
         KIND_QUESTION, resolve_text(args), options=args.options,
         attachments=_stage_attachments(args.attachments),
+        meta={META_OPERATOR_ONLY: True} if args.operator_only else None,
         # The claim starts with the question, not with the first poll: an
         # answer landing in between used to be typed into the harness as well
         # as returned here.
@@ -664,12 +673,22 @@ def _await(client: bus.BusClient, question: dict, args: argparse.Namespace) -> i
         )
         return TIMEOUT_EXIT_CODE
     print(answer["text"])
-    source = answer.get("source") or {}
+    print(f"answered from {_who(answer)}", file=sys.stderr)
+    return 0
+
+
+def _who(record: dict) -> str:
+    """The record's source, with the authority the platform stamped (#594)."""
+    source = record.get("source") or {}
     who = source.get("channel", "?")
     if source.get("author"):
         who = f"{who} · {source['author']}"
-    print(f"answered from {who}", file=sys.stderr)
-    return 0
+    authority = (record.get("meta") or {}).get(META_AUTHORITY)
+    # Only the assistant's channel is ever stamped; elsewhere the key is a
+    # sender's own meta that an older supervisor kept.
+    if authority and source.get("channel") == CHANNEL_UBER:
+        who = f"{who} · authority={authority}"
+    return who
 
 
 def _answers(record: dict, question: dict) -> bool:
@@ -749,14 +768,12 @@ def _cmd_list(args: argparse.Namespace, client: bus.BusClient) -> int:
 
 
 def _print_record(record: dict, state: Optional[str]) -> None:
-    source = record.get("source") or {}
-    who = source.get("channel", "?")
-    if source.get("author"):
-        who = f"{who} · {source['author']}"
-    head = f"[{format_id(record)}] {record.get('kind')} from {who}"
+    head = f"[{format_id(record)}] {record.get('kind')} from {_who(record)}"
     if state:
         head += f" ({state})"
     meta = record.get("meta") or {}
+    if meta.get(META_OPERATOR_ONLY):
+        head += " (operator-only)"
     if meta.get("late"):
         head += " (late)"
     reply_to = record.get("in_reply_to")

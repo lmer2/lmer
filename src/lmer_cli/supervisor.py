@@ -569,6 +569,10 @@ class _MessageBody(BaseModel):
     #: On a question: this caller will be waiting for the answer, so hold it
     #: for them from now rather than from their first poll (#407 §7).
     wait: Optional[float] = None
+    #: The daemon's stamp of the assistant's delegated level (#594). A field of
+    #: its own, not ``meta``: an image that predates it ignores the field and
+    #: the record reads as carrying no authority.
+    authority: Optional[str] = None
 
 
 class _ThreadRequestBody(BaseModel):
@@ -1437,6 +1441,8 @@ def _relay_message(
     text, tagged = _comms.relay_payload(message, log.question_of(message))
     if not tagged:
         text = _rewrite_harness_command(text, harness)
+    elif codex_delivery is None and not _bracketed_paste_for(harness, text):
+        text = _comms.one_turn(text)
     payload = text.encode("utf-8")
     receipt = {
         "payload_sha256": hashlib.sha256(payload).hexdigest(),
@@ -1752,6 +1758,11 @@ def _build_fastapi_app(
                     "vouches for them"
                 ),
             )
+        if body.authority is not None and caller != CALLER_CONTROL:
+            raise HTTPException(
+                status_code=403,
+                detail="authority is stamped by the platform, never by the session",
+            )
         with relay_inbound.lock:
             try:
                 source = _comms.Source.from_dict(
@@ -1778,6 +1789,7 @@ def _build_fastapi_app(
                     attachments=body.attachments,
                     meta=body.meta,
                     session_caller=caller == CALLER_AGENT,
+                    authority=body.authority,
                 )
                 if body.wait and message.kind == _comms.KIND_QUESTION:
                     log.claim(message.id, ttl=body.wait)

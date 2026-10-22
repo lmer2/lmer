@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from lmer_cli import thread_posts
+from lmer_cli import comms, thread_posts
 from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
 from tests.timing_budgets import DRAIN, JOIN, SCRIPT, XDIST_GROUP
 
@@ -272,5 +272,74 @@ def test_attributed_batch_exceeding_hold_limit_drains(channel, reconstruct, tmp_
         assert not connector._posters._held
     finally:
         connector.stop(timeout=DRAIN, announce=False)
+        rig.bus._session._http.close()
+        rig.log.close()
+
+
+def _thread(channel, rig):
+    """The rig's remote and the poll that reads one round of it."""
+    if channel == "slack":
+        return rig.slack, rig.connector._poll_thread
+    rig.connector.connect()
+    return rig.matrix, rig.connector.sync_once
+
+
+def _typed(rig, text):
+    deadline = time.monotonic() + JOIN
+    while text.encode() not in b"".join(rig.sink) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return b"".join(rig.sink).decode("utf-8")
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+def test_an_ansi_paste_reaches_the_worker_clean_and_the_connector_keeps_reading(channel, tmp_path):
+    """Refused at intake, this one post would be retried ahead of every later one
+    until the connector gave up (#594)."""
+    rig = (SlackRig if channel == "slack" else MatrixRig)(tmp_path)
+    remote, poll = _thread(channel, rig)
+    try:
+        remote.human_says("log: \x1b[31mFAILED\x1b[0m test_x\rsee\x08 above")
+        poll()
+        remote.human_says("and after the paste")
+        poll()
+        typed = _typed(rig, "and after the paste")
+        assert "log: FAILED test_x\nsee\\x08 above" in typed
+        assert "and after the paste" in typed
+        for frame in ("\x1b[200~", "\x1b[201~", "\r"):
+            typed = typed.replace(frame, "")
+        assert not comms.holds_typed_controls(typed.replace("\n", ""))
+        assert rig.connector._pending_inbound == {}
+    finally:
+        rig.connector.stop(timeout=DRAIN)
+        rig.bus._session._http.close()
+        rig.log.close()
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+def test_a_record_the_bus_refuses_is_dropped_with_a_note_not_retried(channel, tmp_path):
+    rig = (SlackRig if channel == "slack" else MatrixRig)(tmp_path)
+    remote, poll = _thread(channel, rig)
+    try:
+        remote.human_says("<!channel> <@U123> " + "x" * comms.MAX_TEXT_CHARS[comms.KIND_MESSAGE])
+        poll()
+        remote.human_says("after the refusal")
+        poll()
+        assert "after the refusal" in _typed(rig, "after the refusal")
+        assert rig.connector._pending_inbound == {}
+        notes = [record.text for record in rig.log.read_since(0)[0] if record.kind == comms.KIND_NOTE]
+        assert any(f"{channel} connector dropped an inbound message the bus refused (400)" in note
+                   for note in notes), notes
+        # ...and the sender is told where they posted, naming which post it was.
+        posted = ([text for _, _, text in rig.slack.posted] if channel == "slack"
+                  else [sent[2] for sent in rig.matrix.sent])
+        (notice,) = [text for text in posted if "didn't reach the session" in text]
+        assert "xxxxx…'" in notice and "limit" in notice, notice
+        # A quoted mention must not ping again as the bot's own: Slack gets its
+        # markup escaped, Matrix posts a plain body that mentions nobody.
+        quoted = "&lt;!channel&gt; &lt;@U123&gt;" if channel == "slack" else "<!channel> <@U123>"
+        assert f"'{quoted} xxx" in notice, notice
+        assert channel != "slack" or "<!channel>" not in notice
+    finally:
+        rig.connector.stop(timeout=DRAIN)
         rig.bus._session._http.close()
         rig.log.close()

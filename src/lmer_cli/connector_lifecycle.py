@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 MODULE_POLL_SECONDS = 1.0
 DRAIN_SECONDS = 45.0
 FAILURE_LIMIT = 8
+#: What the bus answers about the record itself (its shape, size or sender),
+#: never about the moment: posting it again gets the same answer.
+REFUSED_RECORD_STATUSES = frozenset({400, 403, 413, 422})
+#: How much of a refused post its notice quotes back, enough to say which one.
+REFUSED_HEAD_CHARS = 60
 EXIT_RETRY = 1
 EXIT_DRAIN = 3
 EXIT_RECOVERY = 4
@@ -264,7 +269,15 @@ class ConnectorLifecycle:
                     return None
                 self._pending_inbound[ref] = pending
                 self._state.save()
-        result = self.bus.post(**pending["request"])
+        try:
+            result = self.bus.post(**pending["request"])
+        except bus.NoChannel:
+            raise
+        except bus.BusError as exc:
+            if exc.status not in REFUSED_RECORD_STATUSES:
+                raise
+            self._drop_refused_inbound(ref, accepted, exc, pending)
+            return None
         message = result.get("message") if isinstance(result, dict) else None
         if not isinstance(message, dict) or not message.get("id"):
             raise bus.BusError("supervisor returned no accepted message receipt")
@@ -279,6 +292,36 @@ class ConnectorLifecycle:
             self._pending_inbound.pop(ref, None)
             self._state.save()
         return result
+
+    def _drop_refused_inbound(self, ref, accepted, exc, pending):
+        """Retire one record the bus refuses, so it never holds up the next."""
+        logger.warning("connector_inbound_refused ref=%s status=%s reason=%s", ref, exc.status, exc)
+        with self._state.lock:
+            accepted()
+            self._posters.ack_ref(ref)
+            self._pending_inbound.pop(ref, None)
+            self._state.save()
+        self._transition_note(f"{self._lease.key.transport} connector dropped an inbound message "
+                              f"the bus refused ({exc.status}): {exc}")
+        # The note above reaches no thread and no digest; without this the sender
+        # sees a post that silently never arrived. Best effort, after the drop is
+        # saved: a crash here loses the notice, never the next message.
+        words = " ".join(str((pending.get("request") or {}).get("text") or "").split())
+        head = words if len(words) <= REFUSED_HEAD_CHARS else words[:REFUSED_HEAD_CHARS - 1] + "…"
+        try:
+            receipt = self._send_notice(
+                f"This message didn't reach the session: {self._inert(repr(head))} ({self._inert(str(exc))})."
+            )
+            with self._state.lock:
+                self._remember_notice(receipt)
+                self._state.save()
+        except Exception as error:
+            logger.warning("connector_refusal_notice_failed ref=%s error=%s", ref, error)
+
+    def _inert(self, text):
+        """*text*, quoted from someone else's post, as the transport shows it
+        without acting on it: a quoted mention must not ping anyone again."""
+        return text
 
     def _resume_pending_inbound(self):
         with self._state.lock:

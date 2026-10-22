@@ -91,6 +91,7 @@ from work_repo.git_ops import (
 from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
+from . import authority
 from . import checkin
 from . import comms
 from . import connectors
@@ -152,7 +153,7 @@ from .config import (
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
 from .meta import MetaError
-from .registry import list_sessions, prune_dead, read_session
+from .registry import ASSISTANT_KIND, list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
@@ -231,6 +232,16 @@ WS_POLICY_VIOLATION = 1008
 #: RFC 6455 caps a close reason at 123 bytes; the reasons here are explanations,
 #: so they are truncated rather than assumed short.
 _WS_REASON_LIMIT = 120
+
+#: Key under which a tty ticket carries the credential that minted it.
+_TTY_CALLER = "tty_caller"
+#: A question its session closed unanswered: answered by file for every caller,
+#: so the file's refusal returns the reason the session gave.
+_CLOSED_ON_FILE = object()
+
+#: The commands the assistant may send a worker above ``none`` (#594): lmer's
+#: own, never a name a harness could pass to its model as an untagged turn.
+_DELEGATED_COMMANDS = frozenset({"/followup"})
 
 #: The integer settings' keys in a config request body (issues #244, #317), spelled
 #: as their config fields rather than the launch settings' short names. **Derived**
@@ -866,7 +877,19 @@ def _body_launch_settings(payload: dict) -> Optional[dict]:
     and reading as "leave it alone".
     """
     named = {key: value for key, value in payload.items() if key not in ("handoff", "workspace_id")}
+    _refuse_worker_settings(named)
     return named or None
+
+
+def _refuse_worker_settings(body: dict) -> None:
+    """The assistant's routes write project settings, and the assistant may
+    call them: a delegation it could set would be one it grants itself (#594)."""
+    named = sorted(set(body) & set(projects.WORKER_SETTING_KEYS))
+    if named:
+        raise projects.ProjectError(
+            f"{', '.join(named)} is a project setting: change it with PATCH /api/projects/{{id}}",
+            code="project_setting",
+        )
 
 
 def _run_dir_files(root: Path) -> tuple[list[str], bool]:
@@ -2195,6 +2218,28 @@ def _author_of(caller: "Caller", requested: object) -> Optional[str]:
     return "operator" if caller.kind == CALLER_OPERATOR else None
 
 
+def _authority_of(caller: "Caller", session_id: str, kind: str) -> Optional[str]:
+    """The delegated level stamped on the assistant's message or answer (#594):
+    from the credential and the platform's settings, never from the body."""
+    if not caller.is_assistant or kind not in (comms.KIND_MESSAGE, comms.KIND_ANSWER):
+        return None
+    return authority.for_session(session_id)
+
+
+def _caller_meta(meta: object, kind: str) -> Optional[dict]:
+    """A caller's ``meta`` without the keys only the platform sets (#594).
+
+    The bus drops them too, but a supervisor older than the stamp would keep
+    them, and the daemon owns the stamp whatever image is on the other end.
+    """
+    if not isinstance(meta, dict):
+        return None
+    kept = {key: value for key, value in meta.items() if key != bus_comms.META_AUTHORITY}
+    if kind != bus_comms.KIND_QUESTION:
+        kept.pop(bus_comms.META_OPERATOR_ONLY, None)
+    return kept
+
+
 def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
     """Who a thread is told wrote a post the platform made: from the credential,
     never from the body — the rule the bus already applies to ``source.channel``."""
@@ -2892,7 +2937,7 @@ def create_app(
         return discover_spawn_options(config, target=target, repo_url=repo_url)
 
     @app.post("/api/sessions", dependencies=guard, status_code=201)
-    def create_session(body: dict) -> dict:
+    def create_session(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Spawn a session and start tracking its run.
 
         Returns 429 at the concurrency cap rather than queueing: the queue that
@@ -2946,6 +2991,8 @@ def create_app(
                 # it afterwards go through one validation and one file.
                 title=body.get("title"),
                 description=body.get("description"),
+                supervisor_authority=body.get("supervisor_authority"),
+                supervisor_authority_capped=caller.kind != CALLER_OPERATOR,
             )
             result = spawn_session(config, request)
         except CapacityError as exc:
@@ -3030,6 +3077,47 @@ def create_app(
             **chunk.to_dict(),
         }
 
+    def _refuse_untagged_typing(caller: Caller, session_id: str) -> None:
+        """Keystrokes reach a worker with no tag, so the assistant could type a
+        turn that looks stamped. Closed where the stamp means something: a
+        worker whose effective level is above ``none`` (#594)."""
+        level = _delegated_level(caller, session_id)
+        if level is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"session {session_id} gives the assistant authority={level}, so the assistant "
+                    "may not type into it untagged: send a message on its bus (lmer-ctl send)"
+                ),
+            )
+
+    def _delegated_level(caller: Caller, session_id: str) -> Optional[str]:
+        """The assistant's level on a worker, when it is above ``none``."""
+        if not caller.is_assistant:
+            return None
+        # Keyed on the assistant, as spawn and lifecycle are: an entry that is
+        # missing or unreadable is a worker, so it fails closed.
+        entry = read_session(session_id) or {}
+        if entry.get("kind") == ASSISTANT_KIND:
+            return None
+        level = authority.for_session(session_id)
+        return None if level == bus_comms.AUTHORITY_NONE else level
+
+    def _refuse_command_arguments(caller: Caller, session_id: str, kind: str, text: str) -> None:
+        """A command is typed untagged, and its arguments are free words: above
+        ``none`` the assistant may send a bare :data:`_DELEGATED_COMMANDS` only (#594)."""
+        if kind != comms.KIND_COMMAND or text.strip() in _DELEGATED_COMMANDS:
+            return
+        level = _delegated_level(caller, session_id)
+        if level is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"session {session_id} gives the assistant authority={level}, so its only "
+                    f"command is a bare {' or '.join(sorted(_DELEGATED_COMMANDS))}: send the words as a message"
+                ),
+            )
+
     @app.post("/api/sessions/{session_id}/input", dependencies=guard)
     def session_input(
         session_id: str, body: dict, caller: Caller = Depends(require_secret)
@@ -3060,12 +3148,14 @@ def create_app(
                 body.get("preserve_slash_commands") and data.startswith("/")
                 and caller.kind in comms.COMMAND_CALLERS
             ) else comms.KIND_MESSAGE
+            _refuse_command_arguments(caller, session_id, kind, data)
             try:
                 session_io.require_session(session_id)
                 result = hub.post(
                     session_id, kind=kind, text=data.rstrip("\r\n"),
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    authority=_authority_of(caller, session_id, kind),
                 )
             except SessionIOError as exc:
                 raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -3095,6 +3185,7 @@ def create_app(
                 "Deprecation": "true",
                 "Link": f'</api/sessions/{session_id}/comms>; rel="successor-version"',
             })
+        _refuse_untagged_typing(caller, session_id)
         try:
             reply = session_io.send_input(
                 session_id, data,
@@ -3227,8 +3318,9 @@ def create_app(
         except bus_comms.CommsError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    def _answer_target(hub, session_id: str, question_id: str) -> Optional[str]:
-        """The bus question this answer names, or ``None`` to answer by file.
+    def _answer_target(hub, session_id: str, question_id: str) -> object:
+        """The bus question this answer names, ``None`` to answer by file, or
+        :data:`_CLOSED_ON_FILE` for a question its session closed unanswered.
 
         A session can have a bus and still ask through the ask directory: its
         image carries the supervisor but the CLI that asked predates it, which
@@ -3251,7 +3343,7 @@ def create_app(
             # The bus would refuse this too, as a late answer — but "already
             # answered" names an event that did not happen and drops the one
             # thing the operator can act on.
-            return None
+            return _CLOSED_ON_FILE
         return hub.question_for_ask_entry(
             session_id, question_id,
             mirrored=ask.entry_is_the_bus_projection(session_id, question_id),
@@ -3298,10 +3390,22 @@ def create_app(
         # arbitrates first-answer-wins and every channel sees who answered. The
         # reply keeps this route's shape; a late answer keeps its 409.
         hub = comms.ensure_hub()
-        target = (
-            _answer_target(hub, session_id, question_id)
-            if hub is not None and hub.supports(session_id) else None
-        )
+        on_bus = hub is not None and hub.supports(session_id)
+        target = _answer_target(hub, session_id, question_id) if on_bus else None
+        closed = target is _CLOSED_ON_FILE
+        if closed:
+            target = None
+        if on_bus and target is None and not closed and caller.is_assistant:
+            # Filed answers are lifted onto the bus later, where an operator-only
+            # question refuses the assistant after this route had said yes, and
+            # the file keeps the slot from the operator's answer (#594).
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"question {question_id} is not on session {session_id}'s bus yet; "
+                    "retry in a moment, or answer it on the bus by its id"
+                ),
+            )
         if target is not None:
             try:
                 session_io.require_session(session_id)
@@ -3310,6 +3414,7 @@ def create_app(
                     option=option,
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    authority=_authority_of(caller, session_id, comms.KIND_ANSWER),
                 )
             except SessionIOError as exc:
                 raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -3331,7 +3436,10 @@ def create_app(
         try:
             session_io.require_session(session_id)
             recorded = ask.answer_question(
-                session_id, question_id, text, option=option
+                session_id, question_id, text, option=option,
+                # Kept through the lift onto the bus, so an operator-only
+                # question refuses it there as it would on the bus route (#594).
+                source=comms.CHANNEL_UBER if caller.is_assistant else "operator",
             )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -3400,9 +3508,9 @@ def create_app(
             project_requests.preflight()
             return peers.send(caller, session_id, body, _require_hub())
         project_requests.preflight()
-        if (caller.source_channel == "peer-ul" or "generation" in body
+        if (caller.source_channel == bus_comms.CHANNEL_PEER_UL or "generation" in body
                 or isinstance(body.get("meta"), dict) and "peer" in body["meta"]
-                or isinstance(body.get("source"), dict) and body["source"].get("channel") == "peer-ul"):
+                or isinstance(body.get("source"), dict) and body["source"].get("channel") == bus_comms.CHANNEL_PEER_UL):
             raise HTTPException(status_code=403, detail="Peer provenance is assigned only to authenticated cross-project UL messages.")
         try:
             session_io.require_session(session_id)
@@ -3422,6 +3530,7 @@ def create_app(
                 status_code=403,
                 detail="only the operator and the assistant may run a harness command",
             )
+        _refuse_command_arguments(caller, session_id, kind, text)
         options = body.get("options") or []
         attachments = body.get("attachments") or []
         if not isinstance(options, list) or not isinstance(attachments, list):
@@ -3439,7 +3548,8 @@ def create_app(
                 option=option,
                 options=[str(item) for item in options],
                 attachments=[item for item in attachments if isinstance(item, dict)],
-                meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
+                meta=_caller_meta(body.get("meta"), kind),
+                authority=_authority_of(caller, session_id, kind),
             )
         except comms.NoBus:
             if option is not None and kind == comms.KIND_ANSWER:
@@ -3480,6 +3590,7 @@ def create_app(
         slash, everything else is guarded as before — and nothing else on the
         session hears it, because there is nothing to hear it with.
         """
+        _refuse_untagged_typing(caller, session_id)
         if kind not in (comms.KIND_MESSAGE, comms.KIND_COMMAND):
             raise HTTPException(
                 status_code=409,
@@ -3952,7 +4063,9 @@ def create_app(
     @app.post(
         "/api/sessions/{session_id}/wind-down", dependencies=guard, status_code=202
     )
-    def session_wind_down(session_id: str, body: Optional[dict] = None) -> dict:
+    def session_wind_down(
+        session_id: str, body: Optional[dict] = None, caller: Caller = Depends(require_secret),
+    ) -> dict:
         """Ask a session's agent to wrap up and end itself. Signals nothing.
 
         **202, not 200.** Nothing has ended when this returns: an agent has been
@@ -3971,8 +4084,17 @@ def create_app(
         comes back in the reply: the operator interrupted a working agent, and what
         it was told should not be something only the source knows.
         """
+        note = (body or {}).get("note")
+        added_by = "The operator"
+        if caller.is_assistant:
+            # The note is typed untagged, like raw input; the fixed prompt is not.
+            if note:
+                _refuse_untagged_typing(caller, session_id)
+            added_by = f"The assistant ({config.assistant_name}), not the operator,"
+        elif caller.kind == CALLER_CONNECTOR:
+            added_by = f"The {caller.name or 'chat'} connector, not the operator,"
         try:
-            report = lifecycle.wind_down(session_id, note=(body or {}).get("note"))
+            report = lifecycle.wind_down(session_id, note=note, added_by=added_by)
         except (SessionIOError, LifecycleError) as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return report.to_dict()
@@ -4010,12 +4132,15 @@ def create_app(
             session_io.require_session(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _refuse_untagged_typing(caller, session_id)
         # The only signal the socket can give: the tty stream carries no
         # credential, so nothing downstream of this mint is attributable.
         _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
-            "ticket": tickets.mint(session_id, binding=project_api.capture()),
+            "ticket": tickets.mint(
+                session_id, binding={**project_api.capture(), _TTY_CALLER: caller},
+            ),
             "expires_in": tickets.ttl,
         }
 
@@ -4063,15 +4188,27 @@ def create_app(
                     websocket, "bad_frame", "an input frame needs a string 'data'"
                 )
                 return
+            caller = websocket.state.tty_caller
+
+            def type_frame() -> None:
+                # The level can rise while the socket is open, so the mint's
+                # check is repeated for every frame, inside the operation that
+                # writes it, where a level change cannot land between (#594).
+                if caller is not None and caller.is_assistant:
+                    _refuse_untagged_typing(caller, session_id)
+                session_io.send_input(
+                    session_id, data, append_newline=bool(frame.get("append_newline")),
+                )
+
             try:
                 await asyncio.to_thread(
                     project_api.invoke_captured, websocket.state.project_binding,
-                    session_io.send_input,
-                    session_id,
-                    data,
-                    append_newline=bool(frame.get("append_newline")),
-                    mutation=True,
+                    type_frame, mutation=True,
                 )
+            except HTTPException as exc:
+                await send_status(websocket, "input_refused", str(exc.detail))
+                await websocket.close(code=WS_POLICY_VIOLATION, reason="input refused")
+                raise WebSocketDisconnect(code=WS_POLICY_VIOLATION) from exc
             except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "input_failed", str(exc))
             return
@@ -4186,6 +4323,7 @@ def create_app(
                 reason="invalid, expired or already-used ticket",
             )
             return
+        websocket.state.tty_caller = binding.pop(_TTY_CALLER, None)
         websocket.state.project_binding = binding
         try:
             live = await asyncio.to_thread(project_api.invoke_captured, binding, _session_preamble, session_id)
@@ -5100,6 +5238,7 @@ def create_app(
         one call away when the operator wants the new settings live. The integer
         settings need neither — the daemon's next tick reads them.
         """
+        _refuse_worker_settings(body)
         if projects.enabled() and project_scope.current():
             project = projects.get(project_scope.current())
             settings = {**project["settings"], **{key: value for key, value in body.items()
