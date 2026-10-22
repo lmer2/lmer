@@ -532,6 +532,7 @@ def _meta():
     cycle and try to read those names before they exist. Same lazy-import shape,
     and same one named seam, as ``lmer_platform.spawn._transcripts``.
     """
+    # deferred: cycle — lmer_platform.meta imports this module at top
     from . import meta
 
     return meta
@@ -540,6 +541,7 @@ def _meta():
 def _references():
     """The :mod:`lmer_platform.references` module, imported on demand — the same
     cycle and the same seam as :func:`_meta`."""
+    # deferred: cycle — lmer_platform.references imports this module at top
     from . import references
 
     return references

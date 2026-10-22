@@ -13,8 +13,8 @@ from lmer_cli.connector_delivery import checkpoint_path, marker_path
 from lmer_cli.connector_ownership import read_json
 from tests.connector_fakes import CHILD_SOURCE, isolated_connectors, live_supervisor
 from tests.timing_budgets import (
-    BACKLOG, CHILD_DRAIN, CHILD_DRAIN_EXPIRED, DRAIN_DEADLINE, FIXTURE_RELEASE,
-    RELOAD_LATENCY, SETTLE, SHUTDOWN, STOP, XDIST_GROUP, outlast,
+    BACKLOG, CHILD_DRAIN, FIXTURE_RELEASE,
+    RELOAD_LATENCY, SETTLE, SHUTDOWN, STOP, XDIST_GROUP, outlast, stretch,
 )
 from tests.test_connector_process import child, wait_for
 from tests.test_connector_recovery import block
@@ -173,7 +173,12 @@ sys.addaudithook(audit)
 
 @pytest.mark.parametrize("stage", ["checkpoint", "final-ack", "lease", "lease-close"])
 def test_finalization_is_inside_total_reload_deadline(child, stage):
-    child.bounds["CONNECTOR_FIXTURE_DRAIN"] = str(CHILD_DRAIN_EXPIRED)
+    # Wider than CHILD_DRAIN_EXPIRED: under load, joining the workers and the
+    # steps before *stage* can spend a 5 s drain, and stop() then skips the stage
+    # instead of reaching it — a loaded host, not a finalization outside the
+    # deadline.
+    drain = stretch(15.0)
+    child.bounds["CONNECTOR_FIXTURE_DRAIN"] = str(drain)
     instrument(child, '''
 from ask_channel import bus
 from lmer_cli.connector_ownership import Lease
@@ -187,7 +192,7 @@ def delay():
     if (root / "finalize").exists():
         publish("finalize.reached", stage)
         # Release after observing drain expiry; the deadline only bounds a broken test.
-        deadline = time.monotonic() + ''' + repr(outlast(DRAIN_DEADLINE)) + '''
+        deadline = time.monotonic() + ''' + repr(outlast(outlast(drain))) + '''
         while not (root / "release-finalize").exists() and time.monotonic() < deadline:
             time.sleep(.01)
 if stage == "checkpoint":
@@ -236,10 +241,10 @@ connector_lifecycle.ConnectorLifecycle.stop = stop
             owned.popen.terminate()
         else:
             (child.root / "watched.py").write_text("# finalize under total deadline\n")
-        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, SHUTDOWN)
+        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, SHUTDOWN + drain)
         result = json.loads((child.root / "stop-result").read_text())
         assert not result["ok"], result
-        assert result["elapsed"] < DRAIN_DEADLINE, result
+        assert result["elapsed"] < outlast(drain), result
         assert (child.root / "finalize.reached").read_text() == stage
         if stage == "lease-close":
             (child.root / "release-finalize").touch()

@@ -334,6 +334,7 @@ _PROBE_HEADERS = {"User-Agent": "lmer/pi-provider-discovery"}
 
 
 def _default_http_get(url: str, headers: Mapping[str, str], timeout: float) -> dict:
+    # deferred: import cost — requests adds ~110 ms
     import requests
 
     try:

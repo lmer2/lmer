@@ -471,7 +471,10 @@ every channel for mentions and needs no public HTTP endpoint.
   for context reads (`channels:history` for public channels and `groups:history`
   for private channels). Keep `chat:write` for replies and `im:write` to start
   assistant DMs. Add `files:write` so runs' `--attach` files upload into their
-  threads. Reinstall the app after changing its granted scopes.
+  threads. Optionally add both `channels:read` and `groups:read` to map a
+  project's mention channel by `#name`: the lookup lists public and private
+  channels in one call and needs both, whichever kind the channel is. A channel
+  ID or link needs neither. Reinstall the app after changing its granted scopes.
 - Invite the bot to the channels where it should receive mentions. Membership
   still controls access to history; `not_in_channel` in the daemon log identifies
   a refused context read.

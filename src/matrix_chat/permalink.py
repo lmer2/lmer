@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 __all__ = [
     "MatrixThread", "parse_matrix_permalink", "is_matrix_thread_url",
@@ -81,6 +81,4 @@ def is_matrix_room(value: object) -> bool:
 
 def matrix_to_link(room_id: str, event_id: str) -> str:
     """The canonical permalink for a thread, the shape the listener spawns with."""
-    from urllib.parse import quote
-
     return f"https://matrix.to/#/{quote(room_id, safe='')}/{quote(event_id, safe='')}"

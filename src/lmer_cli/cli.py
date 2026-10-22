@@ -31,7 +31,8 @@ import re
 from typing import Iterable, Mapping
 from dotenv import dotenv_values
 from work_repo import session_record
-from work_repo.utils import classify_target, repository_of, strip_url_credentials
+from work_repo.run_state import derive_slug
+from work_repo.utils import classify_target, is_secret_env_name, repository_of, strip_url_credentials
 
 from . import resolve
 from .clone_cache import (
@@ -41,6 +42,7 @@ from .clone_cache import (
 )
 from .container import sources as container_sources
 from .container_home import ensure_container_home
+from .env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
@@ -78,6 +80,7 @@ from .mounts import (
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
 from .keep_id import image_id as remap_image_id, record_remap, remap_recorded
 from .harness import (
+    CODEX_SEED_ERROR_ENV,
     HARNESS_ENV,
     HARNESSES,
     LLM_NAME_ENV,
@@ -327,6 +330,7 @@ def _resolve_fastapi_host_port(
             raise ValueError(f"LMER_FASTAPI_PORT must be 1-65535, got {port}")
         return port
 
+    # deferred: import cost — only the no-preset-port branch picks one; supervisor + pydantic add ~140 ms
     from .supervisor import _parse_port_range, _pick_port
 
     port_range = _parse_port_range(cli_range or DEFAULT_FASTAPI_PORT_RANGE)
@@ -413,6 +417,7 @@ def _start_thread_servicer(
     if not host_port or not control_token:
         return None
     try:
+        # deferred: import cost — thread_access (~10 ms) loads only for a launch with a control port and token
         from lmer_cli.thread_access import CLI_ENVIRONMENT, ThreadServicer, UploadStore
 
         servicer = ThreadServicer(
@@ -466,6 +471,7 @@ def _apply_port_passthrough(
 
     port_bind = _resolve_port_bind(getattr(ns, "port_bind", None), os.environ)
 
+    # deferred: import cost — only a launch that requests ports picks them; supervisor + pydantic add ~150 ms
     from .supervisor import _parse_port_range, _pick_ports
 
     try:
@@ -1217,8 +1223,6 @@ def _redact_env_value(name: str, value: str) -> str:
     #285); only the ``value[:4] + "***"`` hint for name-matched vars is
     display behavior of this surface.
     """
-    from work_repo.utils import is_secret_env_name, strip_url_credentials
-
     if is_secret_env_name(name):
         if len(value) <= 4:
             return "***"
@@ -1357,9 +1361,8 @@ def _display_sources_config_cli() -> None:
         manifest_error: "Exception | None" = None
         if cached_manifest is not None:
             try:
-                # Guarded and lazy: a tree with no manifest never imports the
-                # core (the container's own rule). Display-only, so a broken
-                # import renders rather than raises.
+                # Display-only, so a broken import renders rather than raises.
+                # deferred: optional dependency — only a cached manifest needs the core; no manifest, no import
                 from lmer_schema.manifest import parse_manifest
 
                 manifest = parse_manifest(
@@ -2278,8 +2281,6 @@ def _handle_build(argv: list[str]) -> int:
     Returns:
         Exit code (0 for success, non-zero for errors)
     """
-    import argparse
-
     parser = argparse.ArgumentParser(prog="lmer build", description="Build the container image")
     parser.add_argument("--no-pull", action="store_true", help="Don't pass --pull to docker build (skip refreshing base image layers)")
     parser.add_argument("--force", action="store_true", help="Delete existing image before building")
@@ -2489,17 +2490,14 @@ def main(argv: list[str] | None = None) -> int:
         error("'lmer rebuild' has been renamed to 'lmer build'. Please use 'lmer build' instead.")
         return 1
     # The orchestrator platform (issue #141) owns its own argument grammar, so it
-    # is dispatched before task parsing like `build` is. Imported lazily: the
-    # daemon pulls in FastAPI/uvicorn, and every other lmer invocation should
-    # keep paying nothing for that.
+    # is dispatched before task parsing like `build` is.
     if argv and argv[0] == "platform":
+        # deferred: cycle — lmer_platform.daemon imports this module at top (via lmer_platform.api); only `lmer platform` needs it
         from lmer_platform.daemon import main as platform_main
 
         return platform_main(argv[1:])
 
     ns, rest = parse_args(argv)
-
-    from lmer_cli.env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
 
     inherited_env_sources = consume_env_defaults()
     if ns.verbose or ns.debug:
@@ -2609,6 +2607,13 @@ def main(argv: list[str] | None = None) -> int:
             _display_env_config_cli(host_lmer_vars, early_env_file_sources)
             _display_sources_config_cli()
         error(f"❌ {e}")
+        return 2
+    # The platform daemon could not read its Codex seed and left the call to us,
+    # since only this point knows the harness (#544 item 7). Dropped either way so
+    # it never reaches the container.
+    seed_error = os.environ.pop(CODEX_SEED_ERROR_ENV, "").strip()
+    if seed_error and harness.name == "codex":
+        error(f"❌ {seed_error}; this session resolved the codex harness, which needs it")
         return 2
     user_tag = " [user-installed]" if harness.source_dir is not None else ""
     if harness_source == "model":
@@ -3094,6 +3099,7 @@ def main(argv: list[str] | None = None) -> int:
     chat_uploads_container: str | None = None
     chat_uploads_host: Path | None = None
     if chat_connected and not ns.no_thread_connectors:
+        # deferred: import cost — only a chat-connected launch needs it; lmer_platform.uploads adds ~12 ms to every lmer launch
         from lmer_platform.uploads import CONTAINER_UPLOADS_DIR
 
         store_id = ns.session or f"chat-{os.getpid()}-{int(time.time())}"
@@ -4112,9 +4118,6 @@ def _cli_run_slug(task: str | None, target: str | None) -> str | None:
     container name; ``None`` for a run with no task."""
     if not task:
         return None
-    # Here rather than at the top: work_repo takes ~180 ms to import, and only a
-    # launch needs it.
-    from work_repo.run_state import derive_slug
 
     return derive_slug(task, target or "")
 

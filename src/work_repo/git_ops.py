@@ -1786,7 +1786,8 @@ def _memory_rel_paths() -> list[str]:
     this module, so a top-level import here would close the cycle (the same
     local-import convention ``specs_index`` uses for ``run_state``).
     """
-    from .memory import memory_write_rel_paths  # local: memory imports this module
+    # deferred: cycle — work_repo.memory imports this module at top
+    from .memory import memory_write_rel_paths
 
     return memory_write_rel_paths()
 

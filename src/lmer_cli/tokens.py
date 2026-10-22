@@ -5,8 +5,9 @@ Centralizes token lookup, SSH-to-HTTPS conversion, and token injection
 so that both the host CLI (cli.py) and other modules use one implementation.
 
 Note: container/clone_and_exec.py runs standalone inside the container and
-cannot import from this package. It maintains its own copy of _get_gitlab_token.
-When updating token logic here, keep that copy in sync.
+cannot import from this package. It maintains its own copy of _get_gitlab_token
+and the host-name helpers it uses. When updating token logic here, keep that
+copy in sync; tests/test_host_token_names.py compares the two.
 """
 
 import os
@@ -71,10 +72,43 @@ def _gitlab_token_issuing_host() -> str | None:
 def _sanitize_hostname(host: str) -> str:
     """Sanitize a hostname into a valid environment variable suffix.
 
-    Converts the hostname to lowercase and replaces dots/hyphens with underscores.
-    Example: 'git.example.com' -> 'git_example_com'
+    Lowercases the hostname, then turns each hyphen into ``__`` and each dot
+    into ``_``: 'git.example.com' -> 'git_example_com', 'git-example.com' ->
+    'git__example_com'. A valid hostname holds no ``_`` and no empty label, so
+    no two hosts share a suffix. The name selects which host a token is sent
+    to, so a shared one would hand one host's token to a lookalike (#544).
+    """
+    return host.lower().replace("-", "__").replace(".", "_")
+
+
+def _legacy_sanitize_hostname(host: str) -> str:
+    """The pre-#544 suffix, where dots and hyphens both became ``_``.
+
+    Kept only to recognise a variable still set under its old name.
     """
     return re.sub(r"[.\-]", "_", host.lower())
+
+
+def _per_host_env(prefix: str, host: str) -> str | None:
+    """Read ``<prefix><sanitized host>``, or None when it is unset or empty.
+
+    A hyphenated host's old name is also the name of the host with dots in
+    place of its hyphens, so a value found only there may belong to that
+    other host. It is never used: the lookup reports it once and fails
+    closed, naming the variable to rename it to.
+    """
+    name = prefix + _sanitize_hostname(host)
+    value = os.environ.get(name)
+    if value:
+        return value
+    legacy = prefix + _legacy_sanitize_hostname(host)
+    if legacy != name and os.environ.get(legacy):
+        _warn_once(
+            f"⚠️  {legacy} not used for {host}: that name now means "
+            f"{host.lower().replace('-', '.')} only — if it holds the token "
+            f"for {host}, rename it to {name}"
+        )
+    return None
 
 
 def _is_github_host(host: str) -> bool:
@@ -109,7 +143,8 @@ def _get_gitlab_token(
 
     Then, for any lookup:
       3. ``GITLAB_TOKEN_{sanitized_host}`` — host-specific token (provider
-         doesn't matter; the name is historical)
+         doesn't matter; the name is historical). A hyphenated host's
+         pre-#544 name is refused, see :func:`_per_host_env`.
       4. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
          ``GITHUB_TOKEN``
       5. ``GITLAB_TOKEN`` — generic fallback, but only for the host that
@@ -135,7 +170,7 @@ def _get_gitlab_token(
             return token
 
     suffix = _sanitize_hostname(host)
-    token = os.environ.get(f"GITLAB_TOKEN_{suffix}")
+    token = _per_host_env("GITLAB_TOKEN_", host)
     if token:
         return token
 

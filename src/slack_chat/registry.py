@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 
+from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.runtime import lmer_state_dir
 
 logger = logging.getLogger("lmer_slack.registry")
@@ -61,7 +62,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
+        # OverflowError: a pid past pid_t (2**31 and up) names no process.
         return False
     return True
 
@@ -78,7 +80,6 @@ def register(
     """Write a legacy annotation under the metadata lock, without changing a live lease."""
     if not channel or not thread_ts:
         return
-    from lmer_cli.connector_ownership import ThreadKey
 
     key = ThreadKey(kind, channel, thread_ts)
     try:
@@ -126,7 +127,6 @@ def deregister(
     """Remove only the selected legacy PID annotation, under the metadata lock."""
     if not channel or not thread_ts:
         return
-    from lmer_cli.connector_ownership import ThreadKey
 
     key = ThreadKey(kind, channel, thread_ts)
     try:
@@ -173,7 +173,6 @@ def thread_holder(
     """Observe native lease ownership first, then legacy PID annotations."""
     if not channel or not thread_ts:
         return None
-    from lmer_cli.connector_ownership import ThreadKey
 
     try:
         current = ThreadKey(kind, channel, thread_ts).holder()

@@ -484,7 +484,9 @@ def check_readme_index(
     root = Path(root)
     if not root.is_dir():
         return
-    from work_repo import project_index  # lazy: the import direction is work_repo -> lmer_schema
+    # The import direction is work_repo -> lmer_schema.
+    # deferred: import cost — only a schema tree whose root exists needs it; work_repo (~35 ms) stays off the lmer-schema import
+    from work_repo import project_index
 
     found = iter_project_dirs(root) if projects is None else _resolve_projects(root, projects)
     for project in found:

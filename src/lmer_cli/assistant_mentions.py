@@ -32,6 +32,7 @@ class Settings:
 
 def forward(transport: str, conversation: str, event: dict) -> dict:
     """Ask this host's daemon to admit an event; never fall back to spawning."""
+    # deferred: import cost — lmer_platform.config/client pull in requests, ~150 ms on a cold import here
     from lmer_platform import config
     from lmer_platform.client import Call, Endpoint, PlatformError, request
 
@@ -59,6 +60,7 @@ def forward(transport: str, conversation: str, event: dict) -> dict:
 
 
 def _matrix_mention(event, bot_id):
+    # deferred: cycle — matrix_chat.listener imports this module at top
     from matrix_chat.listener import is_assistant_mention
 
     return is_assistant_mention(event, bot_id)

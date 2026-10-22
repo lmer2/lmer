@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from .utils import is_secret_env_name, redact_secrets, redact_token_shapes, load_work_manifest
 
 UID_RE = re.compile(r"[0-9a-f]{32}")
@@ -320,8 +322,6 @@ def is_stopped(state: dict, events: list[dict]) -> bool:
 
 def sort_key(path: Path) -> tuple[str, str]:
     """Sort opaque records by their logged start time, not random UID bytes."""
-    import yaml
-
     try:
         state = yaml.safe_load((path / "state.yaml").read_text())
         metadata = state.get("session") or {}

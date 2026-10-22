@@ -43,8 +43,13 @@ FILL = """(() => {
 
 TOOLBAR = """(() => {
   const toolbar = [...document.querySelectorAll('.uber-toolbar')].find(e => e.checkVisibility());
-  return {background: getComputedStyle(toolbar).backgroundColor,
+  const style = getComputedStyle(toolbar);
+  // ThreadLinks tints its icon with the theme's own colours, by state: read them
+  // from the theme on this surface rather than wait for each state to occur.
+  const themed = name => `rgb(${style.getPropertyValue(`--v-theme-${name}`).trim()})`;
+  return {background: style.backgroundColor,
           ink: getComputedStyle(toolbar.querySelector('[aria-label="project settings"]')).color,
+          primary: themed('primary'), warning: themed('warning'),
           bar: getComputedStyle(document.querySelector('header.v-app-bar')).backgroundColor};
 })()"""
 
@@ -364,10 +369,14 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.wait(f"document.querySelector('.v-application.v-theme--{scheme}')")
             toolbars[scheme] = await browser.evaluate(TOOLBAR)
             toolbars[scheme]["contrast"] = contrast(toolbars[scheme]["background"], toolbars[scheme]["ink"])
+            # Icons, not text: WCAG's 3:1 for graphical objects.
+            for icon in ("primary", "warning"):
+                toolbars[scheme][f"{icon}_contrast"] = contrast(toolbars[scheme]["background"], toolbars[scheme][icon])
         await browser.shot(output, "long-name-phone-dark")
         assert toolbars["light"]["background"] != toolbars["dark"]["background"], toolbars
         for toolbar in toolbars.values():
             assert toolbar["background"] != toolbar["bar"] and toolbar["contrast"] >= 4.5, toolbars
+            assert toolbar["primary_contrast"] >= 3 and toolbar["warning_contrast"] >= 3, toolbars
         await browser.evaluate("[...document.querySelectorAll('[aria-label=\"close the Ratchet chat\"]')].find(e => e.checkVisibility()).click()")
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
         await browser.wait("document.querySelector('.v-navigation-drawer--left').getBoundingClientRect().left >= 0")
@@ -390,7 +399,9 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
                        "durable waiting/cancel", "20 preset color-picker swatches saved by name through UI", "URL/color reload",
                        "close/switch/bar robot opens Beta", "queued historical draft survives admission", "staged attachment survives real rotation gap",
                        "phone overflow and long chat header", "uber pane fills 4K and phone height, badge corner reserved", "robot identity on a real tap and a mouse hover", "dark theme identity", "name-only project creation opens own chat",
-                       "all project app bar text contrasts >= 4.5", "no runtime exceptions"],
+                       "all project app bar text contrasts >= 4.5",
+                       "uber toolbar ThreadLinks primary and warning icons contrast >= 3",
+                       "no runtime exceptions"],
             "limits": "Real Chromium and HTTP routes, fixture inventory and sleeping assistant processes; no external transports or live daemon.",
         }, indent=2) + "\n")
 

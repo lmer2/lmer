@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 from ask_channel import bus
 
-from lmer_cli import thread_access
+from lmer_cli import runref, thread_access
 from lmer_cli.connector_delivery import RecoveryRequired, checkpoint_path, marker_path
 from lmer_cli.connector_lifecycle import EXIT_RECOVERY, PLATFORM_SESSION_ENV
 from lmer_cli.connector_ownership import Lease, OwnershipError, ThreadKey
@@ -41,11 +41,12 @@ from lmer_cli.connector_recovery import Recovery
 from lmer_cli.threads import ThreadError, ThreadRef, parse_thread
 
 from slack_chat import registry as thread_registry
-from slack_chat.client import SlackError
+from slack_chat.client import SlackClient, SlackError
 from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV
-from matrix_chat.client import MatrixError
+from matrix_chat.client import MatrixClient, MatrixError
 
-from . import config, registry, session_io, uploads
+from . import comms as platform_comms
+from . import config, meta, registry, runs, session_io, uploads
 from .comms import comms_dir
 from .store import (
     StoreError, ensure_state_dir, logs_dir, mutating, read_json, utc_now_iso,
@@ -262,8 +263,6 @@ class ThreadConnectors:
 
     def _notify_disconnected(self, session_id: str, record: dict) -> None:
         """Tell the affected session once per loss, outside the connector lock."""
-        from . import comms
-
         key = (session_id, record["id"])
         with self._lock:
             if key in self._disconnected:
@@ -274,12 +273,12 @@ class ThreadConnectors:
             logger.info("assistant_thread_disconnected session=%s thread=%s", session_id, record["id"])
             return
         try:
-            comms.ensure_hub().post(
+            platform_comms.ensure_hub().post(
                 session_id, kind="message", channel="platform",
                 text=f"thread disconnected: {record['label']}",
                 meta={"notification_class": "connector_health"},
             )
-        except (comms.CommsError, session_io.SessionIOError) as exc:
+        except (platform_comms.CommsError, session_io.SessionIOError) as exc:
             logger.warning(
                 "platform_thread_disconnect_notice_failed session=%s thread=%s error=%s",
                 session_id, record["id"], exc,
@@ -503,8 +502,6 @@ class ThreadConnectors:
         — but a *crashed* session's entry is deliberately kept as the crash
         signal, so its records would outlive the run that was forgotten.
         """
-        from . import runs
-
         dropped = 0
         for session_id in list(self.sessions()):
             try:
@@ -1122,10 +1119,6 @@ def _run_label(session_id: str) -> str:
     to be the one the fleet list shows: the run's title when it has one, and
     always the ``host/project/slug`` that finds it.
     """
-    from lmer_cli import runref
-
-    from . import meta, runs
-
     identity = runs.run_for_session(session_id)
     if identity is None:
         return f"session {session_id}"
@@ -1142,14 +1135,10 @@ def _spawn_process(argv: list, env: dict, log_path: Optional[Path] = None, *, pa
 
 
 def _slack_client(token: str):
-    from slack_chat.client import SlackClient
-
     return SlackClient(token, timeout=REMOTE_TIMEOUT_SECONDS, retries=0)
 
 
 def _matrix_client(account):
-    from matrix_chat.client import MatrixClient
-
     return MatrixClient(account, timeout=REMOTE_TIMEOUT_SECONDS)
 
 

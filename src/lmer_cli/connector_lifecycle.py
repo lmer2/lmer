@@ -37,7 +37,7 @@ PLATFORM_SESSION_ENV = "LMER_CHAT_PLATFORM_SESSION"
 
 
 def resolve_speaker(session: str, *, known_only: bool = False) -> Optional[str]:
-    # Lazy: lmer_platform imports the connector modules that import this one.
+    # deferred: cycle — lmer_platform imports the connector modules that import this one.
     from lmer_platform.session_threads import speaker_label
 
     return speaker_label(session, known_only=known_only)

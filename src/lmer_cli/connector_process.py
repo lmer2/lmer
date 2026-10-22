@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def child_environment(base=None):
+    # deferred: cycle — lmer_cli.cli imports this module at top (via lmer_cli.targets)
     from .cli import _updater_child_env
 
     trusted = _updater_child_env()
@@ -167,6 +168,7 @@ class ConnectorProcess:
             self._thread.start()
 
     def _resolve(self):
+        # deferred: import cost — thread_access (~10 ms) stays off the lmer launch path (cli -> targets -> this module)
         from .thread_access import resolve_thread
 
         ref, _, _ = resolve_thread(self.permalink)

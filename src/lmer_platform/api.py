@@ -92,12 +92,16 @@ from work_repo.git_ops import (
 from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
+from . import assistant_conversation
+from . import assistant_history
 from . import authority
 from . import checkin
 from . import comms
 from . import connectors
 from . import lifecycle
 from lmer_cli import comms as bus_comms
+from lmer_cli import pi_providers
+from lmer_cli import routing_receipts
 from lmer_cli import thread_access
 from lmer_cli import thread_posts
 from lmer_cli import thread_requests as thread_queue
@@ -190,6 +194,7 @@ from .spawn import (
     _repo_urls,
     absorb_ports,
     derive_run_identity,
+    live_session_for_run,
     schema_two,
     spawn_session,
 )
@@ -344,6 +349,7 @@ async def _close_quietly(websocket) -> None:
     ``starlette.websockets`` costs a third of a second that ``lmer platform
     status`` must not pay.
     """
+    # deferred: import cost — starlette/anyio adds ~60 ms
     from starlette.websockets import WebSocketDisconnect
 
     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
@@ -739,8 +745,6 @@ def _handoff_reply(state) -> dict:
     carries the one distinction a starting assistant has to be able to make —
     see :data:`_NO_HANDOFF_NOTE`.
     """
-    from . import assistant_history
-
     latest = assistant_history.latest()
     previous = assistant_history.reference(latest["previous_session"]) if latest else None
     return {
@@ -1083,10 +1087,8 @@ def _run_sessions_reply(
     every platform fact: its live session, tracking, workspace and revision
     are that project's business, as ``/api/state`` hides them too.
     """
-    # Imported here for the reason ``create_app`` does: ``project_api`` reaches
-    # back into the platform modules that import this one.
+    # deferred: import cost — project_api -> fastapi adds ~250 ms
     from . import project_api
-    from .spawn import live_session_for_run
 
     host, project = parts[0], parts[1]
     slug = run.get("slug") or None
@@ -1513,6 +1515,7 @@ def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
     nothing, the split D20 draws for the work CLI's resolver.
     """
     try:
+        # deferred: optional dependency — the lmer_schema core may be absent; ImportError degrades (D20)
         from lmer_schema import ManifestError, has_manifest, load_registry
     except ImportError:  # pragma: no cover - the package ships with this one
         return None, None
@@ -1758,8 +1761,6 @@ def _discovered_models() -> dict:
     most the deadline to the first call in a window and nothing to the rest.
     """
     try:
-        from lmer_cli import pi_providers
-
         providers = pi_providers.load_providers()
     except Exception as exc:  # noqa: BLE001 - a menu is never worth a 500
         logger.warning("platform_model_discovery_failed error=%r", exc)
@@ -2370,6 +2371,7 @@ def create_app(
     *state_builder* is injectable so tests can exercise routing and auth without
     a work repo or a network.
     """
+    # deferred: import cost — fastapi adds ~320 ms; anyio, starlette.requests and GZipMiddleware ~58 ms together
     import anyio
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
@@ -2378,6 +2380,7 @@ def create_app(
     from starlette.websockets import WebSocketDisconnect
     from starlette.requests import Request
 
+    # deferred: import cost — project_api -> fastapi adds ~350 ms
     from . import peers, project_api
 
     if not secret:
@@ -2403,6 +2406,7 @@ def create_app(
     # GZipMiddleware only touches `http` scopes, so the tty WebSocket is
     # unaffected — which is what we want: its frames are already base64 of raw
     # terminal bytes and are latency-sensitive, not bandwidth-bound.
+    # deferred: import cost — reached only past the shared-secret refusal; ~58 ms with anyio and starlette.requests
     from starlette.middleware.gzip import GZipMiddleware
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -3903,8 +3907,6 @@ def create_app(
     def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Post once into a thread, attributed to whoever holds the credential."""
         label = _thread_label(caller, config)
-        from . import assistant_conversation
-        from lmer_cli.routing_receipts import receipt
 
         try:
             binding = project_api.capture()
@@ -3917,7 +3919,7 @@ def create_app(
                 result = project_requests.reply(request["id"], body.get("text"), workspace_id=project_scope.current(),
                                                 session_id=caller.session_id)
                 return {**result, "thread": thread_access._thread_summary(source),
-                        **receipt("post", result["posted"].get("ref"))}
+                        **routing_receipts.receipt("post", result["posted"].get("ref"))}
             ref, client = None, None
             private = False
             if caller.is_assistant:
@@ -3935,7 +3937,7 @@ def create_app(
             )
         except ThreadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        result.update(receipt("post", result["posted"].get("ref")))
+        result.update(routing_receipts.receipt("post", result["posted"].get("ref")))
         if caller.is_assistant:
             try:
                 if not caller.session_id:
@@ -4920,8 +4922,6 @@ def create_app(
         view: str = Query(default="conversation", pattern="^(conversation|transcript)$"),
     ) -> dict:
         """One bounded generation page, with an explicit link to its predecessor."""
-        from . import assistant_history
-
         try:
             if assistant.history_for(session_id) is None:
                 raise HTTPException(status_code=404, detail="This assistant generation is not recorded.")

@@ -4,6 +4,7 @@ Gate System - Enforces all rules before major operations
 This module provides static enforcement of all development rules.
 """
 
+import argparse
 import subprocess
 import sys
 import os
@@ -182,10 +183,12 @@ BASELINE_GATE = "gate-baseline"
 # CheckResult.scope / receipt test_scope when CI answered for the suite.
 CI_BASELINE_SCOPE = "ci baseline"
 
+# Left out of every suite run: building the container image is not a unit test.
+SUITE_IGNORE_ARGS = ["--ignore=tests/test_container_build.py"]
+
 # What the smoke check collects: the same targets check_tests runs.
 BASELINE_COLLECT_ARGV = ["-m", "pytest", "--collect-only", "-q",
-                         "-p", "no:cacheprovider", "tests/",
-                         "--ignore=tests/test_container_build.py"]
+                         "-p", "no:cacheprovider", "tests/", *SUITE_IGNORE_ARGS]
 
 BASELINE_REUSED = "reused"
 BASELINE_CI_FAILED = "ci-failed"
@@ -737,19 +740,13 @@ class GateSystem:
                 message="No tests directory found (skipped)"
             )
 
-        # Determine python executable - prefer venv if it can actually import
-        # pytest. In self-dev a bind-mounted host `.venv/bin/python` can resolve
-        # to a system interpreter without the venv's site-packages, so existence
-        # alone is insufficient — probe an import before trusting it.
-        venv_python = self.project_root / ".venv" / "bin" / "python"
-        if venv_python.exists() and self._interpreter_can_import(str(venv_python)):
-            python_cmd = str(venv_python)
-        else:
-            python_cmd = "python"
-            for cand in ("python3", "python"):
-                if self._interpreter_can_import(cand):
-                    python_cmd = cand
-                    break
+        # The first candidate that can actually import pytest: see
+        # _interpreter_candidates for why existence alone is not enough.
+        python_cmd = next(
+            (cand for cand in self._interpreter_candidates()
+             if self._interpreter_can_import(cand)),
+            "python",
+        )
 
         env = self._suite_env()
 
@@ -766,8 +763,7 @@ class GateSystem:
             scope = TEXT_DIFF_SCOPE
 
         pytest_argv = [python_cmd, "-m", "pytest", *targets, "-x",
-                       "--tb=short", "-q",
-                       "--ignore=tests/test_container_build.py"]
+                       "--tb=short", "-q", *SUITE_IGNORE_ARGS]
 
         if parallel_runner:
             script = parallel_runner[0]
@@ -1085,6 +1081,18 @@ class GateSystem:
             # The cache is an optimization. No handoff failure may change the
             # result of the commit that already succeeded.
             return False
+
+    def _interpreter_candidates(self) -> list[str]:
+        """Interpreters the suite may run under, in order of preference.
+
+        The project's venv first, then whatever ``python3``/``python`` resolve
+        to. In self-dev a bind-mounted host ``.venv/bin/python`` can resolve to
+        a system interpreter without the venv's site-packages, so callers probe
+        an import (:meth:`_interpreter_can_import`) rather than trusting this
+        order alone.
+        """
+        venv_python = self.project_root / ".venv" / "bin" / "python"
+        return ([str(venv_python)] if venv_python.exists() else []) + ["python3", "python"]
 
     @staticmethod
     def _interpreter_can_import(python_cmd: str, module: str = "pytest") -> bool:
@@ -1996,7 +2004,7 @@ class GateSystem:
 
     def _baseline_source(self, host: str) -> ci_baseline.GitLabEvidence:
         env = ci_baseline.evidence_token_env(host)
-        token = os.environ.get(env, "").strip()
+        token = ci_baseline.evidence_token(host)
         uses_evidence_token = bool(token)
         if not uses_evidence_token:
             token = get_token(host)
@@ -2080,9 +2088,7 @@ class GateSystem:
                       f"refresh the pins with: gate-check --baseline --print-pins{Colors.NC}")
             return self._baseline_fallback(evidence.reason, evidence)
 
-        venv_python = self.project_root / ".venv" / "bin" / "python"
-        candidates = ([str(venv_python)] if venv_python.exists() else []) + [
-            "python3", "python"]
+        candidates = self._interpreter_candidates()
         print(f"Running environment smoke check (≤{mapping.smoke_timeout}s)...")
         smoke = ci_baseline.run_smoke(
             candidates, BASELINE_COLLECT_ARGV, mapping.tools,
@@ -2721,8 +2727,6 @@ def push_gate(verbose: bool = False, gate: Optional[GateSystem] = None) -> int:
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Gate system for enforcing development rules")
     parser.add_argument('command', choices=['commit', 'push'], help='Gate to run')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')

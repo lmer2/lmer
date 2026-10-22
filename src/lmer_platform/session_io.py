@@ -190,7 +190,7 @@ import requests
 
 from lmer_cli.codex_delivery import MAX_RPC_TIMEOUT, input_budget
 
-from . import registry
+from . import assistant_history, registry
 from .spawn import container_log_path_for, log_path_for, read_control_token
 from .store import append_event
 
@@ -591,7 +591,6 @@ def require_session(session_id: str) -> Optional[dict]:
         raise SessionNotFound(str(exc)) from exc
     if entry is not None:
         return entry
-    from . import assistant_history
 
     if assistant_history.generation(session_id):
         return None

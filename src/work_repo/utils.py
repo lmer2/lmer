@@ -38,6 +38,7 @@ def load_work_manifest(root: Optional[Path] = None) -> Optional["Manifest"]:
     if not (path.exists() or path.is_symlink()):
         return None
     try:
+        # deferred: optional dependency — only a present _lmer.yaml needs the core; an absent core raises SchemaContextError (D20)
         from lmer_schema.manifest import ManifestError, load_manifest
     except ImportError as exc:
         raise SchemaContextError("schema support is unavailable for this work tree") from exc
@@ -935,6 +936,7 @@ def work_repo_project_rels(root: Path) -> list[str]:
     raises ``ImportError``: the caller decides its own fallback, never this
     function, which would otherwise have to guess at a project set.
     """
+    # deferred: optional dependency — the lmer_schema core may be absent and work_repo.utils sits on the hook path (D20)
     from lmer_schema.checks.walk import project_dirs
     from lmer_schema.registry import load_registry
 
@@ -953,10 +955,9 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
     :func:`work_repo_layout`).
     """
     try:
-        # Submodule imports, inside the call: the core is imported only when
-        # a work-repo path is actually resolved, and a build that ships
-        # without it (or with it half-installed) degrades instead of dying on
-        # a module-level import in a hook path.
+        # A build that ships without the core (or with it half-installed)
+        # degrades instead of dying on a module-level import in a hook path.
+        # deferred: optional dependency — the lmer_schema core may be absent; ImportError degrades (D20)
         from lmer_schema.form import Form, detect_form
         from lmer_schema.manifest import ManifestError, load_manifest, manifest_path
         from lmer_schema.registry import (

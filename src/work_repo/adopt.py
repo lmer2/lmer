@@ -96,6 +96,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from . import git_ops, run_state
+from .loggers import get_logger
 from .migrate import preflight_no_live_records
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, CoreUnavailableError, core_module, work_repo_root
@@ -374,8 +375,8 @@ def plan_adoption(
     it bare; the apply calls it inside the mutation lock, so what it
     enumerates is what the apply moves. Raises :class:`AdoptError` on each
     refusal, with the remedy in the text."""
-    root = Path(root) if root is not None else work_repo_root()
     try:
+        # deferred: optional dependency — lmer_cli.container.sources may be absent; ImportError refuses with the remedy below
         from lmer_cli.container.sources import scrub_credentials
         Form = core_module("checks.findings").Form
         walk_api = core_module("checks.walk")
@@ -396,6 +397,7 @@ def plan_adoption(
             f"floor for a schema-form tree ({exc}); update lmer on this host first"
         ) from exc
 
+    root = Path(root) if root is not None else work_repo_root()
     rel = _bucket_rel(bucket)
     if rel is None:
         raise AdoptError(
@@ -753,8 +755,6 @@ def _record_in_caller(plan: Plan, out: Callable[[str], None]) -> list:
     except (run_state.RunStateError, OSError) as exc:
         out(f"⚠️  {ADOPT_EVENT} event not recorded in {caller}: {exc}")
     try:
-        from .loggers import get_logger  # local: loggers imports run_state
-
         get_logger(caller / "log.yaml").log(
             f"work adopt {plan.name}: adopted {plan.bucket} as {plan.name}/ (repo {plan.repo})"
         )

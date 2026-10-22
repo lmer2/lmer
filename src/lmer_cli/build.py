@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,8 +157,6 @@ def build_image_local(
     should be busted (each maps to its registry ``cache_bust_arg``);
     ``update_claude`` is the legacy spelling for ``["claude"]``.
     """
-    import time
-
     uid = os.getuid()
     gid = os.getgid()
     # --cache-from only works with Docker; Podman caches layers automatically

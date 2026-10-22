@@ -67,7 +67,9 @@ from .run_state import (
     RunStateError,
     _backup_bad_state,
     _load_yaml_mapping,
+    _require_record_writer,
     append_event,
+    require_document_version,
     slug_available,
     utc_now_iso,
 )
@@ -261,8 +263,6 @@ def load_release(rdir: Path) -> Optional[dict]:
 def write_release(rdir: Path, release: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of release.yaml (single-writer
     discipline, same as state.yaml/ledger.yaml)."""
-    from .run_state import _require_record_writer, require_document_version
-
     _require_record_writer(rdir)
     require_document_version(rdir / RELEASE_FILE, release, RELEASE_SCHEMA_VERSION)
     rdir.mkdir(parents=True, exist_ok=True)

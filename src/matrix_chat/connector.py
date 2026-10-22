@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ask_channel import bus
-from lmer_cli import thread_posts
+from lmer_cli import thread_access, thread_posts
 from lmer_cli.comms import off_thread
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
@@ -611,9 +611,7 @@ class MatrixConnector(ConnectorLifecycle):
         inbound path already goes this way; this one was the same code with
         neither guard.
         """
-        from lmer_cli.thread_access import MAX_FILE_BYTES, UploadStore, stage_upload
-
-        store = UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
+        store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
         mxc = content.get("url")
         if store is None or not isinstance(mxc, str):
             return None
@@ -622,19 +620,19 @@ class MatrixConnector(ConnectorLifecycle):
         name = str(content.get("filename") or content.get("body") or "file")
         info = content.get("info") if isinstance(content.get("info"), dict) else {}
         declared = info.get("size")
-        if isinstance(declared, int) and not isinstance(declared, bool) and declared > MAX_FILE_BYTES:
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared > thread_access.MAX_FILE_BYTES:
             # What the event claims, before asking for the bytes.
             logger.info("matrix_connector_file_too_large name=%s bytes=%s", name, declared)
             return None
         try:
-            data, media_type = self.matrix.download(mxc, max_bytes=MAX_FILE_BYTES)
+            data, media_type = self.matrix.download(mxc, max_bytes=thread_access.MAX_FILE_BYTES)
         except MatrixError as exc:
             logger.warning("matrix_connector_download_failed mxc=%s error=%s", mxc, exc)
             return None
         if data is None:
-            logger.info("matrix_connector_file_too_large name=%s bytes=over %s", name, MAX_FILE_BYTES)
+            logger.info("matrix_connector_file_too_large name=%s bytes=over %s", name, thread_access.MAX_FILE_BYTES)
             return None
-        return stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+        return thread_access.stage_upload(store, name, data, str(info.get("mimetype") or media_type))
 
     def _prepare(self):
         if self.room_id is None:

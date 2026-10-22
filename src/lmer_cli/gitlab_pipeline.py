@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 # The token lookup rule, not a second copy of it — see get_token. Stdlib-only
 # module, so importing it costs nothing and cannot cycle back here.
-from lmer_cli.tokens import _get_gitlab_token
+from lmer_cli.tokens import _get_gitlab_token, _sanitize_hostname
 
 # Pre-compiled regex for stripping ANSI escape codes
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*[mK]|\[0K")
@@ -32,15 +32,6 @@ STATUS_ICONS = {
 }
 
 DEFAULT_POLL_INTERVAL = 10
-
-
-def _sanitize_hostname(host: str) -> str:
-    """Sanitize a hostname into a valid environment variable suffix.
-
-    Converts the hostname to lowercase and replaces dots/hyphens with underscores.
-    Example: 'git.example.com' -> 'git_example_com'
-    """
-    return re.sub(r"[.\-]", "_", host.lower())
 
 
 class GitLabPipelineError(Exception):

@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
+from ask_channel import protocol as ask_protocol
+
 from .util import get_bool_env
 
 __all__ = [
@@ -1348,15 +1350,13 @@ class AskDirProjection:
     """
 
     def __init__(self, directory: str, log: MessageLog) -> None:
-        from ask_channel import protocol
-
-        self._protocol = protocol
+        self._protocol = ask_protocol
         self._kinds = {
-            protocol.QUESTION_SUFFIX: KIND_QUESTION,
-            protocol.NOTE_SUFFIX: KIND_NOTE,
-            protocol.SIGNAL_SUFFIX: KIND_MILESTONE,
-            protocol.ANSWER_SUFFIX: KIND_ANSWER,
-            protocol.CLOSED_SUFFIX: KIND_CLOSE,
+            ask_protocol.QUESTION_SUFFIX: KIND_QUESTION,
+            ask_protocol.NOTE_SUFFIX: KIND_NOTE,
+            ask_protocol.SIGNAL_SUFFIX: KIND_MILESTONE,
+            ask_protocol.ANSWER_SUFFIX: KIND_ANSWER,
+            ask_protocol.CLOSED_SUFFIX: KIND_CLOSE,
         }
         #: kind → the suffix :meth:`mirror` files it under; the inverse of
         #: ``_kinds``, so the two can never name different files for one kind.

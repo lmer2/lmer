@@ -167,6 +167,13 @@ def request_session_end() -> SessionEndResult:
             f"supervisor process {pid} is gone; nothing to shut down.",
             pid=pid,
         )
+    except OverflowError:
+        return SessionEndResult(
+            NO_SUPERVISOR_EXIT_CODE,
+            f"no supervisor to signal ({SUPERVISOR_PID_ENV}={pid} is past the "
+            "largest process id).",
+            pid=pid,
+        )
     except OSError as exc:
         return SessionEndResult(1, f"could not signal supervisor {pid}: {exc}", pid=pid)
 
@@ -189,6 +196,7 @@ def _unread_answers():
     else that stops the read gets a warning line.
     """
     try:
+        # deferred: optional dependency — a missing ask_channel degrades to a warning; it also triples lmer-end-session start-up (+39 ms)
         from ask_channel import protocol
     except ImportError as exc:  # pragma: no cover - both ship in one distribution
         _warn(f"cannot check the operator channel for unread answers ({exc})")

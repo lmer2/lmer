@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
+import yaml
+
 from .utils import work_repo_root
 
 KNOWLEDGE_DIR = "_knowledge"
@@ -75,7 +77,6 @@ def _frontmatter(text: str) -> dict:
     end = text.find("\n---", 3)
     if end == -1:
         return {}
-    import yaml
 
     try:
         data = yaml.safe_load(text[3:end])

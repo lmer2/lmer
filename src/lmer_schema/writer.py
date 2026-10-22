@@ -230,14 +230,15 @@ def _ruamel() -> types.SimpleNamespace:
     registration never touches ruamel's shared class.
     """
     global _LIB
-    if _LIB is None:
-        from ruamel.yaml import YAML
-        from ruamel.yaml.anchor import Anchor
-        from ruamel.yaml.comments import Comment, CommentedMap, CommentedSeq, merge_attrib
-        from ruamel.yaml.error import CommentMark
-        from ruamel.yaml.representer import RoundTripRepresenter
-        from ruamel.yaml.tokens import CommentToken
+    # deferred: import cost — ruamel (~20 ms) must stay off the PyYAML-only read path; lmer_schema re-exports this module eagerly
+    from ruamel.yaml import YAML
+    from ruamel.yaml.anchor import Anchor
+    from ruamel.yaml.comments import Comment, CommentedMap, CommentedSeq, merge_attrib
+    from ruamel.yaml.error import CommentMark
+    from ruamel.yaml.representer import RoundTripRepresenter
+    from ruamel.yaml.tokens import CommentToken
 
+    if _LIB is None:
         class _Representer(RoundTripRepresenter):
             """ruamel writes ``None`` as an empty value by default; the
             manifest's documented spelling is ``null`` (SCHEMA.md)."""

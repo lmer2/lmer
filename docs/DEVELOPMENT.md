@@ -194,3 +194,46 @@ writes (run records, indexes, changelog fragments) keeps PyYAML; do not
 reach for ruamel because it is now installed. Add a comment position to the
 fixture before relying on it, and extend the round-trip test with the write
 that needs it.
+
+## Deferred imports: module top unless a comment says why
+
+**Decision (2026-10-21, #544 item 1):** imports go at the top of the module.
+An import inside a function is allowed only for a measured reason, written
+as a comment on its first line or as a full-line comment directly above it:
+
+```python
+def serve():
+    # deferred: import cost — uvicorn pulls in the web stack (65–360 ms measured), which most callers never use
+    import uvicorn
+```
+
+The reason is one of three words, followed by ` — ` and the specifics:
+
+- `cycle` — hoisting raises `ImportError` from a partially initialised
+  module, on some import order. Name the modules that close the loop.
+- `import cost` — hoisting adds a measured cost to an entry point that does
+  not need the module. Name the cost and the entry. The yardstick used for
+  the existing comments: more than 50 ms on the module alone, or 10 ms or
+  more on a latency-sensitive entry (`lmer`, `work`, `lmer-signal`,
+  `gate-*`, hooks, `spawn-harness`, `lmer-end-session`). Measure with
+  `python -X importtime`, not wall-clock on a loaded machine.
+- `optional dependency` — the module may not be installed (the `matrix`
+  extra, a `try`/`except ImportError` seam), or the importing module must
+  stay loadable without it (`clone_and_exec` runs standalone in the
+  container).
+
+An unbroken run of import lines in the same block shares the comment on its
+first import. A blank line, a comment line or any other statement ends the
+run, and the next import needs its own comment.
+
+Imports that run at module load (top level, module-level `if`/`try`, class
+bodies) and `if TYPE_CHECKING:` bodies are not deferred and need nothing.
+
+**Hoisting a name that tests patch:** a function-local `from x import f`
+looks `f` up on every call, so a test that patches `x.f` reaches it. A
+module-top `from x import f` binds once and does not. When tests patch the
+attribute, hoist the module (`from lmer_cli import runtime`) and call
+`runtime.f(...)`.
+
+**Enforced by** `tests/test_import_placement.py`, which names each import
+that lacks a valid comment.

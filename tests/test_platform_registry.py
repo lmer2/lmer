@@ -453,6 +453,11 @@ def test_a_pid_reaped_between_the_probe_and_the_proc_read_is_not_live(monkeypatc
         child.wait()
 
 
+@pytest.mark.parametrize("pid", [2**31, 2**63, 2**64])
+def test_a_pid_past_pid_t_is_not_live(pid):
+    assert registry._pid_alive(pid) is False
+
+
 def test_zombie_check_degrades_when_proc_is_unavailable(monkeypatch):
     """No /proc (macOS): fall back to the kill() answer rather than erroring."""
     def no_proc(*_args, **_kwargs):

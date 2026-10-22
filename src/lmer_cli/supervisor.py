@@ -60,9 +60,11 @@ import hashlib
 import logging
 import math
 import os
+import random
 import secrets
 import select
 import signal
+import socket
 import struct
 import sys
 import termios
@@ -75,9 +77,13 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
+from ask_channel.protocol import ASK_DIR_ENV
+
 from . import comms as _comms
 from . import thread_requests as _threads
+from .codex_delivery import CodexDelivery
 from .harness import UnknownHarnessError, resolve_harness, resolve_harness_name
+from .terminal_mirror import TerminalMirror, TranscriptReader
 from .util import decode_escape_bytes
 
 
@@ -1339,9 +1345,6 @@ def _pick_ports(port_range: tuple[int, int], host: str, count: int) -> list[int]
     Raises :class:`ValueError` for an inverted range or non-positive ``count``,
     and :class:`RuntimeError` if fewer than ``count`` free ports are available.
     """
-    import random
-    import socket
-
     low, high = port_range
     if low > high:
         raise ValueError(f"invalid port range {low}-{high}")
@@ -1615,6 +1618,7 @@ def _build_fastapi_app(
     valid ``/resize`` body; a client posts the size it wants, not the size it
     found.
     """
+    # deferred: import cost — fastapi/starlette adds ~360 ms
     from fastapi import FastAPI, Header, HTTPException, Query
 
     app = FastAPI(title="lmer claude supervisor", version="1")
@@ -2046,6 +2050,7 @@ def _start_fastapi_server(
 
     Returns the server thread and a callable to request shutdown.
     """
+    # deferred: import cost — uvicorn adds ~70 ms
     import uvicorn
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
@@ -2742,8 +2747,6 @@ def _open_ask_projection(
 
 
 def _comms_ask_dir_env() -> str:
-    from ask_channel.protocol import ASK_DIR_ENV
-
     return ASK_DIR_ENV
 
 
@@ -2794,7 +2797,6 @@ def run_supervisor(cmd, options, *, stdin_fd=None, stdout_fd=None, write_lock=No
     kwargs = dict(stdin_fd=stdin_fd, stdout_fd=stdout_fd, write_lock=write_lock)
     if _active_harness_name() != "codex":
         return _run_supervisor(cmd, options, **kwargs)
-    from .codex_delivery import CodexDelivery
 
     with CodexDelivery(cmd) as delivery:
         return _run_supervisor(cmd, options, codex_delivery=delivery, **kwargs)
@@ -2979,8 +2981,6 @@ def _run_supervisor(
     )
     if codex_delivery is not None:
         codex_delivery.start_monitor()
-
-    from .terminal_mirror import TerminalMirror, TranscriptReader
 
     try:
         transcript_dir = resolve_harness().session_dir

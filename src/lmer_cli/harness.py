@@ -54,6 +54,13 @@ HARNESS_ENV = "LMER_HARNESS"
 #: there is one answer here rather than a flag and a variable that can disagree.
 LLM_NAME_ENV = "LMER_LLM_NAME"
 
+#: Set by the platform daemon on every ``lmer`` it spawns: why the host's Codex
+#: seed (``LMER_CODEX_CONFIG_SEED``) could not be read, or blank when it could.
+#: Only the child knows its harness once its preset, model aliases and .env
+#: files are applied, so the child refuses a codex launch on it and drops it
+#: either way; it never reaches the container.
+CODEX_SEED_ERROR_ENV = "LMER_CODEX_CONFIG_SEED_ERROR"
+
 #: Environment variable marking a session with no human attached (a
 #: ``spawn-harness`` child, a cron run, any headless launch). The rule it
 #: stands for is the NON-INTERACTIVE SESSIONS section of AGENTS.md: no gate
@@ -399,6 +406,7 @@ def known_harnesses() -> dict[str, Harness]:
     from :mod:`lmer_cli.user_harnesses`, imported lazily — that module
     imports this one's dataclasses.
     """
+    # deferred: cycle — lmer_cli.user_harnesses imports this module at top
     from .user_harnesses import load_user_harnesses
 
     return {**load_user_harnesses(), **HARNESSES}

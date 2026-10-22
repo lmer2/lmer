@@ -416,9 +416,10 @@ def check_agents(root, report, *, project_dirs: Optional[Iterable] = None, manif
     legacy tier; a plain path leaves the tier to the report). Pass ``()`` to
     check the instance scope only.
     """
-    root = Path(root)
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
     from work_repo.memory import MemoryRetirementError, read_memory_retirements
 
+    root = Path(root)
     try:
         read_memory_retirements(root, manifest=manifest)
     except MemoryRetirementError as exc:

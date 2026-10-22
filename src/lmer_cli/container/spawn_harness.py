@@ -224,6 +224,9 @@ def build_child_env(
     file, so the orchestrator consolidates from N-1 agents with nothing to
     show it lost one.
     """
+    # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
+    from work_repo import session_record
+
     child = dict(parent_env)
     # The parent's launch name and goal (`lmer --name/--goal`) describe the
     # PARENT's record. A child starts through ``harness_session`` →
@@ -233,8 +236,6 @@ def build_child_env(
     # both go, for every child, before the overlays.
     for key in ("LMER_RUN_NAME", "LMER_RUN_GOAL"):
         child.pop(key, None)
-    from work_repo import session_record
-
     if session_record.schema_version(Path(child.get("LMER_WORK_REPO_PATH", "/work"))) >= 2:
         # These are one-shot launch decisions. Only a new explicit overlay
         # can select context for this independent execution.
@@ -953,6 +954,7 @@ def run_child(
     wins over our own I/O trouble: a footer or close we cannot complete
     warns and leaves the code alone (:func:`_write_failure_footer`).
     """
+    # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
     from work_repo import session_record
 
     own_session = session_record.schema_version(

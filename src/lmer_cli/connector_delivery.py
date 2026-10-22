@@ -50,6 +50,7 @@ def claim_receipt(key: ThreadKey, marker: dict, receipt: str) -> None:
 
 def verified_rejection(exc: Exception) -> bool:
     """Only structured, documented rejections establish non-acceptance."""
+    # deferred: import cost — matrix_chat.client (~130 ms) and slack_chat.client (~140 ms) each pull in requests
     from matrix_chat.client import MatrixError
     from slack_chat.client import SlackError
 

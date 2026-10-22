@@ -343,7 +343,7 @@ from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 from lmer_cli.comms import assistant_display_name
 
-from . import ask, containers, memory, registry, spawn, statusline
+from . import ask, assistant_history, containers, memory, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -375,6 +375,7 @@ from .store import (
     write_json,
 )
 from .project_context import assistant_dir
+from .thread_targets import MAX_THREAD_TARGETS, validate_thread_targets
 from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.assistant")
@@ -849,8 +850,6 @@ class AssistantStatus:
         return _age_seconds(self.started_at)
 
     def to_dict(self) -> dict:
-        from . import assistant_history
-
         history = assistant_history.latest()
         return {
             "running": self.running,
@@ -999,8 +998,6 @@ def _write_state(state: AssistantState) -> bool:
 
 def history_for(session_id: str) -> Optional[dict]:
     """Resolve a generation, migrating only the explicitly recorded incumbent."""
-    from . import assistant_history
-
     with _LOCK:
         known = assistant_history.generation(session_id)
         state = read_state()
@@ -1088,8 +1085,6 @@ def refuse_full_thread_list(session_id: object) -> None:
     the stored list, not about the link, and a thread about to be created cannot
     already be in it. So: capacity, and the same verdict on what is stored.
     """
-    from .thread_targets import MAX_THREAD_TARGETS
-
     if not _writes_the_launch_list(session_id):
         return
     current = _stored_threads()
@@ -1107,8 +1102,6 @@ def _writes_the_launch_list(session_id: object) -> bool:
 
 def _refuse_unusable(candidate: list) -> None:
     """Refuse when *candidate* is not a list uber lmer could launch with."""
-    from .thread_targets import validate_thread_targets
-
     try:
         validate_thread_targets(candidate)
     except ValueError as exc:
@@ -1135,6 +1128,7 @@ def _refuse_held_explicit_threads(
     """
     if sources.get("threads") != "override":
         return
+    # deferred: cycle — lmer_platform.connectors imports this module at top (via comms); only a threads override needs it
     from . import connectors as thread_connectors
 
     component = thread_connectors.get_connectors()
@@ -1184,7 +1178,6 @@ def note_thread_change(session_id: object, permalink: object, *, connected: bool
         if permalink not in current:
             return False
         current = [entry for entry in current if entry != permalink]
-    from .thread_targets import validate_thread_targets
 
     try:
         # ``update_stored`` tolerates an unusable launch setting rather than
@@ -1309,6 +1302,7 @@ def _connected_threads(session_id: str) -> list:
     same reason: an assistant whose pane cannot be drawn because a thread record
     could not be read is a worse answer than a pane with no icons.
     """
+    # deferred: cycle — lmer_platform.connectors imports this module at top (via lmer_platform.comms)
     from . import connectors
 
     component = connectors.get_connectors()
@@ -1756,8 +1750,6 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
 
 
 def _remember_generation(state) -> None:
-    from . import assistant_history
-
     assistant_history.remember(state)
     if state.session_id:
         assistant_history.bind_credential(state.session_id, active_assistant_credential())
@@ -1765,8 +1757,6 @@ def _remember_generation(state) -> None:
 
 def authenticated_generation(credential: str) -> dict | None:
     """Resolve an authenticated identity; migrate an incumbent under the lifecycle lock."""
-    from . import assistant_history
-
     owner = assistant_history.credential_owner(credential)
     if owner:
         return owner
@@ -1883,7 +1873,6 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
-        from . import assistant_history
 
         previous = assistant_history.latest()
         published = False
@@ -2680,6 +2669,10 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
     would be stored, and what is weighed against :data:`MAX_PENDING` is the entry
     that is actually written.
     """
+    # deferred: cycle — spool_merge (directly and via checkin) and assistant_conversation (via comms) import this module at top
+    from . import spool_merge
+    from . import assistant_conversation
+
     text = _scrubbed_text(note, field="note", limit=MAX_NOTE_CHARS)
     label = _validated_text(kind, field="kind", limit=64)
     payload = _scrubbed_data(data)
@@ -2693,9 +2686,6 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
             data=payload,
         )
         if projects.enabled():
-            # Imported here: spool_merge imports this module (directly and via checkin).
-            from . import spool_merge
-
             pending = spool_merge.add_check_in(list(state.pending), entry)
             dropped = 0
         else:
@@ -2729,8 +2719,6 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
         append_event(
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
-        from . import assistant_conversation
-
         if label in assistant_conversation.DIGEST_KINDS:
             assistant_conversation.record(text, kind=label, data=payload)
         return _live_assistant() is not None
@@ -2887,6 +2875,7 @@ def take_pending() -> list:
     empty either way, and a mark left behind by a take that raced the last digest
     out would suppress the next accumulation's first nudge for a window.
     """
+    # deferred: cycle — lmer_platform.project_requests imports this module at top
     from . import project_requests
 
     with _LOCK:

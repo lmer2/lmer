@@ -249,6 +249,7 @@ class Homeserver:
         ``EncryptionError: No group session created``. They coexist on one file
         because their version tables differ (``crypto_version``, ``mx_version``).
         """
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.client.state_store.asyncpg import upgrade as client_upgrade
         from mautrix.crypto import PgCryptoStore
         from mautrix.util.async_db import Database
@@ -620,6 +621,7 @@ def _state_store_class():
     Built here rather than at module scope because the base classes come from
     ``mautrix``, which this module never imports at import time.
     """
+    # deferred: optional dependency — mautrix ships in the `matrix` extra
     from mautrix.appservice.state_store.asyncpg import PgASStateStore
     from mautrix.crypto import PgCryptoStateStore
 
@@ -666,6 +668,7 @@ class MautrixHomeserver(Homeserver):
         machine. Deviating from that sequence is how a bridge ends up with a
         device the homeserver does not know about.
         """
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.client import Client
         from mautrix.crypto import OlmMachine
         from mautrix.types import TrustState
@@ -748,6 +751,7 @@ class MautrixHomeserver(Homeserver):
         await machine.set_encrypted_account_data(BACKUP_EVENT_TYPE, blob, key)
 
     async def create_room(self, *, invite: Sequence[str]) -> str:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.types import EventType, RoomCreatePreset
 
         client = self._appservice_client()
@@ -766,6 +770,7 @@ class MautrixHomeserver(Homeserver):
         await self._appservice_client().join_room(room_id)
 
     async def room_is_encrypted(self, room_id: str) -> bool:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.errors import MNotFound
         from mautrix.types import EventType
 
@@ -811,6 +816,7 @@ class MautrixHomeserver(Homeserver):
     async def send_text(
         self, room_id: str, text: str, *, thread_root: Optional[str] = None,
     ) -> str:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.types import Format, MessageType, TextMessageEventContent
 
         content = TextMessageEventContent(msgtype=MessageType.TEXT, body=text)
@@ -822,6 +828,7 @@ class MautrixHomeserver(Homeserver):
         self, room_id: str, data: bytes, *, mime: str, filename: str,
         thread_root: Optional[str] = None,
     ) -> str:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.crypto.attachments import encrypt_attachment
         from mautrix.types import (
             FileInfo, MediaMessageEventContent, MessageType,
@@ -903,6 +910,7 @@ class MautrixHomeserver(Homeserver):
         ``mautrix`` and a change of client cannot change what a threaded reply
         means.
         """
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.errors import DecryptionError
         from mautrix.types import EventType
 
@@ -931,6 +939,7 @@ class MautrixHomeserver(Homeserver):
         sharing then retrying is the documented answer (``mautrix``' own
         bridge does exactly this).
         """
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.errors import EncryptionError
         from mautrix.types import EventType
 
@@ -975,6 +984,7 @@ class MautrixHomeserver(Homeserver):
         same key from the same passphrase. So a wiped host with only the
         environment can restore — which is precisely G3's claim.
         """
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.crypto.ssss import Machine
 
         machine = Machine(self._appservice_client())
@@ -997,6 +1007,7 @@ class MautrixHomeserver(Homeserver):
         return machine, self._ssss_key
 
     async def _read_backup(self) -> Optional[bytes]:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.errors import MNotFound
 
         machine, key = await self._ssss()
@@ -1028,6 +1039,7 @@ class MautrixHomeserver(Homeserver):
 
     def _appservice(self):
         """The appservice itself — the transaction handlers hang off it."""
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.appservice import AppService
 
         if self._as is None:
@@ -1062,11 +1074,12 @@ class MautrixHomeserver(Homeserver):
         placeholder for the one verb that runs without a database
         (``check``, which must not create one).
         """
-        if self._state_store is not None:
-            return self._state_store
-
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.appservice.state_store import ASStateStore
         from mautrix.client.state_store import MemoryStateStore
+
+        if self._state_store is not None:
+            return self._state_store
 
         # Composed rather than imported: `ASStateStore` is abstract and mautrix
         # ships no in-memory concrete pairing of the two — `FileASStateStore` is
@@ -1092,7 +1105,9 @@ class MautrixHomeserver(Homeserver):
         same token and state store; the appservice is left to do what only it
         can, which is receive.
         """
+        # deferred: import cost — aiohttp adds ~140 ms
         import aiohttp
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
         from mautrix.appservice import AppServiceAPI
 
         if self._client is None:

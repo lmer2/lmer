@@ -46,6 +46,14 @@ def box(ref):
     return STATE / ref
 
 
+def publish(path, text):
+    """Write *path* whole or not at all: every reader polls for these files
+    and reads them the moment they exist, so a half-written one reads as ""."""
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(text)
+    os.replace(partial, path)
+
+
 def _conflict(name, cid):
     if os.environ.get("FAKE_RUNTIME_FLAVOR") == "podman":
         return (
@@ -118,12 +126,12 @@ def create(args):
         return 125
     box(cid).mkdir(parents=True)
     labels = dict(label.split("=", 1) for label in values.get("--label", []))
-    (box(cid) / "config.json").write_text(json.dumps({
+    publish(box(cid) / "config.json", json.dumps({
         "labels": labels, "command": args[image_at + 1:], "name": name,
         "stop_timeout": int(values.get("--stop-timeout", [10])[0]),
     }))
     (box(cid) / "out.log").write_bytes(b"")
-    cid_file.write_text(cid)
+    publish(cid_file, cid)
     return 0
 
 
@@ -154,11 +162,11 @@ def run_container(cid):
     config = json.loads((box(cid) / "config.json").read_text())
     with (box(cid) / "out.log").open("ab", buffering=0) as out:
         process = subprocess.Popen(config["command"], stdout=out, stderr=out)
-        (box(cid) / "pid").write_text(str(process.pid))
+        publish(box(cid) / "pid", str(process.pid))
         code = process.wait()
     code = 128 - code if code < 0 else code
-    (box(cid) / "finished").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    (box(cid) / "exit").write_text(str(code))
+    publish(box(cid) / "finished", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    publish(box(cid) / "exit", str(code))
     return 0
 
 
@@ -229,7 +237,12 @@ def ps(args):
     for path in sorted(STATE.iterdir()) if STATE.exists() else []:
         if ids and path.name not in ids:
             continue
-        labels = json.loads((path / "config.json").read_text())["labels"]
+        try:
+            labels = json.loads((path / "config.json").read_text())["labels"]
+        except OSError:
+            # Being created or removed: a real runtime's listing never fails
+            # because a container came or went during it (#589).
+            continue
         pairs = {f"{k}={v}" for k, v in labels.items()}
         if all(want in pairs for want in wanted):
             print(path.name)

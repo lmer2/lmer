@@ -1455,7 +1455,7 @@ def test_late_post_reconciles_through_the_real_reader_and_pane(platform_root, co
       const code = source.slice(source.indexOf('function absorb('), source.indexOf('\nasync function start()'));
       const factory = new Function('fetchSessionMessages', `
         const props = { sessionId: 'late-post-pane', view: 'conversation' };
-        const messages = { value: [] }, following = { value: false }, total = {}, sessions = {}, note = {}, live = {}, problem = {};
+        const messages = { value: [] }, following = { value: false }, total = {}, sessions = {}, note = {}, live = {}, problem = {}, phase = { value: 'ready' };
         let cursor = 0, generation = 0, polling = false;
         const PAGE = 40, stale = () => false, settlePending = () => {}, nextTick = () => {}, stickToBottom = () => {};
         ${code}

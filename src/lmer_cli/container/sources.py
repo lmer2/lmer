@@ -1345,6 +1345,7 @@ def _doctor_manifest_sources(root) -> Tuple[Optional[dict], bool, list, list]:
             "guarantees it)"
         ], []
     try:
+        # deferred: optional dependency — only a present manifest needs the core; an absent core degrades (D20)
         from lmer_schema.manifest import ManifestError, load_manifest
     except ImportError as exc:
         return None, True, [

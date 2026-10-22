@@ -235,7 +235,7 @@ GITLAB_HOST=gitlab.example.com gitlab-review myorg/myproject --list
 ### Authentication
 The tool looks for authentication tokens in this order:
 1. `--token` command line argument
-2. Host-specific variables: `GITLAB_TOKEN_{sanitized_host}` (hostname with dots/hyphens replaced by underscores)
+2. Host-specific variables: `GITLAB_TOKEN_{sanitized_host}` (hostname lowercased, dots replaced by `_` and hyphens by `__`: `my-gitlab.example.com` → `GITLAB_TOKEN_my__gitlab_example_com`)
 3. `GITLAB_TOKEN` environment variable — used **only** for the host that issued it (`LMER_GITLAB_TOKEN_HOST`, defaulting to the host in `LMER_WORK_REPO`)
 
 Example: for `gitlab.example.com`, the tool checks `GITLAB_TOKEN_gitlab_example_com`, then `GITLAB_TOKEN` if `gitlab.example.com` is its issuing host.

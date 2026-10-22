@@ -347,6 +347,7 @@ def _color(value):
 
 @serialized
 def update(workspace_id, values):
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import ASSISTANT_SETTING_KEYS, validate_assistant_override
 
     allowed = {"name", "color", "settings", "repositories"}
@@ -511,6 +512,7 @@ def _assign(key, destination_id):
     The caller has validated *destination_id* active and holds the operation
     lock. Ownership comes from the named destination alone.
     """
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     if _live_worker(key):
@@ -537,6 +539,7 @@ def _assign(key, destination_id):
 
 
 def move(key, destination_id, *, expected_project, expected_revision=None):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     with operation(), assistant._LOCK:
@@ -730,6 +733,7 @@ def restore(workspace_id):
 
 
 def limit():
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import config_path
 
     value = (store.read_json(config_path()) or {}).get("max_live_assistants", 4)
@@ -737,6 +741,7 @@ def limit():
 
 
 def worker_limit(default):
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import config_path
 
     value = (store.read_json(config_path()) or {}).get("max_concurrent_sessions", default)
@@ -755,6 +760,7 @@ def request_start(workspace_id):
 
 
 def status(workspace_id):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     project = get(workspace_id)
@@ -798,6 +804,7 @@ def inventory_sessions(sessions):
 
 
 def stop(workspace_id):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     get(workspace_id)
@@ -814,6 +821,7 @@ def stop(workspace_id):
 
 
 def rotate(workspace_id, config, **kwargs):
+    # deferred: cycle — lmer_platform.assistant and lmer_platform.project_requests import this module at top
     from . import assistant, project_requests
 
     get(workspace_id, active=True)
@@ -837,6 +845,7 @@ def rotate(workspace_id, config, **kwargs):
 
 
 def _failed(workspace_id, error, *, retry):
+    # deferred: cycle — lmer_platform.transcripts imports this module at top
     from .transcripts import scrub_credentials
 
     with database() as db:
@@ -852,6 +861,7 @@ def _failed(workspace_id, error, *, retry):
 
 def reconcile(config):
     """Reconcile one fleet pass; reservations include starts and rotations."""
+    # deferred: cycle — lmer_platform.assistant and lmer_platform.project_requests import this module at top
     from . import assistant, project_requests
 
     with operation():
@@ -907,6 +917,7 @@ class Supervisor:
         self._thread = None
 
     def first_start(self):
+        # deferred: cycle — lmer_platform.assistant imports this module at top, and lmer_platform.config does via uploads
         from . import assistant, config
 
         incumbents = {row["id"] for row in listing() if status(row["id"])["running"]}

@@ -35,7 +35,9 @@ from typing import Callable, Optional
 import requests
 
 from ask_channel import bus
+from matrix_chat.client import MatrixAccount, MatrixClient
 from matrix_chat.permalink import matrix_to_link
+from slack_chat.client import SlackClient
 from slack_chat.permalink import slack_thread_link
 
 from . import dm_access, dm_parents
@@ -46,6 +48,7 @@ from .threads import (
 )
 from . import thread_posts
 from . import thread_requests as _requests
+from .util import get_bool_env
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +196,7 @@ def slack_token(env: Optional[dict] = None, *, where: str = DAEMON_ENVIRONMENT) 
 
 
 def matrix_account(env: Optional[dict] = None, *, where: str = DAEMON_ENVIRONMENT):
-    from matrix_chat.client import MatrixAccount
+    # deferred: cycle — matrix_chat.connector imports this module at top
     from matrix_chat.connector import ACCESS_TOKEN_ENV, HOMESERVER_ENV, USER_ID_ENV
 
     environ = env if env is not None else os.environ
@@ -216,20 +219,11 @@ def matrix_account(env: Optional[dict] = None, *, where: str = DAEMON_ENVIRONMEN
     )
 
 
-# The two transports are imported inside their factories on purpose: this module
-# is imported by the supervisor's own CLI path, where neither client is reachable
-# and neither is needed until a request names a thread on that transport.
-
-
 def _slack_client(token: str):
-    from slack_chat.client import SlackClient
-
     return SlackClient(bot_token=token)
 
 
 def _matrix_client(account):
-    from matrix_chat.client import MatrixClient
-
     return MatrixClient(account)
 
 
@@ -506,7 +500,7 @@ class OutboundFile:
 
 def outbound_file(item: dict, store: Optional[UploadStore]) -> OutboundFile:
     """Read, bound and scrub one attachment the session sent, for any transport."""
-    # Deferred: the scrub imports lmer_platform.transcripts, ~0.6 s this module avoids.
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~300 ms
     from matrix_bridge.scrub import scrub_bytes, scrub_text
 
     name = scrub_text(str(item.get("name") or "file"))
@@ -591,7 +585,12 @@ def read_thread(
     ref: Optional[ThreadRef] = None,
     unstored: str = NO_STORE,
 ) -> dict:
-    """Read up to *limit* messages as bus-style records; pagination is transport-specific."""
+    """Read up to *limit* messages as bus-style records; pagination is transport-specific.
+
+    *unstored* is the reason a record's file carries when it is described but
+    not copied in — no upload store to put it in, by default; the API names the
+    reason its own callers see instead.
+    """
     limit = max(1, min(int(limit or _requests.DEFAULT_READ_LIMIT), _requests.MAX_READ_LIMIT))
     fetched = None
     if ref is None or client is None:
@@ -885,12 +884,13 @@ def _post_slack(
     ref: ThreadRef, client, text: str, attachments: list, *,
     store: Optional[UploadStore] = None, poster: Optional[Poster] = None, label: Optional[str] = None,
 ) -> dict:
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~270 ms
+    from matrix_bridge.scrub import scrub_text
+
     for item in attachments:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
             text += f"\n📎 {name}"
-    from matrix_bridge.scrub import scrub_text
-
     body, clipped = _clip(scrub_text(text))
     channel, thread_ts = ref.key["channel"], ref.key["thread_ts"]
     try:
@@ -918,10 +918,17 @@ def _post_slack(
                     prepared, withheld=slack_upload_refusal(exc) or "Slack would not take it",
                 )
         if prepared.withheld is not None:
-            withheld.append(prepared.note)
+            withheld.append({"name": prepared.name, "reason": prepared.withheld})
     if withheld:
         try:
-            note_ts = client.post_message(channel, thread_ts, tagged(label, "\n".join(withheld), slack_markup=True))
+            note_ts = client.post_message(
+                channel, thread_ts,
+                tagged(
+                    label,
+                    "\n".join(withheld_note(item["name"], item["reason"]) for item in withheld),
+                    slack_markup=True,
+                ),
+            )
         except Exception as exc:
             logger.warning("thread_post_note_failed channel=%s error=%s", channel, exc)
         else:
@@ -931,6 +938,7 @@ def _post_slack(
         "ref": f"{channel}:{thread_ts}:{ts}",
         "at": _iso_from_slack_ts(ts),
         "clipped": clipped,
+        "withheld": withheld,
     }
 
 
@@ -939,10 +947,10 @@ def _post_matrix(
     store: Optional[UploadStore], env: Optional[dict], poster: Optional[Poster] = None,
     label: Optional[str] = None,
 ) -> dict:
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~310 ms
     from matrix_bridge.scrub import scrub_text
+    # deferred: cycle — matrix_chat.connector imports this module at top
     from matrix_chat.connector import AUTHENTICATED_MEDIA_ENV
-
-    from .util import get_bool_env
 
     room, event = ref.key["room"], ref.key["event"]
     body, clipped = _clip(scrub_text(text))
@@ -965,9 +973,13 @@ def _post_matrix(
             last_event_id=event_id, stamp=stamp,
         )
         if reason:
-            withheld.append(withheld_note(name, reason))
+            withheld.append({"name": name, "reason": reason})
     if withheld:
-        with_note = tagged(label, "\n".join(withheld), slack_markup=False)
+        with_note = tagged(
+            label,
+            "\n".join(withheld_note(item["name"], item["reason"]) for item in withheld),
+            slack_markup=False,
+        )
         try:
             client.send_thread_text(
                 room, event, with_note, last_event_id=event_id, msgtype="m.notice",
@@ -975,7 +987,7 @@ def _post_matrix(
             )
         except Exception as exc:
             logger.warning("thread_post_note_failed room=%s error=%s", room, exc)
-    return {"ref": event_id, "at": None, "clipped": clipped}
+    return {"ref": event_id, "at": None, "clipped": clipped, "withheld": withheld}
 
 
 def _matrix_attachment(
@@ -983,6 +995,7 @@ def _matrix_attachment(
     last_event_id, stamp: Optional[dict] = None,
 ) -> Optional[str]:
     """Upload one attachment; return why it was withheld, or ``None``."""
+    # deferred: cycle — matrix_chat.connector imports this module at top
     from matrix_chat.connector import AUTHENTICATED_MEDIA_ENV
 
     if not authenticated:
@@ -1093,6 +1106,9 @@ def send_dm(
 def _dm_slack(
     recipient: str, text: str, *, env, where, client, poster, established,
 ) -> dict:
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~300 ms to the lmer-signal path
+    from matrix_bridge.scrub import scrub_text
+
     client = client or _slack_client(slack_token(env, where=where))
     try:
         workspace = client.workspace()
@@ -1111,7 +1127,7 @@ def _dm_slack(
     conversation = _dm_conversation_id(client, user_id, recipient)
     if not allowed and conversation not in established:
         dm_access.check_recipient(user_id, spellings=spellings, env=env, shown=recipient)
-    body, clipped = _clip(text)
+    body, clipped = _clip(scrub_text(text))
     try:
         posted = client.post_root(conversation, body)
     except Exception as exc:
@@ -1188,6 +1204,9 @@ def _no_username_lookup(recipient: str) -> str:
 def _dm_matrix(
     recipient: str, text: str, *, env, where, client, poster, established,
 ) -> dict:
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~300 ms to the lmer-signal path
+    from matrix_bridge.scrub import scrub_text
+
     client = client or _matrix_client(matrix_account(env, where=where))
     try:
         room = client.direct_room(recipient)
@@ -1220,7 +1239,7 @@ def _dm_matrix(
             "unreadable. Nothing was sent",
             status=409,
         )
-    body, clipped = _clip(text)
+    body, clipped = _clip(scrub_text(text))
     try:
         event = client.send_message(room, {"msgtype": "m.text", "body": body})
     except Exception as exc:
@@ -1251,6 +1270,7 @@ def _open_slack(
         raise _slack_failure(exc, ref.target) from None
     _refuse_unverifiable_membership(workspace.get("scopes"), ref.target)
     host = workspace["host"]
+    # deferred: import cost — only a verified workspace reaches it; matrix_bridge.scrub -> transcripts adds ~310 ms
     from matrix_bridge.scrub import scrub_text
 
     body, clipped = _clip(scrub_text(text))
@@ -1310,6 +1330,7 @@ def _open_matrix(
     the real one does). ``joined_rooms`` is the one call here that needs no
     membership, and the two refusals an operator acts on are different errands.
     """
+    # deferred: import cost — matrix_bridge.scrub -> lmer_platform.transcripts adds ~280 ms
     from matrix_bridge.scrub import scrub_text
 
     try:

@@ -29,6 +29,7 @@ def preflight():
 
 
 def effect():
+    # deferred: cycle — lmer_platform.project_api imports this module at top
     from . import project_api
 
     action = _ACTION.get()
@@ -409,6 +410,7 @@ def recover(project_id):
 
 
 def action(binding, perform):
+    # deferred: import cost — fastapi (~230 ms) and starlette (~40 ms) load only when an action builds a response
     from fastapi.encoders import jsonable_encoder
     from starlette.responses import JSONResponse, Response
 
@@ -538,6 +540,7 @@ def _unavailable(row, reason):
 
 
 def reply(identity, text, *, workspace_id, session_id):
+    # deferred: cycle — lmer_platform.project_api imports this module at top
     from . import project_api
 
     if not isinstance(text, str) or not text.strip() or len(text) > 20000:

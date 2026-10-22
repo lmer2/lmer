@@ -167,6 +167,10 @@ class TestPidAlive:
         assert registry._pid_alive(0) is False
         assert registry._pid_alive(-1) is False
 
+    @pytest.mark.parametrize("pid", [2**31, 2**63, 2**64])
+    def test_a_pid_past_pid_t_is_not_alive(self, pid):
+        assert registry._pid_alive(pid) is False
+
     def test_reaped_child_pid_is_not_alive(self):
         # A child we've already waited on is gone; its PID should not read as
         # alive (barring an immediate, vanishingly unlikely reuse).
