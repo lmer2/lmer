@@ -8,6 +8,7 @@ crashed runs survive into the attention list.
 
 import asyncio
 import base64
+import importlib.metadata
 import json
 import os
 
@@ -285,6 +286,23 @@ def test_config_summary_exposes_the_assistant_name(platform_root, monkeypatch):
     app = api.create_app(config, SECRET, state_builder=api.build_state)
     summary = TestClient(app).get("/api/state", headers=bearer_header()).json()["config"]
     assert summary["assistant_name"] == "Ratchet"
+
+
+def test_config_summary_serves_the_version_read_at_start(config, monkeypatch):
+    monkeypatch.setattr(api, "_LMER_VERSION", "9.9.9")
+    client = TestClient(api.create_app(config, SECRET, state_builder=api.build_state))
+    # An upgrade on disk after start does not change what the running daemon reports.
+    monkeypatch.setattr(api.importlib.metadata, "version", lambda name: "10.0.0")
+    summary = client.get("/api/state", headers=bearer_header()).json()["config"]
+    assert summary["version"] == "9.9.9"
+
+
+def test_lmer_version_is_none_without_package_metadata(monkeypatch):
+    def missing(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(api.importlib.metadata, "version", missing)
+    assert api._lmer_version() is None
 
 
 # --- build_state (integration, no network) ----------------------------------

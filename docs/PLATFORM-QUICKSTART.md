@@ -120,6 +120,13 @@ consult relevant prior exchanges when context is missing.
   with the orange border and the face is Ratchet itself; its expression is the
   fleet's mood (hover or tap it for the reason). `chat` on that
   row (or the face in the app bar) opens its drawer.
+- **App bar** — the project picker on the left, Ratchet's badge (face and mood)
+  in the centre, and the actions (fleet view, rescan, `run`, width, colour
+  scheme, settings) on the right. On a phone the bar shows the face alone, and the
+  mood text sits in the row below, beside the picker. In the sidebar each
+  project's Ratchet row wears that project's face, and the foot of the run list
+  names the platform and the lmer version the daemon is running, read once at
+  start (`GET /api/state` → `config.version`).
 - **Spawn a run** — the `run` button. Taskdef + target, optionally a preset,
   a fan-out roster (`--agents`), a title. A plain clone URL is a complete target
   by itself: the platform derives the run identity from it, records that

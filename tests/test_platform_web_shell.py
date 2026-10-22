@@ -302,8 +302,8 @@ def test_the_band_is_a_remembered_preference_with_a_control_that_does_something(
         "the toggle draws the same icon in both states, or one pasted as path data "
         "rather than taken from @mdi/js"
     )
-    cluster = app.index('<div class="bar-cluster"')
-    assert cluster < app.index('@click="narrow = !narrow"') < app.index("</v-app-bar>")
+    actions = app.index('<div class="bar-actions"')
+    assert actions < app.index('@click="narrow = !narrow"') < app.index("</v-app-bar>")
 
     assert "const NARROW_STORAGE_KEY = 'lmer.app.narrow'" in app
     assert re.search(
@@ -605,31 +605,51 @@ def test_the_navigator_does_not_pull_the_terminal_into_the_first_load():
     assert detail.count("import('./Terminal.vue')") == 1
 
 
-# --- the bar's controls sit at the centre on a desktop -------------------------
+# --- the badge at the bar's centre, the actions at its end (issue 596) --------
 
-def test_the_bar_cluster_is_centred_on_a_desktop_and_in_flow_on_a_phone():
-    """The operator's call: the controls read as "tucked into the upper right".
+def test_the_badge_is_centred_and_the_actions_sit_at_the_end():
+    """The operator's layout: Ratchet's badge in the middle of the bar, the action
+    icons on the right.
 
-    Centred absolutely against the bar, because a flex-spacer sandwich centres
-    on whatever the title leaves over — a point that moves with the title's
-    length. And only on a desktop: a 390px bar already carries the nav toggle
-    and the title on the left, so a centred cluster would land on top of them.
+    Three grid columns on a desktop, the outer two equal, so the badge sits at the
+    bar's true centre whatever the left side holds. On a phone the row stays in flow
+    and the actions are pushed to the end: a 390px bar has no room for equal halves.
     """
     text = _read(APP)
-    cluster = re.search(r'<div class="bar-cluster"[^>]*>', text)
-    assert cluster, "the bar's controls are not grouped, so nothing can place them"
-    assert ":class=\"{ 'bar-cluster-centered': !mobile }\"" in cluster.group(0), (
-        "centring is not keyed on the same `mobile` the drawers already read, "
+    row = re.search(r'<div class="bar-row"[^>]*>', text)
+    assert row, "the bar's contents are not one row, so nothing can place them"
+    assert ":class=\"{ 'bar-row-columns': !mobile }\"" in row.group(0), (
+        "the columns are not keyed on the same `mobile` the drawers already read, "
         "so the bar and the drawers can disagree about which device this is"
     )
-    for control in ("RatchetFace", "THEME_ICONS[themeMode]", "doRescan"):
-        after_cluster = text[cluster.start():]
-        assert control in after_cluster.split("</v-app-bar>")[0], (
-            f"{control} is not inside the cluster, so centring moves only part "
-            "of the controls"
-        )
+    bar = text[row.start():text.index("</v-app-bar>")]
+    badge, actions = bar.index('<div class="bar-badge">'), bar.index('<div class="bar-actions">')
+    assert badge < actions
+    assert "RatchetFace" in bar[badge:actions], "the face is not in the badge"
+    for control in ("THEME_ICONS[themeMode]", "doRescan", "narrow = !narrow", "showPlatformSettings"):
+        assert control in bar[actions:], f"{control} is not with the other actions"
     style = text[text.index("<style scoped>"):]
-    assert "position: absolute" in style and "translateX(-50%)" in style, (
-        "the centred cluster is not absolute against the bar, so it centres on "
-        "the title's leftovers rather than the viewport"
+    assert "grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)" in _css_rule(style, ".bar-row-columns"), (
+        "the outer columns are not equal, so the badge centres on what is left over"
+    )
+    assert "margin-inline-start: auto" in _css_rule(style, ".bar-actions"), (
+        "on a phone the actions do not sit at the end of the bar"
+    )
+
+
+def test_a_phone_shows_the_status_in_the_switchers_row_not_the_bar():
+    """A 320px bar row has no width for the status beside the actions (review of
+    !420), so a phone shows the face alone in the bar and the plain-text status in
+    the extension row beside the switcher. Measured in a browser: the row fits 320px.
+    """
+    text = _read(APP)
+    bar = text[text.index('<div class="bar-row"'):text.index("</v-app-bar>")]
+    badge = bar[bar.index('<div class="bar-badge">'):bar.index('<div class="bar-actions">')]
+    assert 'v-if="fleetReason && !mobile" class="ratchet-bar-label' in badge, (
+        "the badge keeps its label on a phone, where the row cannot fit it"
+    )
+    extension = bar[bar.index('<template v-if="mobile" #extension>'):]
+    assert "<ProjectSwitcher" in extension
+    assert 'v-if="fleetReason" class="ratchet-bar-label' in extension, (
+        "a phone shows the status nowhere but a tooltip"
     )

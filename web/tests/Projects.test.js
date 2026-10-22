@@ -258,12 +258,12 @@ it('puts the switcher in the bar row itself at desktop width', async () => {
 })
 
 it.each([
-  ['All projects', '', false],
-  ['a project sharing the tone\'s hue', 'green', true],
-  ['a dark custom project', 'night', true],
-  ['a light custom project', 'pink', true],
-  ['a project with no Ratchet run', 'alpha', false],
-])('keeps Ratchet\'s robot readable on %s', async (_label, workspace, onSurface) => {
+  ['All projects', ''],
+  ['a project sharing the tone\'s hue', 'green'],
+  ['a dark custom project', 'night'],
+  ['a light custom project', 'pink'],
+  ['a project with no Ratchet run', 'alpha'],
+])('draws Ratchet\'s badge in the bar\'s own colour, with no disc, on %s', async (_label, workspace) => {
   const extra = [{ id: 'green', name: 'Green', color: 'Green' }, { id: 'night', name: 'Night', color: '#101030' },
     { id: 'pink', name: 'Pink', color: '#ff69b4' }]
   api.fetchProjects.mockResolvedValue({ projects: [...projects, ...extra] })
@@ -275,9 +275,9 @@ it.each([
   const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
   await flushPromises()
   const supervised = workspace !== 'alpha'
-  const robot = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label^="talk to Ratchet"]')
-  expect(robot.classes().includes('text-success')).toBe(supervised)
-  expect(robot.classes().includes('robot-on-surface')).toBe(onSurface)
+  const badge = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label^="talk to Ratchet"]')
+  expect(badge.classes()).toContain('ratchet-badge')
+  expect(badge.classes().filter((name) => name.startsWith('text-') || name === 'robot-on-surface')).toEqual([])
 })
 
 it('gives project-colored chips and buttons the contrast rule\'s text color, presets unchanged', async () => {

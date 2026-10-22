@@ -3,6 +3,7 @@ import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
 import AssistantChat from '../src/components/AssistantChat.vue'
 import RatchetFace from '../src/components/RatchetFace.vue'
+import RunNav from '../src/components/RunNav.vue'
 import { fetchAssistant, fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
 import { chooseProject, mountPane } from './mount.js'
 import { DEFAULT_ASSISTANT_NAME, applyAssistantName, assistantName, faceFile, faceUrl, moodOf, moodReason, offReason } from '../src/ratchet.js'
@@ -166,7 +167,7 @@ describe('Ratchet in the shell', () => {
     fetchState.mockResolvedValue(appState({ runs: [{ slug: 'a', state: 'running', live: true, orchestrator: false }], totals: { live: 1 } }))
     const wrapper = mountPane(App)
     await flushPromises()
-    const face = wrapper.get('header .bar-cluster img.ratchet-face')
+    const face = wrapper.get('header .bar-badge img.ratchet-face')
     expect(face.attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
     expect(face.attributes('alt')).toBe('Ratchet, on_it')
     wrapper.unmount()
@@ -177,13 +178,13 @@ describe('Ratchet in the shell', () => {
     fetchState.mockResolvedValue(appState({ runs: [{ slug: 'a', state: 'running', live: true, orchestrator: false }], totals: { live: 1 } }))
     const wrapper = mountPane(App)
     await flushPromises()
-    const face = () => wrapper.get('header .bar-cluster img.ratchet-face')
+    const face = () => wrapper.get('header .bar-badge img.ratchet-face')
     expect(face().attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
     fetchState.mockRejectedValueOnce(new Error('Network unavailable'))
     await vi.advanceTimersByTimeAsync(10000)
     await flushPromises()
     expect(face().attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
-    expect(wrapper.get('header .bar-cluster button').attributes('aria-label')).toContain('fleet unreachable')
+    expect(wrapper.get('header .bar-badge button').attributes('aria-label')).toContain('fleet unreachable')
     vi.useRealTimers()
     wrapper.unmount()
   })
@@ -197,25 +198,99 @@ describe('Ratchet in the shell', () => {
     wrapper.unmount()
   })
 
-  it('pairs the bar face with a plain-text status, and the off label when stopped', async () => {
+  it('pairs the bar face with a plain-text status, in the switcher\'s row on a phone, and the off label when stopped', async () => {
     fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] })
     fetchState.mockResolvedValue(appState())
     window.history.replaceState({}, '', '/?workspace=general')
     const wrapper = mountPane(App)
     await flushPromises()
-    expect(wrapper.get('header .bar-cluster .ratchet-bar-label').text()).toBe('off: stopped')
-    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
+    // jsdom's 1024px window is a phone to Vuetify's `lg` breakpoint.
+    expect(wrapper.find('header .bar-badge .ratchet-bar-label').exists()).toBe(false)
+    expect(wrapper.get('header .bar-extension .ratchet-bar-label').text()).toBe('off: stopped')
+    expect(wrapper.get('header .bar-badge img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
     wrapper.unmount()
   })
 
-  it('labels the pane off face with its own lifecycle, not the fleet mood', async () => {
+  it('keeps the pane toolbar to the face, its own lifecycle carried in the face\'s name', async () => {
     fetchAssistant.mockResolvedValue({ running: false, lifecycle: 'stopped' })
     const workspace = { id: 'alpha', name: 'Alpha', color: 'Blue' }
     const wrapper = mountPane(AssistantChat, { workspace, mood: 'idle', moodReason: 'idle: nothing needs you' })
     await flushPromises()
-    expect(wrapper.get('.ratchet-mood-label').text()).toBe('off: stopped')
+    expect(wrapper.get('.uber-toolbar').text()).not.toContain('off: stopped')
     expect(wrapper.get('.uber-identity').attributes('aria-label')).toContain('off: stopped')
+    expect(wrapper.get('.uber-identity img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
     wrapper.unmount()
+  })
+
+  it('gives each project\'s Ratchet row, in the sidebar and the main list, that project\'s face', async () => {
+    const alpha = { id: 'alpha', name: 'Alpha', color: 'Blue', assistant: { lifecycle: 'running' } }
+    const beta = { id: 'beta', name: 'Beta', color: 'Blue', assistant: { lifecycle: 'running' } }
+    const gamma = { id: 'gamma', name: 'Gamma', color: 'Blue', assistant: { lifecycle: 'stopped' } }
+    fetchProjects.mockResolvedValue({ projects: [alpha, beta, gamma] })
+    const supervisor = (id, state = 'running') => ({ workspace_id: id, host: 'h', project: id, slug: 'uber', state, live: state === 'running', orchestrator: true })
+    const broken = { workspace_id: 'beta', host: 'h', project: 'beta', slug: 'b1', state: 'running', live: true, orchestrator: false, attention: { reason: 'critical_error' } }
+    fetchState.mockResolvedValue(appState({
+      runs: [supervisor('alpha'), supervisor('beta'), supervisor('gamma', 'held'), broken,
+        { workspace_id: 'alpha', host: 'h', project: 'alpha', slug: 'w', state: 'running', live: true, orchestrator: false }],
+      attention: [broken],
+      totals: { live: 4, attention: 1 },
+    }))
+    window.history.replaceState({}, '', '/')
+    const wrapper = mountPane(App)
+    await flushPromises()
+    const face = (name) => wrapper.get(`.project-nav[aria-label="${name}"] .run-row img.ratchet-face`).attributes('src')
+    expect(face('Alpha')).toBe('./assets/ratchet/ratchet_on_it.png')
+    expect(face('Beta')).toBe('./assets/ratchet/ratchet_panic.png')
+    expect(face('Gamma')).toBe('./assets/ratchet/ratchet_off.png')
+    const main = wrapper.findAll('.v-main section').find((section) => section.find('h2').text() === 'Alpha')
+    expect(main.get('.run-row img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    wrapper.unmount()
+  })
+
+  it('flashes `yes` on the Unassigned Ratchet row for an unassigned completion, and takes `off` from the row', async () => {
+    vi.useFakeTimers()
+    const uber = (state) => ({ workspace_id: null, host: 'h', project: 'loose', slug: 'uber', state, live: state === 'running', orchestrator: true })
+    const worker = (state) => ({ workspace_id: null, host: 'h', project: 'loose', slug: 'w', state, live: state === 'running', orchestrator: false })
+    fetchState.mockResolvedValue(appState({ runs: [uber('running'), worker('running')], totals: { live: 2 } }))
+    window.history.replaceState({}, '', '/')
+    const wrapper = mountPane(App)
+    await flushPromises()
+    const face = () => wrapper.get('.unassigned-runs .run-row img.ratchet-face').attributes('src')
+    expect(face()).toBe('./assets/ratchet/ratchet_on_it.png')
+    fetchState.mockResolvedValue(appState({ runs: [uber('running'), worker('complete')], totals: { live: 1 } }))
+    await vi.advanceTimersByTimeAsync(10000)
+    await flushPromises()
+    expect(face()).toBe('./assets/ratchet/ratchet_yes.png')
+    fetchState.mockResolvedValue(appState({ runs: [uber('held'), worker('complete')], totals: {} }))
+    await vi.advanceTimersByTimeAsync(10000)
+    await flushPromises()
+    expect(face()).toBe('./assets/ratchet/ratchet_off.png')
+    vi.useRealTimers()
+    wrapper.unmount()
+  })
+
+  it('falls back to the row\'s own state for a Ratchet row given no face', () => {
+    const row = (state) => ({ host: 'h', project: 'p', slug: 'uber', state, orchestrator: true })
+    const running = mountPane(RunNav, { runs: [row('running')] })
+    expect(running.get('img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_idle.png')
+    const held = mountPane(RunNav, { runs: [row('held')], face: { mood: 'on_it' } })
+    expect(held.get('img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_off.png')
+    running.unmount()
+    held.unmount()
+  })
+
+  it('names the platform and the daemon\'s version below the project list, not in the bar', async () => {
+    fetchState.mockResolvedValue(appState({ config: { max_concurrent_sessions: 6, version: '0.11.0' } }))
+    const wrapper = mountPane(App)
+    await flushPromises()
+    expect(wrapper.findAll('.nav-footer > div').map((line) => line.text())).toEqual(['lmer platform', 'v0.11.0'])
+    expect(wrapper.get('header').text()).not.toContain('lmer platform')
+    fetchState.mockResolvedValue(appState())
+    wrapper.unmount()
+    const older = mountPane(App)
+    await flushPromises()
+    expect(older.findAll('.nav-footer > div').map((line) => line.text())).toEqual(['lmer platform'])
+    older.unmount()
   })
 
   it('keys completion history by run identity, not slug', async () => {
@@ -231,7 +306,7 @@ describe('Ratchet in the shell', () => {
     await flushPromises()
     await vi.advanceTimersByTimeAsync(10000)
     await flushPromises()
-    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
+    expect(wrapper.get('header .bar-badge img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_on_it.png')
     vi.useRealTimers()
     wrapper.unmount()
   })
@@ -256,7 +331,7 @@ describe('Ratchet in the shell', () => {
     const pane = wrapper.findAllComponents(AssistantChat).find((candidate) => candidate.get('.uber-toolbar').isVisible())
     expect(pane.props('mood')).toBe('idle')
     // The bar is the fleet view, so it does see Beta's critical error.
-    expect(wrapper.get('header .bar-cluster img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_panic.png')
+    expect(wrapper.get('header .bar-badge img.ratchet-face').attributes('src')).toBe('./assets/ratchet/ratchet_panic.png')
     wrapper.unmount()
   })
 })

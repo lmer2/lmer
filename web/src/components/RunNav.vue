@@ -11,6 +11,7 @@ import {
 import { ago, attentionLabel, stateMeta, toneColor } from '../format.js'
 import { runKey } from '../runref.js'
 import { assistantName } from '../ratchet.js'
+import RatchetFace from './RatchetFace.vue'
 
 const STATE_ICONS = {
   running: mdiPlayCircleOutline,
@@ -53,6 +54,9 @@ const props = defineProps({
   attention: { type: Array, default: () => [] },
   currentKey: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
+  // The scope's Ratchet face, `{ mood, off }`; without `off` the row's own state
+  // decides it.
+  face: { type: Object, default: null },
 })
 
 defineEmits(['open'])
@@ -95,7 +99,7 @@ function isOrchestrator(run) {
 </script>
 
 <template>
-  <v-list density="compact" nav>
+  <v-list density="compact" nav :prepend-gap="12">
     <template v-for="(section, index) in sections" :key="section.key">
       <v-divider v-if="index" class="my-2 run-attention-divider" />
       <v-list-item
@@ -108,9 +112,17 @@ function isOrchestrator(run) {
         @click="$emit('open', run)"
       >
         <template #prepend>
+          <RatchetFace
+            v-if="isOrchestrator(run)"
+            :mood="face?.mood || 'idle'"
+            :off="face?.off ?? run.state !== 'running'"
+            :size="24"
+            :title="stateMeta(run.state).label"
+          />
           <v-icon
+            v-else
             :color="toneColor(tone(run))"
-            :icon="isOrchestrator(run) ? mdiRobot : icon(run)"
+            :icon="icon(run)"
             :title="stateMeta(run.state).label"
           />
         </template>

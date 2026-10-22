@@ -37,7 +37,7 @@ import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason, offReas
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
 import {
-  ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef, toneColor,
+  ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
 } from './format.js'
 import {
   rememberChoice, rememberFlag, storedChoice, storedFlag,
@@ -381,9 +381,6 @@ const relations = computed(() => payloadRelations.value || fetchedRelations.valu
 // tap away in the bar instead). The bar control carries its state, so the thing
 // that replaced the node still answers the question the node answered.
 const orchestrator = computed(() => orchestratorOf(runs.value))
-const orchestratorTone = computed(() => (
-  orchestrator.value ? toneColor(stateMeta(orchestrator.value.state).tone) : null
-))
 const orchestratorHint = computed(() => {
   const run = orchestrator.value
   const parts = run ? [`${assistantName.value} — ${stateMeta(run.state).label}`] : [`talk to ${assistantName.value}`]
@@ -449,12 +446,19 @@ const justFinishedByProject = ref({})
 const fleetScopeId = computed(() => activeProject.value || '')
 const paneScopeId = computed(() => chatProject.value || activeProject.value || '')
 
+const UNASSIGNED_SCOPE = Symbol('unassigned')
+
 function moodInputFor(projectId) {
   const allRuns = state.value?.runs || []
   const allAttention = state.value?.attention || []
-  const scopeRuns = projectId ? allRuns.filter((run) => run.workspace_id === projectId) : allRuns
-  const scopeAttention = projectId ? allAttention.filter((run) => run.workspace_id === projectId) : allAttention
+  const inScope = projectId === UNASSIGNED_SCOPE
+    ? (run) => !run.workspace_id
+    : (run) => run.workspace_id === projectId
+  const scopeRuns = projectId ? allRuns.filter(inScope) : allRuns
+  const scopeAttention = projectId ? allAttention.filter(inScope) : allAttention
   const finished = justFinishedByProject.value
+  // load() counts an unassigned completion under '', which here means "all projects".
+  const finishedKey = projectId === UNASSIGNED_SCOPE ? '' : projectId
   return {
     loaded: !!state.value,
     runs: scopeRuns,
@@ -464,7 +468,7 @@ function moodInputFor(projectId) {
     openQuestions: openQuestionsByProject.value[projectId] || 0,
     replying: !!replyingByProject.value[projectId],
     justFinished: projectId
-      ? (finished[projectId] || 0)
+      ? (finished[finishedKey] || 0)
       : Object.values(finished).reduce((total, count) => total + count, 0),
   }
 }
@@ -497,6 +501,14 @@ function lifecycleOf(projectId) {
 const fleetLifecycle = computed(() => lifecycleOf(fleetScopeId.value))
 const fleetOff = computed(() => !!fleetLifecycle.value && fleetLifecycle.value !== 'running')
 const fleetReason = computed(() => fleetOff.value ? offReason(fleetLifecycle.value) : fleetMoodReason.value)
+// Each project's Ratchet row in the sidebar wears that project's face (issue 596).
+const projectFaces = computed(() => Object.fromEntries(projectGroups.value.map((project) => {
+  const lifecycle = lifecycleOf(project.id)
+  return [project.id, { mood: moodOf(moodInputFor(project.id)), off: !!lifecycle && lifecycle !== 'running' }]
+})))
+// No lifecycle to read for runs outside a project, so `off` is left to each row's state.
+const unassignedFace = computed(() => ({ mood: moodOf(moodInputFor(UNASSIGNED_SCOPE)) }))
+const lmerVersion = computed(() => state.value?.config?.version || null)
 // The tab icon follows the fleet mood (issue 581). No slash variant for `off`:
 // a tab icon is not a status surface, so it stays on the face.
 watch(fleetMood, (mood) => {
@@ -653,7 +665,10 @@ const selected = computed(() =>
 const title = computed(() => {
   if (view.value === 'add') return 'spawn or adopt'
   if (view.value === 'detail') return selected.value?.label || 'run'
-  return 'lmer platform'
+  if (view.value === 'platform-settings') return 'Platform settings'
+  if (view.value === 'project-settings') return 'Project settings'
+  // The fleet's name lives at the foot of the sidebar (issue 596).
+  return ''
 })
 
 // One fleet read at a time. Four things call this now — the interval, a view that
@@ -857,90 +872,103 @@ onUnmounted(() => {
        are at the bottom of this file. -->
   <v-app :class="{ 'app-narrow': narrow, 'app-mobile': mobile }">
     <v-app-bar :elevation="1" density="comfortable" :color="barColor" :style="barStyle">
-      <v-tooltip v-if="mobile" text="show the run list" location="bottom" open-on-focus>
-        <template #activator="{ props: tooltip }">
-          <v-app-bar-nav-icon v-bind="tooltip" aria-label="show the run list" @click="navOpen = !navOpen" />
-        </template>
-      </v-tooltip>
-      <v-tooltip v-if="view !== 'fleet'" text="back to the fleet" location="bottom" open-on-focus>
-        <template #activator="{ props: tooltip }">
-          <v-btn v-bind="tooltip" :icon="mdiArrowLeft" variant="text" aria-label="back to the fleet" @click="view = 'fleet'" />
-        </template>
-      </v-tooltip>
-      <div v-if="!mobile" class="bar-switcher">
-        <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
-      </div>
-      <v-app-bar-title class="text-title-medium">{{ title }}</v-app-bar-title>
-      <div class="bar-cluster" :class="{ 'bar-cluster-centered': !mobile }">
-        <v-tooltip :text="orchestratorHint" location="bottom" open-on-focus>
-          <template #activator="{ props: tooltip }">
-            <v-btn v-bind="tooltip" icon :color="orchestratorTone" variant="text"
-              :class="{ 'robot-on-surface': barColor && orchestratorTone }"
-              :aria-label="orchestratorHint" @click="toggleProjectChat">
-              <RatchetFace :mood="fleetMood" :off="fleetOff" :size="24" />
-            </v-btn>
-          </template>
-        </v-tooltip>
-        <!-- chadd's rule, and the collapsed/mobile case especially: the face is
-             always paired with a plain-text status, not only a tooltip. -->
-        <span v-if="fleetReason" class="ratchet-bar-label text-body-small text-medium-emphasis">{{ fleetReason }}</span>
-        <v-tooltip v-if="!mobile" :text="widthHint" location="bottom" open-on-focus>
-          <template #activator="{ props: tooltip }">
-            <v-btn v-bind="tooltip" :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
-              :variant="narrow ? 'tonal' : 'text'" :aria-label="widthHint" @click="narrow = !narrow" />
-          </template>
-        </v-tooltip>
-        <v-menu location="bottom end">
-          <template #activator="{ props: picker }">
-            <v-tooltip :text="`colour scheme: ${THEME_LABELS[themeMode]}`" location="bottom" open-on-focus>
-              <template #activator="{ props: tooltip }">
-                <v-btn v-bind="mergeProps(picker, tooltip)" :icon="THEME_ICONS[themeMode]" variant="text"
-                  :aria-label="`colour scheme: ${THEME_LABELS[themeMode]}`" />
-              </template>
-            </v-tooltip>
-          </template>
-          <v-list :selected="[themeMode]" density="compact">
-            <v-list-item v-for="mode in THEME_MODES" :key="mode" :value="mode"
-              :prepend-icon="THEME_ICONS[mode]" :title="THEME_LABELS[mode]" @click="themeMode = mode" />
-          </v-list>
-        </v-menu>
-        <v-tooltip text="Platform settings" location="bottom" open-on-focus>
-          <template #activator="{ props: tooltip }">
-            <v-btn v-bind="tooltip" :icon="mdiCogOutline" variant="text" aria-label="Platform settings"
-              :aria-pressed="view === 'platform-settings'" @click="showPlatformSettings" />
-          </template>
-        </v-tooltip>
-        <template v-if="view === 'fleet'">
-          <v-btn-toggle v-model="fleetView" class="me-1" density="compact" mandatory variant="text">
-            <v-tooltip text="read the fleet as a list" location="bottom" open-on-focus>
-              <template #activator="{ props: tooltip }">
-                <v-btn v-bind="tooltip" value="list" :icon="mdiViewListOutline" aria-label="read the fleet as a list" />
-              </template>
-            </v-tooltip>
-            <v-tooltip text="read the fleet as a constellation map" location="bottom" open-on-focus>
-              <template #activator="{ props: tooltip }">
-                <v-btn v-bind="tooltip" value="map" :icon="mdiMapOutline" aria-label="read the fleet as a constellation map" />
-              </template>
-            </v-tooltip>
-          </v-btn-toggle>
-          <v-tooltip text="rescan now" location="bottom" open-on-focus>
+      <!-- Three columns on a desktop so the badge sits at the bar's true centre
+           whatever the left side holds; one row in flow on a phone. -->
+      <div class="bar-row" :class="{ 'bar-row-columns': !mobile }">
+        <div class="bar-start">
+          <v-tooltip v-if="mobile" text="show the run list" location="bottom" open-on-focus>
             <template #activator="{ props: tooltip }">
-              <v-btn v-bind="tooltip" :icon="mdiRefresh" :loading="busy" variant="text" aria-label="rescan now" @click="doRescan" />
+              <v-app-bar-nav-icon v-bind="tooltip" aria-label="show the run list" @click="navOpen = !navOpen" />
             </template>
           </v-tooltip>
-          <v-tooltip text="spawn or adopt a run" location="bottom" open-on-focus>
+          <v-tooltip v-if="view !== 'fleet'" text="back to the fleet" location="bottom" open-on-focus>
             <template #activator="{ props: tooltip }">
-              <v-btn v-bind="tooltip" class="me-2" variant="tonal" :icon="mobile ? mdiPlus : undefined"
-                :prepend-icon="mobile ? undefined : mdiPlus" aria-label="spawn or adopt a run" @click="view = 'add'"
-              ><v-icon v-if="mobile" :icon="mdiPlus" /><template v-else>run</template></v-btn>
+              <v-btn v-bind="tooltip" :icon="mdiArrowLeft" variant="text" aria-label="back to the fleet" @click="view = 'fleet'" />
             </template>
           </v-tooltip>
-        </template>
+          <div v-if="!mobile" class="bar-switcher">
+            <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
+          </div>
+          <v-app-bar-title v-if="title" class="text-title-medium">{{ title }}</v-app-bar-title>
+        </div>
+        <div class="bar-badge">
+          <v-tooltip :text="orchestratorHint" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <!-- The face is always paired with a plain-text status, not only a
+                   tooltip. A phone's bar has no width for it, so there it sits in
+                   the switcher's row below. -->
+              <v-btn v-bind="tooltip" class="ratchet-badge" variant="text" rounded="pill"
+                :aria-label="orchestratorHint" @click="toggleProjectChat">
+                <RatchetFace :mood="fleetMood" :off="fleetOff" :size="32" />
+                <span v-if="fleetReason && !mobile" class="ratchet-bar-label text-body-medium">{{ fleetReason }}</span>
+              </v-btn>
+            </template>
+          </v-tooltip>
+        </div>
+        <div class="bar-actions">
+          <template v-if="view === 'fleet'">
+            <v-btn-toggle v-model="fleetView" :class="{ 'me-1': !mobile }" density="compact" mandatory variant="text">
+              <v-tooltip text="read the fleet as a list" location="bottom" open-on-focus>
+                <template #activator="{ props: tooltip }">
+                  <v-btn v-bind="tooltip" value="list" :icon="mdiViewListOutline" aria-label="read the fleet as a list" />
+                </template>
+              </v-tooltip>
+              <v-tooltip text="read the fleet as a constellation map" location="bottom" open-on-focus>
+                <template #activator="{ props: tooltip }">
+                  <v-btn v-bind="tooltip" value="map" :icon="mdiMapOutline" aria-label="read the fleet as a constellation map" />
+                </template>
+              </v-tooltip>
+            </v-btn-toggle>
+            <v-tooltip text="rescan now" location="bottom" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn v-bind="tooltip" :icon="mdiRefresh" :loading="busy" variant="text" aria-label="rescan now" @click="doRescan" />
+              </template>
+            </v-tooltip>
+            <v-tooltip text="spawn or adopt a run" location="bottom" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn v-bind="tooltip" :class="{ 'me-2': !mobile }" variant="tonal" :icon="mobile ? mdiPlus : undefined"
+                  :prepend-icon="mobile ? undefined : mdiPlus" aria-label="spawn or adopt a run" @click="view = 'add'"
+                ><v-icon v-if="mobile" :icon="mdiPlus" /><template v-else>run</template></v-btn>
+              </template>
+            </v-tooltip>
+          </template>
+          <v-tooltip v-if="!mobile" :text="widthHint" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
+                :variant="narrow ? 'tonal' : 'text'" :aria-label="widthHint" @click="narrow = !narrow" />
+            </template>
+          </v-tooltip>
+          <v-menu location="bottom end">
+            <template #activator="{ props: picker }">
+              <v-tooltip :text="`colour scheme: ${THEME_LABELS[themeMode]}`" location="bottom" open-on-focus>
+                <template #activator="{ props: tooltip }">
+                  <v-btn v-bind="mergeProps(picker, tooltip)" :icon="THEME_ICONS[themeMode]" variant="text"
+                    :aria-label="`colour scheme: ${THEME_LABELS[themeMode]}`" />
+                </template>
+              </v-tooltip>
+            </template>
+            <v-list :selected="[themeMode]" density="compact">
+              <v-list-item v-for="mode in THEME_MODES" :key="mode" :value="mode"
+                :prepend-icon="THEME_ICONS[mode]" :title="THEME_LABELS[mode]" @click="themeMode = mode" />
+            </v-list>
+          </v-menu>
+          <v-tooltip text="Platform settings" location="bottom" open-on-focus>
+            <template #activator="{ props: tooltip }">
+              <v-btn v-bind="tooltip" :icon="mdiCogOutline" variant="text" aria-label="Platform settings"
+                :aria-pressed="view === 'platform-settings'" @click="showPlatformSettings" />
+            </template>
+          </v-tooltip>
+        </div>
       </div>
       <!-- A phone's bar has no width left for a name beside its controls, so the
            switcher takes a row of its own there, inside the bar and so still fixed. -->
       <template v-if="mobile" #extension>
-        <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
+        <div class="bar-extension">
+          <div class="bar-extension-switcher">
+            <ProjectSwitcher v-bind="switcherProps" v-on="switcherEvents" />
+          </div>
+          <span v-if="fleetReason" class="ratchet-bar-label text-body-medium">{{ fleetReason }}</span>
+        </div>
       </template>
     </v-app-bar>
 
@@ -962,12 +990,18 @@ onUnmounted(() => {
       </div>
       <ProjectNav v-for="project in projectGroups" :key="project.id" :project="project"
         :selected="project.id === activeProject" :runs="projectRuns(project.id)" :attention="projectAttention(project.id)"
-        :current-key="view === 'detail' && selected?.workspace_id === project.id ? selectedKey : null" :now="now" @open="open" @chat="showProjectChat" />
+        :current-key="view === 'detail' && selected?.workspace_id === project.id ? selectedKey : null" :now="now"
+        :face="projectFaces[project.id]" @open="open" @chat="showProjectChat" />
       <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs">
         <h2 class="text-title-small pa-3">Unassigned</h2>
         <RunNav :runs="unassignedRuns" :attention="unassignedAttention"
-          :current-key="view === 'detail' && !selected?.workspace_id ? selectedKey : null" :now="now" @open="open" />
+          :current-key="view === 'detail' && !selected?.workspace_id ? selectedKey : null" :now="now"
+          :face="unassignedFace" @open="open" />
       </section>
+      <footer class="nav-footer text-medium-emphasis">
+        <div class="text-body-small">lmer platform</div>
+        <div v-if="lmerVersion" class="text-label-small">v{{ lmerVersion }}</div>
+      </footer>
     </v-navigation-drawer>
 
     <!-- The supervisor's chat, on the right, and the side is the feature: the
@@ -1044,11 +1078,12 @@ onUnmounted(() => {
           />
           <section v-for="project in projectGroups" :key="project.id" class="mb-5">
             <h2 class="text-title-medium project-name" :style="{ borderInlineStart: `4px solid ${projectColor(project.color)}`, paddingInlineStart: '12px' }">{{ project.name }}</h2>
-            <RunNav :runs="projectRuns(project.id)" :attention="projectAttention(project.id)" :now="now" @open="open" />
+            <RunNav :runs="projectRuns(project.id)" :attention="projectAttention(project.id)" :now="now"
+              :face="projectFaces[project.id]" @open="open" />
           </section>
           <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs mb-5">
             <h2 class="text-title-medium">Unassigned</h2>
-            <RunNav :runs="unassignedRuns" :attention="unassignedAttention" :now="now" @open="open" />
+            <RunNav :runs="unassignedRuns" :attention="unassignedAttention" :now="now" :face="unassignedFace" @open="open" />
           </section>
           <p v-if="!loading && !projects.length">Create a project to start.</p>
           <!-- The work repo's own panels (#374): here once, in the all-projects
@@ -1258,53 +1293,96 @@ onUnmounted(() => {
   height: 100%;
 }
 
-/* The tone palette was chosen against the theme's surface, not a project's color
-   (green "running" vanishes on a green project), so on a project bar a toned robot
-   keeps its tone and sits on a disc of that surface. Untoned, it is bar text. */
-.robot-on-surface.v-btn {
-  background: rgb(var(--v-theme-surface));
-}
-
-.app-mobile .bar-cluster .robot-on-surface.v-btn {
-  height: 36px;
-}
-
 /* Vuetify paints a button group in the theme's on-surface color, which on a
    project-colored bar can be black on navy; it follows the bar like its siblings. */
-.bar-cluster :deep(.v-btn-group) {
+.bar-actions :deep(.v-btn-group) {
   color: inherit;
 }
 
-/* The bar's controls, at the bar's centre on a desktop. Absolute because the
-   v-app-bar is itself positioned, so 50% here is the viewport's middle — a
-   flex-spacer approach would centre on what the title leaves over, which moves
-   with the title's length. In flow (right-aligned) on a phone; the template
-   comment above the cluster says why. */
-.bar-cluster {
+.bar-row {
   display: flex;
   align-items: center;
+  width: 100%;
+  min-width: 0;
+  padding-inline: 4px;
 }
 
-/* The face's plain-text status in the bar (issue 581): the mobile/collapsed
-   surface has no hover, so the reason cannot live in the tooltip alone. */
+.bar-row-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+}
+
+.bar-start {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+/* In flow on a phone the start's buttons must not shrink under the badge; only
+   the title gives way. */
+.bar-row:not(.bar-row-columns) .bar-start {
+  min-width: auto;
+}
+
+/* The wrapper costs the title Vuetify's own inset from its neighbours. */
+.bar-start > .v-toolbar-title {
+  margin-inline-start: 16px;
+}
+
+/* A nowrap title's min-content is the whole string, which would crush the badge. */
+.app-mobile .bar-start > .v-toolbar-title {
+  max-width: 26vw;
+}
+
+.bar-badge {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  padding-inline: 8px;
+}
+
+.bar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: none;
+  margin-inline-start: auto;
+}
+
+/* One pill for the face and its status. The ground is the bar's own text colour,
+   thinned, so it reads on the theme bar and on every project colour alike. */
+.ratchet-badge.v-btn {
+  height: 40px;
+  min-width: 0;
+  max-width: 100%;
+  padding-inline: 4px 14px;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.ratchet-badge :deep(.v-btn__content) {
+  min-width: 0;
+  gap: 10px;
+}
+
 .ratchet-bar-label {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 22ch;
-  margin-inline-start: 4px;
-}
-
-.bar-cluster-centered {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+  max-width: 26ch;
+  font-weight: 500;
 }
 
 .bar-switcher {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 240px;
+  max-width: 280px;
+}
+
+.nav-footer {
+  padding: 16px 12px;
+  text-align: center;
 }
 
 .project-create {
@@ -1312,9 +1390,47 @@ onUnmounted(() => {
   margin-block-end: 8px;
 }
 
-.app-mobile .bar-cluster :deep(.v-btn--icon) {
+.app-mobile .bar-actions :deep(.v-btn--icon) {
   width: 36px;
   height: 40px;
+}
+
+/* A phone's bar row is budgeted to fit 320px: the badge is the face alone, and the
+   status has the switcher's row (issue 596). */
+.app-mobile .bar-start :deep(.v-btn--icon) {
+  width: 40px;
+}
+
+.app-mobile .bar-badge {
+  flex: none;
+  padding-inline: 4px;
+}
+
+.app-mobile .ratchet-badge.v-btn {
+  width: 40px;
+  padding-inline: 4px;
+}
+
+.bar-extension {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding-inline: 4px 16px;
+}
+
+.bar-extension-switcher {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+}
+
+.bar-extension .ratchet-bar-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: none;
+  margin-inline-start: auto;
 }
 
 /* The band. What the mode does, and all it does: hold the whole app in a strip in

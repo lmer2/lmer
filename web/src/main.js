@@ -53,7 +53,7 @@ import './style.css'
 // say one thing about it, and with the badge on top of it there were two accent
 // systems competing in one row.
 //
-// So the marking is now a border in `primary` on the fleet card and the filled robot
+// So the marking is now a border in `primary` on the fleet card and Ratchet's face
 // in place of the drawer row's state icon — and neither needs a key here: the accent
 // is already defined in both schemes, and a shape is not a colour at all. Both cyan
 // keys are deleted rather than left unused, because a colour nothing paints with is

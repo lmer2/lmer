@@ -48,6 +48,8 @@ defineEmits(['choose', 'settings', 'create'])
 .project-switcher {
   min-width: 0;
   max-width: 100%;
+  font-size: 1.125rem;
+  font-weight: 500;
   text-transform: none;
   letter-spacing: normal;
 }

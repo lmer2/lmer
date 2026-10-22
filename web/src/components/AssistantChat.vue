@@ -162,9 +162,6 @@ onBeforeUnmount(() => {
           </span>
         </template>
       </v-tooltip>
-      <!-- chadd's rule: a face alone is ambiguous, so the mood is always written
-           beside it, not only on hover. -->
-      <span v-if="displayReason" class="ratchet-mood-label text-body-small text-medium-emphasis me-1">{{ displayReason }}</span>
       <template v-if="status || problem">
         <ThreadLinks
           :session-id="sessionId"
@@ -392,14 +389,6 @@ onBeforeUnmount(() => {
   flex: 1 1 0;
 }
 .loaded-count { white-space: nowrap; }
-/* chadd's rule: the face is never alone. Keep the reason on one line and let it
-   give way before the toolbar's controls do. */
-.ratchet-mood-label {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 34ch;
-}
 .uber-identity { display: inline-flex; cursor: default; }
 .question-slot {
   /* A disabled field (mid-send) sets `pointer-events: none` on its input. */
