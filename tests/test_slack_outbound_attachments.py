@@ -311,6 +311,14 @@ class TestPostThread:
         note_ts = f"{1700000000 + 1}.000100"
         assert thread_posts.lookup("C0123ABCDEF", note_ts) == poster
 
+    def test_the_caller_is_told_what_was_withheld(self, slack, store):
+        (store / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n" + _SHAPED.encode())
+        (store / "b.csv").write_bytes(b"a\n")
+        result = self._post(slack, store, [_item("a.png", "image/png"), _item("b.csv")])
+        assert result["posted"]["withheld"] == [
+            {"name": "a.png", "reason": thread_access.WITHHELD_CREDENTIAL},
+        ]
+
     def test_a_share_is_attributed_by_file_id(self, slack, store):
         """A connector on that thread must relay the share as this run's post,
         not hold it as an unknown app message (§9)."""

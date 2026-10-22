@@ -501,6 +501,18 @@ class TestPosting:
         assert len(notes) == 1 and "withheld" in notes[0]
         assert all(shaped not in text for text, _msgtype in matrix.sent)
 
+    def test_matrix_tells_the_caller_what_was_withheld(self, matrix, store, tmp_path):
+        """#544 item 16, as the Slack twin: the scrubbed name and the reason."""
+        (tmp_path / "uploads" / "notes.md").write_text("hi")
+        item = {"name": "notes.md", "path": "/home/developer/.lmer-uploads/notes.md",
+                "media_type": "text/plain"}
+        result = post_thread(MATRIX_LINK, "here it is", label="run", env=MATRIX_ENV,
+                             attachments=[item], store=store)
+        [withheld] = result["posted"]["withheld"]
+        assert withheld["name"] == "notes.md"
+        assert withheld["reason"] in [text for text, msgtype in matrix.sent
+                                      if msgtype == "m.notice"][0]
+
 
 class TestWhoPostedIt:
     """The machine-readable half of a post's attribution (#427)."""

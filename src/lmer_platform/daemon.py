@@ -40,6 +40,7 @@ command away without curl or a token.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -47,6 +48,8 @@ from typing import Optional
 
 from lmer_cli import comms as bus_comms
 from lmer_cli import runref
+from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
+from lmer_cli.env_sources import remember_env_defaults
 from lmer_cli.tls import ensure_ca_bundle
 
 from .api import adopt_run, build_state, create_app
@@ -70,7 +73,7 @@ from .reattach import reattach_all, startup_notice
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
-from .store import StoreError, platform_dir
+from .store import StoreError, append_event, platform_dir
 from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
@@ -283,8 +286,6 @@ def _cmd_secret(args: argparse.Namespace) -> int:
 
 def _print_status(payload: dict, as_json: bool) -> None:
     if as_json:
-        import json
-
         print(json.dumps(payload, indent=2))
         return
 
@@ -384,6 +385,7 @@ def _watch_for_attention(config) -> Detector:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    # deferred: import cost — uvicorn (~85 ms) loads only for `platform run`
     import uvicorn
 
     logging.basicConfig(level=logging.DEBUG if args.log_level == "trace" else args.log_level.upper(),
@@ -531,8 +533,6 @@ def _subscribe_to_comms() -> CommsHub:
 
 def _assistant_consumer(hub: CommsHub):
     """Record milestones and spool worker and human records to the assistant."""
-    from .store import append_event
-
     def consume(event) -> None:
         message = event.message
         source = message.get("source") or {}
@@ -857,9 +857,6 @@ def _load_env_files() -> None:
     First-wins, so an exported variable still beats the file, and spawned sessions
     inherit the result (they also load ``.env`` themselves, harmlessly).
     """
-    from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
-    from lmer_cli.env_sources import remember_env_defaults
-
     loaded = apply_env_file_defaults(default_env_file_candidates())
     remember_env_defaults(loaded)
     if loaded:

@@ -188,6 +188,7 @@ class CodexDelivery:
     def _connect(self):
         if self._ws is not None:
             return
+        # deferred: import cost — only an unconnected delivery reaches it; websockets adds ~80 ms
         from websockets.sync.client import unix_connect
 
         self._ws = unix_connect(

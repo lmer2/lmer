@@ -123,7 +123,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+import yaml
+
 from . import git_ops, memory, run_state, session_record, specs_index
+from .loggers import get_logger
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, CoreUnavailableError, core_module, work_repo_root
 
@@ -820,8 +823,6 @@ def _resolve_project_dir(root: Path, project: str) -> Path:
 def _declared_schema(manifest: Path):
     """The raw `schema:` scalar, for the version-floor refusal to name.
     Anything unreadable is left to the writer, whose message is better."""
-    import yaml
-
     try:
         raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
     except Exception:
@@ -1383,6 +1384,7 @@ def _instance_sources(root: Path, work_repo_url) -> tuple:
     legacy = root / INSTANCE_SOURCES
     if not legacy.is_file():
         return None, (), None, ()
+    # deferred: optional dependency — read only for a legacy sources file; spec §10: an unimportable module refuses the fold, never breaks `work migrate`
     from lmer_cli.container.sources import SourcesConfigError, load_sources
 
     if not work_repo_url:
@@ -1423,6 +1425,7 @@ def _instance_probe() -> bool:
     unimportable all mean this release cannot read the manifest `sources:`
     tier, so the fold must refuse (spec §10, astra R7)."""
     try:
+        # deferred: optional dependency — spec §10: an unimportable sources module refuses the fold, never breaks `work migrate`
         from lmer_cli.container import sources as sources_mod
 
         return bool(getattr(sources_mod, "MANIFEST_TIER_SUPPORTED", False))
@@ -1555,8 +1558,6 @@ def _record_instance_in_caller(plan: InstancePlan, applied: list,
             out(f"\u26a0\ufe0f  {MOVE_EVENT} events not recorded in {caller}: {exc}")
             break
     try:
-        from .loggers import get_logger  # local: loggers imports run_state
-
         get_logger(caller / "log.yaml").log(
             f"work migrate --instance: applied {plan.summary()} to schema form"
         )
@@ -1744,8 +1745,6 @@ def _slug_rewritten(text: str, new_slug: str) -> str:
     :class:`MigrateError` for anything the surgery cannot do safely: not a
     mapping, no or several `slug:` keys, an alias or a non-scalar value, or
     a result that parses to anything but the old record with the new slug."""
-    import yaml
-
     try:
         node = yaml.compose(text)
         before = yaml.safe_load(text)
@@ -1846,8 +1845,6 @@ def _record_in_caller(plan: Plan, applied: list, out: Callable[[str], None]) -> 
             out(f"⚠️  {MOVE_EVENT} events not recorded in {caller}: {exc}")
             break
     try:
-        from .loggers import get_logger  # local: loggers imports run_state
-
         get_logger(caller / "log.yaml").log(
             f"work migrate {plan.project}: applied {plan.summary()} to schema form"
         )

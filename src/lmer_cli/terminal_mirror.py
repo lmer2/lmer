@@ -98,6 +98,7 @@ class TranscriptReader:
         )
 
     def read(self) -> list[tuple[str, Optional[float]]]:
+        # deferred: import cost — lmer_platform.transcripts adds ~470 ms
         from lmer_platform import transcripts
 
         prompts = []

@@ -360,6 +360,7 @@ def _session_io():
     ``spawn`` — a top-level import here would close that cycle. Same lazy-import
     shape, and same one named seam, as ``lmer_platform.spawn._transcripts``.
     """
+    # deferred: cycle — lmer_platform.session_io imports this module at top (via lmer_platform.spawn)
     from . import session_io
 
     return session_io

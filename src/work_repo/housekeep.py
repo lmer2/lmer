@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -33,7 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from . import git_ops, run_state
+from . import git_ops, memory, run_state
+from .session_record import STALE_AFTER_SECONDS, is_stopped
 from .transactions import work_mutation
 from .utils import MANIFEST_NAME, core_module, load_work_manifest, work_repo_root
 
@@ -232,8 +234,6 @@ def _age_days(stamp, now: datetime) -> Optional[float]:
 
 
 def _stale_seconds() -> float:
-    from .session_record import STALE_AFTER_SECONDS
-
     return STALE_AFTER_SECONDS
 
 
@@ -263,7 +263,6 @@ def _plan_runs(plan, *, root, project, policy, archive_stale=False, now=None, **
     """The runs area: archive STOPPED records past their TTL (never by label)."""
     if policy is None:
         return  # runs: {archive_after: null} disables the whole area
-    from .session_record import is_stopped
 
     now = now or datetime.now(timezone.utc)
     # The walk does not carry the form; a manifest is the schema form (the
@@ -564,7 +563,6 @@ def _plan_bundles(plan, *, root, project, policy, now=None, **_):
     run_area = project.path / "_runs"
     if not run_area.is_dir():
         return
-    from .session_record import is_stopped
 
     for rdir in run_state.iter_record_dirs(run_area):
         mp = rdir / "masterplan"
@@ -654,7 +652,6 @@ def _plan_index(plan, *, root, project, policy, now=None, **_):
     """
     if getattr(project, "kind", None) == "bucket":
         return
-    from . import memory
 
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
@@ -668,8 +665,6 @@ def _plan_index(plan, *, root, project, policy, now=None, **_):
 
 
 def _plan_memory_index(plan, root, scope_dir, manifest, date):
-    from . import memory
-
     index = scope_dir / "MEMORY.md"
     if not index.is_file():
         return
@@ -848,8 +843,6 @@ def _apply_tombstone(root: Path, action: Action) -> bool:
     if updated is None or updated == text:
         return False
     if index.name == "MEMORY.md":
-        from . import memory
-
         with memory._memory_retirement_lock(root):
             index.write_text(updated, encoding="utf-8")
     else:
@@ -881,8 +874,6 @@ def _remove_tree(target: Path) -> None:
     if not target.exists() and not target.is_symlink():
         return
     if target.is_dir() and not target.is_symlink():
-        import shutil
-
         shutil.rmtree(target)
     else:
         target.unlink()
@@ -947,6 +938,7 @@ def _caller_record() -> Optional[Path]:
     guard (which requires the state file to exist) and never raise.
     """
     try:
+        # deferred: import cost — only `work housekeep --apply` with changes needs adopt (~10 ms with migrate on every `work` call)
         from .adopt import _caller_record as _adopt_caller_record
 
         return _adopt_caller_record()

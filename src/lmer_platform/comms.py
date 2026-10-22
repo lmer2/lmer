@@ -29,7 +29,8 @@ from typing import Callable, Iterable, Optional
 from lmer_cli import comms as bus_comms
 from lmer_cli import runref
 
-from . import registry, session_io, teardown
+from . import assistant, assistant_history, registry, session_io, teardown
+from .config import terminal_settings
 from .store import (
     StoreError, ensure_state_dir, mutating, platform_dir,
     read_json, utc_now_iso, write_json,
@@ -456,8 +457,6 @@ class _Subscriber(threading.Thread):
             self.failures = 0
             timing = reply.payload.get("terminal_mirror")
             if isinstance(timing, dict):
-                from .config import terminal_settings
-
                 seconds = terminal_settings()["confirm_seconds"].value
                 if timing.get("window_seconds") != seconds:
                     try:
@@ -665,12 +664,8 @@ class CommsHub:
             # Before the journal/ack: a transient registry write failure must
             # leave this lifecycle fact eligible for the subscriber's retry.
             teardown.record_request(session_id, message)
-            from . import assistant_history
-
             archived = assistant_history.generation(session_id)
             if kind == "assistant" and archived is None:
-                from . import assistant
-
                 archived = assistant.history_for(session_id)
             if kind == "assistant" or archived:
                 assistant_history.retain(session_id, message)
@@ -817,7 +812,6 @@ class CommsHub:
     def flush_digests(self, notify: Optional[Callable] = None) -> int:
         """Coalesce queued records into one digest per session. Returns how many
         digests were spooled."""
-        from . import assistant
         if projects.enabled():
             self._last_digest_flush = time.monotonic()
             return project_events.flush()

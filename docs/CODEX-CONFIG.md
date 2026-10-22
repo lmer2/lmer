@@ -53,8 +53,22 @@ not reseeded on restart.
 Optionally set `LMER_CODEX_CONFIG_SEED` in the **platform daemon's environment**
 to a host-readable TOML file. The launcher copies it, mode `0600`, into a scope
 only when no config exists. Later changes to the seed affect only new scopes.
-An unreadable configured seed refuses the launch rather than pretending that
-defaults were applied. This is a host-only input; it is not forwarded to sessions.
+An unreadable configured seed refuses a codex launch, naming the setting and
+the path, rather than pretending that defaults were applied. Only a codex launch
+is refused. Who refuses depends on who knows the harness:
+
+- A request that names `codex` as its harness is refused by the daemon before
+  anything starts. The session's `--harness` flag outranks everything else.
+- Every other launch starts. The daemon logs one warning naming the path and
+  hands the reason to the session's `lmer` in `LMER_CODEX_CONFIG_SEED_ERROR`.
+  That `lmer` refuses, before any container starts, only if the harness it
+  resolves is codex. It resolves the harness after its preset, model aliases,
+  `.env` files and the inherited `LMER_HARNESS`/`LMER_LLM_NAME` are applied.
+  So an inherited `LMER_HARNESS=codex` with a preset that picks claude runs
+  claude without the seed.
+
+The seed is a host-only input and is never forwarded to sessions, and neither
+is the reason.
 Paths inside the seed are used literally by Codex; use container-valid paths.
 
 The runner still passes the resolved preset/model/effort as command-line

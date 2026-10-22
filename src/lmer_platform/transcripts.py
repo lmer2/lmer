@@ -276,8 +276,10 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from ask_channel.protocol import KIND_QUESTION, AskError
+from lmer_cli import comms as bus
+from lmer_cli.threads import ThreadError, parse_thread
 
-from . import ask, registry, runs
+from . import ask, assistant_history, registry, runs
 from .config import active_assistant_credential, active_secret
 from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
@@ -1122,8 +1124,6 @@ def locate_sources(session_id: str) -> list:
 
     entry = registry.read_session(session_id)
     if entry is None:
-        from . import assistant_history
-
         archived = assistant_history.generation(session_id)
         if archived and archived["transcript"]:
             entry = {"transcript": json.loads(archived["transcript"])}
@@ -2765,13 +2765,12 @@ def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tu
     bus turns and nothing else.
     """
     try:
+        # deferred: cycle — lmer_platform.comms imports this module at top (via project_events); inside the best-effort try
         from . import comms as hub_module
 
         events, _cursor = hub_module.ensure_hub().feed(
             0, session=session_id, limit=hub_module.PANE_LIMIT,
         )
-        from . import assistant_history
-
         archived = assistant_history.events(session_id)
         if archived:
             events = archived
@@ -2785,7 +2784,7 @@ def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tu
 
 
 def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = None) -> tuple:
-    from lmer_cli import comms as bus
+    # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via lmer_platform.comms)
     from .assistant_conversation import digest_run
 
     questions: dict = {}
@@ -2881,7 +2880,6 @@ def _thread_link(value: object) -> Optional[str]:
     """
     if not isinstance(value, str) or not value:
         return None
-    from lmer_cli.threads import ThreadError, parse_thread
 
     try:
         parse_thread(value)
@@ -3149,7 +3147,6 @@ def _collect_sources(session_id: str) -> list:
     """
     grouped: list = []
     files = 0
-    from . import assistant_history
 
     entry = registry.read_session(session_id) or {}
     members = ([session_id] if entry.get("kind") == "assistant" or assistant_history.generation(session_id)
@@ -3220,11 +3217,10 @@ def collect_messages(session_id: str, assistant_name: Optional[str] = None) -> t
             message.session = member
         messages.extend(joined)
 
-    from . import assistant_history
-
     archived = assistant_history.generation(session_id)
     entry = registry.read_session(session_id)
     if not archived and isinstance(entry, dict) and entry.get("kind") == "assistant":
+        # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via comms); only an unarchived assistant needs it
         from . import assistant_conversation
 
         channel, copies = _comms_turns(assistant_conversation.events(), session_id, assistant_name)
@@ -3284,8 +3280,6 @@ def read_messages(
         note = EMPTY_TRANSCRIPT_NOTE
     else:
         note = NO_TRANSCRIPT_NOTE
-
-    from . import assistant_history
 
     archive_note = assistant_history.transcript_limit_note(session_id)
     if archive_note:

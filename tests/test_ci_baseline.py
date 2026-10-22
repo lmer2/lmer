@@ -842,7 +842,7 @@ class TestConfirm:
 
     def test_evidence_token_env_is_per_host(self):
         assert ci_baseline.evidence_token_env("Git.Example-Host.com") == (
-            "LMER_CI_BASELINE_TOKEN_git_example_host_com")
+            "LMER_CI_BASELINE_TOKEN_git_example__host_com")
 
     def test_failed_verdict_reads_no_configuration(self):
         client = FakeClient(routes([pipeline(10, source="web")],

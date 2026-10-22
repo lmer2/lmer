@@ -1001,7 +1001,9 @@ is never blindly replayed. The connector runs until stopped:
   message text names each file (`📎 <name>`). Each file then follows as its own
   thread item, either uploaded or replaced by a
   `📎 <name> withheld: <reason>` note. `post --thread` gathers its notes into one
-  message. The bytes are read from the session's
+  message, and also tells its caller, one stderr line per file
+  (`📎 <name> was not sent: <reason>`); the host answer carries the same list as
+  `posted.withheld`. The bytes are read from the session's
   upload store on a descriptor. A file over 25 MiB (the inbound cap) is withheld.
   Text files are redacted. A binary file whose literal bytes carry something
   credential-shaped is withheld, but the scan does not see inside compressed
@@ -1379,9 +1381,10 @@ the one enforcing it.
   read is *not knowing* rather than evidence of the scope, and stays permitted:
   refusing on a stripped header would break every install behind a proxy that
   drops it. Checking membership directly would need `conversations.info` and
-  therefore `channels:read`, which the documented set does not include (the same
-  trade `_slack_label` makes for a channel's name); a probe on that scope, for
-  operators who grant it, is a follow-up.
+  therefore `channels:read` (`groups:read` for a private channel). The documented
+  set lists those only as optional, together, for mapping a channel by `#name`,
+  so this check cannot count on them (the same trade `_slack_label` makes for a
+  channel's name); a probe on them, for operators who grant them, is a follow-up.
 
 lmer joins nothing and invites nobody either way.
 

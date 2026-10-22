@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
-from lmer_cli.tokens import EVIDENCE_TOKEN_PREFIX, _sanitize_hostname
+from lmer_cli.tokens import EVIDENCE_TOKEN_PREFIX, _per_host_env, _sanitize_hostname
 
 PASSED = "passed"
 FAILED = "failed"
@@ -394,6 +394,13 @@ def judge(mapping: CoverageMapping, jobs: Sequence[Dict[str, Any]]
 
 def evidence_token_env(host: str) -> str:
     return EVIDENCE_TOKEN_PREFIX + _sanitize_hostname(host)
+
+
+def evidence_token(host: str) -> str:
+    """The evidence token set for `host`, stripped, or "" when there is none.
+    A hyphenated host's pre-#544 name is refused: it is also the dotted
+    lookalike's name, and this token reads CI/CD variable values."""
+    return (_per_host_env(EVIDENCE_TOKEN_PREFIX, host) or "").strip()
 
 
 def is_header_text(token: str) -> bool:

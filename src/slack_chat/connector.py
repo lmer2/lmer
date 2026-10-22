@@ -23,18 +23,20 @@ from typing import Callable, Iterable, Mapping, Optional
 import requests
 
 from ask_channel import bus
-from lmer_cli import thread_posts
+from lmer_cli import thread_access, thread_posts
 from lmer_cli.comms import CHANNEL_UBER, META_OPERATOR_ONLY, assistant_display_name, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
 from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
-from lmer_cli.thread_access import UploadStore, outbound_file, slack_upload_refusal, withheld_note
+from lmer_cli.thread_access import (
+    UploadStore, outbound_file, slack_display_name, slack_upload_refusal, withheld_note,
+)
 from lmer_cli.thread_requests import MAX_READ_LIMIT
 from lmer_cli.util import get_bool_env
 from matrix_bridge.scrub import scrub_text
 
 from .client import COMPLETE_UPLOAD_REFUSALS, CONNECTION_NOTICE_BLOCK_PREFIX, SlackClient, SlackError
-from .permalink import slack_thread_link
+from .permalink import parse_slack_permalink, slack_thread_link
 from lmer_cli.assistant_mentions import route_connected_mention
 
 logger = logging.getLogger(__name__)
@@ -636,8 +638,6 @@ class SlackConnector(ConnectorLifecycle):
         return states[0].get("question")
 
     def _display_name(self, user_id: Optional[str]) -> Optional[str]:
-        from lmer_cli.thread_access import slack_display_name
-
         return slack_display_name(self.slack, user_id, self._names)
 
     def _stage_files(self, files: list) -> list:
@@ -649,9 +649,7 @@ class SlackConnector(ConnectorLifecycle):
         ``lmer-signal read``, which is not a distinction anything intends — and
         the unbounded side was this one.
         """
-        from lmer_cli.thread_access import UploadStore, fetch_slack_file, stage_upload
-
-        store = UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
+        store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
         if store is None or not files:
             return []
         staged = []
@@ -662,11 +660,11 @@ class SlackConnector(ConnectorLifecycle):
             name = item.get("name") or item.get("title") or "file"
             if not url:
                 continue
-            data = fetch_slack_file(url, self.config.bot_token)
+            data = thread_access.fetch_slack_file(url, self.config.bot_token)
             if data is None:
                 logger.warning("slack_connector_file_failed name=%s", name)
                 continue
-            record = stage_upload(
+            record = thread_access.stage_upload(
                 store, name, data, item.get("mimetype") or "application/octet-stream",
             )
             if record is not None:
@@ -846,8 +844,6 @@ def main(argv: Optional[list] = None) -> int:
     args = parser.parse_args(argv)
     channel = thread_ts = None
     if args.permalink:
-        from .permalink import parse_slack_permalink
-
         channel, thread_ts = parse_slack_permalink(args.permalink)
     try:
         config = ConnectorConfig.from_env(

@@ -167,7 +167,8 @@ def _kill_probe(pid: int) -> Optional[bool]:
         return False
     except PermissionError:
         return None
-    except OSError:
+    except (OSError, OverflowError):
+        # OverflowError: a pid past pid_t (2**31 and up) names no process.
         return False
     return True
 

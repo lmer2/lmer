@@ -5,12 +5,13 @@ import subprocess
 import pytest
 
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import CLI
 from work_repo import git_ops, memory
 
 
 def git(repo, *args, check=True):
     result = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, timeout=15
+        ["git", *args], cwd=repo, capture_output=True, text=True, timeout=CLI
     )
     if check:
         assert result.returncode == 0, result.stdout + result.stderr

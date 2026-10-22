@@ -319,7 +319,7 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, runs, stall, statusline,
+    ask, assistant, checkin, comms, nudge, registry, rotation, runs, stall, statusline,
     teardown, transcripts,
 )
 from .api import build_state
@@ -1177,8 +1177,6 @@ def new_signals() -> list:
 
 def _comms_hub():
     """The running comms hub, if the daemon started one (issue #407)."""
-    from . import comms
-
     return comms.get_hub()
 
 

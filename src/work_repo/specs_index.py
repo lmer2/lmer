@@ -172,7 +172,7 @@ def run_label(rdir: Path, state: Optional[dict] = None) -> str:
     old name was `2026-08-25-develop-issue-101--spec.md`. A long name that
     names one record beats a short one that hides another.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     if state is None:
         state = run_state._read_sibling_state(rdir)
     label = None
@@ -213,7 +213,7 @@ def _record_session_id(area_rel_name: str) -> Optional[str]:
     old directory is gone by the time it runs — the name is all that is left
     to spell it with.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     parts = [part for part in str(area_rel_name).split("/") if part]
     if len(parts) < 2:
         return None
@@ -373,7 +373,8 @@ def repoint_run_dir_entries(
     re-registered is kept (and warned about) rather than silently dropped.
     """
     try:
-        from . import run_state  # local: run_state imports this module
+        # deferred: cycle — work_repo.run_state imports this module at top; inside the fail-soft try, so a failed import only warns
+        from . import run_state
         if project_dir is not None:
             project_dir = Path(project_dir)
         if specs_directory is not None:
@@ -502,7 +503,7 @@ def _registration_when(rdir: Path, name: str, canonical: Path) -> Optional[datet
     """Best-effort registration time for a backfilled entry: the first
     `artifact_written` event for `name`, else the canonical file's mtime
     (fail-soft to None → "today", the least-wrong remaining answer)."""
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     try:
         for event in run_state.read_events(rdir, last_n=0):
             if event.get("type") == "artifact_written" and event.get("note") == name:
@@ -542,7 +543,7 @@ def rebuild() -> list[Path]:
     grouping level — and a second, form-dependent rule here is exactly the
     drift the shared walk exists to prevent.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     sdir = specs_dir()
     if sdir is None:
         return []

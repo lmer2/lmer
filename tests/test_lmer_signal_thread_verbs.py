@@ -24,6 +24,7 @@ import pytest
 from ask_channel import bus, signal_cli
 from lmer_cli import comms, supervisor, thread_access
 from lmer_cli.thread_access import ThreadServicer, UploadStore
+from slack_chat.client import SlackError
 from tests.conftest import strip_lmer_env
 from tests.connector_fakes import isolated_connectors
 from tests.test_lmer_thread_access import SLACK_ENV, SLACK_LINK, FakeSlack
@@ -312,6 +313,34 @@ class TestPostIntoAThread:
             rig.stop()
         assert "📎 review.md" in rig.slack.posted[0][2]
         assert rig.records()[0].attachments[0]["name"] == "review.md"
+
+
+    def test_a_withheld_attachment_is_named_to_the_caller(self, tmp_path, monkeypatch, capsys):
+        """#544 item 16: the thread gets a note in its place, and so does the
+        run that sent it — by name and reason, not just "posted"."""
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        (tmp_path / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        monkeypatch.setenv("LMER_UPLOADS_DIR", str(uploads))
+        rig = Rig(
+            tmp_path, monkeypatch,
+            store=UploadStore(host_dir=str(uploads), container_dir=str(uploads)),
+        )
+
+        def no_scope(*args, **kwargs):
+            raise SlackError("missing_scope", code="missing_scope")
+
+        rig.slack.upload_external = no_scope
+        rig.serve()
+        try:
+            assert run([
+                "post", "the review", "--thread", SLACK_LINK,
+                "--attach", str(tmp_path / "chart.png"),
+            ]) == 0
+        finally:
+            rig.stop()
+        err = capsys.readouterr().err
+        assert f"📎 chart.png was not sent: {thread_access.WITHHELD_SLACK_SCOPE}" in err
 
 
 class _Connections:

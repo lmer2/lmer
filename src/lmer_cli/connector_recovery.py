@@ -11,7 +11,9 @@ import time
 import uuid
 
 from ask_channel import bus
+from slack_chat.client import strip_run_references
 
+from . import thread_access
 from .connector_delivery import RecoveryRequired, checkpoint_path, claim_receipt, digest, marker_path, receipt_path
 from .connector_ownership import Lease, ThreadKey, read_json, sync_directory, write_json
 from .threads import parse_thread
@@ -21,8 +23,6 @@ AUTOMATIC_RETRY_LIMIT = 1
 
 
 def _slack_text(text):
-    from slack_chat.client import strip_run_references
-
     text = html.unescape(strip_run_references(text))
     return re.sub(r"<(https?://[^>|]+)(?:\|[^>]+)?>", r"\1", text)
 
@@ -232,9 +232,7 @@ def main(argv=None):
         remote = None
         sender = None
         if ref.channel == "matrix" and conversation.startswith("#"):
-            from .thread_access import _matrix_client, matrix_account
-
-            remote = _matrix_client(matrix_account())
+            remote = thread_access._matrix_client(thread_access.matrix_account())
             conversation = remote.resolve_room(conversation)
         key = ThreadKey(ref.channel, conversation, root)
         lease = Lease.acquire(key, owner="recovery")
@@ -251,13 +249,11 @@ def main(argv=None):
                                     accept_duplicate=args.accept_possible_duplicate)
         else:
             if args.remote_ref:
-                from .thread_access import _matrix_client, _slack_client, matrix_account, slack_token
-
                 if key.transport == "slack":
-                    remote = _slack_client(slack_token())
+                    remote = thread_access._slack_client(thread_access.slack_token())
                 else:
-                    account = matrix_account()
-                    remote = remote or _matrix_client(account)
+                    account = thread_access.matrix_account()
+                    remote = remote or thread_access._matrix_client(account)
                     sender = account.user_id
             result = recovery.receipt(args.operation, client, remote_ref=args.remote_ref,
                                       remote=remote, sender=sender)

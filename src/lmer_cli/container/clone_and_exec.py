@@ -442,6 +442,7 @@ def _import_yaml():
     interpreters that lack it (host-side test runs, older images).
     """
     try:
+        # deferred: optional dependency — yaml may be absent from the container interpreter
         import yaml  # type: ignore[import-not-found]
     except ImportError:
         return None
@@ -546,8 +547,7 @@ def _read_manifest_sources_tier(work_repo_path: Path) -> "tuple[int, object | No
     if not (manifest_path.is_symlink() or manifest_path.exists()):
         return 0, None
     try:
-        # Guarded and lazy, like PyYAML above and the placement code's import:
-        # reached only once a manifest is known to be present.
+        # deferred: optional dependency — only a present manifest needs the core, which this standalone script may lack
         from lmer_schema.manifest import ManifestError, load_manifest
     except ImportError as exc:
         print(
@@ -2040,13 +2040,47 @@ def _gitlab_token_issuing_host() -> str | None:
     return _host_from_git_url(os.environ.get("LMER_WORK_REPO", ""))
 
 
+def _sanitize_hostname(host: str) -> str:
+    """Environment variable suffix for ``host``: lowercased, each hyphen
+    turned into ``__`` and each dot into ``_``, so no two valid hostnames
+    share one (#544). Standalone copy of the tokens.py helper.
+    """
+    return host.lower().replace("-", "__").replace(".", "_")
+
+
+def _legacy_sanitize_hostname(host: str) -> str:
+    """The pre-#544 suffix (dots and hyphens both ``_``), recognised only to
+    refuse it. Standalone copy of the tokens.py helper."""
+    return re.sub(r"[.\-]", "_", host.lower())
+
+
+def _per_host_env(prefix: str, host: str) -> str | None:
+    """Read ``<prefix><sanitized host>``, refusing a hyphenated host's old
+    name, which the dotted lookalike host shares. Standalone copy of the
+    tokens.py helper, notice text included.
+    """
+    name = prefix + _sanitize_hostname(host)
+    value = os.environ.get(name)
+    if value:
+        return value
+    legacy = prefix + _legacy_sanitize_hostname(host)
+    if legacy != name and os.environ.get(legacy):
+        _warn_once(
+            f"⚠️  {legacy} not used for {host}: that name now means "
+            f"{host.lower().replace('-', '.')} only — if it holds the token "
+            f"for {host}, rename it to {name}"
+        )
+    return None
+
+
 def _get_gitlab_token(host: str) -> str | None:
     """
     Look up an API token for ``host`` from environment variables.
 
     Despite the name, supports both GitLab and GitHub hosts. Lookup:
       1. ``GITLAB_TOKEN_{sanitized_host}`` — host-specific (provider-agnostic
-         in practice; the prefix is historical)
+         in practice; the prefix is historical). A hyphenated host's pre-#544
+         name is refused, see :func:`_per_host_env`.
       2. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
          ``GITHUB_TOKEN``
       3. ``GITLAB_TOKEN`` — generic fallback, but only for the host that
@@ -2063,8 +2097,8 @@ def _get_gitlab_token(host: str) -> str | None:
     ``LMER_WORK_REPO`` before the container starts. Keep this in sync with
     tokens.py for the host-shared behavior.
     """
-    suffix = re.sub(r"[.\-]", "_", host.lower())
-    token = os.environ.get(f"GITLAB_TOKEN_{suffix}")
+    suffix = _sanitize_hostname(host)
+    token = _per_host_env("GITLAB_TOKEN_", host)
     if token:
         return token
 
@@ -2351,9 +2385,8 @@ def _resolve_work_repo_placement(
         return WorkRepoPlacement(schema=False, base=legacy_base, problem=None)
 
     try:
-        # Guarded and lazy, like PyYAML above: reached only once a manifest is
-        # known to be present, so a legacy tree never imports the core, and an
-        # lmer built without it degrades instead of dying at container start.
+        # An lmer built without the core degrades instead of dying at container start.
+        # deferred: optional dependency — only a present manifest needs the core, so a legacy tree never imports it
         from lmer_schema.form import Form, detect_form
         from lmer_schema.manifest import ManifestError, load_manifest
         from lmer_schema.registry import (
@@ -2672,9 +2705,11 @@ def _is_self_dev_workspace(workspace: Path) -> bool:
     if not pyproject.is_file():
         return False
     try:
+        # deferred: optional dependency — stdlib only from Python 3.11; read only when pyproject.toml exists
         import tomllib  # type: ignore[import-not-found]
     except ImportError:
         try:
+            # deferred: optional dependency — the tomli backport, for an older container interpreter that has it
             import tomli as tomllib  # type: ignore[no-redef,import-not-found]
         except ImportError:
             return False
@@ -3269,6 +3304,7 @@ def mint_session_id(*, fresh: bool = False) -> None:
     A host-injected id is preserved the same way (setdefault).
     """
     if fresh:
+        # deferred: optional dependency — only a fresh mint needs it; this standalone script may lack work_repo
         from work_repo.session_record import start_launch
 
         start_launch()
@@ -3298,6 +3334,7 @@ def _launch_uid_names_a_record(uid: str) -> bool:
     (``run_state._record_scan``), the same walk ``_record_address`` adopts by,
     so a record it cannot see is one this launch could not adopt either.
     """
+    # deferred: optional dependency — standalone container entrypoint; work_repo may not be importable here
     from work_repo import run_state
 
     base = run_state.runs_base()
@@ -3504,6 +3541,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = work_repo_path / PLEXUS_MANIFEST_NAME
     if manifest.exists() or manifest.is_symlink():
         try:
+            # deferred: optional dependency — only a work repo with a manifest needs it; this standalone script may lack work_repo
             from work_repo.session_record import schema_version
 
             process_records = schema_version(work_repo_path) >= 2
@@ -3561,6 +3599,7 @@ def main(argv: list[str] | None = None) -> int:
     task_type = os.environ.get("LMER_TASK")
     task_target = os.environ.get("LMER_TASK_TARGET")
     if process_records:
+        # deferred: optional dependency — only a schema-2 launch needs it; this standalone script may lack work_repo
         from work_repo import run_state
 
         try:

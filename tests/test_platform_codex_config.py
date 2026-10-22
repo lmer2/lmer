@@ -16,9 +16,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lmer_cli.cli import parse_dir_mount_specs
+from lmer_cli.env_sources import DEFAULT_SOURCES_ENV, _digest
+from lmer_cli.harness import CODEX_SEED_ERROR_ENV
 from lmer_platform import api, assistant, codex_config, config as cfg, registry, spawn, store
 from tests.conftest import strip_lmer_env
 from tests.test_harness_runners import run_harness_runner
+from tests.test_preset_cli import _run_main
 
 ROOT = Path(__file__).resolve().parents[1]
 DESTINATION = '/home/developer/.codex'
@@ -31,22 +34,24 @@ def launch(tmp_path, monkeypatch):
     monkeypatch.setattr(assistant, '_require_taskdef', lambda: None)
     argv_file = tmp_path / 'argv.json'
     binary = tmp_path / 'lmer'
-    binary.write_text(f'#!{sys.executable}\nimport json,sys\n'
-                      f'open({str(argv_file)!r}, "w").write(json.dumps(sys.argv))\n')
+    binary.write_text(f'#!{sys.executable}\nimport json,os,sys\n'
+                      f'open({str(argv_file)!r}, "w").write(json.dumps('
+                      f'[sys.argv, os.environ.get({CODEX_SEED_ERROR_ENV!r})]))\n')
     binary.chmod(0o700)
     config = cfg.load({'lmer_bin': str(binary)})
 
-    def start(kind='worker', target='455', untracked=False):
+    def start(kind='worker', target='455', untracked=False, harness='codex', **fields):
         if kind == 'assistant':
-            result = assistant.start(config, settings={'harness': 'codex'})
+            result = assistant.start(config, settings={'harness': harness} if harness else {})
         else:
             result = spawn.spawn_session(config, spawn.SpawnRequest(
-                taskdef='develop', harness='codex',
+                taskdef='develop', harness=harness,
                 target='.' if untracked else f'https://gitlab.example.com/group/project/-/work_items/{target}',
-                no_repo=untracked,
+                no_repo=untracked, **fields,
             ))
         assert spawn.wait_for_exit_recorded(result.session_id, timeout=30)
-        command = json.loads(argv_file.read_text())
+        command, start.seed_error = json.loads(argv_file.read_text())
+        start.argv = command
         specs = [command[i + 1] for i, arg in enumerate(command) if arg == '--mount-dir']
         specs = [spec for spec in specs if spec.split(':')[1] == DESTINATION]
         matching = parse_dir_mount_specs(specs, '')
@@ -433,10 +438,68 @@ def test_host_seed_is_only_copied_into_a_new_scope(launch, tmp_path, monkeypatch
     assert (new_scope / 'config.toml').read_bytes() == seed.read_bytes()
 
 
-def test_an_unreadable_configured_seed_refuses_launch(launch, tmp_path, monkeypatch):
-    monkeypatch.setenv(codex_config.SEED_ENV, str(tmp_path / 'missing.toml'))
-    with pytest.raises(spawn.SpawnError, match='cannot prepare persistent Codex configuration'):
-        launch()
+@pytest.mark.parametrize('harness', ['codex', ' Codex '])
+@pytest.mark.parametrize('kind', ['worker', 'assistant'])
+def test_an_unreadable_configured_seed_refuses_a_requested_codex_launch_naming_it(
+        launch, tmp_path, monkeypatch, kind, harness):
+    """A request that names codex runs codex whatever the child's preset says
+    (the flag outranks it), so the daemon refuses before anything starts."""
+    missing = tmp_path / 'missing.toml'
+    monkeypatch.setenv(codex_config.SEED_ENV, str(missing))
+    with pytest.raises(spawn.SpawnError, match='cannot prepare persistent Codex configuration') as refused:
+        launch(kind=kind, harness=harness)
+    assert codex_config.SEED_ENV in str(refused.value)
+    assert str(missing) in str(refused.value)
+
+
+_CHILD_RESOLVES = {
+    'claude': ('claude', {}, {}),
+    'default': (None, {}, {}),
+    'inherited-harness': (None, {}, {'LMER_HARNESS': 'codex'}),
+    'inherited-model': (None, {}, {'LMER_LLM_NAME': 'gpt-5.2'}),
+    'requested-harness-over-inherited': ('claude', {}, {'LMER_HARNESS': 'codex'}),
+}
+# An assistant launch takes no preset or model from the request.
+_WORKER_ONLY = {
+    'requested-model': (None, {'model': 'gpt-5.2'}, {}),
+    'inherited-harness-with-preset': (None, {'preset': 'reviewer'}, {'LMER_HARNESS': 'codex'}),
+}
+
+
+@pytest.mark.parametrize('kind, harness, fields, env', [
+    pytest.param(kind, *case, id=f'{kind}-{name}')
+    for kind in ('worker', 'assistant') for name, case in _CHILD_RESOLVES.items()
+] + [pytest.param('worker', *case, id=f'worker-{name}') for name, case in _WORKER_ONLY.items()])
+def test_a_launch_the_child_resolves_starts_and_carries_the_unreadable_seed(
+        launch, tmp_path, monkeypatch, caplog, kind, harness, fields, env):
+    """#544 item 7, !422 review: only the child knows its harness once its preset,
+    model aliases and .env files are applied. So the daemon starts it without the
+    seed and hands it the reason; test_the_child_refuses_only_when_it_resolves_codex
+    covers what the child then does."""
+    missing = tmp_path / 'missing.toml'
+    monkeypatch.setenv(codex_config.SEED_ENV, str(missing))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    caplog.set_level('WARNING', logger=codex_config.logger.name)
+    durable = launch(kind=kind, harness=harness, **fields)
+    assert not (durable / 'config.toml').exists()
+    [warning] = [r for r in caplog.records if 'codex_config_seed_skipped' in r.getMessage()]
+    assert str(missing) in warning.getMessage()
+    assert codex_config.SEED_ENV in launch.seed_error
+    assert str(missing) in launch.seed_error
+    if fields.get('preset'):
+        assert launch.argv[launch.argv.index('--preset') + 1] == fields['preset']
+
+
+def test_a_readable_seed_hands_the_child_a_blank_error(launch, tmp_path, monkeypatch):
+    """Blank, not absent, so a stale value in the child's .env cannot fill it."""
+    seed = tmp_path / 'seed.toml'
+    seed.write_text('personality="pragmatic"\n')
+    monkeypatch.setenv(codex_config.SEED_ENV, str(seed))
+    launch(harness=None)
+    assert launch.seed_error == ''
+    launch(harness=None, target='456')
+    assert launch.seed_error == ''
 
 
 def test_model_and_effort_launch_overrides_do_not_change_saved_config(launch, tmp_path):
@@ -456,3 +519,66 @@ def test_model_and_effort_launch_overrides_do_not_change_saved_config(launch, tm
     assert argv[argv.index('--model') + 1] == 'launch-model'
     assert 'model_reasoning_effort=high' in argv
     assert target.read_bytes() == saved
+
+
+def _child_main(tmp_path, argv, env, presets=None):
+    """The real ``lmer`` entry point the daemon spawns, with the runtime mocked."""
+    if presets is not None:
+        path = tmp_path / 'presets.json'
+        path.write_text(json.dumps(presets))
+        env = {**env, 'LMER_PRESETS_FILE': str(path)}
+    captured = {}
+    home = tmp_path / 'home'
+    home.mkdir(exist_ok=True)
+    rc = _run_main(argv, env_in=env, captured_env=captured, home=home)
+    return rc, captured
+
+
+_SEED_REASON = f'{codex_config.SEED_ENV} names /absent/seed.toml, which cannot be read (No such file or directory)'
+_CHILD_ARGV = ['--no-task', '--exec', 'true', 'git@github.com:owner/repo.git']
+
+
+def _daemon_default(name, value):
+    """``name=value`` as the daemon's own .env default, which a preset's env may replace."""
+    return {name: value, DEFAULT_SOURCES_ENV: json.dumps({name: ['daemon .env', _digest(value)]})}
+
+
+@pytest.mark.parametrize('argv, env, presets, refused', [
+    pytest.param(['--preset', 'claude-args'], {'LMER_HARNESS': 'codex'},
+                 {'claude-args': {'args': ['--harness', 'claude']}}, False,
+                 id='inherited-codex-preset-args-pick-claude'),
+    pytest.param(['--preset', 'claude-env'], _daemon_default('LMER_HARNESS', 'codex'),
+                 {'claude-env': {'env': {'LMER_HARNESS': 'claude'}}}, False,
+                 id='inherited-codex-default-preset-env-picks-claude'),
+    pytest.param([], {'LMER_HARNESS': 'codex'}, None, True, id='inherited-codex'),
+    pytest.param(['--preset', 'codex-env'], {},
+                 {'codex-env': {'env': {'LMER_HARNESS': 'codex'}}}, True, id='preset-picks-codex'),
+    pytest.param([], {'LMER_LLM_NAME': 'gpt-5.2'}, None, True, id='model-hint-codex'),
+    pytest.param([], {}, None, False, id='default-claude'),
+])
+def test_the_child_refuses_only_when_it_resolves_codex(tmp_path, capsys, argv, env, presets, refused):
+    """!422 review: an inherited LMER_HARNESS=codex plus a preset choosing claude
+    runs claude, so the unreadable seed must not refuse it; the same child with
+    codex as its final harness must."""
+    rc, captured = _child_main(
+        tmp_path, [*argv, *_CHILD_ARGV], {**env, CODEX_SEED_ERROR_ENV: _SEED_REASON}, presets,
+    )
+    out = capsys.readouterr()
+    if refused:
+        assert rc == 2
+        assert _SEED_REASON in out.out + out.err
+        assert 'resolved the codex harness' in out.out + out.err
+    else:
+        assert rc == 0, out.out + out.err
+        assert captured['LMER_HARNESS'] == 'claude'
+        assert CODEX_SEED_ERROR_ENV not in captured
+        assert _SEED_REASON not in out.out + out.err
+
+
+def test_a_blank_seed_error_never_refuses_codex(tmp_path, capsys):
+    rc, captured = _child_main(
+        tmp_path, _CHILD_ARGV, {'LMER_HARNESS': 'codex', CODEX_SEED_ERROR_ENV: ''},
+    )
+    assert rc == 0, capsys.readouterr()
+    assert captured['LMER_HARNESS'] == 'codex'
+    assert CODEX_SEED_ERROR_ENV not in captured

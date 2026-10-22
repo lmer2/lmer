@@ -97,6 +97,9 @@ from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
 from lmer_cli.comms import DEFAULT_TERMINAL_CONFIRM_SECONDS, TERMINAL_CONFIRM_ENV
 from lmer_cli.comms import ASSISTANT_NAME_ENV, DEFAULT_ASSISTANT_NAME, MAX_ASSISTANT_NAME_CHARS
+from lmer_cli import harness as lmer_harness
+from lmer_cli.presets import load_presets, resolve_agent_presets
+from lmer_cli.user_harnesses import refresh_user_harnesses
 
 # Module level, deliberately: this used to be a function-local import explained as
 # laziness for importability, which defended a cycle that does not exist —
@@ -1141,13 +1144,8 @@ def _authority_names(kind: str) -> Optional[set]:
     """
     try:
         if kind == "harness":
-            from lmer_cli.harness import known_harnesses
-            from lmer_cli.user_harnesses import refresh_user_harnesses
-
             refresh_user_harnesses()
-            return set(known_harnesses())
-        from lmer_cli.presets import load_presets
-
+            return set(lmer_harness.known_harnesses())
         return set(load_presets())
     except Exception as exc:  # noqa: BLE001 - validation must not break a start
         logger.warning(
@@ -1226,9 +1224,6 @@ def _agents_selection_reason(selection: str) -> Optional[str]:
     :func:`_authority_names`.
     """
     try:
-        from lmer_cli.presets import load_presets, resolve_agent_presets
-        from lmer_cli.user_harnesses import refresh_user_harnesses
-
         refresh_user_harnesses()
         _resolved, warnings, error = resolve_agent_presets(
             selection, load_presets()

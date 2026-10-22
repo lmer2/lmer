@@ -887,16 +887,22 @@ function absorb(page, mode = 'append') {
     // is, and history can be renumbered by a transcript file that appeared late.
     cursor = page.cursor
   }
-  total.value = page.total
-  sessions.value = page.sessions || []
-  note.value = page.note || null
-  live.value = !!page.live
+  // What the end looks like is the end's to say. An older page describes it as it
+  // was when that page was asked for, and a poll may have moved past that since —
+  // a session that exited while the page was in flight came back live.
+  if (mode !== 'prepend') {
+    total.value = page.total
+    sessions.value = page.sessions || []
+    note.value = page.note || null
+    live.value = !!page.live
+  }
   settlePending()
   if (follow) nextTick(stickToBottom)
 }
 
 // `older`: a `before` page. Its `total` was read when it was requested and can
-// predate what polling has since seen, so it must not move the tail cursor.
+// predate what polling has since seen, so it must not move the tail cursor — nor
+// say whether the session is live, for the same reason.
 function absorbHistory(page, { older = false } = {}) {
   const conversation = page.history?.conversation
   if (historyConversation && conversation !== historyConversation) {
@@ -917,8 +923,10 @@ function absorbHistory(page, { older = false } = {}) {
   sessions.value = [...sources.values()]
   if (page.session === props.sessionId) {
     cursor = historyGenerations.value.get(page.session).cursor
-    live.value = !!page.live
-    note.value = page.note || null
+    if (!older) {
+      live.value = !!page.live
+      note.value = page.note || null
+    }
   }
   total.value = messages.value.length
   settlePending()
@@ -944,7 +952,10 @@ async function loadRecentHistory(mine) {
 }
 
 async function poll() {
-  if (polling) return
+  // Not while `start()` is still reading the tail. The cursor is 0 until that
+  // read lands, so a poll now reads from the head of the conversation rather than
+  // its end, and the tail landing after it would rewind whatever it had advanced.
+  if (polling || phase.value === 'loading') return
   const mine = generation
   polling = true
   try {

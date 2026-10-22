@@ -478,9 +478,10 @@ Channels are given as:
 
 - **Slack**: a channel ID (`C…`/`G…`), a channel or message link
   (`https://<workspace>.slack.com/archives/C…[/p…]`, `https://app.slack.com/client/T…/C…`),
-  or `#name`. A `#name` is resolved with `conversations.list`, which needs the bot
-  token's `channels:read`/`groups:read` scopes; without them the name is refused
-  with a request for the ID or a link. DM conversations (`D…`) are refused.
+  or `#name`. A `#name` is resolved with one `conversations.list` call over public
+  and private channels, which needs both of the bot token's `channels:read` and
+  `groups:read` scopes; without them the name is refused with a request for the
+  ID or a link. DM conversations (`D…`) are refused.
 - **Matrix**: a room ID (`!room:server`), an alias (`#alias:server`, resolved
   through the room directory), or a `https://matrix.to/#/…` or Element
   `https://<host>/#/room/…` link to either.

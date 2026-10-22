@@ -39,6 +39,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from lmer_cli.cli import default_env_file_candidates
+from lmer_cli.connector_ownership import same_process
 from lmer_cli.presets import (
     PRESETS_FILE_ENV,
     Preset,
@@ -47,6 +49,7 @@ from lmer_cli.presets import (
     select_preset_name,
 )
 
+from . import registry
 from .connector import ATTACH_ACK_ENV
 
 logger = logging.getLogger("lmer_slack.sessions")
@@ -278,10 +281,6 @@ class SessionManager:
         from the CLI's own builder so the list here cannot drift from the list
         the child actually reads.
         """
-        # Imported lazily: the CLI module is the whole lmer entry point, and
-        # the listener should not pay for it just to import this one.
-        from lmer_cli.cli import default_env_file_candidates
-
         candidates: list[tuple[str, Path]] = []
         if self.lmer_env_file:
             explicit = Path(self.lmer_env_file).expanduser()
@@ -755,10 +754,7 @@ class SessionManager:
                     await on_idle_disconnect(session)
 
     def _refresh_bus_activity(self, session: Session) -> None:
-        from lmer_cli.connector_ownership import same_process
-        from .registry import thread_holder
-
-        owner = thread_holder(*session.key, kind=self.transport) or {}
+        owner = registry.thread_holder(*session.key, kind=self.transport) or {}
         activity = owner.get("activity_at")
         if (type(activity) not in (int, float) or not math.isfinite(activity)
                 or not session.last_activity < activity <= time.monotonic()

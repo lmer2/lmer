@@ -9,7 +9,7 @@ from dataclasses import dataclass
 # The token lookup rule, not a second copy of it — see _resolve_token.
 # lmer_cli.tokens is stdlib-only and bin/gitlab-review puts src/ on
 # PYTHONPATH, so the import costs nothing and always resolves.
-from lmer_cli.tokens import _get_gitlab_token
+from lmer_cli.tokens import _get_gitlab_token, _sanitize_hostname
 
 
 DEFAULT_PAGE_SIZE = 20
@@ -65,8 +65,7 @@ class GitLabClient:
         self.token = token or self._resolve_token(self.host)
 
         if not self.token:
-            import re
-            suffix = re.sub(r"[.\-]", "_", self.host.lower())
+            suffix = _sanitize_hostname(self.host)
             raise GitLabError(
                 f"GitLab token required. Set GITLAB_TOKEN_{suffix} (always applies "
                 "to this host) or pass token parameter; a generic GITLAB_TOKEN is "

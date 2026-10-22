@@ -210,13 +210,24 @@ GitHub-host detection covers `github.com`, `*.github.com`, and `*.ghe.com` (GitH
 
 ### Host Suffix Resolution
 
-The `{suffix}` is the sanitized hostname: lowercase with dots and hyphens replaced by underscores.
+The `{suffix}` is the sanitized hostname: lowercase, with each dot replaced by `_` and each hyphen by `__`. Hostnames contain no underscores and no empty labels, so no two hosts share a suffix. The same rule names `GH_TOKEN_<suffix>` (github-review) and `LMER_CI_BASELINE_TOKEN_<suffix>` (the CI baseline).
 
 | Host | Suffix | Environment Variable |
 |---|---|---|
 | `git.example.com` | `git_example_com` | `GITLAB_TOKEN_git_example_com` |
+| `git-example.com` | `git__example_com` | `GITLAB_TOKEN_git__example_com` |
 | `gitlab.myorg.com` | `gitlab_myorg_com` | `GITLAB_TOKEN_gitlab_myorg_com` |
 | `github.com` | `github_com` | `GITLAB_TOKEN_github_com` |
+
+Hyphens used to become a single `_`, so `git-example.com` read `GITLAB_TOKEN_git_example_com`, the variable set for `git.example.com`, and was sent that host's token. A hyphenated host's old name is now refused, never read, with a one-time stderr notice:
+
+```
+⚠️  GITLAB_TOKEN_git_example_com not used for git-example.com: that name now means git.example.com only — if it holds the token for git-example.com, rename it to GITLAB_TOKEN_git__example_com
+```
+
+Names of hosts without hyphens are unchanged.
+
+Rename, don't just add: until the old variable is deleted it still names `git.example.com`, so a token stored there for `git-example.com` is sent to `git.example.com` whenever lmer talks to that host.
 
 ### Example .env Configuration
 
@@ -355,7 +366,7 @@ curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
 #### Wrong Token Used
 
 If the wrong token is being used, check:
-1. The sanitized hostname suffix (dots/hyphens become underscores).
+1. The sanitized hostname suffix (dots become `_`, hyphens `__`).
 2. Whether you intended a work-repo lookup but the work-repo token vars aren't set.
 
 #### The Generic `GITLAB_TOKEN` Was Refused

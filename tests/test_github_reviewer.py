@@ -58,9 +58,12 @@ def test_resolve_token_returns_none_when_nothing_set(monkeypatch):
     assert gh_cli._resolve_token("github.com") is None
 
 
-def test_sanitize_hostname():
-    assert gh_cli._sanitize_hostname("github.com") == "github_com"
-    assert gh_cli._sanitize_hostname("Git.Example-Org.Com") == "git_example_org_com"
+def test_resolve_token_hyphenated_host_name(monkeypatch):
+    """Hyphens become ``__`` in the per-host name (#544)."""
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN_git_example__org_com", "for-hyphen-host")
+    assert gh_cli._resolve_token("Git.Example-Org.Com") == "for-hyphen-host"
 
 
 # ---------------------------------------------------------------------------

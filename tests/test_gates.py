@@ -24,6 +24,7 @@ from lmer_cli.gates import (
     CheckStatus,
     CheckResult,
     Colors,
+    SUITE_IGNORE_ARGS,
     TEST_MODE_LABEL_MAX,
     TEST_MODE_MARKER,
     runner_mode_label,
@@ -192,6 +193,28 @@ class TestGateSystem:
         # Full output is captured for the log even on success.
         assert result.full_output is not None
         assert "5 passed in 0.5s" in result.full_output
+
+    @patch('subprocess.run')
+    def test_check_tests_runs_the_shared_interpreter_and_ignore_list(self, mock_run):
+        """The interpreter comes from _interpreter_candidates, the smoke
+        check's source too, and the ignores from SUITE_IGNORE_ARGS (#544)."""
+        runs = []
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0 if cmd[0] == "sentinel-python" else 1,
+                                 stdout="", stderr="")
+            runs.append(cmd)
+            return MagicMock(returncode=0, stdout="5 passed in 0.5s", stderr="")
+
+        mock_run.side_effect = side_effect
+        with patch.object(self.gate, "_interpreter_candidates",
+                          return_value=["unusable-python", "sentinel-python"]):
+            self.gate.check_tests()
+        [run] = [cmd for cmd in runs if self._is_pytest_run(cmd)]
+        assert run[0] == "sentinel-python"
+        for arg in SUITE_IGNORE_ARGS:
+            assert arg in run
 
     @patch('subprocess.run')
     def test_check_tests_fail(self, mock_run):

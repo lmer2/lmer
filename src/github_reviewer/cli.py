@@ -16,10 +16,14 @@ no value in re-wrapping it.
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+# The per-host naming rule, not a second copy of it. lmer_cli.tokens is
+# stdlib-only and bin/github-review puts src/ on PYTHONPATH, as for
+# gitlab_reviewer, so the import costs nothing and always resolves.
+from lmer_cli.tokens import _per_host_env
 
 
 class GitHubError(Exception):
@@ -32,11 +36,6 @@ DEFAULT_PAGE_SIZE = 20
 DEFAULT_MAX_PAGES = 25
 
 
-def _sanitize_hostname(host: str) -> str:
-    """Convert hostname to env var suffix (lowercase, dots/hyphens -> _)."""
-    return re.sub(r"[.\-]", "_", host.lower())
-
-
 def _resolve_token(host: str, explicit: Optional[str] = None) -> Optional[str]:
     """Look up a GitHub token for ``host`` from the environment.
 
@@ -44,7 +43,8 @@ def _resolve_token(host: str, explicit: Optional[str] = None) -> Optional[str]:
       1. ``--token`` explicit override
       2. ``GH_TOKEN_<sanitized_host>`` — host-specific (parity with the
          ``GITLAB_TOKEN_<host>`` convention; lets one process talk to
-         github.com and a GHE host simultaneously)
+         github.com and a GHE host simultaneously; a hyphenated host's
+         pre-#544 name is refused, as for ``GITLAB_TOKEN_<host>``)
       3. ``GH_TOKEN`` — gh's own preferred env var
       4. ``GITHUB_TOKEN`` — Actions-style fallback
 
@@ -55,8 +55,7 @@ def _resolve_token(host: str, explicit: Optional[str] = None) -> Optional[str]:
     if explicit:
         return explicit
 
-    suffix = _sanitize_hostname(host)
-    token = os.environ.get(f"GH_TOKEN_{suffix}")
+    token = _per_host_env("GH_TOKEN_", host)
     if token:
         return token
 

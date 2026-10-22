@@ -33,6 +33,7 @@ import sys
 from lmer_cli import dm_access
 from lmer_cli import assistant_mentions
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
+from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
@@ -85,11 +86,8 @@ def _load_env_files() -> None:
     Precedence, highest first: the active environment, the cwd ``.env``, then
     ``~/.lmer/.env``. Implemented once in ``lmer_cli.runtime`` (issue #67);
     ``references_from_environ=True`` keeps this caller's pre-#67 resolution of
-    ``${VAR}`` references inside a file. Imported late because ``lmer_cli.cli``
-    imports ``slack_chat``.
+    ``${VAR}`` references inside a file.
     """
-    from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
-
     loaded = apply_env_file_defaults(
         default_env_file_candidates(), references_from_environ=True
     )
@@ -125,6 +123,7 @@ def build_app(token: str | None = None):
     Slack token. Stores the app on the module global ``app`` and returns it.
     """
     global app
+    # deferred: import cost — slack_bolt + aiohttp add ~310 ms, paid only when build_app creates the app
     from slack_bolt.async_app import AsyncApp
 
     app = AsyncApp(token=token or os.environ.get("SLACK_BOT_TOKEN"))
@@ -536,6 +535,7 @@ async def _forward_assistant(channel: str, event: dict) -> None:
 
 async def _run() -> None:
     """Build the app, start the reaper, and run socket mode until stopped."""
+    # deferred: import cost — slack_bolt + aiohttp adds ~320 ms
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
     app_token = os.environ.get("SLACK_APP_TOKEN")

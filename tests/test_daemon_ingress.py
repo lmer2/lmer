@@ -276,11 +276,13 @@ async def test_shutdown_cancels_sdk_reconnect_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close", ["clean", "raises"])
 @pytest.mark.parametrize("owner", ["callback", "loop"])
-async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, owner):
+async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, owner, close):
     """The socket callback and the supervise loop's 1s replay race for a stored
-    event (#524); each case pins one winner. Only a callback-owned admission lets
-    the socket close first, because the loop is the task shutdown cancels."""
+    event (#524); each case pins one winner. Either way the socket closes before
+    the admission is released, and shutdown still waits for it, even when the
+    close itself raises (!422 review)."""
     component = manager(monkeypatch)
     entered, release, admitted = threading.Event(), threading.Event(), threading.Event()
     replayer = contextvars.ContextVar("replayer", default=None)
@@ -314,15 +316,19 @@ async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, o
     finished_after_admission = []
     try:
         await until(lambda: component.snapshot()["slack"]["up"])
+        if close == "raises":
+            socket = fake_socket[0][0]
+            clean_close = socket.close
+
+            async def failing_close():
+                await clean_close()
+                raise ConnectionResetError("injected close failure")
+            socket.close = failing_close
         event = callback["task"] = asyncio.create_task(fake_socket[0][0].emit(slack_event()))
         await until(entered.is_set)
         stopping = asyncio.create_task(lifetime.__aexit__(None, None, None))
         stopping.add_done_callback(lambda _: finished_after_admission.append(admitted.is_set()))
-        if owner == "callback":
-            await until(lambda: fake_socket[0][0].closed)
-        else:
-            await until(lambda: stopping.done()
-                        or any(task.cancelling() for task in component._tasks))
+        await until(lambda: fake_socket[0][0].closed)
         assert not stopping.done()
         release.set()
         await asyncio.wait_for(stopping, 5)

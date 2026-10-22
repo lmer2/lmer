@@ -28,7 +28,7 @@ from lmer_cli.thread_posts import Poster
 from lmer_cli.threads import ThreadError
 
 from . import config as cfg
-from . import connectors, meta, projects, registry, runs
+from . import assistant, connectors, meta, projects, registry, runs
 from .projects import session_operation
 from . import project_threads
 
@@ -48,8 +48,6 @@ BY_AGENT = "agent"
 @session_operation
 def connect(session_id: str, permalink: object, *, by: str) -> dict:
     """Connect *session_id* to the thread *permalink* names, and record it."""
-    from . import assistant
-
     component = connectors.ensure_connectors()
     try:
         # Before the connect, not after: on the assistant this write also extends
@@ -73,8 +71,6 @@ def _refused(exc: Exception) -> ThreadError:
 @session_operation
 def disconnect(session_id: str, thread_id: str) -> dict:
     """Stop mirroring one thread, by the id a listing reports."""
-    from . import assistant
-
     record = connectors.ensure_connectors().disconnect(session_id, thread_id)
     assistant.note_thread_change(session_id, record["permalink"], connected=False)
     return record
@@ -117,8 +113,6 @@ def open_for(
     uber lmer the room in its standing launch list, an independent bound that
     was reached only after the post until !299's review measured it.
     """
-    from . import assistant
-
     component = connectors.ensure_connectors()
     component.require_room(session_id)
     try:

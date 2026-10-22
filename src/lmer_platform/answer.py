@@ -109,6 +109,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 from work_repo import run_state
+from work_repo.utils import classify_target
 
 from . import runs
 from .config import PlatformConfig
@@ -454,6 +455,9 @@ def _require_tracked(request: AnswerRequest) -> runs.TrackedRun:
     :class:`~lmer_platform.resume.RunUnresolved`, which this route already
     renders as ``{code, message}`` and which a picker needs to stay one shape.
     """
+    # deferred: cycle — lmer_platform.resume imports this module at top
+    from .resume import refuse_if_unresolved
+
     entry = runs.get_tracked(
         request.host, request.project, request.slug, uid=request.uid
     )
@@ -462,9 +466,6 @@ def _require_tracked(request: AnswerRequest) -> runs.TrackedRun:
             f"{request.key} is not tracked by this orchestrator — adopt it "
             "first (POST /api/runs/adopt) so it is in scope, then answer it"
         )
-    # Imported here for the reason given at the other resume import below.
-    from .resume import refuse_if_unresolved
-
     refuse_if_unresolved(entry, "answer")
     return entry
 
@@ -650,8 +651,7 @@ def _respawn_inputs(
     recorded one — with the target itself as the recorded clone URL of a run
     that has no other, validated against the run's identity the same way.
     """
-    from work_repo.utils import classify_target
-
+    # deferred: cycle — lmer_platform.resume imports this module at top
     from .resume import _repo_url_for, _target_needs_transport
 
     taskdef = state.get("taskdef") or tracked.taskdef
@@ -747,9 +747,9 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     :class:`~lmer_platform.spawn.SpawnError` through unchanged — the concurrency
     cap belongs to the spawn path, and an answer is not a reason to exceed it.
     """
-    # Imported here to keep answer/resume's existing helper dependency acyclic.
     # The schema-2 rule is shared: a prior launch is read-only context and an
     # unsigned source needs a decision bound to that exact UID.
+    # deferred: cycle — lmer_platform.resume imports this module at top
     from .resume import (
         _bind_to_tracked, _launch_target, _schema_two_source, schema_two_record,
     )

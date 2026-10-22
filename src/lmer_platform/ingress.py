@@ -109,6 +109,11 @@ class Ingress:
                     await getattr(self, f"_{transport}")()
                 except Exception as exc:
                     self._failure(transport, exc)
+                if self._stopping:
+                    # Shutdown cancelled the attempt, but an error from its cleanup
+                    # (a socket close that raised) replaces the cancellation; a
+                    # retry would keep shutdown waiting on this task for good.
+                    return
                 failures += 1
                 await asyncio.sleep(min(RETRY_MAX, 2 ** min(failures - 1, 5)))
         finally:
@@ -144,6 +149,7 @@ class Ingress:
                     await _blocking(ingress_store.finish, row["id"])
 
     async def _slack_event(self, socket, request):
+        # deferred: import cost — slack_sdk (~40 ms) loads only for a configured Slack ingress
         from slack_sdk.socket_mode.response import SocketModeResponse
 
         task = asyncio.current_task()
@@ -170,6 +176,7 @@ class Ingress:
             self._events.discard(task)
 
     async def _slack(self):
+        # deferred: import cost — aiohttp (~160 ms) and slack_sdk (~200 ms with it) load only for a Slack ingress
         import aiohttp
         from slack_sdk.socket_mode.aiohttp import SocketModeClient
         from slack_sdk.web.async_client import AsyncWebClient
@@ -226,6 +233,7 @@ class Ingress:
             socket = ReportingSocket(app_token=self.env["SLACK_APP_TOKEN"], web_client=web,
                                      logger=sdk_logger)
             socket.socket_mode_request_listeners.append(self._slack_event)
+            replay = None
             try:
                 await web.auth_test()
                 socket.wss_uri = await socket.issue_new_wss_url()
@@ -234,7 +242,11 @@ class Ingress:
                 except TimeoutError:
                     raise IngressError(errors.reason or "TimeoutError") from None
                 while True:
-                    await self._replay("slack", reader)
+                    # Its own task, shielded: cancelling this loop on shutdown then
+                    # reaches the socket close below at once, as the event handler's
+                    # path does, while an admission already under way still finishes.
+                    replay = asyncio.create_task(self._replay("slack", reader))
+                    await asyncio.shield(replay)
                     up = await socket.is_connected()
                     was_up = self.snapshot()["slack"]["up"]
                     self._update("slack", up=up, state="up" if up else "reconnecting")
@@ -242,8 +254,14 @@ class Ingress:
                         self._update("slack", last_error="disconnected")
                     await asyncio.sleep(1)
             finally:
-                await socket.close()
-                reader.session.close()
+                try:
+                    await socket.close()
+                finally:
+                    # Even when the close raises: an admission under way finishes
+                    # before shutdown returns.
+                    if replay is not None:
+                        await asyncio.gather(replay, return_exceptions=True)
+                    reader.session.close()
 
     async def _matrix(self):
         account = MatrixAccount(

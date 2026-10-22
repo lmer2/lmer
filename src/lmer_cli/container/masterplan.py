@@ -22,6 +22,9 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
+from lmer_cli.container import taskdefs
 from lmer_cli.util import TRUTHY_VALUES, get_bool_env
 
 
@@ -51,16 +54,10 @@ def taskdef_declares_masterplan() -> bool:
     task = os.environ.get("LMER_TASK")
     if not task:
         return False
-    # Deferred like the work_repo import below: keep masterplan_enabled()'s
-    # pure-env paths importable/testable without the search (or yaml) loaded.
-    from lmer_cli.container.taskdefs import find_taskdef_file
-
-    manifest = find_taskdef_file(TASK_MANIFEST, task)
+    manifest = taskdefs.find_taskdef_file(TASK_MANIFEST, task)
     if manifest is None:
         return False
     try:
-        import yaml
-
         data = yaml.safe_load(manifest.read_text())
     except Exception:
         return False
@@ -119,12 +116,10 @@ def masterplan_runs_dir() -> Optional[Path]:
     rather than inspected — which is what
     ``tests/test_masterplan_runs_dir_session.py`` pins.
     """
-    # Deferred deliberately: keep the import inside this function so that
-    # ``masterplan_enabled()`` (a pure ``get_bool_env`` check) and the module as
-    # a whole stay importable/testable without ``work_repo`` — and its
-    # dependencies — being resolvable on ``sys.path``. Only the run-dir
-    # computation actually needs it, and only when the session is a masterplan
-    # session, so we pay the import cost lazily at that point.
+    # Kept here so that ``masterplan_enabled()`` (a pure ``get_bool_env`` check)
+    # and the module as a whole stay importable/testable without ``work_repo`` —
+    # and its dependencies — being resolvable on ``sys.path``.
+    # deferred: import cost — the work_repo package adds ~80 ms; only a masterplan session's run dir needs it
     from work_repo import run_state
 
     rdir = run_state.run_dir()

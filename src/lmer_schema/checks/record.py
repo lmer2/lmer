@@ -197,8 +197,9 @@ from typing import Iterator, List, Optional, Tuple
 
 import yaml
 
+from lmer_schema import manifest as schema_manifest
 from lmer_schema.checks.findings import Report, Severity, Tier, register
-from lmer_schema.checks import symlinks
+from lmer_schema.checks import symlinks, walk
 from lmer_schema.registry import PROJECT_MARKERS, is_host_bucket_name, is_project_shaped
 
 __all__ = [
@@ -631,20 +632,19 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
     A root that does not exist yields nothing — "is there a tree at all" is
     the runner's question, not a record finding.
     """
-    root = Path(root)
-    now = _utc(now) if now is not None else datetime.now(timezone.utc)
-    from lmer_schema.manifest import ManifestError, load_manifest
-    from lmer_schema.checks.walk import project_dirs
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
     from work_repo.release_claims import read_claim
     from work_repo.run_state import RunStateError
 
+    root = Path(root)
+    now = _utc(now) if now is not None else datetime.now(timezone.utc)
     if manifest is ...:
         try:
-            manifest = load_manifest(root)
-        except ManifestError:
+            manifest = schema_manifest.load_manifest(root)
+        except schema_manifest.ManifestError:
             manifest = None  # the manifest stage already reports the exact cause
     if manifest is not None and manifest.schema >= 2:
-        for project in project_dirs(root) if projects is None else projects:
+        for project in walk.project_dirs(root) if projects is None else projects:
             path = Path(project) / "_claims" / "release.yaml"
             try:
                 read_claim(path)
@@ -773,6 +773,7 @@ def _check_plain_session_group(root, group, report, *, area) -> None:
     """
     if is_host_bucket_name(_rel(root, group).split("/", 1)[0]):
         return  # D9: a bucket never blocks
+    # deferred: import cost — only a group outside a host bucket needs it; work_repo (~35 ms) stays off the lmer-schema import
     from work_repo.run_state import is_legacy_plain_session_slug
 
     candidates = []

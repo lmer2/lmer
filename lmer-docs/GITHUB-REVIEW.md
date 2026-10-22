@@ -187,8 +187,10 @@ github-review myorg/myproject 123 --host github.example.com --info
 
 The tool looks for a token in this order:
 1. `--token` command-line argument
-2. `GH_TOKEN_<sanitized_host>` env var (e.g. `GH_TOKEN_github_example_com`)
-   — useful when one process talks to multiple GitHub hosts
+2. `GH_TOKEN_<sanitized_host>` env var (e.g. `GH_TOKEN_github_example_com`;
+   dots become `_` and hyphens `__`, so `my-ghe.example.com` reads
+   `GH_TOKEN_my__ghe_example_com`) — useful when one process talks to
+   multiple GitHub hosts
 3. `GH_TOKEN` (gh's preferred env var)
 4. `GITHUB_TOKEN` (Actions-style fallback)
 

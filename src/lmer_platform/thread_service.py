@@ -17,7 +17,7 @@ from typing import Optional
 
 from lmer_cli.thread_access import ThreadServicer, UploadStore
 
-from . import references, registry, runs, session_io, session_threads, uploads
+from . import comms, meta, references, registry, runs, session_io, session_threads, uploads
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +117,8 @@ class ThreadServices:
             return None
 
     def _tell(self, session_id: str, reference) -> bool:
-        from .comms import ensure_hub
-
         try:
-            ensure_hub().post(
+            comms.ensure_hub().post(
                 session_id,
                 kind="message",
                 text=references.announcement(reference),
@@ -210,8 +208,6 @@ def _run_name_of(session_id: str):
     word itself, so handing it that label spelled it twice (review of !300).
     """
     def name() -> str:
-        from . import meta, runs
-
         try:
             identity = runs.run_for_session(session_id)
             if identity is None:

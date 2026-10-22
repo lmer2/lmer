@@ -16,6 +16,7 @@ from datetime import datetime
 import yaml
 
 from lmer_cli import gate_lock
+from lmer_cli.container import clone_and_exec
 
 from .loggers import get_logger
 from .info_reader import read_project_info
@@ -37,14 +38,22 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, housekeep, knowledge, plan_index, release_run, run_state, specs_index, write_journal
-from .memory import memory_write_rel_paths, persist_memory, restore_memory
+from . import (
+    git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
+    specs_index, write_journal,
+)
+from .memory import (
+    MemoryRetirementError, forget_memory, memory_retirement_paths, memory_write_rel_paths,
+    persist_memory, restore_memory, revive_memory,
+)
+from .session_record import current_metadata, seeded_session
 from .transactions import (
     checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
     work_mutation, work_transaction,
 )
 from .utils import (
     MANIFEST_PROBLEM,
+    SchemaContextError,
     redact_secrets,
     task_target_dir,
     work_repo_form,
@@ -1104,11 +1113,6 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     elif action == "persist":
         return persist_memory(message, allow_unbaselined_delete)
     elif action in ("forget", "revive"):
-        from .memory import (
-            MemoryRetirementError, forget_memory, revive_memory, memory_retirement_paths,
-        )
-        from . import write_journal
-
         try:
             operation = forget_memory if action == "forget" else revive_memory
             rels = memory_retirement_paths(scoped_path)
@@ -1170,20 +1174,9 @@ def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
     Returns:
         Exit code (0 success, 1 on any setup failure including already-set-up).
     """
-    # Lazy import: only setup-workspace needs lmer_cli. Plain `work log`/`commit`
-    # invocations should not pay to import the lmer_cli package.
     try:
-        from lmer_cli.container.clone_and_exec import (
-            setup_workspace,
-            WorkspaceExistsError,
-        )
-    except ImportError as e:
-        print(f"❌ Could not load workspace setup support: {e}", file=sys.stderr)
-        return 1
-
-    try:
-        result = setup_workspace(target, task=task, sync_deps=sync_deps)
-    except WorkspaceExistsError as e:
+        result = clone_and_exec.setup_workspace(target, task=task, sync_deps=sync_deps)
+    except clone_and_exec.WorkspaceExistsError as e:
         print(f"❌ {e}", file=sys.stderr)
         print(
             "   Remove the existing /workspace contents first if you really "
@@ -2911,7 +2904,6 @@ def cmd_seed(args) -> int:
         held = len(run_state._session_dirs(base / slug))
         if held:
             print(f"group {slug} already holds {held} record(s)")
-        from .session_record import seeded_session
 
         try:
             seeded = seeded_session()
@@ -3115,8 +3107,6 @@ def _drop_claim_commit(pre_head: str) -> None:
     if pre_head:
         repo = _work_repo_root()
         if run_state.is_process_record():
-            from . import release_claims
-
             # Only HEAD and this transaction's claim are rolled back. Hooks
             # or helper commands may have written other files while Git ran.
             rc, detail = run_git_command(["reset", "--soft", pre_head], repo, check=False)
@@ -3332,11 +3322,8 @@ def _shared_release_claim(
 
 def _published_release_claim(expected_holder):
     """Read the holder from a freshly fetched published tree, not our write."""
-    from . import release_claims
-    from .git_ops import _publication_destination
-
     root = _work_repo_root()
-    destination = _publication_destination(root, "work repo")
+    destination = git_ops._publication_destination(root, "work repo")
     if destination is None:
         raise run_state.RunStateError("cannot resolve published claim destination")
     remote, ref = destination
@@ -3354,8 +3341,6 @@ def _published_release_claim(expected_holder):
 
 def _published_claim_at(root, commit: str, claim_rel: str) -> dict:
     """The claim document a published head holds; unclaimed when absent."""
-    from . import release_claims
-
     present, text = published_file(root, commit, claim_rel)
     if not present:
         return dict(release_claims.UNCLAIMED)
@@ -3371,8 +3356,6 @@ def _shared_release_claim_locked(*, release=False, force=False, as_json=False):
     a claim is never stacked onto an unchecked head. What the attempt builds
     is an object graph, not checkout state, so the retry needs no rollback.
     """
-    from . import release_claims
-
     root = _work_repo_root()
     session = run_state.current_session_id()
     action = "unclaim" if release else "claim"
@@ -3592,8 +3575,6 @@ def _last_published_claim():
     brought down — no network, and current as of this session's own claim.
     Returns None when there is no upstream ref or no claim recorded in it.
     """
-    from . import release_claims
-
     root = _work_repo_root()
     rc, head = run_git_command(
         ["rev-parse", "--verify", "--quiet", "@{upstream}"], root, check=False
@@ -3617,8 +3598,6 @@ def cmd_release_claim_status(as_json: bool = False) -> int:
     warning, never a failure.
     """
     if run_state.is_process_record():
-        from . import release_claims
-
         try:
             claim = _last_published_claim() or release_claims.read_claim()
             holder = claim.get("holder")
@@ -3748,8 +3727,6 @@ def _shared_release_abort(*, reason: str | None, force: bool) -> int:
     rewriting history; success verifies the cleared claim and the complete
     execution record together on a freshly fetched head.
     """
-    from . import release_claims
-
     root = _work_repo_root()
     if inherited_transaction(root):
         return _claim_fail_closed("invoking Git transaction still owns this checkout")
@@ -3934,8 +3911,6 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
         session = run_state.current_session_id()
         extra_rels = None
         if run_state.is_process_record():
-            from . import release_claims
-
             try:
                 shared = release_claims.require_available(session, force=force)
                 holder = shared.get("holder")
@@ -4344,8 +4319,6 @@ def cmd_session_start(session: str | None = None) -> int:
     forwarded into the container and kept in step with the directory. A
     legacy tree keeps one shared run dir per target and chains nothing.
     """
-    from .utils import SchemaContextError
-
     try:
         if run_state.is_process_record():
             return _start_process_record(session)
@@ -4596,8 +4569,6 @@ def cmd_session_end() -> int:
         # state write — decided without a network round trip, so non-release
         # sessions pay nothing for it.
         if run_state.is_process_record():
-            from . import release_claims
-
             # From the PUBLISHED claim, not the checkout's copy: the claim
             # verb publishes an object and deliberately leaves that copy
             # alone, so it is absent or stale unless something has pulled
@@ -4685,8 +4656,6 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         if action in ("claim", "unclaim", "abort", "record"):
             rels = run_candidates()
             if run_state.is_process_record():
-                from . import release_claims
-
                 rels.append(release_claims.claim_rel_path())
             return pushing(rels)
         return None
@@ -4707,9 +4676,11 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         specs_rel = specs_index.specs_rel_path()
         return [specs_rel] if specs_rel else []
     if command == "adopt":
+        # deferred: import cost — only `work adopt` needs it; adopt/migrate add ~10 ms to every `work` call
         from . import adopt
         return adopt.write_rel_paths(args)
     if command == "migrate":
+        # deferred: import cost — only `work migrate` needs it; adopt/migrate add ~10 ms to every `work` call
         from . import migrate
         return migrate.write_rel_paths(args)
     if command == "seed":
@@ -4742,8 +4713,6 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         return pushing(rels)
     if command == "memory":
         if getattr(args, "memory_action", None) in ("forget", "revive"):
-            from .memory import memory_retirement_paths
-
             return pushing(memory_retirement_paths(args.scoped_path))
         if getattr(args, "memory_action", None) != "persist":
             return None
@@ -4840,12 +4809,8 @@ def main() -> int:
     if args.command not in (
         "memory", "specs-index", "adopt", "migrate", "housekeep", "knowledge"
     ):
-        from .utils import SchemaContextError
-
         try:
             if run_state.is_process_record() and _write_intent_rel_paths(args) is not None:
-                from .session_record import current_metadata
-
                 current_metadata()
         except SchemaContextError:
             # Existing dispatch reports the manifest cause, retaining each
@@ -4925,9 +4890,11 @@ def _dispatch(args, parser) -> int:
     elif args.command == "specs-index":
         return cmd_specs_index(args.rebuild)
     elif args.command == "adopt":
+        # deferred: import cost — only `work adopt` needs it; adopt/migrate add ~10 ms to every `work` call
         from . import adopt
         return adopt.cmd_adopt(args)
     elif args.command == "migrate":
+        # deferred: import cost — only `work migrate` needs it; adopt/migrate add ~10 ms to every `work` call
         from . import migrate
         return migrate.cmd_migrate(args)
     elif args.command == "seed":

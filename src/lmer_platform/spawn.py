@@ -165,7 +165,7 @@ from work_repo.utils import (
 )
 from lmer_schema.manifest import ManifestError, load_manifest
 from lmer_cli.env_sources import env_with_overrides
-from lmer_cli.harness import HARNESSES, known_harnesses
+from lmer_cli.harness import CODEX_SEED_ERROR_ENV, HARNESSES, known_harnesses
 from lmer_cli.mounts import (
     # Imported rather than restated: credential staging (there) and the
     # session-dir acceptance rule (here) must read one literal.
@@ -190,6 +190,7 @@ from . import (
     ask, authority, codex_config, containers, memory, meta, registry, runs, slots, statusline,
     uploads, workrepo,
 )
+from . import references as run_references
 from .config import (
     assistant_resource_settings,
     terminal_settings,
@@ -828,8 +829,6 @@ class SpawnRequest:
                 raise SpawnError(f"references: {exc}") from exc
             # The title too, before the container starts: a refusal after it is
             # up can only be logged.
-            from . import references as run_references
-
             for item in request.references:
                 try:
                     run_references.checked_title(item.get("title"))
@@ -1471,7 +1470,6 @@ def _write_run_references(
     """
     if not request.references:
         return None
-    from . import references as run_references
 
     lost = []
     for item in request.references:
@@ -1580,6 +1578,7 @@ def _transcripts():
     exist. One named seam so the reason is stated once for every caller that
     needs it; same lazy-import shape as ``lmer_cli.harness.known_harnesses``.
     """
+    # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.session_io)
     from . import transcripts
 
     return transcripts
@@ -3053,6 +3052,7 @@ def _refuse_if_threads_are_held(targets) -> None:
     """
     if not targets:
         return
+    # deferred: cycle — lmer_platform.connectors imports this module at top (via session_io); only a launch with targets needs it
     from . import connectors as thread_connectors
 
     component = thread_connectors.get_connectors()
@@ -3678,6 +3678,19 @@ def spawn_session(
         )
 
 
+def _requests_codex(request: SpawnRequest) -> bool:
+    """Whether the request itself names codex, which nothing in the child outranks.
+
+    Such a launch is refused here for an unreadable Codex seed (#544 item 7),
+    before anything starts. Any other launch may still resolve codex in the
+    child, through a preset, a model alias, an .env file or the inherited
+    ``LMER_HARNESS``, and only the child knows which (!422 review). The child is
+    handed the reason instead (:data:`lmer_cli.harness.CODEX_SEED_ERROR_ENV`)
+    and refuses there if its own harness is codex.
+    """
+    return (request.harness or "").strip().lower() == "codex"
+
+
 def _spawn_session(
     config: PlatformConfig,
     request: SpawnRequest,
@@ -3686,6 +3699,7 @@ def _spawn_session(
     publish_registration: Optional[Callable[[Callable[[], None], str, int], None]],
     refuse_held_targets: bool,
 ) -> SpawnResult:
+    # deferred: cycle — project_requests (via assistant) and project_threads (via connectors) import this module at top
     from . import project_requests, project_threads
 
     request = request.validate()
@@ -3778,7 +3792,9 @@ def _spawn_session(
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
     try:
-        config_flags = codex_config.mount_flags(host, project, slug, kind, session_id)
+        config_flags, seed_error = codex_config.mount_flags(
+            host, project, slug, kind, session_id, codex=_requests_codex(request),
+        )
     except OSError as exc:
         raise SpawnError(f"cannot prepare persistent Codex configuration: {exc}") from exc
     channels = _prepare_session_channels(session_id, kind)
@@ -3819,6 +3835,9 @@ def _spawn_session(
         ),
         "LMER_PLATFORM_ASSISTANT_NAME": config.assistant_name,
         authority.ENV: supervisor_level,
+        # Blank when the seed was read, never absent, so the child's .env
+        # seeding cannot supply one of its own.
+        CODEX_SEED_ERROR_ENV: seed_error,
     }
     invocation_env.update(channels.env)
     invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
@@ -3982,6 +4001,7 @@ def _spawn_session(
     # After registration, because the reconcile reads the entry; best-effort,
     # because a session that is already running must not fail over its bookkeeping.
     if request.targets:
+        # deferred: cycle — lmer_platform.connectors imports this module at top (via session_io); only a launch with targets needs it
         from . import connectors as thread_connectors
 
         component = thread_connectors.get_connectors()

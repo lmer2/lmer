@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from .checks import record as record_checks
 from .manifest import MANIFEST_NAME, ManifestError, load_manifest
 from .registry import RegistryError, build_registry, is_host_bucket_name, resolve_project_dir
 
@@ -50,7 +51,7 @@ def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
     check's, imported verbatim (``record.plain-session-slug``), never
     re-derived here. A host bucket is skipped: a bucket never blocks (D9).
     """
-    from .checks.record import iter_run_areas, plain_session_move_text
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
     from work_repo import run_state, session_record
     from work_repo.run_state import is_legacy_plain_session_slug
 
@@ -58,7 +59,7 @@ def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
     moves = []
     seen = set()
     folded = set()
-    for area, _layout in iter_run_areas(root):
+    for area, _layout in record_checks.iter_run_areas(root):
         bucket = _is_bucket_area(root, area)
         for record in run_state.iter_record_dirs(area):
             relative = record.relative_to(root).as_posix()
@@ -89,7 +90,7 @@ def _record_blockers(root: Path) -> tuple[list[str], list[dict]]:
                         slug, taskdef = state.get("slug"), state.get("taskdef")
                         group_rel = group.relative_to(root).as_posix()
                         blockers.append(
-                            f"{group_rel}: " + plain_session_move_text(
+                            f"{group_rel}: " + record_checks.plain_session_move_text(
                                 slug, taskdef, area=area.name, group=group.name
                             )
                         )

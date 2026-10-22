@@ -69,12 +69,20 @@ os._exit(0)
 """
 
 
+def end_with(control, code):
+    """Let the session exit with *code*. Whole or not at all: the session script
+    reads the file the moment it exists, and a half-written one exits with ""."""
+    partial = control["end"].with_name("end.partial")
+    partial.write_text(str(code))
+    os.replace(partial, control["end"])
+
+
 @pytest.fixture
 def control(tmp_path):
     files = {"go": tmp_path / "go", "end": tmp_path / "end"}
     yield files
     if not files["end"].exists():
-        files["end"].write_text("0")
+        end_with(files, 0)
     files["go"].touch()
 
 
@@ -175,7 +183,7 @@ def test_a_session_outlives_its_daemon_and_is_followed_again(
         "the output nobody was attached for should be replayed into the log"
     )
 
-    control["end"].write_text("0")
+    end_with(control, 0)
     assert spawn.wait_for_exit_recorded(session_id, timeout=20)
     assert [e["data"]["exit_code"] for e in exit_events(session_id)] == [0]
     assert registry.read_session(session_id) is None
@@ -202,7 +210,7 @@ def test_a_container_that_ended_while_no_daemon_was_up_keeps_its_code(
     platform_root, config, control
 ):
     session_id = spawn_then_kill_daemon(platform_root)["session"]
-    control["end"].write_text("5")
+    end_with(control, 5)
     control["go"].touch()
     # Exited, or already removed by the old follower if it outlived its terminal
     # (SIGHUP ignored): the code survives either way.
@@ -226,6 +234,18 @@ def test_a_followed_session_can_still_be_exited(platform_root, config, control):
     assert wait_for(lambda: containers.discover() == []), (
         "the exit stopped and removed the container"
     )
+
+
+def test_a_container_coming_or_going_during_a_listing_is_not_an_error(
+    platform_root, control, tmp_path
+):
+    """#589: a box with no config is one being created or mid-removal, and
+    discovery polled across an exit's removal must not fail on it."""
+    session_id = spawn_then_kill_daemon(platform_root)["session"]
+    (tmp_path / "containers" / ("0" * 32)).mkdir()
+
+    [found] = containers.discover()
+    assert found.session_id == session_id
 
 
 def test_a_cli_container_is_never_touched(platform_root, config, tmp_path):

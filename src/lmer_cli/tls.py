@@ -50,6 +50,7 @@ def ensure_ca_bundle() -> None:
     if os.environ.get("SSL_CERT_FILE"):
         return
     try:
+        # deferred: optional dependency — read only when SSL_CERT_FILE is unset; a missing certifi keeps the CA default
         import certifi
     except ImportError:
         # A declared dependency, so this should not happen — but guessing a path

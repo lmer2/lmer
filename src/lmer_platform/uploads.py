@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import registry, store
+from . import assistant_history, registry, store
 from .store import logs_dir
 from .project_context import assistant_dir
 from . import projects, project_context
@@ -418,7 +418,6 @@ def readable_store(session_id: str, entry: Optional[dict]) -> Path:
     pointer = (entry or {}).get("uploads")
     if isinstance(pointer, dict) and pointer.get("path"):
         return mounted_store(session_id, entry)
-    from . import assistant_history
 
     archived = assistant_history.generation(session_id)
     if archived and archived["uploads"]:

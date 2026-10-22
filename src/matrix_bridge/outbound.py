@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional
 
 from lmer_platform import config as platform_config
+from lmer_platform import ctl
 from lmer_platform.client import Call, Endpoint, PlatformError, request
 from matrix_bridge.config import MatrixConfig
 from matrix_bridge.threads import RunKey, ThreadMap
@@ -249,8 +250,6 @@ def platform_endpoint() -> Endpoint:
     everywhere else in this project: an export is someone saying something the
     file cannot know.
     """
-    from lmer_platform import ctl
-
     url = (os.environ.get(ctl.ENV_PLATFORM_URL) or "").strip()
     credential = (os.environ.get(ctl.ENV_PLATFORM_CREDENTIAL) or "").strip()
     if url and credential:

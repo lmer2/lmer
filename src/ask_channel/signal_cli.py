@@ -53,6 +53,7 @@ from typing import List, Optional
 from lmer_cli import thread_requests as _threads
 from lmer_cli.comms import CHANNEL_UBER, META_AUTHORITY, META_OPERATOR_ONLY
 from lmer_cli.routing_receipts import emit as routing_receipt
+from lmer_cli.session_end import request_session_end
 
 from . import bus
 from .args import (
@@ -270,6 +271,7 @@ def _add_attach(parser: argparse.ArgumentParser) -> None:
             "connected Slack and matrix threads get the file itself, or a "
             "'withheld' note saying why (over 25 MiB, credential-shaped, the Slack "
             "app lacking files:write, matrix media not asserted authenticated). "
+            "With --thread, each withheld file is also named on stderr. "
             "Refused when the session has no store."
         ),
     )
@@ -393,6 +395,9 @@ def _post_into_thread(
         )
     else:
         print(f"posted into {where}", file=sys.stderr)
+    # The thread got a note in their place; the caller is told here, by name.
+    for item in posted.get("withheld") or []:
+        print(f"📎 {item.get('name')} was not sent: {item.get('reason')}", file=sys.stderr)
     try:
         result = client.post(
             KIND_MESSAGE, text, attachments=staged,
@@ -409,6 +414,7 @@ def _post_into_thread(
 
 
 def _cmd_read(args: argparse.Namespace, client: bus.BusClient) -> int:
+    # deferred: import cost — lmer_cli.thread_access adds ~20 ms to every lmer-signal call
     from lmer_cli.thread_access import render_record
 
     result = _thread_work(client, args, _threads.OP_READ, args.permalink, limit=args.limit)
@@ -791,8 +797,6 @@ def _cmd_end_session(args: argparse.Namespace, client: bus.BusClient) -> int:
     what the verb is for, so a conversation nobody is listening to must not
     keep a session alive to its idle timeout.
     """
-    from lmer_cli.session_end import request_session_end
-
     if args.text is not None or args.message_file or args.stdin:
         try:
             client.post(KIND_MESSAGE, resolve_text(args))

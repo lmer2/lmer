@@ -103,6 +103,7 @@ directory ({work}/{host}/{project}/runs/develop-durable-run-state/spec.md).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -112,6 +113,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -119,6 +121,18 @@ from typing import Optional
 import yaml
 
 from . import specs_index
+from .session_record import (
+    SOURCE_ACK_ENV,
+    SOURCE_ENV,
+    UID_RE,
+    current_metadata,
+    display_state,
+    is_seeded,
+    is_stopped,
+    schema_version,
+    signed_out,
+    sort_key,
+)
 from .transactions import mutation_transaction, work_transaction
 from .utils import (
     is_work_item,
@@ -368,8 +382,6 @@ def is_session_form() -> bool:
 
 def is_process_record() -> bool:
     """Schema 2 binds each record to exactly one execution UID."""
-    from .session_record import schema_version
-
     return schema_version() >= 2
 
 
@@ -621,7 +633,6 @@ def _newest_record(records: list[Path]) -> Optional[Path]:
     """
     if not records:
         return None
-    from .session_record import UID_RE, sort_key
 
     in_form = [rdir for rdir in records if SESSION_DIR_RE.fullmatch(rdir.name)]
     if in_form:
@@ -1207,6 +1218,9 @@ def seeded_record_rel_paths() -> list[str]:
     group was removed before the commit resolves to nothing and stages
     nothing. Empty on a legacy tree or with no own record.
     """
+    # deferred: cycle — work_repo.project_index imports this module at top
+    from . import project_index
+
     if not is_process_record():
         return []
     own = run_dir()
@@ -1215,10 +1229,7 @@ def seeded_record_rel_paths() -> list[str]:
     # Lock-free: this runs inside `commit_work_changes`, which a git hook can
     # invoke while the work transaction is already held by the same process,
     # so `load_state`'s mutation lock would deadlock. `read_state_fast` is the
-    # same reader `_nudge_unnamed` uses (project_index imports this module, so
-    # the import is local).
-    from . import project_index
-
+    # same reader `_nudge_unnamed` uses.
     path = _state_path(own)
     if path is None:
         return []
@@ -1302,8 +1313,6 @@ def seed_state(
     }
     if is_process_record():
         if session is None:
-            from .session_record import current_metadata
-
             session = current_metadata()
         state["session"] = dict(session)
     return state
@@ -1376,8 +1385,6 @@ def seed_run_dir(
     os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
     state = seed_state(slug, taskdef, target, session=seeded)
     if context is not None:
-        from copy import deepcopy
-
         state["context"] = context
         state["session"]["source_session_uid"] = context["source_session_uid"]
         if context["unsigned_source_acknowledged"]:
@@ -1478,7 +1485,6 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
     """Read a prior record without any corrupt-file recovery or other writes."""
     if not source_uid:
         return None
-    from .session_record import SOURCE_ACK_ENV, is_stopped
 
     if not _usable_session_id(source_uid):
         raise RunStateError("source session must be a session UID, not a path")
@@ -1510,7 +1516,6 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
             f"last_activity={events[-1].get('ts', '?') if events else state.get('updated', '?')}). "
             "Choose cancel/wait, inspect the prior session, or explicitly start fresh."
         )
-    import hashlib
 
     checkpoints = {}
     for name in (LEDGER_FILE, "release.yaml"):
@@ -1539,8 +1544,6 @@ def _source_context(slug: str, source_uid: str | None) -> dict | None:
 
 def _ensure_process_record(slug, taskdef, target, source_uid):
     """Create or load only this launch's record; a prior record is context."""
-    from .session_record import SOURCE_ENV, current_metadata
-
     try:
         current_metadata()
     except ValueError as exc:
@@ -1573,8 +1576,6 @@ def _seeding_launch_may_write(rdir: Path, state) -> bool:
     relabelled in-memory copy cannot name itself the seeder; only the very
     first write, with nothing on disk yet, is judged on what it carries.
     """
-    from .session_record import UID_RE
-
     metadata = state.get("session") if isinstance(state, dict) else None
     if not isinstance(metadata, dict):
         return False
@@ -1778,14 +1779,10 @@ def list_sessions(
                 }
             )
             if state.get("schema") == 2:
-                from .session_record import display_state, signed_out
-
                 row["session"] = state.get("session")
                 # `seeded`: `work seed` wrote it and nothing has run in it
                 # (D13) — not running, still listed. Its own read of the
                 # events, so the sign-out line stays what it is.
-                from .session_record import is_seeded
-
                 row["seeded"] = is_seeded(state, read_events(rdir, last_n=0))
                 row["signed_out"] = signed_out(read_events(rdir, last_n=0))
                 row["state"] = display_state(
@@ -1799,8 +1796,6 @@ def list_sessions(
                 )
         rows.append(row)
     if any("session" in row for row in rows):
-        from .session_record import sort_key
-
         rows.sort(key=lambda row: (str(row["slug"] or ""), sort_key(row["path"])))
     return rows
 
@@ -2747,6 +2742,9 @@ def decide(
     is the loaded release.yaml record (release-flow §3) — the caller loads
     it only for release runs, exactly like ledger/sessions_used, so every
     non-release run passes None and its output stays byte-identical."""
+    # deferred: cycle — work_repo.release_run imports this module's shared YAML preamble at load time
+    from .release_run import RECEIPT_NAMES, ReleaseRunError, derive_leg
+
     if state is None:
         return {"kind": "none"}
     warnings: list[str] = []
@@ -2790,10 +2788,6 @@ def decide(
     # the record the caller passed in — decide() stays IO-free.
     release_info: Optional[dict] = None
     if release is not None:
-        # Deferred import: release_run imports this module's shared YAML
-        # preamble at load time, so a top-level import here would be a cycle.
-        from .release_run import RECEIPT_NAMES, ReleaseRunError, derive_leg
-
         tag = release.get("tag")
         receipts = release.get("receipts")
         receipts = receipts if isinstance(receipts, dict) else {}

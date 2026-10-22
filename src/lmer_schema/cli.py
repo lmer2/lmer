@@ -170,6 +170,7 @@ from lmer_schema.manifest import (
     ManifestError,
     load_manifest,
 )
+from lmer_schema.migration import migrate
 from lmer_schema.registry import RegistryError, build_registry
 
 __all__ = [
@@ -391,9 +392,6 @@ def _dispatch(parser: _ArgumentParser, args) -> int:
     if args.command is None:
         parser.error("a command is required (try `validate PATH`, or --list-checks)")
     if args.command == "migrate":
-        from .manifest import ManifestError
-        from .migration import migrate
-
         try:
             result = migrate(Path(args.path), apply=args.apply)
         except (ManifestError, OSError) as exc:
@@ -737,7 +735,8 @@ def index_plan(root: Path, document, registry) -> List[IndexFile]:
     choke point renders, and a README the checkout ignores is refused; off
     git, everything on disk is listed. Nothing is written.
     """
-    from work_repo import project_index  # lazy: the import direction is work_repo -> lmer_schema
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
+    from work_repo import project_index
 
     root = Path(root)
     timeout = project_index.GIT_TIMEOUT_SECONDS
@@ -866,7 +865,8 @@ def write_index(root: Path, document, registry) -> List[IndexFile]:
     became untouchable is ``refused``. Raises ``OSError`` when the lock is
     refused (an invoking Git hook owns it) or a write fails.
     """
-    from work_repo import project_index  # lazy: the import direction is work_repo -> lmer_schema
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
+    from work_repo import project_index
     from work_repo.transactions import work_mutation
 
     with work_mutation(Path(root)):

@@ -19,9 +19,9 @@ class TestSanitizeHostname:
         """Test dots are replaced with underscores."""
         assert _sanitize_hostname("git.example.com") == "git_example_com"
 
-    def test_hyphens_to_underscores(self):
-        """Test hyphens are replaced with underscores."""
-        assert _sanitize_hostname("my-gitlab.example.com") == "my_gitlab_example_com"
+    def test_hyphens_to_double_underscores(self):
+        """Hyphens become ``__``, so they cannot read as dots (#544)."""
+        assert _sanitize_hostname("my-gitlab.example.com") == "my__gitlab_example_com"
 
     def test_lowercase(self):
         """Test hostname is lowercased."""

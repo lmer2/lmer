@@ -30,7 +30,7 @@ import os
 import sys
 from typing import Optional
 
-from lmer_cli import assistant_mentions
+from lmer_cli import assistant_mentions, runtime, tls
 
 from slack_chat.registry import is_thread_connected
 from slack_chat.sessions import SessionManager, preset_ack_parts
@@ -245,11 +245,8 @@ def main(argv=None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
-    from lmer_cli.tls import ensure_ca_bundle
-
-    apply_env_file_defaults(default_env_file_candidates(), references_from_environ=True)
-    ensure_ca_bundle()
+    runtime.apply_env_file_defaults(runtime.default_env_file_candidates(), references_from_environ=True)
+    tls.ensure_ca_bundle()
     try:
         config = ListenerConfig()
     except ValueError as exc:

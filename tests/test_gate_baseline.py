@@ -526,6 +526,19 @@ class TestSmoke:
         assert "smoke check failed" in outcome.reason
         assert harness.commit_gate_calls == []
 
+    def test_smoke_and_suite_share_one_interpreter_list_and_ignore_list(
+            self, repo, monkeypatch):
+        """Through the same helper and constant check_tests uses, not a copy
+        that merely agrees with them today (#544 item 13)."""
+        harness = Harness(repo, monkeypatch, _client(_sha(repo), passing_jobs(_sha(repo))))
+        monkeypatch.setattr(harness.gate, "_interpreter_candidates",
+                            lambda: ["sentinel-python"])
+        harness.run()
+        args, _ = harness.smoke_calls[0]
+        candidates, collect_argv = args[:2]
+        assert candidates == ["sentinel-python"]
+        assert collect_argv[-len(gates.SUITE_IGNORE_ARGS):] == gates.SUITE_IGNORE_ARGS
+
     def test_smoke_is_bounded_by_the_mapping_timeout(self, repo, monkeypatch):
         harness = Harness(repo, monkeypatch, _client(_sha(repo), passing_jobs(_sha(repo))))
         harness.run()

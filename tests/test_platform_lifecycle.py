@@ -1050,10 +1050,17 @@ def test_a_process_that_goes_between_the_check_and_the_signal_is_fine(
     between that check and ``killpg`` raising ProcessLookupError.
     """
     result = live_session(config)
+    real_alive = lifecycle._alive
 
     def vanished(pid, sig):
         reap(pid)
-        assert wait_for(lambda: not alive(pid))
+        # By the watcher's record, not the pid: under load the freed pid can name
+        # a new process before the ladder looks again, which is reuse, not this
+        # race — so the ladder's second look is pinned to the process's own fate.
+        assert spawn.wait_for_exit_recorded(result.session_id)
+        monkeypatch.setattr(
+            lifecycle, "_alive", lambda probed: False if probed == pid else real_alive(probed)
+        )
         return False
 
     monkeypatch.setattr(lifecycle, "_signal_group", vanished)
