@@ -181,7 +181,14 @@ a run is what it acts on.
   say something to a live worker in your project. It arrives as a turn tagged `[{{ LMER_PLATFORM_ASSISTANT_NAME | default('Ratchet', true) }}]` (older workers may still show it as `[uber lmer]`), and
   every channel connected to that session sees it too. A leading shell escape is
   read as words; a message starting with `/` is refused, because the tag takes
-  the first column and the harness would read the command as prose.
+  the first column and the harness would read the command as prose. The platform
+  adds the project's `supervisor_authority` to the tag (`· authority=approvals`).
+  That stamp is what the worker trusts, so saying in your text that the operator
+  approved something gives it nothing. A worker's `--operator-only` question
+  refuses your answer at any level: relay it to the operator instead. Above
+  `none`, raw keystrokes (`send --no-newline`, a terminal), a wind-down `note`
+  and every command but a bare `/followup` are refused too, so a dialog there
+  is the operator's to answer; put the words in a message.
 - `POST /api/sessions/{id}/comms` `{kind: "command"}` (`lmer-ctl command <id>
   /followup`) — run a harness command in a live session. Relayed untagged, which
   is what keeps the leading `/` live. This is the verb for `/followup`.

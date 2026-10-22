@@ -1834,6 +1834,31 @@ console.log(JSON.stringify({failed, rows: term.rows, cols: term.cols,
     assert actual["readOnly"] and actual["phase"] == "history"
 
 
+def test_a_refused_keystroke_makes_the_prompt_read_only_and_says_why():
+    """Supervisor authority above none (#594): the next keystroke would be refused too."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    handler = _function_body(_read(TERMINAL), "function handleStatus")
+    script = """
+const term = {rows: 24, cols: 100, options: {disableStdin: false}}
+const resizeSupported = {value: true}, resizeOptIn = {value: true}
+const phase = {value: 'live'}, notice = {value: ''}, problem = {value: ''}
+let finished = false
+""" + handler + """
+handleStatus({event: 'input_refused', message: 'session s1 gives the assistant authority=approvals'})
+console.log(JSON.stringify({readOnly: term.options.disableStdin, problem: problem.value,
+  phase: phase.value, finished}))
+"""
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert json.loads(result.stdout) == {
+        "readOnly": True, "problem": "session s1 gives the assistant authority=approvals",
+        # The reconnect's ticket decides what follows, so nothing here ends the view.
+        "phase": "live", "finished": False,
+    }
+
+
 def test_the_redraw_repairs_this_client_always_and_the_session_only_where_asked():
     """The two halves of one tap, and which of them is allowed to leave the browser.
 

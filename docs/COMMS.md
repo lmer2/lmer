@@ -104,7 +104,7 @@ line in the log and the same object on the wire.
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
 | `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
-| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, and `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, and `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6). |
 
 ### Kinds
 
@@ -390,11 +390,47 @@ one submitted turn, through the same locked submit path `/input` uses:
 
 The tag is `[<channel>]` or `[<channel> · <author>]`; `uber-lmer` renders as
 the configured assistant name, `Ratchet` by default (`LMER_PLATFORM_ASSISTANT_NAME`).
-Sessions started before a rename still show `[uber lmer]`. Because the tag always takes column one, a message starting with
+Sessions started before a rename still show `[uber lmer]`. An assistant record
+the daemon stamped carries its delegated level after the name, as in
+`[Ratchet · authority=approvals]` (issue #594, `docs/PROJECTS.md`). Only the
+stamp counts: the daemon sends it in a body field of `POST /messages` that only
+the control-token holder may set, and a caller's own `meta.authority` is dropped.
+An unstamped assistant tag, from an older daemon or image, carries no authority.
+Because the tag always takes column one, a message starting with
 `!`, `#` or `/` can no longer reach the harness's first-column command
 escapes: **the tag is the defusal**. A `command` is relayed untagged so the
 harness reads it as the slash command it is; only `platform` and `uber-lmer`
-may post one.
+may post one, and its text must be one line starting with `/`, so a sender's
+own words never open a turn untagged. Control characters (C0, C1, ESC, DEL)
+are kept out of what is typed, because a terminal input box edits on them and
+one could erase the tag before the worker reads it. Newline and tab stay in
+prose. Where they are kept out depends on who chose them:
+- **Refused (400):** a `command`, a record's author and its options, and the text
+  of a record from `uber-lmer` or `peer-ul`.
+- **Cleaned:** text from anyone else, such as a human's paste of a coloured log,
+  a terminal line or a worker's own post. ANSI escape sequences are removed
+  whole (an OSC with no terminator ends at its line), a lone CR becomes a
+  newline (as a CRLF does), and any other control is written out as a visible
+  escape (`\x1b`, `\x08`).
+- **At the relay:** any control left in a typed record, tag included, is
+  written out as a visible escape. Nothing is stripped there. This covers what
+  intake never saw, such as a record from a journal written before the rule.
+
+The tag only counts at the head of a turn, and the paste framing keeps a
+record's lines inside one turn. A drop-in harness gets no framing (only
+`claude`, `codex` and `pi` are framed), so a line break may submit there and the
+next line open a turn of its own. On such a harness every tagged record is
+typed on one line, with its line breaks written as spaces, as a command's are,
+whatever its channel or stamp. The assistant reaches a worker by more than one
+route (its `POST /api/comms/thread` post into the worker's connected thread
+arrives as `slack` or `matrix`), and the container cannot know the level live.
+
+A Slack or Matrix connector drops an inbound record the bus refuses as itself
+(400, 403, 413, 422), instead of retrying it ahead of everything that follows.
+It posts a `note` naming the record and replies in the thread with the post's
+first words and the reason, so the sender knows it never arrived. On Slack the
+quoted words are escaped, so a quoted mention does not ping anyone again. That
+reply is best effort, sent after the drop is saved.
 
 Agent-origin records have no PTY leg. Terminal-origin records (§5) have none
 either — the harness already has them.
@@ -683,6 +719,18 @@ is a redundancy rather than a contradiction and is what the ask-directory answer
 file carries. A body that *is* an option's text still matches it, case and
 surrounding space aside, so the record carries the canonical spelling. Anything
 else is stored as sent.
+
+**An operator-only question takes no assistant's answer.** `lmer-signal ask
+--operator-only` stores `meta.operator_only: true` on the question, and the bus
+refuses an `answer` or `close` to it from `uber-lmer` or `peer-ul` with a 400,
+whatever authority the record carries. The Slack connector never binds a
+thread post that no human typed (the platform's, a session's, any bot's) as its
+answer, and the matrix connector never binds one lmer made or its own account
+posted: each arrives as a plain message instead. The matrix connector cannot
+tell another bot account from a human, so such an account can still bind one.
+This is how a worker keeps a gate such as spec approval or a merge with the
+operator (issues #594 and #518). `lmer-signal list` marks such a question
+`(operator-only)`.
 
 The doors that accept an index: `POST /messages` on the bus,
 `POST /api/sessions/{id}/ask/{qid}/answer` and `POST /api/sessions/{id}/comms`

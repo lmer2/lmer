@@ -734,6 +734,7 @@ class CommsHub:
         attachments: Iterable[dict] = (),
         meta: Optional[dict] = None,
         before_send: Optional[Callable] = None,
+        authority: Optional[str] = None,
     ) -> dict:
         """Post one record on *session_id*'s bus and journal it at once.
 
@@ -752,6 +753,8 @@ class CommsHub:
             "attachments": [dict(item) for item in attachments],
             "meta": dict(meta or {}),
         }
+        if authority is not None:
+            body["authority"] = authority
         # Hashed before the wire, like `session_io.send_input`: the durable
         # record of the attempt (#197, spec §5.2) is what answers "did my
         # message reach the session?", and the chat composer, `lmer-ctl send`

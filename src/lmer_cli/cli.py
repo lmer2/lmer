@@ -3712,6 +3712,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": os.environ.get("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"),
         "LMER_PLATFORM_ASSISTANT_NAME": os.environ.get("LMER_PLATFORM_ASSISTANT_NAME"),
+        # The worker's launch-time delegation to the assistant (issue #594),
+        # read by the orchestrator-ask prompt fragment.
+        "LMER_SUPERVISOR_AUTHORITY": os.environ.get("LMER_SUPERVISOR_AUTHORITY"),
         "LMER_COMMS_TERMINAL_MIRROR": os.environ.get("LMER_COMMS_TERMINAL_MIRROR"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which

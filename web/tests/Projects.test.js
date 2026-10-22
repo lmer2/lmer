@@ -1149,6 +1149,23 @@ it('opens Ratchet\'s own run on its question badge and focuses the ask dock ther
   expect(wrapper.getComponent(RunDetail).props('focusQuestions')).toBeGreaterThan(first)
 })
 
+it('sets the supervisor authority, reads unset as none and clears the key for none', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const select = wrapper.getComponent('.supervisor-authority')
+  expect(select.props('modelValue')).toBe('none')
+  expect(select.props('label')).toBe('What Ratchet may approve for workers')
+  const save = () => wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  select.vm.$emit('update:modelValue', 'approvals')
+  await save()
+  await flushPromises()
+  expect(api.updateProject.mock.calls.at(-1)[1].settings.supervisor_authority).toBe('approvals')
+  select.vm.$emit('update:modelValue', 'none')
+  await save()
+  await flushPromises()
+  expect(api.updateProject.mock.calls.at(-1)[1].settings.supervisor_authority).toBeNull()
+})
+
 it('labels project execution overrides readably and says what an empty one inherits', async () => {
   const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
   await flushPromises()

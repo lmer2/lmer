@@ -35,6 +35,17 @@ const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
 const overrideKeys = ['model', 'harness', 'preset', 'agents']
 const overrideLabels = { model: 'Model', harness: 'Harness', preset: 'Preset', agents: 'Fan-out presets' }
+const authorityLevels = [
+  { value: 'none', title: 'None: its messages carry no approval' },
+  { value: 'approvals', title: 'Approvals: answer workers\' asks and say go within the task' },
+  { value: 'full', title: 'Full: direction and scope within a run\'s target' },
+]
+// Unset is `none`; choosing `none` clears the key rather than storing it, so
+// a project has opted in only when it holds a level.
+const supervisorAuthority = computed({
+  get: () => form.value.settings.supervisor_authority || 'none',
+  set: (value) => { form.value.settings.supervisor_authority = value === 'none' ? null : value },
+})
 
 // Each read or save of the orders takes a ticket, and only the latest one's reply lands:
 // two quick taps, or a save during a read, would otherwise let the older text win.
@@ -153,6 +164,9 @@ async function archive() {
       <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
         hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
       <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
+      <v-select v-model="supervisorAuthority" :items="authorityLevels" class="supervisor-authority mb-4"
+        :label="`What ${assistantName} may approve for workers`" :disabled="busy" persistent-hint
+        hint="Stamped on each of its messages to this project's workers. No level passes an operator-only gate such as spec approval or a merge." />
       <v-textarea v-model="channels" class="mention-channels mb-4" label="Mention channels (one per line)" rows="2"
         :disabled="busy || savedChannels === null" persistent-hint spellcheck="false"
         hint="Bot mentions here route to this project unless they name another one. Slack channel ID, #name or link; Matrix room ID, alias or link." />

@@ -120,6 +120,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from lmer_cli import comms as bus_comms
+
 from . import containers, registry
 from .assistant import KIND as ASSISTANT_KIND
 from .provenance import PLATFORM_PREFIX
@@ -293,7 +295,7 @@ def _iso_after(seconds: float) -> str:
 
 
 def _validated_note(note: Optional[str]) -> Optional[str]:
-    """The operator's addition to the prompt, or ``None``.
+    """The note added to the prompt, or ``None``; who added it is the caller's.
 
     Whitespace is collapsed rather than preserved: this text is appended to a
     payload that must not contain a newline (see the module docstring), and a note
@@ -310,6 +312,10 @@ def _validated_note(note: Optional[str]) -> Optional[str]:
     collapsed = " ".join(note.split())
     if not collapsed:
         return None
+    # Typed into a terminal after the platform's own prefix, so one of these
+    # could erase that prefix and type another (#594).
+    if bus_comms.holds_typed_controls(collapsed):
+        raise LifecycleError("a wind-down note may hold no control characters")
     if len(collapsed) > MAX_NOTE_CHARS:
         raise LifecycleError(
             f"wind-down note is {len(collapsed)} characters; the limit is "
@@ -318,20 +324,25 @@ def _validated_note(note: Optional[str]) -> Optional[str]:
     return collapsed
 
 
-def wind_down_prompt(note: Optional[str] = None) -> str:
+def wind_down_prompt(note: Optional[str] = None, *, added_by: str = "The operator") -> str:
     """The exact text a wind-down sends, so a caller can show it before sending.
 
     Public because the route returns it and the UI shows it: an operator about to
     interrupt a working agent should be able to read what it will be told, and a
     prompt that only exists inside the call that sends it cannot be reviewed.
+
+    *added_by* names whoever wrote the note, so the assistant's words are never
+    read as the operator's (#594).
     """
     validated = _validated_note(note)
     if not validated:
         return WIND_DOWN_PROMPT
-    return f"{WIND_DOWN_PROMPT} The operator added: {validated}"
+    return f"{WIND_DOWN_PROMPT} {added_by} added: {validated}"
 
 
-def wind_down(session_id: str, *, note: Optional[str] = None) -> WindDownReport:
+def wind_down(
+    session_id: str, *, note: Optional[str] = None, added_by: str = "The operator",
+) -> WindDownReport:
     """Ask a session's agent to wrap up and end itself. Signals nothing.
 
     Loud on delivery, quiet on bookkeeping, and that split is the point. Getting the
@@ -347,7 +358,7 @@ def wind_down(session_id: str, *, note: Optional[str] = None) -> WindDownReport:
     whole module: the prompt is an HTTP call into the container, so the death of a
     daemon's host PTY does not touch it (:mod:`lmer_platform.reattach`).
     """
-    prompt = wind_down_prompt(note)
+    prompt = wind_down_prompt(note, added_by=added_by)
     # Before the mark, so nothing claims a session was asked to wind down until it
     # has been. append_newline is the control plane's "and press Enter", without
     # which the paragraph sits unsent in the agent's input box.

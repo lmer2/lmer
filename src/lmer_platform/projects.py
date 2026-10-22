@@ -15,11 +15,16 @@ import threading
 import time
 import uuid
 
+from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS
+
 from . import project_context as scope, registry, store
 from . import assistant_history, runs
 
 logger = logging.getLogger(__name__)
 GENERAL = scope.GENERAL
+#: Project settings that are not assistant launch settings: they never reach an
+#: assistant start (issue #594, :mod:`lmer_platform.authority`).
+WORKER_SETTING_KEYS = ("supervisor_authority",)
 COLORS = (
     "Red", "Orange", "Amber", "Yellow", "Lime", "Green", "Emerald", "Teal",
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
@@ -351,10 +356,17 @@ def update(workspace_id, values):
     name = _name(values.get("name", current["name"]))
     color = _color(values.get("color", current["color"]))
     settings = values.get("settings", current["settings"])
-    if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS):
+    if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS) - set(WORKER_SETTING_KEYS):
         raise ProjectError("Invalid assistant overrides.")
     for key, value in settings.items():
-        if value is not None:
+        if value is None:
+            continue
+        if key == "supervisor_authority":
+            if value not in SUPERVISOR_AUTHORITY_LEVELS:
+                raise ProjectError(
+                    f"supervisor_authority must be one of {', '.join(SUPERVISOR_AUTHORITY_LEVELS)}."
+                )
+        else:
             validate_assistant_override(key, value)
     repositories = values.get("repositories", current["repositories"])
     if not isinstance(repositories, list) or any(not isinstance(item, str) or not item.strip() for item in repositories):

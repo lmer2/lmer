@@ -1557,7 +1557,11 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
         sources[key] = setting.source
     project_overrides = {}
     if projects.enabled():
-        project_overrides = projects.get(project_context.current() or projects.GENERAL)["settings"]
+        project_overrides = {
+            key: value
+            for key, value in projects.get(project_context.current() or projects.GENERAL)["settings"].items()
+            if key not in projects.WORKER_SETTING_KEYS
+        }
         if project_context.current() not in (None, projects.GENERAL):
             values["threads"], sources["threads"] = [], "project"
     for key, value in {**project_overrides, **(overrides or {})}.items():

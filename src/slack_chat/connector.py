@@ -24,7 +24,7 @@ import requests
 
 from ask_channel import bus
 from lmer_cli import thread_posts
-from lmer_cli.comms import CHANNEL_UBER, assistant_display_name, off_thread
+from lmer_cli.comms import CHANNEL_UBER, META_OPERATOR_ONLY, assistant_display_name, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
 from lmer_cli.connector_lifecycle import ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -273,11 +273,19 @@ def answer_binding(
     *,
     replies_to_question: bool = False,
     first_since_question: bool = False,
+    refuse_operator_only: bool = False,
 ) -> Optional[str]:
     """Bind only deliberate answers; return None for ordinary conversation.
 
+    *refuse_operator_only* is set for a thread post no human typed (the
+    platform's, a session's, a bot's): it never answers an operator-only
+    question, since the assistant can post into a worker's thread and the bus
+    would see only this connector's channel.
+
     See docs/COMMS.md for reply relations, options and the first free-text reply.
     """
+    if refuse_operator_only and (question.get("meta") or {}).get(META_OPERATOR_ONLY) is True:
+        return None
     options = list(question.get("options") or [])
     if replies_to_question:
         return option_for(text, options) or text
@@ -577,7 +585,8 @@ class SlackConnector(ConnectorLifecycle):
             kind, in_reply_to = "message", None
             oldest = self._oldest_open_question()
             if oldest is not None:
-                bound = answer_binding(text, oldest, first_since_question=self._first_since(oldest))
+                bound = answer_binding(text, oldest, first_since_question=self._first_since(oldest),
+                                       refuse_operator_only=poster is not None or not self._is_human(message))
                 if bound is not None:
                     kind, in_reply_to, text = "answer", oldest.get("id"), bound
             return {"question": oldest.get("id") if oldest else None,
@@ -653,6 +662,11 @@ class SlackConnector(ConnectorLifecycle):
 
     def _remember_notice(self, receipt):
         self._mirrored(receipt)
+
+    def _inert(self, text):
+        # Slack's three control characters: escaped, a quoted <!channel> or
+        # <@U…> renders as text instead of being posted again as the bot's own.
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _send_record(self, record):
         text = render_outbound(record, self._questions)

@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from lmer_cli import routing_receipts, runref
-from lmer_cli.comms import assistant_display_name
+from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS, assistant_display_name
 
 from lmer_platform.client import (
     Call,
@@ -356,7 +356,7 @@ def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
         "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
-        "title", "description", "targets",
+        "title", "description", "targets", "supervisor_authority",
     )))
     if args.references:
         body["references"] = [_reference_of(spec) for spec in args.references]
@@ -849,6 +849,13 @@ def create_parser() -> argparse.ArgumentParser:
         help="The run's label in the fleet view, in the operator's words.",
     )
     spawn.add_argument("--description", help="A longer note about the run.")
+    spawn.add_argument(
+        "--supervisor-authority", dest="supervisor_authority", choices=SUPERVISOR_AUTHORITY_LEVELS,
+        help=(
+            "This run's delegation to the assistant, instead of the project's setting. "
+            "The assistant's own credential may only narrow it."
+        ),
+    )
     spawn.set_defaults(call=_call_spawn)
 
     send = sub.add_parser(

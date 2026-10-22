@@ -187,7 +187,7 @@ from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state, session_record
 
 from . import (
-    ask, codex_config, containers, memory, meta, registry, runs, slots, statusline,
+    ask, authority, codex_config, containers, memory, meta, registry, runs, slots, statusline,
     uploads, workrepo,
 )
 from .config import (
@@ -769,6 +769,10 @@ class SpawnRequest:
     #: reach no launch argument — the run is told about them once its bus is up.
     references: Optional[list] = None
     workspace_id: Optional[str] = None
+    #: A per-spawn ``supervisor_authority`` override (issue #594). *capped* is
+    #: set when the caller is not the operator: then it may only narrow.
+    supervisor_authority: Optional[str] = None
+    supervisor_authority_capped: bool = True
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -3698,6 +3702,14 @@ def _spawn_session(
                 projects.require_admission(workspace_id)
         except projects.ProjectError as exc:
             raise SpawnError(str(exc)) from exc
+    supervisor_level, supervisor_override = authority.AUTHORITY_NONE, None
+    if kind == registry.WORKER_KIND:
+        try:
+            supervisor_level, supervisor_override = authority.spawn_level(
+                workspace_id, request.supervisor_authority, capped=request.supervisor_authority_capped,
+            )
+        except authority.AuthorityError as exc:
+            raise SpawnError(str(exc)) from exc
 
     if kind == registry.WORKER_KIND:
         live = _live_worker_count()
@@ -3806,6 +3818,7 @@ def _spawn_session(
             terminal_settings()["confirm_seconds"].value
         ),
         "LMER_PLATFORM_ASSISTANT_NAME": config.assistant_name,
+        authority.ENV: supervisor_level,
     }
     invocation_env.update(channels.env)
     invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
@@ -3900,6 +3913,7 @@ def _spawn_session(
                 # every poll (issue #312).
                 "slot_service_group": slot_group,
                 "slot_services": slot_services,
+                authority.TASK_KEY: supervisor_override,
                 # No key for ``request.session_id``, and that is a decision
                 # rather than an omission: unlike the flags above, the record a
                 # session writes in accounts for itself. The session appends its
