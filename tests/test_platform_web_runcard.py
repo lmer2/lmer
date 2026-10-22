@@ -1148,33 +1148,42 @@ def test_the_fleet_card_borders_the_row_that_is_not_a_run():
     )
 
 
-def test_the_drawer_swaps_the_state_icon_for_the_uber_lmer_mark():
+def test_the_drawer_rows_keep_a_tight_gap_between_icon_and_title():
+    """Issue 596: Vuetify's 32px icon gap took width the titles need."""
+    nav = _read(RUN_NAV)
+    assert re.search(r'<v-list\b[^>]*:prepend-gap="12"', nav), (
+        "the drawer's list leaves Vuetify's default gap between a row's icon and its title"
+    )
+
+
+def test_the_drawer_swaps_the_state_icon_for_ratchets_face():
     """The other half of that pass: "in the side list view instead of the play icon
-    show the robot icon".
+    show the robot icon", since issue 596 Ratchet's face, the one the app bar draws.
 
     A 40px row has no room for a border and the operator did not ask for one there, so
-    the drawer spends the channel it does have: the gutter. The filled robot is the
-    uber lmer mark wherever this app means the supervising session — the outline
-    variant is the driver chip's, i.e. a harness — so the two listings mark the same
-    session with the same glyph.
+    the drawer spends the channel it does have: the gutter.
 
     Pinned in both directions, because each failure is invisible on the screen the
     other one is fine on: without the swap the platform's own session wears a play
-    button like any running run, and without the fallback *every* row becomes a robot
+    button like any running run, and without the fallback *every* row becomes Ratchet
     and the drawer stops carrying urgency by shape at all.
 
     The row also keeps its ordinary ground: the tint that was here for one pass went
     with the fleet card's, and no scoped rule replaced it.
     """
     nav = _read(RUN_NAV)
-    swap = ':icon="isOrchestrator(run) ? mdiRobot : icon(run)"'
-    assert nav.count(swap) == 1, (
-        f"the drawer's leading icon is not {swap} exactly once; the mark and the "
-        "state icon are one binding, and either half missing is a gutter that lies"
+    prepend = nav[nav.index("<template #prepend>"):]
+    prepend = prepend[:prepend.index("</template>")]
+    assert re.search(r'<RatchetFace\s+v-if="isOrchestrator\(run\)"', prepend), (
+        "the drawer's orchestrator row does not wear Ratchet's face, the mark the app "
+        "bar draws for the same session"
     )
-    assert "mdiRobot," in nav.split("} from '@mdi/js'")[0], (
-        "the drawer's glyph is not the filled mdiRobot from @mdi/js, so the mark the "
-        "fleet card badges this session with is not the one the drawer shows"
+    assert re.search(r'<v-icon\s+v-else\b[^>]*:icon="icon\(run\)"', prepend), (
+        "the state icon is not the fallback for every other row, so the drawer stops "
+        "carrying urgency by shape"
+    )
+    assert "./assets/ratchet" not in nav, (
+        "the drawer spells the face's path itself instead of using RatchetFace"
     )
     assert "orchestrator-row" not in nav, (
         "the drawer still classes the orchestrator row, which is the tint the "

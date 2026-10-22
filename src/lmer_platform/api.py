@@ -54,6 +54,7 @@ import base64
 import binascii
 import concurrent.futures
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -338,6 +339,19 @@ async def _close_quietly(websocket) -> None:
         await websocket.close()
 
 
+def _lmer_version() -> Optional[str]:
+    """The installed lmer's version, or None when it has no package metadata."""
+    try:
+        return importlib.metadata.version("lmer")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+# Read once, when the daemon imports this module: the footer names the code that is
+# serving, not whatever a later upgrade left on disk (issue 596).
+_LMER_VERSION = _lmer_version()
+
+
 def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
     """Operator-visible configuration. Carries no secret and no credentialed URL.
 
@@ -360,6 +374,7 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions,
         "max_followup_rounds": config.max_followup_rounds,
         "assistant_name": config.assistant_name,
+        "version": _LMER_VERSION,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
         **fleet_group_settings(),
