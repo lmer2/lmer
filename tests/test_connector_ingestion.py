@@ -343,3 +343,24 @@ def test_a_record_the_bus_refuses_is_dropped_with_a_note_not_retried(channel, tm
         rig.connector.stop(timeout=DRAIN)
         rig.bus._session._http.close()
         rig.log.close()
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+def test_the_refusal_notice_names_the_session_it_did_not_reach(channel, tmp_path, monkeypatch):
+    """A thread may hold several sessions, so "didn't reach the session" has to
+    say which, with the same tag as every other connector notice (#574)."""
+    rig = (SlackRig if channel == "slack" else MatrixRig)(tmp_path)
+    monkeypatch.setattr(rig.connector, "_speaker_label", lambda: "develop <574>")
+    remote, poll = _thread(channel, rig)
+    try:
+        remote.human_says("x" * (comms.MAX_TEXT_CHARS[comms.KIND_MESSAGE] + 1))
+        poll()
+        posted = ([text for _, _, text in rig.slack.posted] if channel == "slack"
+                  else [sent[2] for sent in rig.matrix.sent])
+        (notice,) = [text for text in posted if "didn't reach the session" in text]
+        tag = "[develop &lt;574&gt;]" if channel == "slack" else "[develop <574>]"
+        assert notice.startswith(f"{tag} This message didn't reach the session: "), notice
+    finally:
+        rig.connector.stop(timeout=DRAIN)
+        rig.bus._session._http.close()
+        rig.log.close()

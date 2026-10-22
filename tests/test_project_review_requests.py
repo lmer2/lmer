@@ -9,7 +9,7 @@ import pytest
 from lmer_platform import api, assistant, config, lifecycle, project_requests, projects, spawn, store
 from lmer_platform import project_context as scope
 from tests.test_platform_projects import fleet  # noqa: F401
-from tests.test_platform_project_transports import transport_host, _link, _next, _post  # noqa: F401
+from tests.test_platform_project_transports import transport_host, _link, _next, _post, _reply  # noqa: F401
 from tests.test_assistant_mentions import body
 from lmer_cli import thread_access
 from lmer_cli.threads import ThreadError
@@ -314,7 +314,7 @@ def test_operator_parks_uncertain_reply_without_resend_and_releases_after_rotati
     assert client.post("/api/assistant/instructions", headers=headers, json={"instructions": "Unbound independent work"}).status_code == 200
     assert client.post(f"/api/assistant/requests/{identity}/reply", json={"text": "Never resend"}).status_code == 409
     assert _post(client, request)["status"] == "duplicate"
-    assert [post[2] for post in remote.posts] == ["Uncertain answer", "Independent answer"]
+    assert [post[2] for post in remote.posts] == [_reply(project["id"], "Uncertain answer"), _reply(project["id"], "Independent answer")]
     assert client.post(f"/api/projects/{project['id']}/archive").status_code == 409
     listed = client.get("/api/assistant/requests", params={"workspace_id": project["id"]}).json()["requests"]
     retained = next(row for row in listed if row["id"] == identity)

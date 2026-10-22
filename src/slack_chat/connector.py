@@ -26,7 +26,7 @@ from ask_channel import bus
 from lmer_cli import thread_posts
 from lmer_cli.comms import CHANNEL_UBER, META_OPERATOR_ONLY, assistant_display_name, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired, verified_rejection
-from lmer_cli.connector_lifecycle import ConnectorLifecycle
+from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.thread_access import UploadStore, outbound_file, slack_upload_refusal, withheld_note
 from lmer_cli.thread_requests import MAX_READ_LIMIT
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConnectorConfig", "SlackConnector", "render_outbound", "option_for",
-    "post_replay_notice", "replay_stamp", "attachment_notice",
+    "post_replay_notice", "replay_stamp", "attachment_notice", "detach_notice",
     "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "SUBSCRIBER", "CHANNEL", "main",
     "ATTACH_ACK", "DETACH_NOTE", "ATTACH_ACK_ENV", "ATTACH_FROM_NOW_ENV",
     "ATTACH_SINCE_ENV",
@@ -63,18 +63,26 @@ ATTACH_FROM_NOW_ENV = "LMER_CHAT_ATTACH_FROM_NOW"
 #: Initial cursor when neither a durable checkpoint nor a subscriber ack exists.
 ATTACH_SINCE_ENV = "LMER_CHAT_ATTACH_SINCE"
 
-#: The two lines a connector says for itself. Deliberately short, deliberately
-#: about listening rather than about a session: what a human in the thread needs
-#: is whether anything is reading what they write. The matrix connector imports
-#: these rather than writing its own, so the two transports cannot drift.
+#: The two lines a connector says for itself, as said before the session's
+#: speaker tag is known; :func:`attachment_notice` and :func:`detach_notice` add
+#: it. The matrix connector imports these rather than writing its own, so the
+#: two transports cannot drift.
 ATTACH_ACK = "🔗 lmer is listening in this thread."
 DETACH_NOTE = "🔌 lmer has stopped listening in this thread."
 
 
-def attachment_notice(launch_settings: Optional[dict], *, slack_markup: bool = True) -> str:
+def _as_speaker(line: str, speaker: Optional[str], slack_markup: bool) -> str:
+    tag = thread_posts.speaker_tag(speaker, slack_markup=slack_markup)
+    return f"{line[:-1]} as {tag}." if tag else line
+
+
+def attachment_notice(
+    launch_settings: Optional[dict], *, slack_markup: bool = True, speaker: Optional[str] = None,
+) -> str:
     """Format launch labels for Slack markup or a Matrix plain-text body."""
+    ack = _as_speaker(ATTACH_ACK, speaker, slack_markup)
     if launch_settings is None:
-        return ATTACH_ACK
+        return ack
 
     def label(key, unset):
         value = launch_settings.get(key)
@@ -83,7 +91,11 @@ def attachment_notice(launch_settings: Optional[dict], *, slack_markup: bool = T
         text = " ".join(scrub_text(value).split())[:160]
         return html.escape(text, quote=False) if slack_markup else text
 
-    return ATTACH_ACK + f" Preset: {label('preset', 'none')}; model: {label('model', 'harness default')}."
+    return ack + f" Preset: {label('preset', 'none')}; model: {label('model', 'harness default')}."
+
+
+def detach_notice(speaker: Optional[str] = None, *, slack_markup: bool = True) -> str:
+    return _as_speaker(DETACH_NOTE, speaker, slack_markup)
 
 
 #: The supervisor caps a long-poll at 30 s.
@@ -117,6 +129,8 @@ class ConnectorConfig:
     #: Seconds to wait for a supervisor that is not up yet (the host CLI starts
     #: this connector before it launches the container).
     connect_budget: float = bus.DEFAULT_CONNECT_BUDGET
+    #: See :data:`lmer_cli.connector_lifecycle.PLATFORM_SESSION_ENV`.
+    platform_session: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -173,6 +187,7 @@ class ConnectorConfig:
                 _int_env(environ.get(ATTACH_SINCE_ENV))
                 if attach_since is None else attach_since
             ),
+            platform_session=(environ.get(PLATFORM_SESSION_ENV) or "").strip() or None,
         )
 
 
@@ -200,13 +215,15 @@ def _head(text: str, limit: int = 80) -> str:
 
 def render_outbound(
     record: dict, questions: Optional[dict] = None, *, own_channel: str = CHANNEL,
+    speaker: Optional[str] = None, slack_markup: bool = True,
 ) -> Optional[str]:
     """The thread text for one bus record, or ``None`` when the record came from
     the thread this render is for, or is a quiet progress note.
 
     *questions* maps question id → record, for the answer lines. *own_channel*
     is whose thread is being rendered: the matrix connector renders with the
-    same code and must skip matrix's records, not Slack's.
+    same code and must skip matrix's records, not Slack's. *speaker* is the
+    session's own tag (#574), put on what the session itself said.
 
     A ``close`` is bookkeeping the humans in the thread already know about (they
     are the ones who answered), so it is skipped too — it stays on the bus, the
@@ -221,8 +238,16 @@ def render_outbound(
     text = str(record.get("text") or "")
     meta = record.get("meta") or {}
     agent = source.get("channel") in (None, "agent")
+    # The session itself speaking: a worker's agent channel, or the assistant's
+    # own records, which the supervisor alone marks — the assistant also writes
+    # onto worker buses as "uber-lmer", and those are not the worker speaking.
+    own = agent or meta.get("session_origin") is True
+    # Before the speaker is known, the assistant still goes by its display name.
+    fallback = None if agent else _who(source)
+    tag = thread_posts.speaker_tag(speaker or fallback, slack_markup=slack_markup) if own else ""
+    said = f"{tag} {text}" if tag else text
     if kind == "question":
-        lines = [f"❓ {text}"]
+        lines = [f"❓ {said}"]
         options = record.get("options") or []
         for index, option in enumerate(options, start=1):
             lines.append(f"{index}. {option}")
@@ -240,14 +265,14 @@ def render_outbound(
         else:
             body = f"✅ answered{about} from {_who(source)}: {text}"
     elif kind == "milestone":
-        body = f"🏁 {text}"
+        body = f"🏁 {said}"
     elif kind == "command":
         body = f"⌨️ [{_who(source)}] {text}"
     elif kind == "message":
         label = _who(source)
         if meta.get("fidelity") in ("reconstructed", "confirmed"):
             label += " · typed"
-        body = text if agent else f"💬 [{label}] {text}"
+        body = said if own else f"💬 [{label}] {text}"
         # Where it went, when it went somewhere else (issue #414): the record is
         # on this session's bus because the run said it, but it was posted into a
         # thread this session is not connected to, and a reader here would
@@ -255,7 +280,7 @@ def render_outbound(
         if agent and meta.get("thread"):
             body = f"↗️ posted into {meta['thread']}:\n{body}"
     else:
-        body = f"[{kind}] {text}" if agent else f"[{_who(source)}] {kind}: {text}"
+        body = f"{tag} [{kind}] {text}".lstrip() if own else f"[{_who(source)}] {kind}: {text}"
     for item in record.get("attachments") or []:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
@@ -372,7 +397,6 @@ class SlackConnector(ConnectorLifecycle):
     """Two loops on two threads, one thread in Slack. See the module docstring."""
 
     _transport_fields = ("_cursor_ts", "_accepted_inbound")
-    _detach_note = DETACH_NOTE
     _bus_poll_seconds = BUS_POLL_SECONDS
 
     def __init__(
@@ -653,7 +677,10 @@ class SlackConnector(ConnectorLifecycle):
         self._acquire(ThreadKey(CHANNEL, self.config.channel, self.config.thread_ts))
 
     def _attachment_notice(self):
-        return attachment_notice(self._launch_settings)
+        return attachment_notice(self._launch_settings, speaker=self._speaker_label())
+
+    def _detach_notice(self):
+        return detach_notice(self._speaker_label())
 
     def _send_notice(self, text):
         text = scrub_text(text)
@@ -663,13 +690,19 @@ class SlackConnector(ConnectorLifecycle):
     def _remember_notice(self, receipt):
         self._mirrored(receipt)
 
+    def _tagged_notice(self, text):
+        return thread_posts.tagged(self._speaker_label(), text, slack_markup=True)
+
     def _inert(self, text):
         # Slack's three control characters: escaped, a quoted <!channel> or
         # <@U…> renders as text instead of being posted again as the bot's own.
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _send_record(self, record):
-        text = render_outbound(record, self._questions)
+        self._ensure_ready()
+        text = self._pending_text(record) or render_outbound(
+            record, self._questions, speaker=self._speaker_label(),
+        )
         if text is None:
             return
         self._deliver_part(record, "text", {"text": text},
@@ -724,7 +757,8 @@ class SlackConnector(ConnectorLifecycle):
                     if upload is not None:
                         payload = {**identity, "file_id": upload["file_id"]}
                 if payload is None:
-                    payload = {"text": scrub_text(prepared.note), "index": index}
+                    note = thread_posts.tagged(self._speaker_label(), prepared.note, slack_markup=True)
+                    payload = {"text": scrub_text(note), "index": index}
             if "file_id" in payload:
                 self._uploaded.add(payload["file_id"])
                 poster = thread_posts.Poster.for_session(self._posters.session)
@@ -748,7 +782,10 @@ class SlackConnector(ConnectorLifecycle):
                 reason = slack_upload_refusal(exc) if "file_id" in payload else None
                 if reason is None:
                     raise
-                note = scrub_text(withheld_note(payload["name"], reason))
+                committed = pending["parts"].get(part + ":note")
+                note = committed["payload"]["text"] if committed else scrub_text(thread_posts.tagged(
+                    self._speaker_label(), withheld_note(payload["name"], reason), slack_markup=True,
+                ))
                 self._deliver_part(
                     record, part + ":note", {"text": note, "index": index},
                     lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, note),

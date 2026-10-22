@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import html
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ __all__ = [
     "matrix_content", "poster_from_matrix", "poster_from_slack", "record",
     "lookup", "REGISTRY_DIR", "ENTRY_TTL_SECONDS", "MAX_ENTRIES",
     "Attribution", "INGEST", "SKIP", "WAIT", "GRACE_SECONDS", "HELD_LIMIT",
-    "WROTE_LIMIT",
+    "WROTE_LIMIT", "speaker_tag", "tagged",
 ]
 
 #: A run said it, through its thread servicer.
@@ -144,6 +145,20 @@ class Poster:
             origin, session=session,
             label=label if isinstance(label, str) and label else None,
         )
+
+
+def speaker_tag(label: object, *, slack_markup: bool) -> str:
+    """``[label]``, the visible half of a post's attribution (#574): one line,
+    and escaped for Slack, where a title holding ``<!channel>`` would ping."""
+    text = " ".join(str(label or "").split())
+    if slack_markup:
+        text = html.escape(text, quote=False)
+    return f"[{text}]" if text else ""
+
+
+def tagged(label: object, text: str, *, slack_markup: bool) -> str:
+    tag = speaker_tag(label, slack_markup=slack_markup)
+    return f"{tag} {text}" if tag else text
 
 
 # ---------------------------------------------------------------------------

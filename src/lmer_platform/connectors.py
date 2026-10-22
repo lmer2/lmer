@@ -34,7 +34,7 @@ from ask_channel import bus
 
 from lmer_cli import thread_access
 from lmer_cli.connector_delivery import RecoveryRequired, checkpoint_path, marker_path
-from lmer_cli.connector_lifecycle import EXIT_RECOVERY
+from lmer_cli.connector_lifecycle import EXIT_RECOVERY, PLATFORM_SESSION_ENV
 from lmer_cli.connector_ownership import Lease, OwnershipError, ThreadKey
 from lmer_cli.connector_process import OwnedProcess, reclaim_orphan, spawn_child, spawn_owned
 from lmer_cli.connector_recovery import Recovery
@@ -992,6 +992,9 @@ class ThreadConnectors:
         if isinstance(cursor, int) and not isinstance(cursor, bool):
             env[ATTACH_SINCE_ENV] = str(cursor)
         env["LMER_SUPERVISOR_URL"] = f"http://{endpoint.host}:{endpoint.port}"
+        # The speaker tag is looked up by this id; the supervisor knows only the
+        # container's own (#574).
+        env[PLATFORM_SESSION_ENV] = session_id
         # In the environment and not in argv: argv is readable from /proc by
         # every account on the host, and this is the credential that opens the
         # session's control plane.

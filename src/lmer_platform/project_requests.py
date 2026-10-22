@@ -5,9 +5,9 @@ import hashlib
 import json
 import re
 
-from lmer_cli import thread_access
+from lmer_cli import thread_access, thread_posts
 from lmer_cli.threads import ThreadError
-from . import assistant, channel_routes, project_context as scope, project_threads, projects, store
+from . import assistant, channel_routes, project_context as scope, project_threads, projects, session_threads, store
 from .transcripts import scrub_credentials
 from . import assistant_conversation
 
@@ -244,13 +244,26 @@ def _queue(db, row, project_id, ownership):
                (project_id, json.dumps(ownership), json.dumps(payload), row["id"]))
 
 
-def _reply_source(row, text, client=None):
+def _reply_source(row, text, client=None, *, poster=None):
     payload = row["payload"]
     if client is None:
         ref, client, _ = thread_access.resolve_thread(payload["permalink"])
     if row["transport"] == "slack":
-        return client.post_message(row["conversation"], row["root"], text)
-    return client.send_thread_text(row["conversation"], row["root"], text)
+        ts = client.post_message(row["conversation"], row["root"], text)
+        if poster is not None:
+            thread_posts.record(row["conversation"], ts, poster)
+        return ts
+    return client.send_thread_text(row["conversation"], row["root"], text,
+                                   extra=thread_posts.matrix_content(poster))
+
+
+def _reply_as_assistant(row, text, client=None):
+    """The project's assistant answering in the source thread, tagged and
+    stamped like its ``lmer-ctl thread post`` (#574, #427)."""
+    label = session_threads.assistant_label(row["project_id"])
+    tagged = thread_posts.tagged(label, text, slack_markup=row["transport"] == "slack")
+    return _reply_source(row, tagged, client,
+                         poster=thread_posts.Poster.for_platform(label))
 
 
 def _notice(row, text, client=None):
@@ -542,7 +555,7 @@ def reply(identity, text, *, workspace_id, session_id):
         with projects.database() as db:
             db.execute("UPDATE requests SET state='reply_sending' WHERE id=?", (identity,))
         try:
-            ref = _reply_source(row, text, client)
+            ref = _reply_as_assistant(row, text, client)
         except Exception as exc:
             with projects.database() as db:
                 db.execute("UPDATE requests SET state='reply_uncertain',error=? WHERE id=?",

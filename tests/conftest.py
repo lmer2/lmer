@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 import pytest
 
-from lmer_cli import gate_lock, precommit_cache, runtime, user_harnesses
+from lmer_cli import connector_lifecycle, gate_lock, precommit_cache, runtime, user_harnesses
 from lmer_cli.container import spawn_harness
 
 # Read-only toolchain lookup still uses the installed runtime root after the
@@ -121,6 +121,14 @@ def routing_call(tmp_path, monkeypatch):
 
     select()
     return select
+
+
+@pytest.fixture(autouse=True)
+def untagged_speaker(monkeypatch):
+    """Connectors post without a speaker tag unless a test asks for one, so what
+    a record or notice says does not depend on platform state; the tag has its
+    own tests (tests/test_thread_speaker.py)."""
+    monkeypatch.setattr(connector_lifecycle, "resolve_speaker", lambda session, **kwargs: None)
 
 
 def drain_connectors(instances, budget, *, announce=True):
