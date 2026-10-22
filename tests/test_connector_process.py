@@ -449,3 +449,24 @@ def test_failed_parent_handoff_collects_real_child_before_releasing_lease(child,
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
         child.close()
+
+
+def test_a_direct_connector_never_inherits_a_platform_session_id(monkeypatch):
+    """A shell ``lmer chat`` has no platform session: its connector tags with the
+    supervisor's session id, so an inherited platform id must not reach it (#574)."""
+    # The module, not the ``spawn_owned`` imported above: ``_spawn`` looks it up there.
+    from lmer_cli import connector_process
+
+    monkeypatch.setenv("LMER_CHAT_PLATFORM_SESSION", "s-stale")
+    captured = {}
+
+    def spawn_owned(key, argv, env, **kwargs):
+        captured["env"] = connector_process.child_environment(env)
+
+    monkeypatch.setattr(connector_process, "spawn_owned", spawn_owned)
+    owner = connector_process.ConnectorProcess("slack", "C1", "1.0", "https://example.slack.com/archives/C1/p1000000",
+                                              ("http://127.0.0.1:1", "tok"))
+    owner._resolved = True
+    monkeypatch.setattr(owner, "_session", lambda: "sess-1")
+    owner._spawn()
+    assert captured["env"]["LMER_CHAT_PLATFORM_SESSION"] == ""

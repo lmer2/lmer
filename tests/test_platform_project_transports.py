@@ -17,11 +17,16 @@ from tests.test_platform_projects import fleet  # noqa: F401
 from tests.test_assistant_mentions import Slack, Matrix, body, SLACK_USER, MATRIX_USER
 from slack_chat.permalink import slack_thread_link
 from matrix_chat.permalink import matrix_to_link
-from lmer_platform import lifecycle, registry
+from lmer_platform import lifecycle, registry, session_threads
 from slack_chat import listener as slack_listener
 from matrix_chat import listener as matrix_listener
 from tests.connector_fakes import SlackRig, MatrixRig
 from tests.timing_budgets import DRAIN
+
+
+def _reply(workspace_id, text):
+    """A project assistant's source-thread reply, speaker-tagged (#574)."""
+    return f"[{session_threads.assistant_label(workspace_id)}] {text}"
 
 
 @pytest.fixture
@@ -161,7 +166,7 @@ def test_bound_threads_use_own_project_and_reply_only_to_source(transport_host, 
     reply = client.post(f"/api/assistant/requests/{accepted['request_id']}/reply", json={"text": "source answer"},
                         headers={"Authorization": f"Bearer {token}"})
     assert reply.status_code == 200, reply.text
-    assert transports[transport].posts[-1] == (request["conversation"], notes[0]["data"]["root"], "source answer")
+    assert transports[transport].posts[-1] == (request["conversation"], notes[0]["data"]["root"], _reply(alpha["id"], "source answer"))
     again = client.post(f"/api/assistant/requests/{accepted['request_id']}/reply", json={"text": "duplicate"},
                         headers={"Authorization": f"Bearer {token}"})
     assert again.json()["duplicate"] is True
@@ -233,7 +238,7 @@ def test_project_name_or_general_admission_and_source_reply(transport_host, flee
     headers = {"Authorization": f"Bearer {credential}"}
     response = client.post(path, headers=headers, json={"text": "source answer"})
     assert response.status_code == 200, response.text
-    assert transports[transport].posts == [(request["conversation"], data["root"], "source answer")]
+    assert transports[transport].posts == [(request["conversation"], data["root"], _reply(selected, "source answer"))]
     assert client.post(path, headers=headers, json={"text": "source answer"}).json()["duplicate"]
     assert _post(client, request)["status"] == "duplicate"
     assert len(transports[transport].posts) == 1

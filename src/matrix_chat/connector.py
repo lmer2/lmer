@@ -21,13 +21,13 @@ from ask_channel import bus
 from lmer_cli import thread_posts
 from lmer_cli.comms import off_thread
 from lmer_cli.connector_delivery import RecoveryRequired
-from lmer_cli.connector_lifecycle import ConnectorLifecycle
+from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.thread_access import UploadStore, outbound_file, withheld_note
 from lmer_cli.util import get_bool_env
 from matrix_bridge.scrub import scrub_text
 from slack_chat.connector import (
-    ATTACH_ACK, ATTACH_ACK_ENV, ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV, DETACH_NOTE,
+    ATTACH_ACK, ATTACH_ACK_ENV, ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV, DETACH_NOTE, detach_notice,
     _int_env, _with_references, answer_binding, attachment_notice, option_for,
     post_replay_notice, render_outbound as _render_slack, replay_stamp,
 )
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConnectorConfig", "MatrixConnector", "render_outbound", "strip_reply_fallback",
-    "resolve_thread_root", "CHANNEL", "SUBSCRIBER", "ATTACH_ACK", "main",
+    "resolve_thread_root", "CHANNEL", "SUBSCRIBER", "ATTACH_ACK", "DETACH_NOTE", "main",
 ]
 
 CHANNEL = "matrix"
@@ -88,6 +88,8 @@ class ConnectorConfig:
     #: Seconds to wait for a supervisor that is not up yet (the host CLI starts
     #: this connector before it launches the container).
     connect_budget: float = bus.DEFAULT_CONNECT_BUDGET
+    #: See :data:`lmer_cli.connector_lifecycle.PLATFORM_SESSION_ENV`.
+    platform_session: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -143,6 +145,7 @@ class ConnectorConfig:
             ),
             uploads_dir=uploads_dir, container_uploads_dir=container_uploads_dir,
             connect_budget=bus.connect_budget(environ),
+            platform_session=(environ.get(PLATFORM_SESSION_ENV) or "").strip() or None,
         )
 
     @property
@@ -150,7 +153,9 @@ class ConnectorConfig:
         return MatrixAccount(homeserver=self.homeserver, user_id=self.user_id, access_token=self.access_token)
 
 
-def render_outbound(record: dict, questions: Optional[dict] = None) -> Optional[str]:
+def render_outbound(
+    record: dict, questions: Optional[dict] = None, *, speaker: Optional[str] = None,
+) -> Optional[str]:
     """Thread text, or ``None`` for quiet notes and matrix's own records.
 
     The same rendering the Slack connector uses (numbered options, who answered
@@ -159,7 +164,7 @@ def render_outbound(record: dict, questions: Optional[dict] = None) -> Optional[
     bridge scrubs everything it posts. A ``close`` renders as ``None`` here too:
     it stays on the bus, the platform and the transcript (issue #579).
     """
-    text = _render_slack(record, questions, own_channel=CHANNEL)
+    text = _render_slack(record, questions, own_channel=CHANNEL, speaker=speaker, slack_markup=False)
     if text is None:
         return None
     text = scrub_text(text)
@@ -192,7 +197,6 @@ def resolve_thread_root(event: dict) -> str:
 
 class MatrixConnector(ConnectorLifecycle):
     _transport_fields = ("_seen", "_next_batch", "_last_event_id", "_question_events")
-    _detach_note = DETACH_NOTE
     _bus_poll_seconds = BUS_POLL_SECONDS
 
     def __init__(
@@ -301,7 +305,9 @@ class MatrixConnector(ConnectorLifecycle):
 
     def _post_outbound(self, record, questions):
         self._ensure_ready()
-        text = render_outbound(record, questions)
+        text = self._pending_text(record) or render_outbound(
+            record, questions, speaker=self._speaker_label(),
+        )
         if text is None:
             return True
         def remember(receipt):
@@ -349,6 +355,7 @@ class MatrixConnector(ConnectorLifecycle):
                     else:
                         clean = prepared.data
                 if note is not None:
+                    note = thread_posts.tagged(self._speaker_label(), note, slack_markup=False)
                     payload = {"text": note, "index": index}
                 else:
                     identity = {"index": index, "name": name, "sha256": hashlib.sha256(clean).hexdigest(),
@@ -636,12 +643,18 @@ class MatrixConnector(ConnectorLifecycle):
             self._acquire(ThreadKey(CHANNEL, self.room_id, self.config.thread_event))
 
     def _attachment_notice(self):
-        return attachment_notice(self._launch_settings, slack_markup=False)
+        return attachment_notice(self._launch_settings, slack_markup=False, speaker=self._speaker_label())
+
+    def _detach_notice(self):
+        return detach_notice(self._speaker_label(), slack_markup=False)
 
     def _send_notice(self, text):
         return self.matrix.send_thread_text(self.room_id, self.config.thread_event, text,
                                            last_event_id=self._last_event_id, msgtype="m.notice",
                                            extra={"net.20c.lmer.connection": True})
+
+    def _tagged_notice(self, text):
+        return thread_posts.tagged(self._speaker_label(), text, slack_markup=False)
 
     def _remember_notice(self, receipt):
         self._seen.add(receipt)

@@ -11,7 +11,7 @@ from lmer_cli import assistant_mentions, thread_access
 from lmer_platform import client as platform_client, connectors, daemon
 from slack_chat.client import SlackError
 from tests.test_platform_projects import fleet  # noqa: F401
-from tests.test_platform_project_transports import transport_host, _link, _post, _next  # noqa: F401
+from tests.test_platform_project_transports import transport_host, _link, _post, _next, _reply  # noqa: F401
 from tests.test_project_review_requests import credential, actions
 from tests.test_assistant_mentions import body
 
@@ -76,7 +76,7 @@ def test_source_attachment_allows_brief_reply_and_release(transport_host, fleet,
     assert [item[0] for item in briefs] == [worker]
     reply = client.post(f"/api/assistant/requests/{identity}/reply", headers=headers, json={"text": "Worker started"})
     assert reply.status_code == 200, reply.text
-    assert transports[transport].posts == [(request["conversation"], project_requests.get(identity)["root"], "Worker started")]
+    assert transports[transport].posts == [(request["conversation"], project_requests.get(identity)["root"], _reply(project["id"], "Worker started"))]
     duplicate = client.post("/api/sessions", headers=headers, json=payload)
     assert duplicate.status_code == 201, duplicate.text
     assert duplicate.json()["session_id"] == worker
@@ -418,7 +418,7 @@ def test_daemon_mention_spawn_brief_reply_release(transport_host, fleet, monkeyp
         assert client.post(f"/api/sessions/{worker}/comms", headers=headers, json={"text": "Review the behavior"}).status_code == 200
         assert [row[0] for row in briefs] == [worker]
         assert client.post(f"/api/assistant/requests/{identity}/reply", headers=headers, json={"text": "Review started"}).status_code == 200
-        assert transports["slack"].posts == [(event["conversation"], event["event"]["thread_ts"], "Review started")]
+        assert transports["slack"].posts == [(event["conversation"], event["event"]["thread_ts"], _reply(project["id"], "Review started"))]
         assert client.post("/api/assistant/pending", headers=headers).json()["pending"] == []
         assert project_requests.active(project["id"]) is None
         assert [row["state"] for row in stored_actions(identity)] == ["complete", "complete"]

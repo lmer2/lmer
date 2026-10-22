@@ -2259,7 +2259,10 @@ def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
     """Who a thread is told wrote a post the platform made: from the credential,
     never from the body — the rule the bus already applies to ``source.channel``."""
     if caller.is_assistant:
-        return config.assistant_name
+        return session_threads.assistant_label(
+            project_scope.current() if projects.enabled() else None,
+            name=config.assistant_name,
+        )
     if caller.kind == CALLER_CONNECTOR and caller.channel:
         return caller.channel
     return CALLER_OPERATOR

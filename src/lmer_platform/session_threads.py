@@ -23,11 +23,12 @@ import logging
 from typing import Optional
 
 from lmer_cli import runref, thread_access
+from lmer_cli.comms import assistant_display_name
 from lmer_cli.thread_posts import Poster
 from lmer_cli.threads import ThreadError
 
 from . import config as cfg
-from . import connectors, meta, runs
+from . import connectors, meta, projects, registry, runs
 from .projects import session_operation
 from . import project_threads
 
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BY_AGENT", "SessionThreads", "connect", "disconnect", "disconnect_link",
-    "open_for", "root_message", "run_label",
+    "open_for", "root_message", "run_label", "speaker_label", "assistant_label",
 ]
 
 #: What a connection made by the run itself is recorded as having been made by.
@@ -177,12 +178,64 @@ def run_label(session_id: str) -> str:
     is what makes the thread traceable to a run at all.
     """
     try:
-        identity = _identity(session_id)
-        if identity is None:
-            return f"lmer session {session_id}"
-        return meta.read(*identity).title or identity[2]
+        return _run_name(session_id)
     except Exception:
         return f"lmer session {session_id}"
+
+
+def _run_name(session_id: str) -> str:
+    identity = runs.run_for_session(session_id)
+    if identity is None:
+        return f"lmer session {session_id}"
+    return meta.read(*identity).title or identity[2]
+
+
+def assistant_label(workspace_id: Optional[str], *, name: Optional[str] = None) -> str:
+    """``<assistant> · <project>``, or the bare assistant name without
+    projects (#574).
+
+    *name* is the resolved display name (``config.assistant_name``) when the
+    caller has it; without it the environment decides, which the daemon and
+    its connector children are given (#581).
+    """
+    speaker = (name or "").strip() or assistant_display_name()
+    try:
+        return _assistant_name(workspace_id, speaker)
+    except Exception:
+        return speaker
+
+
+def _assistant_name(workspace_id: Optional[str], speaker: str) -> str:
+    if not workspace_id:
+        return speaker
+    name = " ".join(str(projects.get(workspace_id)["name"]).split())
+    return f"{speaker} · {name}" if name else speaker
+
+
+def speaker_label(session_id: str, *, known_only: bool = False) -> Optional[str]:
+    """The ``[speaker]`` tag every post this session makes into a thread
+    carries (#574): :func:`assistant_label` for the assistant, :func:`run_label`
+    for a run.
+
+    A lookup that fails falls back to a guess. With *known_only* it returns
+    ``None`` instead, so a caller already holding a good tag can keep it: a
+    rotated assistant's entry is gone before its last posts are.
+    """
+    try:
+        entry = registry.read_session(session_id)
+    except Exception:
+        entry = None
+    if entry is None:
+        return None if known_only else run_label(session_id)
+    assistant = entry.get("kind") == registry.ASSISTANT_KIND
+    try:
+        if assistant:
+            return _assistant_name(projects.session_home(session_id), assistant_display_name())
+        return _run_name(session_id)
+    except Exception:
+        if known_only:
+            return None
+        return assistant_display_name() if assistant else f"lmer session {session_id}"
 
 
 def _identity(session_id: str):

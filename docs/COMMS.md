@@ -973,7 +973,8 @@ is never blindly replayed. The connector runs until stopped:
 - **outbound**: long-polls the supervisor's `GET /messages`, omits quiet notes
   and records from its own channel, and posts the rest (a question with numbered options,
   an answer from another channel with who gave it, milestones with a
-  glyph, other channels' messages tagged `[Ratchet] …`), and acks its
+  glyph, other channels' messages tagged `💬 [<channel> · <author>] …`; what the
+  session says itself carries its speaker tag, below), and acks its
   position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`).
   Every posted text, Slack's and matrix's alike, goes through the shared
   value-and-shape credential scrub *before* it is clipped, so options display
@@ -1203,6 +1204,60 @@ sight. A hold that does expire is logged, at most once every 10 minutes —
 because the alternative is that this failure looks exactly like the one it
 replaced (nothing, anywhere), and a single line per connector would be spent on
 the first benign expiry and silent about a stamp that broke an hour later.
+
+### Who is speaking: the speaker tag
+
+Several sessions can share one thread through one Slack app or one matrix bot
+account, so the app's name says nothing about which session wrote a post
+(#574). Every post a session makes into a thread therefore starts with one
+**speaker tag**:
+
+| speaker | tag |
+|---|---|
+| a run | `[<run title>]`, else `[<run slug>]`, else `[lmer session <id>]` |
+| Ratchet | `[Ratchet · <project>]`, or `[Ratchet]` when the daemon runs no projects; the configured name (`LMER_PLATFORM_ASSISTANT_NAME`) replaces `Ratchet` |
+
+For a platform session it is the same tag on every path into a thread: a
+connected thread's mirror of the session's own records (`❓ [run] question`,
+`🏁 [run] milestone`, `[run] message`), `lmer-signal post --thread`,
+`lmer-ctl thread post`, and the project Ratchet's reply to a conversation
+request. The attach and detach notices name
+the session too: `🔗 lmer is listening in this thread as [run].` A connector
+posts the untagged notice only while its supervisor has not yet said which
+session it serves. On both transports, an attachment that is withheld is
+reported in a note of its own, which is tagged too (`[run] 📎 report.txt
+withheld: …`), and so is the notice for an inbound post the bus refused
+(`[run] This message didn't reach the session: …`); an uploaded file carries
+the poster stamp, not a tag.
+
+Only what the session itself said is tagged: its agent records and, for
+Ratchet, the records its supervisor marks `meta.session_origin`. Ratchet also
+writes onto a worker's bus (channel `uber-lmer`, through the platform), and in
+the worker's thread that still reads `💬 [Ratchet] …`, never as the worker.
+
+A shell `lmer chat` has no platform run, so its connector tags the mirror
+`[lmer session <id>]` while its `lmer-signal post --thread` keeps the label the
+CLI gives it (`lmer <task>`, or `lmer session <--session>`).
+
+The tag is resolved host-side from platform state
+(`lmer_platform.session_threads.speaker_label`) and re-read at most once a
+minute, because a run is usually titled after its connector starts. It is looked
+up by the platform's session id, which the daemon gives each connector it starts
+(`LMER_CHAT_PLATFORM_SESSION`); the supervisor reports only the container's own
+session id, which the registry does not know. A shell `lmer chat` connector has
+no platform id and looks up its supervisor's. A re-read
+that cannot identify the session keeps the tag the connector already has: a
+rotated Ratchet's registry entry is gone before its last posts are. A send that
+failed and is retried re-sends the text it first committed to rather than a new
+rendering, since delivery refuses changed content (CONNECTOR-RECOVERY.md). On
+Slack the tag is HTML-escaped on every path, so a title cannot ping; matrix
+carries it as plain text, because a bot account has one display name for every
+event.
+
+The tag is for people. Sessions still attribute each other's posts from the
+host-stamped poster above, never from the tag. A project Ratchet's request
+reply is stamped too, so a session connected to that thread receives it as
+`[slack · platform · Ratchet · <project>]` and does not skip it.
 
 ### Connecting and disconnecting a thread while a run is up
 

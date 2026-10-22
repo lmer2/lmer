@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lmer_cli import thread_access, thread_posts
+from lmer_cli import connector_lifecycle, thread_access, thread_posts
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_recovery import Recovery
 from lmer_cli.thread_access import (
@@ -235,6 +235,46 @@ class TestConnector:
         assert [shared[0] for shared in rig.slack.shared] == ["F0001"]
 
 
+class TestSpeakerTag:
+    """A withheld note is a post of its own, so it names the session (#574)."""
+
+    @pytest.fixture
+    def speaker(self, monkeypatch):
+        current = {"label": "run-a"}
+        monkeypatch.setattr(connector_lifecycle, "resolve_speaker", lambda session, **kwargs: current["label"])
+        return current
+
+    def test_a_file_withheld_before_upload_is_tagged(self, rig, store, speaker):
+        rig.agent("message", "see", attachments=[_item("shot.png", "image/png")])
+        rig.connector._outbound_once()
+        assert _texts(rig) == ["[run-a] see\n📎 shot.png",
+                               f"[run-a] 📎 shot.png withheld: {thread_access.WITHHELD_UNREADABLE}"]
+
+    def test_a_refused_share_keeps_the_tag_it_committed_to_across_a_retry(self, rig, store, speaker, monkeypatch):
+        """Delivery refuses changed content on a retry, so a run titled between a
+        failed note and its retry re-sends the note as first rendered."""
+        monkeypatch.setattr(connector_lifecycle, "SPEAKER_REFRESH_SECONDS", 0.0)
+        (store / "data.csv").write_bytes(b"a,b\n")
+        rig.agent("message", "results", attachments=[_item("data.csv")])
+        note_fails = {"value": True}
+
+        def refuse(*args, **kwargs):
+            rig.slack.fail_post = note_fails["value"]
+            raise SlackError("Slack API error: restricted_action", code="restricted_action")
+
+        rig.slack.complete_upload = refuse
+        with pytest.raises(SlackError):
+            rig.connector._outbound_once()
+        speaker["label"] = "Renamed run"
+        note_fails["value"] = rig.slack.fail_post = False
+        rig.connector._outbound_once()
+        assert _texts(rig) == [
+            "[run-a] results\n📎 data.csv",
+            "[run-a] 📎 data.csv withheld: Slack refused the upload (restricted_action)",
+        ]
+        assert rig.connector._state.data["pending"] is None, "the record finished"
+
+
 class TestPostThread:
     LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
 
@@ -265,7 +305,7 @@ class TestPostThread:
         self._post(slack, store, [_item("a.png", "image/png"), _item("b.csv")], poster=poster)
         texts = [text for _c, _t, text in slack.posted]
         assert texts[1] == (
-            f"📎 a.png withheld: {thread_access.WITHHELD_CREDENTIAL}\n"
+            f"[run] 📎 a.png withheld: {thread_access.WITHHELD_CREDENTIAL}\n"
             "📎 b.csv withheld: the Slack app lacks the files:write scope"
         )
         note_ts = f"{1700000000 + 1}.000100"

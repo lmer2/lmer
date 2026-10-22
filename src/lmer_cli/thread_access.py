@@ -39,7 +39,7 @@ from matrix_chat.permalink import matrix_to_link
 from slack_chat.permalink import slack_thread_link
 
 from . import dm_access, dm_parents
-from .thread_posts import Poster
+from .thread_posts import Poster, tagged
 from .threads import (
     CHANNEL_MATRIX, CHANNEL_SLACK, ChannelRef, ThreadError, ThreadRef,
     parse_channel, parse_thread,
@@ -859,12 +859,12 @@ def post_thread(
         raise ThreadError("a post needs text", status=400)
     if ref is None or client is None:
         ref, client, _fetched = resolve_thread(permalink, env=env, where=where)
-    composed = f"[{label}] {body}" if label else body
+    composed = tagged(label, body, slack_markup=ref.channel == CHANNEL_SLACK)
     named = list(attachments or [])
     if ref.channel == CHANNEL_SLACK:
-        posted = _post_slack(ref, client, composed, named, store=store, poster=poster)
+        posted = _post_slack(ref, client, composed, named, store=store, poster=poster, label=label)
     else:
-        posted = _post_matrix(ref, client, composed, named, store=store, env=env, poster=poster)
+        posted = _post_matrix(ref, client, composed, named, store=store, env=env, poster=poster, label=label)
     return {"thread": _thread_summary(ref), "posted": posted}
 
 
@@ -883,7 +883,7 @@ def _clip(text: str) -> tuple[str, bool]:
 
 def _post_slack(
     ref: ThreadRef, client, text: str, attachments: list, *,
-    store: Optional[UploadStore] = None, poster: Optional[Poster] = None,
+    store: Optional[UploadStore] = None, poster: Optional[Poster] = None, label: Optional[str] = None,
 ) -> dict:
     for item in attachments:
         name = item.get("name") if isinstance(item, dict) else None
@@ -921,7 +921,7 @@ def _post_slack(
             withheld.append(prepared.note)
     if withheld:
         try:
-            note_ts = client.post_message(channel, thread_ts, "\n".join(withheld))
+            note_ts = client.post_message(channel, thread_ts, tagged(label, "\n".join(withheld), slack_markup=True))
         except Exception as exc:
             logger.warning("thread_post_note_failed channel=%s error=%s", channel, exc)
         else:
@@ -937,6 +937,7 @@ def _post_slack(
 def _post_matrix(
     ref: ThreadRef, client, text: str, attachments: list, *,
     store: Optional[UploadStore], env: Optional[dict], poster: Optional[Poster] = None,
+    label: Optional[str] = None,
 ) -> dict:
     from matrix_bridge.scrub import scrub_text
     from matrix_chat.connector import AUTHENTICATED_MEDIA_ENV
@@ -966,7 +967,7 @@ def _post_matrix(
         if reason:
             withheld.append(withheld_note(name, reason))
     if withheld:
-        with_note = "\n".join(withheld)
+        with_note = tagged(label, "\n".join(withheld), slack_markup=False)
         try:
             client.send_thread_text(
                 room, event, with_note, last_event_id=event_id, msgtype="m.notice",
