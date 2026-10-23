@@ -332,7 +332,7 @@ traffic. It reads no file a container wrote.
 | `POST /api/comms/ack {connector?, cursor}` | a platform-side client's position |
 | `GET /api/comms/connectors` | acked positions and the minted connector credentials (names and channels, never values) |
 | `GET /api/comms/questions?open=<bool>` | the question fold across every journaled session |
-| `POST /api/sessions/{id}/ask/{qid}/answer {answer?, option?}` | the older answer route; one of the two is required and they may not both be given (§6); on a session with a bus it posts an `answer` (a late one is a `409`) against the bus question that *is* this ask-directory entry, and answers by file when the bus holds none (§10) |
+| `POST /api/sessions/{id}/ask/{qid}/answer {answer?, option?}` | the older answer route; one of the two is required and they may not both be given (§6); on a session with a bus it posts an `answer` (a late one is a `409`) against the bus question that *is* this ask-directory entry, and answers by file when the bus holds none (§10). `qid` is the entry's number (`000003`): bus ids carry the container's `LMER_SESSION_ID`, not the platform's `s-…` session id, so a full bus id is answered through `POST …/comms` with `in_reply_to`, which is where `lmer-ctl answer` sends one (and exits non-zero on `accepted_as: late`, as it does on this route's `409`) |
 | `POST /api/sessions/{id}/input` (submitted prose) | deprecated for one release: converted to a bus `message` (or `command`), answers `deprecated: true` |
 
 **Source is stamped from the caller's credential**, never from the body:

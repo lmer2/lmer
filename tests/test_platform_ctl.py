@@ -420,6 +420,12 @@ ROUTE_TABLE = [
      "/api/sessions/s-1/ask/q-7/answer", None, {"answer": "prep-release"}),
     (["answer", "s-1", "q-7", "--option", "2"], "POST",
      "/api/sessions/s-1/ask/q-7/answer", None, {"option": 2}),
+    (["answer", "s-1", "20261022-194257-7-12523/000003", "prep-release"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "answer", "in_reply_to": "20261022-194257-7-12523/000003", "text": "prep-release"}),
+    (["answer", "s-1", "20261022-194257-7-12523/000003", "--option", "2"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "answer", "in_reply_to": "20261022-194257-7-12523/000003", "option": 2}),
     (["wind-down", "s-1"], "POST", "/api/sessions/s-1/wind-down", None, {}),
     (["wind-down", "s-1", "--note", "skip the MR"], "POST",
      "/api/sessions/s-1/wind-down", None, {"note": "skip the MR"}),
@@ -527,6 +533,26 @@ def test_the_two_answer_verbs_are_two_routes():
     assert live.path == "/api/sessions/s-1/ask/q-7/answer"
     assert stopped.path == "/api/runs/answer"
     assert live.path != stopped.path
+
+
+BUS_ID = "20261022-194257-7-12523/000003"
+
+
+def test_a_late_answer_by_full_bus_id_fails_as_the_answer_routes_409_does(configured, capsys):
+    """#602: ``/comms`` takes a late answer with a 200; the answer route refuses it."""
+    late = {"session": "s-1", "accepted_as": "late", "message": {"id": "b/000009"}}
+    payload = refused(["answer", "s-1", BUS_ID, "yes"], Recorder(Reply(200, json.dumps(late))), capsys)
+    assert payload == {"error": "late", "status": 200, "body": late}
+
+
+def test_a_first_answer_by_full_bus_id_succeeds(configured, capsys):
+    first = {"session": "s-1", "accepted_as": "new", "message": {"id": "b/000009"}}
+    assert ok(["answer", "s-1", BUS_ID, "yes"], Recorder(Reply(200, json.dumps(first))), capsys) == first
+
+
+def test_send_still_prints_a_comms_reply_as_it_arrived(configured, capsys):
+    late = {"session": "s-1", "accepted_as": "late"}
+    assert ok(["send", "s-1", "carry on"], Recorder(Reply(200, json.dumps(late))), capsys) == late
 
 
 def test_an_omitted_flag_is_absent_from_the_body_not_null():

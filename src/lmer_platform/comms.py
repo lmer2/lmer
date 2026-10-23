@@ -625,6 +625,10 @@ class CommsHub:
           reading of that stamp, and without it the file belongs to the session's
           own CLI whatever number it carries.
 
+        The mirrored record is found by its ``seq``, never by an id built from
+        *session_id*: bus ids carry the container's ``LMER_SESSION_ID``, not the
+        ``s-…`` id the platform files the session under (#602).
+
         ``None`` sends the answer down the ask-directory path, which is where the
         question is.
         """
@@ -634,9 +638,12 @@ class CommsHub:
             ref = (record.get("source") or {}).get("ref")
             if bus_comms.ask_dir_ref_stem(ref) == entry_id:
                 return qid
-        if not mirrored or f"{session_id}/{entry_id}" not in states:
+        if not mirrored or not entry_id.isdigit():
             return None
-        return f"{session_id}/{entry_id}"
+        for qid, state in states.items():
+            if (state.get("question") or {}).get("seq") == int(entry_id):
+                return qid
+        return None
 
     def handles(self, session_id: str) -> bool:
         """Whether this hub is the reader for *session_id*'s milestones — the

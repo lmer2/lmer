@@ -12,12 +12,14 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from lmer_cli import comms as bus
 from lmer_platform import (
     api, assistant, authority, comms, config, ctl, lifecycle, project_api, projects, registry, spawn, store,
 )
+from lmer_platform import ask as ask_channel
 from lmer_platform import project_context as scope
 from tests.conftest import strip_lmer_env
-from tests.test_platform_comms import SECRET, BusPlane, agent_posts, auth, bearer, live_session
+from tests.test_platform_comms import SECRET, BusPlane, _until, agent_posts, auth, bearer, live_session
 from tests.test_platform_projects import fleet  # noqa: F401
 from tests.test_platform_session_io import next_frame
 
@@ -309,6 +311,59 @@ def test_the_assistants_answer_to_a_question_not_on_the_bus_is_refused_before_an
     operator = project_client.post(f"/api/sessions/{session}/ask/000002/answer", json={"answer": "approved"})
     assert operator.status_code == 200, operator.text
     assert len(filed) == 1
+
+
+@pytest.fixture
+def mirrored(project_client, tmp_path):
+    """#602's shape: the platform files a worker as ``s-…`` while its bus ids
+    carry the container's ``LMER_SESSION_ID``, and questions reach the ask
+    directory through the projection."""
+    plane = BusPlane(tmp_path, session="20261022-194257-7-12523")
+    try:
+        alpha, assistant_headers = _project(project_client)
+        session = live_session(plane, session_id="s-20261022T194250-6705")
+        projects.bind_session(session, alpha["id"])
+        projection = bus.AskDirProjection(str(ask_channel.prepare_ask_dir(session)), plane.log)
+        plane.log.add_listener(projection.mirror)
+        hub = comms.ensure_hub()
+        hub.subscribe(session)
+
+        def ask(text, **kw):
+            question = agent_posts(plane, "question", text, **kw)
+            _until(lambda: question.id in hub.journal.question_states(session))
+            return question
+
+        yield plane, session, assistant_headers, ask
+    finally:
+        plane.stop()
+
+
+def test_the_assistants_short_qid_answers_a_bus_question_whose_ids_carry_the_containers_session_id(
+    project_client, mirrored,
+):
+    """#602: every mirrored question was a 409."""
+    plane, session, assistant_headers, ask = mirrored
+    question = ask("which branch?")
+    resp = project_client.post(f"/api/sessions/{session}/ask/{question.seq:06d}/answer",
+                               json={"answer": "prep-release"}, headers=assistant_headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["message_id"] == "20261022-194257-7-12523/000002", "answered on the bus"
+    assert plane.log.question(question.id).state == bus.STATE_ANSWERED
+
+
+def test_an_operator_only_question_refuses_the_assistants_short_qid_on_the_bus(project_client, mirrored):
+    """#594 on the path #602 opened: the refusal is now the bus's, not the 409."""
+    plane, session, assistant_headers, ask = mirrored
+    gate = ask("approve the spec?", meta={"operator_only": True})
+    path = f"/api/sessions/{session}/ask/{gate.seq:06d}/answer"
+    refused = project_client.post(path, json={"answer": "approved"}, headers=assistant_headers)
+    assert refused.status_code == 400, refused.text
+    assert "operator-only" in refused.json()["detail"]
+    assert plane.log.question(gate.id).state == bus.STATE_OPEN
+    operator = project_client.post(path, json={"answer": "approved"})
+    assert operator.status_code == 200, operator.text
+    assert operator.json()["message_id"], "answered on the bus"
+    assert plane.log.question(gate.id).state == bus.STATE_ANSWERED
 
 
 def test_a_question_its_session_closed_returns_the_reason_to_the_assistant(project_client, bus_plane, monkeypatch):

@@ -41,6 +41,7 @@ Seeing::
 Answering — two routes, and never each other's::
 
     answer SESSION QUESTION TEXT    POST /api/sessions/{id}/ask/{qid}/answer
+                                    (a full bus id: POST /api/sessions/{id}/comms)
     runs answer KEY TEXT            POST /api/runs/answer
 
 Steering::
@@ -101,6 +102,8 @@ A failure is one object with an ``error`` discriminator::
     {"error": "http", "status": 429, "body": {"detail": "…"}}   the daemon refused
     {"error": "unreachable", "detail": "…"}                     it was never asked
     {"error": "configuration", "detail": "…"}                   nothing to ask
+    {"error": "late", "status": 200, "body": {…}}               an answer by bus id
+                                                                came after the first
 
 ``body`` is the daemon's own body, untouched — including
 ``POST /api/runs/resume``'s ``{code,message}``, which a client is meant to match
@@ -240,12 +243,18 @@ def _payload(text: str) -> Any:
     return {"detail": str(parsed)[:_DETAIL_LIMIT]}
 
 
-def _emit(response: Any, endpoint: Endpoint, *, out=None, err=None) -> int:
+def _emit(
+    response: Any, endpoint: Endpoint, *, late_fails: bool = False, out=None, err=None,
+) -> int:
     """Print the reply and return the exit code.
 
     Success is the daemon's body; a refusal is the daemon's body under ``body``
     with the status beside it, because the status is the part a client acts on and
     FastAPI's ``detail`` is not always a sentence.
+
+    *late_fails* is ``answer`` sent by full bus id: ``/comms`` takes a late answer
+    with a 200 where the answer route refuses it with a 409, and one verb keeps one
+    exit status for the same outcome (#602).
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
@@ -254,6 +263,10 @@ def _emit(response: Any, endpoint: Endpoint, *, out=None, err=None) -> int:
         text = text.replace(endpoint.credential, "<redacted>")
     payload = _payload(text)
     status = response.status_code
+    if late_fails and 200 <= status < 300 and isinstance(payload, dict) \
+            and payload.get("accepted_as") == "late":
+        print(json.dumps({"error": "late", "status": status, "body": payload}), file=err)
+        return EXIT_FAILURE
     if 200 <= status < 300:
         print(json.dumps(payload), file=out)
         return 0
@@ -459,11 +472,20 @@ def _call_answer(args) -> Call:
             "an answer names its option by index or in its text, not both — "
             f"drop one of --option {args.option} and {args.text!r}"
         )
+    bus_id = "/" in args.question
     body: dict = {}
     if args.text is not None:
-        body["answer"] = _text(args.text)
+        body["text" if bus_id else "answer"] = _text(args.text)
     if args.option is not None:
         body["option"] = args.option
+    if bus_id:
+        # The answer route's path holds only the ask-directory number, and the
+        # bus refuses an id from any bus but this session's own (#602).
+        return Call(
+            "POST",
+            f"/api/sessions/{args.session}/comms",
+            body={"kind": "answer", "in_reply_to": args.question, **body},
+        )
     return Call(
         "POST",
         f"/api/sessions/{args.session}/ask/{args.question}/answer",
@@ -978,7 +1000,13 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     answer.add_argument("session", help="Session id.")
-    answer.add_argument("question", help="Question id, from `questions`.")
+    answer.add_argument(
+        "question",
+        help=(
+            "Question id, from `questions` (000003), or a full bus id from "
+            "`comms` (<bus-session>/000003), which is answered on the bus."
+        ),
+    )
     _add_text(answer, "The answer, unless --option names it.", optional=True)
     answer.add_argument(
         "--option", type=int, metavar="N",
@@ -1404,7 +1432,10 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     except CtlError as exc:
         print(json.dumps({"error": exc.error, "detail": str(exc)}), file=sys.stderr)
         return EXIT_FAILURE
-    return _emit(response, endpoint)
+    return _emit(
+        response, endpoint,
+        late_fails=call.path.endswith("/comms") and (call.body or {}).get("kind") == "answer",
+    )
 
 
 if __name__ == "__main__":
