@@ -3,6 +3,7 @@ import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import {
   mdiRobot, mdiClipboardTextOutline, mdiClockAlertOutline,
   mdiClockOutline, mdiCommentQuestionOutline, mdiConsole, mdiExitRun,
+  mdiBellOffOutline, mdiBellOutline,
   mdiEyeOffOutline, mdiFileDocumentOutline, mdiFolderOpenOutline,
   mdiForumOutline, mdiInformationOutline, mdiLinkVariant, mdiOpenInNew,
   mdiPlayOutline, mdiPowerPlugOff, mdiRobotOutline, mdiSourceBranchPlus,
@@ -17,7 +18,7 @@ import RunMeta from './RunMeta.vue'
 import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
-import { forgetRun, resumeRun, moveRun } from '../api.js'
+import { forgetRun, muteRun, resumeRun, moveRun } from '../api.js'
 import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
@@ -613,6 +614,19 @@ function cancelUnsignedSource() {
   resumeError.value = null
   resumeNeeds.value = null
   unsignedSource.value = null
+}
+
+async function toggleMute() {
+  busy.value = true
+  error.value = null
+  try {
+    await muteRun(props.run, !props.run.muted)
+    emit('changed')
+  } catch (exc) {
+    error.value = exc.message
+  } finally {
+    busy.value = false
+  }
 }
 
 async function forget() {
@@ -1480,6 +1494,19 @@ async function forget() {
             <v-alert v-if="error" type="error" density="compact" class="mb-3">
               {{ error }}
             </v-alert>
+            <p class="text-medium-emphasis mb-3">
+              Muting a run stops its routine messages, replies and notes reaching
+              {{ assistantName }}, and leaves it out of stale and stalled reminders.
+              Its questions, crashes and completion still get through, and
+              unmuting replays nothing.
+            </p>
+            <v-btn
+              class="mb-4 run-mute-toggle"
+              variant="tonal"
+              :prepend-icon="run.muted ? mdiBellOutline : mdiBellOffOutline"
+              :loading="busy"
+              @click="toggleMute"
+            >{{ run.muted ? 'unmute this run' : 'mute this run' }}</v-btn>
             <p class="text-medium-emphasis mb-3">
               Forgetting a run removes it from this orchestrator's view. Its work-repo
               state and any running session are left untouched.

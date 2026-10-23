@@ -161,6 +161,35 @@ export function forgetRun(run) {
   })
 }
 
+// Mute or unmute a run (issue 458): its routine records stop reaching the
+// assistant's spool, and nothing else about it changes. Platform state, like the
+// metadata below, so it is this orchestrator's own and goes when the run is
+// forgotten. Nothing suppressed while muted is replayed on unmute.
+// A live row goes by its session: the daemon mutes the run when it tracks it
+// and the session itself when it does not (an identified run nobody adopted),
+// and the session's own path is what scopes the request to its project. A row
+// with no run identity is a session that has not committed one yet: the daemon
+// writes a dash into its host and project (fleetMap.js recognises the same
+// dash), so it goes by its session id too. Anything else is a tracked run whose
+// session has ended, muted by its key.
+export function muteRun(run, muted) {
+  const verb = muted ? 'mute' : 'unmute'
+  const named = [run.host, run.project].every((field) => field && field !== '\u2014')
+  const session = run.session?.id
+  if (session && (run.live || !named)) {
+    return request(`api/sessions/${encodeURIComponent(session)}/${verb}`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ workspace_id: run.workspace_id }),
+    })
+  }
+  return request(`api/runs/${verb}`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(runFields(run)),
+  })
+}
+
 // What a run is about: this orchestrator's own title and description for it
 // (T52). Read by query string rather than a path, because a project is
 // `group/subgroup` and a path parameter would have to be escaped by every caller

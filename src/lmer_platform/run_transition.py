@@ -75,7 +75,7 @@ entry to ``host/project/<uid>``, records the old key as an alias that
 :class:`lmer_platform.runs.Transition` with every store pending. Each store is
 then moved and marked done in its own write, in
 :data:`lmer_platform.runs.TRANSITION_STORES` order: meta, relations, check-in
-marks, references, the project home together with the durable thread owners
+marks, references, mutes, the project home together with the durable thread owners
 (:func:`lmer_platform.projects.rekey` moves both in one transaction, so both
 names are marked done by one call), and last the registry entry. The record is
 cleared only when every store is done. :func:`reconcile` resumes every entry
@@ -123,7 +123,7 @@ from typing import Optional
 
 from lmer_cli import runref
 
-from . import checkin, meta, projects, references, registry, relations, runs, workrepo
+from . import checkin, meta, mute, projects, references, registry, relations, runs, workrepo
 from .config import PlatformConfig
 
 logger = logging.getLogger("lmer_platform.run_transition")
@@ -148,6 +148,7 @@ _STORE_MODULES = {
     "relations": relations,
     "checkin": checkin,
     "references": references,
+    "mute": mute,
 }
 
 #: ``{entry key: what it was examined against}`` (:func:`_examined`) for uid-less

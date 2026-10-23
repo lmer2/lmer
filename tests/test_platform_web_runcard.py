@@ -170,6 +170,8 @@ CHIP_VARIANTS = {
     'v-if="run.preset"': "outlined",
     'v-if="run.agents"': "outlined",
     'v-if="driver"': "outlined",
+    # A setting the operator chose for the run (issue 458), like the preset.
+    'v-if="run.muted"': "outlined",
     'v-for="port in run.ports"': "outlined",
 }
 

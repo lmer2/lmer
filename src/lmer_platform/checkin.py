@@ -261,7 +261,7 @@ def is_eligible(row: dict) -> bool:
     Public because the fleet view asks it too: a second reading of it is how a
     badge starts marking a run no digest will ever name.
     """
-    if row.get("orchestrator"):
+    if row.get("orchestrator") or row.get("muted") is True:
         return False
     return row.get("state") not in SETTLED_STATES
 

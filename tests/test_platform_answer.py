@@ -33,7 +33,7 @@ import pytest
 
 from lmer_platform import answer as answer_mod
 from lmer_platform import config as cfg
-from lmer_platform import inventory, registry, resume as resume_mod, runs, spawn, store
+from lmer_platform import inventory, mute, registry, resume as resume_mod, runs, spawn, store
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 
@@ -960,6 +960,57 @@ def test_a_schema_two_answer_event_names_both_executions(config):
     answered = [e for e in store.read_events() if e["type"] == "run_answered"][-1]
     assert answered["data"]["run"]["uid"] == UID
     assert answered["data"]["started"]["uid"] == result.session.uid
+
+
+def test_a_schema_two_answer_carries_a_muted_runs_mute(config, monkeypatch):
+    """The answering execution is a new uid-keyed row (issue 458): a run the
+    operator muted must not start waking the assistant because it was answered."""
+    plant_schema_two_manifest(config)
+    plant_question_execution(config)
+    tracked = track_execution()
+    mute.set_run(tracked.host, tracked.project, uid=UID, muted=True)
+    seen = []
+    real = registry.register
+
+    def register(session_id, **fields):
+        seen.append(set(mute.load_all()))
+        return real(session_id, **fields)
+
+    monkeypatch.setattr(registry, "register", register)
+
+    result = answer_mod.answer_run(config, uid_answer())
+
+    started = runs.run_key(tracked.host, tracked.project, result.session.uid)
+    assert mute.is_muted((tracked.host, tracked.project, result.session.uid))
+    # Before the session was published, so none of its records is read unmuted.
+    assert seen and started in seen[0]
+
+
+def test_answering_a_muted_renamed_run_carries_the_mute_to_its_recorded_slug(
+    config, monkeypatch
+):
+    """The answering session registers under the recorded slug, tracked by the
+    spawn as a run of its own; the mute goes there before it is published."""
+    recorded = run_state.derive_slug(TASKDEF, TARGET)
+    renamed = f"{recorded}--nice-name"
+    plant_run(config, slug=renamed, recorded_slug=recorded)
+    track_run(slug=renamed)
+    mute.set_run(HOST, PROJECT, renamed, muted=True)
+    seen = []
+    real = registry.register
+
+    def register(session_id, **fields):
+        seen.append(set(mute.load_all()))
+        return real(session_id, **fields)
+
+    monkeypatch.setattr(registry, "register", register)
+
+    result = answer_mod.answer_run(config, request_for(slug=renamed))
+
+    assert result.session.slug == recorded
+    bare = runs.run_key(HOST, PROJECT, recorded)
+    assert seen and bare in seen[0]
+    assert mute.run_muted((HOST, PROJECT, recorded))
 
 
 def test_a_legacy_answer_event_keeps_its_shape(config, waiting_run):

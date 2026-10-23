@@ -211,7 +211,7 @@ from work_repo import run_state
 from work_repo import session_record
 from work_repo.utils import classify_target
 
-from . import runs
+from . import mute, runs
 # Deliberate reuse of two private helpers rather than two second copies of
 # them, the way `workrepo` imports `_scrub_credentials` from `clone_and_exec`:
 # `_reject_traversal` is an identical decision with identical inputs,
@@ -1647,6 +1647,17 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
             source_session_id=source_session_id,
             allow_unsigned_source=unsigned_source_ack,
             extra_args=_direction_args(request.direction),
+            # A continue founds a new uid-keyed run, or for a renamed legacy run
+            # files its session under the recorded slug; the spawn mutes that
+            # key before it is published (#458). Never an override, a different
+            # run.
+            mute_from=(
+                None if not continued
+                else mute.source_of(request.host, request.project, execution)
+                if execution is not None
+                else mute.source_of(request.host, request.project, request.slug)
+                if started_slug != request.slug else None
+            ),
         ),
     )
 

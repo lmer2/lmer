@@ -466,6 +466,12 @@ ROUTE_TABLE = [
      {**RUN_FIELDS, "related": OTHER_FIELDS}),
     (["runs", "unrelate", RUN_KEY, OTHER_KEY], "POST", "/api/runs/unrelate",
      None, {**RUN_FIELDS, "related": OTHER_FIELDS}),
+    (["runs", "mute", RUN_KEY], "POST", "/api/runs/mute", None, RUN_FIELDS),
+    (["runs", "unmute", RUN_KEY], "POST", "/api/runs/unmute", None, RUN_FIELDS),
+    (["runs", "mute", "--session", "s-chat"], "POST", "/api/sessions/s-chat/mute",
+     None, None),
+    (["runs", "unmute", "--session", "s-chat"], "POST",
+     "/api/sessions/s-chat/unmute", None, None),
 ]
 
 

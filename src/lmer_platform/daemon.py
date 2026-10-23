@@ -86,7 +86,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, assistant, detect, project_context
+from . import projects, assistant, detect, mute, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -565,7 +565,7 @@ def _assistant_consumer(hub: CommsHub):
             except Exception as exc:
                 logger.warning("platform_comms_mark_failed session=%s error=%s", event.session, exc)
             return
-        if not own:
+        if not own and not mute.suppressed(event.session, message, event.run):
             hub.queue_digest(event)
 
     return consume

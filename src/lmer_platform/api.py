@@ -110,6 +110,7 @@ from lmer_cli.threads import ThreadError
 
 from . import meta
 from . import mention_routing
+from . import mute
 from .ingress import Ingress
 from . import references
 from . import reattach
@@ -163,7 +164,7 @@ from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
     UID_RE, RunIndexError, TrackedRun, filter_forgotten, forget, get_tracked, key_parts,
-    key_parts_lenient, keys as tracked_keys_of, list_tracked, run_for_session,
+    key_parts_lenient, keys as tracked_keys_of, list_tracked, load_index, run_for_session,
     run_of_session, run_key, track,
 )
 from .session_io import ControlPlaneError, SessionIOError
@@ -1155,6 +1156,31 @@ def _fold_checkins(payload: dict) -> None:
             row["checkin"] = checkin.row_checkin(row, marks, window=window)
 
 
+def _fold_mute(payload: dict, sessions: list) -> None:
+    """Put ``muted`` on each row, in place (#458).
+
+    Before :func:`_fold_checkins`, which reads it: a muted run is not eligible
+    for a check-in, so its row must not carry a stale marker either. Always a
+    boolean, so a listing tests one field.
+
+    Through :func:`lmer_platform.mute.run_muted`, the resolver the record
+    filter uses, so a row never says muted while its chatter still spools —
+    or the other way round, for a session row still spelled by a slug a key
+    transition or a rename left behind.
+    """
+    entries = mute.load_all()
+    index = load_index() if entries else {}
+    by_session = mute.muted_sessions(sessions)
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        session = row.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
+        row["muted"] = mute.run_muted(key_parts_lenient(row), entries, index) or (
+            session_id is not None and session_id in by_session
+        )
+
+
 def _fold_threads(payload: dict) -> None:
     """Put each row's chat-thread connections on the row, in place (issue #412).
 
@@ -1358,6 +1384,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         "slots_problem": slots_problem,
     }
     payload.update(inventory.to_dict())
+    _fold_mute(payload, sessions)
     _fold_checkins(payload)
     _fold_threads(payload)
     _fold_references(payload)
@@ -2595,6 +2622,19 @@ def create_app(
             "                              (D3): local to this orchestrator,\n"
             "                              invisible to anyone else's fleet view,\n"
             "                              and dropped when the run is forgotten\n"
+            "  POST /api/runs/mute         stop a tracked run's routine records\n"
+            "                              (messages, replies and notes a person or\n"
+            "                              the agent wrote, answers, commands,\n"
+            "                              closes) reaching the assistant's spool\n"
+            "                              {host,project,slug|uid}. Questions,\n"
+            "                              milestones, the platform's own notices,\n"
+            "                              crashes and complete still spool; a\n"
+            "                              muted run is left out of stale_runs and\n"
+            "                              stalled digests. Fleet rows carry muted.\n"
+            "                              PLATFORM state, local to this\n"
+            "                              orchestrator, dropped on forget\n"
+            "  POST /api/runs/unmute       undo it, session mutes of the run too;\n"
+            "                              nothing suppressed is replayed\n"
             "  GET  /api/runs/relations    runs this orchestrator considers related\n"
             "                              to this one ?host=&project=&slug=, each\n"
             "                              with tracked: false meaning it is not in\n"
@@ -2692,6 +2732,10 @@ def create_app(
             "control plane, so it reaches a session whose host terminal died with a\n"
             "previous daemon; exit refuses that case (409) rather than signalling a\n"
             "pid this daemon no longer owns.\n\n"
+            "Muting by session (POST /api/runs/mute's session form):\n"
+            "  POST /api/sessions/{id}/mute    mute its run when this orchestrator\n"
+            "                                  tracks it, else the session itself\n"
+            "  POST /api/sessions/{id}/unmute  undo it\n\n"
             "The orchestrating assistant — the one session this platform runs for\n"
             "itself, and the thing the operator chats with:\n"
             "  GET  /api/assistant          whether one is running, which session,\n"
@@ -4528,6 +4572,74 @@ def create_app(
         except MetaError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return _meta_reply(body, record)
+
+    # --- muting a run (#458) -------------------------------------------------
+    #
+    # Platform state like the metadata above (:mod:`lmer_platform.mute`): a run
+    # the operator steers directly stops waking the assistant with its routine
+    # chatter, and nothing else about it changes.
+
+    def _mute_caller(caller: Caller) -> dict:
+        """Who muted or unmuted, for the event (spec §7)."""
+        by = {"kind": caller.kind, "name": _author_of(caller, None) or caller.source_channel}
+        if caller.session_id:
+            by["session"] = caller.session_id
+        return by
+
+    def _mute_reply(outcome: dict) -> dict:
+        return {**outcome, "local": True, "note": mute.LOCALITY_NOTE}
+
+    def _set_run_mute(body: dict, muted: bool, caller: Caller) -> dict:
+        # The session form lives on the session's own path, where the request
+        # binding scopes it to that session's project (project_api.bind reads a
+        # path parameter, never a body field) — so it is refused here by name
+        # rather than read as a run with no parts.
+        if "session" in body:
+            raise HTTPException(status_code=400, detail=(
+                "mute a session by its own path: POST /api/sessions/<id>/mute "
+                "(or /unmute)"))
+        try:
+            outcome = mute.set_run(*_run_parts(body), muted=muted, by=_mute_caller(caller))
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except mute.MuteError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return _mute_reply({"muted": muted, "changed": outcome["changed"], "run": outcome["key"]})
+
+    def _set_session_mute(session_id: str, muted: bool, caller: Caller) -> dict:
+        try:
+            outcome = mute.set_session(session_id, muted=muted, by=_mute_caller(caller))
+        except mute.MuteError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return _mute_reply(outcome)
+
+    @app.post("/api/runs/mute", dependencies=guard)
+    def mute_run(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Stop a tracked run's routine records reaching the assistant's spool.
+
+        ``{host, project, slug|uid}``. Idempotent: ``changed`` says whether this
+        call did anything. A session with no tracked run is muted by
+        :func:`mute_session`.
+        """
+        return _set_run_mute(body, True, caller)
+
+    @app.post("/api/runs/unmute", dependencies=guard)
+    def unmute_run(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Undo :func:`mute_run`, and any session-level mute of that run's
+        sessions. Nothing suppressed while muted is replayed."""
+        return _set_run_mute(body, False, caller)
+
+    @app.post("/api/sessions/{session_id}/mute", dependencies=guard)
+    def mute_session(session_id: str, caller: Caller = Depends(require_secret)) -> dict:
+        """Mute by session: its run when this orchestrator tracks it, otherwise
+        the session itself. Scoped to the session's project like every other
+        session route."""
+        return _set_session_mute(session_id, True, caller)
+
+    @app.post("/api/sessions/{session_id}/unmute", dependencies=guard)
+    def unmute_session(session_id: str, caller: Caller = Depends(require_secret)) -> dict:
+        """Undo :func:`mute_session`. Nothing suppressed is replayed."""
+        return _set_session_mute(session_id, False, caller)
 
     # --- what a run wrote (T66) ----------------------------------------------
     #

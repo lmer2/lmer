@@ -310,7 +310,7 @@ import logging
 import hashlib
 import uuid
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from ask_channel import protocol as ask_protocol
@@ -454,6 +454,9 @@ ASSISTANT_NUDGED = "assistant_nudged"
 #: to tell them failed on every thread (#584).
 ASSISTANT_STALLED = "assistant_stalled"
 
+#: The attention reason a muted run does not spool (#458).
+MUTED_STALL_KIND = "stalled"
+
 #: What the platform records when it has recommended a rotation to the
 #: assistant (issue #446). An event for :data:`ASSISTANT_NUDGED`'s reason —
 #: the platform typed into a session unasked — and the only durable trace of
@@ -538,6 +541,9 @@ class Signal:
     #: stays slug-spelled for the digest text; :attr:`run` is what tells two
     #: executions of one slug group apart.
     uid: Optional[str] = None
+    #: The row's ``muted`` flag (#458). Not part of the condition's identity, so
+    #: muting or unmuting a run never makes a standing condition look new.
+    muted: bool = field(default=False, compare=False)
 
     @property
     def ref(self) -> str:
@@ -683,6 +689,7 @@ def _signals_of_row(row: object) -> list:
                 note=_text(attention.get("note")),
                 since=_text(attention.get("since")),
                 label=label, state=state, uid=uid,
+                muted=row.get("muted") is True,
             ))
 
     if state in MATERIAL_STATES:
@@ -1305,6 +1312,9 @@ class Detector:
         #: #254), counted apart from ``notified`` because this is the one digest
         #: class raised by a condition *going away*.
         self.answered = 0
+        #: ``stalled`` conditions not spooled because their run is muted (#458).
+        #: They stay in the baseline, so unmuting does not replay them.
+        self.muted_stalls = 0
         #: Nudges typed into the assistant's session (issue #317). Counted
         #: apart because it is the only stage that writes *into* a session.
         self.nudged = 0
@@ -1588,6 +1598,13 @@ class Detector:
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
         fresh = self._confirmed(fresh)
+        # A muted run is quiet because the operator is driving it (#458).
+        muted = [signal for signal in fresh if signal.muted and signal.kind == MUTED_STALL_KIND]
+        if muted:
+            self.muted_stalls += len(muted)
+            fresh = [signal for signal in fresh if signal not in muted]
+            logger.debug("platform_detection_muted_stalls runs=%s",
+                         ",".join(signal.ref for signal in muted))
         for signal in fresh:
             self._deliver(signal)
         # After the fresh ones, so a run whose question cleared *into* another

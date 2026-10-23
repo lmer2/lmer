@@ -138,7 +138,8 @@ TRANSITION_STATES = ("pending", "done")
 #: uid (:mod:`lmer_platform.run_transition`), last because it is the one step a
 #: client can observe joining two rows into one.
 TRANSITION_STORES = (
-    "meta", "relations", "checkin", "references", "projects", "threads", "registry",
+    "meta", "relations", "checkin", "references", "mute", "projects", "threads",
+    "registry",
 )
 
 #: Fleet-row text when a collision kept both values (spec §6.1).
@@ -547,6 +548,15 @@ def _references():
     return references
 
 
+def _mute():
+    """The :mod:`lmer_platform.mute` module, imported on demand — the same
+    cycle and the same seam as :func:`_meta`."""
+    # deferred: cycle — lmer_platform.mute imports this module at top
+    from . import mute
+
+    return mute
+
+
 def _snapshot() -> dict:
     """The whole index file: ``{"runs": {...}, "forgotten": [[...], ...]}``.
 
@@ -885,6 +895,11 @@ def forget(
         _references().drop(host, project, segment)
     except StoreError as exc:
         logger.warning("platform_run_references_orphaned key=%s error=%s", key, exc)
+    # A mute (#458) is scoped to the tracked run the same way.
+    try:
+        _mute().drop(host, project, segment)
+    except StoreError as exc:
+        logger.warning("platform_run_mute_orphaned key=%s error=%s", key, exc)
     logger.info("platform_run_forgotten key=%s", key)
     return True
 
