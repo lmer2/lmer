@@ -1,4 +1,9 @@
-# The lmer schema (version 1)
+# The lmer schema (versions 1 and 2)
+
+Schema 2 is current. [Schema 2](./SCHEMA-V2.md) defines its changed writer,
+identity, session and retirement contracts. The layout and schema-1 behavior
+below remain the baseline; explicit schema-2 rules take precedence for a
+`schema: 2` tree. Existing schema-1 trees retain their original semantics.
 
 The lmer schema is the normative layout of everything lmer reads and writes
 outside the code repositories it works on: run records, specifications, plans,
@@ -31,7 +36,7 @@ is not a final form.
   - [record](#record)
   - [agents](#agents)
   - [Supporting surfaces](#supporting-surfaces)
-- [The manifest: `_plexus.yaml`](#the-manifest-_plexusyaml) — top-level keys,
+- [The manifest: `_lmer.yaml`](#the-manifest-_lmeryaml) — top-level keys,
   [the registry](#the-registry),
   [project resolution and host buckets](#project-resolution-and-host-buckets),
   [sources](#sources), [housekeeping policy](#housekeeping-policy)
@@ -57,7 +62,7 @@ targets, nor lmer's own configuration outside the plexus.
 There is exactly **one** schema and **one** form. A plexus conforms to schema 1
 when:
 
-1. its root carries a `_plexus.yaml` manifest declaring `schema: 1`, and
+1. its root carries a `_lmer.yaml` manifest declaring `schema: 1`, and
 2. `lmer-schema validate` reports no findings at ERROR severity.
 
 Warnings and informational findings never affect conformance. A tree without a
@@ -102,7 +107,7 @@ layout property this document does not state.
 ## Layout
 
 ```
-_plexus.yaml              # the manifest: schema int, name, registry, sources, policy
+_lmer.yaml                # the manifest: schema int, name, registry, sources, policy
 _knowledge/               # instance wiki, org/topic directories
 _napkin/                  # transient scratch, org/topic directories
 _taskdef/                 # instance-level task definitions
@@ -124,11 +129,11 @@ widgets/                  # a project, by short name
 gadgets/                  # another project, same shape
 capacity-planning/        # a project with no repository
 git.example.com/acme/…    # host bucket: an UNNAMED repository's work (not schema form)
-README.md                 # content namespace: anything human
+README.md                 # content namespace (human); MAY carry the generated index block (Inventory)
 ```
 
 Every directory in the tree above is OPTIONAL; the only required entry is the
-`_plexus.yaml` file. A plexus with one registry entry and a plexus with fifty
+`_lmer.yaml` file. A plexus with one registry entry and a plexus with fifty
 are the same form; there is no other.
 
 ## Ownership namespaces
@@ -142,7 +147,13 @@ are the same form; there is no other.
   guarantees a project short name can never collide with a schema directory.
 - Everything else is the **content namespace**: project directories, org and
   topic directories inside `_knowledge/` and `_napkin/`, and human files such
-  as `README.md`. Content-namespace files are never validated for shape.
+  as `README.md`. Content-namespace files are never validated for shape. The
+  one exception is the generated index block a `README.md` at the plexus root
+  or at a project root may carry between `<!-- lmer:index:start -->` and
+  `<!-- lmer:index:end -->`: tooling-owned, checked for freshness only; the
+  text outside the markers stays content and is never checked, except that a
+  line that git would read as a conflict marker keeps the generator away from
+  the file.
 - Schema-owned names are lowercase. Capitalised variants (`_Runs/`,
   `_Plans/`) are not schema names and MUST NOT be used; case-insensitive
   filesystems make them indistinguishable from the real name.
@@ -191,7 +202,10 @@ outside its own area's rules.
 
 ### knowledge
 
-`_knowledge/`, instance level, org/topic directories.
+`_knowledge/`, instance level, org/topic directories. `work knowledge index`
+generates each org's `INDEX.md` from its pages; a generated index carries the
+`lmer:knowledge-index:generated` marker, and a hand-written index is never
+overwritten.
 
 - **Role:** the durable wiki — how things are done, for humans and agents.
 - **Writers:** humans and agents; fed by promoted napkin notes and distilled
@@ -233,7 +247,74 @@ selects its scope:
   a session can neither drop an entry it never held nor restore one another
   session retired. A writer that cannot tell which files it was given MUST
   delete nothing. Mirroring a scope from one session's directory is how a
-  session deletes work it never knew about.
+  session deletes work it never knew about. A writer MUST also keep each
+  scope's `MEMORY.md` entry lines derived from the scope's live files and its
+  retirement state: a live memory file with no entry gets one, and an entry
+  whose file is gone is tombstoned in place per [Index lines](#index-lines) —
+  never silently dropped. Non-entry lines — headings, hand-written commentary
+  and the tombstones `forget` wrote — are preserved verbatim.
+- **Split index.** A harness loads only the head of `MEMORY.md` at session
+  start (Claude Code: the first 200 lines or 25 KB). A scope MAY therefore
+  split its index. In a split scope `MEMORY.md` is the **map**: one line per
+  area, linking to `areas/<slug>.md` (slug `[a-z0-9][a-z0-9-]*`), with a
+  hook saying when to read it. The entry lines live in the area indexes,
+  with links relative to the area file (`../<name>.md`). The memory files
+  themselves stay flat in the scope directory. A scope is split exactly when
+  `areas/` holds an area index; there is no other marker. A memory MAY name
+  its area in `metadata.area`. A writer filing an entry that is in no area
+  index (one added to the map, or one generated for an unindexed file) MUST
+  put it in that area, or in `areas/unsorted.md` when the memory names none,
+  and MUST give a new area a map line with a read-when hook. In a split
+  scope a `MEMORY.md` line that links an area index is a map line, whatever
+  else its hook links: the memories a hook links are not entries. A link
+  from one area index to another (`<slug>.md`) is a cross-reference, not an
+  entry. Restore merges both scopes, so a hook link or a cross-reference is
+  live when what it names — a memory or an area — exists in either scope, or
+  is a file that exists (`../notes.md`). The instance scope is merged with
+  every project's, so its links are live when any project's scope has what
+  they name. A map line's own area (its first area link) must be this
+  scope's. Liveness is judged on what the persist leaves behind: an area or
+  memory another session deleted, or this persist deletes, is dead even
+  where the session's copy still holds it. A dead one — a map line's area, a
+  hook link, a cross-reference to an area no merged scope has — is
+  tombstoned like any other link, and a map line whose area is gone keeps
+  its hook with its links reduced to their text. A `forget` tombstone is
+  kept verbatim by every pass. Every merge, tombstone and reconcile rule
+  above applies to each area index as it does to `MEMORY.md`, including
+  the deletion rule: an area index another session deleted or emptied is
+  not recreated from what a session was given, only from what it added. (A
+  `MEMORY.md` blanked or deleted outside a writer is rebuilt from the
+  session's copy, as it always was.) A writer MUST NOT delete an index file
+  because a file list says it was given it: an index file is merged line
+  by line, never held whole.
+- **Splitting is a migration with a contract.** Every file in `areas/` is a
+  `<slug>.md` area index, every area-index link to a memory is
+  `../<name>.md`, and `lmer-schema validate` reports the scope clean. A
+  persist judges a split scope's merged result against both scopes: a
+  non-slug file, or a link that stays in `areas/` where no area of that name
+  exists in either scope and the memory it names does (`x.md` for
+  `../x.md`). When the session holds that line or file, the persist refuses,
+  names each one in the session's memory dir, and writes nothing: repairing
+  it would tombstone the entry or file the memory into `unsorted`. A line or
+  file another writer added after the session restored is no edit of the
+  session's to make, so the persist warns and goes on, and the dead link is
+  tombstoned. A flat scope ignores `areas/`: a line there that links one is
+  an ordinary entry, and its dead area link is tombstoned like any other —
+  by persist, by `work housekeep` and by `work migrate`'s lift alike, and in
+  mixed form too, where a flat scope's edited entry leading with its memory
+  link stays that scope's entry. `work housekeep` plans a split scope's
+  dangling entries in its area indexes, where they are.
+- **Load budget.** `work memory persist` reports the size of the index a
+  session will load (the scope's `MEMORY.md`, or both scopes' merged) against
+  the strictest limit a built-in harness declares, every time it runs. A flat
+  scope over the budget is warned and never refused, and so is a load that
+  includes any flat scope's index. When every scope with an index is split,
+  a persist that would grow an over-budget map is refused and the work repo
+  is left untouched. A writer MUST NOT split a flat scope as a side effect:
+  persist ignores area indexes for a scope with no `areas/`, and splitting
+  is a deliberate migration. An entry left in a split map whose memory is
+  already filed in an area is dropped, and an area index a session restored
+  and deleted is removed once no other session's entries remain in it.
 
 ### record
 
@@ -279,7 +360,7 @@ mountable, not runtime plumbing.
   project's `gate-check.yaml`. Prose is unchecked; `gate-check.yaml` keeps its
   existing shape.
 
-## The manifest: `_plexus.yaml`
+## The manifest: `_lmer.yaml`
 
 The manifest is a YAML file at the plexus root. Its presence is what makes a
 tree schema form; its absence makes a tree legacy. The registry inside it is
@@ -414,11 +495,11 @@ rules, same resolution against the environment overrides (see
 |---|---|---|
 | `taskdef` | `{repo, ref?}` | the shared task-definition repository |
 | `napkin` | `{repo}` | the napkin repository |
-| `knowledge`, `plans` | `{repo}` | reserved: mountable the same way when needed |
+| `knowledge`, `plans` | `{repo}` | declared and validated, but NOT mounted by this release (runner-side wiring has not shipped yet): warned about by name and left unmounted |
 
 - **The key set is the name's, not the section's.** `ref:` is `taskdef`'s
   alone — there is no `LMER_NAPKIN_REF` and nothing pins any other area to a
-  ref — so a `ref:` under any other name is an unknown key in `_plexus.yaml`
+  ref — so a `ref:` under any other name is an unknown key in `_lmer.yaml`
   (`manifest.unknown-key`, WARN) and a refuse-start error in a standalone
   `sources.yaml`.
 - A mounted repository's **root is the area**: a napkin repository's root is
@@ -428,9 +509,11 @@ rules, same resolution against the environment overrides (see
   credential at clone time; the environment override for that source remains
   the operator-controlled escape hatch. Declarations MUST NOT contain
   credentials.
-- **Precedence:** environment overrides, then `_plexus.yaml sources:`, then a
-  legacy standalone `sources.yaml` (recognised with a warning; retires when
-  the tree migrates).
+- **Precedence:** the container reads all three tiers — environment
+  overrides, then `_lmer.yaml sources:`, then a legacy standalone
+  `sources.yaml` (recognised with a stale-legacy warning; retires when the
+  tree migrates). See the tier table in
+  [Canonical Source Declarations](./LMER-CLI.md#canonical-source-declarations-sourcesyaml).
 
 ### Housekeeping policy
 
@@ -456,11 +539,33 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
   `_archive/` mirror and tombstone the index line.
 - Every tool write to a plexus is one git commit. A hosted service commits as
   its own bot identity.
-- Index files (`MEMORY.md`, `PLANS.md`) are last-writer-wins at schema 1.
+- Index files (`MEMORY.md`, `PLANS.md`) are last-writer-wins at schema 1. The
+  generated `README.md` index blocks are not: they are re-rendered from the
+  records (project) or the manifest (root), so concurrent writers converge,
+  and a rebase conflict confined to them is resolved by rendering again from
+  the merged tree ([WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)).
+  `MEMORY.md` is not last-writer-wins either: `work memory persist` merges its
+  lines and reconciles its entry lines with the scope's live files and
+  retirement state ([memory](#memory)), so concurrent writers converge rather
+  than overwrite one another's entries.
   Every schema-defined symlink MUST be relative and MUST resolve inside the
   plexus.
 - A bare `git clone` of any conforming plexus is readable markdown throughout
   and passes `lmer-schema validate` with no errors.
+
+### Tool writes
+
+The registry writer (`lmer_schema.writer`) is the ONE tool that rewrites
+`_lmer.yaml`. It writes canonical remotes (the same normalizer resolution
+uses), checks the registry's invariants BEFORE anything reaches disk (a
+non-canonical spelling is a WARN, a remote bound twice is an error, and an
+unusable manifest is refused with the file byte-identical), and replaces the
+file atomically. Comments, blank lines, quoting and indentation are preserved
+by a ruamel.yaml round trip, with the exact comment behaviour decided in
+[DEVELOPMENT.md](./DEVELOPMENT.md) (a rewritten scalar keeps its end-of-line
+comment on its original column; `null` spelling is normalized). Hand edits stay
+legal — the writer is a convenience, not a gate — and `writer.create()` is the
+one call that flips a tree's form, by adding the manifest.
 
 ## Archive and housekeeping
 
@@ -475,10 +580,16 @@ These rules bind every writer — lmer tooling and hosted connectors alike:
   session, or a stale one past the threshold) are the existing cleaner
   contract of [RUN-STATE.md](./RUN-STATE.md). Legacy `runs/archive/` is
   recognised in legacy trees and is never required to move.
-- The housekeeping tool applies the manifest's TTL policy — napkin decay,
-  done-plan retirement, index tombstone sweeps — and lists host buckets
-  awaiting adoption without ever adopting them. Its default mode is a dry run.
-  Scheduling is the operator's concern.
+- The housekeeping tool — `work housekeep` — applies the manifest's TTL
+  policy (napkin decay, done-plan retirement, runs archiving, index tombstone
+  sweeps, bundle flattening) and lists host buckets awaiting adoption without
+  ever adopting them. Liveness is decided from LIFECYCLE FACTS — a recorded
+  final `session_end`, or a never-started `work seed` — never a display
+  label; an unknown lifecycle is never moved, and seeds follow the runs
+  policy. Its default mode is a dry run; `--archive-stale` is human-only.
+  Scheduling is the operator's concern; the one supported unattended recipe
+  is in
+  [RUN-STATE.md](./RUN-STATE.md#running-the-cleaner-unattended-recipe).
 
 ## Sessions and runs
 
@@ -502,16 +613,29 @@ self-contained; nothing about it is shared with any other launch.
   timestamp `YYYYMMDD-HHMMSS`, a process id and a random suffix — four
   `-`-joined all-digit fields matching `\d{8}-\d{6}-\d+-\d+` (for example
   `20260824-165230-2-31245`). Timestamp-first means `ls _runs/<slug>/` lists
-  launches in start order. The id is minted by the launch that OPENS the
-  record; a launch that continues an existing record carries that record's id
-  instead of minting one (see **Resume** below), so the timestamp and pid in a
-  directory name are always the launch that opened it — which is what keeps
-  that listing in start order however often a record is resumed. A session dir
-  SHOULD carry a `state.yaml`; a session-id not matching this pattern is a
-  warning.
+  launches in start order. (Under schema 2 the id is an opaque UID and carries
+  no order — [SCHEMA-V2.md](./SCHEMA-V2.md); the generated
+  `<project>/README.md` block is the ordered view.) The id is minted by the
+  launch that OPENS the record; a launch that continues an existing record
+  carries that record's id instead of minting one (see **Resume** below), so
+  the timestamp and pid in a directory name are always the launch that opened
+  it — which is what keeps that listing in start order however often a record
+  is resumed. A session dir SHOULD carry a `state.yaml`; a session-id not
+  matching this pattern is a warning.
 - **`--<name>`** is appended to the directory name when the session is named
   at its pre-execution freeze; the rename happens at most once. Index symlinks
   are re-pointed by the tool that renames.
+- **Names are labels, not addresses.** On a schema-2 record the name is a
+  label: two records may carry the same one, it is never a resolution key, and
+  a launch `--name` replaces a default or inherited label. An unnamed record
+  carries the default label `<taskdef>-<yymmdd>-<uid4>` (UTC date, the first
+  four uid hex digits); the project index and `work sessions` show it, and it
+  is not a naming. The `--<name>` directory suffix is added only for a
+  non-default name.
+- **Seeded records.** `work seed` writes a record of its own with
+  `session.seeded_by` set and no `session_start` logged. It is never started,
+  is read-only to the seeding launch, and is a valid continuation source that
+  needs no acknowledgement. `session.seeded_by` is provenance, never an owner.
 - **Independence and single writer.** Two launches on one target are two
   directories that never touch each other; there is nothing to merge, and a
   session writes only its own directory. The `owner` field in `state.yaml`
@@ -531,7 +655,8 @@ self-contained; nothing about it is shared with any other launch.
   never auto-ended.
 - `_specs/` and `_plans/` index into session directories with dated relative
   symlinks (`YYYY-MM-DD-<runlabel>--<artifact>.md`). `<runlabel>` names the
-  **record**, not the run: the launch's name when it has one, else the run's
+  **record**, not the run: the launch's name when it has one (a default label
+  counts as unnamed, so it uses the slug), else the run's
   slug, followed by `-<session-id>`. That is what guarantees **one entry per
   (record, artifact)** — two launches against one target are two complete
   records, so a run-keyed label would name both launches' entries identically
@@ -558,7 +683,7 @@ importable core.
 
 **Exit codes** are the validator's own: `0` clean (warnings and informational
 findings allowed), `1` one or more errors, `2` unusable input — no such path, a
-`_plexus.yaml` that cannot be read, or a `schema:` this lmer does not support
+`_lmer.yaml` that cannot be read, or a `schema:` this lmer does not support
 (see [Top-level keys](#top-level-keys)). A misuse of the command is `2` as
 well: the exact command surface is the CLI reference's,
 [LMER-CLI.md](./LMER-CLI.md#validating-a-plexus-lmer-schema-validate).
@@ -593,8 +718,9 @@ precedence); registry-to-directory consistency and bucket/registry collisions;
 host-bucket recognition; `_agents/` shape and reserved names; memory scope
 routing and index consistency at both scopes; session-unit shape under
 `_runs/`; state-file schemas and `events.jsonl` line-parseability;
-`_specs/`/`_plans/` symlink integrity and `PLANS.md` consistency; `_`
-reservation; archive mirror path validity; bundle and mirror opacity.
+`_specs/`/`_plans/` symlink integrity and `PLANS.md` consistency; generated
+`README.md` index block freshness; `_` reservation; archive mirror path
+validity; bundle and mirror opacity.
 
 **Out of scope:** napkin, knowledge and info content; legacy
 `{task_type}/{target}/` trees (informational); orchestration bundle internals.
@@ -658,16 +784,17 @@ memory scope) but never shape findings.
 
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
-| `_plexus.yaml` | operator; adoption tooling writes it in canonical form | YAML mapping per [The manifest](#the-manifest-_plexusyaml): `schema` integer, `name`, `projects`, `sources`, `housekeeping` | required | machine |
+| `_lmer.yaml` | operator; adoption tooling writes it in canonical form | YAML mapping per [The manifest](#the-manifest-_lmeryaml): `schema` integer, `name`, `projects`, `sources`, `housekeeping` | required | machine |
 | `<short-name>/` | operator or adoption tooling creates it; a session creates it on first write for a registered project | directory; name matches `[a-z0-9][a-z0-9_-]*`; SHOULD have a registry entry and a registry entry SHOULD have the directory (either mismatch is a warning) | optional | machine |
 | `_knowledge/` | humans and agents | directory of `<org>/<topic>/` directories | optional | free-form |
 | `_knowledge/<org>/<topic>/*.md` | humans and agents; promotion from napkin | free-form markdown | optional | free-form |
-| `_knowledge/<org>/INDEX.md` | humans and agents | free-form markdown index; RECOMMENDED, never checked | optional | free-form |
+| `_knowledge/<org>/INDEX.md` | humans and agents; `work knowledge index` generates one when it carries the marker | free-form markdown index; RECOMMENDED. A generated index (starting with the `lmer:knowledge-index:generated` comment) is maintained by `work knowledge index`; a hand-written one is never overwritten. The validator never checks either | optional | free-form |
 | `_napkin/` | humans and agents | directory of `<org>/<topic>/` directories; subject to the housekeeping TTL | optional | free-form |
 | `_napkin/<org>/<topic>/*.md` | humans and agents | free-form markdown; never authoritative | optional | free-form |
 | `_taskdef/` | operator, or the root of a mounted taskdef repository | the task-definition contract of [TASKDEFS.md](./TASKDEFS.md); validated by the taskdef loader, not by `lmer-schema` | optional | opaque |
 | `_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `_archive/` | housekeeping tooling; connectors' `archive_plan` and `forget` | mirror: `_archive/<relative path>`. A **`_`-prefixed** first component MUST be an area of this scope — `_agents`, `_knowledge`, `_napkin`, `_taskdef` — and anything else `_`-prefixed is a broken mirror path (an error). A content-namespace first component (`README.md`, a project's short name) is mirrored content and is never a finding; archived contents are not re-validated | optional | machine |
+| `README.md` | humans outside the markers; `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block rendered from `_lmer.yaml` (project list) plus a fixed legend; a block that differs from a fresh render is a warning; a block of a newer format than the tool is left alone; text outside the markers is never checked | optional | machine (the block only) |
 | any other top-level name | humans | content namespace, never checked; a `_`-prefixed name is a warning; a dotless directory that is project-shaped and unregistered is a warning; a dotted directory is a host bucket | optional | free-form |
 
 ### Project tree
@@ -675,10 +802,10 @@ memory scope) but never shape findings.
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
 | `<project>/_runs/` | session (`work` CLI) creates it on first launch | directory of `<slug>/` grouping directories | optional | machine |
-| `<project>/_runs/<slug>/` | session (`work` CLI) creates it; nothing is written at this level | directory holding session directories only; a file or non-session directory here is a warning | optional | machine |
+| `<project>/_runs/<slug>/` | session (`work` CLI) creates it; nothing is written at this level | directory holding session directories only; a file or non-session directory here is a warning; a slug that is the obsolete derivation of its own target (`chat-.`, `chat-<repo>.git`) is `record.plain-session-slug` and `work migrate` folds it into the bare taskdef group | optional | machine |
 | `<project>/_runs/.new-<session-id>-*/` | session (`work` CLI) | seed directory of the run-dir lifecycle in [RUN-STATE.md](./RUN-STATE.md): written, then moved to `<session-dir>` by one atomic rename | transient | machine |
 | `<session-dir>/` | see [Session directory](#session-directory) | see Session directory (`<session-dir>/` row) | see Session directory | see Session directory |
-| `<project>/_specs/` | tooling: the specs index sync of `work artifact`, `work session-end` and `work specs-index --rebuild` | flat directory of dated relative symlinks `YYYY-MM-DD-<runlabel>--<basename>.md` into session directories (`../_runs/<slug>/<session-dir>/…`); `<runlabel>` is the RECORD's label, `<name-or-slug>-<session-id>` (see [Sessions and runs](#sessions-and-runs)), so one entry per (record, artifact) and a second launch of one target never unlinks the first launch's entry; the `--` is reserved as the label/basename boundary and a label never contains one; no index file; dangling is an error, non-relative or escaping is an error in every form | optional | machine |
+| `<project>/_specs/` | tooling: the specs index sync of `work artifact`, `work session-end` and `work specs-index --rebuild` | flat directory of dated relative symlinks `YYYY-MM-DD-<runlabel>--<basename>.md` into session directories (`../_runs/<slug>/<session-dir>/…`); `<runlabel>` is the RECORD's label, `<name-or-slug>-<session-id>` (see [Sessions and runs](#sessions-and-runs)), so one entry per (record, artifact) and a second launch of one target never unlinks the first launch's entry; the `--` is reserved as the label/basename boundary and a label never contains one; an entry keeps its FIRST registration date across later session starts and re-registrations (#334); no index file; dangling is an error, non-relative or escaping is an error in every form | optional | machine |
 | `<project>/_plans/` | tooling and connectors | directory of plan files, run-plan symlinks and `PLANS.md` | optional | machine |
 | `<project>/_plans/<slug>.md` | tooling and connectors (`save_plan`) | kebab-case slug filename; free-form markdown body | optional | free-form |
 | `<project>/_plans/YYYY-MM-DD-<runlabel>--plan.md` | tooling: the run-plan link sync (no shipped lmer verb writes one at schema 1) | relative symlink to `../_runs/<slug>/<session-dir>/plan.md`, the session directory's current name (`--<name>` included once named); same integrity rules as `_specs/` | optional | machine |
@@ -688,6 +815,7 @@ memory scope) but never shape findings.
 | `<project>/_taskdef/` | operator | project-scoped task-definition overrides ([TASKDEFS.md](./TASKDEFS.md)) | optional | opaque |
 | `<project>/_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `<project>/_archive/` | housekeeping tooling; the session cleaner for archived sessions | mirror, same rule as the instance `_archive/` with this scope's areas (`_agents`, `_info`, `_plans`, `_runs`, `_specs`, `_taskdef`): `<project>/_archive/_runs/<slug>/<session-dir>/` for an archived session | optional | machine |
+| `<project>/README.md` | humans outside the markers; the durability push of any session in the project and `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block: one row per committed run record under `_runs/`, newest first, each a pure function of its own record; absence while records exist is informational; a block that differs from a fresh render is a warning; a conflict-marker line in the hand text keeps the generator away | optional | machine (the block only) |
 | any other name inside `<project>/` | humans | content namespace, never checked; a `_`-prefixed name is a warning | optional | free-form |
 
 ### Session directory
@@ -724,14 +852,18 @@ configuration and mirrors.
 | `<scope>/mirrors/<name>/` | mirror tooling (foreign writer) | vendored agent tooling | optional | opaque |
 | `<scope>/memory/` | `work memory persist`; connectors' `remember` and `forget` | directory of memory files plus `MEMORY.md` | optional | machine |
 | `<scope>/memory/<name>.md` | same | markdown with YAML frontmatter `name`, `description`, `metadata.type` in `user`, `feedback`, `project`, `reference`; missing or malformed frontmatter is an error; a type that does not select this scope is a warning (informational in a legacy tree); the body is free-form | optional | machine |
-| `<scope>/memory/MEMORY.md` | same | one line per memory carrying a relative link to its file (see [Index lines](#index-lines)); an entry without a file is an error (a warning in a legacy tree), a file without an entry is a warning | expected when memory files exist | machine |
+| `<scope>/memory/MEMORY.md` | same | one line per memory carrying a relative link to its file (see [Index lines](#index-lines)), or in a split scope one map line per area linking to `areas/<slug>.md`; an entry without a file is an error (a warning in a legacy tree), a file without an entry in any index is a warning | expected when memory files exist | machine |
+| `<scope>/memory/areas/<slug>.md` | same | a split scope's area index: entry lines whose links resolve against `areas/` (`../<name>.md`); entries are checked like `MEMORY.md`'s, and a cross-reference to another area (`<slug>.md`) resolves in this scope or the one restore merges it with; anything in `areas/` that is not `<slug>.md` is an unknown file | optional | machine |
 
 ### Index lines
 
-`MEMORY.md` and `PLANS.md` are line indexes. For the validator an **entry**
-is a line that carries a relative markdown link to a `.md` file, resolved
-against the index's own directory; a line with no such link (a heading, prose,
-or a tombstone) is never an entry and never a finding. **Tombstoning** a line
+`MEMORY.md`, a split memory scope's `areas/<slug>.md` and `PLANS.md` are line
+indexes. For the validator an **entry** is a line that carries a relative
+markdown link to a `.md` file, resolved against the index's own directory; a
+line with no such link (a heading, prose, or a tombstone) is never an entry
+and never a finding. A map line in `MEMORY.md` links to an area index rather
+than a memory: the area index must exist, and the line is otherwise not an
+entry. **Tombstoning** a line
 means replacing its link with the word `archived` or `forgotten` and the date,
 or re-pointing the link at the `_archive/` mirror; either way the line stays
 and the file's disappearance is not a dangling entry.
@@ -771,8 +903,8 @@ registered. Keeping the two in step is part of the
 
 | code | severity | legacy | tier | reports |
 |---|---|---|---|---|
-| `manifest.absent` | INFO | | legacy | no `_plexus.yaml` at the plexus root: the tree is [legacy form](#legacy-form), recognised and read in place — never an error |
-| `manifest.unparseable` | ERROR | | machine | a present `_plexus.yaml` that cannot be read or interpreted: unusable input, and never a demotion to legacy |
+| `manifest.absent` | INFO | | legacy | no `_lmer.yaml` at the plexus root: the tree is [legacy form](#legacy-form), recognised and read in place — never an error |
+| `manifest.unparseable` | ERROR | | machine | a present `_lmer.yaml` that cannot be read or interpreted: unusable input, and never a demotion to legacy |
 | `manifest.schema-not-int` | ERROR | | machine | `schema:` is missing or is not an integer (a YAML bool is not one) |
 | `manifest.schema-newer` | ERROR | | machine | `schema:` is newer than this lmer understands; tools refuse to write, and the tree is unusable input |
 | `manifest.schema-unsupported` | ERROR | | machine | `schema:` is an integer no version of this lmer supports |
@@ -820,6 +952,7 @@ Rows of [Agent surface](#agent-surface-both-scopes); the scope rules are
 | `agents.unknown-harness` | WARN | | machine | a first-level name under `_agents/` that is neither a known harness nor the reserved `memory`/`mirrors` |
 | `agents.reserved-harness-name` | ERROR | | machine | the reserved `_agents/` name `memory` or `mirrors` used as something else — a harness configuration dir, or not a directory at all |
 | `agents.memory-frontmatter` | ERROR | | machine | a memory file whose YAML frontmatter is missing, malformed or short of `name`, `description` or `metadata.type` |
+| `agents.memory-retirement` | ERROR | | machine | schema-2 retirement state cannot be safely interpreted; no memory mutation is permitted |
 | `agents.memory-type-unknown` | ERROR | | machine | a memory whose `metadata.type` is outside the four-value vocabulary |
 | `agents.memory-scope-mismatch` | WARN | INFO | machine | a memory whose `metadata.type` does not select the scope it lives in; recall unions both scopes, so nothing is lost |
 | `agents.memory-unknown-file` | WARN | | machine | a file in a memory directory that is not a memory or its index |
@@ -839,6 +972,8 @@ tier: a corrupt state file is broken in every form.
 | `record.state-unparseable` | ERROR | | machine | a state file (`state.yaml`, `ledger.yaml`, `plan.index.json`) that does not parse |
 | `record.state-schema` | ERROR | | machine | a state file whose `schema:` is not an integer (a bool is not one) |
 | `record.state-enum` | ERROR | | machine | a state file enum (run status, task status) outside its RUN-STATE.md range |
+| `record.session-metadata` | ERROR | | machine | a schema-2 session dictionary is absent or its opaque UID does not match the record directory |
+| `record.release-claim` | ERROR | | machine | a schema-2 shared release claim cannot be safely interpreted; arbitration must refuse |
 | `record.events-line-unparseable` | ERROR | | machine | an `events.jsonl` line that is not one JSON object |
 | `record.grouping-level-entry` | WARN | | machine | a file or a non-session directory at a `_runs/<slug>/` grouping level, where nothing is written |
 | `record.session-dir-without-state` | WARN | | machine | a session directory with no `state.yaml`: a session SHOULD carry one |
@@ -846,13 +981,17 @@ tier: a corrupt state file is broken in every form.
 | `record.seed-dir-leftover` | WARN | | machine | a `.new-<session-id>-*` seed directory left behind by a crash — transient state the cleaner sweeps |
 | `record.session-stale` | INFO | | machine | an `in-progress` session untouched for longer than the staleness window: possibly orphaned, resumable, never auto-ended |
 | `record.masterplan-nested` | INFO | | opaque | a masterplan bundle in the pre-schema-1 nested `masterplan/<mp-slug>/` shape; reported for migration, never an error |
+| `record.plain-session-slug` | ERROR | | machine | a pre-A1 plain-session leftover: the slug is the obsolete derivation of the record's own target (`chat-.`, `chat-<repo>.git`); `work migrate <project>` folds it |
 
-#### `index.*` — the link mechanic of the indexes and the bundle
+#### `index.*` — the link mechanic of the indexes and the bundle, and the generated README index blocks
 
 One set of codes for every schema-defined symlink: the `_specs/` and `_plans/`
 index links and the `<session-dir>/<artifact>.md` bundle links (see
 [Index lines](#index-lines)). A link is reported once — an escaping target is
-never also reported dangling.
+never also reported dangling. The two `readme` codes are about the generated
+index block a root or project `README.md` carries: the block is compared with
+a fresh render by the same kernel that writes it, so the finding is exact and
+clock-free, and a block of a newer format than this tool is never judged.
 
 | code | severity | legacy | tier | reports |
 |---|---|---|---|---|
@@ -861,6 +1000,8 @@ never also reported dangling.
 | `index.dangling-link` | ERROR | WARN | machine | a `_specs/`/`_plans/` index symlink or a `<session-dir>/<artifact>.md` bundle link whose target does not exist |
 | `index.entry-without-file` | ERROR | WARN | machine | a `PLANS.md` entry whose linked plan file does not exist |
 | `index.file-without-entry` | WARN | | machine | a `<project>/_plans/<slug>.md` plan file that no `PLANS.md` line carries |
+| `index.readme-missing` | INFO | | machine | a project holding run records whose `README.md` carries no generated index block (`<!-- lmer:index:start -->` … `<!-- lmer:index:end -->`); the project's next durability push or `lmer-schema index --write` creates it; the detail says when a conflict-marker line in the hand text is what keeps the generator away |
+| `index.readme-stale` | WARN | | machine | a `README.md` generated index block that no longer matches a fresh render of the records under `_runs/` (or, at the plexus root, of `_lmer.yaml`), whose markers are malformed, or whose hand text holds a conflict-marker line the generator refuses to stage; a block of a newer format than this tool is left alone; warnings never block |
 
 #### `runner.*` — the run itself
 
@@ -875,7 +1016,7 @@ what keeps a short report from reading as a clean one.
 
 ## Versioning and change process
 
-The schema is versioned by the single integer `schema:` in `_plexus.yaml`.
+The schema is versioned by the single integer `schema:` in `_lmer.yaml`.
 Schema `1` is this document.
 
 - **Additive or loosening** changes — a new optional key, a new `_` name, a
@@ -930,19 +1071,20 @@ issues; there is no further governance at schema 1.
 
 ## Legacy form
 
-A tree with no `_plexus.yaml` is a **legacy tree**. lmer detects the form by
+A tree with no `_lmer.yaml` is a **legacy tree**. lmer detects the form by
 manifest presence; in a legacy tree it resolves a project by its
 `{host}/{project}/` path, reads and writes every area in place at its bare
 name (`runs/`, `specs/`, `info/`, `memory/`, `napkin/`, `taskdef/`,
 `agent-files/`, `mirrors/`, a standalone `sources.yaml`), and validates at the
 legacy tier.
 
-Migrating is never a prerequisite. Migration is incremental and per tree: a
-project tree migrates by gaining a registry entry, moving from
-`{host}/{project}/` to `<short-name>/`, renaming its bare areas to their `_`
-names and re-pointing its index symlinks — one commit, with an OPTIONAL
-compatibility symlink at the old path. The instance surfaces migrate
-independently of any project tree; memory migrates by lifting every
+Migrating is never a prerequisite. Migration is incremental and per tree, and
+it is tooling: `work adopt <host>/<project> <shortname>` gains the registry
+entry and moves `{host}/{project}/` to `<short-name>/` in one commit, then
+`work migrate <project>` renames the bare areas to their `_` names,
+nests the run dirs and re-points the index symlinks — one commit, with an
+OPTIONAL compatibility symlink at the old path. The instance surfaces migrate
+independently with `work migrate --instance`; memory migrates by lifting every
 non-`project`-type memory from `<project>/memory/` to `_agents/memory/`. The
 underscore and the flat short name make each tree's migration state visible
 in `ls`.
@@ -1019,17 +1161,18 @@ path is a `legacy`-tier row there, or a host bucket.
 
 | legacy (no manifest) | schema form | note |
 |---|---|---|
-| `sources.yaml` at the root | `_plexus.yaml` `sources:` | same shape and rules; the standalone file retires on migration |
-| (none) | `_plexus.yaml` `projects:` | the registry; identity moves out of paths |
+| `sources.yaml` at the root | `_lmer.yaml` `sources:` | same shape and rules; the standalone file retires on migration |
+| (none) | `_lmer.yaml` `projects:` | the registry; identity moves out of paths |
 | `{host}/{project}/` | `<short-name>/` | by registry entry; the old path survives only as a host bucket for unnamed work or as a compatibility symlink |
 | `{host}/{project}/runs/<slug>/` | `<project>/_runs/<slug>/<session-id>/` | a legacy run dir maps to its first session's id; the shared dir becomes one session dir |
 | `{host}/{project}/runs/<slug>--<name>/` | `<project>/_runs/<slug>/<session-id>--<name>/` | the name suffix moves onto the session dir |
+| `{host}/{project}/runs/chat-./`, `runs/chat-<repo>[.git]/` (a pre-A1 plain-session spelling) | `<project>/_runs/chat/<session-id>/` | the fold: the record joins its bare taskdef group with only `slug:` rewritten; `_runs/chat-./<session-id>/` in a schema-form tree folds the same way (`record.plain-session-slug`) |
 | `{host}/{project}/runs/.new-<session>-*/` | `<project>/_runs/.new-<session-id>-*/` | the seed directory, same lifecycle |
 | `runs/<slug>/{state.yaml,events.jsonl,ledger.yaml,release.yaml,log.yaml,plan.index.json,goals.md,reports/}` | `<session-dir>/` same names | shapes and writers unchanged; location only |
 | `runs/<slug>/masterplan/<mp-slug>/` | `<session-dir>/masterplan/` | the bundle de-nests: one bundle per session dir |
 | `runs/<slug>/<artifact>.md -> masterplan/<mp-slug>/<artifact>.md` | `<session-dir>/<artifact>.md -> masterplan/<artifact>.md` | the same well-known artifact links, targets one level shallower; the multi-bundle `<mp-slug>-<name>` prefix retires |
 | `{host}/{project}/runs/archive/<slug>/` | `<project>/_archive/_runs/<slug>/<session-id>/` | one archive home; legacy `runs/archive/` stays recognised in legacy trees |
-| `{host}/{project}/specs/YYYY-MM-DD-<runlabel>--<basename>.md` | `<project>/_specs/YYYY-MM-DD-<runlabel>--<basename>.md` | same symlink mechanics and the same entry grammar; targets re-pointed at `../_runs/<slug>/<session-dir>/…`, and `<runlabel>` gains its `-<session-id>` half because the one legacy run dir becomes one record per launch |
+| `{host}/{project}/specs/YYYY-MM-DD-<runlabel>--<basename>.md` | `<project>/_specs/YYYY-MM-DD-<runlabel>--<basename>.md` | same symlink mechanics and the same entry grammar; `work migrate` re-points each target in place at `../_runs/<slug>/<session-dir>/…` and keeps the entry's name and date (a legacy run dir is one record, so a migrated entry collides with nothing); entries registered after the migration carry the `-<session-id>` half of `<runlabel>` |
 | `{host}/{project}/info/` | `<project>/_info/` | unchanged contents |
 | `{host}/{project}/info/gate-check.yaml` | `<project>/_info/gate-check.yaml` | same shape, same consumer |
 | `{host}/{project}/memory/` | `<project>/_agents/memory/` and `_agents/memory/` | split by `metadata.type`: `project` stays, every other type lifts to instance scope |

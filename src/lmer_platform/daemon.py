@@ -40,6 +40,7 @@ command away without curl or a token.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -47,12 +48,15 @@ from typing import Optional
 
 from lmer_cli import comms as bus_comms
 from lmer_cli import runref
+from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
+from lmer_cli.env_sources import remember_env_defaults
 from lmer_cli.tls import ensure_ca_bundle
 
-from .api import build_state, create_app
+from .api import adopt_run, build_state, create_app
 from .assistant import Supervisor, register_supervisor
 from .comms import CommsHub, register_hub
 from .connectors import ThreadConnectors, register_connectors
+from .ctl import segment_field
 from .thread_service import ThreadServices, register_services
 from .config import (
     connector_path,
@@ -61,15 +65,15 @@ from .config import (
     revoke_connector_credential,
 )
 from .config import (
-    ConfigError, binding_notice, ensure_secret, load as load_config, read_secret,
+    ConfigError, binding_notice, ensure_secret, export_assistant_name, load as load_config, read_secret,
 )
 from .detect import Detector
 from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
 from .resume import ResumeError, ResumeRequest, resume_run
-from .runs import forget, list_tracked, run_key, track
+from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
-from .store import StoreError, platform_dir
+from .store import StoreError, append_event, platform_dir
 from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
@@ -82,7 +86,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, assistant, detect, project_context
+from . import projects, assistant, detect, mute, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -129,14 +133,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Instead list every run in the shared work repo (adoption picker)",
     )
 
-    adopt = sub.add_parser("adopt", help="Track an existing run: <host>/<project>/<slug>")
+    adopt = sub.add_parser(
+        "adopt", help="Track an existing run: <host>/<project>/<slug|uid>"
+    )
     adopt.add_argument(
         "run", help="e.g. gitlab.example.com/group/project/develop-issue-141"
     )
     adopt.add_argument("--note", help="Free-form note recorded with the entry")
 
     forget_cmd = sub.add_parser("forget", help="Stop tracking a run")
-    forget_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    forget_cmd.add_argument("run", help="<host>/<project>/<slug|uid>")
 
     setup_ui_cmd = sub.add_parser(
         "setup-ui", help="Fetch a pinned Node and build the control UI"
@@ -186,7 +192,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     resume_cmd = sub.add_parser(
         "resume", help="Continue a tracked run by starting its next session"
     )
-    resume_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    resume_cmd.add_argument("run", help="<host>/<project>/<slug|uid>")
     resume_cmd.add_argument("--slot")
     resume_cmd.add_argument("--home-revision", type=int)
     resume_cmd.add_argument("--confirm-project", action="store_true")
@@ -246,6 +252,23 @@ def _split_run_ref(raw: str) -> tuple:
     return parts
 
 
+def _run_ref_fields(raw: str) -> tuple:
+    """``(host, project, slug, uid)`` for a run reference typed at the shell.
+
+    The last segment is the run's key segment (spec §6.1): 32 lowercase hex is a
+    schema-2 run's execution uid and is passed as ``uid`` with no slug — the
+    verbs read the group label off the tracked entry or the mirror — and
+    anything else is the slug, exactly as before uids. The same rule
+    ``lmer-ctl``'s ``_run_fields`` applies, and unambiguous for the reason it
+    gives: the spawn refuses a taskdef named like a uid — and it is that
+    function's rule, called (:func:`lmer_platform.ctl.segment_field`).
+    """
+    host, project, segment = _split_run_ref(raw)
+    if segment_field(segment) == "uid":
+        return host, project, None, segment
+    return host, project, segment, None
+
+
 def _overrides(args: argparse.Namespace) -> dict:
     return {
         "bind_address": getattr(args, "bind_address", None),
@@ -263,8 +286,6 @@ def _cmd_secret(args: argparse.Namespace) -> int:
 
 def _print_status(payload: dict, as_json: bool) -> None:
     if as_json:
-        import json
-
         print(json.dumps(payload, indent=2))
         return
 
@@ -364,6 +385,7 @@ def _watch_for_attention(config) -> Detector:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    # deferred: import cost — uvicorn (~85 ms) loads only for `platform run`
     import uvicorn
 
     logging.basicConfig(level=logging.DEBUG if args.log_level == "trace" else args.log_level.upper(),
@@ -372,6 +394,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ingress = Ingress()
     overrides = _overrides(args)
     config = load_config(overrides)
+    export_assistant_name(config)
     secret = ensure_secret(config)
 
     # flush=True throughout: stdout is a pipe under nohup/systemd, so Python
@@ -408,7 +431,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # last, and with it the thread that fed each session's log. Re-attaching here
     # means the first request for a survivor's scrollback already sees the seam
     # and the recovered output, rather than a file that stopped growing (T36).
-    notice = startup_notice(reattach_all())
+    notice = startup_notice(reattach_all(config=config))
     if notice:
         print(notice, flush=True)
 
@@ -510,8 +533,6 @@ def _subscribe_to_comms() -> CommsHub:
 
 def _assistant_consumer(hub: CommsHub):
     """Record milestones and spool worker and human records to the assistant."""
-    from .store import append_event
-
     def consume(event) -> None:
         message = event.message
         source = message.get("source") or {}
@@ -544,7 +565,7 @@ def _assistant_consumer(hub: CommsHub):
             except Exception as exc:
                 logger.warning("platform_comms_mark_failed session=%s error=%s", event.session, exc)
             return
-        if not own:
+        if not own and not mute.suppressed(event.session, message, event.run):
             hub.queue_digest(event)
 
     return consume
@@ -637,11 +658,15 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 
 def _cmd_adopt(args: argparse.Namespace) -> int:
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     config = load_config()
-    entry = track(host, project, slug, source="adopted", note=args.note)
+    try:
+        entry = adopt_run(config, host, project, slug, uid=uid, note=args.note)
+    except RunIndexError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
 
-    if resolve_run_dir(config, host, project, slug) is None:
+    if resolve_run_dir(config, host, project, entry.slug, uid=entry.uid) is None:
         print(
             f"⚠️  adopted {entry.key}, but no such run dir is in the mirror "
             "yet — it may not be pushed, or the mirror may be stale "
@@ -653,12 +678,23 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
 
 
 def _cmd_forget(args: argparse.Namespace) -> int:
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     # Echoed as the key the operator typed. These two lines used to compose
     # ``<host>/<project>/runs/<slug>``, which for a named run is a directory that
     # does not exist — and this verb touches no directory at all.
-    key = run_key(host, project, slug)
-    if forget(host, project, slug):
+    key = run_key(*key_parts({"host": host, "project": project, "slug": slug, "uid": uid}))
+    # Through the alias a key transition left, as ``POST /api/runs/forget``
+    # resolves it: after a bind the slug key the operator still holds is the
+    # uid entry's, and forgetting by it must reach that entry.
+    try:
+        entry = get_tracked(host, project, slug, uid=uid)
+    except RunIndexError:
+        entry = None
+    if entry is not None:
+        host, project, slug, uid, key = (
+            entry.host, entry.project, entry.slug, entry.uid, entry.key
+        )
+    if forget(host, project, slug, uid=uid):
         print(f"✅ no longer tracking {key}")
         return 0
     print(f"not tracked: {key}", file=sys.stderr)
@@ -734,12 +770,13 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     gives — it is the operator's content, and it is already in their shell history
     if they want it.
     """
-    host, project, slug = _split_run_ref(args.run)
+    host, project, slug, uid = _run_ref_fields(args.run)
     config = load_config()
     request = ResumeRequest(
         host=host,
         project=project,
         slug=slug,
+        uid=uid,
         taskdef=args.taskdef,
         repo_url=args.repo_url,
         direction=args.direction,
@@ -820,9 +857,6 @@ def _load_env_files() -> None:
     First-wins, so an exported variable still beats the file, and spawned sessions
     inherit the result (they also load ``.env`` themselves, harmlessly).
     """
-    from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
-    from lmer_cli.env_sources import remember_env_defaults
-
     loaded = apply_env_file_defaults(default_env_file_candidates())
     remember_env_defaults(loaded)
     if loaded:

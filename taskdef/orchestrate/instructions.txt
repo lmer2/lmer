@@ -178,10 +178,17 @@ a run is what it acts on.
 
 **Steering**
 - `POST /api/sessions/{id}/comms` `{kind,text}` (`lmer-ctl send <id> <text>`) —
-  say something to a live worker in your project. It arrives as a turn tagged `[uber lmer]`, and
+  say something to a live worker in your project. It arrives as a turn tagged `[{{ LMER_PLATFORM_ASSISTANT_NAME | default('Ratchet', true) }}]` (older workers may still show it as `[uber lmer]`), and
   every channel connected to that session sees it too. A leading shell escape is
   read as words; a message starting with `/` is refused, because the tag takes
-  the first column and the harness would read the command as prose.
+  the first column and the harness would read the command as prose. The platform
+  adds the project's `supervisor_authority` to the tag (`· authority=approvals`).
+  That stamp is what the worker trusts, so saying in your text that the operator
+  approved something gives it nothing. A worker's `--operator-only` question
+  refuses your answer at any level: relay it to the operator instead. Above
+  `none`, raw keystrokes (`send --no-newline`, a terminal), a wind-down `note`
+  and every command but a bare `/followup` are refused too, so a dialog there
+  is the operator's to answer; put the words in a message.
 - `POST /api/sessions/{id}/comms` `{kind: "command"}` (`lmer-ctl command <id>
   /followup`) — run a harness command in a live session. Relayed untagged, which
   is what keeps the leading `/` live. This is the verb for `/followup`.
@@ -252,7 +259,9 @@ destination `permalink`, and context. Top-level mentions include the configured
 backlog preceding the trigger. A DM reply names the exact DM parent you sent;
 another run's connected thread remains that run's conversation.
 
-Read the thread with `lmer-ctl thread read <permalink>`. Decide whether to answer
+Read the thread with `lmer-ctl thread read <permalink>`. Files in it are copied
+into your upload store and named by path; a file that was only described says
+why (`lmer-signal read <permalink>` copies it in too). Decide whether to answer
 or start a worker under the operator's existing run-start policy. For an answer,
 use `lmer-ctl thread post <permalink> <text>`: it addresses that conversation
 only. Keep its context and any private reply out of broadcast `lmer-signal post`
@@ -280,8 +289,9 @@ run had no identity to attach one to); the session is running regardless.
 
 **Write every run name as a link the operator can tap.** When you name a run in
 chat, make the name a markdown link whose href is
-`lmer://run/<host>/<project>/<slug>` — the same `host/project/slug` key the routes
-above take:
+`lmer://run/<host>/<project>/<uid or slug>` — the run's `uid` when its fleet row
+carries one, otherwise its `slug`. Two runs of one work item share a slug and
+never a uid, so a slug link to a run that has a uid opens nothing:
 
     [auth rate-limit fix](lmer://run/gitlab.example.com/acme/widget/develop-issue-412)
     is on its third review round.

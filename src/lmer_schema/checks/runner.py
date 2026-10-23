@@ -56,7 +56,7 @@ Three levels of "something is too broken to continue", deliberately distinct:
 1. **No tree.** The target is not a directory: one ``runner.no-such-path``
    error, the report is unusable (exit 2) and NO check runs. There is nothing
    to say anything about.
-2. **An unusable manifest.** A present-but-broken ``_plexus.yaml``, or one
+2. **An unusable manifest.** A present-but-broken ``_lmer.yaml``, or one
    declaring a ``schema:`` int newer than this lmer understands, is unusable
    input (exit 2) — the manifest check marks it so. The runner then STOPS:
    the downstream checks do NOT run against an empty registry. Running them
@@ -102,9 +102,11 @@ The project-list modules carry it themselves — every
 :class:`~lmer_schema.checks.walk.ProjectDir` carries the form its CONTENTS
 are checked at, ``check_agents`` reads that per project and ``index_links``
 derives the same answer from the top-level name — so the runner adds nothing
-to their path. ``record`` is the one that cannot: it is deliberately not
-project-list-driven (it finds run areas by name, so it works on a bare root)
-and it passes no form of its own. It therefore writes through a report VIEW
+to their path. ``record`` is the one that cannot: it is handed the same list
+but is deliberately not project-list-DRIVEN — it finds run areas by name, so
+it works on a bare root and reaches a nested project the list never names,
+and uses the list only to place one prune (Scope-outs, below) — and it
+passes no form of its own. It therefore writes through a report VIEW
 (:class:`_TierPinnedReport`) that pins any finding under a legacy-form
 project dir to the legacy tier, using the ``form`` the walk already
 determined. Only a call that leaves the tier to the report is affected, so a
@@ -129,14 +131,25 @@ which is what makes a vendored fork's own ``mirrors/<fork>/runs/`` fixtures
 silent rather than an ERROR on a healthy plexus.
 
 The one scope-out no NAME can prune is the legacy ``{task_type}/{target}/``
-tree, ``{task_type}`` being an open set; ``record.py`` prunes it by SHAPE
-instead (:func:`~lmer_schema.checks.record._is_legacy_task_tree`, issue #379 —
-until that landed, a ``runs``-named directory inside one was opened, parsed
-and reported, and a tree conformant everywhere else exited 1). Every prune is
-``record.py``'s boundary to draw, not the runner's.
+tree, ``{task_type}`` being an open set. ``record.py`` prunes it by POSITION
+composed with SHAPE (:func:`~lmer_schema.checks.record._is_legacy_task_tree`,
+issue #379 — until the shape half landed, a ``runs``-named directory inside
+one was opened, parsed and reported, and a tree conformant everywhere else
+exited 1). The position is "directly inside a project", and the runner is
+where that becomes positional: the layout walk's list reaches the record
+check as ``projects=`` — the same list the agent and index modules get — so a
+directory the registry names is a project before it has grown a §1 marker,
+and the walk is never rediscovered. Where the list is silent (no list; a
+nested project the walk's own rule never names) the marker test answers, so
+the list adds and never subtracts. The ``{target}`` level is shape alone —
+what the legacy writers left in it — because no position separates a target
+holding only a run area from a nested project holding only one, and the
+live tree holds the latter. Every prune is ``record.py``'s boundary to draw,
+not the runner's; the runner only hands the list down.
 ``tests/test_lmer_schema_runner.py`` pins every half of this with
-booby-trapped files planted where the walk could reach them and a recorder
-around the real filesystem calls.
+booby-trapped files planted where the walk could reach them — one task tree
+under a project-shaped directory, one under a registered directory with no
+marker at all — and a recorder around the real filesystem calls.
 """
 
 from __future__ import annotations
@@ -304,33 +317,43 @@ def _check_agents(context: Context) -> None:
     form its contents are checked at and ``check_agents`` reads it, so the
     bucket tier arrives with the list (module docstring)."""
     agents_checks.check_agents(
-        context.root, context.report, project_dirs=context.project_dirs
+        context.root, context.report, project_dirs=context.project_dirs,
+        manifest=context.manifest,
     )
 
 
 def _check_record(context: Context) -> None:
-    """``check_record(root, report, *, now=None, stale_after=...) -> None``.
+    """``check_record(root, report, *, now=None, stale_after=..., manifest=...,
+    projects=None) -> None``.
 
     Walks the record areas by name itself (a bucket's ``_runs/`` sits below
-    its host segments, at no fixed depth); *now* and *stale_after* are the
-    caller's, so a verdict never depends on the wall clock."""
+    its host segments, at no fixed depth); the project list is handed down
+    all the same, to place the legacy task-tree prune by position (#379) and
+    for the schema-2 claim check, never to find areas by. *now* and
+    *stale_after* are the caller's, so a verdict never depends on the wall
+    clock."""
     record_checks.check_record(
         context.root,
         context.tiered(),
         now=context.now,
         stale_after=context.stale_after,
+        manifest=context.manifest,
+        projects=context.project_dirs,
     )
 
 
 def _check_index_links(context: Context) -> None:
-    """``check_index_links(root, report, *, projects=None) -> None`` — the
-    same project list, spelled ``projects=`` here.
+    """``check_index_links(root, report, *, projects=None, manifest=None) ->
+    None`` — the same project list, spelled ``projects=`` here, and the
+    manifest loaded once at the top of the run, which gates the generated
+    README index codes (a legacy tree has no index, so none is passed there).
 
     This module decides the bucket tier itself (from the top-level name), so
     the view would leave every one of its findings alone; it gets the report.
     """
     index_checks.check_index_links(
-        context.root, context.report, projects=context.project_dirs
+        context.root, context.report, projects=context.project_dirs,
+        manifest=context.manifest,
     )
 
 
@@ -486,10 +509,11 @@ class _TierPinnedReport:
     legacy tier's severities in either form (SCHEMA.md "Host buckets"), so a
     bucket never blocks (D9). A module handed the project list carries that
     with the list (each :class:`~lmer_schema.checks.walk.ProjectDir` states
-    the form its contents are checked at). ``record`` is not handed one — it
-    finds run areas by NAME so that it works on a bare root — and has no
-    project to read a form from, so its tier is pinned by PATH here, from the
-    same walk's answer: one rule, one place, no second reading of the tree.
+    the form its contents are checked at). ``record`` reads no form from the
+    list it is handed — it finds run areas by NAME so that it works on a bare
+    root, and uses the list only to place a prune — so it has no project to
+    read a form from, and its tier is pinned by PATH here, from the same
+    walk's answer: one rule, one place, no second reading of the tree.
 
     Only a call that leaves the tier to the report (``form=None``) is
     affected: a module that decides the tier itself passes an explicit form

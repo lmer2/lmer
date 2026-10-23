@@ -54,6 +54,13 @@ HARNESS_ENV = "LMER_HARNESS"
 #: there is one answer here rather than a flag and a variable that can disagree.
 LLM_NAME_ENV = "LMER_LLM_NAME"
 
+#: Set by the platform daemon on every ``lmer`` it spawns: why the host's Codex
+#: seed (``LMER_CODEX_CONFIG_SEED``) could not be read, or blank when it could.
+#: Only the child knows its harness once its preset, model aliases and .env
+#: files are applied, so the child refuses a codex launch on it and drops it
+#: either way; it never reaches the container.
+CODEX_SEED_ERROR_ENV = "LMER_CODEX_CONFIG_SEED_ERROR"
+
 #: Environment variable marking a session with no human attached (a
 #: ``spawn-harness`` child, a cron run, any headless launch). The rule it
 #: stands for is the NON-INTERACTIVE SESSIONS section of AGENTS.md: no gate
@@ -202,6 +209,24 @@ class ExecProfile:
 
 
 @dataclass(frozen=True)
+class MemoryIndexLimit:
+    """How much of the memory index (``MEMORY.md``) a harness loads at start.
+
+    Whichever limit is reached first ends the load, at a line boundary.
+    """
+
+    max_bytes: int
+    max_lines: int
+
+
+#: Claude Code loads "the first 200 lines of MEMORY.md, or the first 25KB,
+#: whichever comes first" (code.claude.com/docs/en/memory). Measured on
+#: 2.1.306 the 25KB is 25,000 *characters*; the docs promise no unit, so it is
+#: budgeted here in UTF-8 bytes, which is never looser (issue #435).
+CLAUDE_MEMORY_INDEX_LIMIT = MemoryIndexLimit(max_bytes=25_000, max_lines=200)
+
+
+@dataclass(frozen=True)
 class Harness:
     """Registry entry describing one supported agent harness."""
 
@@ -226,6 +251,11 @@ class Harness:
     #: Extra fixed environment for the container when this harness is active.
     #: (e.g. disable self-updates inside ephemeral containers)
     extra_env: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
+    #: Environment variables that authenticate this harness. ``spawn-harness``
+    #: fills one a child lacks from the container's initial environment,
+    #: because a harness may scrub its own credential from its shell tools
+    #: (issue #588).
+    credential_env: Tuple[str, ...] = field(default_factory=tuple)
     #: Absolute CONTAINER directory this harness writes its session JSONL
     #: under. Declared here so an orchestrator can mount each harness's
     #: transcripts out to the host instead of only claude's (issue #280):
@@ -237,6 +267,11 @@ class Harness:
     #: orchestrator can mount it out of a ``--rm`` container (issue #325).
     #: ``None`` for a harness with no *native* memory feature.
     memory_dir: Optional[str] = None
+    #: How much of ``MEMORY.md`` the harness's native memory feature loads at
+    #: session start; ``work memory persist`` budgets the shared index against
+    #: the strictest one declared (:func:`memory_index_budget`). ``None`` for a
+    #: harness that reads the index by hand, in full.
+    memory_index_limit: Optional[MemoryIndexLimit] = None
     #: For user-installed harnesses (lmer_cli.user_harnesses): the host
     #: directory the definition was loaded from. ``None`` for built-ins —
     #: the "is this a user harness" discriminator.
@@ -279,6 +314,7 @@ HARNESSES: dict[str, Harness] = {
             dashdash_before_prompt=True,
         ),
         description="Claude Code (Anthropic) — full feature tier",
+        credential_env=("CLAUDE_CODE_OAUTH_TOKEN",),
         # The platform's transcript mount destination since T22 — one fact with
         # lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR, which
         # lmer_platform.spawn refuses to spawn without agreeing with.
@@ -288,6 +324,7 @@ HARNESSES: dict[str, Harness] = {
         # parent. ``-workspace`` is claude's encoding of the container cwd, the
         # same encoding work_repo.memory relies on.
         memory_dir="/home/developer/.claude/projects/-workspace/memory",
+        memory_index_limit=CLAUDE_MEMORY_INDEX_LIMIT,
     ),
     "codex": Harness(
         name="codex",
@@ -393,9 +430,25 @@ def known_harnesses() -> dict[str, Harness]:
     from :mod:`lmer_cli.user_harnesses`, imported lazily — that module
     imports this one's dataclasses.
     """
+    # deferred: cycle — lmer_cli.user_harnesses imports this module at top
     from .user_harnesses import load_user_harnesses
 
     return {**load_user_harnesses(), **HARNESSES}
+
+
+def memory_index_budget() -> Optional[MemoryIndexLimit]:
+    """The strictest session-start ``MEMORY.md`` load any built-in declares.
+
+    The work-repo memory store is shared by every harness, so its index must
+    fit the tightest reader. ``None`` when no harness declares a limit.
+    """
+    limits = [h.memory_index_limit for h in HARNESSES.values() if h.memory_index_limit]
+    if not limits:
+        return None
+    return MemoryIndexLimit(
+        max_bytes=min(limit.max_bytes for limit in limits),
+        max_lines=min(limit.max_lines for limit in limits),
+    )
 
 
 def get_harness(name: str) -> Harness:

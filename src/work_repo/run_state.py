@@ -103,14 +103,17 @@ directory ({work}/{host}/{project}/runs/develop-durable-run-state/spec.md).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
 import re
+import shlex
 import shutil
 import sys
 import tempfile
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -118,7 +121,21 @@ from typing import Optional
 import yaml
 
 from . import specs_index
+from .session_record import (
+    SOURCE_ACK_ENV,
+    SOURCE_ENV,
+    UID_RE,
+    current_metadata,
+    display_state,
+    is_seeded,
+    is_stopped,
+    schema_version,
+    signed_out,
+    sort_key,
+)
+from .transactions import mutation_transaction, work_transaction
 from .utils import (
+    is_work_item,
     project_area,
     redact_secrets,
     sanitize_task_target,
@@ -126,7 +143,7 @@ from .utils import (
     work_repo_root,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATE_FILE = "state.yaml"
 # Pre-rename runs wrote this name; read-fallback + rename-on-write migration.
 LEGACY_STATE_FILE = "state.yml"
@@ -148,7 +165,7 @@ ARCHIVE_DIR = "archive"
 # timestamp-first, so a directory listing of one group is start order
 # (docs/SCHEMA.md, "Sessions and runs"). SESSION_DIR_RE adds the `--<name>`
 # suffix the freeze rename appends; the two spellings are ONE session.
-SESSION_ID_RE = re.compile(r"\d{8}-\d{6}-\d+-\d+")
+SESSION_ID_RE = re.compile(r"(?:\d{8}-\d{6}-\d+-\d+|[0-9a-f]{32})")
 SESSION_DIR_RE = re.compile(rf"{SESSION_ID_RE.pattern}(?:--.+)?")
 # The append-only lineage of harness ids that have written in a session dir
 # (D22 resume). Optional and additive: a record without it is a record from
@@ -235,6 +252,21 @@ def current_session_id() -> str:
 def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> str:
     """Deterministic run slug: same taskdef + target => same slug (spec §4.5).
 
+    The env fallback resolves first — ``LMER_TASK`` for the taskdef,
+    ``LMER_TASK_TARGET`` for a target of ``None`` — and the value found is
+    then classified (run-identity spec §3, review S1): **no work item means
+    the bare taskdef**. No target, a filesystem path (``.``), a bare
+    repository URL (``…/project.git``) and a document URL all derive
+    ``<taskdef>``, so a plain session never carries a ``.`` or a repository
+    basename in its slug and every plain chat on a project shares ONE group
+    (#311, #81). A work item — an issue, an MR, a branch, a SHA, or a thread
+    permalink the handler owns (``special``, :func:`utils.is_work_item`) —
+    keeps the slug the rest of this function derives. A legacy record whose
+    slug came from a non-work-item target (``chat-project.git``, ``chat-.``)
+    no longer derives from its recorded target: that cost is accepted for
+    schema-1 trees (spec §14.2) and ``work migrate`` folds such records into
+    the bare group.
+
     A bare full 40-hex commit SHA is truncated to its 12-char short form —
     a slug-only concern (readable dir names, issue #87 D4); the legacy
     ``{task_type}/{target}/`` path builders keep the full form so read-side
@@ -244,16 +276,80 @@ def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> 
     re-slug successor fallback does not weaken that — it matches addresses a
     run RECORDS having vacated (``reslugged_from``), which a legacy run never
     has, rather than re-deriving identity through this function.
+
+    ``lmer_cli/container/clone_and_exec._derive_run_slug`` mirrors this
+    function minus the env fallback (its caller reads the env); the §9.1
+    derive-slug table in ``tests/test_clone_and_exec_session_dir.py`` pins
+    the two copies equal.
     """
     taskdef = taskdef or os.environ.get("LMER_TASK", "default")
     if target is None:
         target = os.environ.get("LMER_TASK_TARGET", "")
+    if not is_work_item(target):
+        return taskdef
     if target and _FULL_SHA_RE.fullmatch(target):
         return f"{taskdef}-{target[:12].lower()}"
     safe = sanitize_task_target(target) if target else "default"
     if safe == "default":
         return taskdef
     return f"{taskdef}-{safe}"
+
+
+def legacy_derive_slug(taskdef: Optional[str], target: Optional[str]) -> str:
+    """The pre-A1 slug derivation, kept verbatim (run-identity spec §7).
+
+    ``derive_slug`` was rewritten by A1 to classify the target first: no work
+    item means the bare taskdef. This is the spelling the OLD derivation
+    produced, which is what the §7 predicate compares a record's stored
+    ``slug`` against — a leftover ``chat-.``/``chat-widgets.git`` group is
+    exactly a record whose slug equals this function's answer. Pure: unlike
+    the old ``derive_slug`` it takes both values and reads no environment
+    (the predicate always holds the record's recorded taskdef and target).
+    """
+    target = target or ""
+    if target and _FULL_SHA_RE.fullmatch(target):
+        return f"{taskdef}-{target[:12].lower()}"
+    safe = sanitize_task_target(target) if target else "default"
+    if safe == "default":
+        return taskdef
+    return f"{taskdef}-{safe}"
+
+
+def is_legacy_plain_session_slug(state) -> bool:
+    """Whether *state* is a pre-A1 plain-session leftover (spec §7, astra R1).
+
+    The ONE predicate the validator check ``record.plain-session-slug``, the
+    ``lmer-schema migrate`` blocker and the ``work migrate`` fold share. A
+    record matches only when its stored ``slug`` is the OBSOLETE DERIVED
+    spelling of its own recorded target: ``slug`` and ``taskdef`` are
+    non-empty strings, the recorded ``target`` (absent or null read as ``''``)
+    is not a work item, ``slug == legacy_derive_slug(taskdef, target)``, and
+    that derivation differs from the bare taskdef. So ``chat`` with target
+    ``.`` (``chat-.``), a bare repo URL (``chat-widgets``), its ``.git`` form
+    and ``masterplan-.`` match, while a re-slugged record — one carrying a
+    non-empty ``reslugged_from`` — never does, however it was named. A
+    non-mapping state, or a missing or non-string ``slug``/``taskdef``, never
+    matches (review S9): the predicate is about the stored spelling, and a
+    record that does not record one is not this leftover.
+    """
+    if not isinstance(state, dict):
+        return False
+    slug = state.get("slug")
+    taskdef = state.get("taskdef")
+    if not isinstance(slug, str) or not slug:
+        return False
+    if not isinstance(taskdef, str) or not taskdef:
+        return False
+    if vacated_slugs(state):
+        return False
+    target = state.get("target")
+    if target is not None and not isinstance(target, str):
+        return False
+    target = target or ""
+    if is_work_item(target):
+        return False
+    legacy = legacy_derive_slug(taskdef, target)
+    return slug == legacy and legacy != taskdef
 
 
 def runs_base() -> Optional[Path]:
@@ -282,6 +378,11 @@ def is_session_form() -> bool:
     any base handed in and meet an unmigrated record wherever it lies.
     """
     return work_repo_layout().is_schema
+
+
+def is_process_record() -> bool:
+    """Schema 2 binds each record to exactly one execution UID."""
+    return schema_version() >= 2
 
 
 def _usable_session_id(session: Optional[str]) -> bool:
@@ -421,6 +522,7 @@ def _chain_session(state: dict, session_id: str) -> bool:
     return True
 
 
+@mutation_transaction
 def attach_session(
     rdir: Path, state: dict, session_id: Optional[str] = None
 ) -> bool:
@@ -531,8 +633,11 @@ def _newest_record(records: list[Path]) -> Optional[Path]:
     """
     if not records:
         return None
+
     in_form = [rdir for rdir in records if SESSION_DIR_RE.fullmatch(rdir.name)]
     if in_form:
+        if any(UID_RE.fullmatch(session_id_of(path.name)) for path in in_form):
+            return max(in_form, key=sort_key)
         return max(in_form, key=lambda rdir: rdir.name)
     return max(records, key=lambda rdir: (_mtime(rdir), rdir.name))
 
@@ -617,11 +722,15 @@ def find_run_dir(
 
     Scans every record under the run area — `runs/*/state.yaml` in a legacy
     tree, `_runs/*/<session-id>/state.yaml` in schema form (:func:`_record_scan`
-    walks both) — for `state.slug == identifier`; with `match_names`, falls
-    back to `state.name == identifier` (a slug match always wins — names are
-    unique per project). Session-level resolution keeps `match_names` off so
-    a run *name* can never hijack another session's derived slug; explicit
-    lookups (e.g. `work seed`'s duplicate check) opt in. Dot-dirs (`.new-*`
+    walks both) — for `state.slug == identifier`; with `match_names` in a
+    LEGACY tree, falls back to `state.name == identifier` (a slug match
+    always wins — names are unique per project there). On a process record
+    (schema 2) names are labels, not addresses (D4): `match_names` is
+    ignored and a name never resolves a record, so two continuations of one
+    source can carry one label. Session-level resolution keeps `match_names`
+    off so a run *name* can never hijack another session's derived slug;
+    legacy explicit lookups (e.g. `work seed`'s duplicate check) opt in.
+    Dot-dirs (`.new-*`
     orphans), the archive/ subtree, and corrupt siblings are skipped, and any
     fs error during the scan resolves to "no match" — a broken runs/ tree
     must never raise out of a resolver that hook-facing always-exit-0
@@ -639,6 +748,9 @@ def find_run_dir(
         base = runs_base()
     if base is None:
         return None
+    # D4: on schema 2 a name is a label, never an address.
+    if is_process_record():
+        match_names = False
     name_match: Optional[Path] = None
     for _group, records in _record_scan(base):
         slug_hits, name_hits = [], []
@@ -894,6 +1006,8 @@ def _session_dir(group: Path, session: Optional[str] = None) -> Path:
         return _named_session(group, session) or group / session
     launch = launch_session_id()
     if launch:
+        if is_process_record():
+            return _named_session(group, launch) or group / launch
         return (
             _named_session(group, launch)
             or _lineage_session(group, launch)
@@ -940,6 +1054,17 @@ def _record_address(
     legacy run dir, or a tree adopted before its runs were migrated, is
     written where it lies and never given a session dir nested inside it.
     """
+    if is_process_record():
+        uid = session or launch_session_id()
+        if uid:
+            if not _usable_session_id(uid):
+                raise RunStateError("session must be a UID, not a path or pattern")
+            matches = [path for path in iter_record_dirs(base)
+                       if session_id_of(path.name) == session_id_of(uid)]
+            if len(matches) > 1:
+                raise RunStateError(f"session UID {uid} has more than one record")
+            if matches:
+                return matches[0]
     found = resolve_run_dir(slug, base) or _unreadable_state_candidate(base, slug)
     if found is None:
         return _creation_address(base, slug, session)
@@ -1053,11 +1178,122 @@ def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
     return rels
 
 
-def seed_state(slug: str, taskdef: str, target: str) -> dict:
-    """Fresh state for a new run (spec §4.1). taskdef/target are immutable."""
+def note_seeded_record(seeded_rdir: Path) -> None:
+    """Remember a record this launch seeded, on the launch's own state.
+
+    ``work seed`` writes into ANOTHER group (D13): the record carries a
+    fresh uid with this launch in ``session.seeded_by``, so
+    :func:`run_rel_path_candidates` — the launch's own address — never names
+    it and ``work commit`` would report it as a stray and leave it
+    unpublished (#535, spec §5.2). Recording its run-area-relative path here
+    lets ``work commit`` and ``work session-end`` stage it beside the
+    launch's own candidates.
+
+    Schema form only: a legacy tree's ``work seed`` and ``work commit`` stay
+    byte-identical (the legacy publication gap is not #535's). A launch with
+    no own record (an operator shell) records nothing.
+    """
+    if not is_process_record():
+        return
+    own = run_dir()
+    if own is None:
+        return
+    rel = run_area_rel_name(seeded_rdir)
+    if rel is None:
+        return
+    state = load_state(own)
+    if state is None:
+        return
+    seeded = [name for name in (state.get("seeded_records") or []) if isinstance(name, str)]
+    if rel not in seeded:
+        seeded.append(rel)
+    state["seeded_records"] = seeded
+    write_state(own, state)
+
+
+def seeded_record_rel_paths() -> list[str]:
+    """Work-repo-relative paths of records this launch seeded (schema form).
+
+    Read from the launch's own ``seeded_records`` list (D13); a path whose
+    group was removed before the commit resolves to nothing and stages
+    nothing. Empty on a legacy tree or with no own record.
+    """
+    # deferred: cycle — work_repo.project_index imports this module at top
+    from . import project_index
+
+    if not is_process_record():
+        return []
+    own = run_dir()
+    if own is None:
+        return []
+    # Lock-free: this runs inside `commit_work_changes`, which a git hook can
+    # invoke while the work transaction is already held by the same process,
+    # so `load_state`'s mutation lock would deadlock. `read_state_fast` is the
+    # same reader `_nudge_unnamed` uses.
+    path = _state_path(own)
+    if path is None:
+        return []
+    state = project_index.read_state_fast(path)
+    if not state:
+        return []
+    rels: list[str] = []
+    for name in state.get("seeded_records") or []:
+        if not isinstance(name, str):
+            continue
+        rel = run_rel_for_dir_name(name)
+        if rel and rel not in rels:
+            rels.append(rel)
+    return rels
+
+
+def derive_default_label(taskdef: str, started_at: str, uid: str) -> str:
+    """The default label for an unnamed schema-2 record (D5):
+    ``<taskdef>-<yymmdd>-<uid[:4]>`` with the date in UTC.
+
+    A label, not a name: it makes a record findable in a listing without
+    claiming the run was named (D5). ``started_at`` is the record's own
+    logged start (``session.started_at``); a value this kernel cannot parse
+    falls back to the current UTC day rather than refusing the seed.
+    """
+    try:
+        when = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        stamp = when.astimezone(timezone.utc).strftime("%y%m%d")
+    except (ValueError, TypeError, AttributeError):
+        stamp = datetime.now(timezone.utc).strftime("%y%m%d")
+    return f"{taskdef}-{stamp}-{uid[:4]}"
+
+
+def is_default_label(state: dict) -> bool:
+    """Whether *state*'s name is the default-label SHAPE (D5/D6).
+
+    The shape — ``<taskdef>-<6 digits>-<4 lowercase hex>`` for the record's
+    OWN taskdef — not a recomputation from this record's uid/started_at, so
+    a continuation that inherited a default label from an unnamed source is
+    still treated as unnamed by the freeze, the goals-freeze seam, the nudge
+    and the specs index. A human name that happens to match the shape is
+    accepted as that cost.
+    """
+    name = state.get("name")
+    taskdef = state.get("taskdef")
+    if not isinstance(name, str) or not isinstance(taskdef, str) or not taskdef:
+        return False
+    return re.fullmatch(rf"{re.escape(taskdef)}-\d{{6}}-[0-9a-f]{{4}}", name) is not None
+
+
+def seed_state(
+    slug: str, taskdef: str, target: str, session: Optional[dict] = None
+) -> dict:
+    """Fresh state for a new run (spec §4.1). taskdef/target are immutable.
+
+    In schema form the record carries its `session`: this launch's own
+    metadata by default, or *session* when the caller supplies one — the
+    mapping `work seed` mints (:func:`session_record.seeded_session`), which
+    names a record nobody has run in yet (D13)."""
     now = utc_now_iso()
-    return {
-        "schema": SCHEMA_VERSION,
+    state = {
+        "schema": 2 if is_process_record() else 1,
         "slug": slug,
         "name": None,
         "taskdef": taskdef,
@@ -1075,8 +1311,14 @@ def seed_state(slug: str, taskdef: str, target: str) -> dict:
         "created": now,
         "updated": now,
     }
+    if is_process_record():
+        if session is None:
+            session = current_metadata()
+        state["session"] = dict(session)
+    return state
 
 
+@mutation_transaction
 def seed_run_dir(
     slug: str,
     taskdef: str,
@@ -1084,6 +1326,10 @@ def seed_run_dir(
     note: Optional[str] = None,
     adopt_existing: bool = True,
     session: Optional[str] = None,
+    context: Optional[dict] = None,
+    seeded: Optional[dict] = None,
+    goal: Optional[str] = None,
+    name: Optional[str] = None,
 ) -> tuple[Path, dict]:
     """Create a run dir via the tmp-dir-then-rename lifecycle (issue #87 D2).
 
@@ -1110,6 +1356,19 @@ def seed_run_dir(
     one rename — and it keeps the grouping level clear: a leftover inside a
     group would be litter nobody sweeps and nobody reports. The group dir
     itself is created here, empty, and stays that way (D22).
+
+    `seeded` (schema 2, `work seed` — #535, D13) makes the record SOMEONE
+    ELSE'S from the start: it is the session mapping the record carries
+    (:func:`session_record.seeded_session` — a fresh uid, this launch in
+    `seeded_by`), the destination is that uid's address under the group and
+    never this launch's own session dir, the temp dir is `.new-<that uid>-*`,
+    and the lineage stays empty because nothing has run in it. Everything
+    the record gets — `goal` and `name` in state, then the `run_seeded`,
+    `goal_set` and `run_named` events — is written INSIDE the temp dir: the
+    one place the seeding launch may write it (:func:`_seeding_launch_may_write`);
+    after the rename the record is read-only to it like any prior record.
+    `goal` and `name` are honoured without `seeded` too, so a legacy `work
+    seed` makes the same writes in the same order, just unguarded.
     """
     base = runs_base()
     if base is None:
@@ -1119,19 +1378,55 @@ def seed_run_dir(
     # content (see :func:`_creation_address`) but it is where an unusable
     # explicit session id is refused, and a refusal after the mkdtemp would
     # leave a `.new-*` orphan for the external cleaner to sweep.
-    final = _creation_address(base, slug, session)
+    final = _creation_address(base, slug, seeded["uid"] if seeded is not None else session)
     tmp = Path(
-        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{_seed_session_label()}-", dir=base)
+        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{_seed_session_label(seeded)}-", dir=base)
     )
     os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
-    state = seed_state(slug, taskdef, target)
-    if is_session_form():
+    state = seed_state(slug, taskdef, target, session=seeded)
+    if context is not None:
+        state["context"] = context
+        state["session"]["source_session_uid"] = context["source_session_uid"]
+        if context["unsigned_source_acknowledged"]:
+            state["session"]["unsigned_source_acknowledged"] = context["source_session_uid"]
+        for key in ("goal", "estimate", "phase", "open_question"):
+            if key in context["state"]:
+                state[key] = deepcopy(context["state"][key])
+        if context["state"].get("stop_reason") == "question":
+            state["stop_reason"] = "question"
+    if goal:
+        state["goal"] = goal
+    # A name can be inherited from a continuation source, passed explicitly by
+    # `work seed --name`, or defaulted (D5): an unnamed schema-2 record gets a
+    # default label so it is findable in a listing without claiming a naming.
+    # A default label is NOT a naming — no `run_named` event (D5).
+    inherited_name = context["state"].get("name") if context is not None else None
+    resolved_name = inherited_name or name
+    if resolved_name is None and is_process_record():
+        session_meta = state.get("session") or {}
+        uid = session_meta.get("uid")
+        started_at = session_meta.get("started_at") or state.get("created")
+        if uid:
+            resolved_name = derive_default_label(taskdef, started_at, uid)
+    if resolved_name:
+        state["name"] = resolved_name
+    if is_session_form() and seeded is None:
         # The chain starts with the launch that opened the record, so a
         # resumed dir reads as the lineage it is. A synthesized id names a
-        # process, not a session anyone can resume, and is left out.
+        # process, not a session anyone can resume, and is left out — as is
+        # a launch that only SEEDED the record: nothing has run in it.
         _chain_session(state, launch_session_id() or "")
     write_state(tmp, state)
+    if context is not None:
+        for filename, checkpoint in context.get("checkpoints", {}).items():
+            (tmp / filename).write_text(yaml.safe_dump(checkpoint["data"], sort_keys=False))
     append_event(tmp, "run_seeded", note=note)
+    # The CLI-shaped events `work seed` records, here with the rest: once
+    # renamed, a seeded record has no writer left to add them.
+    if goal:
+        append_event(tmp, "goal_set", note=goal)
+    if name:
+        append_event(tmp, "run_named", note=name)
     # Whose directory the group is, recorded BEFORE the mutation — the same
     # question, and the same answer, as the re-slug path below. `mkdir` with
     # `exist_ok=True` cannot report whether it created anything, so this is the
@@ -1174,14 +1469,188 @@ def seed_run_dir(
     return final, state
 
 
-def _seed_session_label() -> str:
+def _seed_session_label(seeded: Optional[dict] = None) -> str:
     """The writer id a `.new-*` seed dir carries. The launch's session id in
     schema form — `.new-<session-id>-*` is the documented seed name and the
     litter should say whose it is — and `current_session_id()`'s label in a
-    legacy tree, unchanged."""
+    legacy tree, unchanged. A record seeded for someone else (`seeded`) is
+    labelled with ITS uid: that is whose the litter is, and the prefix is
+    what lets the seeding launch write there at all (D13)."""
+    if seeded is not None:
+        return seeded["uid"]
     return _session_dir_id() if is_session_form() else current_session_id()
 
 
+def _source_context(slug: str, source_uid: str | None) -> dict | None:
+    """Read a prior record without any corrupt-file recovery or other writes."""
+    if not source_uid:
+        return None
+
+    if not _usable_session_id(source_uid):
+        raise RunStateError("source session must be a session UID, not a path")
+    if source_uid == current_session_id():
+        raise RunStateError("a new session cannot reuse its context source's UID")
+    source = run_dir(slug, session=source_uid)
+    if source is None or _state_path(source) is None:
+        raise RunStateError(f"source session {source_uid} does not exist")
+    try:
+        raw = _state_path(source).read_bytes()
+        state = yaml.safe_load(raw)
+    except (OSError, yaml.YAMLError) as exc:
+        raise RunStateError(f"source session {source_uid} cannot be read") from exc
+    if not isinstance(state, dict) or state.get("schema", 1) > SCHEMA_VERSION:
+        raise RunStateError(f"source session {source_uid} has an unsupported record")
+    events = read_events(source, last_n=0)
+    acknowledged = os.environ.get(SOURCE_ACK_ENV) == source_uid
+    # A signed-out record and a seeded one nobody has run in (D13) are both
+    # stopped: there is no session that "may still be running" to warn
+    # about, so neither asks for the acknowledgement, and an acknowledgement
+    # given anyway is not recorded — it would name a decision nobody took.
+    stopped = is_stopped(state, events)
+    if not stopped and not acknowledged:
+        metadata = state.get("session") or {}
+        raise RunStateError(
+            f"source session {source_uid} has no recorded sign-out "
+            f"(operator={metadata.get('operator', '?')}, host={metadata.get('hostname', '?')}, "
+            f"started={metadata.get('started_at', state.get('created', '?'))}, "
+            f"last_activity={events[-1].get('ts', '?') if events else state.get('updated', '?')}). "
+            "Choose cancel/wait, inspect the prior session, or explicitly start fresh."
+        )
+
+    checkpoints = {}
+    for name in (LEDGER_FILE, "release.yaml"):
+        path = source / name
+        if not path.exists():
+            continue
+        try:
+            content = path.read_bytes()
+            data = yaml.safe_load(content)
+        except (OSError, yaml.YAMLError) as exc:
+            raise RunStateError(f"source checkpoint {name} cannot be read") from exc
+        if (not isinstance(data, dict) or type(data.get("schema")) is not int
+                or data["schema"] != 1):
+            raise RunStateError(f"source checkpoint {name} has an unsupported format")
+        checkpoints[name] = {"data": data, "sha256": hashlib.sha256(content).hexdigest()}
+    return {
+        "source_session_uid": source_uid,
+        "source_path": source.relative_to(work_repo_root()).as_posix(),
+        "state_sha256": hashlib.sha256(raw).hexdigest(),
+        "state": state,
+        "events": events[-25:],
+        "checkpoints": checkpoints,
+        "unsigned_source_acknowledged": acknowledged and not stopped,
+    }
+
+
+def _ensure_process_record(slug, taskdef, target, source_uid):
+    """Create or load only this launch's record; a prior record is context."""
+    try:
+        current_metadata()
+    except ValueError as exc:
+        raise RunStateError(str(exc)) from exc
+    slug = slug or derive_slug()
+    rdir = run_dir(slug)
+    if rdir is None:
+        raise RunStateError("no run context")
+    if _state_path(rdir) is not None:
+        state = load_state(rdir)
+        _require_record_writer(rdir, state)
+        return rdir, state
+    context = _source_context(slug, source_uid or os.environ.get(SOURCE_ENV))
+    return seed_run_dir(
+        slug, taskdef or os.environ.get("LMER_TASK", "default"),
+        target if target is not None else os.environ.get("LMER_TASK_TARGET", ""),
+        adopt_existing=False,
+        context=context,
+    )
+
+
+def _seeding_launch_may_write(rdir: Path, state) -> bool:
+    """The one writer-rule exception (D13, spec §5.2): the launch that seeded
+    a record may write it while the record is still its own `.new-<uid>-*`
+    temp dir. The seed is written whole there before the single rename; from
+    its final address on, the record is read-only to that launch like any
+    other prior record — `seeded_by` is never an owner at `_runs/<slug>/<uid>`.
+
+    *state* is the PERSISTED document whenever the dir has one, so a caller's
+    relabelled in-memory copy cannot name itself the seeder; only the very
+    first write, with nothing on disk yet, is judged on what it carries.
+    """
+    metadata = state.get("session") if isinstance(state, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    uid = metadata.get("uid")
+    if not isinstance(uid, str) or UID_RE.fullmatch(uid) is None:
+        return False
+    if not rdir.name.startswith(f"{TMP_DIR_PREFIX}{uid}-"):
+        return False
+    launch = launch_session_id()
+    return launch is not None and metadata.get("seeded_by") == launch
+
+
+def continuation_route(
+    taskdef: Optional[str], target: Optional[str], uid: str
+) -> str:
+    """The shell command that continues a finished schema-2 record (D14):
+    ``lmer <taskdef> [<target>] --source-session <uid>``.
+
+    The ONE builder for every place that prints the route, so the target is
+    `shlex.quote`d once: a list-page or query target (`.../-/issues?x=1&y=2`)
+    pasted from the brief must not background the shell at `&`. A missing
+    taskdef reads ``<taskdef>``; an empty target is omitted.
+    """
+    parts = ["lmer", str(taskdef or "<taskdef>")]
+    if target:
+        parts.append(shlex.quote(str(target)))
+    parts.extend(["--source-session", uid])
+    return " ".join(parts)
+
+
+def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
+    """Refuse writes to another execution's record before touching files."""
+    process_records = is_process_record()
+    path = _state_path(rdir)
+    persisted = None
+    if path is not None:
+        try:
+            persisted = yaml.safe_load(path.read_text())
+        except (OSError, yaml.YAMLError) as exc:
+            if not process_records:
+                return  # legacy corrupt-state recovery remains unchanged
+            raise RunStateError("cannot establish record ownership") from exc
+    # Inspect disk even when the caller supplies an older in-memory state.
+    # Otherwise a stale helper could overwrite a newer document version.
+    for candidate in (persisted, state):
+        if isinstance(candidate, dict):
+            version = candidate.get("schema", 1)
+            if isinstance(version, int) and version > SCHEMA_VERSION:
+                raise RunStateError("record uses a newer schema; upgrade lmer before writing")
+    if state is None:
+        state = persisted
+    state = state or {}
+    if state.get("schema", 1) < 2 and not process_records:
+        return
+    metadata = state.get("session") or {}
+    owner = metadata.get("uid") or session_id_of(rdir.name)
+    address_matches = session_id_of(rdir.name) == owner or rdir.name.startswith(f"{TMP_DIR_PREFIX}{owner}-")
+    if owner != launch_session_id() or not address_matches:
+        if _seeding_launch_may_write(rdir, persisted if path is not None else state):
+            return
+        # A schema-2 record is continued as a NEW execution, never written in
+        # place (D14): name that route with the record's own values. A legacy
+        # record keeps the generic wording.
+        if process_records and state.get("schema", 1) >= 2 and metadata.get("uid"):
+            route = continuation_route(
+                state.get("taskdef"), state.get("target"), metadata["uid"]
+            )
+            raise RunStateError(
+                "a session may write only its own record; to continue it, start a "
+                f"new execution with `{route}`"
+            )
+        raise RunStateError("a session may write only its own record; use prior sessions as context")
+
+
+@mutation_transaction
 def ensure_run(
     slug: Optional[str] = None,
     taskdef: Optional[str] = None,
@@ -1206,6 +1675,8 @@ def ensure_run(
     slug and strand the renamed dir. Only load_state's read-only refusal
     (schema newer than this kernel) propagates.
     """
+    if is_process_record():
+        return _ensure_process_record(slug, taskdef, target, session)
     slug = slug or derive_slug()
     rdir = run_dir(slug, session)
     if rdir is None:
@@ -1260,6 +1731,14 @@ def list_sessions(
     `orphaned=None` — no verdict, rather than a verdict of "fine". Dropping
     it would be how a live run disappears from the operator's view, which is
     the failure this listing exists to prevent.
+
+    A schema-2 row has no `orphaned` verdict (nothing infers death from a
+    claim or a timestamp there); it carries `signed_out` and, derived from
+    the record plus this call's own `now`, `state` — one of `closed`,
+    `waiting on question`, `ended, not closed`, `active`, `stale`
+    (:func:`session_record.display_state`, the 14-day
+    :data:`session_record.STALE_AFTER_SECONDS` window). Every row carries
+    the record's `stop_reason`.
     """
     if base is None:
         base = runs_base()
@@ -1277,6 +1756,7 @@ def list_sessions(
             "slug": None,
             "name": None,
             "status": None,
+            "stop_reason": None,
             "phase": None,
             "created": None,
             "updated": None,
@@ -1289,14 +1769,34 @@ def list_sessions(
                     "slug": state.get("slug"),
                     "name": state.get("name"),
                     "status": state.get("status"),
+                    "stop_reason": state.get("stop_reason"),
                     "phase": state.get("phase"),
                     "created": state.get("created"),
                     "updated": state.get("updated"),
                     "owner": state.get("owner"),
-                    "orphaned": _is_orphaned(state, now, stale_after_minutes),
+                    "orphaned": (None if state.get("schema") == 2 else
+                                 _is_orphaned(state, now, stale_after_minutes)),
                 }
             )
+            if state.get("schema") == 2:
+                row["session"] = state.get("session")
+                # `seeded`: `work seed` wrote it and nothing has run in it
+                # (D13) — not running, still listed. Its own read of the
+                # events, so the sign-out line stays what it is.
+                row["seeded"] = is_seeded(state, read_events(rdir, last_n=0))
+                row["signed_out"] = signed_out(read_events(rdir, last_n=0))
+                row["state"] = display_state(
+                    readable=True,
+                    status=state.get("status"),
+                    stop_reason=state.get("stop_reason"),
+                    signed_out=row["signed_out"],
+                    updated=state.get("updated"),
+                    now=now,
+                    seeded=row["seeded"],
+                )
         rows.append(row)
+    if any("session" in row for row in rows):
+        rows.sort(key=lambda row: (str(row["slug"] or ""), sort_key(row["path"])))
     return rows
 
 
@@ -1325,6 +1825,7 @@ def is_planning_phase(phase: Optional[str]) -> bool:
     return lowered.startswith(PLANNING_PHASE_PREFIXES)
 
 
+@mutation_transaction
 def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     """Pre-execution freeze gate (issue #87 D2): the run's identity is final.
 
@@ -1349,10 +1850,13 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     the caller stages the pre-rename path so the old path's deletion lands in
     the same commit (:func:`run_rel_for_dir_name`).
     """
+    _require_record_writer(rdir)
     state["frozen"] = utc_now_iso()
     name = state.get("name")
     slug = state.get("slug") or rdir.name
-    if not name:
+    # A default label is not a naming (D5): the freeze stamps `frozen` but
+    # does not rename, exactly as for a run unnamed at the freeze.
+    if not name or is_default_label(state):
         return rdir, None
     base = runs_base()
     group = rdir.parent
@@ -1393,6 +1897,7 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     return rdir, old_rel
 
 
+@mutation_transaction
 def reslug_run(
     rdir: Path, state: dict, new_slug: str
 ) -> tuple[Path, dict, Optional[str]]:
@@ -1438,6 +1943,7 @@ def reslug_run(
     name when a rename happened, else None) — the caller stages the previous
     path so the old path's deletion lands in the same commit.
     """
+    _require_record_writer(rdir)
     old_slug = state.get("slug")
     if not new_slug or new_slug == old_slug:
         return rdir, state, None
@@ -1555,6 +2061,7 @@ def reslug_run(
     return rdir, state, old_dir_name
 
 
+@mutation_transaction
 def _backup_bad_state(path: Path, reason: str) -> "RunStateError":
     """Move an unusable state file aside and return the error to raise.
 
@@ -1562,6 +2069,8 @@ def _backup_bad_state(path: Path, reason: str) -> "RunStateError":
     preserved as <name>.bad-<utc-compact> for post-mortem, named after
     whichever file was actually read (state.yaml or legacy state.yml).
     """
+    if is_process_record():
+        return RunStateError(f"{reason} — left untouched at {path}")
     stamp = utc_now_iso().replace(":", "").replace("-", "")
     backup = path.with_name(f"{path.name}.bad-{stamp}")
     path.rename(backup)
@@ -1578,6 +2087,7 @@ def _state_path(rdir: Path) -> Optional[Path]:
     return None
 
 
+@mutation_transaction
 def _load_yaml_mapping(path: Path, label: str, supported_version: int) -> dict:
     """Shared parse/validate preamble for the schema'd single-writer YAML
     files (state.yaml, ledger.yaml): parse → mapping check → schema
@@ -1600,6 +2110,7 @@ def _load_yaml_mapping(path: Path, label: str, supported_version: int) -> dict:
     return data
 
 
+@mutation_transaction
 def load_state(rdir: Path) -> Optional[dict]:
     """Read state.yaml (falling back to legacy state.yml). None if absent.
     RunStateError if corrupt (backed up first) or if `schema` is newer than
@@ -1610,6 +2121,7 @@ def load_state(rdir: Path) -> Optional[dict]:
     return _load_yaml_mapping(path, "state", SCHEMA_VERSION)
 
 
+@mutation_transaction
 def write_state(rdir: Path, state: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of state.yaml (spec §3.4).
 
@@ -1620,6 +2132,7 @@ def write_state(rdir: Path, state: dict) -> None:
     hole. Single-writer discipline is a contract on the destination, not a
     guarantee that only one process is executing this function.
     """
+    _require_record_writer(rdir, state)
     rdir.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["updated"] = utc_now_iso()
@@ -1635,6 +2148,7 @@ def write_state(rdir: Path, state: dict) -> None:
         legacy.rename(rdir / f"{LEGACY_STATE_FILE}.migrated")
 
 
+@mutation_transaction
 def append_event(
     rdir: Path,
     event_type: str,
@@ -1642,6 +2156,7 @@ def append_event(
     data: Optional[dict] = None,
 ) -> None:
     """Append one JSON line to events.jsonl (append-only, spec §4.2)."""
+    _require_record_writer(rdir)
     rdir.mkdir(parents=True, exist_ok=True)
     event = {"ts": utc_now_iso(), "session": current_session_id(), "type": event_type}
     if note is not None:
@@ -1672,6 +2187,7 @@ def read_events(rdir: Path, last_n: int = 5) -> list[dict]:
     return events[-last_n:] if last_n else events
 
 
+@mutation_transaction
 def load_ledger(rdir: Path) -> Optional[dict]:
     """Read ledger.yaml. None if absent. Same safety contract as state.yaml
     (the shared preamble): corrupt files are backed up first (RunStateError),
@@ -1689,16 +2205,46 @@ def load_ledger(rdir: Path) -> Optional[dict]:
     return ledger
 
 
+def require_document_version(path: Path, proposed: dict, supported: int) -> None:
+    """Check disk and proposed machine-owned versions without modifying either.
+
+    A supported in-memory snapshot is not permission to overwrite a document
+    another writer has upgraded since it was read. Descriptive extensions are
+    deliberately outside this small version envelope.
+    """
+    candidates = [proposed]
+    if path.exists():
+        try:
+            candidates.append(yaml.safe_load(path.read_text(encoding="utf-8")))
+        except (OSError, yaml.YAMLError) as exc:
+            raise RunStateError(f"cannot validate {path.name}: {exc}") from exc
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RunStateError(f"{path.name} must be a mapping")
+        version = candidate.get("schema", 0)
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise RunStateError(f"{path.name} schema must be an integer")
+        if version > supported:
+            raise RunStateError(
+                f"{path.name} schema {version} is newer than supported "
+                f"{supported} — read-only refusal"
+            )
+
+
+@mutation_transaction
 def write_ledger(rdir: Path, ledger: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of ledger.yaml (issue #89:
     single-writer contract, same as state.yaml) — including its temp naming,
     which carries pid and thread id for the reason :func:`write_state` gives."""
+    _require_record_writer(rdir)
+    require_document_version(rdir / LEDGER_FILE, ledger, LEDGER_SCHEMA_VERSION)
     rdir.mkdir(parents=True, exist_ok=True)
     tmp = rdir / f".{LEDGER_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(yaml.safe_dump(ledger, sort_keys=False), encoding="utf-8")
     tmp.replace(rdir / LEDGER_FILE)
 
 
+@mutation_transaction
 def set_ledger_task(
     rdir: Path,
     task_id: str,
@@ -1820,6 +2366,7 @@ def format_ledger(ledger: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+@mutation_transaction
 def answer_question(rdir: Path, state: dict, answer: str) -> dict:
     """Apply a human's answer to the run's open question (issue #98).
 
@@ -1987,6 +2534,7 @@ def claim_pointer(
     )
 
 
+@mutation_transaction
 def claim_run(
     rdir: Path,
     state: dict,
@@ -2048,6 +2596,7 @@ def claim_run(
     return state
 
 
+@mutation_transaction
 def unclaim_run(
     rdir: Path,
     state: dict,
@@ -2086,6 +2635,7 @@ def unclaim_run(
     return state
 
 
+@mutation_transaction
 def abort_run(
     rdir: Path,
     state: dict,
@@ -2192,6 +2742,9 @@ def decide(
     is the loaded release.yaml record (release-flow §3) — the caller loads
     it only for release runs, exactly like ledger/sessions_used, so every
     non-release run passes None and its output stays byte-identical."""
+    # deferred: cycle — work_repo.release_run imports this module's shared YAML preamble at load time
+    from .release_run import RECEIPT_NAMES, ReleaseRunError, derive_leg
+
     if state is None:
         return {"kind": "none"}
     warnings: list[str] = []
@@ -2235,10 +2788,6 @@ def decide(
     # the record the caller passed in — decide() stays IO-free.
     release_info: Optional[dict] = None
     if release is not None:
-        # Deferred import: release_run imports this module's shared YAML
-        # preamble at load time, so a top-level import here would be a cycle.
-        from .release_run import RECEIPT_NAMES, ReleaseRunError, derive_leg
-
         tag = release.get("tag")
         receipts = release.get("receipts")
         receipts = receipts if isinstance(receipts, dict) else {}
@@ -2263,11 +2812,20 @@ def decide(
             # warning instead of breaking the session-start hook.
             release_info["error"] = str(exc)
             warnings.append(f"release record inconsistent: {exc}")
+    session = state.get("session")
+    session = session if isinstance(session, dict) else {}
     return {
         "kind": "run",
         "slug": state.get("slug"),
         "name": state.get("name"),
         "status": state.get("status"),
+        # The record's own identity, carried additively for the schema-2
+        # completed-run direction (`lmer <taskdef> [<target>] --source-session
+        # <uid>`, D14). Legacy records carry schema 1 and no session uid.
+        "schema": state.get("schema", 1),
+        "session_uid": session.get("uid"),
+        "taskdef": state.get("taskdef"),
+        "target": state.get("target"),
         # Structural signal for guard JSON / brief consumers (issue #96):
         # a finished run must never be silently resumed. `archived` counts —
         # until the external cleaner moves the dir under runs/archive/ the
@@ -2306,6 +2864,7 @@ def format_brief(
     seed: str | None = None,
     answered: Optional[dict] = None,
     run_dir_url: Optional[str] = None,
+    dir_name: Optional[str] = None,
 ) -> str:
     """Human-readable resume brief for prompt injection. `seed` is the
     launch prompt (LMER_START_PROMPT), passed in by the caller — it selects
@@ -2319,10 +2878,22 @@ def format_brief(
     if decision.get("kind") != "run":
         return "No run state found — this is a fresh run."
     if decision.get("name"):
-        header = (
-            f"Run: {decision['name']} "
-            f"(slug: {decision['slug']}, status: {decision['status']})"
-        )
+        # A post-freeze `work name` writes the name but cannot rename a frozen
+        # dir (D14/§9.5): when the dir's `--<name>` half disagrees with the
+        # stored name, name the directory too. An unsuffixed, not-yet-frozen
+        # dir is not a mismatch (the freeze is what adds the suffix).
+        suffix = dir_name.split("--", 1)[1] if dir_name and "--" in dir_name else None
+        if suffix is not None and suffix != decision["name"]:
+            header = (
+                f"Run: {decision['name']} "
+                f"(dir: {dir_name}, slug: {decision['slug']}, "
+                f"status: {decision['status']})"
+            )
+        else:
+            header = (
+                f"Run: {decision['name']} "
+                f"(slug: {decision['slug']}, status: {decision['status']})"
+            )
     else:
         header = f"Run: {decision['slug']} (status: {decision['status']})"
     lines = []
@@ -2420,24 +2991,53 @@ def format_brief(
     if decision.get("completed_run"):
         lines.append("")
         lines.append("⚠️  COMPLETED RUN — direction contract:")
-        lines.append("This run is finished. Do NOT resume it or invent work.")
-        if seed:
-            seed = " ".join(seed.split())  # keep the brief field one-line
-            excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
-                       else seed[:SEED_EXCERPT_MAX_LEN] + "…")
-            lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
-            lines.append(
-                'Record it as the goal (`work goal "<seed>"`), reopen with '
-                "`work state set --status=in-progress --stop-reason=none`, "
-                "then proceed on the seed."
+        session_uid = decision.get("session_uid")
+        if session_uid:
+            # Schema 2 (D14): the record is never reopened in place; it is
+            # continued as a NEW execution addressed by its uid.
+            route = continuation_route(
+                decision.get("taskdef"), decision.get("target"), session_uid
             )
+            lines.append(
+                "This run is finished. Do NOT resume it in place or invent "
+                "work — continue it as a new execution."
+            )
+            lines.append(f"Continue with: {route} (or the platform's continue).")
+            if seed:
+                seed = " ".join(seed.split())  # keep the brief field one-line
+                excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                           else seed[:SEED_EXCERPT_MAX_LEN] + "…")
+                lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+                lines.append(
+                    "The seed belongs to that new execution: record it as the "
+                    "new execution's goal, then proceed."
+                )
+            else:
+                lines.append(
+                    "No seed — ask the user (new target vs continue this run). "
+                    "If the question goes unanswered, record "
+                    '`work state set --stop-reason=question --question "<text>"` '
+                    "and end the session — never proceed on a guess."
+                )
         else:
-            lines.append(
-                "No seed — ask the user (new target vs continue this run). "
-                "If the question goes unanswered, record "
-                '`work state set --stop-reason=question --question "<text>"` '
-                "and end the session — never proceed on a guess."
-            )
+            lines.append("This run is finished. Do NOT resume it or invent work.")
+            if seed:
+                seed = " ".join(seed.split())  # keep the brief field one-line
+                excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                           else seed[:SEED_EXCERPT_MAX_LEN] + "…")
+                lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+                lines.append(
+                    'Record it as the goal (`work goal "<seed>"`), reopen with '
+                    "`work state set --status=in-progress --stop-reason=none`, "
+                    "then proceed on the seed."
+                )
+            else:
+                lines.append(
+                    "No seed — ask the user (new target vs continue this run). "
+                    "If the question goes unanswered, record "
+                    '`work state set --stop-reason=question --question "<text>"` '
+                    "and end the session — never proceed on a guess."
+                )
     if run_dir_url:
         lines.append(f"Run dir: {run_dir_url}")
     return "\n".join(lines)
@@ -2494,6 +3094,7 @@ def _masterplan_bundle_artifacts(rdir: Path) -> list[tuple[Path, str, str]]:
     return found
 
 
+@mutation_transaction
 def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     """Surface masterplan bundle artifacts at the record root (spec §6).
 
@@ -2527,6 +3128,7 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     linked: list[str] = []
     spec_files: list[tuple[Path, str]] = []  # (bundle file, record-root link name)
     try:
+        _require_record_writer(rdir)
         for bundle_file, link_name, target in _masterplan_bundle_artifacts(rdir):
             if specs_index.is_spec_artifact(bundle_file.name):
                 spec_files.append((bundle_file, link_name))
@@ -2580,13 +3182,20 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
         # corrupt state nor an index problem can fail the sync.
         for spec_file, link_name in spec_files:
             specs_index.upsert_spec_link(
-                spec_file, specs_index.run_label(rdir), alias=link_name
+                spec_file,
+                specs_index.run_label(rdir),
+                # A FIRST registration is dated by the record's own
+                # registration, not by this sync (#334); an existing entry's
+                # date always wins inside upsert_spec_link.
+                when=specs_index._registration_when(rdir, link_name, spec_file),
+                alias=link_name,
             )
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
     return linked
 
 
+@work_transaction(failure_result=None)
 def emit_gate_event(
     gate: str,
     outcome: str,
@@ -2599,6 +3208,7 @@ def emit_gate_event(
     test_targets: Optional[list] = None,
     test_cache_verdict: Optional[str] = None,
     test_cache_reason: Optional[str] = None,
+    ci_baseline: Optional[dict] = None,
 ) -> None:
     """Record a gate command outcome ('pass' | 'fail' | 'bypass') on the
     current run, as a machine-written receipt (issue #88): the `data`
@@ -2617,7 +3227,11 @@ def emit_gate_event(
     ran, a narrowed subset ran, or nothing ran because an earlier pass on
     the same tree was reused — a receipt that cannot tell those apart lets
     a subset green be read back as a full-suite green. Absent means the
-    caller could not say, never 'full'."""
+    caller could not say, never 'full'.
+
+    `ci_baseline` is the CI evidence a `gate-baseline` receipt rests on (#452):
+    project, full sha, every attempt of every required job, and the local
+    smoke result — the provenance of a baseline the local suite never ran."""
     try:
         rdir = run_dir()
         if rdir is None or _state_path(rdir) is None:
@@ -2651,6 +3265,9 @@ def emit_gate_event(
             )
         if test_cache_reason is not None:
             data["test_cache_reason"] = redact_secrets(str(test_cache_reason))
+        if ci_baseline is not None:
+            data["ci_baseline"] = json.loads(
+                redact_secrets(json.dumps(ci_baseline, default=str)))
         append_event(rdir, "gate", note=f"{gate}: {outcome}", data=data)
     except Exception:
         pass

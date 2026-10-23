@@ -78,10 +78,12 @@ What each test keeps, and why losing it is silent:
   directions, because a second copy of it in a component is how the row and the
   detail header start disagreeing;
 - the ref in the row is the ticket number, parsed from the target with the same
-  vocabulary ``lmer_cli.cli._derive_repo_url_from_task_target`` uses. That
-  function cannot be imported into a browser, so its indicator list is read here
-  and compared against the JS map: a resource kind added there arrives as a
-  failing test rather than as a row that stops naming what it points at. And the
+  vocabulary the CLI's target classifier uses (``work_repo.utils``
+  ``WORK_ITEM_INDICATORS``, the one constant behind
+  ``_derive_repo_url_from_task_target`` in both its copies). It cannot be
+  imported into a browser, so the constant is read here and compared against
+  the JS map: a resource kind added there arrives as a failing test rather than
+  as a row that stops naming what it points at. And the
   parse stays clear of ``_parse_repo_url``, whose SSH branch is the
   character-class ``rstrip(".git")`` bug T28 found and T48 is fixing — a second
   copy of that grammar is how it comes back.
@@ -91,7 +93,6 @@ line reads as quiet rather than as clutter, are verified by building the bundle
 and by live test LT3 on a real phone.
 """
 
-import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -169,6 +170,8 @@ CHIP_VARIANTS = {
     'v-if="run.preset"': "outlined",
     'v-if="run.agents"': "outlined",
     'v-if="driver"': "outlined",
+    # A setting the operator chose for the run (issue 458), like the preset.
+    'v-if="run.muted"': "outlined",
     'v-for="port in run.ports"': "outlined",
 }
 
@@ -247,7 +250,7 @@ def _badge(text):
     several chips and this is the one identified by what it says, which is also the
     only thing about it that has survived three passes of the operator's.
     """
-    end = text.index(">uber lmer<")
+    end = text.index(">{{ assistantName }}<")
     return text[text.rindex("<v-chip", 0, end):end]
 
 
@@ -327,19 +330,34 @@ def _resource_icons():
 
 
 def _cli_indicators():
-    """The resource paths ``lmer_cli``'s target parser recognises, from its source.
+    """The path segments the CLI reads a work item out of, from the shared constant.
 
-    Read off the imported function rather than the file, so the comparison is
-    against the grammar that actually ships.
+    ``work_repo.utils.WORK_ITEM_INDICATORS`` is the one definition behind the
+    classifier and both copies of ``_derive_repo_url_from_task_target``
+    (A1-wave0.repository-of), keyed by the bare segment as ``TARGET_KINDS`` is;
+    the id each pair requires is the CLI's business, not the card's.
     """
-    from lmer_cli.cli import _derive_repo_url_from_task_target
+    from work_repo.utils import WORK_ITEM_INDICATORS
 
-    source = inspect.getsource(_derive_repo_url_from_task_target)
-    block = re.search(r"indicators = \((.*?)\)", source, re.S)
-    assert block, "the CLI's target grammar no longer lists the paths it accepts"
-    found = {token.strip("/") for token in re.findall(r"'([^']+)'", block.group(1))}
-    assert found, "the CLI's indicator list is empty"
+    found = {segment for segment, _id in WORK_ITEM_INDICATORS}
+    assert found, "the CLI's work-item indicator list is empty"
     return found
+
+
+def _cli_reference_routes():
+    """The routes the CLI reads a *reference* out of, in the card's bare spelling.
+
+    ``REFERENCE_INDICATORS`` names content inside a repository — a tree, a file,
+    a wiki page, a commit listing, an id-less list page — in GitLab's ``-/``
+    spelling and GitHub's bare one; the prefix is dropped because the card keys
+    by the bare segment. A reference never names a number, so the card has no
+    reason to list one — but ``commits`` is listed, with a ``null`` verdict,
+    from when the derivation's flat tuple carried it beside ``commit``, and a
+    reference route the card does list can only ever be ``null``.
+    """
+    from work_repo.utils import REFERENCE_INDICATORS
+
+    return {route.removeprefix("-/") for route in REFERENCE_INDICATORS}
 
 
 def _probe(body):
@@ -828,10 +846,13 @@ def test_the_target_grammar_knows_every_resource_the_cli_derives_from():
     ``_derive_repo_url_from_task_target`` reads a task target for the *repo*; the
     row reads it for the *number*. Same GitHub PR and issue URLs, same GitLab MR,
     ``issues`` and ``work_items`` forms, same subgroup paths. It cannot be
-    imported into a browser, so this is the seam: its indicator list is the
-    vocabulary, and each entry must be classified in ``TARGET_KINDS`` — either as
-    a resource with a word, or explicitly as ``null`` for a list page or a diff
-    range that has no single number to name.
+    imported into a browser, so this is the seam: the work-item segments
+    (``WORK_ITEM_INDICATORS``) are the vocabulary, and each must be classified
+    in ``TARGET_KINDS`` — either as a resource with a word, or explicitly as
+    ``null`` for a diff range or a commit that has no single number to name.
+    A segment the card lists must be one the CLI reads: a work-item segment,
+    or a reference route (``REFERENCE_INDICATORS``) — a listing or a file,
+    which names no number, so its only verdict is ``null`` (``commits``).
 
     A kind added on either side therefore arrives as a failing test, and somebody
     decides which bucket it is in, instead of a row quietly stopping naming what
@@ -839,17 +860,23 @@ def test_the_target_grammar_knows_every_resource_the_cli_derives_from():
     """
     kinds = _target_kinds()
     indicators = _cli_indicators()
+    references = _cli_reference_routes()
 
     for indicator in indicators:
         assert indicator in kinds, (
             f"lmer_cli derives a repo from {indicator!r} targets and format.js "
             "has no verdict on them — the row would call such a target unnamed"
         )
-    for segment in kinds:
-        assert segment in indicators, (
+    for segment, body in kinds.items():
+        assert segment in indicators or segment in references, (
             f"format.js reads {segment!r} out of a target that lmer_cli does not "
             "recognise as a resource path at all; one of the two is wrong"
         )
+        if segment not in indicators:
+            assert body is None, (
+                f"format.js names a number in {segment!r}, a reference route "
+                "that has none"
+            )
     # The three the row actually names, spelled out: a map that classified
     # everything as null would satisfy the two loops above and name nothing.
     assert _kind_names() == {"issue", "mr", "pr"}, (
@@ -998,11 +1025,11 @@ def test_both_listings_mark_the_platforms_own_session():
     """
     for source in (RUN_CARD, RUN_NAV):
         text = _read(source)
-        assert ">uber lmer<" in text, (
+        assert ">{{ assistantName }}<" in text, (
             f"{source.name} does not name the platform's own session, so the row "
             "that orchestrates the fleet reads as one of the runs in it"
         )
-        assert "assistant" not in text.lower(), (
+        assert "assistant" not in re.sub(r"assistantName", "", text).lower(), (
             f"{source.name} calls the supervisor an assistant; that spelling is the "
             "module's and the API's, and never an operator's (T31)"
         )
@@ -1035,7 +1062,7 @@ def test_the_orchestrator_card_offers_the_chat():
         "the chat button does something other than asking the shell to open "
         "the drawer"
     )
-    assert 'aria-label="talk to uber lmer"' in button.group(0), (
+    assert ':aria-label="`talk to ${assistantName}`"' in button.group(0), (
         "the button's accessible name no longer matches the bar toggle's, so "
         "a screen reader meets two names for one conversation"
     )
@@ -1123,33 +1150,42 @@ def test_the_fleet_card_borders_the_row_that_is_not_a_run():
     )
 
 
-def test_the_drawer_swaps_the_state_icon_for_the_uber_lmer_mark():
+def test_the_drawer_rows_keep_a_tight_gap_between_icon_and_title():
+    """Issue 596: Vuetify's 32px icon gap took width the titles need."""
+    nav = _read(RUN_NAV)
+    assert re.search(r'<v-list\b[^>]*:prepend-gap="12"', nav), (
+        "the drawer's list leaves Vuetify's default gap between a row's icon and its title"
+    )
+
+
+def test_the_drawer_swaps_the_state_icon_for_ratchets_face():
     """The other half of that pass: "in the side list view instead of the play icon
-    show the robot icon".
+    show the robot icon", since issue 596 Ratchet's face, the one the app bar draws.
 
     A 40px row has no room for a border and the operator did not ask for one there, so
-    the drawer spends the channel it does have: the gutter. The filled robot is the
-    uber lmer mark wherever this app means the supervising session — the outline
-    variant is the driver chip's, i.e. a harness — so the two listings mark the same
-    session with the same glyph.
+    the drawer spends the channel it does have: the gutter.
 
     Pinned in both directions, because each failure is invisible on the screen the
     other one is fine on: without the swap the platform's own session wears a play
-    button like any running run, and without the fallback *every* row becomes a robot
+    button like any running run, and without the fallback *every* row becomes Ratchet
     and the drawer stops carrying urgency by shape at all.
 
     The row also keeps its ordinary ground: the tint that was here for one pass went
     with the fleet card's, and no scoped rule replaced it.
     """
     nav = _read(RUN_NAV)
-    swap = ':icon="isOrchestrator(run) ? mdiRobot : icon(run)"'
-    assert nav.count(swap) == 1, (
-        f"the drawer's leading icon is not {swap} exactly once; the mark and the "
-        "state icon are one binding, and either half missing is a gutter that lies"
+    prepend = nav[nav.index("<template #prepend>"):]
+    prepend = prepend[:prepend.index("</template>")]
+    assert re.search(r'<RatchetFace\s+v-if="isOrchestrator\(run\)"', prepend), (
+        "the drawer's orchestrator row does not wear Ratchet's face, the mark the app "
+        "bar draws for the same session"
     )
-    assert "mdiRobot," in nav.split("} from '@mdi/js'")[0], (
-        "the drawer's glyph is not the filled mdiRobot from @mdi/js, so the mark the "
-        "fleet card badges this session with is not the one the drawer shows"
+    assert re.search(r'<v-icon\s+v-else\b[^>]*:icon="icon\(run\)"', prepend), (
+        "the state icon is not the fallback for every other row, so the drawer stops "
+        "carrying urgency by shape"
+    )
+    assert "./assets/ratchet" not in nav, (
+        "the drawer spells the face's path itself instead of using RatchetFace"
     )
     assert "orchestrator-row" not in nav, (
         "the drawer still classes the orchestrator row, which is the tint the "

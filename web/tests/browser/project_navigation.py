@@ -106,12 +106,12 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         chat = alpha_group + ".querySelector('.project-assistant')"
         await browser.evaluate(chat + ".focus()")
         await key(browser, " ", "Space", 32, " ")
-        await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Alpha'))")
+        await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Alpha'))")
         await browser.wait("document.querySelector('.v-navigation-drawer--right').getBoundingClientRect().right <= innerWidth + 1")
         assert await browser.evaluate(toggle + ".getAttribute('aria-expanded')") == 'false'
         assert await browser.evaluate("location.search") == "?workspace=" + alpha["id"]
         await browser.shot(output, "collapsed-project-chat-desktop")
-        await browser.click("close the uber lmer chat")
+        await browser.click("close the Ratchet chat")
         await browser.wait("document.querySelector('.v-navigation-drawer--right').getBoundingClientRect().left >= innerWidth")
         await browser.choose_project("Beta")
         with scope.bound(alpha["id"]):
@@ -163,7 +163,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.shot(output, f"selected-beta-sidebar-phone-{width}")
             if width == 390:
                 await browser.click_element(beta_group + ".querySelector('.project-assistant')")
-                await browser.wait("[...document.querySelectorAll('.project-chat-title')].some(e => e.checkVisibility() && e.textContent.includes('Beta'))")
+                await browser.wait("[...document.querySelectorAll('.uber-pane')].some(e => e.checkVisibility() && e.getAttribute('aria-label').startsWith('Beta'))")
                 await browser.wait("[...document.querySelectorAll('textarea')].some(e => e.checkVisibility() && !e.disabled)")
                 await browser.wait(sidebar + ".getBoundingClientRect().right <= 0")
                 await browser.wait("document.querySelector('.v-navigation-drawer--right').getBoundingClientRect().right <= innerWidth + 1")

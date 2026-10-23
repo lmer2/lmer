@@ -20,6 +20,21 @@ class ResolveError(Exception):
     pass
 
 
+class NotACheckoutError(ResolveError):
+    """A target names an existing filesystem entry that is not a git checkout.
+
+    Raised by :func:`probe_local_repo` for the middle case — a plain
+    directory, a file, or a directory whose git metadata is unusable. The
+    caller refuses it rather than reading the name as a branch. A target
+    that names no filesystem entry at all is *not* this: the probe returns
+    ``None`` so it reaches the target classifier.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(f"not a git repository: {path}")
+
+
 def _git(*args: str, cwd: Optional[Path] = None) -> Tuple[int, str]:
     """
     Execute a git command and return its status and output.
@@ -154,6 +169,39 @@ def validate_local_repo(path: Path) -> None:
     rc, _ = _git("rev-parse", "--is-inside-work-tree", cwd=path)
     if rc != 0:
         raise ResolveError(f"Not a git repository: {path}")
+
+
+def probe_local_repo(target: str, cwd: Path) -> Optional[Path]:
+    """The resolved path when *target* names an existing git checkout.
+
+    The local-path leg of :func:`normalize_repo_url` as a probe
+    (A1-wave0.host-export, spec §4/§2), with three outcomes:
+
+    - the checkout's path when *target* is a valid git checkout;
+    - ``None`` when it names no filesystem entry — a branch, a commit SHA, an
+      ``mr-N``/``issue-N`` shorthand, a document URL — so the caller reaches
+      the target classifier instead of failing with 'Local path does not
+      exist';
+    - :class:`NotACheckoutError` when it names an existing entry that is not a
+      git checkout (a plain directory, a file), so the caller refuses it and
+      never silently reads the name as a branch. The path resolution and its
+      ``OSError``/``RuntimeError`` guard live here alone.
+    """
+    if not target or is_likely_url(target):
+        return None
+    try:
+        p = (cwd / target).resolve() if not os.path.isabs(target) else Path(target).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not p.exists():
+        return None
+    if not p.is_dir():
+        raise NotACheckoutError(p)
+    try:
+        validate_local_repo(p)
+    except ResolveError:
+        raise NotACheckoutError(p) from None
+    return p
 
 
 def normalize_repo_url(target: str, cwd: Path, remote_name: Optional[str] = None) -> Tuple[str, Optional[Path]]:

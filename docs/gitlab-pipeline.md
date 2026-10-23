@@ -73,7 +73,7 @@ gitlab-pipeline myorg/myrepo 123 --host gitlab.example.com --mr
 | Variable | Description |
 |----------|-------------|
 | `GITLAB_HOST` | Default GitLab host |
-| `GITLAB_TOKEN_{sanitized_host}` | Host-specific API token (hostname with dots/hyphens as underscores) |
+| `GITLAB_TOKEN_{sanitized_host}` | Host-specific API token (hostname lowercased, dots as `_`, hyphens as `__`: `my-gitlab.example.com` → `GITLAB_TOKEN_my__gitlab_example_com`) |
 | `GITLAB_TOKEN` | Fallback API token, used only for its issuing host (`LMER_GITLAB_TOKEN_HOST`, default: the `LMER_WORK_REPO` host) |
 
 ### Token Requirements

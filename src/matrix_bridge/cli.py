@@ -39,9 +39,11 @@ import contextlib
 import logging
 import signal
 import sys
+from pathlib import Path
 from typing import Optional, Sequence
+from urllib.parse import urlparse
 
-from lmer_platform.client import PlatformError
+from lmer_platform.client import Call, PlatformError, request
 from matrix_bridge import client as mxclient
 from matrix_bridge import config as mxcfg
 from matrix_bridge import inbound as mxin
@@ -260,8 +262,6 @@ def _in_a_container() -> bool:
     is enough for the one question this answers — whether a loopback bind can
     reach anybody (!246 review).
     """
-    from pathlib import Path
-
     return Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
 
 
@@ -295,8 +295,6 @@ def _reachability(config) -> tuple:
     typo is not possible here, and pretending otherwise is what produced both
     wrong answers.
     """
-    from urllib.parse import urlparse
-
     bind = config.bind_address
     listening_everywhere = bind in _WILDCARD
     listening_on_loopback = bind in _LOOPBACK
@@ -414,8 +412,6 @@ async def check_remote(config, client, endpoint, *, transport, out) -> bool:
     client-visible fact, and the local half already reports the operator's
     assertion (!243 review).
     """
-    from lmer_platform.client import Call, request
-
     ok = True
 
     if client is None:

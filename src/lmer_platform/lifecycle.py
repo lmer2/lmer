@@ -43,23 +43,21 @@ textarea is the obvious source of a newline.
 
 Why exit signals the process **group**
 --------------------------------------
-``lmer`` is not the thing holding the container. It runs ``podman run`` as its own
-child and installs no signal handler of its own
-(``lmer_cli.cli``), so a SIGTERM delivered to the session's pid alone kills the
-bookkeeping and leaves a container running with nothing watching it. The session is
-spawned with ``start_new_session=True``
-(:func:`lmer_platform.spawn.spawn_session`), so its pid *is* a process-group id, and
-signalling the group reaches ``podman run`` too — which is what actually stops and
-removes the container. Group leadership is checked rather than assumed, because
+Since #444 ``lmer`` creates its container detached and follows it
+(:mod:`lmer_cli.container_follow`): on SIGTERM it asks the runtime to stop the
+container, then records the exit and removes it. Nothing else stops a detached
+container — the attach client holds nothing up. The session is spawned with
+``start_new_session=True`` (:func:`lmer_platform.spawn.spawn_session`), so its pid
+*is* a process-group id, and signalling the group reaches the follower and its
+attach client together. Group leadership is checked rather than assumed, because
 ``killpg`` on a pid that does not lead one signals whatever group happens to carry
 that id. Same discipline as ``lmer_cli.container.spawn_harness``'s group kill and
 :func:`lmer_platform.assistant.stop`.
 
 The ladder is SIGTERM, then SIGKILL, and the first step is the one that matters:
-SIGTERM lets ``podman run`` tear the container down, while SIGKILL only guarantees
-that the *session* ends and can leave the container behind (the lingering-grandchild
-case :func:`lmer_platform.spawn._scrub_transcripts` describes). So SIGTERM gets a
-generous grace and SIGKILL is the backstop.
+SIGTERM lets the follower stop the container, while SIGKILL only ends the follower
+and leaves the container running, to be found by label at the next daemon start.
+So SIGTERM gets a generous grace and SIGKILL is the backstop.
 
 Which sessions may be signalled at all
 --------------------------------------
@@ -122,7 +120,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from . import registry
+from lmer_cli import comms as bus_comms
+
+from . import containers, registry
 from .assistant import KIND as ASSISTANT_KIND
 from .provenance import PLATFORM_PREFIX
 from .reattach import detached_record
@@ -295,7 +295,7 @@ def _iso_after(seconds: float) -> str:
 
 
 def _validated_note(note: Optional[str]) -> Optional[str]:
-    """The operator's addition to the prompt, or ``None``.
+    """The note added to the prompt, or ``None``; who added it is the caller's.
 
     Whitespace is collapsed rather than preserved: this text is appended to a
     payload that must not contain a newline (see the module docstring), and a note
@@ -312,6 +312,10 @@ def _validated_note(note: Optional[str]) -> Optional[str]:
     collapsed = " ".join(note.split())
     if not collapsed:
         return None
+    # Typed into a terminal after the platform's own prefix, so one of these
+    # could erase that prefix and type another (#594).
+    if bus_comms.holds_typed_controls(collapsed):
+        raise LifecycleError("a wind-down note may hold no control characters")
     if len(collapsed) > MAX_NOTE_CHARS:
         raise LifecycleError(
             f"wind-down note is {len(collapsed)} characters; the limit is "
@@ -320,20 +324,25 @@ def _validated_note(note: Optional[str]) -> Optional[str]:
     return collapsed
 
 
-def wind_down_prompt(note: Optional[str] = None) -> str:
+def wind_down_prompt(note: Optional[str] = None, *, added_by: str = "The operator") -> str:
     """The exact text a wind-down sends, so a caller can show it before sending.
 
     Public because the route returns it and the UI shows it: an operator about to
     interrupt a working agent should be able to read what it will be told, and a
     prompt that only exists inside the call that sends it cannot be reviewed.
+
+    *added_by* names whoever wrote the note, so the assistant's words are never
+    read as the operator's (#594).
     """
     validated = _validated_note(note)
     if not validated:
         return WIND_DOWN_PROMPT
-    return f"{WIND_DOWN_PROMPT} The operator added: {validated}"
+    return f"{WIND_DOWN_PROMPT} {added_by} added: {validated}"
 
 
-def wind_down(session_id: str, *, note: Optional[str] = None) -> WindDownReport:
+def wind_down(
+    session_id: str, *, note: Optional[str] = None, added_by: str = "The operator",
+) -> WindDownReport:
     """Ask a session's agent to wrap up and end itself. Signals nothing.
 
     Loud on delivery, quiet on bookkeeping, and that split is the point. Getting the
@@ -349,7 +358,7 @@ def wind_down(session_id: str, *, note: Optional[str] = None) -> WindDownReport:
     whole module: the prompt is an HTTP call into the container, so the death of a
     daemon's host PTY does not touch it (:mod:`lmer_platform.reattach`).
     """
-    prompt = wind_down_prompt(note)
+    prompt = wind_down_prompt(note, added_by=added_by)
     # Before the mark, so nothing claims a session was asked to wind down until it
     # has been. append_newline is the control plane's "and press Enter", without
     # which the paragraph sits unsent in the agent's input box.
@@ -627,6 +636,9 @@ def exit_session(session_id: str) -> ExitReport:
             "it is still listed as running, which is the truth"
         )
 
+    # A follower stops its container on SIGTERM, but one that was killed first —
+    # or had not yet installed its handler — leaves it running, detached (#444).
+    containers.stop_for_session(session_id)
     removed = registry.remove(session_id)
     logger.info(
         "platform_session_exited_on_request id=%s pid=%s signals=%s removed=%s",

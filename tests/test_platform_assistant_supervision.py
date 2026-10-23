@@ -685,7 +685,7 @@ def test_the_auto_started_assistant_does_not_spend_a_worker_slot(
         assert "all 1 worker slot(s) remain" in report.notice
         worker = spawn.spawn_session(
             config,
-            spawn.SpawnRequest(taskdef="develop", target="https://example.com/x"),
+            spawn.SpawnRequest(taskdef="develop", target="https://example.com/g/p/-/issues/1"),
         )
         assert worker.session_id, (
             "the assistant was holding the host's only slot against a worker"
@@ -710,12 +710,12 @@ def test_a_worker_that_fills_the_cap_still_refuses_another_worker(
         assert report.running is True
         worker = spawn.spawn_session(
             config,
-            spawn.SpawnRequest(taskdef="develop", target="https://example.com/x"),
+            spawn.SpawnRequest(taskdef="develop", target="https://example.com/g/p/-/issues/1"),
         )
         with pytest.raises(spawn.CapacityError, match="1/1"):
             spawn.spawn_session(
                 config,
-                spawn.SpawnRequest(taskdef="develop", target="https://example.com/y"),
+                spawn.SpawnRequest(taskdef="develop", target="https://example.com/g/p/-/issues/2"),
             )
     finally:
         kill(worker.pid if worker else None)

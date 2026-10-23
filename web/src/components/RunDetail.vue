@@ -3,6 +3,7 @@ import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import {
   mdiRobot, mdiClipboardTextOutline, mdiClockAlertOutline,
   mdiClockOutline, mdiCommentQuestionOutline, mdiConsole, mdiExitRun,
+  mdiBellOffOutline, mdiBellOutline,
   mdiEyeOffOutline, mdiFileDocumentOutline, mdiFolderOpenOutline,
   mdiForumOutline, mdiInformationOutline, mdiLinkVariant, mdiOpenInNew,
   mdiPlayOutline, mdiPowerPlugOff, mdiRobotOutline, mdiSourceBranchPlus,
@@ -14,9 +15,10 @@ import AskHistory from './AskHistory.vue'
 import Chat from './Chat.vue'
 import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
+import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
-import { forgetRun, resumeRun, moveRun } from '../api.js'
+import { forgetRun, muteRun, resumeRun, moveRun } from '../api.js'
 import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
@@ -25,6 +27,7 @@ import {
 import { rememberChoice, storedChoice } from '../preferences.js'
 import { projectColor, projectTextColor } from '../projects.js'
 import { runKey as composeRunKey } from '../runref.js'
+import { assistantName } from '../ratchet.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
 // it arrives as its own chunk. It is now deferred twice over: a tab panel renders
@@ -171,6 +174,9 @@ async function loadRunFiles() {
     const query = new URLSearchParams({
       host: props.run.host, project: props.run.project, slug: props.run.slug,
     })
+    // A schema-2 row's directory is named by its uid (spec §6.1); a row without
+    // one keeps the query it always sent.
+    if (props.run.uid) query.set('uid', props.run.uid)
     const response = await fetch(`api/runs/files?${query}`, {
       credentials: 'same-origin',
     })
@@ -496,6 +502,7 @@ async function exitNow() {
 // the reason and the way through.
 const RESUME_NEEDS_REPO_URL = 'repo_url_required'
 const RESUME_NEEDS_DIRECTION = 'direction_required'
+const RESUME_NEEDS_UNSIGNED_DECISION = 'unsigned_session'
 
 // Long enough to want a name rather than a 200-character attribute, and each says
 // what the field *does* instead of calling it optional — for the taskdef the
@@ -522,6 +529,7 @@ const resumeNeeds = ref(null)
 // would take the operator's value with it.
 const repoUrlAsked = ref(false)
 const resumeStarted = ref(null)
+const unsignedSource = ref(null)
 
 // Nothing to continue while a session is up. Liveness outranks committed run
 // state (spec D24), so the row can read "yielded" with a container already working
@@ -544,6 +552,7 @@ const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value
 const resumeAsksForAField = computed(() => (
   resumeNeeds.value === RESUME_NEEDS_REPO_URL
   || resumeNeeds.value === RESUME_NEEDS_DIRECTION
+  || resumeNeeds.value === RESUME_NEEDS_UNSIGNED_DECISION
 ))
 
 // Naming a taskdef that is not this run's does not continue this run: the
@@ -561,7 +570,7 @@ const resumeLabel = computed(() => (
     : 'continue this run'
 ))
 
-async function resume() {
+async function submitResume(allowUnsignedSource = null) {
   if (!canResume.value || !canSubmitResume.value) return
   resuming.value = true
   resumeError.value = null
@@ -570,9 +579,12 @@ async function resume() {
       taskdef: resumeTaskdef.value,
       repoUrl: resumeRepoUrl.value,
       direction: resumeDirection.value,
-      confirmProject: projectConfirmed.value, slot: selectedSlot.value,
+      allowUnsignedSource,
+      confirmProject: projectConfirmed.value,
+      slot: selectedSlot.value,
     })
     resumeNeeds.value = null
+    unsignedSource.value = null
     emit('changed')
   } catch (exc) {
     // Nothing typed is cleared on this path: the platform records nothing before
@@ -580,9 +592,40 @@ async function resume() {
     // nowhere but this box.
     resumeError.value = exc.message
     resumeNeeds.value = exc.code || null
+    unsignedSource.value = (
+      exc.code === RESUME_NEEDS_UNSIGNED_DECISION ? exc.source : null
+    )
     if (exc.code === RESUME_NEEDS_REPO_URL) repoUrlAsked.value = true
   } finally {
     resuming.value = false
+  }
+}
+
+function resume() {
+  return submitResume()
+}
+
+function continueUnsignedSource() {
+  const uid = unsignedSource.value?.uid
+  if (uid) return submitResume(uid)
+}
+
+function cancelUnsignedSource() {
+  resumeError.value = null
+  resumeNeeds.value = null
+  unsignedSource.value = null
+}
+
+async function toggleMute() {
+  busy.value = true
+  error.value = null
+  try {
+    await muteRun(props.run, !props.run.muted)
+    emit('changed')
+  } catch (exc) {
+    error.value = exc.message
+  } finally {
+    busy.value = false
   }
 }
 
@@ -642,7 +685,7 @@ async function forget() {
         size="small"
         title="the platform's own orchestrating session, not one of the runs"
         variant="tonal"
-      >uber lmer</v-chip>
+      >{{ assistantName }}</v-chip>
       <!-- The heading line is the run's *name*, so this is where the title goes
            (the operator asked: "if meta.title is set it should be used in the
            details header and the listings") — not an extra item on the identity
@@ -933,6 +976,8 @@ async function forget() {
                 <dd><code class="scroll-x">{{ session.id }}</code></dd>
                 <dt>pid</dt>
                 <dd>{{ session.pid }}</dd>
+                <dt v-if="session.container_name">container</dt>
+                <dd v-if="session.container_name"><code class="scroll-x">{{ session.container_name }}</code></dd>
                 <dt>started</dt>
                 <dd :title="session.started_at || ''">{{ ago(session.started_at, now) }}</dd>
                 <dt v-if="session.log_path">log</dt>
@@ -1015,6 +1060,17 @@ async function forget() {
                 class="mb-3"
               >
                 {{ resumeError }}
+                <div
+                  v-if="resumeNeeds === RESUME_NEEDS_UNSIGNED_DECISION && unsignedSource?.uid"
+                  class="d-flex flex-wrap ga-2 mt-3"
+                >
+                  <v-btn color="warning" variant="tonal" @click="continueUnsignedSource">
+                    continue fresh
+                  </v-btn>
+                  <v-btn variant="text" @click="cancelUnsignedSource">
+                    cancel and wait
+                  </v-btn>
+                </div>
               </v-alert>
 
               <v-alert v-if="resumeStarted" type="success" density="compact" class="mb-3">
@@ -1095,6 +1151,20 @@ async function forget() {
             </v-card-text>
           </v-card>
         </template>
+
+        <!-- Every launch of this target (#374), beside the continue verb because
+             it is the same question asked of a group: which launch goes on next.
+             Outside `canResume` on purpose — a live run still has siblings worth
+             seeing — and only for a schema-2 row: a schema-1 run is one shared
+             record per target, so a legacy row mounts nothing and sends nothing.
+             In this panel and not a fifth tab, for the same reason as the file list below. -->
+        <SessionsPerTarget
+          v-if="run.uid"
+          :run="run"
+          :slots="slots"
+          :now="now"
+          @changed="emit('changed')"
+        />
 
         <template v-if="run.events && run.events.length">
           <div class="section-title">recent events</div>
@@ -1424,6 +1494,19 @@ async function forget() {
             <v-alert v-if="error" type="error" density="compact" class="mb-3">
               {{ error }}
             </v-alert>
+            <p class="text-medium-emphasis mb-3">
+              Muting a run stops its routine messages, replies and notes reaching
+              {{ assistantName }}, and leaves it out of stale and stalled reminders.
+              Its questions, crashes and completion still get through, and
+              unmuting replays nothing.
+            </p>
+            <v-btn
+              class="mb-4 run-mute-toggle"
+              variant="tonal"
+              :prepend-icon="run.muted ? mdiBellOutline : mdiBellOffOutline"
+              :loading="busy"
+              @click="toggleMute"
+            >{{ run.muted ? 'unmute this run' : 'mute this run' }}</v-btn>
             <p class="text-medium-emphasis mb-3">
               Forgetting a run removes it from this orchestrator's view. Its work-repo
               state and any running session are left untouched.

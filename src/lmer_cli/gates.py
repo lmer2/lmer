@@ -4,6 +4,7 @@ Gate System - Enforces all rules before major operations
 This module provides static enforcement of all development rules.
 """
 
+import argparse
 import subprocess
 import sys
 import os
@@ -21,8 +22,9 @@ import time
 
 import yaml
 
-from lmer_cli import gate_cache, gate_descriptor, precommit_cache, push_allow, test_resources
+from lmer_cli import ci_baseline, gate_cache, gate_descriptor, precommit_cache, push_allow, test_resources
 from lmer_cli.container.clone_and_exec import _scrub_credentials
+from lmer_cli.gitlab_pipeline import GitLabPipelineClient, GitLabPipelineError, get_token
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, redact_secrets, task_info_dir
 
@@ -167,6 +169,54 @@ CACHE_SCOPE = "cached"
 # to know covers everything) and the receipt's `test_scope` field, where
 # absence has to keep meaning "this run cannot say".
 FULL_SUITE_SCOPE = "full suite"
+
+# The initial-baseline switch (#452), resolved on the host from the scoped
+# GATE_CI_BASELINE ladder (runtime.resolve_gate_ci_baseline) and passed in as
+# this one variable. Off by default: `gate-check --baseline` is then exactly
+# `gate-check`.
+CI_BASELINE_ENV = "LMER_GATE_CI_BASELINE"
+
+# The receipt name for a baseline decision. Deliberately not "gate-check": a
+# receipt cited as gate-check evidence must mean the local gate ran.
+BASELINE_GATE = "gate-baseline"
+
+# CheckResult.scope / receipt test_scope when CI answered for the suite.
+CI_BASELINE_SCOPE = "ci baseline"
+
+# Left out of every suite run: building the container image is not a unit test.
+SUITE_IGNORE_ARGS = ["--ignore=tests/test_container_build.py"]
+
+# What the smoke check collects: the same targets check_tests runs.
+BASELINE_COLLECT_ARGV = ["-m", "pytest", "--collect-only", "-q",
+                         "-p", "no:cacheprovider", "tests/", *SUITE_IGNORE_ARGS]
+
+BASELINE_REUSED = "reused"
+BASELINE_CI_FAILED = "ci-failed"
+BASELINE_FALLBACK = "fallback"
+BASELINE_LOCAL_FAILED = "local-failed"
+
+
+@dataclass
+class BaselineOutcome:
+    """What `gate-check --baseline` decided, and what its receipt carries.
+
+    `fallback` means the caller must run the normal full gate; every other
+    kind is final with `exit_code`.
+    """
+    kind: str
+    exit_code: int
+    reason: str
+    evidence: Optional[ci_baseline.Evidence] = None
+    smoke: Optional[ci_baseline.SmokeResult] = None
+
+    def payload(self) -> Dict[str, Any]:
+        return {
+            "decision": self.kind,
+            "reason": self.reason,
+            "evidence": self.evidence.as_dict() if self.evidence else None,
+            "smoke": self.smoke.as_dict() if self.smoke else None,
+        }
+
 
 # check_changelog() warning hints for repos with a changelog.d/ directory
 CTL_FRAGMENT_HINT = "Or stage a fragment: changelog.d/YYYYMMDD-<topic>.yaml"
@@ -690,29 +740,15 @@ class GateSystem:
                 message="No tests directory found (skipped)"
             )
 
-        # Determine python executable - prefer venv if it can actually import
-        # pytest. In self-dev a bind-mounted host `.venv/bin/python` can resolve
-        # to a system interpreter without the venv's site-packages, so existence
-        # alone is insufficient — probe an import before trusting it.
-        venv_python = self.project_root / ".venv" / "bin" / "python"
-        if venv_python.exists() and self._interpreter_can_import(str(venv_python)):
-            python_cmd = str(venv_python)
-        else:
-            python_cmd = "python"
-            for cand in ("python3", "python"):
-                if self._interpreter_can_import(cand):
-                    python_cmd = cand
-                    break
+        # The first candidate that can actually import pytest: see
+        # _interpreter_candidates for why existence alone is not enough.
+        python_cmd = next(
+            (cand for cand in self._interpreter_candidates()
+             if self._interpreter_can_import(cand)),
+            "python",
+        )
 
-        # Prepend the dev src/ tree to PYTHONPATH so pytest imports the working
-        # copy. Without this, an inherited PYTHONPATH (e.g. lmer self-dev's
-        # `/Agents/global/src`) shadows the project's own source.
-        env = os.environ.copy()
-        src_dir = self.project_root / "src"
-        if src_dir.is_dir():
-            env["PYTHONPATH"] = (
-                str(src_dir) + os.pathsep + env.get("PYTHONPATH", "")
-            )
+        env = self._suite_env()
 
         # A text-only diff runs the declared text-reading subset instead of
         # the whole tree (#269) — nothing that could fail on the change is
@@ -727,8 +763,7 @@ class GateSystem:
             scope = TEXT_DIFF_SCOPE
 
         pytest_argv = [python_cmd, "-m", "pytest", *targets, "-x",
-                       "--tb=short", "-q",
-                       "--ignore=tests/test_container_build.py"]
+                       "--tb=short", "-q", *SUITE_IGNORE_ARGS]
 
         if parallel_runner:
             script = parallel_runner[0]
@@ -881,6 +916,21 @@ class GateSystem:
                 cache_reason=cache_reason,
             )
 
+    def _suite_env(self) -> Dict[str, str]:
+        """The environment the suite runs in.
+
+        Prepends the dev src/ tree to PYTHONPATH so pytest imports the working
+        copy. Without this, an inherited PYTHONPATH (e.g. lmer self-dev's
+        `/Agents/global/src`) shadows the project's own source.
+        """
+        env = os.environ.copy()
+        src_dir = self.project_root / "src"
+        if src_dir.is_dir():
+            env["PYTHONPATH"] = (
+                str(src_dir) + os.pathsep + env.get("PYTHONPATH", "")
+            )
+        return env
+
     def _cache_miss_decision(
         self, fingerprint: Optional[gate_cache.Fingerprint]
     ) -> Tuple[str, str]:
@@ -1031,6 +1081,18 @@ class GateSystem:
             # The cache is an optimization. No handoff failure may change the
             # result of the commit that already succeeded.
             return False
+
+    def _interpreter_candidates(self) -> list[str]:
+        """Interpreters the suite may run under, in order of preference.
+
+        The project's venv first, then whatever ``python3``/``python`` resolve
+        to. In self-dev a bind-mounted host ``.venv/bin/python`` can resolve to
+        a system interpreter without the venv's site-packages, so callers probe
+        an import (:meth:`_interpreter_can_import`) rather than trusting this
+        order alone.
+        """
+        venv_python = self.project_root / ".venv" / "bin" / "python"
+        return ([str(venv_python)] if venv_python.exists() else []) + ["python3", "python"]
 
     @staticmethod
     def _interpreter_can_import(python_cmd: str, module: str = "pytest") -> bool:
@@ -1855,12 +1917,17 @@ class GateSystem:
             if result.status == CheckStatus.FAILED and result.is_critical
         ]
 
-    def run_commit_gate(self, skip_tests: bool = False) -> bool:
+    def run_commit_gate(self, skip_tests: bool = False,
+                        baseline_tests: Optional[CheckResult] = None) -> bool:
         """Run all checks for commit gate.
 
         When skip_tests=True, the long-running test suite is skipped. Callers
         are responsible for any caller-specific user-facing rationale (e.g.
         gate-commit prints a QUICK_GATE_COMMIT hint before invoking).
+
+        `baseline_tests` stands in for the suite when CI already answered for
+        this exact commit (#452): it is recorded as the tests result and the
+        suite neither runs nor touches the test cache.
         """
         # Cheapest-first, with the suite always last (#269). The suite is
         # ~10 minutes and every other check is seconds, so this ordering plus
@@ -1890,6 +1957,9 @@ class GateSystem:
             checks.remove(self.check_tests)
 
         for check in checks:
+            if check == self.check_tests and baseline_tests is not None:
+                self.results.append(baseline_tests)
+                continue
             if check == self.check_tests:
                 blockers = self._critical_failures_so_far()
                 if blockers:
@@ -1922,6 +1992,219 @@ class GateSystem:
             print(f"\n{Colors.CYAN}📝 Full check log written to: {log_path}{Colors.NC}")
 
         return passed
+
+    def _baseline_fallback(self, reason: str,
+                           evidence: Optional[ci_baseline.Evidence] = None,
+                           smoke: Optional[ci_baseline.SmokeResult] = None
+                           ) -> BaselineOutcome:
+        print(f"{Colors.CYAN}ℹ️  CI baseline not used: {reason}{Colors.NC}")
+        # A redirected gate-check is block-buffered, and the full gate follows.
+        print("    Running the full local gate instead.", flush=True)
+        return BaselineOutcome(BASELINE_FALLBACK, 0, reason, evidence, smoke)
+
+    def _baseline_source(self, host: str) -> ci_baseline.GitLabEvidence:
+        env = ci_baseline.evidence_token_env(host)
+        token = ci_baseline.evidence_token(host)
+        uses_evidence_token = bool(token)
+        if not uses_evidence_token:
+            token = get_token(host)
+        source = ci_baseline.GitLabEvidence(GitLabPipelineClient(host, token), evidence_env=env,
+                                            uses_evidence_token=uses_evidence_token)
+        if not ci_baseline.is_header_text(token):
+            raise GitLabPipelineError(f"{source.credential} is not a valid token "
+                                      "(control or non-latin-1 characters)")
+        return source
+
+    def run_baseline_gate(self) -> BaselineOutcome:
+        """The initial-baseline gate (#452): reuse CI that already ran the
+        required lint and test jobs on this exact commit, or say why not.
+
+        Only a PASSED verdict skips the local suite, and only after a bounded
+        smoke check; a FAILED verdict is final (exit EXIT_CI_FAILED, no local
+        rerun); everything else is a fallback to the normal full gate —
+        including an error in the evaluation itself.
+        """
+        try:
+            return self._run_baseline_gate()
+        except Exception as exc:
+            # Once local checks have run, an error is theirs, as in the plain gate.
+            if self.results:
+                raise
+            return self._baseline_fallback(f"baseline evaluation failed: {exc!r}")
+
+    def _run_baseline_gate(self) -> BaselineOutcome:
+        if not get_bool_env(CI_BASELINE_ENV, False):
+            return self._baseline_fallback(f"{CI_BASELINE_ENV} is off")
+
+        raw, _source = self._gate_config_lookup("ci_baseline", repo_local=False)
+        mapping, problem = ci_baseline.parse_mapping(raw)
+        if mapping is None:
+            return self._baseline_fallback(problem)
+
+        # A project runner owns how its suite runs (a service container, a
+        # parallel split); a plain collection here would not be its check.
+        if self._find_parallel_test_runner() or self._find_custom_test_runner():
+            return self._baseline_fallback(
+                "this project runs its tests through its own runner")
+        if not (self.project_root / "tests").is_dir():
+            return self._baseline_fallback("no tests directory")
+
+        code, status, _ = self.run_command(
+            ["git", "status", "--porcelain", "--untracked-files=all"], check=False)
+        if code != 0:
+            return self._baseline_fallback("git status failed")
+        if status.strip():
+            return self._baseline_fallback("the tree is not clean")
+        code, sha, _ = self.run_command(["git", "rev-parse", "HEAD"], check=False)
+        sha = sha.strip()
+        if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return self._baseline_fallback("HEAD is not a full commit SHA")
+
+        identity, problem = self._baseline_origin()
+        if identity is None:
+            return self._baseline_fallback(problem)
+        host, _, project = identity.partition("/")
+
+        try:
+            source = self._baseline_source(host)
+        except GitLabPipelineError as exc:
+            return self._baseline_fallback(f"no GitLab API access: {exc}")
+        print(f"Reading CI evidence with {source.credential}...", flush=True)
+        evidence = ci_baseline.collect(mapping, source, host, project, sha)
+        self._print_baseline_evidence(evidence)
+
+        if evidence.verdict == ci_baseline.FAILED:
+            print(f"{Colors.RED}❌ CI already failed a required job at "
+                  f"{sha}: {evidence.reason}{Colors.NC}")
+            print("    This is the baseline failure; the local suite was not "
+                  "run to second-guess it.", flush=True)
+            return BaselineOutcome(BASELINE_CI_FAILED, ci_baseline.EXIT_CI_FAILED,
+                                   evidence.reason, evidence)
+        if evidence.verdict != ci_baseline.PASSED:
+            if any(job.definition and job.pinned != job.definition
+                   for job in evidence.jobs):
+                print(f"{Colors.YELLOW}⚠️  A declared CI job has no audited definition "
+                      f"pin, or its pin no longer matches. After auditing the job, "
+                      f"refresh the pins with: gate-check --baseline --print-pins{Colors.NC}")
+            return self._baseline_fallback(evidence.reason, evidence)
+
+        candidates = self._interpreter_candidates()
+        print(f"Running environment smoke check (≤{mapping.smoke_timeout}s)...")
+        smoke = ci_baseline.run_smoke(
+            candidates, BASELINE_COLLECT_ARGV, mapping.tools,
+            mapping.smoke_timeout, str(self.project_root), self._suite_env())
+        print(f"    {smoke.outcome}: {smoke.detail}", flush=True)
+        if smoke.outcome == ci_baseline.SMOKE_TIMEOUT:
+            return self._baseline_fallback(f"smoke check timed out: {smoke.detail}",
+                                           evidence, smoke)
+        if smoke.outcome != ci_baseline.SMOKE_PASS:
+            print(f"{Colors.RED}❌ Environment smoke check failed — this worker "
+                  f"cannot run the suite as it stands.{Colors.NC}")
+            return BaselineOutcome(BASELINE_LOCAL_FAILED, 1,
+                                   f"smoke check failed: {smoke.detail}",
+                                   evidence, smoke)
+
+        tests_result = CheckResult(
+            name="Python Tests",
+            status=CheckStatus.PASSED,
+            message=(f"{CI_BASELINE_SCOPE}: CI passed at {sha[:12]} "
+                     f"(not run locally)"),
+            details=[f"{job.name}: {job.deciding.web_url}"
+                     for job in evidence.jobs if job.deciding],
+            scope=CI_BASELINE_SCOPE,
+        )
+        if self.run_commit_gate(baseline_tests=tests_result):
+            return BaselineOutcome(BASELINE_REUSED, 0, evidence.reason,
+                                   evidence, smoke)
+        return BaselineOutcome(BASELINE_LOCAL_FAILED, 1,
+                               "failed: " + ", ".join(self._critical_failures_so_far()),
+                               evidence, smoke)
+
+    def _baseline_origin(self) -> Tuple[Optional[str], str]:
+        """`host/project` of origin, or None and why it cannot be used."""
+        code, origin, _ = self.run_command(
+            ["git", "remote", "get-url", "origin"], check=False)
+        identity = self._normalize_remote_url(origin) if code == 0 else None
+        if identity is None:
+            return None, "origin is not a forge repository"
+        expected = os.environ.get("LMER_REPO_URL")
+        if expected and self._normalize_remote_url(expected) != identity:
+            return None, "origin is not the repository this run targets"
+        return identity, ""
+
+    def print_baseline_pins(self, revision: str = "HEAD") -> int:
+        """Print the definition pin of every job the CI mapping declares, at
+        `revision`, as the mapping's `jobs` block — the step after an operator
+        re-audits a changed CI job. Reads only; exit 1 when a pin cannot be
+        computed."""
+        raw, _source = self._gate_config_lookup("ci_baseline", repo_local=False)
+        mapping, problem = ci_baseline.parse_mapping(raw)
+        if mapping is None:
+            print(f"{Colors.RED}❌ {problem}{Colors.NC}")
+            return 1
+        code, sha, _ = self.run_command(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+                                        check=False)
+        sha = sha.strip()
+        if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            print(f"{Colors.RED}❌ {revision} is not a commit{Colors.NC}")
+            return 1
+        identity, problem = self._baseline_origin()
+        if identity is None:
+            print(f"{Colors.RED}❌ {problem}{Colors.NC}")
+            return 1
+        host, _, project = identity.partition("/")
+        try:
+            pins = ci_baseline.current_pins(mapping, self._baseline_source(host),
+                                            project, sha)
+        except (GitLabPipelineError, ci_baseline.EvidenceUnavailable,
+                KeyError, TypeError, ValueError) as exc:
+            print(f"{Colors.RED}❌ could not read the CI configuration: {exc}{Colors.NC}")
+            return 1
+        print(f"# ci_baseline pins for {project} @ {sha}")
+        print("# Pin only after auditing that each job still runs the full lint/tests.")
+        print("jobs:")
+        for name, covers in mapping.jobs.items():
+            print(f"  {json.dumps(name)}:")
+            print(f"    covers: {covers}")
+            if pins.get(name):
+                print(f"    definition: \"{pins[name]}\"")
+            else:
+                print("    # not defined in the CI configuration at this commit")
+        return 0 if all(pins.values()) else 1
+
+    def _print_baseline_evidence(self, evidence: ci_baseline.Evidence) -> None:
+        print(f"CI evidence for {evidence.project} @ {evidence.sha}: "
+              f"{evidence.verdict}")
+        for pipeline in evidence.pipelines:
+            print(f"    pipeline {pipeline.get('id')} ({pipeline.get('status')}): "
+                  f"{pipeline.get('web_url')}")
+        for job in evidence.jobs:
+            print(f"    {job.name} [{job.covers}]: {job.verdict} — {job.reason}")
+            if job.verdict == ci_baseline.PASSED and job.definition:
+                print(f"        definition {job.definition} matches its pin; "
+                      f"{job.pipeline_source} pipeline, no variables")
+            for attempt in job.attempts:
+                print(f"        job {attempt.job_id} {attempt.status}: "
+                      f"{attempt.web_url}")
+        sys.stdout.flush()
+
+    def baseline_receipt(self, outcome: BaselineOutcome) -> Dict[str, Any]:
+        """`emit_gate_event` kwargs for the gate-baseline receipt.
+
+        A reused baseline names its scope as CI evidence and its cache verdict
+        as not-applicable: nothing local ran, and nothing was cached.
+        """
+        receipt: Dict[str, Any] = {
+            "summary": f"{outcome.kind}: {outcome.reason}",
+            "ci_baseline": outcome.payload(),
+        }
+        if outcome.kind == BASELINE_REUSED:
+            receipt.update(
+                test_scope=CI_BASELINE_SCOPE,
+                test_cache_verdict="not-applicable",
+                test_cache_reason="CI evidence; the local suite did not run",
+            )
+        return receipt
 
     def _parse_push_allow_entry(self, entry: str) -> Optional[Tuple[str, str]]:
         """Parse one allow-list entry into (repo, ref_pattern).
@@ -2444,8 +2727,6 @@ def push_gate(verbose: bool = False, gate: Optional[GateSystem] = None) -> int:
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Gate system for enforcing development rules")
     parser.add_argument('command', choices=['commit', 'push'], help='Gate to run')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')

@@ -242,6 +242,17 @@ class TestConnect:
         assert started.env["SLACK_BOT_TOKEN"] == "xoxb-test"
         assert thread_registry.is_thread_connected("C0123ABCDEF", "1712345678.000900")
 
+    def test_the_connector_is_told_the_platform_session_id(self, platform_root):
+        """The supervisor reports the container's own session id; the speaker
+        tag is looked up by this one (#574). An inherited value never wins."""
+        live_session("s-7")
+        runner = Runner()
+        threads = component(platform_root, runner=runner, environ={
+            "SLACK_BOT_TOKEN": "xoxb-test", "LMER_CHAT_PLATFORM_SESSION": "s-stale",
+        })
+        threads.connect("s-7", SLACK_LINK, by="operator")
+        assert runner.started[0].env["LMER_CHAT_PLATFORM_SESSION"] == "s-7"
+
     def test_the_control_token_never_reaches_the_command_line(self, platform_root):
         live_session()
         runner = Runner()
@@ -1131,3 +1142,22 @@ class TestVerifiedLaunchThreadIdentity:
         with pytest.raises(connectors.ThreadError) as caught:
             threads.refuse_held_targets([OTHER_SLACK_LINK])
         assert caught.value.status == 409
+
+
+def test_the_connector_environment_carries_the_resolved_assistant_name(platform_root):
+    """A connector renders the assistant's records, so it needs the same name the
+    daemon resolved — including one set only in config.json (review of !403)."""
+    from types import SimpleNamespace
+
+    from lmer_platform import config as platform_config
+
+    cfg = platform_config.load({
+        "work_repo_url": "https://git.example.com/agents/work.git",
+        "assistant_name": "Sprocket",
+    })
+    threads = connectors.ThreadConnectors(
+        runner=Runner(), environ={}, platform_config=cfg,
+        matrix_client=lambda account: FakeMatrix(), slack_client=lambda token: FakeSlack(),
+    )
+    env = threads._environment(SimpleNamespace(host="127.0.0.1", port=1234, token="tok"), "s-1", {})
+    assert env["LMER_PLATFORM_ASSISTANT_NAME"] == "Sprocket"

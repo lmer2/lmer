@@ -42,6 +42,8 @@ from lmer_cli.mounts import MOUNT_LINK_MARKER
 from lmer_platform import assistant
 from lmer_platform import config as cfg
 from lmer_platform import connectors, memory, registry, runs, spawn, store
+from matrix_chat.client import MatrixError
+from slack_chat.client import SlackError
 from tests.conftest import strip_lmer_env
 
 
@@ -1350,7 +1352,7 @@ def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer
         assert status.running is True
         worker = spawn.spawn_session(
             config,
-            spawn.SpawnRequest(taskdef="develop", target="https://example.com/x"),
+            spawn.SpawnRequest(taskdef="develop", target="https://example.com/g/p/-/issues/1"),
         )
         try:
             assert worker.session_id, "the chat window took the host's only slot"
@@ -2807,6 +2809,7 @@ def test_the_memory_walk_does_not_run_under_the_publication_lock(
 # is refused, the standing list defers so the orchestrator still comes up.
 
 HELD_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
+OTHER_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000999"
 
 
 class _ThreadFake:
@@ -2916,6 +2919,110 @@ def test_a_rotation_may_name_the_threads_the_incumbent_itself_holds(
         finally:
             kill(rotated.pid)
             wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+class _RateLimitedSlack:
+    """Slack refusing every thread read with one error code."""
+
+    def __init__(self, code="ratelimited", retry_after=None):
+        self.code, self.retry_after, self.calls = code, retry_after, 0
+
+    def get_replies(self, channel, ts, oldest=None):
+        self.calls += 1
+        # The client only ever sees `ratelimited` as an HTTP 429.
+        raise SlackError(f"Slack API error: {self.code}", code=self.code,
+                         transient=self.code == "ratelimited", retry_after=self.retry_after)
+
+
+def test_the_held_check_reuses_the_incumbents_verified_thread_without_slack(thread_component):
+    """The incumbent's record was verified when it connected."""
+    incumbent = worker_holding(thread_component, session_id="s-incumbent")
+    slack = _RateLimitedSlack()
+    thread_component._slack_client = lambda token: slack
+
+    thread_component.refuse_held_targets([HELD_LINK], besides=incumbent)
+    assert slack.calls == 0
+
+
+@pytest.mark.parametrize("code, retry_after, later", [
+    ("ratelimited", 1800, "; rate limited, so retry in 1800s or later"),
+    ("ratelimited", None, "; it is transient, but no retry time was given"),
+    ("invalid_auth", None, ""), ("token_revoked", None, ""), ("account_inactive", None, ""),
+])
+def test_a_thread_slack_cannot_verify_is_refused_naming_the_method(thread_component, code, retry_after, later):
+    thread_component._slack_client = lambda token: _RateLimitedSlack(code, retry_after)
+    with pytest.raises(connectors.ThreadError) as caught:
+        thread_component.refuse_held_targets([OTHER_LINK])
+    assert "conversations.replies" in str(caught.value) and code in str(caught.value)
+    assert str(caught.value).endswith(")" + later)
+    assert caught.value.transient is (code == "ratelimited")
+    assert caught.value.retry_after == retry_after
+
+
+@pytest.mark.parametrize("status, transient, retry_after", [
+    (None, True, None), (None, False, None), (429, True, 2.5), (503, True, None), (404, False, None),
+])
+def test_a_matrix_alias_the_homeserver_cannot_resolve(
+    platform_root, tmp_path, monkeypatch, status, transient, retry_after,
+):
+    """The refusal carries what the Matrix transport said about retrying."""
+    class Homeserver:
+        def resolve_room(self, alias):
+            raise MatrixError("cannot resolve", status=status, transient=transient, retry_after=retry_after)
+
+    monkeypatch.setattr(connectors.thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"))
+    component = connectors.ThreadConnectors(
+        environ={
+            "LMER_MATRIX_HOMESERVER": "https://matrix.example.org",
+            "LMER_MATRIX_USER_ID": "@lmer:example.org",
+            "LMER_MATRIX_ACCESS_TOKEN": "secret-access-token",
+        },
+        matrix_client=lambda account: Homeserver(),
+    )
+    with pytest.raises(connectors.ThreadError) as caught:
+        component.refuse_held_targets(["https://matrix.to/#/%23lmer%3Aexample.org/%24event"])
+    assert "room alias resolution" in str(caught.value)
+    assert caught.value.status == (502 if status is None else status)
+    assert (caught.value.transient, caught.value.retry_after) == (transient, retry_after)
+    assert ("retry in 3s or later" in str(caught.value)) is (retry_after is not None)
+
+
+def test_a_rotation_survives_slack_rate_limiting_its_own_thread(
+    config, thread_component, long_lived,
+):
+    with started(config) as first:
+        thread_component.connect(first.session_id, HELD_LINK, by="operator")
+        thread_component._slack_client = lambda token: _RateLimitedSlack()
+
+        rotated = assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        try:
+            assert rotated.running is True and rotated.session_id != first.session_id
+            assert events_of("assistant_rotate_refused") == []
+        finally:
+            kill(rotated.pid)
+            wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+def test_a_rate_limited_thread_the_incumbent_does_not_hold_refuses_the_rotation(
+    config, thread_component, long_lived,
+):
+    with started(config) as first:
+        thread_component._slack_client = lambda token: _RateLimitedSlack()
+
+        with pytest.raises(assistant.AssistantThreadHeld, match="conversations.replies"):
+            assistant.rotate(config, settings={"threads": [OTHER_LINK]})
+        assert assistant.status().session_id == first.session_id
+
+
+def test_slack_saying_not_your_channel_still_refuses_the_rotation(
+    config, thread_component, long_lived,
+):
+    with started(config) as first:
+        thread_component._slack_client = lambda token: _RateLimitedSlack("not_in_channel")
+
+        with pytest.raises(assistant.AssistantThreadHeld, match="not_in_channel"):
+            assistant.rotate(config, settings={"threads": [OTHER_LINK]})
+        assert assistant.status().session_id == first.session_id
 
 
 def test_a_thread_taken_during_the_rotation_does_not_cost_the_assistant(

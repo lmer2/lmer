@@ -4,6 +4,164 @@
 ## Unreleased
 
 
+## 0.12.0
+### Added
+- `docs/SCHEMA-GUIDE.md`: a plain-language guide to the lmer schema for operators — what it is, who writes and reads each path, a step-by-step migration plan for an existing work repo with the validator findings to expect at each step, and a test checklist.
+- schema 2 agent-memory retirement markers with archive-backed forget and revive operations
+- schema 2 execution records with opaque UIDs and extensible session metadata
+- explicit migration preview preserving historical records and manifest extensions
+- operator guide separates legacy layout adoption from schema-2 cutover, with scratch-repository isolation, runtime rollout, publication and continuation checks
+- generated project index: every durability push renders the `<project>/README.md` index block (one row per committed run record, newest first) and stages it with the record; `lmer-schema index PATH [--write] [--diff]` previews and backfills every project README and the root README's project list
+- `lmer --name <kebab> --goal <text>` record a run's name and goal at session start; every push prints a one-line reminder while a run is unnamed
+- validator codes `index.readme-missing` (INFO) and `index.readme-stale` (WARN) for the generated README index blocks
+- the run view lists every launch of a schema-2 target by uid; resume continues that one launch, and untracked launches are read-only (#374)
+- a Work repo panel in the fleet view shows `lmer-schema validate --json` findings for the mirror, cached per HEAD, with re-validate (#374)
+- unnamed repos awaiting adoption are listed with a copyable `work adopt <host>/<project> <short-name>` line; the platform never picks the name (#374)
+- `GET /api/runs/sessions` and `GET /api/workrepo/schema` serve these views; neither pulls, and a legacy work repo shows no change (#374)
+- `work housekeep [--apply] [--area …] [--project …]` archives stale content and maintains indexes, dry-run by default with one commit on `--apply`; the per-area TTL policy comes from `_lmer.yaml housekeeping:` (#371)
+- `work memory persist` reconciles each scope's `MEMORY.md` with its live files: a missing entry is generated, and one whose file is gone is tombstoned (#369)
+- `lmer --launch-uid <uid>` records a launch under a caller-minted execution uid; flag-only, refused when that uid already names a record (#537)
+- `POST /api/runs/adopt {uid}` and `lmer-ctl runs adopt host/project/<uid>` adopt a schema-2 run by uid and bind rows marked "re-adopt by uid" (#537)
+- `lmer <taskdef> --repo <url-or-path>` names the repository explicitly, so a work-item, document or thread target can run against a chosen repository and `lmer chat --repo <url>` with no positional is the plain project session from anywhere (#536)
+- an unnamed schema-2 record now stores a default label `<taskdef>-<yymmdd>-<uid4>`, shown by the project README index and `work sessions`; a continuation inherits its source's name, including a default label (#536)
+- `work sessions` and the project README index gain a `seeded` state for a `work seed` record nobody has run in (#535)
+- `lmer_cli.container.sources.MANIFEST_TIER_SUPPORTED` is the importable capability marker `work migrate --instance` checks as its version floor (#370)
+- `work housekeep [--apply] [--area …] [--project …]` archives stale content and maintains the indexes — napkin decay, done-plan retirement, runs archiving, index tombstone sweeps, masterplan bundle flattening and host-bucket listing — dry-run by default with one commit on `--apply` (#371)
+- `work knowledge index [--check] [--org NAME]` generates `_knowledge/<org>/INDEX.md` from the pages beneath the org, grouped by topic with a last-git-touch date per page (#372)
+- the supported unattended housekeeping recipe: a weekly cron-run lmer session with a minimal `housekeep` taskdef, recorded in docs/RUN-STATE.md §6 (#373)
+- `work adopt <host>/<project> <shortname>` registers a host-bucket tree and moves it to its short name in one commit, dry-run by default
+- `work migrate <project>` moves a registered project's legacy areas to schema form in one commit, folding pre-A1 plain-session records (`chat-.`) into their taskdef group
+- `work migrate --instance` moves the instance surfaces and folds `sources.yaml` into `_lmer.yaml`; it refuses until the #370 release runs fleet-wide
+- Validator check `record.plain-session-slug` and a matching `lmer-schema migrate` blocker name `work migrate <project>` for obsolete plain-session slugs
+- The `_lmer.yaml` registry writer preserves comments and quoting and checks registry invariants before writing
+- the `_lmer.yaml sources:` tier is read at container start, by `lmer --show-env` and by `bin/doctor`, with env > manifest > legacy `sources.yaml` precedence (#370)
+- `lmer_cli.container.sources.MANIFEST_TIER_SUPPORTED` marks a release that reads the manifest tier, the version floor `work migrate --instance` checks (#370)
+- A session's log ends with its container's real exit code, which is also recorded when the container exits while the platform is down.
+- Session containers get readable names like `lmer-<run slug>-<suffix>`, shown in the control UI's live-session card.
+- Added `gate-check --baseline`: with the scoped `GATE_CI_BASELINE` toggle on and a work-repo CI mapping, a run's initial baseline reuses passing CI on the exact commit when each declared job still matches its audited definition pin (`gate-check --baseline --print-pins` prints them).
+- Standing instructions in Project settings show when they last changed, say when there are none, and note they are usually set in chat (#578).
+- LMER_CODEX_RPC_TIMEOUT sets the Codex delivery request deadline (default 10s, was a fixed 3s); healthz reports it with observed latency.
+- Slack channels and Matrix rooms can map to a project, routing plain bot mentions there to it (project settings or `lmer-ctl projects channels`).
+- `lmer --repo-url` names the repository apart from the target, so label or thread targets give non-chat taskdefs one run per request.
+- Thread posts now start with a speaker tag, the run's name or `Ratchet · <project>` (the assistant's configured name), so readers can tell lmer sessions sharing a Slack or matrix thread apart
+- Ratchet's face in the control UI shows the fleet's mood — question, oops, panic, strained, on it, skeptical, idle, yes, talking or off — with the reason beside it, and the tab icon follows it.
+- `gate-check --baseline` can reuse CI under a Developer run token when `LMER_CI_BASELINE_TOKEN_<host>` holds a Maintainer `read_api` token.
+- `work memory persist` reports the memory index size against the harness's session-start load limit, and restore warns when it is over.
+- Memory scopes can split their index into a map plus `areas/<slug>.md` indexes; persist files entries into areas, refuses growing an over-budget map, and refuses a badly migrated split index.
+- Operators can mute a run so its routine chatter stops waking the assistant; questions, milestones, the platform's own notices, crashes and completion still reach it.
+- Project setting `supervisor_authority` (none, approvals, full; default none) stamps the assistant's delegated level on its messages to workers.
+- `lmer-signal ask --operator-only` marks a gate question no assistant can answer, at any authority level.
+### Fixed
+- schema 2 platform continuations carry the explicit source and acknowledgement through the host CLI, and independent harness children own truthful records and lifecycle
+- shared-checkout release transactions serialize Git activity, preserve unrelated edits, and verify the published holder
+- deferred memory forget and revive publish complete transitions after retries, with scope-aware conflicts and instance-only routing
+- future-version log, report and checkpoint writes fail closed, and newest-session resolution ignores malformed directory names
+- a release claim already verified on the remote is reported as won even when restoring the saved unrelated edits conflicts; the retained stash is named instead of failing the claim
+- release claims publish through a temporary index and `commit-tree` instead of stashing the checkout, so a claim cannot capture, move or lose a sibling session's uncommitted record, and a lost race has nothing to roll back
+- `work release claim-status` reads the last fetched publication, so it is current even though the claim verb no longer writes the checkout
+- a cleanly ended release holder now releases its own claim: session end reads the published claim rather than the checkout copy the claim verb no longer writes
+- `work release abort` publishes the same way claim and unclaim do, so it no longer fails on a shared checkout when a sibling session has an uncommitted file
+- schema 2 resume and answer launches now keep predecessor records read-only, bind unsigned-source approval to the selected UID, and carry scrubbed host launch provenance
+- a bare shell `work answer` on a schema 2 tree stays refused and now names the platform answer route; the run-state docs and taskdef no longer present it as the human's recording path
+- stale agent-memory persists no longer recreate files deleted by another session
+- a forget tombstone stays in its own scope's memory index; restore and persist no longer copy a project-scope tombstone into the instance index (or the reverse)
+- an instance-scope forget no longer makes sessions that restored earlier write the retired memory's live entry into their project index on the next persist
+- schema 2 repository routing now preserves non-default ports and path case across registry lookup, fallback buckets, and platform run inventory
+- schema 1 Registry construction remains backward compatible, and platform inventory tolerates opaque session records disappearing during a scan
+- continuations create fresh records and require a decision for unsigned predecessors
+- schema 2 releases arbitrate one shared project claim without automatic age-based takeover
+- `lmer-schema migrate` reports a blocked cutover with exit 1 instead of crashing on the preview
+- session metadata scrubbing also redacts token-shaped values (GitLab, GitHub, AWS key ids, Slack, PEM private keys) under benign keys that this process does not hold
+- token redaction never depends on what precedes a prefix, so a token after an ANSI colour code, an escaped newline or inside a slug is still redacted; AWS key ids are caught whatever surrounds them
+- supported work commands and direct mutation helpers serialize before file writes, preventing release stash cleanup from deleting successful concurrent reports, logs, state, or artifacts
+- nested Git-hook record writers refuse before mutation while durability-only commits keep their deferred publication behavior
+- the work-repo mutation lock is keyed on the checkout the written path belongs to, so a write elsewhere never holds the configured checkout's lock
+- schema-2 release abort retries failed publication without rewriting the original reason or events, rechecks successor claims, and verifies the published claim and record before reporting success
+- platform mount validation tests check real launch arguments before session cleanup can remove their host directories, avoiding a CI timing race
+- `work sessions` on a schema-2 work repo no longer prints `state unreadable` on every row
+- `work seed` no longer reuses the launch uid or breaks the seeding session's own record: on schema 2 the seed is a fresh-uid record, written whole in its temp dir and read-only to the seeder once renamed (#535)
+- agent memory persists no longer lose a sibling session's add or edit: persist pulls the published branch first, fast-forward only (#369)
+- the restore baseline is keyed to the launch's session id, so a manifest recorded under another session no longer authorizes deletions (#369, #162)
+- a publication conflict now keeps upstream's version as a `.conflict-<sid>` copy and rolls the local memory commit back, instead of failing the rebase (#369)
+- a run whose recorded target is a bare repository URL can be resumed again; it launches on `--repo` instead of being refused as "two repositories named" (#537)
+- answering an adopted plain-project run that needs both a repository URL and unsigned-source confirmation no longer loops between the two refusals; each retry now carries both options forward (#536)
+- `work commit` and `work session-end` now publish a record `work seed` wrote into another group; previously it was reported as a stray and left unpublished (#535)
+- a document URL target — a file, tree or wiki page inside a repository — clones that repository instead of being refused or mis-derived (#523)
+- a list-page target such as `/-/issues` or `/-/merge_requests` no longer leaks the `/-/…` route into the work-repo project path (#391)
+- a specs-index entry keeps its first registration date across later session starts and re-registrations (#334)
+- Platform sessions now survive a daemon restart on podman and docker; the restarted platform finds each session's container by label and follows it again.
+- A session that ends at the instant its status is checked is no longer briefly reported as still running.
+- uber lmer's conversation fills the window's height at every size instead of stopping at half the screen on large displays (#575).
+- The 'digests waiting for uber lmer' notice no longer stretches to fill the uber lmer pane; it sizes to its text (#578).
+- Slack threads now receive a run's `--attach` files as uploads, or a withheld note naming why; needs the `files:write` scope
+- `lmer-ctl thread read` copies a thread's files into the calling assistant's upload store instead of only describing them
+- Codex sessions no longer leave an inbound message unseen until the next one: it is confirmed, safely retried, or raised to uber lmer.
+- Messages posted to a slow Codex session are no longer reported as not sent and then delivered, which invited a duplicate resend.
+- Uber lmer rotation no longer fails for hours when Slack rate-limits a thread it already holds; other unverifiable threads are refused with the failing method named, and the wait a rate limit asked for.
+- A `repo_url` given to a platform spawn now reaches the session when the target is a label or a thread permalink, instead of being dropped.
+- `lmer` refuses a target given after an option instead of silently ignoring it, outside `--exec`.
+- Slack and matrix threads no longer post the '⏹ the session stopped waiting for an answer' line when a question is withdrawn (#579).
+- A refused pipeline-variables read now gives its own fallback reason, and the baseline decision prints immediately instead of at exit.
+- A large assistant spool no longer stalls the platform: loading it resolves credentials once per pass and reuses earlier scrub results.
+- Direct messages sent with `lmer-signal dm` are now scrubbed of credentials before they are clipped and sent (#544)
+- The chat pane no longer rewinds when its first tail load or an older page lands after polling has moved on (#544)
+- Daemon shutdown closes the Slack socket before draining an admission started by the replay loop, as it already did for live events, and no longer hangs when that close fails (#544)
+- Session and gate liveness checks treat an out-of-range pid as gone, and no longer misread a process reaped mid-check as alive; `lmer-end-session` reports one as no supervisor instead of raising (#544)
+- Claude fan-out children now use the session's CLAUDE_CODE_OAUTH_TOKEN instead of falling back to the shared credentials file.
+- Fixed the assistant's answers to worker questions being refused with a 409; `lmer-ctl answer` now also takes a full bus id.
+### Changed
+- a local filesystem path target (`.`, `./`, `../x`) is a plain project session: the host exports an empty task target, so the slug is the bare taskdef (`chat`, not `chat-.`); existing `chat-.` groups stay addressable by their recorded slug and `work session-start` warns when a continuation crosses groups; such records are host-only — the platform's resume and answer refuse an empty recorded target until a follow-up lands
+- a rebase conflict confined to generated README index blocks is resolved by rendering them again from the merged tree (the usual case when two sessions push in one project); any other conflict aborts publication as before; every git call `work_repo.git_ops` makes (the publication path: pull --rebase, rebase --continue, commit, push) runs with GIT_EDITOR and GIT_SEQUENCE_EDITOR pinned to `true`
+- `work sessions` on a schema-2 work repo reports a derived state per row (closed, waiting on question, ended not closed, active, stale) and `--json` rows carry `stop_reason` and `state`
+- a seeded record is continued with `--source-session <uid>` (the launch line `work seed` prints), needs no unsigned-source acknowledgement, and is left out of `work sessions --running`
+- a persist with no restore baseline names the deletions it declined to propagate and requires `--allow-unbaselined-delete` to carry them (#369)
+- `work memory persist` prints every deletion with a count (#369)
+- the platform keys schema-2 runs `host/project/<uid>` and returns `uid` in spawn, resume and answer replies, fleet rows and run references (#537)
+- a second session on a schema-2 project is no longer refused with a 409; the reply's warning names the live sessions already there (#537)
+- schema-2 records with an empty target, a document (reference) URL or an `other` URL can be resumed and answered through the platform, given a repo_url or a recorded clone URL (#537)
+- on upgrade, slug-keyed rows for schema-2 runs are re-keyed to their uid, or marked "re-adopt by uid" when the record is ambiguous; a "conflicting" mark clears on re-adopt by uid once the conflicting field has been written (#537)
+- a spawn whose target is an `other` URL (not a repository, work item, thread or document inside a repository) clones from the daemon's `LMER_REPO_URL` when the request names no repo_url; a document URL still clones from its own repository. A repository target naming the same repository as repo_url is accepted (#537)
+- a plain project session — no target, `.`, a checkout path, a bare repository URL or a document URL — now files its run under the bare taskdef group (`chat`) instead of `chat-.` or `chat-<repo>.git`; the slug is derived from one target classifier shared by the host CLI, the container and the work CLI (#536, #537)
+- a bare repository URL positional and no positional now export an empty `LMER_TASK_TARGET` (delivered empty, never absent), like a checkout path; a repository URL was previously exported verbatim (#536)
+- a positional that names an existing filesystem entry which is not a git checkout (a plain directory or a file) is refused (exit 2) instead of being read as a branch name; a branch, SHA or shorthand now reaches the classifier and resolves its repository from the cwd origin (#536)
+- `--repo` must name a repository: a path that is not a checkout, or a work-item, document or other URL, is refused (exit 2) rather than used as the clone URL (#536)
+- a work-item or reference URL that derives no repository is refused (exit 2) instead of silently cloning the cwd origin; the cwd fallback is kept only for a non-URL branch, SHA or shorthand (#536)
+- existing schema-1 records under the old `chat-.` / `chat-<repo>.git` spellings stay where they are, but the platform no longer resumes or answers them and a host launch seeds the bare group beside them, until `work migrate` folds them at adoption (#368)
+- a `continues` link in the project README index resolves its source by session uid, so a folded, freeze-renamed or archived source still links (#536)
+- a launch `--name` replaces a default or inherited name on the call that opens a schema-2 record (#536)
+- on a schema-2 tree a finished record's resume brief names the continuation route (`lmer <taskdef> [<target>] --source-session <uid>`, target shell-quoted) instead of the schema-1 reopen, and the write refusal names the same route (#437)
+- a resume brief shows `(dir: <dir>)` when a post-freeze `work name` left the directory's `--<name>` suffix stale; `work name` on a frozen record says the directory will not be renamed; `run-state:` commit subjects carry the record's name label (#536)
+- on schema 2 a name is a label: two continuations of one source may carry the same label, and `work name`, `work seed --name` and a launch `--name` no longer refuse a label another record holds (#536)
+- `lmer --show-env` labels declared sources by tier (manifest or `sources.yaml`) when a `_lmer.yaml` is cached (#370)
+- The validator's legacy task-tree prune (#379) keeps legacy `{task_type}/{target}/` directories out of the schema-form run-area walk
+- declared-source origins name the tier (`declared (manifest)` / `declared (sources.yaml)`) whenever a manifest is present (#370)
+- a manifest `sources.napkin.ref` (or any non-`taskdef` `ref:`) now refuses start, the same rule the legacy file already enforced (#370)
+- ROLLOUT: `work migrate --instance` removes `sources.yaml`, so deploy a release carrying the manifest tier on every host before applying the instance fold (#370)
+- Closing the terminal no longer ends a CLI session: its container keeps running. Re-attach with `lmer follow <container>`; remove a stopped one with `<runtime> rm`.
+- Consoles lmer attaches now detach with Ctrl-] Ctrl-\ instead of Ctrl-P Ctrl-Q, which swallowed input.
+- Stopping a session gives its container up to 200 s to finish its session-end work, instead of the runtimes' 10 s.
+- uber lmer's pane drops its header bar for one compact toolbar holding Slack and matrix, restart, stop, project settings, standing orders, the count of loaded messages, earlier messages and close; the ⋮ menu and the two introductory lines are gone (#575).
+- The standing-orders button opens Project settings with Standing instructions expanded, in place of the read-only panel in the pane (#575).
+- uber lmer's open-question bell moves into the message box's right-hand corner, which stays reserved so the box never shifts when the bell appears or clears (#575).
+- uber lmer's toolbar uses a neutral surface a shade darker than the pane, in light and dark themes, instead of the project colour (#578).
+- uber lmer's generation and start time move from a line in the pane to the toolbar robot's tooltip (#578).
+- The orchestrator assistant is now called Ratchet everywhere people read its name; set the display name with LMER_PLATFORM_ASSISTANT_NAME (wire identifiers like the uber-lmer channel are unchanged, and both [uber lmer] and [Ratchet] tags are accepted on read).
+- Digest nudges stop after 3 unanswered reminders, and the operator gets one message per episode in the assistant's thread, naming the known marker its terminal shows (such as `Login expired`).
+- Projects mode merges repeated stale-run check-ins and note-only session comms in the assistant spool; questions, milestones and other records are never merged.
+- The work-repo manifest is now `_lmer.yaml`, renamed from `_plexus.yaml`. The old name is no longer read or accepted anywhere, so rename an existing `_plexus.yaml` to `_lmer.yaml` (#587)
+- Per-host token variables now spell hyphens as `__` (`git-example.com` reads `GITLAB_TOKEN_git__example_com`): rename `GITLAB_TOKEN_*`, `GH_TOKEN_*` and `LMER_CI_BASELINE_TOKEN_*` for hyphenated hosts. The old name is no longer read for the hyphenated host, but it is also the name of the host with dots in place of its hyphens, so delete it once renamed (#544)
+- An unreadable `LMER_CODEX_CONFIG_SEED` now refuses only launches that end up running codex, naming the path: the daemon refuses a request for codex, and the session's `lmer` refuses when its preset, model or environment resolves codex; other launches start with a warning (#544)
+- `lmer-signal post --thread --attach` now names each withheld attachment and its reason on stderr (#544)
+- Nothing typed into a worker can erase the tag in front of it: the bus refuses control characters from the assistant and in commands, authors and options, and cleans them out of anyone else's text (a pasted coloured log arrives without its escape codes).
+- A Slack or Matrix connector drops an inbound message the bus refuses outright, instead of retrying it ahead of every later message, and tells the thread which post did not arrive and why.
+- On a drop-in harness, every tagged message is typed on one line, whichever route it came by, so a later line cannot open a turn with a stamp of its own.
+- The platform header centres Ratchet's badge and moves its actions right, and sidebar Ratchet rows show Ratchet's face (#596)
+- The platform sidebar shows the product name and the lmer version the daemon is running below the project list; `/api/state` serves `config.version` (#596)
+- The operator's answer to a question a worker asked on its bus now lands on the bus (first answer wins, a late one is a 409) instead of by file.
+### Security
+- A hyphenated host no longer reads the token variable of the host with dots in place of its hyphens (`git-example.com` used to read `GITLAB_TOKEN_git_example_com`, which belongs to `git.example.com`). A token still stored under the old name keeps going to the dotted host until that variable is deleted (#544)
+
+
 ## 0.11.0
 ### Added
 - Added opt-in --root-userns / LMER_ROOT_USERNS: sub-second container start under rootless podman by skipping the keep-id UID remap (agent runs as container root)

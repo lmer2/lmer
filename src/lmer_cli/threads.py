@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
 from matrix_chat.permalink import (
@@ -57,9 +58,14 @@ class ThreadError(RuntimeError):
     each caller (the platform routes and ``lmer-ctl`` both use it).
     """
 
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, *, transient: bool = False,
+                 retry_after: Optional[float] = None) -> None:
         super().__init__(message)
         self.status = status
+        #: The transport said "not now" (rate limit, 5xx, no answer), not "no".
+        self.transient = transient
+        #: Seconds the rate-limiting server asked for, when it named any.
+        self.retry_after = retry_after
 
 
 def validate_thread_targets(value: object) -> list[str]:

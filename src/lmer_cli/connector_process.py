@@ -16,7 +16,7 @@ from pathlib import Path
 from ask_channel import bus
 
 from .connector_delivery import RecoveryRequired, marker_path
-from .connector_lifecycle import DRAIN_SECONDS
+from .connector_lifecycle import DRAIN_SECONDS, PLATFORM_SESSION_ENV
 from .connector_ownership import (
     LEASE_DIRECTORY_ENV, LEASE_FD_ENV, LEASE_TOKEN_ENV, READY_FD_ENV,
     Lease, OwnershipBusy, OwnershipError, ThreadKey, read_json, same_process, write_json,
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def child_environment(base=None):
+    # deferred: cycle — lmer_cli.cli imports this module at top (via lmer_cli.targets)
     from .cli import _updater_child_env
 
     trusted = _updater_child_env()
@@ -167,6 +168,7 @@ class ConnectorProcess:
             self._thread.start()
 
     def _resolve(self):
+        # deferred: import cost — thread_access (~10 ms) stays off the lmer launch path (cli -> targets -> this module)
         from .thread_access import resolve_thread
 
         ref, _, _ = resolve_thread(self.permalink)
@@ -186,6 +188,9 @@ class ConnectorProcess:
             self._resolve()
         env = child_environment()
         env["LMER_SUPERVISOR_URL"], env["LMER_FASTAPI_TOKEN"] = self.endpoint
+        # No platform session here: the tag is the supervisor's session id, and
+        # an inherited value would name some other session (#574).
+        env[PLATFORM_SESSION_ENV] = ""
         argv = [sys.executable, "-m", f"{self.key.transport}_chat.connector", "--permalink", self.permalink]
         if self.uploads:
             argv += ["--uploads-dir", self.uploads[0], "--container-uploads-dir", self.uploads[1]]

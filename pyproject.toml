@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmer"
-version = "0.11.0"
+version = "0.12.0"
 description = "Containerized harness for running Claude Code against external repositories"
 requires-python = ">=3.12"
 readme = "README.md"
@@ -33,6 +33,20 @@ dependencies = [
     "pre-commit>=3.5.0",
     "requests>=2.33.0",
     "pyyaml>=6.0",
+    # Round-trip rewrites of the hand-annotated `_lmer.yaml` (issue #365;
+    # the decision is docs/DEVELOPMENT.md "Manifest rewrites"). PyYAML drops
+    # every comment on dump; ruamel's round-trip mode keeps them, and only
+    # the manifest WRITER imports it — the read path (`lmer_schema.manifest`,
+    # `lmer_cli.container.sources`, `clone_and_exec`) stays PyYAML-only,
+    # guarded by tests/test_lmer_schema_manifest_roundtrip.py. A core
+    # dependency rather than an extra because it is pure Python since 0.19
+    # (the C accelerator is its own optional extra and round-trip mode never
+    # uses it), so it carries none of the `matrix` extra's wheel risk, and
+    # `work adopt`/`work migrate` must not fail at first use for want of an
+    # extra. Minor-bounded on purpose: 0.x minors have broken the API (0.18
+    # removed the module-level load/dump, 0.19 swapped the C dependency);
+    # raising the ceiling means re-running the round-trip tests.
+    "ruamel.yaml>=0.19.1,<0.20",
     "jinja2>=3.1.6",
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",

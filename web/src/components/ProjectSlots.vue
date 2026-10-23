@@ -3,6 +3,8 @@ import { computed } from 'vue'
 import { mdiCogOutline, mdiServerOutline } from '@mdi/js'
 import { projectColor, projectTextColor } from '../projects.js'
 import { slotIsFree, slotMeta, toneColor } from '../format.js'
+// By the row key, not the slug: two uid rows of one group share a slug.
+import { runKey } from '../runref.js'
 
 const props = defineProps({
   slots: { type: Array, default: () => [] },
@@ -17,7 +19,7 @@ defineEmits(['manage'])
 function holder(held, via = null) {
   const run = (held.session_id && props.runs.find(row => row.session?.id === held.session_id))
     || props.runs.find(row => held.host && held.project && held.slug
-      && row.host === held.host && row.project === held.project && row.slug === held.slug)
+      && runKey(row) === runKey(held))
   const project = props.projects.find(row => row.id === run?.workspace_id)
   return { session: held.session_id, via, project, name: project?.name || run?.workspace_name || 'Unassigned project' }
 }

@@ -11,6 +11,7 @@ const props = defineProps({
   selected: Boolean,
   currentKey: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
+  face: { type: Object, default: null },
 })
 defineEmits(['chat', 'open'])
 const expanded = ref(true)
@@ -45,7 +46,7 @@ const chatLabel = computed(() => `Chat with ${props.project.name} — assistant 
       </v-btn>
     </div>
     <div v-show="expanded" :id="`project-runs-${project.id}`">
-      <RunNav :runs="runs" :attention="attention" :current-key="currentKey" :now="now" @open="$emit('open', $event)" />
+      <RunNav :runs="runs" :attention="attention" :current-key="currentKey" :now="now" :face="face" @open="$emit('open', $event)" />
     </div>
   </section>
 </template>

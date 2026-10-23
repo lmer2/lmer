@@ -41,6 +41,9 @@ from typing import Optional
 from lmer_cli import runref
 
 from .assistant import MAX_NOTE_CHARS
+from .runs import (
+    holds_conflict, key_parts, key_parts_lenient, merge_values, run_key,
+)
 from .store import (
     StoreError,
     age_seconds,
@@ -59,10 +62,13 @@ __all__ = [
     "MAX_LABEL_CHARS", "MAX_DATA_LABEL_CHARS", "FUTURE_GRACE_SECONDS", "StaleRun",
     "marks_path", "read_marks", "record_check", "observe", "stale_runs",
     "record_announced", "digest", "checkin_of", "is_eligible", "row_checkin",
+    "rekey",
 ]
 
-#: ``{"runs": {"<host>/<project>/<slug>": {"checked_at", "announced_at",
-#: "first_seen"}}}``, beside the daemon's other snapshots (spec §6.1).
+#: ``{"runs": {"<host>/<project>/<key segment>": {"checked_at", "announced_at",
+#: "first_seen"}}}``, beside the daemon's other snapshots (spec §6.1). The key
+#: segment is the run's execution uid for a schema-2 row and its slug otherwise
+#: (:func:`lmer_platform.runs.key_parts`).
 CHECKIN_MARKS_FILE = "checkins.json"
 
 #: A label on a spooled note, never an attention reason (module docstring).
@@ -103,20 +109,27 @@ class StaleRun:
     #: When the clock last restarted — a check, a digest, or first sight.
     since: Optional[str]
     age_seconds: Optional[float]
+    #: The schema-2 execution uid the row is keyed by, ``None`` for a slug-keyed
+    #: one. ``slug`` stays the group label, which is what a person reads.
+    uid: Optional[str] = None
 
     @property
     def ref(self) -> str:
-        return runref.compose(self.host, self.project, self.slug)
+        return run_key(*self.key)
 
     @property
     def key(self) -> tuple:
-        return (self.host, self.project, self.slug)
+        return key_parts({
+            "host": self.host, "project": self.project,
+            "slug": self.slug, "uid": self.uid,
+        })
 
     def to_dict(self) -> dict:
         return {
             "host": self.host,
             "project": self.project,
             "slug": self.slug,
+            "uid": self.uid,
             "label": clamp_text(self.label, MAX_DATA_LABEL_CHARS),
             "state": self.state,
             "since": self.since,
@@ -159,11 +172,34 @@ def read_marks() -> dict:
             field: value
             for field, value in record.items()
             if field in ("checked_at", "announced_at", "first_seen")
-            and isinstance(value, str) and value
+            and (isinstance(value, str) and value or _conflict_pair(value))
         }
         if kept:
             marks[ref] = kept
     return marks
+
+
+def _conflict_pair(value: object) -> bool:
+    """Whether *value* is the ``{"old", "new"}`` pair a :func:`rekey` collision
+    keeps (:func:`lmer_platform.runs.merge_values`).
+
+    Kept by :func:`read_marks` rather than filtered as malformed: every write
+    here rewrites the whole file from that read, so filtering it would drop both
+    stamps on the next tick — the loss the collision policy exists to prevent.
+    """
+    return (
+        isinstance(value, dict) and set(value) == {"old", "new"}
+        and all(isinstance(stamp, str) and stamp for stamp in value.values())
+    )
+
+
+def _stamps(value: object) -> list:
+    """The stamp strings in one field: itself, or both halves of a conflict pair."""
+    if isinstance(value, str) and value:
+        return [value]
+    if _conflict_pair(value):
+        return [value["old"], value["new"]]
+    return []
 
 
 def _write_marks(marks: dict) -> None:
@@ -210,10 +246,13 @@ def _rows(payload: object) -> list:
 
 
 def _identity(row: dict) -> Optional[tuple]:
-    host, project, slug = row.get("host"), row.get("project"), row.get("slug")
-    if not all(isinstance(value, str) and value for value in (host, project, slug)):
-        return None
-    return (host, project, slug)
+    """``(host, project, key segment)`` for a fleet row, or ``None``.
+
+    The segment is the row's ``uid`` when it carries one (spec §6.1), so two
+    launches of one slug group keep two clocks. Lenient: a fleet row is read,
+    and a malformed one costs its own clock, not the digest.
+    """
+    return key_parts_lenient(row)
 
 
 def is_eligible(row: dict) -> bool:
@@ -222,7 +261,7 @@ def is_eligible(row: dict) -> bool:
     Public because the fleet view asks it too: a second reading of it is how a
     badge starts marking a run no digest will ever name.
     """
-    if row.get("orchestrator"):
+    if row.get("orchestrator") or row.get("muted") is True:
         return False
     return row.get("state") not in SETTLED_STATES
 
@@ -276,9 +315,7 @@ def _latest_stamp(mark: dict, *, now=None) -> Optional[str]:
     check beats it.
     """
     best_stamp, best_age = None, None
-    for value in mark.values():
-        if not isinstance(value, str) or not value:
-            continue
+    for value in (stamp for field in mark.values() for stamp in _stamps(field)):
         age = age_seconds(value, now=now)
         if age is None or age < -FUTURE_GRACE_SECONDS:
             continue
@@ -298,8 +335,12 @@ def checkin_of(mark: Optional[dict], *, window: int, now=None) -> dict:
     since = _latest_stamp(mark, now=now)
     age = age_seconds(since, now=now)
     stale = bool(window) and age is not None and age >= window
+    checked = mark.get("checked_at")
+    if _conflict_pair(checked):
+        # Both stamps stay on disk; a row reads the later of the two looks.
+        checked = _latest_stamp({"checked_at": checked}, now=now) or checked["new"]
     return {
-        "checked_at": mark.get("checked_at"),
+        "checked_at": checked,
         "since": since,
         "age_seconds": None if age is None else round(age),
         "stale": stale,
@@ -341,12 +382,16 @@ def stale_runs(payload: object, *, window: int, marks: Optional[dict] = None) ->
         facts = checkin_of(marks.get(_run_key(*identity)), window=window, now=now)
         if not facts["stale"]:
             continue
-        host, project, slug = identity
+        host, project, segment = identity
+        slug = row.get("slug")
+        slug = slug if isinstance(slug, str) and slug else segment
+        uid = row.get("uid") if row.get("uid") == segment else None
         label = row.get("label")
         found.append(StaleRun(
             host=host,
             project=project,
             slug=slug,
+            uid=uid,
             label=label if isinstance(label, str) and label else slug,
             state=row.get("state") if isinstance(row.get("state"), str) else "unknown",
             since=facts["since"],
@@ -373,6 +418,51 @@ def record_announced(runs: list) -> None:
             record.setdefault("first_seen", now)
             marks[run.ref] = record
         _write_marks(marks)
+
+
+def rekey(old_parts: tuple, new_parts: tuple) -> dict:
+    """Carry a run's check-in marks from one key to another (spec §6.1 transition).
+
+    *old_parts* and *new_parts* are ``(host, project, key segment)`` triples —
+    in practice a slug-keyed entry being bound to its schema-2 record's uid —
+    so a run whose key changes keeps its clock instead of reading as newly seen.
+
+    Returns ``{"moved": bool, "conflict": bool}``, the shape every store's
+    ``rekey`` returns (see :func:`lmer_platform.meta.rekey`). Stamps merge by
+    :func:`lmer_platform.runs.merge_values`: one only the old key has is carried,
+    an equal one is a no-op, and two different ones are kept as an
+    ``{"old", "new"}`` pair with ``conflict: True`` — which :func:`read_marks`
+    keeps and :func:`checkin_of` reads as the later of the two.
+
+    Every field of a mark is a stamp (:data:`lmer_platform.runs.BOOKKEEPING_STAMPS`),
+    so a collision keeps the later of each and is no conflict; a pair can only
+    be one an earlier build left, which a call still reports.
+
+    Idempotent, and under the marks file's lock like every other write here. A
+    second call still reports ``conflict`` while the new key holds a pair
+    (:func:`conflicted`), for the reason :func:`lmer_platform.meta.rekey` gives.
+    """
+    old_key = run_key(*old_parts)
+    new_key = run_key(*new_parts)
+    if old_key == new_key:
+        return {"moved": False, "conflict": False}
+    with mutating(marks_path()):
+        marks = read_marks()
+        if old_key not in marks:
+            return {"moved": False, "conflict": holds_conflict(marks.get(new_key))}
+        merged, conflict = merge_values(marks.pop(old_key), marks.get(new_key))
+        conflict = conflict or holds_conflict(merged)
+        marks[new_key] = merged
+        _write_marks(marks)
+    logger.info(
+        "platform_checkin_rekeyed old=%s new=%s conflict=%s", old_key, new_key, conflict
+    )
+    return {"moved": True, "conflict": conflict}
+
+
+def conflicted(parts: tuple) -> bool:
+    """Whether the run *parts* names still holds a stamp pair :func:`rekey` kept."""
+    return holds_conflict(read_marks().get(run_key(*parts)))
 
 
 def _duration(seconds: Optional[float]) -> str:

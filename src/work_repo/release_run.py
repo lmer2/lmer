@@ -67,11 +67,14 @@ from .run_state import (
     RunStateError,
     _backup_bad_state,
     _load_yaml_mapping,
+    _require_record_writer,
     append_event,
+    require_document_version,
     slug_available,
     utc_now_iso,
 )
 from .utils import redact_secrets
+from .transactions import mutation_transaction
 
 RELEASE_FILE = "release.yaml"
 RELEASE_SCHEMA_VERSION = 1
@@ -232,6 +235,7 @@ def seed_release() -> dict:
     }
 
 
+@mutation_transaction
 def load_release(rdir: Path) -> Optional[dict]:
     """Read release.yaml. None if absent. Same safety contract as ledger.yaml
     (the shared preamble): corrupt files are backed up first (error raised),
@@ -255,9 +259,12 @@ def load_release(rdir: Path) -> Optional[dict]:
     return release
 
 
+@mutation_transaction
 def write_release(rdir: Path, release: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of release.yaml (single-writer
     discipline, same as state.yaml/ledger.yaml)."""
+    _require_record_writer(rdir)
+    require_document_version(rdir / RELEASE_FILE, release, RELEASE_SCHEMA_VERSION)
     rdir.mkdir(parents=True, exist_ok=True)
     release = dict(release)
     release["updated"] = utc_now_iso()
@@ -303,6 +310,7 @@ def _load_or_seed(rdir: Path) -> dict:
     return load_release(rdir) or seed_release()
 
 
+@mutation_transaction
 def record_version(rdir: Path, version: str) -> dict:
     """Record leg 1's release version (`work release record version`).
     Write-once; re-recording the same version is a no-op (the abandoned-
@@ -320,6 +328,7 @@ def record_version(rdir: Path, version: str) -> dict:
     return release
 
 
+@mutation_transaction
 def record_bump_merge(rdir: Path, sha: str) -> dict:
     """Record the bump-MR merge SHA (`work release record bump-sha`) —
     leg 1's completion marker (spec §3 leg 1 step 4). Requires the version
@@ -341,6 +350,7 @@ def record_bump_merge(rdir: Path, sha: str) -> dict:
     return release
 
 
+@mutation_transaction
 def record_release_merge(rdir: Path, sha: str, version_at_sha: str) -> dict:
     """Record the release-MR merge SHA (`work release record merge-sha`) —
     the SHA every leg-2 step keys on. `version_at_sha` is the version the
@@ -373,6 +383,7 @@ def record_release_merge(rdir: Path, sha: str, version_at_sha: str) -> dict:
     return release
 
 
+@mutation_transaction
 def record_tag(rdir: Path, name: str, sha: str) -> dict:
     """Record the signed-tag creation receipt (`work release record tag`).
     HARD STOPS: the tag SHA must equal the recorded release-MR merge SHA
@@ -415,6 +426,7 @@ def record_tag(rdir: Path, name: str, sha: str) -> dict:
     return release
 
 
+@mutation_transaction
 def record_receipt(
     rdir: Path,
     name: str,
@@ -457,6 +469,7 @@ def record_receipt(
     return release
 
 
+@mutation_transaction
 def record_abort(rdir: Path, reason: Optional[str] = None) -> dict:
     """Mark the release record terminal (`work release abort` — spec §7's
     abandoned release: bump merged, human declines the release MR).

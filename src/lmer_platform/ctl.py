@@ -41,6 +41,7 @@ Seeing::
 Answering — two routes, and never each other's::
 
     answer SESSION QUESTION TEXT    POST /api/sessions/{id}/ask/{qid}/answer
+                                    (a full bus id: POST /api/sessions/{id}/comms)
     runs answer KEY TEXT            POST /api/runs/answer
 
 Steering::
@@ -61,6 +62,8 @@ The fleet this orchestrator tracks::
     runs forget KEY                 POST /api/runs/forget
     runs meta get KEY               GET  /api/runs/meta
     runs meta set KEY               POST /api/runs/meta
+    runs mute KEY|--session ID      POST /api/runs/mute, or /api/sessions/ID/mute
+    runs unmute KEY|--session ID    POST /api/runs/unmute, or /api/sessions/ID/unmute
     runs relations KEY              GET  /api/runs/relations
     runs relate KEY OTHER           POST /api/runs/relate
     runs unrelate KEY OTHER         POST /api/runs/unrelate
@@ -76,7 +79,7 @@ The assistant's own state::
     rotate                          POST /api/assistant/handoff, then
                                     POST /api/assistant/rotate
 
-A run is named by one ``host/project/slug`` key — see :func:`_run_fields`.
+A run is named by one ``host/project/<slug|uid>`` key — see :func:`_run_fields`.
 
 Configuration
 -------------
@@ -101,6 +104,8 @@ A failure is one object with an ``error`` discriminator::
     {"error": "http", "status": 429, "body": {"detail": "…"}}   the daemon refused
     {"error": "unreachable", "detail": "…"}                     it was never asked
     {"error": "configuration", "detail": "…"}                   nothing to ask
+    {"error": "late", "status": 200, "body": {…}}               an answer by bus id
+                                                                came after the first
 
 ``body`` is the daemon's own body, untouched — including
 ``POST /api/runs/resume``'s ``{code,message}``, which a client is meant to match
@@ -126,6 +131,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from lmer_cli import routing_receipts, runref
+from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS, assistant_display_name
 
 from lmer_platform.client import (
     Call,
@@ -163,6 +169,12 @@ ENV_PLATFORM_CREDENTIAL = "LMER_PLATFORM_SECRET"
 
 #: Why the host gave this container neither, in a sentence worth relaying.
 ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
+
+#: A schema-2 execution uid, the last segment of such a run's key (spec §6.1).
+#: Spelled here rather than imported from :mod:`lmer_platform.runs`, which pulls
+#: the registry and the projects database into a process an agent starts once
+#: per operation; ``tests/test_platform_ctl.py`` pins it against the index's.
+UID_RE = re.compile(r"^[0-9a-f]{32}\Z")
 
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
@@ -233,12 +245,18 @@ def _payload(text: str) -> Any:
     return {"detail": str(parsed)[:_DETAIL_LIMIT]}
 
 
-def _emit(response: Any, endpoint: Endpoint, *, out=None, err=None) -> int:
+def _emit(
+    response: Any, endpoint: Endpoint, *, late_fails: bool = False, out=None, err=None,
+) -> int:
     """Print the reply and return the exit code.
 
     Success is the daemon's body; a refusal is the daemon's body under ``body``
     with the status beside it, because the status is the part a client acts on and
     FastAPI's ``detail`` is not always a sentence.
+
+    *late_fails* is ``answer`` sent by full bus id: ``/comms`` takes a late answer
+    with a 200 where the answer route refuses it with a 409, and one verb keeps one
+    exit status for the same outcome (#602).
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
@@ -247,6 +265,10 @@ def _emit(response: Any, endpoint: Endpoint, *, out=None, err=None) -> int:
         text = text.replace(endpoint.credential, "<redacted>")
     payload = _payload(text)
     status = response.status_code
+    if late_fails and 200 <= status < 300 and isinstance(payload, dict) \
+            and payload.get("accepted_as") == "late":
+        print(json.dumps({"error": "late", "status": status, "body": payload}), file=err)
+        return EXIT_FAILURE
     if 200 <= status < 300:
         print(json.dumps(payload), file=out)
         return 0
@@ -286,12 +308,20 @@ def _given(args: argparse.Namespace, names: Sequence[str]) -> dict:
 
 
 def _run_fields(key: str) -> dict:
-    """``host/project/slug`` as the three fields every run-keyed route names.
+    """``host/project/<slug|uid>`` as the fields every run-keyed route names.
 
     The inverse of :func:`lmer_platform.runs.run_key`, which is the string the
     platform's own state files use and therefore the one an operator has in front
     of them. A project is ``group/subgroup``, so the middle is whatever lies
     between the first segment and the last.
+
+    The last segment is the run's key segment (spec §6.1): a schema-2 run is
+    keyed by its execution uid, and every route takes ``uid`` beside ``slug``
+    and addresses the record by it. So a last segment of 32 lowercase hex is
+    sent as ``uid`` and anything else as ``slug``. That is unambiguous rather
+    than a guess because a slug cannot be 32 hex: a target-less run's slug is
+    its bare taskdef, which is the one way a slug could be, and the spawn
+    refuses a taskdef so named. Shape again, not validation.
 
     Splitting is argument shape and stops there: the parts are not checked for
     emptiness or existence, so a key naming no run reaches the daemon and comes
@@ -300,11 +330,21 @@ def _run_fields(key: str) -> dict:
     parts = runref.split(key)
     if parts is None:
         raise CtlError(
-            f"{key!r} is not a run key — a run is named host/project/slug, as "
-            "the fleet view names it (gitlab.example.com/group/project/develop-141)"
+            f"{key!r} is not a run key — a run is named host/project/slug (or "
+            "host/project/<uid> for a schema-2 run), as the fleet view names it "
+            "(gitlab.example.com/group/project/develop-141)"
         )
-    host, project, slug = parts
-    return {"host": host, "project": project, "slug": slug}
+    host, project, segment = parts
+    return {"host": host, "project": project, segment_field(segment): segment}
+
+
+def segment_field(segment: str) -> str:
+    """``"uid"`` or ``"slug"``: which field a run key's last segment is sent as.
+
+    The rule :func:`_run_fields` gives, in one place for both shells that type
+    run keys — this CLI and ``lmer platform`` (:mod:`lmer_platform.daemon`).
+    """
+    return "uid" if UID_RE.match(segment) else "slug"
 
 
 # --- the verbs: one route each ----------------------------------------------
@@ -331,7 +371,7 @@ def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
         "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
-        "title", "description", "targets",
+        "title", "description", "targets", "supervisor_authority",
     )))
     if args.references:
         body["references"] = [_reference_of(spec) for spec in args.references]
@@ -434,11 +474,20 @@ def _call_answer(args) -> Call:
             "an answer names its option by index or in its text, not both — "
             f"drop one of --option {args.option} and {args.text!r}"
         )
+    bus_id = "/" in args.question
     body: dict = {}
     if args.text is not None:
-        body["answer"] = _text(args.text)
+        body["text" if bus_id else "answer"] = _text(args.text)
     if args.option is not None:
         body["option"] = args.option
+    if bus_id:
+        # The answer route's path holds only the ask-directory number, and the
+        # bus refuses an id from any bus but this session's own (#602).
+        return Call(
+            "POST",
+            f"/api/sessions/{args.session}/comms",
+            body={"kind": "answer", "in_reply_to": args.question, **body},
+        )
     return Call(
         "POST",
         f"/api/sessions/{args.session}/ask/{args.question}/answer",
@@ -568,6 +617,24 @@ def _call_runs_meta_set(args) -> Call:
     )
 
 
+def _mute_call(args, verb: str) -> Call:
+    """A run key mutes by run; ``--session`` by the session's own path, which
+    the daemon scopes to that session's project."""
+    if (args.key is None) == (args.session is None) or args.session == "":
+        raise CtlError("name exactly one of: a run KEY, or --session ID")
+    if args.session is not None:
+        return Call("POST", f"/api/sessions/{args.session}/{verb}")
+    return Call("POST", f"/api/runs/{verb}", body=_run_fields(args.key))
+
+
+def _call_runs_mute(args) -> Call:
+    return _mute_call(args, "mute")
+
+
+def _call_runs_unmute(args) -> Call:
+    return _mute_call(args, "unmute")
+
+
 def _call_runs_relations(args) -> Call:
     return Call("GET", "/api/runs/relations", params=_run_fields(args.key))
 
@@ -661,7 +728,8 @@ def _handoff_note(args) -> Optional[str]:
 def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
     parser.add_argument(
         name,
-        help="A run, as host/project/slug — the key the fleet view names it by.",
+        help="A run, as host/project/<slug|uid> — the key the fleet view names "
+             "it by; a 32-hex last segment is a schema-2 run's uid.",
     )
 
 
@@ -728,6 +796,17 @@ def create_parser() -> argparse.ArgumentParser:
     move.add_argument("destination_id")
     move.add_argument("--home-revision", type=int, required=True)
     move.set_defaults(call=lambda args: Call("POST", "/api/runs/move", body={**_run_fields(args.key), "destination_id": args.destination_id, "home_revision": args.home_revision}))
+    channels = workspace_sub.add_parser("channels", help="Slack channels / Matrix rooms whose bot mentions route to a project.")
+    channels_sub = channels.add_subparsers(dest="channels_command")
+    channels_sub.add_parser("list").set_defaults(call=lambda _args: Call("GET", "/api/channel-routes"))
+    channels_set = channels_sub.add_parser("set", help="Replace PROJECT's channels; none clears them.")
+    channels_set.add_argument("identity", metavar="PROJECT")
+    channels_set.add_argument("channel", nargs="*", help="Channel ID, #name or link; Matrix room ID, alias or link.")
+    channels_set.set_defaults(call=lambda args: Call("PUT", f"/api/projects/{args.identity}/channel-routes",
+                                                     body={"channels": args.channel}))
+    channels_remove = channels_sub.add_parser("remove", help="Drop one channel's route, whichever project holds it.")
+    channels_remove.add_argument("channel")
+    channels_remove.set_defaults(call=lambda args: Call("DELETE", "/api/channel-routes", params={"channel": args.channel}))
 
     requests = sub.add_parser("requests", help="Source-bound conversation requests.")
     requests_sub = requests.add_subparsers(dest="requests_command")
@@ -812,13 +891,20 @@ def create_parser() -> argparse.ArgumentParser:
         help="The run's label in the fleet view, in the operator's words.",
     )
     spawn.add_argument("--description", help="A longer note about the run.")
+    spawn.add_argument(
+        "--supervisor-authority", dest="supervisor_authority", choices=SUPERVISOR_AUTHORITY_LEVELS,
+        help=(
+            "This run's delegation to the assistant, instead of the project's setting. "
+            "The assistant's own credential may only narrow it."
+        ),
+    )
     spawn.set_defaults(call=_call_spawn)
 
     send = sub.add_parser(
         "send",
         help=(
             "Send a message to a live session on its bus; the agent sees it "
-            "tagged [uber lmer] for workers, or [peer UL message] for an explicitly "
+            f"tagged [{assistant_display_name()}] for workers, or [peer UL message] for an explicitly "
             "addressed peer UL. Peer sends require --ref, remain native and never mirror to external threads "
             "(POST /api/sessions/{id}/comms)."
         ),
@@ -934,7 +1020,13 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     answer.add_argument("session", help="Session id.")
-    answer.add_argument("question", help="Question id, from `questions`.")
+    answer.add_argument(
+        "question",
+        help=(
+            "Question id, from `questions` (000003), or a full bus id from "
+            "`comms` (<bus-session>/000003), which is answered on the bus."
+        ),
+    )
     _add_text(answer, "The answer, unless --option names it.", optional=True)
     answer.add_argument(
         "--option", type=int, metavar="N",
@@ -979,7 +1071,7 @@ def create_parser() -> argparse.ArgumentParser:
         "post",
         help=(
             "Post once into a thread. The post is attributed to this credential "
-            "— `uber lmer` or `operator` — not to anything in the text."
+            f"— `{assistant_display_name()}` or `operator` — not to anything in the text."
         ),
     )
     thread_post.add_argument("permalink", help="Thread permalink.")
@@ -1276,6 +1368,27 @@ def _add_runs(sub) -> None:
     meta_set.add_argument("--description", help="A longer note.")
     meta_set.set_defaults(call=_call_runs_meta_set)
 
+    for verb, call, summary in (
+        ("mute", _call_runs_mute,
+         "Stop a run's routine records reaching the assistant; questions, "
+         "milestones, the platform's own notices, crashes and complete still "
+         "do (POST /api/runs/mute)."),
+        ("unmute", _call_runs_unmute,
+         "Undo mute, and any session mute of the run; nothing suppressed is "
+         "replayed (POST /api/runs/unmute)."),
+    ):
+        parser = runs_sub.add_parser(verb, help=summary)
+        parser.add_argument(
+            "key", nargs="?",
+            help="A run, as host/project/<slug|uid>. Omit it with --session.",
+        )
+        parser.add_argument(
+            "--session",
+            help="A session id, for a session with no tracked run (a chat run "
+                 "with no identity). A tracked run's session mutes the run.",
+        )
+        parser.set_defaults(call=call)
+
     relations = runs_sub.add_parser(
         "relations",
         help=(
@@ -1360,7 +1473,10 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     except CtlError as exc:
         print(json.dumps({"error": exc.error, "detail": str(exc)}), file=sys.stderr)
         return EXIT_FAILURE
-    return _emit(response, endpoint)
+    return _emit(
+        response, endpoint,
+        late_fails=call.path.endswith("/comms") and (call.body or {}).get("kind") == "answer",
+    )
 
 
 if __name__ == "__main__":

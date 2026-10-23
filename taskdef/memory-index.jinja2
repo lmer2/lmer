@@ -1,0 +1,14 @@
+{% if (LMER_PERSIST_AGENT_MEMORY or '')|lower in ('1', 'true', 'yes') %}
+
+### Agent memory: read the map, then the area
+
+Claude Code loads only the head of your memory index, `MEMORY.md`, at
+session start (at most 200 lines / 25,000 bytes), and the shared index is
+budgeted for it whichever harness you run. When an `areas/` directory sits beside it,
+the index is split and `MEMORY.md` is a map: one line per area, each saying
+when to read `areas/<slug>.md`. **Before you start work, open the area index
+whose hook matches your task** — that is where the lessons for it are. File a
+new memory's pointer in its area index (link `../<file>.md`), or set
+`metadata.area: <slug>` in its frontmatter; `work memory persist` reports the
+index size against the limit and files stray map entries for you.
+{% endif %}

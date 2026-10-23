@@ -6,7 +6,7 @@ tree, so every consumer that routes a path (the work CLI's ``_runs``/``_specs``
 resolvers) begins by asking which form the tree it is standing in is written
 in. D20 answers with one bit of evidence:
 
-    a plexus root holding ``_plexus.yaml`` is SCHEMA form; one without it is
+    a plexus root holding ``_lmer.yaml`` is SCHEMA form; one without it is
     LEGACY form.
 
 Two answers, spelled as an enum
@@ -88,7 +88,7 @@ __all__ = [
 class Form(Enum):
     """The form a plexus tree is written in (D20) — the only two answers.
 
-    ``SCHEMA``: a ``_plexus.yaml`` is present at the root, so the tree uses
+    ``SCHEMA``: a ``_lmer.yaml`` is present at the root, so the tree uses
     the one form (§2, ``_``-owned area names, flat short-name project dirs).
     ``LEGACY``: no manifest, so the tree uses the bare pre-schema names and
     the ``{host}/{project}`` placement (§9), read in place and validated at
@@ -121,7 +121,7 @@ class Detection:
 
 
 def has_manifest(root) -> bool:
-    """Whether a ``_plexus.yaml`` is PRESENT at *root* (D20's one bit).
+    """Whether a ``_lmer.yaml`` is PRESENT at *root* (D20's one bit).
 
     ``is_symlink`` first, exactly as ``load_manifest`` tests it: a dangling
     symlink is present — someone put a manifest there — even though

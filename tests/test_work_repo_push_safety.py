@@ -5,12 +5,13 @@ import subprocess
 import pytest
 
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import CLI
 from work_repo import git_ops, memory
 
 
 def git(repo, *args, check=True):
     result = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, timeout=15
+        ["git", *args], cwd=repo, capture_output=True, text=True, timeout=CLI
     )
     if check:
         assert result.returncode == 0, result.stdout + result.stderr
@@ -42,6 +43,14 @@ def publication(request, tmp_path, monkeypatch):
     target.parent.mkdir(parents=True)
     target.write_text("base\n")
     git(repo, "add", "--", str(target))
+    if request.param == "memory":
+        # A memory scope with a file but no index is not a clean target: gap
+        # (e) reconciles it on the next persist, which would land a commit.
+        # Seed the index so this fixture is the "nothing to publish" case the
+        # tests here need.
+        index = target.parent / "MEMORY.md"
+        index.write_text("- [fact](fact.md)\n")
+        git(repo, "add", "--", str(index))
     git(repo, "commit", "-m", "seed")
     git(repo, "push", "-u", "origin", "main")
     peer = tmp_path / "peer"
@@ -77,7 +86,32 @@ def publication(request, tmp_path, monkeypatch):
             git(peer, "commit", "-m", "peer update")
             git(peer, "push")
 
+        def conflict_at_the_rebase(self, path, text):
+            """Land a peer commit that the post-commit rebase must meet.
+
+            Memory persist fast-forwards to upstream before it merges (#369
+            gap (b)), so a peer commit made beforehand is integrated, not
+            conflicted; it has to land after that pull, just before the
+            local commit, to reach the rebase."""
+            if request.param != "memory":
+                self.peer_commit(path, text)
+                return
+            real_commit = memory.commit_work_path
+            raced = []
+
+            def commit_after_the_peer(*args, **kwargs):
+                if not raced:
+                    raced.append(True)
+                    self.peer_commit(path, text)
+                return real_commit(*args, **kwargs)
+
+            monkeypatch.setattr(memory, "commit_work_path", commit_after_the_peer)
+
+        def conflict_copies(self):
+            return sorted(p.name for p in agent.iterdir() if ".conflict-" in p.name)
+
     case = Publication()
+    case.kind = request.param
     case.repo, case.origin, case.peer = repo, origin, peer
     case.rel = f"{rel}/fact.md"
     case.target = target
@@ -183,7 +217,7 @@ def test_marker_gate_checks_the_index_including_other_paths(publication):
 
 def test_rebase_conflict_aborts_without_push_and_retries_safely(publication, monkeypatch, capsys):
     case = publication
-    case.peer_commit(case.rel, "remote conflict\n")
+    case.conflict_at_the_rebase(case.rel, "remote conflict\n")
     case.write("local conflict\n")
     commands = record_commands(monkeypatch)
 
@@ -193,6 +227,17 @@ def test_rebase_conflict_aborts_without_push_and_retries_safely(publication, mon
     assert git(case.repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
     assert not (case.repo / ".git/rebase-merge").exists()
     assert not (case.repo / ".git/rebase-apply").exists()
+    if case.kind == "memory":
+        # The memory contract (#369 gap (b)): the session's version survives
+        # as a conflict copy, and its commit is dropped so the shared
+        # checkout stays publishable; the retry is pinned in
+        # tests/test_work_repo_memory_merge.py.
+        assert case.target.read_text() == "base\n"
+        assert git(case.repo, "rev-list", "@{upstream}..HEAD").stdout == ""
+        assert case.conflict_copies(), "no .conflict- copy was written"
+        assert git(case.origin, "show", f"main:{case.rel}").stdout == "remote conflict\n"
+        assert "Successfully" not in capsys.readouterr().out
+        return
     assert case.target.read_text() == "local conflict\n"
     assert git(case.repo, "log", "-1", "--format=%s").stdout.strip() == "save"
     assert git(case.origin, "show", f"main:{case.rel}").stdout == "remote conflict\n"
@@ -327,6 +372,11 @@ def test_race_that_conflicts_stops_before_a_second_push(publication, monkeypatch
     assert case.publish() != 0
     assert sum(cmd[0] == "push" for cmd in commands) == 1
     assert git(case.repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    if case.kind == "memory":
+        # Memory drops its unpublishable commit and keeps a conflict copy.
+        assert case.target.read_text() == "base\n"
+        assert case.conflict_copies(), "no .conflict- copy was written"
+        return
     assert case.target.read_text() == "local fact\n"
 
 
@@ -469,7 +519,7 @@ def test_rebase_conflict_restores_unrelated_tracked_edits(publication, monkeypat
     git(case.repo, "pull", "--rebase")
     dirty = case.repo / "run/log.txt"
     dirty.write_text("uncommitted log\n")
-    case.peer_commit(case.rel, "remote conflict\n")
+    case.conflict_at_the_rebase(case.rel, "remote conflict\n")
     case.write("local conflict\n")
     commands = record_commands(monkeypatch)
 
@@ -477,7 +527,9 @@ def test_rebase_conflict_restores_unrelated_tracked_edits(publication, monkeypat
     assert ["pull", "--rebase", "--autostash", "origin", "refs/heads/main"] in commands
     assert ["rebase", "--abort"] in commands
     assert dirty.read_text() == "uncommitted log\n"
-    assert case.target.read_text() == "local conflict\n"
+    # Memory drops its unpublishable commit; work keeps it.
+    expected = "base\n" if case.kind == "memory" else "local conflict\n"
+    assert case.target.read_text() == expected
     assert git(case.repo, "stash", "list").stdout == ""
     assert git(case.repo, "ls-files", "--unmerged").stdout == ""
     assert not (case.repo / ".git/rebase-merge").exists()
@@ -578,7 +630,7 @@ def test_stash_inspection_failure_stops_publication(publication, monkeypatch, ca
 
 def test_abort_failure_is_reported_and_next_call_refuses_state(publication, monkeypatch, capsys):
     case = publication
-    case.peer_commit(case.rel, "remote conflict\n")
+    case.conflict_at_the_rebase(case.rel, "remote conflict\n")
     case.write("local conflict\n")
     commands = record_commands(monkeypatch, lambda cmd, cwd: (128, "abort unavailable") if cmd == ["rebase", "--abort"] else None)
 

@@ -96,6 +96,10 @@ from lmer_cli.runtime import (
 from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
 from lmer_cli.comms import DEFAULT_TERMINAL_CONFIRM_SECONDS, TERMINAL_CONFIRM_ENV
+from lmer_cli.comms import ASSISTANT_NAME_ENV, DEFAULT_ASSISTANT_NAME, MAX_ASSISTANT_NAME_CHARS
+from lmer_cli import harness as lmer_harness
+from lmer_cli.presets import load_presets, resolve_agent_presets
+from lmer_cli.user_harnesses import refresh_user_harnesses
 
 # Module level, deliberately: this used to be a function-local import explained as
 # laziness for importability, which defended a cycle that does not exist —
@@ -142,6 +146,7 @@ __all__ = [
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
     "ASSISTANT_RESOURCE_KEYS", "assistant_resource_settings",
     "ENV_ASSISTANT_MEMORY", "ENV_ASSISTANT_CPUS",
+    "ENV_ASSISTANT_NAME",
     "update_stored", "validate_assistant_override",
     "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
     "ENV_CHECKIN_WINDOW", "checkin_settings", "validate_checkin_window",
@@ -289,6 +294,10 @@ ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
 ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
+#: The assistant's display name (issue #581). Not in :data:`ASSISTANT_SETTING_KEYS`:
+#: it is not a launch flag and not written by the settings dialog — config.json or
+#: the env, read-only through the API.
+ENV_ASSISTANT_NAME = ASSISTANT_NAME_ENV
 
 #: The supervising assistant's own container allocation (issue #453). It
 #: coordinates workers rather than running their test suites, so it has no use
@@ -628,6 +637,9 @@ class PlatformConfig:
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
     assistant_threads: Optional[list[str]] = None
+    #: The assistant's human-facing name (issue #581); always resolved, never
+    #: ``None``. See :data:`ENV_ASSISTANT_NAME`.
+    assistant_name: str = DEFAULT_ASSISTANT_NAME
     chat_keep_last: int = 0
     #: Whether the uber lmer chat pane draws the harness transcript — tool
     #: calls, watch events, hook re-prompts, unposted prose — beside the
@@ -816,6 +828,12 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         usable = _bool_setting_value(getattr(config, field_name), field=field_name)
         if usable is not getattr(config, field_name):
             config = replace(config, **{field_name: usable})
+    raw_name = config.assistant_name if isinstance(config.assistant_name, str) else ""
+    name = raw_name.strip()
+    if not name or len(name) > MAX_ASSISTANT_NAME_CHARS:
+        name = DEFAULT_ASSISTANT_NAME
+    if name != config.assistant_name:
+        config = replace(config, assistant_name=name)
     try:
         groups = validate_fleet_groups(config.fleet_groups)
     except ConfigError as exc:
@@ -1126,13 +1144,8 @@ def _authority_names(kind: str) -> Optional[set]:
     """
     try:
         if kind == "harness":
-            from lmer_cli.harness import known_harnesses
-            from lmer_cli.user_harnesses import refresh_user_harnesses
-
             refresh_user_harnesses()
-            return set(known_harnesses())
-        from lmer_cli.presets import load_presets
-
+            return set(lmer_harness.known_harnesses())
         return set(load_presets())
     except Exception as exc:  # noqa: BLE001 - validation must not break a start
         logger.warning(
@@ -1211,9 +1224,6 @@ def _agents_selection_reason(selection: str) -> Optional[str]:
     :func:`_authority_names`.
     """
     try:
-        from lmer_cli.presets import load_presets, resolve_agent_presets
-        from lmer_cli.user_harnesses import refresh_user_harnesses
-
         refresh_user_harnesses()
         _resolved, warnings, error = resolve_agent_presets(
             selection, load_presets()
@@ -1366,6 +1376,7 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             field: _env_str(env_var)
             for field, env_var in ASSISTANT_SETTING_KEYS.values() if env_var
         },
+        "assistant_name": _env_str(ENV_ASSISTANT_NAME),
         # Same warn-don't-refuse posture as the two above: an unusable export
         # costs its own layer and lets ``config.json`` show through.
         "upload_max_bytes": _layer_int(
@@ -1398,6 +1409,20 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
     config = _validate(PlatformConfig(**values))
     _seed_gitlab_token_host(config.work_repo_url)
     return config
+
+
+def export_assistant_name(config: "PlatformConfig") -> None:
+    """Make this process's environment agree with the resolved display name.
+
+    Host-side consumers that have no config in hand — the daemon's notices and
+    errors, the CLI help, and the connector child's inherited environment — read
+    :func:`lmer_cli.comms.assistant_display_name` from the environment. Exporting
+    the resolved value here keeps them all on one name even when it was set only
+    in ``config.json`` (review of !403).
+    """
+    name = (config.assistant_name or "").strip()
+    if name:
+        os.environ[ASSISTANT_NAME_ENV] = name
 
 
 def _seed_gitlab_token_host(work_repo_url: Optional[str]) -> None:

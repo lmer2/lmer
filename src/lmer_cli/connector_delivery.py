@@ -50,6 +50,7 @@ def claim_receipt(key: ThreadKey, marker: dict, receipt: str) -> None:
 
 def verified_rejection(exc: Exception) -> bool:
     """Only structured, documented rejections establish non-acceptance."""
+    # deferred: import cost — matrix_chat.client (~130 ms) and slack_chat.client (~140 ms) each pull in requests
     from matrix_chat.client import MatrixError
     from slack_chat.client import SlackError
 
@@ -153,7 +154,7 @@ class DeliveryState:
             self.save()
             return pending
 
-    def send(self, source: dict, part: str, payload: dict, call) -> str:
+    def send(self, source: dict, part: str, payload: dict, call, *, rejected=verified_rejection) -> str:
         """Persist intent before calling, receipt before returning to bookkeeping."""
         with self.outbound:
             with self.lock:
@@ -212,7 +213,7 @@ class DeliveryState:
                     raise ValueError("transport returned no receipt")
             except Exception as exc:
                 with self.lock:
-                    if verified_rejection(exc):
+                    if rejected(exc):
                         try:
                             operation["status"] = "rejected"
                             self.save()

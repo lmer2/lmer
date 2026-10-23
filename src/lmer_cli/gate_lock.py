@@ -234,15 +234,8 @@ def _is_zombie(pid: int) -> bool:
     return bool(fields) and fields[0] == "Z"
 
 
-def _pid_alive(pid: int) -> bool:
-    """
-    Whether *pid* is a live process, via signal 0 plus a zombie check.
-
-    ``PermissionError`` means the process exists but belongs to another user —
-    still alive, and still a reason to defer. Anything else (no such process, a
-    pid the platform rejects) reads as dead, as does a pid that only exists as
-    an unreaped exit status (:func:`_is_zombie`).
-    """
+def _kill_probe(pid: int) -> bool:
+    """``kill(pid, 0)``: whether the process exists, another user's included."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -251,7 +244,29 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (OSError, OverflowError, ValueError):
         return False
-    return not _is_zombie(pid)
+    return True
+
+
+def _pid_alive(pid: int) -> bool:
+    """
+    Whether *pid* is a live process, via signal 0 plus a zombie check.
+
+    ``PermissionError`` means the process exists but belongs to another user —
+    still alive, and still a reason to defer. Anything else (no such process, a
+    pid the platform rejects) reads as dead, as does a pid that only exists as
+    an unreaped exit status (:func:`_is_zombie`).
+
+    The zombie check reads ``/proc``, and the parent can reap the process
+    between the probe and that read. The read then finds nothing, which
+    :func:`_is_zombie` must call "not a zombie" for hosts without ``/proc``;
+    so the probe is asked again, and a reaped pid answers gone — the same fix
+    :func:`lmer_platform.registry._pid_alive` got for #525.
+    """
+    if not _kill_probe(pid):
+        return False
+    if _is_zombie(pid):
+        return False
+    return _kill_probe(pid)
 
 
 def _marker_path(pid: int, directory: Path | None = None) -> Path:

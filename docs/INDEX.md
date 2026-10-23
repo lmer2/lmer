@@ -30,9 +30,9 @@ assistant) on a host:
 - Reaching it remotely: direct bind vs an nginx reverse proxy (WebSocket
   upgrade + timeouts included)
 - `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
-- A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
-- Digest nudges: when the daemon reminds uber lmer that its spool is unread
-- uber lmer's memory: the host-local store its incarnations share, what its
+- A tour of the fleet view, spawning, answering, wind down vs exit, Ratchet
+- Digest nudges: when the daemon reminds Ratchet that its spool is unread
+- Ratchet's memory: the host-local store its incarnations share, what its
   file count does and does not show
 
 **Best for**: Getting the platform running and usable in a few minutes.
@@ -59,6 +59,20 @@ Complete guide to using Docker and Podman with LMER. Covers:
 - Performance considerations and security benefits
 
 **Best for**: Understanding how containers work in this project, troubleshooting container issues, and learning about FIPS compliance.
+
+---
+
+### [CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md)
+**Session Container Lifecycle**
+
+How lmer runs a session container detached and follows it:
+- Create, start attached, wait, record and remove
+- The detach keys (Ctrl-] Ctrl-\) and the labels on every session container
+- Closing the terminal no longer ends a CLI session; `lmer follow` and cleanup
+- How a restarted platform finds and follows its sessions again
+
+**Best for**: Re-attaching to a session, cleaning up stopped containers, and
+understanding why sessions survive a platform restart.
 
 ---
 
@@ -108,6 +122,19 @@ How the commit and push gates avoid re-running the test suite, and when they ref
 
 ---
 
+### [GATE-CI-BASELINE.md](./GATE-CI-BASELINE.md)
+**Initial baseline from CI**
+
+How `gate-check --baseline` reuses passing CI on the exact starting commit:
+- The scoped `GATE_CI_BASELINE` toggle and the work-repo `ci_baseline` coverage mapping
+- Definition pins that hold each CI job to its audit, and `--print-pins` to refresh them
+- The per-job decision, the bounded smoke check, and the fallbacks
+- Exit codes and the `gate-baseline` receipt
+
+**Best for**: Turning on CI baseline reuse for a project, or reading why a run did or did not use it.
+
+---
+
 ### [LMER-CLI.md](./LMER-CLI.md)
 **LMER Python CLI (lmer)**
 
@@ -120,6 +147,7 @@ User guide for the `lmer` command-line interface:
 - Canonical source configuration (`sources.yaml`)
 - Exec mode and debugging options
 - `lmer-schema validate`: checking a work repo against the schema, its output modes and exit codes
+- `lmer-schema index`: previewing and backfilling the generated README index blocks (`--diff`, `--write`, exit codes), and `lmer --name` / `--goal` for recording a run's name and goal at launch
 - `work sessions` and resuming a specific session by id
 
 **Best for**: Learning how to use the `lmer` CLI tool, understanding task workflows, and getting started with LMER.
@@ -230,6 +258,7 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 - Deterministic slug derivation and the completed-run policy
 - `work` CLI verbs (`state`, `state set`, `event`, `resume`, `artifact`, `session-start`, `session-end`)
 - Session lifecycle (seeding, owner claims, `LMER_SESSION_ID`) and fail-soft guarantees
+- The generated `README.md` index block every durability push re-renders and stages with the record, the `work sessions` state words, and the launch name and goal applied once at `work session-start`
 - The external cleaner contract and the deferred growth path
 
 **Best for**: Understanding how sessions persist and resume machine-readable state, and what external tools can rely on when reading a run dir — legacy `runs/<slug>/` or a schema-form session dir.
@@ -241,7 +270,25 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 Git state guards, staged-marker validation, verified publication, and recovery
 for memory, work logs, and napkin repositories.
 
+Generated index blocks: regenerated and staged before every durability
+commit, and the one rebase conflict — confined to those blocks — that is
+resolved by rendering again from the merged tree instead of aborting.
+
 **Best for**: Recovering failed work publication and understanding clean retries.
+
+---
+
+### [SCHEMA-GUIDE.md](./SCHEMA-GUIDE.md)
+**The lmer schema, for the operator**
+
+A reading guide to SCHEMA.md, plus the two things it deliberately leaves out — how to migrate and how to check:
+- What the schema is in one page: the problem, form detection, the manifest and registry, short names and the compat symlink, session dirs, the two memory scopes
+- Per path: who writes it, who reads it, whether that reader dual-reads the legacy name, and the one command that exercises it
+- A step-by-step migration for an existing repo, with the validator findings to expect after each step and the two areas to leave alone
+- A test checklist of commands with their real output
+- The generated README index blocks: who writes them, `lmer-schema index . --write` as the last adoption step and an explicit backfill at the schema-2 cut-over, and the freshness check in the test checklist
+
+**Best for**: Planning a migration, or finding out which command would notice if you got a step wrong.
 
 ---
 
@@ -251,11 +298,25 @@ for memory, work logs, and napkin repositories.
 The normative layout of everything lmer reads and writes outside the code repos it works on — one repository holding it is a *plexus*:
 - The single form: flat short-name project dirs, `_`-prefixed schema-owned names, and the `{host}/{project}/` host bucket for repos nobody has named yet
 - The areas (napkin, plans, knowledge, memory at two scopes, record, `_agents/`) and their writer/shape/strictness contracts
-- The `_plexus.yaml` manifest: schema int, registry identity (`repo:`/`remotes:`, repoless projects), sources, housekeeping policy
+- The `_lmer.yaml` manifest: schema int, registry identity (`repo:`/`remotes:`, repoless projects), sources, housekeeping policy
 - Sessions as the unit of record (`_runs/<slug>/<session-id>[--<name>]/`), archive, and the legacy mapping
 - What `lmer-schema validate` checks at each strictness tier, versioning, and the change process
+- The generated `README.md` index blocks at the plexus root and in each project: the inventory rows, the `index.readme-missing` / `index.readme-stale` codes and the hand-text marker rule
 
 **Best for**: Migrating a work repo to the schema, validating a tree with `lmer-schema validate`, and knowing exactly where a file belongs.
+
+---
+
+### [SCHEMA-V2.md](./SCHEMA-V2.md)
+**Schema 2: one execution, one record**
+
+What changes when the manifest declares `schema: 2`, on top of the schema-1 layout:
+- Session identity and metadata: a fresh opaque UID per execution, and continuing work from a source session (`--source-session`, the unsigned-source decision)
+- Repository identity, shared release claims and memory retirement
+- The project index: the generated `README.md` block per project and the root project list — who writes it, the clock-free state words, the regenerate-on-conflict rule, mixed versions and the hand-text marker rule
+- The compatibility rule and the schema-1 to schema-2 migration
+
+**Best for**: Reading a schema-2 record, continuing someone else's session safely, and knowing what the generated README index block promises.
 
 ---
 
@@ -396,7 +457,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
 - **Talking to a session from Slack, matrix or the chat pane?** See [COMMS.md](./COMMS.md)
 - **Announcing runs that want a human into a Matrix room?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
-- **Migrating a work repo to the schema?** See [SCHEMA.md](./SCHEMA.md) for the normative layout, then check the tree with `lmer-schema validate`
+- **Migrating a work repo to the schema?** Start with [SCHEMA-GUIDE.md](./SCHEMA-GUIDE.md) for the plan and the checks, and read [SCHEMA.md](./SCHEMA.md) for the normative layout
 - **Need to troubleshoot?** All documents include troubleshooting sections
 
 ---

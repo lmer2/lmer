@@ -74,7 +74,7 @@ say".
 ## What the platform does with it
 
 `GET /api/state` carries it per run (`run.statusline`) for the run's live
-session, and `GET /api/assistant` carries it for uber lmer's own session. The
+session, and `GET /api/assistant` carries it for Ratchet's own session. The
 UI renders a strip of meters in the run view, one dimmed line of text in the run
 list row, and the same strip in the chat pane.
 
@@ -287,7 +287,7 @@ block is not served.
 
 ### Assistant launch path
 
-Codex uber lmer uses the same publication path as workers:
+Codex Ratchet uses the same publication path as workers:
 `assistant.start` → `spawn.spawn_session` supplies the read-write status mount
 and `LMER_STATUS_DIR` → `supervisor.run_supervisor` constructs `CodexDelivery`
 for Codex → `_run_supervisor` starts its private backend and usage monitor.

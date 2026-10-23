@@ -351,3 +351,46 @@ class TestTheEstablishedConversationExemption:
             thread_access.send_dm(
                 "U0123ABCD", "hi", env=env(""), client=slack, established=("DSOMEONEELSE",))
         assert slack.posted == []
+
+
+class TestDmEgressRedaction:
+    """#544 item 2: both DM paths scrub like the thread posts, before the clip.
+    Fabricated values only; the bus note records a length, never the body."""
+
+    SHAPED = "ghp_" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8"
+    ENV_VALUE = "fabricated-env-value-" + "0123456789abcdef"
+
+    @pytest.fixture(autouse=True)
+    def held_secret(self, monkeypatch):
+        # Value-based redaction reads this host's secret-named variables.
+        monkeypatch.setenv("LMER_FABRICATED_API_TOKEN", self.ENV_VALUE)
+
+    @staticmethod
+    def slack_body(text):
+        slack = FakeSlack()
+        thread_access.send_dm("U0123ABCD", text, env=env("U0123ABCD"), client=slack)
+        [(_, body)] = slack.posted
+        return body
+
+    @staticmethod
+    def matrix_body(text):
+        matrix = FakeMatrix(existing="!dm:example.org")
+        thread_access.send_dm(
+            "@someone:example.org", text, env=env("@someone:example.org"), client=matrix)
+        [(_, content)] = matrix.sent
+        return content["body"]
+
+    @pytest.mark.parametrize("deliver", ["slack_body", "matrix_body"])
+    @pytest.mark.parametrize("secret", [SHAPED, ENV_VALUE], ids=["shape", "env-value"])
+    def test_the_message_arrives_redacted(self, deliver, secret):
+        body = getattr(self, deliver)(f"found {secret} in the log")
+        assert secret not in body
+        assert "***REDACTED***" in body
+
+    @pytest.mark.parametrize("deliver", ["slack_body", "matrix_body"])
+    @pytest.mark.parametrize("secret", [SHAPED, ENV_VALUE], ids=["shape", "env-value"])
+    def test_a_secret_the_clip_would_cut_is_redacted_first(self, deliver, secret):
+        """Clipped first, the cut-off head would no longer match either rule."""
+        lead = "x" * (thread_access.MAX_POST_CHARS - 12)
+        body = getattr(self, deliver)(lead + secret)
+        assert secret[:10] not in body

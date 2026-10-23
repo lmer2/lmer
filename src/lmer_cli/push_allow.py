@@ -117,6 +117,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
+import yaml
+
+from lmer_cli.container import taskdefs
+from lmer_cli.container.masterplan import TASK_MANIFEST
+
 
 def env_allow_list() -> List[str]:
     """Entries from the ``LMER_PUSH_ALLOW_LIST`` env var (comma-separated).
@@ -136,16 +141,12 @@ def _trusted_taskdef_dirs() -> List[Path]:
     point into a work-repo tier). See the module docstring for the threat
     model behind the exclusion.
     """
-    # Deferred like masterplan's own imports: keep this module importable
-    # and the env-only paths testable without the taskdef search loaded.
-    from lmer_cli.container.taskdefs import builtin_taskdef_root
-
     dirs: List[Path] = []
     for p in os.environ.get("LMER_TASKDEF_PATHS", "").split(":"):
         p = p.strip()
         if p:
             dirs.append(Path(p))
-    dirs.append(builtin_taskdef_root())
+    dirs.append(taskdefs.builtin_taskdef_root())
     return dirs
 
 
@@ -164,8 +165,6 @@ def taskdef_allow_source() -> Tuple[List[str], Optional[Path]]:
     ``([], None)`` — a bad ``task.yaml`` must never grant nor crash the gate.
     """
     try:
-        from lmer_cli.container.masterplan import TASK_MANIFEST
-
         taskdef_name = os.environ.get("LMER_TASK") or os.environ.get("LMER_TASKDEF")
         if not taskdef_name:
             return [], None
@@ -177,8 +176,6 @@ def taskdef_allow_source() -> Tuple[List[str], Optional[Path]]:
                 break
         if manifest is None:
             return [], None
-        import yaml
-
         data = yaml.safe_load(manifest.read_text())
     except Exception:
         return [], None

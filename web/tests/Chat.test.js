@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import Chat from '../src/components/Chat.vue'
 import { fetchSessionMessages } from '../src/api.js'
-import { mountPane } from './mount.js'
+import { deferred, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
   fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(),
@@ -150,7 +150,7 @@ const said = (id, seq, extra = {}) => ({ id, seq, role: 'assistant', kind: 'said
 const session = () => [
   said('prose', 0, { text: prose }),
   said('spool', 1, { tools: [tool('curl -sS -X POST http://127.0.0.1:8700/api/assistant/pending')] }),
-  { id: 'watch', seq: 2, role: 'monitor', kind: 'said', via: 'monitor', text: 'uber lmer spool: pending digests > 0\nSPOOL pending=1', tools: [] },
+  { id: 'watch', seq: 2, role: 'monitor', kind: 'said', via: 'monitor', text: 'Ratchet spool: pending digests > 0\nSPOOL pending=1', tools: [] },
   { id: 'hook', seq: 3, role: 'user', kind: 'injected', text: 'Stop hook feedback: Reply-routing check: this turn produced visible reply text…', tools: [] },
   said('filler', 4, { text: 'Working output only.' }),
   said('post', 5, { via: 'comms', source: { channel: 'uber-lmer' }, comms_kind: 'message', text: posted }),
@@ -337,6 +337,112 @@ it.each([false, true])('reconciles late bus posts across polls (combined=%s)', a
     await vi.advanceTimersByTimeAsync(5000)
     await flushPromises()
     expect(wrapper.text().split(text)).toHaveLength(2)
+  } finally {
+    wrapper.unmount()
+    vi.useRealTimers()
+  }
+})
+
+it('keeps the run view\'s row above an empty transcript, and drops it only in fill mode', async () => {
+  const runView = await open([])
+  const first = (wrapper) => wrapper.get('.v-card-text').element.firstElementChild
+  expect(first(runView).classList.contains('mb-3')).toBe(true)
+  expect(first(runView).classList.contains('d-flex')).toBe(true)
+  fetchSessionMessages.mockResolvedValue({ messages: [], total: 0, cursor: 0 })
+  const filled = mountPane(Chat, { sessionId: 's-1', fill: true })
+  await flushPromises()
+  expect(first(filled).classList.contains('d-flex')).toBe(false)
+})
+
+// Late responses outside `before` pages (issue 544 item 3), on the session read.
+// Each holds a stale response across poll intervals while the session moves on.
+const closed = 'Recorded conversation, not a live one'
+const numbered = (count) => Array.from({ length: count }, (_, i) => said(`r${i}`, i, { text: `row ${i}` }))
+const serve = (state, since, limit) => {
+  const start = since < 0 ? Math.max(0, state.rows.length + since) : Math.min(since, state.rows.length)
+  const messages = state.rows.slice(start, start + limit)
+  return {
+    messages, from: start, total: state.rows.length, cursor: start + messages.length,
+    live: state.live, note: state.note,
+  }
+}
+
+it('holds polling until the first tail lands, so the late tail cannot rewind a poll', async () => {
+  vi.useFakeTimers()
+  const state = { rows: numbered(100), live: false, note: 'starting' }
+  const delayed = deferred()
+  let requested
+  fetchSessionMessages.mockImplementation(async (_id, { since, limit }) => serve(state, since, limit))
+  fetchSessionMessages.mockImplementationOnce((_id, { since, limit }) => {
+    requested = serve(state, since, limit)
+    return delayed.promise
+  })
+  const wrapper = mountPane(Chat, { sessionId: 's-1' })
+  try {
+    Object.assign(state, { rows: numbered(120), live: true, note: null })
+    await vi.advanceTimersByTimeAsync(15000)
+    // A poll now would read from cursor 0: the head of the conversation, not its
+    // end — drawn, then rewound by the tail landing behind it.
+    expect(fetchSessionMessages).toHaveBeenCalledTimes(1)
+    expect(wrapper.findAll('.turn')).toHaveLength(0)
+    delayed.resolve(requested)
+    await flushPromises()
+    await vi.dynamicImportSettled()
+    await flushPromises()
+    expect(wrapper.findAll('.turn')).toHaveLength(40)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchSessionMessages.mock.calls.at(-1)[1].since).toBe(100)
+    expect(wrapper.text()).toContain('row 119')
+    expect(wrapper.text()).toContain('120 messages')
+    expect(wrapper.text()).not.toContain(closed)
+    expect(wrapper.vm.$.setupState.note).toBe(null)
+    const texts = wrapper.findAll('.turn').map((row) => row.text())
+    expect(texts).toHaveLength(60)
+    expect(new Set(texts).size).toBe(texts.length)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchSessionMessages.mock.calls.at(-1)[1].since).toBe(120)
+  } finally {
+    wrapper.unmount()
+    vi.useRealTimers()
+  }
+})
+
+it('keeps what a poll said about the end when an earlier page lands late', async () => {
+  vi.useFakeTimers()
+  const state = { rows: numbered(100), live: true, note: null }
+  fetchSessionMessages.mockImplementation(async (_id, { since, limit }) => serve(state, since, limit))
+  const wrapper = mountPane(Chat, { sessionId: 's-1' })
+  try {
+    await flushPromises()
+    await vi.dynamicImportSettled()
+    await flushPromises()
+    expect(wrapper.text()).not.toContain(closed)
+    const delayed = deferred()
+    let requested
+    fetchSessionMessages.mockImplementationOnce((_id, { since, limit }) => {
+      requested = serve(state, since, limit)
+      return delayed.promise
+    })
+    await wrapper.findAll('button').find((button) => button.text() === 'earlier messages').trigger('click')
+    // The session writes twenty more turns and exits while the earlier page is in flight.
+    Object.assign(state, { rows: numbered(120), live: false, note: 'This session has exited.' })
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(wrapper.text()).toContain('row 119')
+    expect(wrapper.text()).toContain(closed)
+    delayed.resolve(requested)
+    await flushPromises()
+    await vi.dynamicImportSettled()
+    await flushPromises()
+    expect(requested).toMatchObject({ total: 100, live: true, note: null })
+    expect(wrapper.text()).toContain('row 20')
+    expect(wrapper.text()).toContain(closed)
+    expect(wrapper.text()).toContain('120 messages')
+    expect(wrapper.vm.$.setupState.note).toBe('This session has exited.')
+    const texts = wrapper.findAll('.turn').map((row) => row.text())
+    expect(texts).toHaveLength(100)
+    expect(new Set(texts).size).toBe(texts.length)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchSessionMessages.mock.calls.at(-1)[1].since).toBe(120)
   } finally {
     wrapper.unmount()
     vi.useRealTimers()

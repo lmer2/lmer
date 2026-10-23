@@ -54,6 +54,7 @@ import base64
 import binascii
 import concurrent.futures
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -91,11 +92,16 @@ from work_repo.git_ops import (
 from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
+from . import assistant_conversation
+from . import assistant_history
+from . import authority
 from . import checkin
 from . import comms
 from . import connectors
 from . import lifecycle
 from lmer_cli import comms as bus_comms
+from lmer_cli import pi_providers
+from lmer_cli import routing_receipts
 from lmer_cli import thread_access
 from lmer_cli import thread_posts
 from lmer_cli import thread_requests as thread_queue
@@ -104,10 +110,13 @@ from lmer_cli.threads import ThreadError
 
 from . import meta
 from . import mention_routing
+from . import mute
 from .ingress import Ingress
 from . import references
 from . import reattach
 from . import relations
+from . import run_transition
+from . import schema_report
 from . import session_io
 from . import session_threads
 from . import statusline
@@ -150,11 +159,13 @@ from .config import (
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
 from .meta import MetaError
-from .registry import list_sessions, prune_dead, read_session
+from .registry import ASSISTANT_KIND, list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
-    RunIndexError, filter_forgotten, forget, list_tracked, run_for_session, run_key, track,
+    UID_RE, RunIndexError, TrackedRun, filter_forgotten, forget, get_tracked, key_parts,
+    key_parts_lenient, keys as tracked_keys_of, list_tracked, load_index, run_for_session,
+    run_of_session, run_key, track,
 )
 from .session_io import ControlPlaneError, SessionIOError
 # ``_repo_urls`` and ``derive_run_identity`` are the pair that predicts a run's
@@ -184,6 +195,8 @@ from .spawn import (
     _repo_urls,
     absorb_ports,
     derive_run_identity,
+    live_session_for_run,
+    schema_two,
     spawn_session,
 )
 from .store import StoreError, utc_now_iso
@@ -191,12 +204,13 @@ from .ui_build import dist_dir
 from .workrepo import (
     fold_registry,
     folded_identity,
+    group_sessions,
     mirror_status,
     pull,
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, project_context as project_scope, project_requests, project_threads
+from . import channel_routes, projects, project_context as project_scope, project_requests, project_threads
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -225,6 +239,16 @@ WS_POLICY_VIOLATION = 1008
 #: RFC 6455 caps a close reason at 123 bytes; the reasons here are explanations,
 #: so they are truncated rather than assumed short.
 _WS_REASON_LIMIT = 120
+
+#: Key under which a tty ticket carries the credential that minted it.
+_TTY_CALLER = "tty_caller"
+#: A question its session closed unanswered: answered by file for every caller,
+#: so the file's refusal returns the reason the session gave.
+_CLOSED_ON_FILE = object()
+
+#: The commands the assistant may send a worker above ``none`` (#594): lmer's
+#: own, never a name a harness could pass to its model as an untagged turn.
+_DELEGATED_COMMANDS = frozenset({"/followup"})
 
 #: The integer settings' keys in a config request body (issues #244, #317), spelled
 #: as their config fields rather than the launch settings' short names. **Derived**
@@ -326,10 +350,24 @@ async def _close_quietly(websocket) -> None:
     ``starlette.websockets`` costs a third of a second that ``lmer platform
     status`` must not pay.
     """
+    # deferred: import cost — starlette/anyio adds ~60 ms
     from starlette.websockets import WebSocketDisconnect
 
     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
         await websocket.close()
+
+
+def _lmer_version() -> Optional[str]:
+    """The installed lmer's version, or None when it has no package metadata."""
+    try:
+        return importlib.metadata.version("lmer")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+# Read once, when the daemon imports this module: the footer names the code that is
+# serving, not whatever a later upgrade left on disk (issue 596).
+_LMER_VERSION = _lmer_version()
 
 
 def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
@@ -353,13 +391,250 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "work_repo_pull_interval": config.work_repo_pull_interval,
         "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions,
         "max_followup_rounds": config.max_followup_rounds,
+        "assistant_name": config.assistant_name,
+        "version": _LMER_VERSION,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
         **fleet_group_settings(),
     }
 
 
-def _meta_reply(host: str, project: str, slug: str, record) -> dict:
+def _run_parts(mapping, *, field: Optional[str] = None) -> tuple:
+    """``(host, project, key segment)`` for the run a request names (spec §6.1).
+
+    Every run-keyed route takes ``uid`` beside ``{host, project, slug}``, on the
+    body for a write and on the query string for a read, and addresses the
+    record by it when it is present. The segment comes from
+    :func:`lmer_platform.runs.key_parts`, the one spelling of that rule.
+
+    Two cases are answered before ``key_parts`` on purpose. A ``uid`` that is
+    present but not 32 lowercase hex is refused here with the run it was about
+    named (``key_parts`` refuses it too, but without that context), so a
+    mistyped uid never reaches the group's slug-keyed entry. And a request ``key_parts``
+    refuses is handed through as its own three fields, so the store's
+    :func:`lmer_platform.runs.run_key` gives the refusal it always gave, naming
+    the field that is missing; a schema-1 request is answered byte for byte as
+    before uids existed. *field* prefixes the uid refusal with which run it was
+    about, for a body that names two.
+
+    A request with no uid is keyed by :func:`_bound_uid`, so a slug a client
+    held from before a key transition addresses the record its entry was bound
+    to rather than whatever the slug alone would reach.
+    """
+    uid = mapping.get("uid")
+    if uid is not None and uid != "" and not (isinstance(uid, str) and UID_RE.match(uid)):
+        prefix = f"{field}: " if field else ""
+        raise RunIndexError(f"{prefix}uid must be 32 lowercase hex, got {uid!r}")
+    try:
+        return key_parts({**mapping, "uid": _bound_uid(mapping)})
+    except RunIndexError:
+        return (mapping.get("host"), mapping.get("project"), mapping.get("slug"))
+
+
+def _bound_uid(mapping) -> Optional[str]:
+    """The uid a request addresses: its own, else its slug's bound entry's.
+
+    After a key transition the slug-keyed entry is gone and its key is an alias
+    of the uid-keyed one (:mod:`lmer_platform.run_transition`), so a client
+    still holding the slug reference reaches the bound entry through
+    :func:`lmer_platform.runs.get_tracked` — and that entry's uid is the record
+    it means. Keying the read by the slug instead resolves the GROUP, whose
+    newest record is another launch's whenever the bound one is not the newest;
+    keying a write by it re-creates the slug-keyed state the transition moved.
+
+    ``None`` for every schema-1 request: an unbound entry, an untracked run and
+    an incomplete identity carry no uid, and :func:`_run_parts` then keys by the
+    slug exactly as before uids.
+    """
+    uid = mapping.get("uid")
+    if uid:
+        return uid
+    try:
+        entry = get_tracked(mapping.get("host"), mapping.get("project"), mapping.get("slug"))
+    except RunIndexError:
+        return None
+    return entry.uid if entry is not None else None
+
+
+def _run_echo(mapping) -> dict:
+    """The run a request named, as the ``run`` object of its reply.
+
+    Echoed as sent rather than as :func:`_run_parts` normalised it, which is
+    what every reply here did before uids; ``uid`` appears only when the request
+    carried one, so a schema-1 reply keeps exactly the shape it had.
+
+    Beside a uid the ``slug`` is the tracked entry's group label, and ``None``
+    for a uid no entry holds: the uid decided which run the request was about,
+    so a slug the caller sent beside it — perhaps another group's — is not
+    repeated back as if it were this run's.
+    """
+    run = {"host": mapping.get("host"), "project": mapping.get("project"),
+           "slug": mapping.get("slug")}
+    if mapping.get("uid"):
+        run["uid"] = mapping["uid"]
+        try:
+            entry = get_tracked(run["host"], run["project"], uid=run["uid"])
+        except RunIndexError:
+            entry = None
+        run["slug"] = entry.slug if entry is not None else None
+    return run
+
+
+def _query_run(host: str, project: str, slug: str, uid: str) -> dict:
+    """A read route's query parameters as the mapping a body would be."""
+    return {"host": host, "project": project, "slug": slug, "uid": uid}
+
+
+def adopt_run(
+    config: PlatformConfig,
+    host: str,
+    project: str,
+    slug: Optional[str] = None,
+    *,
+    uid: Optional[str] = None,
+    note: Optional[str] = None,
+) -> TrackedRun:
+    """Track a run an operator names, by slug or by execution uid.
+
+    The one adoption path for ``POST /api/runs/adopt`` and ``lmer platform
+    adopt``, so the two cannot disagree about what naming a uid does.
+
+    By slug it is :func:`lmer_platform.runs.track`, exactly as before uids.
+
+    By uid (spec §6.1) there are three cases, tried in this order:
+
+    - the uid is already tracked: refreshed (the note), never re-sourced, and
+      its ``conflict`` mark rechecked (:func:`lmer_platform.run_transition.recheck_conflict`);
+    - a slug-keyed entry with no uid that the key transition left
+      **unresolved** with this uid among its candidates is **bound** to this
+      record through :func:`lmer_platform.run_transition.bind`, which carries
+      its meta, relations, marks, references and home under the new key. That
+      is the operator's answer to a ``re-adopt by uid`` row, and tracking a
+      second row beside the old one instead would leave the old row unresolved
+      forever. The entry is the one the body's ``slug`` names when it names
+      one, else the one of the record's own group;
+    - otherwise a new uid-keyed entry, labelled with the slug the mirror records
+      for that uid. A slug resolving to an entry already bound to another uid is
+      not a reason to re-key that launch: this uid is a row of its own.
+
+    Before any of that, each uid-less entry the adopt could bind is examined by
+    the transition itself (:func:`lmer_platform.run_transition.settle`), so an
+    entry no state build has looked at yet — the daemon CLI never builds
+    state, and an adopt can land before the first build after an upgrade —
+    gets the launcher proof every other bind gets. If that binds it to this
+    uid, the uid is tracked and is refreshed as above; if it binds it to
+    another launch, this uid becomes a row of its own beside it; if it leaves
+    it unresolved, the candidate check applies. Binding the unexamined entry
+    straight to the named uid instead would move another launch's title,
+    relations and home onto this one whenever its last session proves it was
+    that other launch. The one bind the slug alone justifies — the group's
+    only record is this uid and nothing contradicts it — is the transition's
+    own rule 2, so it is made there.
+
+    A uid the mirror does not know is tracked only when the caller supplies the
+    slug to label it with — adopting ahead of a push, as a slug adoption may.
+
+    Two refusals guard the bind, because it moves platform state that is not
+    the record's. The entry bound must hold the record — the transition listed
+    this uid among its candidates — or a body slug naming another run would
+    carry that run's title, relations and home onto a launch they never
+    described. And a uid is adopted only on a schema-2 mirror
+    (:func:`lmer_platform.spawn.schema_two`): a legacy work repo has no
+    execution records, so a uid there names nothing a container will ever
+    write.
+    """
+    if uid is None or uid == "":
+        return track(host, project, slug, source="adopted", note=note)
+    if not (isinstance(uid, str) and UID_RE.match(uid)):
+        raise RunIndexError(f"uid must be 32 lowercase hex, got {uid!r}")
+    run_key(host, project, uid)
+    try:
+        uid_keyed = schema_two(config)
+    except SpawnError as exc:
+        raise RunIndexError(str(exc)) from exc
+    if not uid_keyed:
+        raise RunIndexError(
+            f"cannot adopt {uid}: the work repo is not schema 2, so it has no "
+            "execution records to address by uid — adopt the run by its slug"
+        )
+    existing = get_tracked(host, project, uid=uid)
+    if existing is not None:
+        return _refresh_adopted(host, project, existing, note)
+    ref = resolve_run_dir(config, host, project, uid=uid)
+    labels = list(dict.fromkeys(
+        label for label in (slug, ref.slug if ref is not None else None) if label
+    ))
+    for label in labels:
+        run_transition.settle(config, host, project, label)
+    existing = get_tracked(host, project, uid=uid)
+    if existing is not None:
+        return _refresh_adopted(host, project, existing, note)
+    for label in labels:
+        entry = get_tracked(host, project, label)
+        if entry is not None and entry.uid is None:
+            if not _holds_record(entry, uid):
+                raise RunIndexError(
+                    f"run {entry.key} does not hold record {uid}, which "
+                    + (
+                        f"sits in group {ref.slug!r}" if ref is not None
+                        else "is not in the mirror"
+                    )
+                    + " — binding it would move that run's state onto another "
+                    "launch; name the record's own slug, or none"
+                )
+            bound = run_transition.bind(config, host, project, entry.slug, uid)
+            if note is None:
+                return bound
+            return track(host, project, bound.slug, uid=uid, source="adopted", note=note)
+    label = ref.slug if ref is not None else slug
+    if not label:
+        raise RunIndexError(
+            f"no record {uid} for {host}/{project} is in the mirror, so there is no "
+            "slug to track it under — supply the slug, or wait for the record to be "
+            "pushed and the mirror to pull it (POST /api/rescan)"
+        )
+    return track(host, project, label, uid=uid, source="adopted", note=note)
+
+
+def _refresh_adopted(host: str, project: str, existing: TrackedRun,
+                     note: Optional[str]) -> TrackedRun:
+    tracked = track(host, project, existing.slug, uid=existing.uid, source="adopted",
+                    note=note)
+    # Re-adopting is how an operator says a conflicting carry is resolved;
+    # the mark goes for every store whose pair has been written since
+    # (:func:`lmer_platform.runs.settle_conflict`).
+    run_transition.recheck_conflict(tracked.key)
+    return tracked
+
+
+def _holds_record(entry: TrackedRun, uid: str) -> bool:
+    """Whether the slug-keyed *entry* may be bound to the record *uid*.
+
+    Only when the key transition left it unresolved with *uid* among its
+    candidates — the transition's own word that this entry may be that launch.
+    :func:`adopt_run` has had the transition examine the entry first, so an
+    entry whose group alone proves the record is already bound by now, and a
+    group match is never a reason on its own: two records in one group are
+    exactly the case the launcher rule decides.
+    """
+    mark = run_transition.readopt_marks().get(entry.key) or {}
+    return any(
+        isinstance(candidate, dict) and candidate.get("uid") == uid
+        for candidate in mark.get("candidates") or []
+    )
+
+
+def _candidate_uid(ref) -> Optional[str]:
+    """The execution uid of the record a candidate row addresses, or ``None``.
+
+    :attr:`RunDirRef.uid`, which :func:`lmer_platform.workrepo.run_dirs` sets
+    for a schema-form session dir named by its uid and leaves ``None`` for a
+    legacy run dir and an unmigrated record.
+    """
+    return ref.uid or None
+
+
+def _meta_reply(run: dict, record) -> dict:
     """The body both metadata routes answer with (T52).
 
     One shape for the read and the write, so a client that just set a title does
@@ -374,7 +649,7 @@ def _meta_reply(host: str, project: str, slug: str, record) -> dict:
     the run — see :mod:`lmer_platform.meta`.
     """
     return {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "meta": record.to_dict(),
         "limits": {
             "title": meta.MAX_TITLE_CHARS,
@@ -385,15 +660,17 @@ def _meta_reply(host: str, project: str, slug: str, record) -> dict:
     }
 
 
-def _related_ref(body: dict) -> tuple:
-    """The *other* run named by a relate/unrelate body, as a triple.
+def _related_ref(body: dict) -> dict:
+    """The *other* run named by a relate/unrelate body, as the object it was sent as.
 
     One nested object rather than three more top-level fields, and that is the
     decision worth stating: the thing being related is a **run**, so it carries a
-    run's three field names — ``related_host``/``related_project``/``related_slug``
+    run's field names — ``related_host``/``related_project``/``related_slug``
     would be a second spelling of the identity every other route on this API
-    already has one spelling for. The refusal names the shape because the mistake
-    it catches (a bare string, or the composite key) is the natural one.
+    already has one spelling for, and the ``uid`` a schema-2 run is addressed by
+    (spec §6.1) rides in it the same way. The refusal names the shape because
+    the mistake it catches (a bare string, or the composite key) is the natural
+    one.
 
     Raises :class:`lmer_platform.relations.RelationError` rather than an
     ``HTTPException`` so the two routes keep one handler and one status source —
@@ -406,21 +683,10 @@ def _related_ref(body: dict) -> tuple:
             '"project": ..., "slug": ...}, the same three fields this body names '
             f"the first run with — got {type(related).__name__}"
         )
-    return related.get("host"), related.get("project"), related.get("slug")
+    return related
 
 
-def _run_ref_dict(run: tuple) -> dict:
-    """A ``(host, project, slug)`` triple as the object every reply names a run with.
-
-    Echoed back on a write so a caller reading the reply alone can see which two
-    runs it acted on, in the shape ``run`` already uses on the same body.
-    """
-    return {"host": run[0], "project": run[1], "slug": run[2]}
-
-
-def _relations_reply(
-    host: str, project: str, slug: str, extra: Optional[dict] = None
-) -> dict:
+def _relations_reply(run: dict, extra: Optional[dict] = None) -> dict:
     """The body all three relation routes answer with (T53).
 
     One shape for the read and both writes, for :func:`_meta_reply`'s reason: a
@@ -442,7 +708,7 @@ def _relations_reply(
     """
     titles = meta.load_all()
     payload = {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "relations": [
             {
                 **entry.to_dict(),
@@ -450,7 +716,7 @@ def _relations_reply(
                     entry.key, titles.get(entry.key)
                 ).title,
             }
-            for entry in relations.list_for(host, project, slug)
+            for entry in relations.list_for(*_run_parts(run))
         ],
         # The daemon's own cap, so a UI can say how many are left from the number
         # that will actually refuse the next one rather than from a copy of it.
@@ -480,8 +746,6 @@ def _handoff_reply(state) -> dict:
     carries the one distinction a starting assistant has to be able to make —
     see :data:`_NO_HANDOFF_NOTE`.
     """
-    from . import assistant_history
-
     latest = assistant_history.latest()
     previous = assistant_history.reference(latest["previous_session"]) if latest else None
     return {
@@ -633,7 +897,19 @@ def _body_launch_settings(payload: dict) -> Optional[dict]:
     and reading as "leave it alone".
     """
     named = {key: value for key, value in payload.items() if key not in ("handoff", "workspace_id")}
+    _refuse_worker_settings(named)
     return named or None
+
+
+def _refuse_worker_settings(body: dict) -> None:
+    """The assistant's routes write project settings, and the assistant may
+    call them: a delegation it could set would be one it grants itself (#594)."""
+    named = sorted(set(body) & set(projects.WORKER_SETTING_KEYS))
+    if named:
+        raise projects.ProjectError(
+            f"{', '.join(named)} is a project setting: change it with PATCH /api/projects/{{id}}",
+            code="project_setting",
+        )
 
 
 def _run_dir_files(root: Path) -> tuple[list[str], bool]:
@@ -670,9 +946,7 @@ def _run_dir_files(root: Path) -> tuple[list[str], bool]:
     return found[:_MAX_RUN_FILES], len(found) > _MAX_RUN_FILES
 
 
-def _run_files_reply(
-    config: PlatformConfig, host: str, project: str, slug: str
-) -> dict:
+def _run_files_reply(config: PlatformConfig, run: dict) -> dict:
     """One run's files and the forge URL of each (T66).
 
     The operator asked: "the detail view should have a list of run files, clicking
@@ -714,7 +988,10 @@ def _run_files_reply(
     other about a URL either could have built. The opt-out moved to the knob, where
     an operator who really is on something else can say ``none`` once.
     """
-    ref = resolve_run_dir(config, host, project, slug)
+    ref = resolve_run_dir(
+        config, run.get("host"), run.get("project"), run.get("slug") or None,
+        uid=_bound_uid(run) or None,
+    )
     base = _web_base_from_remote((config.work_repo_url or "").strip()) or ""
     branch = checkout_branch(config.mirror_path)
     forge = config.work_repo_forge
@@ -738,7 +1015,7 @@ def _run_files_reply(
         ]
 
     return {
-        "run": {"host": host, "project": project, "slug": slug},
+        "run": _run_echo(run),
         "rel_path": ref.rel_path if ref is not None else None,
         "present": ref is not None,
         "files": files,
@@ -756,6 +1033,106 @@ def _run_files_reply(
             else None
         ),
         "note": _RUN_FILES_NOTE,
+    }
+
+
+_RUN_SESSIONS_NOTE = (
+    "the session records of this run's _runs/<slug>/ group in this daemon's "
+    "mirror, oldest start first. Each is one launch, addressed by its uid; "
+    "live, tracked and the project fields are this orchestrator's own. No pull "
+    "is forced, so a launch that pushed seconds ago can be missing for one "
+    "interval."
+)
+
+
+#: The per-row fields of ``GET /api/runs/sessions`` that come from this
+#: platform rather than the mirror: what a caller scoped to one project may not
+#: see on a sibling homed in another (:func:`_run_sessions_reply`).
+_RUN_SESSIONS_PLATFORM_FIELDS = (
+    "live", "live_session", "tracked", "workspace_id", "home_revision",
+    "confirm_project", "workspace_name", "workspace_color",
+)
+
+
+def _run_sessions_reply(
+    config: PlatformConfig, run: dict, parts: tuple, *, scope: Optional[str] = None
+) -> dict:
+    """``{run, form, group, sessions, note}`` for one ``_runs/<slug>/`` group (#374).
+
+    The records come from :func:`lmer_platform.workrepo.group_sessions` — mirror
+    facts only, in start order — and this adds what only the platform knows, per
+    ROW rather than per request:
+
+    - ``live`` / ``live_session``: a live registry entry filed under that row's
+      uid (:func:`lmer_platform.spawn.live_session_for_run`, spec §6.3);
+    - ``tracked``: whether that uid is tracked (:func:`get_tracked`);
+    - ``current``: the row the request addressed — its ``uid``, or the uid its
+      slug-keyed entry was bound to (:func:`_bound_uid`). A slug alone names
+      the group, not one launch, so then no row is current;
+    - ``workspace_id`` / ``home_revision`` / ``confirm_project`` (and the
+      project's name and colour): the row's OWN authorized project context,
+      read through :func:`lmer_platform.project_api.annotate` — exactly the
+      call that puts those fields on a fleet row for RunDetail's resume — keyed
+      by the child's own run key (astra PR6). A resume posted from a child row
+      therefore never borrows the parent row's home revision, which the
+      request binding would refuse as a stale one.
+
+    A row whose id is not a 32-hex uid (a timestamp-id launch of a schema-1
+    tree) answers ``live`` and ``tracked`` as ``None``: those are keyed by the
+    group's slug there, and a slug-level session cannot be attributed to one of
+    its launches. Its project context is the slug run's, which is its key.
+
+    *scope* is the one project a non-operator caller may see (projects on,
+    the request bound to it). A sibling row homed in ANOTHER project keeps its
+    mirror facts — the group is one target's, already addressed — but loses
+    every platform fact: its live session, tracking, workspace and revision
+    are that project's business, as ``/api/state`` hides them too.
+    """
+    # deferred: import cost — project_api -> fastapi adds ~250 ms
+    from . import project_api
+
+    host, project = parts[0], parts[1]
+    slug = run.get("slug") or None
+    found = group_sessions(config, host, project, slug, uid=run.get("uid") or None)
+    requested = _bound_uid(run) or None
+    # A row with no uid is keyed by its group's slug — the group directory's
+    # name, since a request by uid alone names no slug.
+    group_slug = slug or (found["group"].rsplit("/", 1)[-1] if found["group"] else None)
+    rows = []
+    for facts in found["sessions"]:
+        row_uid = facts["uid"]
+        by_uid = bool(UID_RE.fullmatch(row_uid or ""))
+        live = (
+            live_session_for_run(host, project, slug, uid=row_uid) if by_uid else None
+        )
+        tracked = (
+            get_tracked(host, project, uid=row_uid) is not None if by_uid else None
+        )
+        context = project_api.annotate({"sessions": [{
+            "host": host, "project": project, "slug": group_slug,
+            "uid": row_uid if by_uid else None,
+            "session": {"id": live.get("id")} if live else None,
+        }]})["sessions"][0]
+        rows.append({
+            **facts,
+            "live": (live is not None) if by_uid else None,
+            "live_session": live.get("id") if live else None,
+            "tracked": tracked,
+            "current": requested is not None and row_uid == requested,
+            "workspace_id": context.get("workspace_id"),
+            "home_revision": context.get("home_revision"),
+            "confirm_project": bool(context.get("confirm_project")),
+            "workspace_name": context.get("workspace_name"),
+            "workspace_color": context.get("workspace_color"),
+        })
+        if scope is not None and rows[-1]["workspace_id"] != scope:
+            rows[-1].update(dict.fromkeys(_RUN_SESSIONS_PLATFORM_FIELDS))
+    return {
+        "run": _run_echo(run),
+        "form": found["form"],
+        "group": found["group"],
+        "sessions": rows,
+        "note": _RUN_SESSIONS_NOTE,
     }
 
 
@@ -777,6 +1154,31 @@ def _fold_checkins(payload: dict) -> None:
     for row in (payload.get("runs") or []) + (payload.get("attention") or []):
         if isinstance(row, dict):
             row["checkin"] = checkin.row_checkin(row, marks, window=window)
+
+
+def _fold_mute(payload: dict, sessions: list) -> None:
+    """Put ``muted`` on each row, in place (#458).
+
+    Before :func:`_fold_checkins`, which reads it: a muted run is not eligible
+    for a check-in, so its row must not carry a stale marker either. Always a
+    boolean, so a listing tests one field.
+
+    Through :func:`lmer_platform.mute.run_muted`, the resolver the record
+    filter uses, so a row never says muted while its chatter still spools —
+    or the other way round, for a session row still spelled by a slug a key
+    transition or a rename left behind.
+    """
+    entries = mute.load_all()
+    index = load_index() if entries else {}
+    by_session = mute.muted_sessions(sessions)
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        session = row.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
+        row["muted"] = mute.run_muted(key_parts_lenient(row), entries, index) or (
+            session_id is not None and session_id in by_session
+        )
 
 
 def _fold_threads(payload: dict) -> None:
@@ -827,10 +1229,9 @@ def _fold_relations(payload: dict) -> None:
         # (:class:`lmer_platform.inventory.RunView`), which is the same shape
         # ``runKey()`` composes from in the browser — so the client joins these
         # edges to its nodes without parsing anything.
-        try:
-            keys.add(run_key(row.get("host"), row.get("project"), row.get("slug")))
-        except Exception:
-            continue
+        parts = key_parts_lenient(row)
+        if parts is not None:
+            keys.add(run_key(*parts))
     payload["relations"] = [
         {"a": first, "b": second}
         for first, second in relations.all_pairs()
@@ -852,16 +1253,34 @@ def _fold_references(payload: dict) -> None:
     for row in (payload.get("runs") or []) + (payload.get("attention") or []):
         if not isinstance(row, dict):
             continue
-        run = row.get("run") if isinstance(row.get("run"), dict) else {}
-        try:
-            key = run_key(run.get("host"), run.get("project"), run.get("slug"))
-        except Exception:
+        # The flat fleet row, or a nested ``run`` block when the row has no flat
+        # identity, keyed by its uid when it carries one.
+        parts = key_parts_lenient(row)
+        if parts is None:
             continue
+        key = run_key(*parts)
         row["references"] = [
             item for item in (references.ThreadReference.from_dict(raw) for raw in stored.get(key) or [])
             if item is not None
         ]
         row["references"] = [item.to_dict() for item in row["references"]]
+
+
+def _fold_readopt(payload: dict, marks: dict) -> None:
+    """Put "re-adopt by uid" and its candidates on the rows that need it, in place.
+
+    *marks* is :func:`lmer_platform.run_transition.readopt_marks`: an entry left
+    unresolved by the key transition carries its candidate records, and one whose
+    carry kept two differing values names the stores that clashed (spec §6.1).
+    ``readopt`` is ``None`` on every other row. Both lists get it, like the
+    folds above.
+    """
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        parts = key_parts_lenient(row)
+        mark = marks.get(run_key(*parts)) if parts is not None else None
+        row["readopt"] = dict(mark) if mark else None
 
 
 def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
@@ -878,6 +1297,17 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     :mod:`lmer_platform.inventory`).
     """
     mirror = pull(config, force=force_pull).to_dict()
+    # The tree's form, so the UI can gate its schema views (#374): a presence
+    # test and no validation — the validator runs only behind
+    # GET /api/workrepo/schema, never on the poll.
+    mirror["form"] = schema_report.mirror_form(config)
+    # Before the index and the registry are read: an entry a pre-A2 daemon keyed
+    # by slug for a schema-2 group is bound to its record or marked unresolved
+    # here, so it is never shown on "the newest record in the group", and a live
+    # session's registry entry it canonicalizes joins the bound row (spec §6.1).
+    # A read of the index and nothing else once every entry carries its uid.
+    run_transition.reconcile(config)
+    readopt = run_transition.readopt_marks()
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
     with assistant._PUBLICATION_LOCK:
@@ -887,11 +1317,20 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     sessions = filter_forgotten(sessions)
     sessions = absorb_ports(sessions)
     tracked = list_tracked()
+    # Each ref travels with the entry that resolved it, so the inventory keys the
+    # row by that entry — uid or slug (spec §6.1) — and never re-derives a key
+    # from the directory it found. A uid-keyed entry is resolved by its uid: the
+    # slug walk would hand back the group's newest record, which for the older
+    # of two launches is the other launch's.
     refs = [
-        ref
-        for ref in (
-            resolve_run_dir(config, entry.host, entry.project, entry.slug)
+        (entry, ref)
+        for entry, ref in (
+            (entry, resolve_run_dir(
+                config, entry.host, entry.project, entry.slug, uid=entry.uid,
+            ))
             for entry in tracked
+            # An unresolved entry names no record: any one would be a guess.
+            if "candidates" not in readopt.get(entry.key, {})
         )
         if ref is not None
     ]
@@ -945,10 +1384,12 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         "slots_problem": slots_problem,
     }
     payload.update(inventory.to_dict())
+    _fold_mute(payload, sessions)
     _fold_checkins(payload)
     _fold_threads(payload)
     _fold_references(payload)
     _fold_relations(payload)
+    _fold_readopt(payload, readopt)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -1072,7 +1513,7 @@ def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]
 def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
     """``(schema-form project dir, problem)`` for *repo_url* in the mirror (D20).
 
-    The second tree shape (issue #353): with a ``_plexus.yaml`` at the mirror
+    The second tree shape (issue #353): with a ``_lmer.yaml`` at the mirror
     root the project dir is a flat top-level SHORT NAME (D7), and nothing in a
     repo URL says which name that is — only the registry does (D8). So the URL is
     looked up across every entry's ``repo:`` and ``remotes:`` through
@@ -1101,6 +1542,7 @@ def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
     nothing, the split D20 draws for the work CLI's resolver.
     """
     try:
+        # deferred: optional dependency — the lmer_schema core may be absent; ImportError degrades (D20)
         from lmer_schema import ManifestError, has_manifest, load_registry
     except ImportError:  # pragma: no cover - the package ships with this one
         return None, None
@@ -1140,7 +1582,7 @@ def _mirror_project_dirs(
             "platform_mirror_manifest_unusable path=%s problem=%s — the project "
             "taskdef tier is dropped rather than resolved against the "
             "pre-migration path",
-            mirror / "_plexus.yaml", problem,
+            mirror / "_lmer.yaml", problem,
         )
         return []
     roots = [schema_dir] if schema_dir is not None else []
@@ -1346,8 +1788,6 @@ def _discovered_models() -> dict:
     most the deadline to the first call in a window and nothing to the rest.
     """
     try:
-        from lmer_cli import pi_providers
-
         providers = pi_providers.load_providers()
     except Exception as exc:  # noqa: BLE001 - a menu is never worth a 500
         logger.warning("platform_model_discovery_failed error=%r", exc)
@@ -1821,11 +2261,36 @@ def _author_of(caller: "Caller", requested: object) -> Optional[str]:
     return "operator" if caller.kind == CALLER_OPERATOR else None
 
 
-def _thread_label(caller: "Caller") -> str:
+def _authority_of(caller: "Caller", session_id: str, kind: str) -> Optional[str]:
+    """The delegated level stamped on the assistant's message or answer (#594):
+    from the credential and the platform's settings, never from the body."""
+    if not caller.is_assistant or kind not in (comms.KIND_MESSAGE, comms.KIND_ANSWER):
+        return None
+    return authority.for_session(session_id)
+
+
+def _caller_meta(meta: object, kind: str) -> Optional[dict]:
+    """A caller's ``meta`` without the keys only the platform sets (#594).
+
+    The bus drops them too, but a supervisor older than the stamp would keep
+    them, and the daemon owns the stamp whatever image is on the other end.
+    """
+    if not isinstance(meta, dict):
+        return None
+    kept = {key: value for key, value in meta.items() if key != bus_comms.META_AUTHORITY}
+    if kind != bus_comms.KIND_QUESTION:
+        kept.pop(bus_comms.META_OPERATOR_ONLY, None)
+    return kept
+
+
+def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
     """Who a thread is told wrote a post the platform made: from the credential,
     never from the body — the rule the bus already applies to ``source.channel``."""
     if caller.is_assistant:
-        return "uber lmer"
+        return session_threads.assistant_label(
+            project_scope.current() if projects.enabled() else None,
+            name=config.assistant_name,
+        )
     if caller.kind == CALLER_CONNECTOR and caller.channel:
         return caller.channel
     return CALLER_OPERATOR
@@ -1851,12 +2316,53 @@ def _note_check(
     credential counts (a browser tab left open would otherwise suppress the
     reminders for the run on screen), and only routes naming **one** run stamp
     (``GET /api/state`` would mark the whole fleet checked at once).
+
+    *run* is ``(host, project, key segment)``. A slug that reaches a bound
+    entry through its alias (:mod:`lmer_platform.run_transition`) stamps the
+    entry's own key, for the reason :func:`lmer_platform.runs.note_session`
+    gives: stamping the slug would re-create the mark the transition moved.
     """
     if not caller.is_assistant:
         return
     identity = run or (run_for_session(session_id) if session_id else None)
-    if identity:
-        checkin.record_check(*identity)
+    if not identity:
+        return
+    try:
+        tracked = get_tracked(*identity)
+    except RunIndexError:
+        tracked = None
+    if tracked is not None:
+        identity = key_parts(tracked.to_dict())
+    checkin.record_check(*identity)
+
+
+def _note_check_started(caller: "Caller", result, body: dict) -> None:
+    """:func:`_note_check` for a verb whose session is already running.
+
+    The run is the one the verb validated and acted on — the result's
+    ``host``/``project``/``slug``/``uid`` — never the raw body, whose uid the
+    request may have stripped of padding; a result that carries none of them
+    falls back to a lenient read of the body. And nothing here may raise: the
+    container has started, so a 500 now would send the operator to answer or
+    resume again for a session that exists. A key that will not compose costs
+    one superfluous reminder, which is logged.
+    """
+    try:
+        fields = {
+            name: getattr(result, name, None)
+            for name in ("host", "project", "slug", "uid")
+        }
+        parts = (
+            key_parts(fields) if fields["host"] and fields["project"]
+            else key_parts_lenient(body)
+        )
+        if parts is not None:
+            _note_check(caller, run=parts)
+    except Exception as exc:
+        logger.warning(
+            "platform_checkin_skipped error=%s — the session is already "
+            "running; only the record of the look is missing", exc,
+        )
 
 
 def _presented_secret(authorization: Optional[str]) -> Optional[str]:
@@ -1892,6 +2398,7 @@ def create_app(
     *state_builder* is injectable so tests can exercise routing and auth without
     a work repo or a network.
     """
+    # deferred: import cost — fastapi adds ~320 ms; anyio, starlette.requests and GZipMiddleware ~58 ms together
     import anyio
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
@@ -1900,6 +2407,7 @@ def create_app(
     from starlette.websockets import WebSocketDisconnect
     from starlette.requests import Request
 
+    # deferred: import cost — project_api -> fastapi adds ~350 ms
     from . import peers, project_api
 
     if not secret:
@@ -1925,6 +2433,7 @@ def create_app(
     # GZipMiddleware only touches `http` scopes, so the tty WebSocket is
     # unaffected — which is what we want: its frames are already base64 of raw
     # terminal bytes and are latency-sensitive, not bandwidth-bound.
+    # deferred: import cost — reached only past the shared-secret refusal; ~58 ms with anyio and starlette.requests
     from starlette.middleware.gzip import GZipMiddleware
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -2093,9 +2602,16 @@ def create_app(
             "                              read off the mirror, no pull forced\n"
             "  POST /api/rescan            force a work-repo pull, then re-read\n"
             "  POST /api/prune             forget dead session entries\n"
-            "  GET  /api/runs/candidates   every run in the shared work repo\n"
+            "  GET  /api/runs/candidates   every run in the shared work repo, each\n"
+            "                              with its record's uid (null for a\n"
+            "                              legacy run)\n"
             "  POST /api/runs/adopt        track an existing run {host,project,slug}\n"
+            "                              or {host,project,uid}; a uid also binds\n"
+            "                              a row marked \"re-adopt by uid\"\n"
             "  POST /api/runs/forget       stop tracking a run\n"
+            "                              Every run-keyed route below, and both\n"
+            "                              above, take uid beside slug (body or\n"
+            "                              ?uid=) and address the record by it\n"
             "  GET  /api/runs/meta         what a run is about: this\n"
             "                              orchestrator's title and description\n"
             "                              for it ?host=&project=&slug=\n"
@@ -2106,6 +2622,19 @@ def create_app(
             "                              (D3): local to this orchestrator,\n"
             "                              invisible to anyone else's fleet view,\n"
             "                              and dropped when the run is forgotten\n"
+            "  POST /api/runs/mute         stop a tracked run's routine records\n"
+            "                              (messages, replies and notes a person or\n"
+            "                              the agent wrote, answers, commands,\n"
+            "                              closes) reaching the assistant's spool\n"
+            "                              {host,project,slug|uid}. Questions,\n"
+            "                              milestones, the platform's own notices,\n"
+            "                              crashes and complete still spool; a\n"
+            "                              muted run is left out of stale_runs and\n"
+            "                              stalled digests. Fleet rows carry muted.\n"
+            "                              PLATFORM state, local to this\n"
+            "                              orchestrator, dropped on forget\n"
+            "  POST /api/runs/unmute       undo it, session mutes of the run too;\n"
+            "                              nothing suppressed is replayed\n"
             "  GET  /api/runs/relations    runs this orchestrator considers related\n"
             "                              to this one ?host=&project=&slug=, each\n"
             "                              with tracked: false meaning it is not in\n"
@@ -2131,9 +2660,24 @@ def create_app(
             "                              none), not a missing file; no pull is\n"
             "                              forced, so a just-pushed file can lag\n"
             "                              one interval\n"
+            "  GET  /api/runs/sessions     the session records of the run's\n"
+            "                              _runs/<slug>/ group in this daemon's\n"
+            "                              mirror ?host=&project=&slug=|uid=, in\n"
+            "                              start order, each with its uid, state,\n"
+            "                              live, tracked and its own project\n"
+            "                              context; a legacy tree or row answers\n"
+            "                              form: legacy and none. No pull\n"
+            "  GET  /api/workrepo/schema   lmer-schema validate --json over this\n"
+            "                              daemon's mirror, as the CLI prints it,\n"
+            "                              plus form, tier and the host buckets\n"
+            "                              awaiting `work adopt`. Cached per\n"
+            "                              revision for ten minutes; ?refresh=1\n"
+            "                              re-validates. A legacy tree has no\n"
+            "                              document. No pull\n"
             "  POST /api/runs/answer       answer a question-blocked run\n"
-            "                              {host,project,slug,answer} — starts a\n"
-            "                              fresh session carrying the answer\n"
+            "                              {host,project,slug,answer,repo_url?} —\n"
+            "                              starts a fresh session carrying the\n"
+            "                              answer\n"
             "  POST /api/runs/resume       continue a tracked run by starting its\n"
             "                              next session {host,project,slug,\n"
             "                              taskdef?,repo_url?,direction?,\n"
@@ -2188,6 +2732,10 @@ def create_app(
             "control plane, so it reaches a session whose host terminal died with a\n"
             "previous daemon; exit refuses that case (409) rather than signalling a\n"
             "pid this daemon no longer owns.\n\n"
+            "Muting by session (POST /api/runs/mute's session form):\n"
+            "  POST /api/sessions/{id}/mute    mute its run when this orchestrator\n"
+            "                                  tracks it, else the session itself\n"
+            "  POST /api/sessions/{id}/unmute  undo it\n\n"
             "The orchestrating assistant — the one session this platform runs for\n"
             "itself, and the thing the operator chats with:\n"
             "  GET  /api/assistant          whether one is running, which session,\n"
@@ -2261,6 +2809,9 @@ def create_app(
             "  PATCH /api/projects/{workspace_id}  change name, color, repositories, settings\n"
             "  POST /api/projects/{workspace_id}/archive  archive eligible project\n"
             "  POST /api/projects/{workspace_id}/restore  restore stopped\n"
+            "  GET  /api/channel-routes    Slack channel / Matrix room → project mention routes\n"
+            "  PUT  /api/projects/{workspace_id}/channel-routes  replace its {channels}\n"
+            "  DELETE /api/channel-routes?channel=  drop one route, archived holders included\n"
             "  GET|POST /api/settings      fleet assistant capacity\n"
             "  POST /api/runs/move         inactive run: assign/transfer to destination_id,\n"
             "                               with workspace_id and home_revision\n"
@@ -2323,9 +2874,30 @@ def create_app(
     def project_restore(workspace_id: str) -> dict:
         return project_api.public_project(projects.restore(workspace_id))
 
+    @app.get("/api/channel-routes", dependencies=guard)
+    def channel_route_list() -> dict:
+        return {"routes": channel_routes.listing()}
+
+    @app.put("/api/projects/{workspace_id}/channel-routes", dependencies=guard)
+    def channel_route_replace(workspace_id: str, body: dict) -> dict:
+        try:
+            return {"routes": channel_routes.replace(workspace_id, body.get("channels"))}
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.delete("/api/channel-routes", dependencies=guard)
+    def channel_route_remove(channel: str) -> dict:
+        try:
+            return {"routes": channel_routes.remove(channel)}
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
     @app.post("/api/runs/move", dependencies=guard)
     def move_run(body: dict) -> dict:
-        key = run_key(body.get("host") or "", body.get("project") or "", body.get("slug") or "")
+        try:
+            key = run_key(*_run_parts(body))
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return projects.move(key, body.get("destination_id"), expected_project=project_scope.current(),
                              expected_revision=body.get("home_revision"))
 
@@ -2333,7 +2905,7 @@ def create_app(
     def project_context(source_workspace_id: str) -> dict:
         source = projects.get(source_workspace_id)
         payload = project_api.annotate(builder(config), workspace_id=source_workspace_id)
-        fields = {"host", "project", "slug", "title", "label", "state", "status", "phase", "attention"}
+        fields = {"host", "project", "slug", "uid", "title", "label", "state", "status", "phase", "attention"}
         return {"source": {"id": source["id"], "name": source["name"]},
                 "runs": [{key: value for key, value in row.items() if key in fields}
                          for row in payload.get("runs", [])]}
@@ -2431,7 +3003,7 @@ def create_app(
         return discover_spawn_options(config, target=target, repo_url=repo_url)
 
     @app.post("/api/sessions", dependencies=guard, status_code=201)
-    def create_session(body: dict) -> dict:
+    def create_session(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Spawn a session and start tracking its run.
 
         Returns 429 at the concurrency cap rather than queueing: the queue that
@@ -2468,6 +3040,9 @@ def create_app(
                 agents=body.get("agents"),
                 harness=body.get("harness"),
                 model=body.get("model"),
+                session_metadata=body.get("session_metadata"),
+                source_session_id=body.get("source_session_id"),
+                allow_unsigned_source=body.get("allow_unsigned_source"),
                 # Not a launch flag like the four above it: the slot resolves
                 # against ``config.slots`` and supplies the preset, which is why
                 # naming both is refused rather than ordered (issue #245).
@@ -2482,6 +3057,8 @@ def create_app(
                 # it afterwards go through one validation and one file.
                 title=body.get("title"),
                 description=body.get("description"),
+                supervisor_authority=body.get("supervisor_authority"),
+                supervisor_authority_capped=caller.kind != CALLER_OPERATOR,
             )
             result = spawn_session(config, request)
         except CapacityError as exc:
@@ -2566,6 +3143,47 @@ def create_app(
             **chunk.to_dict(),
         }
 
+    def _refuse_untagged_typing(caller: Caller, session_id: str) -> None:
+        """Keystrokes reach a worker with no tag, so the assistant could type a
+        turn that looks stamped. Closed where the stamp means something: a
+        worker whose effective level is above ``none`` (#594)."""
+        level = _delegated_level(caller, session_id)
+        if level is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"session {session_id} gives the assistant authority={level}, so the assistant "
+                    "may not type into it untagged: send a message on its bus (lmer-ctl send)"
+                ),
+            )
+
+    def _delegated_level(caller: Caller, session_id: str) -> Optional[str]:
+        """The assistant's level on a worker, when it is above ``none``."""
+        if not caller.is_assistant:
+            return None
+        # Keyed on the assistant, as spawn and lifecycle are: an entry that is
+        # missing or unreadable is a worker, so it fails closed.
+        entry = read_session(session_id) or {}
+        if entry.get("kind") == ASSISTANT_KIND:
+            return None
+        level = authority.for_session(session_id)
+        return None if level == bus_comms.AUTHORITY_NONE else level
+
+    def _refuse_command_arguments(caller: Caller, session_id: str, kind: str, text: str) -> None:
+        """A command is typed untagged, and its arguments are free words: above
+        ``none`` the assistant may send a bare :data:`_DELEGATED_COMMANDS` only (#594)."""
+        if kind != comms.KIND_COMMAND or text.strip() in _DELEGATED_COMMANDS:
+            return
+        level = _delegated_level(caller, session_id)
+        if level is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"session {session_id} gives the assistant authority={level}, so its only "
+                    f"command is a bare {' or '.join(sorted(_DELEGATED_COMMANDS))}: send the words as a message"
+                ),
+            )
+
     @app.post("/api/sessions/{session_id}/input", dependencies=guard)
     def session_input(
         session_id: str, body: dict, caller: Caller = Depends(require_secret)
@@ -2596,12 +3214,14 @@ def create_app(
                 body.get("preserve_slash_commands") and data.startswith("/")
                 and caller.kind in comms.COMMAND_CALLERS
             ) else comms.KIND_MESSAGE
+            _refuse_command_arguments(caller, session_id, kind, data)
             try:
                 session_io.require_session(session_id)
                 result = hub.post(
                     session_id, kind=kind, text=data.rstrip("\r\n"),
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    authority=_authority_of(caller, session_id, kind),
                 )
             except SessionIOError as exc:
                 raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -2616,7 +3236,7 @@ def create_app(
                 "queued": bool(relay.get("queued")),
                 "submit_confirmed": False,
                 "note": (
-                    "Accepted; typing is held until startup submission completes. "
+                    "Accepted and queued for delivery, after startup submission if that is still pending. "
                     if relay.get("queued") else ""
                 ) + _SUBMIT_VIA_BUS_NOTE,
                 "submit_text": relay.get("submit_text"),
@@ -2631,6 +3251,7 @@ def create_app(
                 "Deprecation": "true",
                 "Link": f'</api/sessions/{session_id}/comms>; rel="successor-version"',
             })
+        _refuse_untagged_typing(caller, session_id)
         try:
             reply = session_io.send_input(
                 session_id, data,
@@ -2709,7 +3330,7 @@ def create_app(
         """
         try:
             session_io.require_session(session_id)
-            page = transcripts.read_messages(session_id, since=since, limit=limit)
+            page = transcripts.read_messages(session_id, since=since, limit=limit, assistant_name=config.assistant_name)
             live = session_io.session_is_live(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -2763,8 +3384,9 @@ def create_app(
         except bus_comms.CommsError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    def _answer_target(hub, session_id: str, question_id: str) -> Optional[str]:
-        """The bus question this answer names, or ``None`` to answer by file.
+    def _answer_target(hub, session_id: str, question_id: str) -> object:
+        """The bus question this answer names, ``None`` to answer by file, or
+        :data:`_CLOSED_ON_FILE` for a question its session closed unanswered.
 
         A session can have a bus and still ask through the ask directory: its
         image carries the supervisor but the CLI that asked predates it, which
@@ -2787,7 +3409,7 @@ def create_app(
             # The bus would refuse this too, as a late answer — but "already
             # answered" names an event that did not happen and drops the one
             # thing the operator can act on.
-            return None
+            return _CLOSED_ON_FILE
         return hub.question_for_ask_entry(
             session_id, question_id,
             mirrored=ask.entry_is_the_bus_projection(session_id, question_id),
@@ -2834,10 +3456,22 @@ def create_app(
         # arbitrates first-answer-wins and every channel sees who answered. The
         # reply keeps this route's shape; a late answer keeps its 409.
         hub = comms.ensure_hub()
-        target = (
-            _answer_target(hub, session_id, question_id)
-            if hub is not None and hub.supports(session_id) else None
-        )
+        on_bus = hub is not None and hub.supports(session_id)
+        target = _answer_target(hub, session_id, question_id) if on_bus else None
+        closed = target is _CLOSED_ON_FILE
+        if closed:
+            target = None
+        if on_bus and target is None and not closed and caller.is_assistant:
+            # Filed answers are lifted onto the bus later, where an operator-only
+            # question refuses the assistant after this route had said yes, and
+            # the file keeps the slot from the operator's answer (#594).
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"question {question_id} is not on session {session_id}'s bus yet; "
+                    "retry in a moment, or answer it on the bus by its id"
+                ),
+            )
         if target is not None:
             try:
                 session_io.require_session(session_id)
@@ -2846,6 +3480,7 @@ def create_app(
                     option=option,
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    authority=_authority_of(caller, session_id, comms.KIND_ANSWER),
                 )
             except SessionIOError as exc:
                 raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -2867,7 +3502,10 @@ def create_app(
         try:
             session_io.require_session(session_id)
             recorded = ask.answer_question(
-                session_id, question_id, text, option=option
+                session_id, question_id, text, option=option,
+                # Kept through the lift onto the bus, so an operator-only
+                # question refuses it there as it would on the bus route (#594).
+                source=comms.CHANNEL_UBER if caller.is_assistant else "operator",
             )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -2936,9 +3574,9 @@ def create_app(
             project_requests.preflight()
             return peers.send(caller, session_id, body, _require_hub())
         project_requests.preflight()
-        if (caller.source_channel == "peer-ul" or "generation" in body
+        if (caller.source_channel == bus_comms.CHANNEL_PEER_UL or "generation" in body
                 or isinstance(body.get("meta"), dict) and "peer" in body["meta"]
-                or isinstance(body.get("source"), dict) and body["source"].get("channel") == "peer-ul"):
+                or isinstance(body.get("source"), dict) and body["source"].get("channel") == bus_comms.CHANNEL_PEER_UL):
             raise HTTPException(status_code=403, detail="Peer provenance is assigned only to authenticated cross-project UL messages.")
         try:
             session_io.require_session(session_id)
@@ -2958,6 +3596,7 @@ def create_app(
                 status_code=403,
                 detail="only the operator and the assistant may run a harness command",
             )
+        _refuse_command_arguments(caller, session_id, kind, text)
         options = body.get("options") or []
         attachments = body.get("attachments") or []
         if not isinstance(options, list) or not isinstance(attachments, list):
@@ -2975,7 +3614,8 @@ def create_app(
                 option=option,
                 options=[str(item) for item in options],
                 attachments=[item for item in attachments if isinstance(item, dict)],
-                meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
+                meta=_caller_meta(body.get("meta"), kind),
+                authority=_authority_of(caller, session_id, kind),
             )
         except comms.NoBus:
             if option is not None and kind == comms.KIND_ANSWER:
@@ -3016,6 +3656,7 @@ def create_app(
         slash, everything else is guarded as before — and nothing else on the
         session hears it, because there is nothing to hear it with.
         """
+        _refuse_untagged_typing(caller, session_id)
         if kind not in (comms.KIND_MESSAGE, comms.KIND_COMMAND):
             raise HTTPException(
                 status_code=409,
@@ -3153,7 +3794,7 @@ def create_app(
                     # nobody's session wrote it, and the run this thread is being
                     # opened for should read it as the operator addressing it
                     # rather than as its own echo to skip.
-                    poster=thread_posts.Poster.for_platform(_thread_label(caller)),
+                    poster=thread_posts.Poster.for_platform(_thread_label(caller, config)),
                 )
             else:
                 record = session_threads.connect(session_id, permalink, by=by)
@@ -3219,7 +3860,9 @@ def create_app(
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return {
-            "run": dict(zip(("host", "project", "slug"), identity)),
+            # Named as a run reply names one — ``slug`` the group label, ``uid``
+            # only for a schema-2 run — never the key segment in ``slug``.
+            "run": run_of_session(session_id) or dict(zip(("host", "project", "slug"), identity)),
             "references": references.listing(*identity),
             "local": True,
             "note": references.LOCALITY_NOTE,
@@ -3271,23 +3914,43 @@ def create_app(
         limit: int = Query(
             default=thread_queue.DEFAULT_READ_LIMIT, ge=1, le=thread_queue.MAX_READ_LIMIT
         ),
+        caller: Caller = Depends(require_secret),
     ) -> dict:
         """A thread's most recent messages, as the records a session would see.
 
-        No upload store: no session is behind this call, so a file is described
-        rather than copied anywhere.
+        Files are copied into the calling assistant's upload store (#550); for any
+        other caller they are described, with the command that copies them in.
         """
+        store = _assistant_store(caller)
         try:
-            return thread_access.read_thread(permalink, limit=limit)
+            return thread_access.read_thread(
+                permalink, limit=limit, store=store,
+                unstored=(
+                    "not copied on this route: no upload store is behind this caller; "
+                    f"`lmer-signal read {permalink}` in a session copies it into that "
+                    "session's store"
+                ),
+            )
         except ThreadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    def _assistant_store(caller: Caller) -> Optional[thread_access.UploadStore]:
+        """The calling assistant's mounted upload store, or ``None``."""
+        if not caller.is_assistant or not caller.session_id:
+            return None
+        try:
+            directory = uploads.mounted_store(
+                caller.session_id, session_io.require_session(caller.session_id),
+            )
+        except (SessionIOError, UploadError) as exc:
+            logger.info("comms_thread_read_no_store session=%s error=%s", caller.session_id, exc)
+            return None
+        return thread_access.UploadStore(str(directory), uploads.CONTAINER_UPLOADS_DIR)
 
     @app.post("/api/comms/thread", dependencies=guard)
     def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Post once into a thread, attributed to whoever holds the credential."""
-        label = _thread_label(caller)
-        from . import assistant_conversation
-        from lmer_cli.routing_receipts import receipt
+        label = _thread_label(caller, config)
 
         try:
             binding = project_api.capture()
@@ -3300,7 +3963,7 @@ def create_app(
                 result = project_requests.reply(request["id"], body.get("text"), workspace_id=project_scope.current(),
                                                 session_id=caller.session_id)
                 return {**result, "thread": thread_access._thread_summary(source),
-                        **receipt("post", result["posted"].get("ref"))}
+                        **routing_receipts.receipt("post", result["posted"].get("ref"))}
             ref, client = None, None
             private = False
             if caller.is_assistant:
@@ -3318,7 +3981,7 @@ def create_app(
             )
         except ThreadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        result.update(receipt("post", result["posted"].get("ref")))
+        result.update(routing_receipts.receipt("post", result["posted"].get("ref")))
         if caller.is_assistant:
             try:
                 if not caller.session_id:
@@ -3464,7 +4127,9 @@ def create_app(
     @app.post(
         "/api/sessions/{session_id}/wind-down", dependencies=guard, status_code=202
     )
-    def session_wind_down(session_id: str, body: Optional[dict] = None) -> dict:
+    def session_wind_down(
+        session_id: str, body: Optional[dict] = None, caller: Caller = Depends(require_secret),
+    ) -> dict:
         """Ask a session's agent to wrap up and end itself. Signals nothing.
 
         **202, not 200.** Nothing has ended when this returns: an agent has been
@@ -3483,8 +4148,17 @@ def create_app(
         comes back in the reply: the operator interrupted a working agent, and what
         it was told should not be something only the source knows.
         """
+        note = (body or {}).get("note")
+        added_by = "The operator"
+        if caller.is_assistant:
+            # The note is typed untagged, like raw input; the fixed prompt is not.
+            if note:
+                _refuse_untagged_typing(caller, session_id)
+            added_by = f"The assistant ({config.assistant_name}), not the operator,"
+        elif caller.kind == CALLER_CONNECTOR:
+            added_by = f"The {caller.name or 'chat'} connector, not the operator,"
         try:
-            report = lifecycle.wind_down(session_id, note=(body or {}).get("note"))
+            report = lifecycle.wind_down(session_id, note=note, added_by=added_by)
         except (SessionIOError, LifecycleError) as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return report.to_dict()
@@ -3522,12 +4196,15 @@ def create_app(
             session_io.require_session(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _refuse_untagged_typing(caller, session_id)
         # The only signal the socket can give: the tty stream carries no
         # credential, so nothing downstream of this mint is attributable.
         _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
-            "ticket": tickets.mint(session_id, binding=project_api.capture()),
+            "ticket": tickets.mint(
+                session_id, binding={**project_api.capture(), _TTY_CALLER: caller},
+            ),
             "expires_in": tickets.ttl,
         }
 
@@ -3575,15 +4252,27 @@ def create_app(
                     websocket, "bad_frame", "an input frame needs a string 'data'"
                 )
                 return
+            caller = websocket.state.tty_caller
+
+            def type_frame() -> None:
+                # The level can rise while the socket is open, so the mint's
+                # check is repeated for every frame, inside the operation that
+                # writes it, where a level change cannot land between (#594).
+                if caller is not None and caller.is_assistant:
+                    _refuse_untagged_typing(caller, session_id)
+                session_io.send_input(
+                    session_id, data, append_newline=bool(frame.get("append_newline")),
+                )
+
             try:
                 await asyncio.to_thread(
                     project_api.invoke_captured, websocket.state.project_binding,
-                    session_io.send_input,
-                    session_id,
-                    data,
-                    append_newline=bool(frame.get("append_newline")),
-                    mutation=True,
+                    type_frame, mutation=True,
                 )
+            except HTTPException as exc:
+                await send_status(websocket, "input_refused", str(exc.detail))
+                await websocket.close(code=WS_POLICY_VIOLATION, reason="input refused")
+                raise WebSocketDisconnect(code=WS_POLICY_VIOLATION) from exc
             except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "input_failed", str(exc))
             return
@@ -3698,6 +4387,7 @@ def create_app(
                 reason="invalid, expired or already-used ticket",
             )
             return
+        websocket.state.tty_caller = binding.pop(_TTY_CALLER, None)
         websocket.state.project_binding = binding
         try:
             live = await asyncio.to_thread(project_api.invoke_captured, binding, _session_preamble, session_id)
@@ -3742,40 +4432,55 @@ def create_app(
         # to close, reappearing one level up. A no-op in a legacy tree, and
         # for every row whose key is already the primary.
         # Read the registry ONCE for the whole listing: every row and every
-        # walked directory is folded, and re-parsing `_plexus.yaml` per fold
+        # walked directory is folded, and re-parsing `_lmer.yaml` per fold
         # meant twenty-odd reads of one unchanging file to answer one question.
+        #
+        # Membership is by key segment (spec §6.1): a schema-2 record is tracked
+        # when its uid is, and a uid-keyed entry says nothing about the other
+        # launches of its group, which are separate rows to adopt.
         registry = fold_registry(config)
         tracked_keys = {
-            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
-            for e in list_tracked()
+            folded_identity(config, host, project, registry=registry) + (segment,)
+            for host, project, segment in tracked_keys_of(list_tracked())
         }
+        rows = []
+        for ref in run_dirs(config):
+            uid = _candidate_uid(ref)
+            _host, _project, segment = key_parts(
+                {"host": ref.host, "project": ref.project, "slug": ref.slug, "uid": uid}
+            )
+            rows.append({
+                "host": ref.host,
+                "project": ref.project,
+                "slug": ref.slug,
+                "uid": uid,
+                "rel_path": ref.rel_path,
+                "tracked": folded_identity(
+                    config, ref.host, ref.project, registry=registry
+                )
+                + (segment,)
+                in tracked_keys,
+            })
         return {
-            "candidates": [
-                {
-                    "host": ref.host,
-                    "project": ref.project,
-                    "slug": ref.slug,
-                    "rel_path": ref.rel_path,
-                    "tracked": folded_identity(
-                        config, ref.host, ref.project, registry=registry
-                    )
-                    + (ref.slug,)
-                    in tracked_keys,
-                }
-                for ref in run_dirs(config)
-            ],
+            "candidates": rows,
             "note": "every run in the shared work repo, including other people's",
         }
 
     @app.post("/api/runs/adopt", dependencies=guard)
     def adopt(body: dict) -> dict:
-        """Start tracking an existing run so it appears in the fleet view."""
+        """Start tracking an existing run so it appears in the fleet view.
+
+        ``uid`` beside ``{host, project}`` adopts one schema-2 execution, and
+        binds the slug-keyed entry the key transition left unresolved when
+        there is one — :func:`adopt_run` has the cases.
+        """
         try:
-            entry = track(
+            entry = adopt_run(
+                config,
                 body.get("host"),
                 body.get("project"),
                 body.get("slug"),
-                source="adopted",
+                uid=body.get("uid"),
                 note=body.get("note"),
             )
         except RunIndexError as exc:
@@ -3786,19 +4491,17 @@ def create_app(
     def forget_run(body: dict) -> dict:
         """Stop tracking a run. Its work-repo state is untouched."""
         try:
-            removed = forget(
-                body.get("host"), body.get("project"), body.get("slug")
-            )
+            parts = _run_parts(body)
+            removed = forget(*parts)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if removed:
             # Its chat-thread connections go with it (issue #412): a crashed
             # session's registry entry is kept on purpose as the crash signal, so
             # the reconcile's prune would leave the records of a run this
-            # orchestrator has been told to forget.
-            _require_connectors().drop_run(
-                (body.get("host"), body.get("project"), body.get("slug"))
-            )
+            # orchestrator has been told to forget. By key segment, because that
+            # is what ``runs.run_for_session`` names each session's run with.
+            _require_connectors().drop_run(parts)
         return {"forgotten": removed}
 
     # --- what a run is about (T52) -------------------------------------------
@@ -3814,7 +4517,9 @@ def create_app(
     # have to be escaped by every caller to survive the slash it contains.
 
     @app.get("/api/runs/meta", dependencies=guard)
-    def run_meta(host: str = "", project: str = "", slug: str = "") -> dict:
+    def run_meta(
+        host: str = "", project: str = "", slug: str = "", uid: str = ""
+    ) -> dict:
         """This orchestrator's title and description for one run.
 
         Empty for a run that has none, which is most of them, and empty rather
@@ -3827,11 +4532,12 @@ def create_app(
         which names the field — instead of a validation error in a different
         shape from every other refusal here.
         """
+        run = _query_run(host, project, slug, uid)
         try:
-            record = meta.read(host, project, slug)
+            record = meta.read(*_run_parts(run))
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _meta_reply(host, project, slug, record)
+        return _meta_reply(run, record)
 
     @app.post("/api/runs/meta", dependencies=guard)
     def set_run_meta(body: dict) -> dict:
@@ -3853,10 +4559,9 @@ def create_app(
         :class:`lmer_platform.meta.MetaError` so a refusal added later arrives
         with its own code instead of a 500.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             record = meta.write(
-                host, project, slug,
+                *_run_parts(body),
                 # Not coerced: a non-string keeps its own refusal rather than
                 # arriving as ``None`` and reading as "leave this field alone".
                 title=body.get("title"),
@@ -3866,7 +4571,75 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except MetaError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        return _meta_reply(host, project, slug, record)
+        return _meta_reply(body, record)
+
+    # --- muting a run (#458) -------------------------------------------------
+    #
+    # Platform state like the metadata above (:mod:`lmer_platform.mute`): a run
+    # the operator steers directly stops waking the assistant with its routine
+    # chatter, and nothing else about it changes.
+
+    def _mute_caller(caller: Caller) -> dict:
+        """Who muted or unmuted, for the event (spec §7)."""
+        by = {"kind": caller.kind, "name": _author_of(caller, None) or caller.source_channel}
+        if caller.session_id:
+            by["session"] = caller.session_id
+        return by
+
+    def _mute_reply(outcome: dict) -> dict:
+        return {**outcome, "local": True, "note": mute.LOCALITY_NOTE}
+
+    def _set_run_mute(body: dict, muted: bool, caller: Caller) -> dict:
+        # The session form lives on the session's own path, where the request
+        # binding scopes it to that session's project (project_api.bind reads a
+        # path parameter, never a body field) — so it is refused here by name
+        # rather than read as a run with no parts.
+        if "session" in body:
+            raise HTTPException(status_code=400, detail=(
+                "mute a session by its own path: POST /api/sessions/<id>/mute "
+                "(or /unmute)"))
+        try:
+            outcome = mute.set_run(*_run_parts(body), muted=muted, by=_mute_caller(caller))
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except mute.MuteError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return _mute_reply({"muted": muted, "changed": outcome["changed"], "run": outcome["key"]})
+
+    def _set_session_mute(session_id: str, muted: bool, caller: Caller) -> dict:
+        try:
+            outcome = mute.set_session(session_id, muted=muted, by=_mute_caller(caller))
+        except mute.MuteError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return _mute_reply(outcome)
+
+    @app.post("/api/runs/mute", dependencies=guard)
+    def mute_run(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Stop a tracked run's routine records reaching the assistant's spool.
+
+        ``{host, project, slug|uid}``. Idempotent: ``changed`` says whether this
+        call did anything. A session with no tracked run is muted by
+        :func:`mute_session`.
+        """
+        return _set_run_mute(body, True, caller)
+
+    @app.post("/api/runs/unmute", dependencies=guard)
+    def unmute_run(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Undo :func:`mute_run`, and any session-level mute of that run's
+        sessions. Nothing suppressed while muted is replayed."""
+        return _set_run_mute(body, False, caller)
+
+    @app.post("/api/sessions/{session_id}/mute", dependencies=guard)
+    def mute_session(session_id: str, caller: Caller = Depends(require_secret)) -> dict:
+        """Mute by session: its run when this orchestrator tracks it, otherwise
+        the session itself. Scoped to the session's project like every other
+        session route."""
+        return _set_session_mute(session_id, True, caller)
+
+    @app.post("/api/sessions/{session_id}/unmute", dependencies=guard)
+    def unmute_session(session_id: str, caller: Caller = Depends(require_secret)) -> dict:
+        """Undo :func:`mute_session`. Nothing suppressed is replayed."""
+        return _set_session_mute(session_id, False, caller)
 
     # --- what a run wrote (T66) ----------------------------------------------
     #
@@ -3882,6 +4655,7 @@ def create_app(
         host: str = "",
         project: str = "",
         slug: str = "",
+        uid: str = "",
         caller: Caller = Depends(require_secret),
     ) -> dict:
         """The run's own files in the mirror, each with its forge URL.
@@ -3897,12 +4671,63 @@ def create_app(
         which names the field — instead of a validation error in a shape no other
         refusal here uses.
         """
+        run = _query_run(host, project, slug, uid)
         try:
-            run_key(host, project, slug)
+            parts = _run_parts(run)
+            run_key(*parts)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(host, project, slug))
-        return _run_files_reply(config, host, project, slug)
+        _note_check(caller, run=parts)
+        return _run_files_reply(config, run)
+
+    # --- the launches of one target (#374, spec §13.F) ------------------------
+    #
+    # Read when an operator opens "sessions per target", like the file list
+    # above and for its reason: a directory walk per group per fleet poll is the
+    # wrong cost for something one view renders. Keyed by query string like
+    # GET /api/runs/files, and like it never pulls.
+
+    @app.get("/api/runs/sessions", dependencies=guard)
+    def run_sessions(
+        host: str = "", project: str = "", slug: str = "", uid: str = "",
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Every session record of the run's ``_runs/<slug>/`` group, oldest first.
+
+        Each row is addressable by its uid, which is what a resume of that one
+        launch posts. A legacy tree or a legacy row answers ``form: "legacy"``
+        with no sessions; a group not yet in the mirror answers
+        ``form: "schema"`` with none. :func:`_run_sessions_reply` has the fields.
+
+        The parts default to empty strings so an omitted one gets
+        :func:`lmer_platform.runs.run_key`'s refusal, which names the field.
+        """
+        run = _query_run(host, project, slug, uid)
+        try:
+            parts = _run_parts(run)
+            run_key(*parts)
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        scope = (
+            project_scope.current()
+            if projects.enabled() and caller.kind != "operator" else None
+        )
+        return _run_sessions_reply(config, run, parts, scope=scope)
+
+    @app.get("/api/workrepo/schema", dependencies=guard)
+    def workrepo_schema(refresh: str = "") -> dict:
+        """The validator's view of the mirror: ``{form, tier, document, buckets, note}``.
+
+        ``document`` is exactly what ``lmer-schema validate <mirror> --json``
+        prints (:mod:`lmer_platform.schema_report` has the decisions: the guard
+        URL, the cache and its expiry). An unusable manifest is a 200 carrying
+        the document's ``unusable`` and exit code 2 — a verdict about the tree,
+        not a failure of this route. A legacy tree is never validated.
+        ``?refresh=1`` bypasses the cache; nothing here pulls.
+        """
+        return schema_report.workrepo_schema(
+            config, refresh=refresh.strip().lower() in ("1", "true", "yes"),
+        )
 
     # --- which runs belong together (T53) -------------------------------------
     #
@@ -3929,7 +4754,9 @@ def create_app(
     # would have to be escaped by every caller to survive the slash it contains.
 
     @app.get("/api/runs/relations", dependencies=guard)
-    def run_relations(host: str = "", project: str = "", slug: str = "") -> dict:
+    def run_relations(
+        host: str = "", project: str = "", slug: str = "", uid: str = ""
+    ) -> dict:
         """The runs this orchestrator considers related to this one.
 
         Empty for most runs, and empty rather than 404 for a run that is not
@@ -3950,7 +4777,7 @@ def create_app(
         refusal here.
         """
         try:
-            return _relations_reply(host, project, slug)
+            return _relations_reply(_query_run(host, project, slug, uid))
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3973,13 +4800,13 @@ def create_app(
         :class:`lmer_platform.relations.RelationError` so a refusal added later
         arrives with its own code instead of a 500.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             related = _related_ref(body)
-            created = relations.relate((host, project, slug), related)
+            created = relations.relate(
+                _run_parts(body), _run_parts(related, field="related")
+            )
             return _relations_reply(
-                host, project, slug,
-                {"related": _run_ref_dict(related), "created": created},
+                body, {"related": _run_echo(related), "created": created},
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4000,13 +4827,13 @@ def create_app(
         to clear a relation naming a run nobody tracks any more, which is why it
         requires no adoption.
         """
-        host, project, slug = body.get("host"), body.get("project"), body.get("slug")
         try:
             related = _related_ref(body)
-            removed = relations.unrelate((host, project, slug), related)
+            removed = relations.unrelate(
+                _run_parts(body), _run_parts(related, field="related")
+            )
             return _relations_reply(
-                host, project, slug,
-                {"related": _run_ref_dict(related), "removed": removed},
+                body, {"related": _run_echo(related), "removed": removed},
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4043,13 +4870,22 @@ def create_app(
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
+                # Verbatim: the request refuses a uid that is not 32 lowercase
+                # hex rather than reading it as absent.
+                uid=body.get("uid"),
+                repo_url=body.get("repo_url"),
                 # Not coerced: a non-string answer keeps its own refusal message
                 # rather than being reported as an empty one.
                 answer=body.get("answer") or "",
+                allow_unsigned_source=body.get("allow_unsigned_source"),
             )
             result = answer_run(config, request)
         except AnswerError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except ResumeError as exc:
+            # Schema-2 answers continue from the record that asked, so the same
+            # source-bound unsigned decision as resume can be required here.
+            raise HTTPException(status_code=exc.status, detail=exc.to_dict()) from exc
         # The same 409 ``NotAnswerable`` gives this route for a run that is already
         # running, for the residual case the answer path's own check cannot see: the
         # spawn's invariant matches the identity it is about to register, so it
@@ -4060,7 +4896,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(request.host, request.project, request.slug))
+        _note_check_started(caller, result, body)
         return result.to_dict()
 
     @app.post("/api/runs/resume", dependencies=guard, status_code=202)
@@ -4110,6 +4946,7 @@ def create_app(
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
+                uid=body.get("uid"),
                 taskdef=body.get("taskdef"),
                 repo_url=body.get("repo_url"),
                 direction=body.get("direction"),
@@ -4117,6 +4954,10 @@ def create_app(
                 # path segment and imposes no grammar beyond that, because the
                 # ``--<name>`` half of a session dir has none (docs/SCHEMA.md).
                 session_id=body.get("session_id"),
+                # The selected source UID itself, never a boolean force flag.
+                # Resume validates it against the record it resolved before a
+                # child process is started.
+                allow_unsigned_source=body.get("allow_unsigned_source"),
             )
             result = resume_run(config, request)
         except ResumeError as exc:
@@ -4134,7 +4975,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _note_check(caller, run=(request.host, request.project, request.slug))
+        _note_check_started(caller, result, body)
         return result.to_dict()
 
     # --- the orchestrating assistant (spec §8, T60) ---------------------------
@@ -4193,8 +5034,6 @@ def create_app(
         view: str = Query(default="conversation", pattern="^(conversation|transcript)$"),
     ) -> dict:
         """One bounded generation page, with an explicit link to its predecessor."""
-        from . import assistant_history
-
         try:
             if assistant.history_for(session_id) is None:
                 raise HTTPException(status_code=404, detail="This assistant generation is not recorded.")
@@ -4529,6 +5368,7 @@ def create_app(
         one call away when the operator wants the new settings live. The integer
         settings need neither — the daemon's next tick reads them.
         """
+        _refuse_worker_settings(body)
         if projects.enabled() and project_scope.current():
             project = projects.get(project_scope.current())
             settings = {**project["settings"], **{key: value for key, value in body.items()

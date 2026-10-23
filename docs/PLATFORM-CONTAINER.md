@@ -160,6 +160,11 @@ The table is the *default* install. What a config file can add to it is
 — `lmer_bin`, `secret_file`, `work_repo_mirror` — each of which has to be
 mounted path-identically or removed before this topology is honest.
 
+The control UI's validator panels (`GET /api/workrepo/schema`) run
+`lmer-schema validate` in-process in the daemon, against the work-repo mirror
+already under the state mount. The run is read-only, and there is nothing new
+to mount or configure.
+
 Credentials for git, incidentally, do not have to be mounted at all: the daemon
 loads `~/.lmer/.env` at startup (`_load_env_files`,
 `src/lmer_platform/daemon.py:584-601`, via `apply_env_file_defaults` in
@@ -385,14 +390,50 @@ otherwise, so a platform image built from a newer commit will start looking
 for a session image tag the host may not have. It will try to pull it. Pin
 `LMER_IMAGE` if you want that decision to be yours.
 
+The upgrade to a daemon that keys schema-2 runs by uid (`host/project/<uid>`)
+re-keys tracked runs in place, without an operator step. Its first state
+build — and every `POST /api/rescan` — looks at each tracked entry that still
+has a slug key while its slug group holds schema-2 records, and never reads
+such an entry as "the group's newest record":
+
+- **Bound** when one record is provably that run's: the group holds exactly
+  one record, it is schema-2 and the registry entry of the run's last session
+  does not contradict it, or exactly one record's launcher matches that
+  registry entry. The entry is re-keyed to
+  `host/project/<uid>`, its meta, relations, check-in marks, references and
+  project home move with it, and the old key stays as an alias in `runs.json`
+  so a stale reference still resolves — to the bound record, never to the
+  group's newest.
+- **Unresolved** otherwise: the fleet row says **re-adopt by uid** and lists
+  the candidate records (uid, start time, name), and resume and answer on it
+  are refused (`run_unresolved`) with that list. `POST /api/runs/adopt
+  {host, project, uid}` — or `lmer-ctl runs adopt <host>/<project>/<uid>` —
+  binds it to the chosen record. An adopt by uid first runs the same
+  examination on the entry it would bind, so an entry no state build has
+  looked at yet (`lmer platform adopt` never builds state) is bound only on
+  the launcher proof above: if that binds it to another record, the uid you
+  named becomes a row of its own beside it. A body `slug` naming an entry
+  that does not list the record as a candidate is refused (400) and nothing
+  moves, and adopting by uid is refused on a schema-1 work repo, which has no
+  execution records.
+
+A carry that meets a different value already under the new key keeps both and
+the row says `re-adopt by uid: conflicting <store> state` (`index` when the two
+entries' notes differ). Timestamps and revisions never conflict: an origin
+stamp (`first_seen`, `created`, `created_at`) keeps the earlier value, every
+other stamp and a revision the later one. To clear the mark, write the conflicting field (set the title, or adopt
+with a `note`), which replaces the kept pair, then re-adopt by uid: the mark
+goes for every store that no longer holds two values. Entries whose group
+holds no schema-2 record — every schema-1 run — keep their slug key unchanged.
+
 ### Restart semantics, and what breaks today
 
-On a bare host, sessions survive a daemon restart. Each session has a
-host-side `lmer` client process that owns the PTY master, and those
-processes are not children of the daemon in any meaningful sense — the
-daemon restarts, re-attaches, and the fleet carries on (spec R11, T36).
+On a bare host, sessions survive a daemon restart. Each session's container
+is detached and labelled, so the daemon's death costs it nothing; the new
+daemon finds it by label and follows it again — see
+[CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md) (spec R11, T36).
 
-In this topology those client processes live **inside the platform
+In this topology the `lmer` followers live **inside the platform
 container**, in its PID namespace. So every platform upgrade — every
 `docker restart`, every stop/run — kills all of them. Two consequences,
 one benign and one not:
@@ -403,7 +444,11 @@ one benign and one not:
   `~/.lmer/platform/logs/<id>.session/`, and the read path prefers it when
   it holds anything (`session_io.canonical_log`). The host-side tee dying
   costs nothing for a session whose image writes its own log.
-- **Re-attach does not, yet.** `reattach_all`
+- **Re-attach does not, yet, for sessions started before #444.** Sessions
+  launched since are found by container label rather than by pid, which
+  sidesteps the namespace problem below
+  ([CONTAINER-LIFECYCLE.md](./CONTAINER-LIFECYCLE.md)); that path has not
+  been verified in this topology yet. For the older sessions: `reattach_all`
   (`src/lmer_platform/reattach.py:814`) is scoped to
   `registry.list_sessions(live_only=True)`, and liveness is
   `kill(pid, 0)` plus a `/proc` zombie check against the pid recorded in

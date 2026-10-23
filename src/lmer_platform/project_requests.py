@@ -5,9 +5,9 @@ import hashlib
 import json
 import re
 
-from lmer_cli import thread_access
+from lmer_cli import thread_access, thread_posts
 from lmer_cli.threads import ThreadError
-from . import assistant, project_context as scope, project_threads, projects, store
+from . import assistant, channel_routes, project_context as scope, project_threads, projects, session_threads, store
 from .transcripts import scrub_credentials
 from . import assistant_conversation
 
@@ -29,6 +29,7 @@ def preflight():
 
 
 def effect():
+    # deferred: cycle — lmer_platform.project_api imports this module at top
     from . import project_api
 
     action = _ACTION.get()
@@ -162,7 +163,7 @@ def _release(row, reason):
         db.execute("UPDATE requests SET state='invalid',error=? WHERE id=?", (reason, row["id"]))
         db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (row["project_id"], row["id"]))
         raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (row["project_id"],)).fetchone()
-        state = assistant.AssistantState.from_dict(json.loads(raw[0]))
+        state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=row["project_id"])
         retained = tuple(note for note in state.pending if not (
             note.kind == "conversation_request" and (note.data or {}).get("request_id") == row["id"]))
         state = replace(state, pending=retained, pending_since=retained[0].at if retained else None)
@@ -234,7 +235,7 @@ def _queue(db, row, project_id, ownership):
     if payload["actions"]:
         payload["instruction"] += " Existing action receipts are attached. Do not repeat completed or uncertain actions."
     raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (project_id,)).fetchone()
-    state = assistant.AssistantState.from_dict(json.loads(raw[0]))
+    state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=project_id)
     note = assistant.PendingNote(at=store.utc_now_iso(), kind="conversation_request",
                                  note="A conversation request is waiting for its owning project.", data=payload)
     state = replace(state, pending=(*state.pending, note), pending_since=state.pending_since or note.at,
@@ -244,13 +245,26 @@ def _queue(db, row, project_id, ownership):
                (project_id, json.dumps(ownership), json.dumps(payload), row["id"]))
 
 
-def _reply_source(row, text, client=None):
+def _reply_source(row, text, client=None, *, poster=None):
     payload = row["payload"]
     if client is None:
         ref, client, _ = thread_access.resolve_thread(payload["permalink"])
     if row["transport"] == "slack":
-        return client.post_message(row["conversation"], row["root"], text)
-    return client.send_thread_text(row["conversation"], row["root"], text)
+        ts = client.post_message(row["conversation"], row["root"], text)
+        if poster is not None:
+            thread_posts.record(row["conversation"], ts, poster)
+        return ts
+    return client.send_thread_text(row["conversation"], row["root"], text,
+                                   extra=thread_posts.matrix_content(poster))
+
+
+def _reply_as_assistant(row, text, client=None):
+    """The project's assistant answering in the source thread, tagged and
+    stamped like its ``lmer-ctl thread post`` (#574, #427)."""
+    label = session_threads.assistant_label(row["project_id"])
+    tagged = thread_posts.tagged(label, text, slack_markup=row["transport"] == "slack")
+    return _reply_source(row, tagged, client,
+                         poster=thread_posts.Poster.for_platform(label))
 
 
 def _notice(row, text, client=None):
@@ -309,6 +323,7 @@ def admit(identity, payload, client):
                 _queue(db, original, selected, ownership)
             return _accepted(original["id"], selected, original["payload"]["permalink"])
         text = row["payload"]["message"]["text"].lstrip()
+        routed = None
         matches = _named_projects(text) if payload["entry"] == "mention" else []
         if len(matches) > 1:
             selected = None
@@ -324,13 +339,16 @@ def admit(identity, payload, client):
                 message.setdefault("original_text", message["text"])
                 message["text"] = remainder
         elif not owners and payload["entry"] == "mention":
-            selected = projects.GENERAL
+            routed = channel_routes.project_for(row["transport"], row["conversation"])
+            selected = routed or projects.GENERAL
         state = "choice"
         if selected:
             project = projects.get(selected)
             if project["archived"]:
                 state = "invalid"
-                row["error"] = f"Project {project['name']} is archived; restore it before sending a new request."
+                row["error"] = (f"This channel is mapped to project {project['name']}, which is archived; "
+                                "restore it or remap the channel before sending a new request." if routed else
+                                f"Project {project['name']} is archived; restore it before sending a new request.")
             elif not ownership:
                 project_threads.choose_unbound(payload["permalink"], selected)
                 ownership = _current(row)
@@ -392,6 +410,7 @@ def recover(project_id):
 
 
 def action(binding, perform):
+    # deferred: import cost — fastapi (~230 ms) and starlette (~40 ms) load only when an action builds a response
     from fastapi.encoders import jsonable_encoder
     from starlette.responses import JSONResponse, Response
 
@@ -505,7 +524,8 @@ def drain(state):
             db.execute("INSERT OR REPLACE INTO request_context VALUES (?,?)", (project_id, current))
         else:
             db.execute("DELETE FROM request_context WHERE project_id=?", (project_id,))
-        cleared = replace(state, pending=tuple(retained), pending_since=retained[0].at if retained else None, nudged_at=None)
+        cleared = replace(state, pending=tuple(retained), pending_since=retained[0].at if retained else None,
+                          **assistant.ended_episode(state))
         db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(cleared.to_dict()), project_id))
     return notes
 
@@ -520,6 +540,7 @@ def _unavailable(row, reason):
 
 
 def reply(identity, text, *, workspace_id, session_id):
+    # deferred: cycle — lmer_platform.project_api imports this module at top
     from . import project_api
 
     if not isinstance(text, str) or not text.strip() or len(text) > 20000:
@@ -537,7 +558,7 @@ def reply(identity, text, *, workspace_id, session_id):
         with projects.database() as db:
             db.execute("UPDATE requests SET state='reply_sending' WHERE id=?", (identity,))
         try:
-            ref = _reply_source(row, text, client)
+            ref = _reply_as_assistant(row, text, client)
         except Exception as exc:
             with projects.database() as db:
                 db.execute("UPDATE requests SET state='reply_uncertain',error=? WHERE id=?",

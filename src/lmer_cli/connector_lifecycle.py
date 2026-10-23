@@ -8,9 +8,10 @@ import os
 import sys
 import threading
 import time
+from typing import Optional
 
 from ask_channel import bus
-from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired
+from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired, verified_rejection
 from .connector_ownership import Lease, same_process
 from .connector_receipts import ReceiptReactions
 
@@ -18,9 +19,28 @@ logger = logging.getLogger(__name__)
 MODULE_POLL_SECONDS = 1.0
 DRAIN_SECONDS = 45.0
 FAILURE_LIMIT = 8
+#: What the bus answers about the record itself (its shape, size or sender),
+#: never about the moment: posting it again gets the same answer.
+REFUSED_RECORD_STATUSES = frozenset({400, 403, 413, 422})
+#: How much of a refused post its notice quotes back, enough to say which one.
+REFUSED_HEAD_CHARS = 60
 EXIT_RETRY = 1
 EXIT_DRAIN = 3
 EXIT_RECOVERY = 4
+#: A run is often titled after its connector starts, so its tag is re-read.
+SPEAKER_REFRESH_SECONDS = 60.0
+
+#: The platform's id for the session a connector serves. The supervisor reports
+#: the container's own session id, a different namespace, and the platform's
+#: registry and runs index know only this one. Unset for a shell ``lmer chat``.
+PLATFORM_SESSION_ENV = "LMER_CHAT_PLATFORM_SESSION"
+
+
+def resolve_speaker(session: str, *, known_only: bool = False) -> Optional[str]:
+    # deferred: cycle — lmer_platform imports the connector modules that import this one.
+    from lmer_platform.session_threads import speaker_label
+
+    return speaker_label(session, known_only=known_only)
 
 
 class ConnectorLifecycle:
@@ -41,6 +61,8 @@ class ConnectorLifecycle:
         self._activity_seq = None
         self._receipt_pending = {}
         self._receipts = ReceiptReactions(self)
+        self._speaker = None
+        self._speaker_at = 0.0
         self.exit_code = 0
         self.status = "starting"
 
@@ -89,6 +111,36 @@ class ConnectorLifecycle:
                     self._bus_cursor = int(health.get("seq") or 0)
             self._state.save()
             self._seeded = True
+
+    def _speaker_label(self):
+        """This session's speaker tag (#574), or ``None`` while it is unknown."""
+        now = time.monotonic()
+        if self._speaker is not None and now - self._speaker_at < SPEAKER_REFRESH_SECONDS:
+            return self._speaker
+        session = getattr(self.config, "platform_session", None) or (
+            self._state.session if self._state is not None else None
+        )
+        if session:
+            try:
+                # Once a tag is held, a failed lookup keeps it rather than a guess.
+                label = resolve_speaker(session, known_only=self._speaker is not None)
+            except Exception as exc:  # a missing tag costs the label, never the post
+                logger.debug("connector_speaker_unknown session=%s error=%s", session, exc)
+                label = None
+            if label:
+                self._speaker, self._speaker_at = label, now
+        return self._speaker
+
+    def _pending_text(self, record):
+        """The text an unfinished send of *record* already committed to: a retry
+        must not re-render, since the speaker tag may have changed meanwhile and
+        delivery refuses changed content."""
+        pending = self._state.data.get("pending") if self._state and self._state.data else None
+        if pending and pending.get("source") == record:
+            part = pending["parts"].get("text")
+            if part:
+                return part["payload"].get("text")
+        return None
 
     def _ensure_ready(self):
         self._prepare()
@@ -209,10 +261,10 @@ class ConnectorLifecycle:
     def _backoff(self):
         self._stop.wait(min(30.0, 0.5 * 2 ** min(self.failures, 6)))
 
-    def _deliver_part(self, source, part, payload, send, bookkeeping):
+    def _deliver_part(self, source, part, payload, send, bookkeeping, *, rejected=verified_rejection):
         self._ensure_ready()
         with self._state.outbound:
-            receipt = self._state.send(source, part, payload, send)
+            receipt = self._state.send(source, part, payload, send, rejected=rejected)
             with self._state.lock:
                 if not self._state.part_done(part):
                     bookkeeping(receipt)
@@ -264,7 +316,15 @@ class ConnectorLifecycle:
                     return None
                 self._pending_inbound[ref] = pending
                 self._state.save()
-        result = self.bus.post(**pending["request"])
+        try:
+            result = self.bus.post(**pending["request"])
+        except bus.NoChannel:
+            raise
+        except bus.BusError as exc:
+            if exc.status not in REFUSED_RECORD_STATUSES:
+                raise
+            self._drop_refused_inbound(ref, accepted, exc, pending)
+            return None
         message = result.get("message") if isinstance(result, dict) else None
         if not isinstance(message, dict) or not message.get("id"):
             raise bus.BusError("supervisor returned no accepted message receipt")
@@ -279,6 +339,41 @@ class ConnectorLifecycle:
             self._pending_inbound.pop(ref, None)
             self._state.save()
         return result
+
+    def _drop_refused_inbound(self, ref, accepted, exc, pending):
+        """Retire one record the bus refuses, so it never holds up the next."""
+        logger.warning("connector_inbound_refused ref=%s status=%s reason=%s", ref, exc.status, exc)
+        with self._state.lock:
+            accepted()
+            self._posters.ack_ref(ref)
+            self._pending_inbound.pop(ref, None)
+            self._state.save()
+        self._transition_note(f"{self._lease.key.transport} connector dropped an inbound message "
+                              f"the bus refused ({exc.status}): {exc}")
+        # The note above reaches no thread and no digest; without this the sender
+        # sees a post that silently never arrived. Best effort, after the drop is
+        # saved: a crash here loses the notice, never the next message.
+        words = " ".join(str((pending.get("request") or {}).get("text") or "").split())
+        head = words if len(words) <= REFUSED_HEAD_CHARS else words[:REFUSED_HEAD_CHARS - 1] + "…"
+        try:
+            receipt = self._send_notice(self._tagged_notice(
+                f"This message didn't reach the session: {self._inert(repr(head))} ({self._inert(str(exc))})."
+            ))
+            with self._state.lock:
+                self._remember_notice(receipt)
+                self._state.save()
+        except Exception as error:
+            logger.warning("connector_refusal_notice_failed ref=%s error=%s", ref, error)
+
+    def _inert(self, text):
+        """*text*, quoted from someone else's post, as the transport shows it
+        without acting on it: a quoted mention must not ping anyone again."""
+        return text
+
+    def _tagged_notice(self, text):
+        """*text*, a notice about one session's traffic, with that session's
+        speaker tag in the transport's markup: the thread may hold several (#574)."""
+        return text
 
     def _resume_pending_inbound(self):
         with self._state.lock:
@@ -300,7 +395,7 @@ class ConnectorLifecycle:
 
     def _announce_detached(self):
         if self._announced and self._state and not self._state.blocked and not self._state.data.get("pending"):
-            self._notice(self._detach_note, "detached")
+            self._notice(self._detach_notice(), "detached")
 
     def stop(self, timeout=DRAIN_SECONDS, *, release=True, announce=True):
         self._stop.set()

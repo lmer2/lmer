@@ -131,7 +131,7 @@ See [GATE-FASTPATH.md](./GATE-FASTPATH.md) and the rules in `rules/`.
 
 One session at a time is the `lmer` command. Running a fleet is the
 **platform**: a small daemon on your host with a web UI, plus a supervising
-assistant — "uber lmer" — that is itself an lmer session with no repository,
+assistant — "Ratchet" — that is itself an lmer session with no repository,
 so it can steer but structurally cannot write code.
 
 ```mermaid
@@ -143,7 +143,7 @@ flowchart TD
     D -->|spawns, watches,<br/>answers| S1[Session]
     D --> S2[Session]
     D --> S3[Session]
-    D <-->|digests · standing orders| UL[uber lmer<br/>supervising assistant]
+    D <-->|digests · standing orders| UL[Ratchet<br/>supervising assistant]
     D -->|reads run state| Work[(Work repo)]
 ```
 
@@ -157,9 +157,9 @@ How a running session reaches you:
   any of those channels reaches the agent as a turn tagged with its source
   (`[slack · tester] …`). See [COMMS.md](./COMMS.md).
 - **Signals** — milestones (`lmer-signal "MR pushed"`) ride the same bus and
-  reach uber lmer, which decides what to spawn or wind down next.
+  reach Ratchet, which decides what to spawn or wind down next.
 - **Digests** — the daemon, not an AI, notices when a run needs attention or
-  has stopped, and nudges uber lmer once when it goes quiet.
+  has stopped, and nudges Ratchet once when it goes quiet.
 - **Uploads** — a screenshot or log you attach in chat lands in the
   container as a file the agent can read.
 

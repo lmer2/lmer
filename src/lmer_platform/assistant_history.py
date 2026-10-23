@@ -156,6 +156,7 @@ def remember(state) -> dict | None:
     with _database() as db:
         if not db.execute("SELECT 1 FROM metadata WHERE key = ?", (key,)).fetchone():
             return known
+    # deferred: cycle — lmer_platform.comms imports this module at top (via projects); only a pending migration marker needs it
     from . import comms
 
     cursor = 0
@@ -173,6 +174,7 @@ def remember(state) -> dict | None:
 
 def retain(session_id: str, message: dict) -> None:
     """Only already-public communication records enter this archive."""
+    # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.projects)
     from .transcripts import _scrub_decoded
 
     registry.session_path(session_id)
@@ -192,6 +194,7 @@ def retain(session_id: str, message: dict) -> None:
 
 def events(session_id: str) -> list:
     """Read one generation for the optional working-transcript normalizer."""
+    # deferred: cycle — lmer_platform.comms and .transcripts import this module at top (via lmer_platform.projects)
     from .comms import FleetEvent
     from .transcripts import MAX_MESSAGES_PER_SOURCE
 
@@ -208,6 +211,7 @@ def events(session_id: str) -> list:
 
 def transcript_limit_note(session_id: str) -> str | None:
     """Explain the optional normalizer's ceiling, with a paged recovery route."""
+    # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.projects)
     from .transcripts import MAX_MESSAGES_PER_SOURCE
 
     if not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
@@ -246,6 +250,7 @@ class HistoryError(ValueError):
 
 
 def _notice(session_id: str, item: dict, kind: str, text: str):
+    # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.projects)
     from .transcripts import Message
 
     return Message(role="platform", kind="said", text=text, at=item["started_at"],
@@ -255,6 +260,7 @@ def _notice(session_id: str, item: dict, kind: str, text: str):
 
 def _conversation_page(session_id: str, prefix: list, *, since: int,
                        before: str | None, limit: int) -> tuple:
+    # deferred: cycle — lmer_platform.comms and .transcripts import this module at top (via lmer_platform.projects)
     from .comms import FleetEvent
     from .transcripts import _comms_turns
 
@@ -300,6 +306,7 @@ def _conversation_page(session_id: str, prefix: list, *, since: int,
 def page(session_id: str, *, since: int = -40, before: str | None = None,
          limit: int = 40, view: str = "conversation") -> dict:
     """Read a bounded page, keeping notices and message ownership explicit."""
+    # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.projects)
     from . import session_io, transcripts
 
     item = generation(session_id)

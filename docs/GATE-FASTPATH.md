@@ -193,6 +193,8 @@ Both mechanisms fail toward running everything. The full suite runs when:
 - a declared subset path no longer exists (the gate warns and falls back);
 - either kill switch is set.
 
+The initial clean-state baseline of a development run has one more route, `gate-check --baseline`, which can reuse CI evidence for the exact starting commit instead of running the suite. It never reads or writes this cache; see [GATE-CI-BASELINE.md](./GATE-CI-BASELINE.md).
+
 ## Kill switches
 
 | Variable | Effect |
@@ -409,7 +411,13 @@ injected stall from the bound it has to outlive, so the two cannot drift apart. 
 intervals are the deliberate exception: they stay short and unscaled, because
 they decide how quickly a satisfied condition is noticed, not how long a test is
 willing to wait. A test that reintroduces a literal fails
-`tests/test_timing_budgets.py`.
+`tests/test_timing_budgets.py`. The family is the scan's `FAMILY` list: the
+connector modules, and since schema 2 the work-repo transaction tests
+(`tests/test_schema_v2_git_transactions.py`,
+`tests/test_schema_v2_mutation_transactions.py`) and the run-state writer
+tests, which wait on real `work` children and threads the same way (`CLI` for
+a `work` verb run to completion in a scratch clone, `BARRIER` for a hook or
+child parked until the test releases it, `QUIET` for an absence window).
 
 **One factor scales them together.** `LMER_TESTS_WAIT_SCALE` multiplies every
 budget. `ci/gate-tests.py` derives it from the worker count it chose: the

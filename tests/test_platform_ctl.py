@@ -420,6 +420,12 @@ ROUTE_TABLE = [
      "/api/sessions/s-1/ask/q-7/answer", None, {"answer": "prep-release"}),
     (["answer", "s-1", "q-7", "--option", "2"], "POST",
      "/api/sessions/s-1/ask/q-7/answer", None, {"option": 2}),
+    (["answer", "s-1", "20261022-194257-7-12523/000003", "prep-release"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "answer", "in_reply_to": "20261022-194257-7-12523/000003", "text": "prep-release"}),
+    (["answer", "s-1", "20261022-194257-7-12523/000003", "--option", "2"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "answer", "in_reply_to": "20261022-194257-7-12523/000003", "option": 2}),
     (["wind-down", "s-1"], "POST", "/api/sessions/s-1/wind-down", None, {}),
     (["wind-down", "s-1", "--note", "skip the MR"], "POST",
      "/api/sessions/s-1/wind-down", None, {"note": "skip the MR"}),
@@ -466,6 +472,12 @@ ROUTE_TABLE = [
      {**RUN_FIELDS, "related": OTHER_FIELDS}),
     (["runs", "unrelate", RUN_KEY, OTHER_KEY], "POST", "/api/runs/unrelate",
      None, {**RUN_FIELDS, "related": OTHER_FIELDS}),
+    (["runs", "mute", RUN_KEY], "POST", "/api/runs/mute", None, RUN_FIELDS),
+    (["runs", "unmute", RUN_KEY], "POST", "/api/runs/unmute", None, RUN_FIELDS),
+    (["runs", "mute", "--session", "s-chat"], "POST", "/api/sessions/s-chat/mute",
+     None, None),
+    (["runs", "unmute", "--session", "s-chat"], "POST",
+     "/api/sessions/s-chat/unmute", None, None),
 ]
 
 
@@ -529,6 +541,26 @@ def test_the_two_answer_verbs_are_two_routes():
     assert live.path != stopped.path
 
 
+BUS_ID = "20261022-194257-7-12523/000003"
+
+
+def test_a_late_answer_by_full_bus_id_fails_as_the_answer_routes_409_does(configured, capsys):
+    """#602: ``/comms`` takes a late answer with a 200; the answer route refuses it."""
+    late = {"session": "s-1", "accepted_as": "late", "message": {"id": "b/000009"}}
+    payload = refused(["answer", "s-1", BUS_ID, "yes"], Recorder(Reply(200, json.dumps(late))), capsys)
+    assert payload == {"error": "late", "status": 200, "body": late}
+
+
+def test_a_first_answer_by_full_bus_id_succeeds(configured, capsys):
+    first = {"session": "s-1", "accepted_as": "new", "message": {"id": "b/000009"}}
+    assert ok(["answer", "s-1", BUS_ID, "yes"], Recorder(Reply(200, json.dumps(first))), capsys) == first
+
+
+def test_send_still_prints_a_comms_reply_as_it_arrived(configured, capsys):
+    late = {"session": "s-1", "accepted_as": "late"}
+    assert ok(["send", "s-1", "carry on"], Recorder(Reply(200, json.dumps(late))), capsys) == late
+
+
 def test_an_omitted_flag_is_absent_from_the_body_not_null():
     """``POST /api/runs/meta`` leaves an absent field alone and clears it on
     ``""``, so a ``null`` sent for a flag nobody passed would be a different
@@ -545,6 +577,63 @@ def test_a_run_key_keeps_a_project_that_contains_a_slash():
     body = build("runs", "forget", "git.example.com/a/b/c/the-slug").body
     assert body == {"host": "git.example.com", "project": "a/b/c",
                     "slug": "the-slug"}
+
+
+UID = "e" * 32
+
+
+def test_a_uid_last_segment_becomes_the_uid_field():
+    """A schema-2 run's key is ``host/project/<uid>`` (spec §6.1), and the
+    routes address its record by ``uid`` — a slug field holding a uid would
+    name a group that does not exist."""
+    body = build("runs", "forget", f"gitlab.example.com/agents/global/{UID}").body
+    assert body == {"host": "gitlab.example.com", "project": "agents/global",
+                    "uid": UID}
+
+
+@pytest.mark.parametrize("segment", [
+    "E" * 32,          # upper case is not the uid grammar
+    "e" * 31,          # one short
+    "develop-141",
+])
+def test_anything_else_in_the_last_segment_stays_a_slug(segment):
+    body = build("runs", "forget", f"gitlab.example.com/agents/global/{segment}").body
+    assert body == {"host": "gitlab.example.com", "project": "agents/global",
+                    "slug": segment}
+
+
+def test_the_related_run_takes_a_uid_too():
+    body = build("runs", "relate", RUN_KEY, f"gitlab.example.com/agents/global/{UID}").body
+    assert body["related"] == {"host": "gitlab.example.com", "project": "agents/global",
+                               "uid": UID}
+
+
+def test_the_uid_grammar_is_the_index_s_own():
+    """Spelled in ``ctl`` to keep its imports off the platform's state modules,
+    so the copy is pinned here."""
+    from lmer_platform import runs
+
+    assert ctl.UID_RE.pattern == runs.UID_RE.pattern
+    assert ctl.UID_RE.match(UID + "\n") is None, "a trailing newline is not a uid"
+
+
+def test_the_run_key_help_names_both_last_segments(configured, capsys):
+    with pytest.raises(SystemExit):
+        ctl.main(["runs", "forget", "--help"], transport=Recorder())
+    assert "host/project/<slug|uid>" in capsys.readouterr().out
+
+
+def test_a_uid_key_round_trips_through_meta(configured, client, platform_root, capsys):
+    from lmer_platform import runs
+
+    runs.track("gitlab.example.com", "agents/global", "chat", uid=UID)
+    key = f"gitlab.example.com/agents/global/{UID}"
+
+    ok(["runs", "meta", "set", key, "--title", "one launch"], client, capsys)
+    read = ok(["runs", "meta", "get", key], client, capsys)
+
+    assert read["meta"]["title"] == "one launch"
+    assert read["run"]["uid"] == UID
 
 
 def test_a_key_that_cannot_name_a_run_is_refused_before_any_request(

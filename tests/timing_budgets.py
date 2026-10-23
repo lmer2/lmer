@@ -64,8 +64,12 @@ SHUTDOWN = stretch(60.0)
 DRAIN = stretch(60.0)
 #: An in-process thread finishing, or an event the test posted being picked up.
 JOIN = stretch(90.0)
-#: A recovery-CLI subprocess run to completion.
+#: A CLI subprocess run to completion: a recovery CLI, or a `work` verb in a
+#: scratch clone (a release claim fetches, commits, pushes and re-fetches).
 CLI = stretch(90.0)
+#: A Git hook or child parked at a barrier until the test releases it; must
+#: outlive every wait the test performs before the release.
+BARRIER = outlast(SETTLE)
 #: Interleaving probe in test_connector_ingestion.py.
 SCRIPT = stretch(360.0)
 #: The contained orphan probe can perform three SETTLE waits in sequence.
@@ -78,6 +82,14 @@ REAP = stretch(5.0)
 BACKLOG = stretch(900.0)
 #: Deliberately expired by tests of connection failure.
 CONNECT_EXPIRED = stretch(0.3)
+
+# Project-index render budgets (pure-Python PyYAML, no libyaml, must pass).
+
+#: Rendering one project's index block over 1,000 shallow run records (≈0.9s measured).
+INDEX_FLAT = stretch(5.0)
+#: Rendering one project's index block over ten 20-deep continuation chains
+#: (≈0.3s measured with the context cut; a full parse of the same records is ≈10s).
+INDEX_CHAINS = stretch(3.0)
 
 # Fixture child budgets.
 

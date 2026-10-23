@@ -1,4 +1,4 @@
-"""``_plexus.yaml`` — the plexus manifest, parsed into a typed model (spec §4).
+"""``_lmer.yaml`` — the plexus manifest, parsed into a typed model (spec §4).
 
 The manifest is the one file whose presence makes a tree schema form (D20):
 ``schema:`` int, instance ``name``, the ``projects`` registry, area
@@ -81,18 +81,18 @@ int → tools read and write, validator WARN).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
 #: The manifest filename at the plexus root (§2).
-MANIFEST_NAME = "_plexus.yaml"
+MANIFEST_NAME = "_lmer.yaml"
 
 #: Schema versions this loader understands. A present manifest declaring
 #: anything else fails loud (see the module docstring).
-SUPPORTED_SCHEMAS = (1,)
+SUPPORTED_SCHEMAS = (1, 2)
 
 #: The newest supported schema — the int a tool writes into a new manifest.
 CURRENT_SCHEMA = max(SUPPORTED_SCHEMAS)
@@ -122,15 +122,13 @@ RESERVED_SOURCE_NAMES = ("knowledge", "plans")
 #: Documented keys of a ``sources.<name>`` entry, PER NAME — the vocabulary
 #: is not uniform. SCHEMA.md's sources table gives ``taskdef`` ``{repo, ref?}``
 #: and every other name ``{repo}``, and ``load_sources`` enforces exactly that
-#: asymmetry on a standalone ``sources.yaml`` ("`ref:` is valid under
-#: `sources.taskdef` only in schema 1 (there is no LMER_NAPKIN_REF)") — a
-#: refuse-start error, not a warning. A uniform set here would accept
-#: ``sources.napkin.ref`` in a manifest, where nothing would ever act on it:
-#: the manifest's ``sources:`` tier is declared-only until its loader lands
-#: (issue #370), so the ref takes effect nowhere and no tool says a word.
-#: The day that loader arrives, every manifest already carrying one becomes a
-#: tree that refuses to start — which is why the key set is per-name NOW,
-#: while the warning still costs an operator one edit.
+#: asymmetry at every tier through its one per-entry rule set
+#: (``validate_source_entry``: "`ref:` is valid under `sources.taskdef` only
+#: in schema 1 (there is no LMER_NAPKIN_REF)") — a refuse-start error, not a
+#: warning. The manifest's ``sources:`` tier is read by that loader since
+#: issue #370, so a ``sources.napkin.ref`` in a manifest refuses start at
+#: container launch; this per-name key set is what makes the validator warn
+#: about it first, while the fix still costs an operator one edit.
 #:
 #: Keyed by name rather than special-cased at the call site: which names take
 #: ``ref`` is a schema fact, and a second place that knows it is a second
@@ -153,7 +151,7 @@ HOUSEKEEPING_POLICY_KEYS = ("archive_after",)
 
 
 class ManifestError(Exception):
-    """A present ``_plexus.yaml`` cannot be read or interpreted.
+    """A present ``_lmer.yaml`` cannot be read or interpreted.
 
     The single exception type of this module. Callers treat any instance as
     "this tree is schema form and unusable" — never as "no manifest, fall back
@@ -167,7 +165,7 @@ class ManifestError(Exception):
 
 @dataclass(frozen=True)
 class Manifest:
-    """One parsed ``_plexus.yaml``.
+    """One parsed ``_lmer.yaml``.
 
     ``projects``, ``sources`` and ``housekeeping`` are the sections as
     written: short name / source name / area name -> the raw entry mapping
@@ -185,6 +183,9 @@ class Manifest:
     sources: Dict[str, Dict[str, Any]]
     housekeeping: Dict[str, Dict[str, Any]]
     warnings: Tuple[str, ...]
+    # Writers retain the full document; understanding a subset never grants
+    # permission to discard an extension owned by another compatible writer.
+    document: Dict[str, Any] = field(default_factory=dict)
 
 
 def source_entry_keys(name) -> Tuple[str, ...]:
@@ -209,7 +210,7 @@ def manifest_path(root) -> Path:
 def load_manifest(root) -> Optional[Manifest]:
     """Load the manifest of the plexus rooted at *root*.
 
-    Returns ``None`` when no ``_plexus.yaml`` exists there — the legacy-form
+    Returns ``None`` when no ``_lmer.yaml`` exists there — the legacy-form
     signal (D20). Anything present that cannot be read or interpreted raises
     :class:`ManifestError`; see the module docstring for the full taxonomy.
     """
@@ -282,6 +283,7 @@ def parse_manifest(text, path=None) -> Manifest:
         sources=sections["sources"],
         housekeeping=sections["housekeeping"],
         warnings=tuple(warnings),
+        document=data,
     )
 
 

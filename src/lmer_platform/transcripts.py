@@ -268,14 +268,18 @@ import logging
 import os
 import re
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from ask_channel.protocol import KIND_QUESTION, AskError
+from lmer_cli import comms as bus
+from lmer_cli.threads import ThreadError, parse_thread
 
-from . import ask, registry, runs
+from . import ask, assistant_history, registry, runs
 from .config import active_assistant_credential, active_secret
 from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
@@ -640,6 +644,10 @@ _CREDENTIAL_WORDS = (
 _MAX_NAME_CHARS = 64
 
 _REDACTED = "<redacted>"
+
+#: The values :func:`scrub_pass` resolved for the pass in progress, or ``None``
+#: outside one.
+_SCRUB_PASS: ContextVar[Optional[tuple]] = ContextVar("lmer_transcript_scrub_pass", default=None)
 
 #: Credential shapes stripped from everything this module emits. Not a hunch: a
 #: real transcript on this codebase recorded a browser tool navigating to
@@ -1116,8 +1124,6 @@ def locate_sources(session_id: str) -> list:
 
     entry = registry.read_session(session_id)
     if entry is None:
-        from . import assistant_history
-
         archived = assistant_history.generation(session_id)
         if archived and archived["transcript"]:
             entry = {"transcript": json.loads(archived["transcript"])}
@@ -1217,16 +1223,52 @@ def _scrub(text: str) -> str:
     substitution that rewrote the text around one could leave the value itself
     behind in a form no later pattern recognises.
     """
-    for known in (_platform_secret(), _assistant_credential()):
-        if known:
-            text = text.replace(known, _REDACTED)
-    if projects.enabled():
-        for known in active_assistant_credentials():
-            if len(known) >= 8:
-                text = text.replace(known, _REDACTED)
+    known_values = _SCRUB_PASS.get()
+    if known_values is None:
+        known_values = _known_credentials()
+    for known in known_values:
+        text = text.replace(known, _REDACTED)
     for pattern, replacement in _CREDENTIAL_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _known_credentials() -> tuple:
+    """The credentials :func:`_scrub` strikes out by value, longest first.
+
+    Longest first because a credential that contains another must be struck out
+    before the shorter one splits it and leaves its remainder in the text. The
+    order depends on the values alone, so every project context resolves the
+    same tuple.
+
+    Resolving them opens ``projects.sqlite3`` and globs every project's
+    credential file, which is why a caller about to scrub many strings resolves
+    them once through :func:`scrub_pass` (issue #583).
+    """
+    known = {value for value in (_platform_secret(), _assistant_credential()) if value}
+    if projects.enabled():
+        known.update(value for value in active_assistant_credentials() if len(value) >= 8)
+    return tuple(sorted(known, key=lambda value: (-len(value), value)))
+
+
+@contextmanager
+def scrub_pass():
+    """Resolve the by-value credentials once for every :func:`_scrub` inside.
+
+    Yields the resolved tuple, which identifies the pass's masking rule for a
+    caller that memoizes scrub results. A nested pass reuses the outer one. A
+    credential minted while a pass is open is masked from the next pass on.
+    """
+    current = _SCRUB_PASS.get()
+    if current is not None:
+        yield current
+        return
+    known = _known_credentials()
+    token = _SCRUB_PASS.set(known)
+    try:
+        yield known
+    finally:
+        _SCRUB_PASS.reset(token)
 
 
 def _present(text: str, limit: int, *, keep: str = "head") -> tuple:
@@ -2363,6 +2405,7 @@ def _tail_source(source: Source) -> tuple:
     return messages, vocabulary, modified
 
 
+@scrub_pass()
 def last_turn(session_id: str) -> Optional["Message"]:
     """The newest turn in *session_id*'s transcript, or ``None``.
 
@@ -2702,7 +2745,7 @@ def _interleave(transcript: list, channel: list) -> list:
     return [item[3] for item in ordered]
 
 
-def _comms_messages(session_id: str) -> tuple:
+def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """One session's bus records as turns, and the harness's copies to hide.
 
     Returns ``(turns, copies)``. *copies* holds ``(role, text)`` for every
@@ -2722,13 +2765,12 @@ def _comms_messages(session_id: str) -> tuple:
     bus turns and nothing else.
     """
     try:
+        # deferred: cycle — lmer_platform.comms imports this module at top (via project_events); inside the best-effort try
         from . import comms as hub_module
 
         events, _cursor = hub_module.ensure_hub().feed(
             0, session=session_id, limit=hub_module.PANE_LIMIT,
         )
-        from . import assistant_history
-
         archived = assistant_history.events(session_id)
         if archived:
             events = archived
@@ -2738,11 +2780,11 @@ def _comms_messages(session_id: str) -> tuple:
             "conversation is served without the bus's turns", session_id, exc,
         )
         return [], []
-    return _comms_turns(events, session_id)
+    return _comms_turns(events, session_id, assistant_name)
 
 
-def _comms_turns(events: list, session_id: str) -> tuple:
-    from lmer_cli import comms as bus
+def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = None) -> tuple:
+    # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via lmer_platform.comms)
     from .assistant_conversation import digest_run
 
     questions: dict = {}
@@ -2804,10 +2846,19 @@ def _comms_turns(events: list, session_id: str) -> tuple:
                 continue
             asked = questions.get(record.get("in_reply_to"))
             line, tagged = bus.relay_payload(
-                message, bus.Message.from_dict(asked) if asked else None
+                message, bus.Message.from_dict(asked) if asked else None,
+                assistant_name=assistant_name,
             )
             if tagged:
                 copies.append(("user", _collapsed(line), None))
+                # A container started before a rename keeps typing the old tag
+                # (#581); claim every alias so the pane does not show the
+                # relayed message twice until that session rotates.
+                if message.source.channel == bus.CHANNEL_UBER:
+                    current = (assistant_name or "").strip() or bus.assistant_display_name()
+                    for alias in bus.assistant_label_aliases(name=assistant_name):
+                        if alias != current:
+                            copies.append(("user", _collapsed(line.replace(f"[{current}", f"[{alias}", 1)), None))
     return turns, copies
 
 
@@ -2829,7 +2880,6 @@ def _thread_link(value: object) -> Optional[str]:
     """
     if not isinstance(value, str) or not value:
         return None
-    from lmer_cli.threads import ThreadError, parse_thread
 
     try:
         parse_thread(value)
@@ -3015,7 +3065,7 @@ def _spend_by_tail(transcript, copies, wanted, claimed, spent) -> None:
             break
 
 
-def _merged_channel(session_id: str) -> tuple:
+def _merged_channel(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """The turns to merge into one session's transcript, and the copies to hide.
 
     The bus wins when it has anything: the ask directory is a projection of the
@@ -3023,7 +3073,7 @@ def _merged_channel(session_id: str) -> tuple:
     question twice. A session with no bus turns — an older image — keeps the ask
     channel's exchange exactly as before.
     """
-    turns, copies = _comms_messages(session_id)
+    turns, copies = _comms_messages(session_id, assistant_name)
     if turns:
         return turns, copies
     return _channel_messages(session_id), []
@@ -3097,7 +3147,6 @@ def _collect_sources(session_id: str) -> list:
     """
     grouped: list = []
     files = 0
-    from . import assistant_history
 
     entry = registry.read_session(session_id) or {}
     members = ([session_id] if entry.get("kind") == "assistant" or assistant_history.generation(session_id)
@@ -3139,7 +3188,8 @@ def _source_name(session_id: str, path: Path) -> str:
     return hashlib.blake2b(str(path).encode("utf-8"), digest_size=8).hexdigest()
 
 
-def collect_messages(session_id: str) -> tuple:
+@scrub_pass()
+def collect_messages(session_id: str, assistant_name: Optional[str] = None) -> tuple:
     """Normalize the named conversation without choosing a response page."""
     _validated(session_id)
     messages: list = []
@@ -3161,20 +3211,19 @@ def collect_messages(session_id: str) -> tuple:
                 if message.id is None:
                     message.id = f"{member}:{name}#{index}"
                 found.append(message)
-        channel, copies = _merged_channel(member)
+        channel, copies = _merged_channel(member, assistant_name)
         joined = _interleave(_without_bus_copies(found, copies), channel)
         for message in joined:
             message.session = member
         messages.extend(joined)
 
-    from . import assistant_history
-
     archived = assistant_history.generation(session_id)
     entry = registry.read_session(session_id)
     if not archived and isinstance(entry, dict) and entry.get("kind") == "assistant":
+        # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via comms); only an unarchived assistant needs it
         from . import assistant_conversation
 
-        channel, copies = _comms_turns(assistant_conversation.events(), session_id)
+        channel, copies = _comms_turns(assistant_conversation.events(), session_id, assistant_name)
         working = [message for message in messages if not message.via]
         conversation = [message for message in messages if message.via]
         messages = _interleave(
@@ -3195,6 +3244,7 @@ def read_messages(
     *,
     since: int = 0,
     limit: int = DEFAULT_MESSAGE_LIMIT,
+    assistant_name: Optional[str] = None,
 ) -> MessagePage:
     """The conversation of *session_id*'s run, as a page of normalised messages.
 
@@ -3215,7 +3265,7 @@ def read_messages(
     _validated(session_id)
     limit = max(1, min(int(limit), MAX_MESSAGE_LIMIT))
 
-    messages, read = collect_messages(session_id)
+    messages, read = collect_messages(session_id, assistant_name)
 
     total = len(messages)
     start = max(0, total + since) if since < 0 else min(since, total)
@@ -3230,8 +3280,6 @@ def read_messages(
         note = EMPTY_TRANSCRIPT_NOTE
     else:
         note = NO_TRANSCRIPT_NOTE
-
-    from . import assistant_history
 
     archive_note = assistant_history.transcript_limit_note(session_id)
     if archive_note:

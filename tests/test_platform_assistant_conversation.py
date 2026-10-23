@@ -87,3 +87,14 @@ def test_a_digest_run_is_bounded_and_needs_its_whole_key():
     ) == {"host": "h", "project": limit, "slug": "s"}
     assert assistant_conversation.digest_run({"host": "h", "project": 3, "slug": "s"}) is None
     assert assistant_conversation.digest_run("not a mapping") is None
+
+
+def test_a_digest_run_keeps_a_schema_2_uid_so_its_link_is_the_execution():
+    uid = "a" * 32
+    assert assistant_conversation.digest_run(
+        {"host": "h", "project": "p", "slug": "s", "uid": uid}
+    ) == {"host": "h", "project": "p", "slug": "s", "uid": uid}
+    for malformed in ("A" * 32, "a" * 31, 7, None):
+        assert assistant_conversation.digest_run(
+            {"host": "h", "project": "p", "slug": "s", "uid": malformed}
+        ) == {"host": "h", "project": "p", "slug": "s"}

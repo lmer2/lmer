@@ -19,6 +19,7 @@ and what a thread is told.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -31,20 +32,21 @@ from typing import Callable, Optional
 
 from ask_channel import bus
 
-from lmer_cli import thread_access
+from lmer_cli import runref, thread_access
 from lmer_cli.connector_delivery import RecoveryRequired, checkpoint_path, marker_path
-from lmer_cli.connector_lifecycle import EXIT_RECOVERY
+from lmer_cli.connector_lifecycle import EXIT_RECOVERY, PLATFORM_SESSION_ENV
 from lmer_cli.connector_ownership import Lease, OwnershipError, ThreadKey
 from lmer_cli.connector_process import OwnedProcess, reclaim_orphan, spawn_child, spawn_owned
 from lmer_cli.connector_recovery import Recovery
 from lmer_cli.threads import ThreadError, ThreadRef, parse_thread
 
 from slack_chat import registry as thread_registry
-from slack_chat.client import SlackError
+from slack_chat.client import SlackClient, SlackError
 from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV
-from matrix_chat.client import MatrixError
+from matrix_chat.client import MatrixClient, MatrixError
 
-from . import config, registry, session_io, uploads
+from . import comms as platform_comms
+from . import config, meta, registry, runs, session_io, uploads
 from .comms import comms_dir
 from .store import (
     StoreError, ensure_state_dir, logs_dir, mutating, read_json, utc_now_iso,
@@ -261,8 +263,6 @@ class ThreadConnectors:
 
     def _notify_disconnected(self, session_id: str, record: dict) -> None:
         """Tell the affected session once per loss, outside the connector lock."""
-        from . import comms
-
         key = (session_id, record["id"])
         with self._lock:
             if key in self._disconnected:
@@ -273,12 +273,12 @@ class ThreadConnectors:
             logger.info("assistant_thread_disconnected session=%s thread=%s", session_id, record["id"])
             return
         try:
-            comms.ensure_hub().post(
+            platform_comms.ensure_hub().post(
                 session_id, kind="message", channel="platform",
                 text=f"thread disconnected: {record['label']}",
                 meta={"notification_class": "connector_health"},
             )
-        except (comms.CommsError, session_io.SessionIOError) as exc:
+        except (platform_comms.CommsError, session_io.SessionIOError) as exc:
             logger.warning(
                 "platform_thread_disconnect_notice_failed session=%s thread=%s error=%s",
                 session_id, record["id"], exc,
@@ -355,7 +355,7 @@ class ThreadConnectors:
                 # Not this check's to refuse: an unusable target is dropped with
                 # a warning by adopt_launch_targets, not made fatal to a launch.
                 continue
-            ref = self._resolved(ref, require_resolution=True)
+            ref = self._held_check_ref(ref, besides=besides)
             with self._lock:
                 holder = self._live_holder(ref, besides=besides)
             if holder is not None:
@@ -375,6 +375,37 @@ class ThreadConnectors:
                     "or disconnect the thread there, then launch this one",
                     status=409,
                 )
+
+    def _held_check_ref(self, ref: ThreadRef, *, besides: Optional[str]) -> ThreadRef:
+        """The identity :meth:`refuse_held_targets` checks *ref* under.
+
+        The replaced session's own record is reused as it stands, with no
+        transport read. Any other target must resolve; a refusal names the
+        method that failed.
+        """
+        if besides is not None:
+            with self._lock:
+                for record in self._sessions.get(besides, ()):
+                    if record["id"] == ref.id or record["permalink"] == ref.permalink:
+                        return _ref_of(record)
+        if ref.channel == CHANNEL_SLACK:
+            self._require_slack_credentials()
+        elif ref.key["room"].startswith("#"):
+            self._require_matrix_credentials()
+        try:
+            return self._resolved(ref, require_resolution=True)
+        except ThreadError as exc:
+            method = "conversations.replies" if ref.channel == CHANNEL_SLACK else "room alias resolution"
+            if exc.retry_after is not None:
+                later = f"; rate limited, so retry in {math.ceil(exc.retry_after)}s or later"
+            elif exc.transient:
+                later = "; it is transient, but no retry time was given"
+            else:
+                later = ""
+            raise ThreadError(
+                f"cannot check who holds {ref.permalink}: {method} failed ({exc}){later}",
+                status=exc.status, transient=exc.transient, retry_after=exc.retry_after,
+            ) from None
 
     def prepare(self, permalink: object, *, checks: bool = True) -> ThreadRef:
         """Parse *permalink* and check this host can actually serve it.
@@ -415,10 +446,13 @@ class ThreadConnectors:
             )
         except Exception as exc:
             if require_resolution:
+                status = getattr(exc, "status", None)
                 raise ThreadError(
                     f"cannot verify the matrix room {ref.key['room']}: {exc} — "
                     "retry once it can be resolved, or launch without that thread",
-                    status=getattr(exc, "status", 502),
+                    # MatrixError carries status=None when the homeserver never answered.
+                    status=status if isinstance(status, int) else 502,
+                    **thread_access.retry_hint(exc),
                 ) from None
             logger.warning(
                 "platform_thread_alias_unresolved room=%s error=%s", ref.key["room"], exc,
@@ -468,8 +502,6 @@ class ThreadConnectors:
         — but a *crashed* session's entry is deliberately kept as the crash
         signal, so its records would outlive the run that was forgotten.
         """
-        from . import runs
-
         dropped = 0
         for session_id in list(self.sessions()):
             try:
@@ -925,7 +957,8 @@ class ThreadConnectors:
 
     def _upload_store(self, session_id: str) -> Optional[Path]:
         try:
-            return uploads.mounted_store(session_id, registry.read_session(session_id))
+            name = self._platform_config.assistant_name if self._platform_config is not None else None
+            return uploads.mounted_store(session_id, registry.read_session(session_id), name)
         except Exception:
             # A session with no store still gets a connector: what it loses is
             # files from the thread, not the conversation.
@@ -940,6 +973,9 @@ class ThreadConnectors:
             env[config.ENV_BIND_PORT] = str(self._platform_config.bind_port)
             # The child launches from its interpreter directory, not the daemon cwd.
             env[config.ENV_SECRET_FILE] = str(self._platform_config.secret_path.absolute())
+            # The connector renders the assistant's bus records and thread posts
+            # with this name; carry the resolved value, not the daemon's env (#581).
+            env[config.ENV_ASSISTANT_NAME] = self._platform_config.assistant_name
         for name in _THREAD_CONTEXT_ENV:
             env.pop(name, None)
         # Which kind of attachment this is, told to the one process that has to
@@ -953,6 +989,9 @@ class ThreadConnectors:
         if isinstance(cursor, int) and not isinstance(cursor, bool):
             env[ATTACH_SINCE_ENV] = str(cursor)
         env["LMER_SUPERVISOR_URL"] = f"http://{endpoint.host}:{endpoint.port}"
+        # The speaker tag is looked up by this id; the supervisor knows only the
+        # container's own (#574).
+        env[PLATFORM_SESSION_ENV] = session_id
         # In the environment and not in argv: argv is readable from /proc by
         # every account on the host, and this is the credential that opens the
         # session's control plane.
@@ -1080,10 +1119,6 @@ def _run_label(session_id: str) -> str:
     to be the one the fleet list shows: the run's title when it has one, and
     always the ``host/project/slug`` that finds it.
     """
-    from lmer_cli import runref
-
-    from . import meta, runs
-
     identity = runs.run_for_session(session_id)
     if identity is None:
         return f"session {session_id}"
@@ -1100,14 +1135,10 @@ def _spawn_process(argv: list, env: dict, log_path: Optional[Path] = None, *, pa
 
 
 def _slack_client(token: str):
-    from slack_chat.client import SlackClient
-
     return SlackClient(token, timeout=REMOTE_TIMEOUT_SECONDS, retries=0)
 
 
 def _matrix_client(account):
-    from matrix_chat.client import MatrixClient
-
     return MatrixClient(account, timeout=REMOTE_TIMEOUT_SECONDS)
 
 

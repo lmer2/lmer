@@ -8,13 +8,35 @@ logic, opens no file of the tree and decides no severity — a rule that is
 easy to keep because the report already carries everything the two outputs
 need (the form, the ordered findings, the counts, the exit code).
 
-Two commands, two outputs
-=========================
+Commands and outputs
+====================
 ``validate <path>`` renders the report, as **text** for a human or as one
 **JSON document** for a machine (``--json``); ``--list-checks`` prints the
 registered check codes with their severities and tiers — the machine-readable
 inventory docs/SCHEMA.md's strictness table is reconciled against, in text or
-JSON. Nothing else: the adoption/migration verbs are ``work``'s (spec §9).
+JSON. ``migrate <path>`` previews an explicit schema-1 to schema-2 cutover,
+or applies that reviewed local change with ``--apply``. Its preconditions
+and filesystem changes live in :mod:`lmer_schema.migration`; it never commits
+or pushes. Legacy layout adoption remains separate.
+
+``index <path> [--write] [--diff] [--json]`` renders the generated README
+index blocks (the legible-work-repo design): the root ``README.md``'s project
+list from ``_lmer.yaml`` and every project README's run table from the
+records under ``_runs/``, through the kernel every durability push uses
+(``work_repo.project_index``, imported lazily inside the functions — the
+import direction is ``work_repo -> lmer_schema``). A dry run prints one
+action per file — ``create``, ``update``, ``unchanged`` or ``refused`` with
+its reason — and exits ``1`` when anything would change or is refused;
+``--write`` applies the plan under the checkout's mutation lock
+(``work_repo.transactions.work_mutation``) and never commits; a written root
+README is sent to an explicit gated commit, because a session's push stages
+project READMEs only. On a git checkout the rows are the tracked records and
+a README the checkout ignores is refused, exactly what the publication choke
+point would do, so the backfill and the next push render the same bytes. A
+project directory outside the write boundary (``project_dir_refusal``: a
+symlink, a path resolving outside the root, a ``_runs/`` record) is refused
+before anything is written, in the preview as in ``--write``. A legacy tree
+exits ``2``: the index exists only in schema form.
 
 The exit taxonomy
 =================
@@ -119,33 +141,58 @@ script only reaches PATH after the editable package is reinstalled — so
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
+import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
+from lmer_schema.checks import walk
 from lmer_schema.checks.findings import (
     CHECKS,
     EXIT_CLEAN,
+    EXIT_ERRORS,
     EXIT_UNUSABLE,
     Form,
     Report,
 )
+from lmer_schema.checks.index_links import README_NAME, line_delta
 from lmer_schema.checks.record import STALE_AFTER_SECONDS
 from lmer_schema.checks.runner import validate
-from lmer_schema.manifest import CURRENT_SCHEMA, MANIFEST_NAME, SUPPORTED_SCHEMAS
+from lmer_schema.manifest import (
+    CURRENT_SCHEMA,
+    MANIFEST_NAME,
+    SUPPORTED_SCHEMAS,
+    ManifestError,
+    load_manifest,
+)
+from lmer_schema.migration import migrate
+from lmer_schema.registry import RegistryError, build_registry
 
 __all__ = [
+    "CREATE",
     "OUTPUT_SCHEMA",
     "PROG",
+    "REFUSED",
+    "UNCHANGED",
+    "UPDATE",
+    "IndexFile",
     "build_parser",
+    "index_document",
+    "index_exit_code",
+    "index_plan",
     "inventory_document",
     "json_document",
     "main",
+    "render_index",
     "render_inventory",
     "render_text",
     "unreachable_codes",
+    "write_index",
 ]
 
 #: The console entry's name — the documented spelling of this command, used as
@@ -207,14 +254,17 @@ def build_parser() -> _ArgumentParser:
         # argparse's generated line would show the subcommand as required.
         usage=(
             f"{PROG} validate PATH [--json] [--plexus-repo-url URL] "
-            f"[--stale-after DAYS]\n       {PROG} --list-checks [--json]"
+            f"[--stale-after DAYS]\n       {PROG} migrate PATH [--apply] [--json]"
+            f"\n       {PROG} index PATH [--write] [--diff] [--json]"
+            f"\n       {PROG} --list-checks [--json]"
         ),
         description=(
-            "Validate a plexus — an lmer schema tree — against docs/SCHEMA.md. "
-            "Exit 0 clean (warnings never block), 1 errors, 2 unusable input."
+            "Validate a plexus, preview a schema-version migration, or render the "
+            "generated README index blocks. Exit 0 clean (warnings never block), "
+            "1 errors, 2 unusable input."
         ),
         epilog=(
-            "Text output is an ordered fix-list; --json prints one document "
+            "Validation text is an ordered fix-list; --json prints one document "
             "(schema, tool, form, exit_code, unusable, counts, findings) whose "
             "every path is repo-relative. Run it as `python -m lmer_schema.cli` "
             "when the console script is not on PATH yet."
@@ -231,9 +281,50 @@ def build_parser() -> _ArgumentParser:
         action="store_true",
         help="emit one JSON document on stdout instead of text",
     )
-    # metavar="" so the one command is listed once: argparse otherwise prints
+    # metavar="" so each command is listed once: argparse otherwise prints
     # the choice line AND the choice's own help line under it.
     subparsers = parser.add_subparsers(dest="command", title="commands", metavar="")
+    migration_parser = subparsers.add_parser(
+        "migrate", help="preview a schema-1 to schema-2 cutover"
+    )
+    migration_parser.add_argument("path", help="plexus root")
+    migration_parser.add_argument("--apply", action="store_true", help="apply a clear preview")
+    migration_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    index_parser = subparsers.add_parser(
+        "index",
+        prog=f"{PROG} index",
+        help="render the generated README index blocks of the plexus at PATH "
+        "(a dry run unless --write)",
+        description=(
+            "Render the generated index block of the root README (the project list, "
+            f"from `{MANIFEST_NAME}`) and of every project README (one row per run "
+            "record under `_runs/`, newest first). A dry run prints one action per "
+            "file — create, update, unchanged, or refused with its reason — and exits "
+            "1 when anything would change or is refused; --write applies it under the "
+            "checkout's mutation lock and never commits: publish through the normal "
+            "process (in a session: `work commit`, which publishes project READMEs "
+            "only — commit a written root README explicitly through the normal gated "
+            "commit). On a git checkout only tracked records are listed and an ignored "
+            "README is refused, exactly as the publication path behaves. A project "
+            "directory that is a symlink, resolves outside PATH or lies inside a "
+            "`_runs/` record is refused before anything is written. A tree without a "
+            "manifest exits 2."
+        ),
+    )
+    index_parser.add_argument("path", help="the plexus root to index")
+    index_parser.add_argument(
+        "--write", action="store_true", help="write the files a dry run would change"
+    )
+    index_parser.add_argument(
+        "--diff", action="store_true",
+        help="print a unified diff under every file that would change",
+    )
+    index_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit one JSON document on stdout instead of text",
+    )
     validate_parser = subparsers.add_parser(
         "validate",
         prog=f"{PROG} validate",
@@ -300,6 +391,33 @@ def _dispatch(parser: _ArgumentParser, args) -> int:
         return _cmd_list_checks(args)
     if args.command is None:
         parser.error("a command is required (try `validate PATH`, or --list-checks)")
+    if args.command == "migrate":
+        try:
+            result = migrate(Path(args.path), apply=args.apply)
+        except (ManifestError, OSError) as exc:
+            print(f"Migration refused: {exc}", file=sys.stderr)
+            return EXIT_UNUSABLE
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(result["diff"] or "Already schema 2; no changes.")
+            if result["moves"]:
+                for move in result["moves"]:
+                    print(
+                        f"Directory move: {move['from']} -> {move['to']} "
+                        f"(slug: {move['slug']})"
+                    )
+            else:
+                print("Directory moves: none; historical records remain unchanged.")
+            for blocker in result["blockers"]:
+                print(f"Blocked: {blocker}")
+            if result["applied"]:
+                print("Schema 2 applied locally.")
+            elif result["diff"] and not result["blockers"]:
+                print("Preview only. Re-run with --apply after reviewing and stopping old writers.")
+        return EXIT_ERRORS if result["blockers"] else EXIT_CLEAN
+    if args.command == "index":
+        return _cmd_index(args)
     return _cmd_validate(args)
 
 
@@ -519,6 +637,379 @@ def render_inventory() -> List[str]:
             f"{entry.tier.value:<{tier_width}}  {note}{entry.summary}"
         )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# index
+# ---------------------------------------------------------------------------
+
+#: The four actions an `index` run reports, one per README.
+CREATE = "create"
+UPDATE = "update"
+UNCHANGED = "unchanged"
+REFUSED = "refused"
+
+#: The tail of the `--write` summary line: the command never commits.
+_NOT_COMMITTED = "not committed — publish through the normal process (in a session: work commit)"
+
+#: The tail instead when the root README was written: a session's push stages
+#: project READMEs only, so `work commit` would leave the root behind.
+_NOT_COMMITTED_ROOT = (
+    "not committed — commit the root README.md explicitly through the normal gated commit "
+    "(work commit publishes project READMEs only)"
+)
+
+#: One more phrase after a refusal reason, in the text output only.
+_REFUSAL_HINTS = {
+    "marker line in hand text": "indent or lengthen the line",
+    "newer format": "upgrade lmer",
+    "ignored": "the checkout's ignore rules would make `git add` refuse it",
+}
+
+
+class _Refused(Exception):
+    """A README the index must not write; ``str(exc)`` is the short reason."""
+
+
+@dataclass
+class IndexFile:
+    """One README the `index` command accounts for: where it is, what the
+    command would do to it and why. ``old`` is ``None`` when the file does
+    not exist; ``include`` is the tracked-record filter on a git checkout.
+    ``reason`` is set only for a refusal."""
+
+    rel: str
+    directory: Path
+    heading: str
+    project_rel: Optional[str]
+    include: Optional[Callable[[str], bool]] = None
+    action: str = UNCHANGED
+    old: Optional[str] = None
+    new: str = ""
+    added: int = 0
+    removed: int = 0
+    reason: Optional[str] = None
+
+
+def _cmd_index(args) -> int:
+    root = Path(args.path).expanduser()
+    if not root.is_dir():
+        print(f"Index refused: not a directory: {args.path}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    try:
+        manifest = load_manifest(root)
+        registry = None if manifest is None else build_registry(manifest)
+    except (ManifestError, RegistryError, OSError) as exc:
+        print(f"Index refused: {exc}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if manifest is None:
+        print(
+            f"Index refused: no {MANIFEST_NAME} — legacy trees are out of scope for the "
+            "index; adopt the schema first",
+            file=sys.stderr,
+        )
+        return EXIT_UNUSABLE
+    if args.write:
+        try:
+            files = write_index(root, manifest.document, registry)
+        except OSError as exc:  # the lock refused (a hook owns it), or a write failed
+            print(f"Index refused: {exc}", file=sys.stderr)
+            return EXIT_UNUSABLE
+    else:
+        files = index_plan(root, manifest.document, registry)
+    if args.json:
+        print(json.dumps(index_document(files, write=args.write), indent=2))
+    else:
+        for line in render_index(files, write=args.write, diff=args.diff):
+            print(line)
+    return index_exit_code(files, write=args.write)
+
+
+def index_plan(root: Path, document, registry) -> List[IndexFile]:
+    """What `index` would do to every README of the plexus at *root*: the
+    root first, then every project dir in the shared walk's order
+    (registered projects first, then host buckets).
+
+    On a git checkout each project is rendered over the records whose state
+    file is tracked (``tracked_record_filter``), the set the publication
+    choke point renders, and a README the checkout ignores is refused; off
+    git, everything on disk is listed. Nothing is written.
+    """
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
+    from work_repo import project_index
+
+    root = Path(root)
+    timeout = project_index.GIT_TIMEOUT_SECONDS
+    checkout = _is_git_checkout(root, timeout)
+    files = [_plan_root(root, document, project_index)]
+    for project in walk.project_dirs(root, registry=registry):
+        files.append(
+            _plan_project(root, project.rel, Path(project.path), checkout, timeout, project_index)
+        )
+    return files
+
+
+def _plan_root(root: Path, document, project_index) -> IndexFile:
+    name = document.get("name") if isinstance(document, dict) else None
+    entry = IndexFile(
+        rel=README_NAME, directory=root, heading=str(name) if name else root.name, project_rel=None
+    )
+    # The root README is never staged by a session's push, so a human's
+    # setext underline there is no hazard: only project READMEs are screened.
+    return _classify(
+        entry, lambda _old: project_index.render_root_readme(root, document),
+        project_index, screen_hand_text=False,
+    )
+
+
+def _plan_project(
+    root: Path, rel: str, directory: Path, checkout: bool, timeout: float, project_index
+) -> IndexFile:
+    entry = IndexFile(
+        rel=f"{rel}/{README_NAME}", directory=directory,
+        heading=rel.rsplit("/", 1)[-1], project_rel=rel,
+    )
+    # The write boundary comes first: `is_dir()` follows a symlink, and the
+    # walk hands a registered short name over by name, so an alias would
+    # otherwise carry the write outside the tree or into a run record.
+    boundary = project_index.project_dir_refusal(root, rel)
+    if boundary is not None:
+        return _refuse(entry, boundary)
+    if not directory.is_dir():
+        return _refuse(entry, "missing directory")
+    if checkout:
+        if _is_ignored(root, entry.rel, timeout):
+            return _refuse(entry, "ignored")
+        entry.include = project_index.tracked_record_filter(root, rel)
+
+    def render(old: Optional[str]) -> str:
+        block = project_index.render_project_block(
+            project_index.scan_project(directory, include=entry.include, project_rel=rel)
+        )
+        return project_index.splice_block(old, block, heading=entry.heading)
+
+    return _classify(entry, render, project_index, screen_hand_text=True)
+
+
+def _classify(entry: IndexFile, render, project_index, *, screen_hand_text: bool) -> IndexFile:
+    """Read the existing README, refuse what the generator must not touch,
+    render the new text and name the action."""
+    try:
+        entry.old = _existing_text(entry.directory / README_NAME)
+        if entry.old is not None:
+            _screen(entry.old, project_index, screen_hand_text=screen_hand_text)
+        entry.new = render(entry.old)
+    except _Refused as exc:
+        return _refuse(entry, str(exc))
+    except (project_index.IndexSkipped, project_index.MalformedMarkers) as exc:
+        return _refuse(entry, str(exc))
+    if entry.old is None:
+        entry.action = CREATE
+    elif entry.new == entry.old:
+        entry.action = UNCHANGED
+    else:
+        entry.action = UPDATE
+    if entry.action != UNCHANGED:
+        entry.added, entry.removed = line_delta(entry.old or "", entry.new)
+    return entry
+
+
+def _refuse(entry: IndexFile, reason: str) -> IndexFile:
+    entry.action, entry.reason, entry.added, entry.removed = REFUSED, reason, 0, 0
+    return entry
+
+
+def _existing_text(path: Path) -> Optional[str]:
+    """The README's text, ``None`` when there is no file; a symlink, a
+    directory, an unreadable file or non-UTF-8 bytes are refusals."""
+    if path.is_symlink():
+        raise _Refused("symlink")
+    if path.is_dir():
+        raise _Refused("directory")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _Refused(f"not readable ({exc.strerror or exc})") from exc
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _Refused("not UTF-8 text") from exc
+
+
+def _screen(existing: str, project_index, *, screen_hand_text: bool) -> None:
+    """The generator's own refusals, spelled as the short reasons the action
+    line and the JSON document carry."""
+    try:
+        block = project_index.extract_block(existing)
+    except project_index.MalformedMarkers as exc:
+        raise _Refused("malformed markers") from exc
+    token = project_index.block_format(block)
+    if token is not None and token > project_index.FORMAT:
+        raise _Refused("newer format")
+    if screen_hand_text and project_index.hand_text_has_marker(existing):
+        raise _Refused("marker line in hand text")
+
+
+def write_index(root: Path, document, registry) -> List[IndexFile]:
+    """Plan and write under the checkout's mutation lock, and return the
+    files with the actions as they turned out.
+
+    The plan — the tracked-filter snapshots (``git ls-files``) and the record
+    scans of :func:`index_plan` — is computed INSIDE the lock, not before
+    taking it: a session's durability push regenerates a README under the
+    same lock, so a plan made outside it could describe a tree the write no
+    longer finds. The kernel's writer still compares bytes at write time, so
+    a README that matches makes a planned update ``unchanged`` and one that
+    became untouchable is ``refused``. Raises ``OSError`` when the lock is
+    refused (an invoking Git hook owns it) or a write fails.
+    """
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
+    from work_repo import project_index
+    from work_repo.transactions import work_mutation
+
+    with work_mutation(Path(root)):
+        files = index_plan(root, document, registry)
+        for entry in files:
+            if entry.action in (CREATE, UPDATE):
+                _write_one(entry, project_index)
+    return files
+
+
+def _write_one(entry: IndexFile, project_index) -> None:
+    if entry.project_rel is None:
+        _replace_file(entry.directory / README_NAME, entry.new.encode("utf-8"))
+        return
+    try:
+        changed, _previous = project_index.write_project_readme(
+            entry.directory, include=entry.include, project_rel=entry.project_rel,
+            heading=entry.heading,
+        )
+    except (project_index.IndexSkipped, project_index.MalformedMarkers) as exc:
+        _refuse(entry, str(exc))
+        return
+    if not changed:
+        entry.action, entry.added, entry.removed = UNCHANGED, 0, 0
+
+
+def _replace_file(path: Path, data: bytes) -> None:
+    """Write *data* to *path* through a temp file and one rename, keeping the
+    file's mode (the root README has no kernel writer of its own)."""
+    mode = (path.stat().st_mode & 0o7777) if path.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _git(root: Path, args: Sequence[str], timeout: float) -> Optional[subprocess.CompletedProcess]:
+    """One git call in *root*; ``None`` when git is absent, fails to start or
+    times out — every one of which means "not a checkout we can ask"."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, check=False,
+            env={**os.environ, "LC_ALL": "C"}, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _is_git_checkout(root: Path, timeout: float) -> bool:
+    result = _git(root, ["rev-parse", "--is-inside-work-tree"], timeout)
+    return result is not None and result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _is_ignored(root: Path, rel: str, timeout: float) -> bool:
+    """Whether the checkout's ignore rules would make ``git add`` refuse *rel*."""
+    result = _git(root, ["check-ignore", "-q", "--", rel], timeout)
+    return result is not None and result.returncode == 0
+
+
+def render_index(files: Sequence[IndexFile], *, write: bool, diff: bool) -> List[str]:
+    """The text output: one action line per file — ``<action> <path> (+N -M)``,
+    or ``refused <path> — <reason>`` — a unified diff under each pending file
+    when *diff* is set, then the summary line(s)."""
+    lines: List[str] = []
+    for entry in files:
+        if entry.action == REFUSED:
+            hint = _REFUSAL_HINTS.get(entry.reason or "")
+            tail = f" ({hint})" if hint else ""
+            lines.append(f"{REFUSED:<9}  {entry.rel} — {entry.reason}{tail}")
+            continue
+        lines.append(f"{entry.action:<9}  {entry.rel} (+{entry.added} -{entry.removed})")
+        if diff and entry.action in (CREATE, UPDATE):
+            lines += _unified_diff(entry)
+    return lines + _index_summary(files, write=write)
+
+
+def _unified_diff(entry: IndexFile) -> List[str]:
+    old = (entry.old or "").splitlines(keepends=True)
+    new = entry.new.splitlines(keepends=True)
+    return [
+        line.rstrip("\n")
+        for line in difflib.unified_diff(
+            old, new, fromfile=f"a/{entry.rel}", tofile=f"b/{entry.rel}"
+        )
+    ]
+
+
+def _index_summary(files: Sequence[IndexFile], *, write: bool) -> List[str]:
+    pending = sum(1 for entry in files if entry.action in (CREATE, UPDATE))
+    refused = sum(1 for entry in files if entry.action == REFUSED)
+    if write and pending:
+        root_written = any(
+            entry.project_rel is None and entry.action in (CREATE, UPDATE) for entry in files
+        )
+        tail = _NOT_COMMITTED_ROOT if root_written else _NOT_COMMITTED
+        lines = [f"Wrote {pending} file(s); {tail}"]
+    elif pending:
+        lines = [f"Preview only. Re-run with --write to write {pending} file(s)."]
+    elif refused:
+        lines = ["Nothing to write."]
+    else:
+        lines = ["Nothing to write; every index block is up to date."]
+    if refused:
+        lines.append(f"{refused} file(s) refused; fix the reason shown and run again.")
+    return lines
+
+
+def index_document(files: Sequence[IndexFile], *, write: bool) -> Dict[str, object]:
+    """The `index --json` document: the usual envelope, the form (always
+    schema — a legacy tree never gets this far), whether this run wrote, and
+    one entry per file with its action and line delta; ``reason`` appears
+    only on a refused entry. Plain types, no machine path."""
+    entries: List[Dict[str, object]] = []
+    for entry in files:
+        item: Dict[str, object] = {
+            "path": entry.rel, "action": entry.action,
+            "added": entry.added, "removed": entry.removed,
+        }
+        if entry.action == REFUSED:
+            item["reason"] = entry.reason
+        entries.append(item)
+    return {
+        "schema": OUTPUT_SCHEMA, "tool": PROG, "form": Form.SCHEMA.value,
+        "write": write, "files": entries,
+    }
+
+
+def index_exit_code(files: Sequence[IndexFile], *, write: bool) -> int:
+    """``0`` when nothing is pending (or everything pending was written), ``1``
+    for a dry run with pending changes or any refused file."""
+    if any(entry.action == REFUSED for entry in files):
+        return EXIT_ERRORS
+    if not write and any(entry.action in (CREATE, UPDATE) for entry in files):
+        return EXIT_ERRORS
+    return EXIT_CLEAN
 
 
 if __name__ == "__main__":

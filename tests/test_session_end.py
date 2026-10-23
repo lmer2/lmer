@@ -117,6 +117,18 @@ def test_an_unusable_pid_is_never_signalled(monkeypatch, raw):
     assert session_end.SUPERVISOR_PID_ENV in result.message
 
 
+@pytest.mark.parametrize("pid", [2**31, 2**63, 2**64])
+def test_a_pid_past_pid_t_is_no_supervisor_not_a_raise(monkeypatch, pid):
+    """The real ``os.kill`` raises OverflowError before any syscall — no signal
+    can be sent — and the promise is never to raise at an agent (#544)."""
+    monkeypatch.setenv(session_end.SUPERVISOR_PID_ENV, str(pid))
+
+    result = session_end.request_session_end()
+
+    assert result.code == session_end.NO_SUPERVISOR_EXIT_CODE
+    assert session_end.SUPERVISOR_PID_ENV in result.message
+
+
 def test_no_supervisor_reads_differently_from_a_failed_attempt(monkeypatch):
     """A wind-down needs to tell these apart: "this session never had a
     supervisor" is a configuration fact, "the signal failed" is a fault."""

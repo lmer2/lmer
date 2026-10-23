@@ -42,6 +42,9 @@ import argparse
 from pathlib import Path
 from typing import List, Optional
 
+from ask_channel import bus as _bus
+from ask_channel import signal_cli
+from lmer_cli.routing_receipts import emit
 from lmer_cli.session_end import (
     NO_SUPERVISOR_EXIT_CODE, SUPERVISOR_PID_ENV, request_session_end,
     supervisor_pid,
@@ -498,7 +501,6 @@ def _cmd_post(args: argparse.Namespace, client: SlackClient) -> int:
 
     text = _resolve_post_text(args)
     new_ts = client.post_message(channel, thread_ts, text)
-    from lmer_cli.routing_receipts import emit
 
     emit("post", new_ts)
     print(new_ts)
@@ -528,9 +530,6 @@ def _cmd_post_shim(args: argparse.Namespace) -> int:
     bus nor a token exists there is no way to reach the human, and the exit
     code says so.
     """
-    from ask_channel import bus as _bus
-    from ask_channel import signal_cli
-
     text = _resolve_post_text(args)
     bus_error: Optional[Exception] = None
     try:
@@ -570,9 +569,6 @@ def _cmd_end_session_shim(args: argparse.Namespace) -> int:
     is the point of the verb: a session that cannot say goodbye must still free
     its slot rather than hold it to the idle timeout.
     """
-    from ask_channel import bus as _bus
-    from ask_channel import signal_cli
-
     goodbye = _resolve_optional_post_text(args)
     if goodbye:
         try:
@@ -594,8 +590,6 @@ def _cmd_inbound_shim(args: argparse.Namespace) -> int:
     Inbound Slack messages reach the harness as tagged turns now, so there is
     nothing to poll or watch; ``history`` becomes the bus's ``list``.
     """
-    from ask_channel import signal_cli
-
     if args.subcommand == "history":
         return signal_cli.main(["list"])
     print(

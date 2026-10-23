@@ -923,6 +923,13 @@ function handleStatus(frame) {
       phase.value = 'failed'
       problem.value = message
       return
+    case 'input_refused':
+      // Supervisor authority above none (#594). The daemon closes the socket next,
+      // and the reconnect's ticket answers for the level: refused while it holds,
+      // which ends this view with the reason, or a live prompt once it is lowered.
+      problem.value = message
+      if (term) term.options.disableStdin = true
+      return
     case 'input_failed':
     case 'bad_frame':
       problem.value = message

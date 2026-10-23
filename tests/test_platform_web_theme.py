@@ -282,6 +282,17 @@ def test_every_state_says_what_it_is_and_can_be_picked():
         assert icon in app, f"{icon} is not imported from @mdi/js"
 
 
+def _template_block(markup, opening):
+    """The element *opening* starts, through its matching ``</template>``."""
+    start = markup.index(opening)
+    depth = 0
+    for tag in re.finditer(r"<template\b|</template>", markup[start:]):
+        depth += -1 if tag.group(0) == "</template>" else 1
+        if not depth:
+            return markup[start:start + tag.end()]
+    raise AssertionError(f"{opening} is never closed")
+
+
 def test_the_scheme_is_the_apps_and_reachable_from_every_view():
     """In the app bar, not in a run: the operator's screen does not change when
     they open a run, and a preference behind one view is one they cannot find from
@@ -290,11 +301,12 @@ def test_the_scheme_is_the_apps_and_reachable_from_every_view():
 
     assert "<v-menu" in bar, "the switcher is not in the app bar"
     assert "THEME_ICONS[themeMode]" in bar, "the button does not show the state"
-    # Before the fleet-only block, which is the difference between "always there"
-    # and "there on the landing screen": the bar's other two controls are behind
+    # Outside the fleet-only block, which is the difference between "always there"
+    # and "there on the landing screen": the bar's other controls are behind
     # `view === 'fleet'`, and a switcher inside that template is unreachable from a
     # run detail view and from the spawn form.
-    assert bar.index("<v-menu") < bar.index("""<template v-if="view === 'fleet'">"""), (
+    fleet_only = _template_block(bar, """<template v-if="view === 'fleet'">""")
+    assert "<v-menu" not in fleet_only and "<v-menu" in bar.replace(fleet_only, ""), (
         "the switcher sits inside the fleet-only block, so it disappears the "
         "moment a run is opened"
     )

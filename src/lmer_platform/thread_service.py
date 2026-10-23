@@ -17,7 +17,7 @@ from typing import Optional
 
 from lmer_cli.thread_access import ThreadServicer, UploadStore
 
-from . import references, registry, runs, session_io, session_threads, uploads
+from . import comms, meta, references, registry, runs, session_io, session_threads, uploads
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +117,8 @@ class ThreadServices:
             return None
 
     def _tell(self, session_id: str, reference) -> bool:
-        from .comms import ensure_hub
-
         try:
-            ensure_hub().post(
+            comms.ensure_hub().post(
                 session_id,
                 kind="message",
                 text=references.announcement(reference),
@@ -158,7 +156,7 @@ class ThreadServices:
         servicer = ThreadServicer(
             supervisor_url=f"http://{endpoint.host}:{endpoint.port}",
             token=endpoint.token,
-            label=_run_label_of(session_id),
+            label=_speaker_label_of(session_id),
             run_name=_run_name_of(session_id),
             env=self._environ,
             assistant_session=(registry.read_session(session_id) or {}).get("kind") == registry.ASSISTANT_KIND,
@@ -205,13 +203,11 @@ def _run_name_of(session_id: str):
     """The run's own name for the machine-readable stamp (#427): its title, else
     its slug, else nothing.
 
-    Not ``_run_label_of``, which falls back to ``"lmer session <id>"`` — that is
+    Not ``_speaker_label_of``, which falls back to ``"lmer session <id>"`` — that is
     the line humans read in the thread, and `Poster.author` composes the "lmer"
     word itself, so handing it that label spelled it twice (review of !300).
     """
     def name() -> str:
-        from . import meta, runs
-
         try:
             identity = runs.run_for_session(session_id)
             if identity is None:
@@ -223,14 +219,9 @@ def _run_name_of(session_id: str):
     return name
 
 
-def _run_label_of(session_id: str):
-    """How a thread is told which run posted into it.
-
-    A callable, because a run is frequently named *after* it starts. The label
-    itself is :func:`lmer_platform.session_threads.run_label`, which an opened
-    thread's root message uses for the same audience.
-    """
-    return lambda: session_threads.run_label(session_id)
+def _speaker_label_of(session_id: str):
+    """A callable, because a run is frequently named *after* it starts."""
+    return lambda: session_threads.speaker_label(session_id)
 
 
 _services: Optional[ThreadServices] = None

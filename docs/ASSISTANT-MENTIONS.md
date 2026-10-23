@@ -3,7 +3,7 @@
 For named workspaces, project-bound routing, capacity and General migration, see
 [Projects](PROJECTS.md).
 
-The platform daemon routes bot mentions to the existing Uber Lmer assistant.
+The platform daemon routes bot mentions to the existing Ratchet assistant.
 The assistant reads the request, answers in that conversation, or starts a worker
 under the operator's existing run-start policy. Receiving a mention does not
 start a worker or connect the conversation to the assistant's broadcast channel.
@@ -38,6 +38,9 @@ request. Ordinary connected-run delivery is independent of the setting.
   thread root. Include up to N preceding messages, oldest first, followed by the
   trigger. The first assistant or worker reply establishes the reply thread;
   ingestion does not post a second root or a public acknowledgement.
+  With projects enabled, a channel or room mapped to a project sends such a
+  mention to that project unless it names another one (see
+  [Channel → project mapping](PROJECTS.md#channel--project-mapping)).
 - **Reply to an assistant DM:** match Slack `thread_ts`, or the Matrix `m.thread`
   relation, to the exact parent receipt recorded when the assistant sent its DM.
   The receipt contains identifiers, recipient and originating assistant session;
@@ -90,7 +93,8 @@ triggering message ID, conversation, thread root, permalink and optional DM
 parent receipt. Each message carries text and an explicit clipping flag if it
 exceeds 8,000 characters. Read the source thread to obtain the full text.
 
-The assistant reads the supplied permalink with `lmer-ctl thread read <permalink>`
+The assistant reads the supplied permalink with `lmer-ctl thread read <permalink>`,
+which copies the thread's files into the assistant's upload store,
 and responds using `lmer-ctl thread post <permalink> <text>`. That explicit post
 addresses only the named conversation and does not journal the body on the
 assistant's shared bus. Do not use a broadcast `lmer-signal post` for contextual

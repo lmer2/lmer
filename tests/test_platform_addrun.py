@@ -625,22 +625,21 @@ def test_a_plain_repo_url_target_tracks_the_run_and_keeps_its_title(config):
     assert result.warning is None
 
 
-def test_a_web_page_target_remains_untracked_and_drops_its_title_loudly(config):
-    """A URL-shaped page is not repository evidence for metadata attachment."""
-    result = spawn.spawn_session(
-        config,
-        request_for(
-            repo_url=None,
-            target="https://gitlab.example.com/agents/global/-/pipelines/1691",
-            title="must not attach to a fabricated project",
-        ),
-    )
+def test_a_web_page_target_is_refused_without_a_repo_url(config):
+    """A URL-shaped page is not repository evidence: it is context only, and
+    without a repository it is refused (spec §6.5), never spawned untracked."""
+    with pytest.raises(spawn.SpawnError, match="not a repository"):
+        spawn.spawn_session(
+            config,
+            request_for(
+                repo_url=None,
+                target="https://gitlab.example.com/agents/global/-/pipelines/1691",
+                title="must not attach to a fabricated project",
+            ),
+        )
 
-    assert (result.host, result.project) == (None, None)
     assert runs.list_tracked() == []
     assert meta.load_all() == {}
-    assert "not tracked" in result.warning
-    assert "were not stored" in result.warning
 
 
 def test_a_spawn_that_named_nothing_gets_no_warning_about_it(config):

@@ -162,6 +162,80 @@ it('keeps the tail cursor when an older page finishes after polling advanced it'
   expect(new Set(texts).size).toBe(texts.length)
 })
 
+// Late responses outside `before` pages (issue 544 item 3). Each holds a stale
+// response across poll intervals while the session moves on, then checks that
+// the cursor, the live state and the note are the newest ones and no row is drawn twice.
+const closed = 'Recorded conversation, not a live one'
+
+it('holds polling until the initial tail lands, so the late tail cannot rewind a poll', async () => {
+  vi.useFakeTimers()
+  pages.set(3, Array.from({ length: 100 }, (_, i) => row(3, i, `row ${i}`)))
+  const delayed = deferred()
+  let requested
+  fetchAssistantHistory.mockImplementationOnce((session, request) => {
+    requested = { ...page(3, request), live: false, note: 'starting' }
+    return delayed.promise
+  })
+  const wrapper = mountPane(Chat, { sessionId: 's-3', assistantHistory: true, view: 'conversation' })
+  pages.set(3, Array.from({ length: 200 }, (_, i) => row(3, i, `row ${i}`)))
+  await vi.advanceTimersByTimeAsync(15000)
+  // A poll now would read from cursor 0: the head of the conversation, not its
+  // end — drawn, then rewound by the tail landing behind it.
+  expect(fetchAssistantHistory).toHaveBeenCalledTimes(1)
+  expect(wrapper.findAll('.turn')).toHaveLength(0)
+  delayed.resolve(requested)
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  expect(wrapper.findAll('.turn')).toHaveLength(40)
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(fetchAssistantHistory.mock.calls.at(-1)[1].since).toBe(100 - 40)
+  expect(wrapper.text()).toContain('row 199')
+  expect(wrapper.text()).not.toContain(closed)
+  expect(wrapper.vm.$.setupState.note).toBe(null)
+  const texts = wrapper.findAll('.turn').map((turn) => turn.text())
+  expect(texts).toHaveLength(140)
+  expect(new Set(texts).size).toBe(texts.length)
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(fetchAssistantHistory.mock.calls.at(-1)[1].since).toBe(200 - 40)
+})
+
+it('keeps the live state and note a poll reported when an older page lands late', async () => {
+  vi.useFakeTimers()
+  pages.set(3, Array.from({ length: 100 }, (_, i) => row(3, i, `row ${i}`)))
+  const wrapper = await open()
+  expect(wrapper.text()).not.toContain(closed)
+  const delayed = deferred()
+  let requested
+  fetchAssistantHistory.mockImplementationOnce((session, request) => {
+    requested = page(3, request)
+    return delayed.promise
+  })
+  await wrapper.findAll('button').find((button) => button.text() === 'earlier messages').trigger('click')
+  // The session exits while the older page is in flight.
+  pages.set(3, [...pages.get(3), row(3, 100, 'last words')])
+  fetchAssistantHistory.mockImplementation((session, request) => Promise.resolve({
+    ...page(Number(session.slice(2)), request), live: false, note: 'This session has exited.',
+  }))
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(wrapper.text()).toContain('last words')
+  expect(wrapper.text()).toContain(closed)
+  delayed.resolve(requested)
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  expect(requested.live).toBe(true)
+  expect(wrapper.text()).toContain('row 20')
+  expect(wrapper.text()).toContain(closed)
+  expect(wrapper.vm.$.setupState.note).toBe('This session has exited.')
+  const texts = wrapper.findAll('.turn').map((turn) => turn.text())
+  expect(texts).toHaveLength(81)
+  expect(new Set(texts).size).toBe(texts.length)
+  fetchAssistantHistory.mockClear()
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(fetchAssistantHistory.mock.calls[0][1].since).toBe(101 - 40)
+})
+
 it('ignores an old response that arrives after rotation', async () => {
   const pending = deferred()
   fetchAssistantHistory.mockImplementationOnce(() => pending.promise)
@@ -311,5 +385,24 @@ it('draws platform digests as compact, attributed rows that open their run', asy
   expect(digests[1].find('.d-flex').text()).toContain('lmer platform')
   expect(wrapper.findAll('.turn').filter((turn) => turn.classes('turn-digest')).every(
     (turn) => !turn.classes('ground-operator'))).toBe(true)
+  stop()
+})
+
+it('opens a schema-2 digest at its execution, not its slug group', async () => {
+  const uid = 'a'.repeat(32)
+  const run = { host: 'gitlab.example.com', project: 'group/app', slug: 'run-1', label: 'Fix the widget', uid }
+  const body = 'gitlab.example.com/group/app/run-1 is now complete'
+  pages.set(3, [
+    ...data(3),
+    row(3, 2, body, { id: 'digest-uid', role: 'platform', source: { channel: 'platform' }, comms_kind: 'digest: complete',
+      digest: { kind: 'complete', run } }),
+  ])
+  const opened = []
+  const stop = onRunRef((ref) => opened.push(ref.key))
+  const wrapper = await open()
+  const digest = wrapper.find('.turn-digest')
+  expect(digest.find('button.digest-toggle').text()).toBe('is now complete')
+  await digest.find('button.digest-run').trigger('click')
+  expect(opened).toEqual([`gitlab.example.com/group/app/${uid}`])
   stop()
 })

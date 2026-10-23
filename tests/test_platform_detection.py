@@ -447,6 +447,26 @@ def test_the_digest_carries_what_the_assistant_needs_to_act(config):
     }
 
 
+def test_a_schema_2_digest_names_its_execution_uid(config):
+    """The ref stays slug-spelled, but the payload carries the uid the UI keys by."""
+    uid = "b" * 32
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet({**row("develop-141", reason="question", note=QUESTION,
+                     state="waiting_on_you", since="2026-07-28T10:00:00Z"), "uid": uid}),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    call = spool.calls[0]
+
+    assert call["note"].startswith("gitlab.example.com/group/project/develop-141 ")
+    assert call["data"]["uid"] == uid
+
+
 def test_a_row_with_no_run_identity_yet_is_skipped(config):
     """A session spawned seconds ago has no ``<host>/<project>/<slug>``.
 
@@ -2378,6 +2398,87 @@ def test_a_run_that_leaves_the_fleet_had_its_question_answered_by_nobody(
     assert tick.answered == 0
 
 
+EXEC_A, EXEC_B = "a" * 32, "b" * 32
+
+
+def executed(uid, **kwargs):
+    """A schema-2 ``chat`` row: one execution of a slug group two of them share."""
+    return {**row("chat", **kwargs), "uid": uid}
+
+
+def test_one_execution_s_clear_is_announced_while_its_sibling_still_waits(config):
+    """Schema 2 lets two executions share host/project/slug (!411 review).
+
+    Keyed on the slug-spelled ref, B's open question made A look still waiting,
+    so A's answer was never announced.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(executed(EXEC_A, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:00:00Z"),
+              executed(EXEC_B, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:01:00Z")),
+        fleet(executed(EXEC_A, state="running"),
+              executed(EXEC_B, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:01:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert tick.answered == 1
+    assert spool.kinds[-1] == detect.QUESTION_ANSWERED_KIND
+    assert spool.calls[-1]["data"]["uid"] == EXEC_A
+
+
+def test_two_executions_asking_at_the_same_moment_are_two_conditions(config):
+    """Same slug, kind and ``since`` used to be one key, so B was never announced."""
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(executed(EXEC_A, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:00:00Z"),
+              executed(EXEC_B, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:00:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+
+    assert spool.kinds == ["live_question", "live_question"]
+    assert [call["data"]["uid"] for call in spool.calls] == [EXEC_A, EXEC_B]
+
+
+def test_an_execution_that_leaves_is_not_answered_because_its_sibling_remains(config):
+    """A left the fleet; B, same slug and not waiting, is a different run.
+
+    Membership by slug-spelled ref read B's presence as A's, and announced a
+    clear that never happened.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(executed(EXEC_A, reason="live_question", note=QUESTION, state="running",
+                       since="2026-10-14T12:00:00Z")),
+        fleet(executed(EXEC_B, state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert spool.kinds == ["live_question"]
+    assert tick.answered == 0
+
+
 def test_the_answered_digest_is_not_a_reason_for_the_operator_to_act():
     """Its own class beside the attention axis, exactly as a milestone is (T122).
 
@@ -2459,3 +2560,45 @@ def test_a_confirm_failure_does_not_log_that_the_tick_was_skipped(
     assert said, "the confirm failure was not logged at all"
     assert not any("this tick is skipped" in message for message in said), said
     assert any("delivered unconfirmed" in message for message in said), said
+
+
+def plant_session_record(config, slug, uid, *, status):
+    """One schema-form launch record: ``_runs/<slug>/<uid>/state.yaml``."""
+    path = config.mirror_path / HOST / PROJECT / "_runs" / slug / uid
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.yaml").write_text(
+        "\n".join([
+            "schema: 1",
+            f"status: {json.dumps(status)}",
+            f"slug: {json.dumps(slug)}",
+            'taskdef: "develop"',
+            'target: "issue-141"',
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_uid_session_is_judged_by_its_own_record_not_its_group_s_newest(config):
+    """A dead uid launch whose group holds ANOTHER, finished launch stays put.
+
+    By slug the group answers with one record; by uid it answers with this
+    launch's. Sweeping on the neighbour's ``complete`` would clear the evidence
+    of a launch that never finished.
+    """
+    mine, other = "a" * 32, "f" * 32
+    plant_session_record(config, "develop-141", mine, status="in-progress")
+    finished = plant_session_record(config, "develop-141", other, status="complete")
+    by_slug = resolve_run_dir(config, HOST, PROJECT, "develop-141")
+    assert by_slug is not None and by_slug.path == finished.resolve(), (
+        "precondition: the slug lookup lands on the finished neighbour"
+    )
+    registry.register(
+        "s-uid-unwatched",
+        pid=DEAD_PID,
+        run={"host": HOST, "project": PROJECT, "slug": "develop-141", "uid": mine},
+        task={"taskdef": "develop", "target": "issue-141"},
+    )
+
+    assert detect.sweep_finished_sessions(config) == []
+    assert registry.read_session("s-uid-unwatched") is not None

@@ -36,6 +36,11 @@ from lmer_cli.harness import HARNESSES, NONINTERACTIVE_ENV, build_exec_argv
 
 BIN_WRAPPER = Path(__file__).parent.parent / "bin" / "spawn-harness"
 
+#: Stands in for a real token. In-process runs never read the real source
+#: (conftest ``_isolate_container_environ``); subprocess runs that spawn a stub
+#: child pass this so they never fall back to it.
+FAKE_OAUTH_TOKEN = "fixture-oauth-token-not-real"
+
 CONFIG = {
     "opus-review": {"env": {"LMER_LLM_NAME": "opus", "LMER_REASONING_EFFORT": "max"}},
     "sol-review": {"env": {"LMER_HARNESS": "codex", "LMER_LLM_NAME": "gpt-5.6-sol"}},
@@ -1166,6 +1171,112 @@ class TestFooterWriteFailuresKeepTheExitCode:
         assert "no usable output" not in err
 
 
+def _write_container_environ(path: Path, **env: str) -> None:
+    path.write_bytes(
+        b"\0".join(f"{key}={value}".encode() for key, value in env.items()) + b"\0"
+    )
+
+
+class TestCredentialEnvRestore:
+    """A claude shell strips CLAUDE_CODE_OAUTH_TOKEN, so the child takes it from
+    the container's initial environment (issue #588)."""
+
+    def _container_has_token(self, tmp_path, monkeypatch):
+        environ = tmp_path / "container-environ"
+        _write_container_environ(
+            environ, PATH="/usr/bin", CLAUDE_CODE_OAUTH_TOKEN=FAKE_OAUTH_TOKEN
+        )
+        monkeypatch.setattr(spawn_harness, "CONTAINER_ENVIRON", environ)
+
+    def test_claude_declares_only_the_oauth_token(self):
+        assert HARNESSES["claude"].credential_env == ("CLAUDE_CODE_OAUTH_TOKEN",)
+        assert HARNESSES["codex"].credential_env == ()
+        assert HARNESSES["pi"].credential_env == ()
+
+    def test_stripped_shell_token_reaches_the_child_by_env_only(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._container_has_token(tmp_path, monkeypatch)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        code, argv_file, env_file = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"]
+        )
+        assert code == 0
+        assert (
+            f"CLAUDE_CODE_OAUTH_TOKEN={FAKE_OAUTH_TOKEN}"
+            in env_file.read_text().splitlines()
+        )
+        assert FAKE_OAUTH_TOKEN not in argv_file.read_text()
+        captured = capsys.readouterr()
+        assert "CLAUDE_CODE_OAUTH_TOKEN taken from the container environment" in captured.err
+        assert FAKE_OAUTH_TOKEN not in captured.err + captured.out
+
+    def test_shell_and_spawn_values_win(self, tmp_path, monkeypatch):
+        self._container_has_token(tmp_path, monkeypatch)
+        _, _, env_file = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p"],
+            extra_env={"CLAUDE_CODE_OAUTH_TOKEN": "from-shell"},
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN=from-shell" in env_file.read_text().splitlines()
+        _, _, env_file = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--env", "CLAUDE_CODE_OAUTH_TOKEN=from-env"],
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN=from-env" in env_file.read_text().splitlines()
+        config = {"preset-token": {"env": {"CLAUDE_CODE_OAUTH_TOKEN": "from-preset"}}}
+        _, _, env_file = _run_main(
+            tmp_path, ["preset-token", "--prompt", "p"], config=config
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN=from-preset" in env_file.read_text().splitlines()
+
+    def test_an_empty_shell_value_counts_as_stripped(self, tmp_path, monkeypatch):
+        self._container_has_token(tmp_path, monkeypatch)
+        _, _, env_file = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p"],
+            extra_env={"CLAUDE_CODE_OAUTH_TOKEN": ""},
+        )
+        assert (
+            f"CLAUDE_CODE_OAUTH_TOKEN={FAKE_OAUTH_TOKEN}"
+            in env_file.read_text().splitlines()
+        )
+
+    def test_an_explicit_overlay_blank_stays_blank(self, tmp_path, monkeypatch):
+        self._container_has_token(tmp_path, monkeypatch)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        _, _, env_file = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p", "--env", "CLAUDE_CODE_OAUTH_TOKEN="]
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN=" in env_file.read_text().splitlines()
+        config = {"blank-token": {"env": {"CLAUDE_CODE_OAUTH_TOKEN": ""}}}
+        _, _, env_file = _run_main(
+            tmp_path, ["blank-token", "--prompt", "p"], config=config
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN=" in env_file.read_text().splitlines()
+
+    def test_cross_harness_child_never_gets_the_token(self, tmp_path, monkeypatch):
+        self._container_has_token(tmp_path, monkeypatch)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        _, _, env_file = _run_main(
+            tmp_path, ["sol-review", "--prompt", "p"], stub="codex"
+        )
+        assert FAKE_OAUTH_TOKEN not in env_file.read_text()
+
+    def test_unreadable_source_warns_and_leaves_the_child_on_its_old_auth(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(spawn_harness, "CONTAINER_ENVIRON", tmp_path)  # a directory
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        code, _, env_file = _run_main(tmp_path, ["opus-review", "--prompt", "p"])
+        assert code == 0
+        assert "CLAUDE_CODE_OAUTH_TOKEN not restored" in capsys.readouterr().err
+        assert not any(
+            line.startswith("CLAUDE_CODE_OAUTH_TOKEN=")
+            for line in env_file.read_text().splitlines()
+        )
+
+
 class TestMainValidation:
     def _main(self, args, environ):
         with pytest.MonkeyPatch.context() as mp:
@@ -1244,6 +1355,7 @@ class TestInterruptKillsChild:
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
                 "HOME": str(tmp_path),
                 "LMER_PYTHON": sys.executable,
+                "CLAUDE_CODE_OAUTH_TOKEN": FAKE_OAUTH_TOKEN,
                 **_config_env(),
             },
             stderr=subprocess.PIPE,
@@ -1481,6 +1593,7 @@ class TestTeeSurvivesADeadReader:
             "HOME": str(tmp_path),
             "PYTHONPATH": str(BIN_WRAPPER.parent.parent / "src"),
             "LMER_SPAWN_AGENTS": ",".join(CONFIG),
+            "CLAUDE_CODE_OAUTH_TOKEN": FAKE_OAUTH_TOKEN,
             **_config_env(CONFIG),
         }
         read_fd, write_fd = os.pipe()

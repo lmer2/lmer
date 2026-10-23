@@ -11,7 +11,12 @@ from pathlib import Path
 from unittest import mock
 import pytest
 
-from lmer_cli import gate_lock, precommit_cache, user_harnesses
+from lmer_cli import connector_lifecycle, gate_lock, precommit_cache, runtime, user_harnesses
+from lmer_cli.container import spawn_harness
+
+# Read-only toolchain lookup still uses the installed runtime root after the
+# session fixture isolates writable state and credential-bearing defaults.
+_INSTALLED_RUNTIME_ROOT = runtime.lmer_state_dir()
 
 # The shared lmer-schema (plexus) fixture trees (issue #353) live in
 # tests/plexus_fixtures.py; re-exporting the fixtures here is what registers
@@ -116,6 +121,14 @@ def routing_call(tmp_path, monkeypatch):
 
     select()
     return select
+
+
+@pytest.fixture(autouse=True)
+def untagged_speaker(monkeypatch):
+    """Connectors post without a speaker tag unless a test asks for one, so what
+    a record or notice says does not depend on platform state; the tag has its
+    own tests (tests/test_thread_speaker.py)."""
+    monkeypatch.setattr(connector_lifecycle, "resolve_speaker", lambda session, **kwargs: None)
 
 
 def drain_connectors(instances, budget, *, announce=True):
@@ -231,7 +244,10 @@ def node_binary():
     installed = (
         lmer_state_dir() / PLATFORM_DIRNAME / isolated.relative_to(platform_dir())
     )
-    for root in (isolated, installed):
+    operational_toolchain = (
+        _INSTALLED_RUNTIME_ROOT / PLATFORM_DIRNAME / isolated.relative_to(platform_dir())
+    )
+    for root in (isolated, installed, operational_toolchain):
         own = NodeToolchain(root=root)
         if own.node.is_file():
             return str(own.node)
@@ -802,6 +818,24 @@ def _work_repo_leak_guard(_isolate_gate_lock_dir):
 
 
 @pytest.fixture(autouse=True, scope="session")
+def isolate_runtime_state(tmp_path_factory):
+    """Keep CLI defaults and .env loading out of the operator's live state.
+
+    runtime captures its root at import time, so tests changing HOME later do
+    not isolate it. Redirect the root itself; tests needing configuration can
+    still explicitly supply their own temporary state directory.
+    """
+    from lmer_cli import runtime
+
+    original = runtime._LMER_STATE_DIR
+    runtime._LMER_STATE_DIR = tmp_path_factory.mktemp("runtime-state")
+    try:
+        yield
+    finally:
+        runtime._LMER_STATE_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _isolate_user_harnesses(tmp_path_factory):
     """Point user-harness resolution away from the real ~/.lmer/harnesses.
 
@@ -819,6 +853,19 @@ def _isolate_user_harnesses(tmp_path_factory):
     user_harnesses.DEFAULT_HARNESSES_DIR = empty
     yield
     user_harnesses.DEFAULT_HARNESSES_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_container_environ(tmp_path_factory):
+    """Keep the real ``/proc/1/environ``, and any credential in it, out of every
+    in-process spawn-harness run (issue #588): a stub child dumps its env to a
+    file, and a failing assertion prints it. Subprocess runs pass a fake token."""
+    original = spawn_harness.CONTAINER_ENVIRON
+    empty = tmp_path_factory.mktemp("container-environ") / "environ"
+    empty.write_bytes(b"")
+    spawn_harness.CONTAINER_ENVIRON = empty
+    yield
+    spawn_harness.CONTAINER_ENVIRON = original
 
 
 @pytest.fixture(autouse=True, scope="session")

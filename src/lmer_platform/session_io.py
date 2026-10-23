@@ -188,7 +188,9 @@ from typing import AsyncIterator, Optional
 
 import requests
 
-from . import registry
+from lmer_cli.codex_delivery import MAX_RPC_TIMEOUT, input_budget
+
+from . import assistant_history, registry
 from .spawn import container_log_path_for, log_path_for, read_control_token
 from .store import append_event
 
@@ -589,7 +591,6 @@ def require_session(session_id: str) -> Optional[dict]:
         raise SessionNotFound(str(exc)) from exc
     if entry is not None:
         return entry
-    from . import assistant_history
 
     if assistant_history.generation(session_id):
         return None
@@ -935,6 +936,22 @@ def _record_attempt(
     )
 
 
+def submit_timeout(session_id: str):
+    """Timeout for a submitting ``/input``: a Codex session's own :func:`input_budget`.
+
+    A session that does not answer the probe gets this daemon's budget, since a
+    busy Codex session is the one most likely to miss it.
+    """
+    health = quiet_health(session_id)
+    if health is not None and not isinstance(health.get("codex_delivery"), dict):
+        return CONTROL_TIMEOUT_SECONDS
+    rpc = ((health or {}).get("codex_delivery") or {}).get("rpc_timeout")
+    if (isinstance(rpc, bool) or not isinstance(rpc, (int, float))
+            or not 0 < rpc <= MAX_RPC_TIMEOUT):
+        rpc = None
+    return (CONTROL_TIMEOUT_SECONDS, CONTROL_TIMEOUT_SECONDS + input_budget(rpc))
+
+
 def send_input(
     session_id: str, data: str, *, append_newline: bool = False,
     sanitize: bool = False, preserve_slash_commands: bool = False,
@@ -976,7 +993,8 @@ def send_input(
     error: Optional[str] = None
     try:
         endpoint = control_endpoint(session_id)
-        reply = _post(endpoint, "/input", body)
+        reply = _post(endpoint, "/input", body,
+                      timeout=submit_timeout(session_id) if append_newline else CONTROL_TIMEOUT_SECONDS)
     except SessionIOError as exc:
         error = str(exc)[:_DETAIL_LIMIT]
         raise

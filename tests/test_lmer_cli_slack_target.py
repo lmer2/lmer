@@ -323,6 +323,7 @@ class TestTargetHandlerContract:
         reason = SlackThreadTargets().repoless_unsupported_reason("review")
         assert "'chat'" in reason
         assert "'review'" in reason
+        assert "--repo-url" in reason
 
     def test_validate_environment_requires_bot_token(self):
         """Missing SLACK_BOT_TOKEN produces an error naming the variable."""
@@ -379,6 +380,7 @@ class TestTargetHandlerContract:
         assert handler.supports_repoless_session("chat") is False
         reason = handler.repoless_unsupported_reason("chat")
         assert "repository target" in reason
+        assert "--repo-url" in reason
         assert "'chat'" in reason
 
 
@@ -541,6 +543,13 @@ def _make_main_mocks(
     stack.enter_context(
         patch("lmer_cli.cli.subprocess.call", return_value=runtime_rc)
     )
+    # --- the launch is create, then follow (#444): a faked create writes no
+    # cidfile and starts nothing, so the follow is faked too ---
+    for reader in ("lmer_cli.cli.read_container_id",
+                   "lmer_cli.container_follow.read_container_id"):
+        stack.enter_context(patch(reader, return_value="fake-container"))
+    stack.enter_context(patch("lmer_cli.cli.follow_container", return_value=0))
+    stack.enter_context(patch("lmer_cli.cli.remove_container"))
 
     return stack
 
@@ -873,6 +882,33 @@ def _run_main_repoless(
                 from lmer_cli.cli import main
 
                 return main(argv)
+
+
+class TestCiBaselineLaunchWiring:
+    """#452: the host resolves the toggle's ladder for this launch and the
+    container receives that one value, whatever the bare variable says."""
+
+    def test_task_tier_reaches_the_container_as_the_resolved_value(self):
+        captured: dict = {}
+        assert _run_main_repoless(
+            ["chat", _SLACK_URL], captured_env=captured,
+            extra_env={"LMER_CHAT_GATE_CI_BASELINE": "yes"},
+        ) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "1"
+
+    def test_specific_off_overrides_a_general_on(self):
+        captured: dict = {}
+        assert _run_main_repoless(
+            ["chat", _SLACK_URL], captured_env=captured,
+            extra_env={"LMER_GATE_CI_BASELINE": "1",
+                       "LMER_CHAT_GATE_CI_BASELINE": "0"},
+        ) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "0"
+
+    def test_unset_is_off(self):
+        captured: dict = {}
+        assert _run_main_repoless(["chat", _SLACK_URL], captured_env=captured) == 0
+        assert captured["LMER_GATE_CI_BASELINE"] == "0"
 
 
 class TestGpuLaunchWiring:

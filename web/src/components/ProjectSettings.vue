@@ -1,17 +1,26 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
-import { archiveProject, fetchAssistantInstructions, setAssistantInstructions, updateProject } from '../api.js'
+import { computed, nextTick, ref, watch } from 'vue'
+import { archiveProject, fetchAssistantInstructions, fetchChannelRoutes, setAssistantInstructions, setProjectChannels,
+  updateProject } from '../api.js'
+import { ago } from '../format.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
+import { assistantName } from '../ratchet.js'
 
-const props = defineProps({ project: { type: Object, required: true } })
-const emit = defineEmits(['changed', 'close'])
+// `focus` is `{ id, section, nonce }`; the nonce makes a repeat tap count.
+const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null },
+  now: { type: Number, default: () => Date.now() } })
+const emit = defineEmits(['changed', 'close', 'focused'])
 const form = ref({})
 const orders = ref(null)
 const instructions = ref('')
 const savedInstructions = ref('')
 const ordersOpen = ref(undefined)
+const ordersPanel = ref(null)
 const error = ref(null)
+const ordersError = ref(null)
 const busy = ref(false)
+const channels = ref('')
+const savedChannels = ref(null)
 // The picker speaks hex; the form keeps the stored spelling, preset name or hex.
 const pickedColor = computed({
   get: () => projectColor(form.value.color),
@@ -26,23 +35,77 @@ const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
 const overrideKeys = ['model', 'harness', 'preset', 'agents']
 const overrideLabels = { model: 'Model', harness: 'Harness', preset: 'Preset', agents: 'Fan-out presets' }
+const authorityLevels = [
+  { value: 'none', title: 'None: its messages carry no approval' },
+  { value: 'approvals', title: 'Approvals: answer workers\' asks and say go within the task' },
+  { value: 'full', title: 'Full: direction and scope within a run\'s target' },
+]
+// Unset is `none`; choosing `none` clears the key rather than storing it, so
+// a project has opted in only when it holds a level.
+const supervisorAuthority = computed({
+  get: () => form.value.settings.supervisor_authority || 'none',
+  set: (value) => { form.value.settings.supervisor_authority = value === 'none' ? null : value },
+})
 
-watch(() => props.project.id, async (id, _previous, onCleanup) => {
-  let current = true
-  onCleanup(() => { current = false })
+// Each read or save of the orders takes a ticket, and only the latest one's reply lands:
+// two quick taps, or a save during a read, would otherwise let the older text win.
+let ordersTicket = 0
+// A read waits out an orders save: a GET answered before the PUT would mark the saved
+// text unsaved, and the next Save project would write it over newer orders.
+let ordersSave = null
+// The tap whose orders the project watcher's own read already covers.
+let readForNonce
+
+watch(() => props.project.id, (id) => {
   orders.value = null
   instructions.value = ''
   savedInstructions.value = ''
   ordersOpen.value = undefined
   error.value = null
+  ordersError.value = null
   form.value = { name: props.project.name, color: props.project.color,
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
+  readForNonce = props.focus?.nonce
+  readOrders(id)
+  readChannels(id)
+}, { immediate: true })
+
+const channelList = (text) => text.split('\n').map(value => value.trim()).filter(Boolean)
+
+async function readChannels(id) {
+  channels.value = ''
+  savedChannels.value = null
+  try {
+    const { routes } = await fetchChannelRoutes()
+    if (id !== props.project.id) return
+    savedChannels.value = channels.value = routes.filter(route => route.project_id === id).map(route => route.label).join('\n')
+  } catch (exc) { if (id === props.project.id) error.value = exc.message }
+}
+
+// uber lmer rewrites the orders from the chat, so each tap re-reads them: saving a
+// stale copy would overwrite the newer wording. An unsaved edit is kept.
+async function readOrders(id) {
+  await ordersSave?.catch(() => {})
+  const ticket = ++ordersTicket
   try {
     const loaded = await fetchAssistantInstructions(id)
-    if (!current) return
+    if (ticket !== ordersTicket) return
+    const edited = instructions.value !== savedInstructions.value
     orders.value = loaded
-    instructions.value = savedInstructions.value = loaded.instructions || ''
-  } catch (exc) { if (current) error.value = exc.message }
+    savedInstructions.value = loaded.instructions || ''
+    if (!edited) instructions.value = savedInstructions.value
+    ordersError.value = null
+  } catch (exc) { if (ticket === ordersTicket) ordersError.value = exc.message }
+}
+
+// The request is spent once read, so coming back to this project later opens it as it was.
+watch(() => props.focus?.nonce, async () => {
+  if (props.focus?.section !== 'orders' || props.focus.id !== props.project.id) return
+  ordersOpen.value = 0
+  if (props.focus.nonce !== readForNonce) readOrders(props.project.id)
+  emit('focused')
+  await nextTick()
+  ordersPanel.value?.$el?.scrollIntoView?.({ block: 'start' })
 }, { immediate: true })
 
 async function save() {
@@ -51,13 +114,22 @@ async function save() {
   error.value = null
   try {
     if (orders.value && instructions.value !== savedInstructions.value) {
-      orders.value = await setAssistantInstructions(id, instructions.value)
-      instructions.value = savedInstructions.value = orders.value.instructions || ''
+      const ticket = ++ordersTicket
+      ordersSave = setAssistantInstructions(id, instructions.value)
+      const saved = await ordersSave
+      if (ticket === ordersTicket) {
+        orders.value = saved
+        instructions.value = savedInstructions.value = saved.instructions || ''
+      }
     }
     await updateProject(id, { name: form.value.name, color: form.value.color,
       repositories: form.value.repositories.split('\n').map(value => value.trim()).filter(Boolean),
       settings: Object.fromEntries(Object.entries(form.value.settings).map(([key, value]) => [key, value || null])) })
     emit('changed')
+    if (savedChannels.value !== null && channels.value !== savedChannels.value) {
+      const { routes } = await setProjectChannels(id, channelList(channels.value))
+      savedChannels.value = channels.value = routes.map(route => route.label).join('\n')
+    }
   } catch (exc) { error.value = exc.message } finally { busy.value = false }
 }
 
@@ -78,6 +150,7 @@ async function archive() {
     </v-card-actions>
     <v-card-text>
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+      <v-alert v-if="ordersError" type="error" class="mb-3">{{ ordersError }}</v-alert>
       <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" />
       <fieldset class="project-color mb-4" :disabled="busy">
         <legend class="text-body-medium mb-2">Project color
@@ -91,12 +164,29 @@ async function archive() {
       <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
         hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
       <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
-      <v-expansion-panels v-model="ordersOpen" class="project-orders">
+      <v-select v-model="supervisorAuthority" :items="authorityLevels" class="supervisor-authority mb-4"
+        :label="`What ${assistantName} may approve for workers`" :disabled="busy" persistent-hint
+        hint="Stamped on each of its messages to this project's workers. No level passes an operator-only gate such as spec approval or a merge." />
+      <v-textarea v-model="channels" class="mention-channels mb-4" label="Mention channels (one per line)" rows="2"
+        :disabled="busy || savedChannels === null" persistent-hint spellcheck="false"
+        hint="Bot mentions here route to this project unless they name another one. Slack channel ID, #name or link; Matrix room ID, alias or link." />
+      <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
         <v-expansion-panel title="Standing instructions">
           <v-expansion-panel-text>
+            <p v-if="orders && !savedInstructions" class="orders-empty text-medium-emphasis mb-3">
+              No standing instructions yet.
+            </p>
             <v-textarea v-model="instructions" label="Standing instructions" :disabled="busy || !orders"
               :maxlength="orders?.limit" :counter="orders?.limit" rows="6" />
-            <p>Saved with this project. Each new assistant incarnation reads these instructions.</p>
+            <p class="mb-2">Saved with this project. Each new assistant incarnation reads these instructions.</p>
+            <p class="orders-hint text-body-small text-medium-emphasis mb-2">
+              Usually set by telling {{ assistantName }} in chat — "from now on…", "always…" — and it
+              confirms the wording before storing them.
+            </p>
+            <p v-if="orders?.instructions_at" :title="orders.instructions_at"
+              class="orders-changed text-body-small text-medium-emphasis mb-0">
+              last changed {{ ago(orders.instructions_at, now) }}
+            </p>
           </v-expansion-panel-text>
         </v-expansion-panel>
       </v-expansion-panels>

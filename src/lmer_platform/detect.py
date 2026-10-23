@@ -310,7 +310,7 @@ import logging
 import hashlib
 import uuid
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from ask_channel import protocol as ask_protocol
@@ -319,8 +319,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, nudge, registry, rotation, statusline, teardown,
-    transcripts,
+    ask, assistant, checkin, comms, nudge, registry, rotation, runs, stall, statusline,
+    teardown, transcripts,
 )
 from .api import build_state
 from . import config as config_module
@@ -450,6 +450,13 @@ MAX_SEND_ERROR_CHARS = 500
 #: the same history that records a wind-down.
 ASSISTANT_NUDGED = "assistant_nudged"
 
+#: The nudges for an episode ran out and the operator was told, or the attempt
+#: to tell them failed on every thread (#584).
+ASSISTANT_STALLED = "assistant_stalled"
+
+#: The attention reason a muted run does not spool (#458).
+MUTED_STALL_KIND = "stalled"
+
 #: What the platform records when it has recommended a rotation to the
 #: assistant (issue #446). An event for :data:`ASSISTANT_NUDGED`'s reason —
 #: the platform typed into a session unasked — and the only durable trace of
@@ -530,6 +537,13 @@ class Signal:
     label: Optional[str] = None
     state: Optional[str] = None
     session: Optional[str] = None
+    #: The row's schema-2 execution uid, or ``None`` for a slug-keyed row. ``ref``
+    #: stays slug-spelled for the digest text; :attr:`run` is what tells two
+    #: executions of one slug group apart.
+    uid: Optional[str] = None
+    #: The row's ``muted`` flag (#458). Not part of the condition's identity, so
+    #: muting or unmuting a run never makes a standing condition look new.
+    muted: bool = field(default=False, compare=False)
 
     @property
     def ref(self) -> str:
@@ -539,9 +553,18 @@ class Signal:
         return runref.compose(self.host, self.project, self.slug)
 
     @property
+    def run(self) -> tuple:
+        """Which run this is: its execution uid in schema 2, its ref in schema 1.
+
+        Schema 2 lets two executions share host/project/slug, so the ref alone
+        would merge their conditions and read one's presence as the other's.
+        """
+        return (self.ref, self.uid)
+
+    @property
     def key(self) -> tuple:
         """What makes two observations the same condition."""
-        return (self.ref, self.kind, self.since or "")
+        return (self.run, self.kind, self.since or "")
 
     @property
     def digest(self) -> str:
@@ -598,7 +621,15 @@ class Signal:
         }
         if self.session:
             data["session"] = self.session
+        if self.uid:
+            data["uid"] = self.uid
         return data
+
+
+def _row_uid(row: dict) -> Optional[str]:
+    """The fleet row's execution uid, or ``None`` for a slug-keyed row."""
+    uid = row.get("uid")
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -646,6 +677,7 @@ def _signals_of_row(row: object) -> list:
 
     state = _text(row.get("state"))
     label = _text(row.get("label"))
+    uid = _row_uid(row)
     found = []
 
     attention = row.get("attention")
@@ -656,13 +688,14 @@ def _signals_of_row(row: object) -> list:
                 host=host, project=project, slug=slug, kind=reason,
                 note=_text(attention.get("note")),
                 since=_text(attention.get("since")),
-                label=label, state=state,
+                label=label, state=state, uid=uid,
+                muted=row.get("muted") is True,
             ))
 
     if state in MATERIAL_STATES:
         found.append(Signal(
             host=host, project=project, slug=slug, kind=state,
-            since=_text(row.get("updated")), label=label, state=state,
+            since=_text(row.get("updated")), label=label, state=state, uid=uid,
         ))
     return found
 
@@ -693,7 +726,7 @@ def _question_refs(signals: dict) -> set:
     person.
     """
     return {
-        signal.ref for signal in signals.values() if signal.kind in QUESTION_KINDS
+        signal.run for signal in signals.values() if signal.kind in QUESTION_KINDS
     }
 
 
@@ -725,7 +758,8 @@ def _refs(payload: object) -> set:
     for row in rows if isinstance(rows, list) else []:
         identity = _identity(row)
         if identity is not None:
-            found.add("/".join(identity))
+            # :attr:`Signal.run`'s spelling, so membership is per execution.
+            found.add((runref.compose(*identity), _row_uid(row)))
     return found
 
 
@@ -751,7 +785,16 @@ def _run_identity(entry: dict) -> Optional[tuple]:
     return (host, project, slug)
 
 
-def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
+def _run_uid(entry: dict) -> Optional[str]:
+    """The registry entry's execution uid, or ``None`` for a schema-1 launch."""
+    run = entry.get("run")
+    uid = run.get("uid") if isinstance(run, dict) else None
+    return uid if isinstance(uid, str) and runs.UID_RE.fullmatch(uid) else None
+
+
+def _committed_status(
+    config: PlatformConfig, identity: tuple, uid: Optional[str] = None
+) -> Optional[str]:
     """The ``status`` in the run's committed state, or ``None`` if not knowable.
 
     Read out of the mirror as it stands, with no pull: the sweep is a read on the
@@ -764,7 +807,9 @@ def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
     ``unreadable``), a state file with no status. The bar for removing the evidence
     of a possible crash is a run that says it finished, and nothing less.
     """
-    ref = resolve_run_dir(config, *identity)
+    # By uid when the launch has one: the slug lookup answers with the group's
+    # newest record, which for a schema-2 group may be another launch entirely.
+    ref = resolve_run_dir(config, *identity, uid=uid)
     if ref is None:
         return None
     try:
@@ -898,7 +943,7 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
         identity = _run_identity(entry)
         if identity is None:
             continue
-        status = _committed_status(config, identity)
+        status = _committed_status(config, identity, _run_uid(entry))
         finished = status in _TERMINAL_STATUSES
         if not finished and not _ended_as_asked(entry):
             continue
@@ -1139,8 +1184,6 @@ def new_signals() -> list:
 
 def _comms_hub():
     """The running comms hub, if the daemon started one (issue #407)."""
-    from . import comms
-
     return comms.get_hub()
 
 
@@ -1188,6 +1231,16 @@ def record_ingested_signals(signals: list) -> None:
                 }
             },
         )
+
+
+def _project_name() -> Optional[str]:
+    """The bound project's name in projects mode, else ``None``."""
+    if not projects.enabled():
+        return None
+    try:
+        return projects.get(project_context.current() or projects.GENERAL)["name"]
+    except projects.ProjectError:
+        return None
 
 
 def _reading_age(status, reading) -> "Optional[float]":
@@ -1259,6 +1312,9 @@ class Detector:
         #: #254), counted apart from ``notified`` because this is the one digest
         #: class raised by a condition *going away*.
         self.answered = 0
+        #: ``stalled`` conditions not spooled because their run is muted (#458).
+        #: They stay in the baseline, so unmuting does not replay them.
+        self.muted_stalls = 0
         #: Nudges typed into the assistant's session (issue #317). Counted
         #: apart because it is the only stage that writes *into* a session.
         self.nudged = 0
@@ -1294,6 +1350,12 @@ class Detector:
         #: rather than the accumulation's stamp, which two accumulations a second
         #: apart share. Per process: a restart re-nudges once.
         self._nudged: Optional[tuple] = None
+        #: ``(session_id, episode, nudges, stalled_at)``, recorded before each
+        #: durable episode write (#584) so a store refusing writes can neither
+        #: nudge past the back-off nor post the signal every tick.
+        self._episode: Optional[tuple] = None
+        #: Stall signals raised (#584).
+        self.stalled = 0
         #: ``(session_id, stamp)`` for the rotation reminder this process last
         #: typed, or ``None`` while the reading is below the threshold — which is
         #: what makes the *next* crossing announce itself immediately instead of
@@ -1360,11 +1422,11 @@ class Detector:
         if not threshold:
             return (
                 "context-fullness reminders are OFF on this host "
-                "(rotation_context_threshold is 0): uber lmer is never told its "
+                f"(rotation_context_threshold is 0): {self.config.assistant_name} is never told its "
                 "window is filling. POST /api/assistant/config to set a percent."
             )
         return (
-            f"context-fullness reminder ON: when uber lmer's own status line "
+            f"context-fullness reminder ON: when {self.config.assistant_name}'s own status line "
             f"reports {threshold}% of its context window used, it is told once "
             f"— and again at most every "
             f"{rotation.REMINDER_INTERVAL_SECONDS // 60}m while it stays there — "
@@ -1536,6 +1598,13 @@ class Detector:
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
         fresh = self._confirmed(fresh)
+        # A muted run is quiet because the operator is driving it (#458).
+        muted = [signal for signal in fresh if signal.muted and signal.kind == MUTED_STALL_KIND]
+        if muted:
+            self.muted_stalls += len(muted)
+            fresh = [signal for signal in fresh if signal not in muted]
+            logger.debug("platform_detection_muted_stalls runs=%s",
+                         ",".join(signal.ref for signal in muted))
         for signal in fresh:
             self._deliver(signal)
         # After the fresh ones, so a run whose question cleared *into* another
@@ -1863,7 +1932,7 @@ class Detector:
         status = assistant.status()
         if not status.running or not status.session_id:
             return None
-        state = self._nudge_state()
+        state = self._nudge_state(status.session_id)
         threshold = settings["pending_threshold"].value
         # The cheap gates first, with both container-sourced readings omitted —
         # ``None`` proceeds for each — so a young spool costs no HTTP call. The
@@ -1874,6 +1943,7 @@ class Detector:
             idle_seconds=None,
             after_seconds=after,
             pending_threshold=threshold,
+            session_id=status.session_id,
         ) is None:
             return None
         reading = session_output_state(status.session_id) or {}
@@ -1884,10 +1954,14 @@ class Detector:
             produced_output=reading.get("produced"),
             after_seconds=after,
             pending_threshold=threshold,
+            session_id=status.session_id,
         )
         if due is None:
             # Working, or not yet drawing bytes. Unmarked, so the tick after
             # that changes is the one that tells it.
+            return None
+        if due.backed_off:
+            self._stall(status.session_id, state, due)
             return None
         text = nudge.prompt(due)
         adapter = (quiet_health(status.session_id) or {}).get('codex_delivery')
@@ -1902,7 +1976,7 @@ class Detector:
                 due = nudge.due(
                     durable, running=True, idle_seconds=reading.get('idle_seconds'),
                     produced_output=reading.get('produced'), after_seconds=after,
-                    pending_threshold=threshold,
+                    pending_threshold=threshold, session_id=status.session_id,
                 )
                 if due is None:
                     return None
@@ -1930,7 +2004,10 @@ class Detector:
         # Before the durable write, which can fail: this is the bound that does
         # not need a disk. Tagged with its accumulation so it cannot outlive it.
         self._nudged = (state.pending_seq, utc_now_iso())
-        marked = assistant.mark_nudged()
+        count = state.episode_nudges(status.session_id) + 1
+        self._episode = (status.session_id, state.episode, count, None)
+        marked = self._mark(assistant.mark_nudged, status.session_id,
+                            episode=state.episode, nudges=count)
         append_event(
             ASSISTANT_NUDGED,
             note=status.session_id,
@@ -1943,6 +2020,7 @@ class Detector:
                 # measurable, which is what explains a mid-turn arrival.
                 "idle_seconds": due.idle,
                 "repeat": due.repeat,
+                "nudges": state.episode_nudges(status.session_id) + 1,
                 "after_seconds": after,
                 "marked": bool(marked),
                 # Always present; null unless the send raised after delivering.
@@ -1959,7 +2037,7 @@ class Detector:
         )
         return due
 
-    def _nudge_state(self):
+    def _nudge_state(self, session_id=None):
         """The assistant state the nudge decision reads, with this process's own
         nudge stamp folded in when the durable one is missing or older.
 
@@ -1971,7 +2049,7 @@ class Detector:
         written repeats every tick — and that same outage stops the assistant
         draining the spool, so the repeats never end.
         """
-        state = assistant.clamp_future_nudged_at()
+        state = self._with_episode(assistant.clamp_future_nudged_at(), session_id)
         if self._nudged is None:
             return state
         seq, stamp = self._nudged
@@ -1987,6 +2065,81 @@ class Detector:
         if stored is None or stored_age is None or stored < stamp:
             return replace(state, nudged_at=stamp)
         return state
+
+    def _with_episode(self, state, session_id):
+        """*state* with this process's own record of the episode folded in.
+
+        Recorded before each durable write, like :attr:`_nudged`, and dropped once
+        a take or a new incarnation ends the episode it was about.
+        """
+        if self._episode is None:
+            return state
+        session, episode, nudges, stalled_at = self._episode
+        if episode != state.episode or session != session_id:
+            self._episode = None
+            return state
+        return replace(
+            state,
+            nudge_session=session,
+            nudges=max(state.episode_nudges(session), nudges),
+            stalled_at=state.stalled_at if state.episode_stalled(session) else stalled_at,
+        )
+
+    def _mark(self, mark, *args, **kwargs):
+        """*mark*'s stamp, or ``None``; the projects store raises where the file returns."""
+        try:
+            return mark(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the in-memory record holds the bound
+            self._absorb("nudge-mark", exc)
+            return None
+
+    def _stall(self, session_id: str, state, due: nudge.Nudge) -> None:
+        """Tell the operator, once per episode, that the spool is not being taken.
+
+        If every standing thread refuses the post the episode stays unsignalled
+        and the next attempt waits one interval, like a nudge.
+        """
+        threads = assistant._stored_threads()
+        try:
+            reason = stall.terminal_reason(session_id)
+        except Exception as exc:  # noqa: BLE001 - the signal goes out without a quote
+            logger.info("platform_assistant_stall_reason_unreadable session=%s error=%s",
+                        session_id, exc)
+            reason = None
+        nudges = state.episode_nudges(session_id)
+        text = stall.message(project=_project_name(), pending=due.count,
+                             waited_minutes=due.waited_minutes, nudges=nudges, reason=reason)
+        posted, failed = stall.deliver(text, threads)
+        signalled = bool(posted) or not threads
+        if signalled:
+            self.stalled += 1
+            self._episode = (session_id, state.episode, nudges, utc_now_iso())
+            self._mark(assistant.mark_stalled, session_id, episode=state.episode)
+            self._clear("stall")
+        else:
+            self._nudged = (state.pending_seq, utc_now_iso())
+            self._mark(assistant.mark_nudged, session_id, counted=False, episode=state.episode)
+            self._absorb("stall", RuntimeError(failed[0]["error"]))
+        append_event(
+            ASSISTANT_STALLED,
+            note=session_id,
+            data={
+                "session": session_id,
+                "pending": due.count,
+                "accumulation": state.pending_seq,
+                "waited_seconds": round(due.waited_seconds, 1),
+                "nudges": nudges,
+                "reason": reason,
+                "threads": posted,
+                "failed": failed,
+                "signalled": signalled,
+            },
+        )
+        logger.warning(
+            "platform_assistant_stalled session=%s pending=%d nudges=%d reason=%s "
+            "threads=%d failed=%d signalled=%s — reminders stopped for this episode",
+            session_id, due.count, nudges, reason, len(posted), len(failed), signalled,
+        )
 
     def _answered_questions(
         self, baseline: dict, current: dict, payload: object
@@ -2015,11 +2168,11 @@ class Detector:
         for signal in baseline.values():
             if signal.kind not in QUESTION_KINDS:
                 continue
-            if signal.ref in outstanding or signal.ref not in refs:
+            if signal.run in outstanding or signal.run not in refs:
                 continue
-            previous = cleared.get(signal.ref)
+            previous = cleared.get(signal.run)
             if previous is None or _question_rank(signal) > _question_rank(previous):
-                cleared[signal.ref] = signal
+                cleared[signal.run] = signal
         # Baseline order, which is the inventory's own sort (:func:`_signals`).
         return list(cleared.values())
 

@@ -274,6 +274,27 @@ class TestZombies:
         assert gate_lock.active_gate() is None
         assert not path.exists()
 
+    def test_a_pid_reaped_between_the_probe_and_the_proc_read_is_not_live(self, monkeypatch):
+        """As #525 for the registry: the parent reaps after kill(pid, 0)
+        succeeded, so the /proc read finds nothing."""
+        child = subprocess.Popen(["/bin/true"])
+        stat = f"/proc/{child.pid}/stat"
+        real_open = open
+        reaped = []
+
+        def reaping_open(path, *args, **kwargs):
+            if path == stat and not reaped:
+                reaped.append(os.waitpid(child.pid, 0))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", reaping_open)
+        try:
+            assert gate_lock._pid_alive(child.pid) is False
+            assert reaped, "the reap never landed inside the window"
+        finally:
+            monkeypatch.undo()
+            child.wait()
+
     def test_a_running_process_is_not_a_zombie(self):
         assert gate_lock._is_zombie(os.getpid()) is False
         assert gate_lock._pid_alive(os.getpid()) is True

@@ -15,11 +15,16 @@ import threading
 import time
 import uuid
 
+from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS
+
 from . import project_context as scope, registry, store
 from . import assistant_history, runs
 
 logger = logging.getLogger(__name__)
 GENERAL = scope.GENERAL
+#: Project settings that are not assistant launch settings: they never reach an
+#: assistant start (issue #594, :mod:`lmer_platform.authority`).
+WORKER_SETTING_KEYS = ("supervisor_authority",)
 COLORS = (
     "Red", "Orange", "Amber", "Yellow", "Lime", "Green", "Emerald", "Teal",
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
@@ -77,11 +82,19 @@ def require_admission(workspace_id):
 def run_operation(function):
     @wraps(function)
     def wrapped(config, request):
+        # Normalise before reading any field. This decorator consumes
+        # workspace_id/home_revision/confirm_project directly, and the request's
+        # own validate() — which runs inside the wrapped function — is too late
+        # for them. Idempotent, so the inner call is a no-op.
+        request = request.validate()
         if not enabled():
             return function(config, request)
 
         with operation():
-            key = runs.run_key(request.host, request.project, request.slug)
+            # The request's own fields are the body it was built from, so a
+            # request that carries a uid binds to the uid home and one that does
+            # not (or predates the field) to the slug home, by key_parts' rule.
+            key = runs.run_key(*runs.key_parts(vars(request)))
             home = run_home(key)
             chosen = request.workspace_id or scope.current() or (home or {}).get("project_id")
             get(chosen, active=True)
@@ -197,6 +210,11 @@ def database():
                 fingerprint TEXT NOT NULL, state TEXT NOT NULL, result TEXT,
                 PRIMARY KEY(project_id, ref)
             );
+            CREATE TABLE IF NOT EXISTS channel_routes (
+                transport TEXT NOT NULL, conversation TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id), label TEXT NOT NULL,
+                PRIMARY KEY(transport, conversation)
+            );
         """)
         if "run_key" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
             db.execute("ALTER TABLE sessions ADD COLUMN run_key TEXT")
@@ -240,15 +258,20 @@ def migrate():
         history = store.platform_dir() / "assistant-history.sqlite3"
         if history.is_file():
             with closing(sqlite3.connect(history)) as old:
-                for (session,) in old.execute("SELECT session FROM generations"):
+                # The history writer creates its file before its tables
+                # (assistant_history._database), so a file with no
+                # ``generations`` yet holds no session to carry.
+                known = old.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='generations'"
+                ).fetchone()
+                for (session,) in old.execute("SELECT session FROM generations") if known else ():
                     db.execute("INSERT OR IGNORE INTO sessions VALUES (?,?,NULL)", (session, GENERAL))
         for event in store.read_events():
             if event.get("type") != "session_spawned":
                 continue
             data = event.get("data") or {}
-            run = data.get("run") or {}
-            if data.get("session") and all(run.get(field) for field in ("host", "project", "slug")):
-                key = runs.run_key(run["host"], run["project"], run["slug"])
+            key = key_of(data.get("run"))
+            if data.get("session") and key:
                 db.execute("INSERT OR IGNORE INTO sessions VALUES (?,?,?)", (data["session"], GENERAL, key))
         db.execute("INSERT INTO metadata VALUES ('migrated','1')")
 
@@ -324,6 +347,7 @@ def _color(value):
 
 @serialized
 def update(workspace_id, values):
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import ASSISTANT_SETTING_KEYS, validate_assistant_override
 
     allowed = {"name", "color", "settings", "repositories"}
@@ -333,10 +357,17 @@ def update(workspace_id, values):
     name = _name(values.get("name", current["name"]))
     color = _color(values.get("color", current["color"]))
     settings = values.get("settings", current["settings"])
-    if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS):
+    if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS) - set(WORKER_SETTING_KEYS):
         raise ProjectError("Invalid assistant overrides.")
     for key, value in settings.items():
-        if value is not None:
+        if value is None:
+            continue
+        if key == "supervisor_authority":
+            if value not in SUPERVISOR_AUTHORITY_LEVELS:
+                raise ProjectError(
+                    f"supervisor_authority must be one of {', '.join(SUPERVISOR_AUTHORITY_LEVELS)}."
+                )
+        else:
             validate_assistant_override(key, value)
     repositories = values.get("repositories", current["repositories"])
     if not isinstance(repositories, list) or any(not isinstance(item, str) or not item.strip() for item in repositories):
@@ -432,11 +463,27 @@ def check_home(key, workspace_id, revision=None):
     return home
 
 
+def key_of(data):
+    """The run key a body, fleet row, event or registry block names, or ``None``.
+
+    Composed through :func:`lmer_platform.runs.key_parts`, so a mapping that
+    carries a uid binds to the uid key and one that does not to the slug key —
+    the same rule the tracked index keys by. ``None`` rather than a refusal for a
+    mapping that names no run: every caller here is asking "is this about a run",
+    and most of what reaches them is not.
+    """
+    try:
+        return runs.run_key(*runs.key_parts(data))
+    except runs.RunIndexError:
+        return None
+
+
 def destination(data):
     """Resolve a recorded run/session, without repository or UI inference."""
     data = data or {}
-    if all(data.get(key) for key in ("host", "project", "slug")):
-        home = run_home(runs.run_key(data["host"], data["project"], data["slug"]))
+    key = key_of(data)
+    if key:
+        home = run_home(key)
         if home:
             return home["project_id"]
     return session_home(data.get("session")) or data.get("workspace_id") or scope.current()
@@ -465,6 +512,7 @@ def _assign(key, destination_id):
     The caller has validated *destination_id* active and holds the operation
     lock. Ownership comes from the named destination alone.
     """
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     if _live_worker(key):
@@ -476,7 +524,7 @@ def _assign(key, destination_id):
                    "(SELECT session FROM sessions WHERE run_key=?) OR json_extract(payload,'$.data.run_key')=?)",
                    (destination_id, key, key))
         row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (destination_id,)).fetchone()
-        state = assistant.AssistantState.from_dict(json.loads(row[0]))
+        state = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=destination_id)
         notice = assistant.PendingNote(
             at=store.utc_now_iso(), kind="run_assigned",
             note=f"Run {key} was assigned to this project.",
@@ -491,6 +539,7 @@ def _assign(key, destination_id):
 
 
 def move(key, destination_id, *, expected_project, expected_revision=None):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     with operation(), assistant._LOCK:
@@ -512,14 +561,13 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
             states = {}
             for project_id in (expected_project, destination_id):
                 row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (project_id,)).fetchone()
-                states[project_id] = assistant.AssistantState.from_dict(json.loads(row[0]))
+                states[project_id] = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=project_id)
             source, target = states[expected_project], states[destination_id]
             moved, retained = [], []
             for note in source.pending:
                 data = note.data or {}
-                parts = [data.get(field) for field in ("host", "project", "slug")]
                 session_run = db.execute("SELECT run_key FROM sessions WHERE session=?", (data.get("session"),)).fetchone()
-                belongs = (all(parts) and runs.run_key(*parts) == key or data.get("run_key") == key
+                belongs = (key_of(data) == key or data.get("run_key") == key
                            or session_run and session_run[0] == key)
                 (moved if belongs else retained).append(note)
             notice = assistant.PendingNote(
@@ -528,7 +576,8 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
                       "workspace_id": destination_id, "home_revision": home["revision"] + 1},
             )
             updates = {
-                expected_project: replace(source, pending=tuple(retained)),
+                expected_project: replace(source, pending=tuple(retained),
+                                          **({} if retained else assistant.ended_episode(source))),
                 destination_id: replace(target, pending=(*target.pending, *moved, notice),
                                         pending_since=target.pending_since or notice.at,
                                         pending_seq=target.pending_seq + (not target.pending)),
@@ -542,6 +591,101 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
                        "(SELECT session FROM sessions WHERE run_key=?) OR json_extract(payload,'$.data.run_key')=?)",
                        (destination_id, key, key))
         return run_home(key)
+
+
+def _present(row, *, skip):
+    """A row's columns as :func:`runs.merge_values` reads them: NULL is "lacks"."""
+    return {name: value for name, value in dict(row).items() if name not in skip and value is not None}
+
+
+def _carry(db, table, where, old_args, new_args, old, new, *, rename):
+    """Move one row of *table* to its new key, or merge it into the row already there.
+
+    *old* and *new* are the two rows' non-key columns (:func:`_present`); *new*
+    is ``None`` when nothing holds the new key, and the old row is then renamed
+    in place with *rename*. Otherwise the new row gains only the columns it
+    lacked, and the old row is removed only when nothing differed — a differing
+    column leaves both rows standing, which is how the lossless policy keeps
+    both values in a table whose key admits one row per run. A stamp column
+    (``revision``, :data:`runs.BOOKKEEPING_STAMPS`) is not a difference: the
+    new row takes the later one. Returns ``(moved, conflict)``.
+    """
+    if new is None:
+        columns = ",".join(f"{name}=?" for name in rename)
+        db.execute(f"UPDATE {table} SET {columns} WHERE {where}", (*rename.values(), *old_args))
+        return (True, False)
+    merged, conflict = runs.merge_values(old, new)
+    carried = [
+        name for name in merged
+        if name not in new
+        or (name in runs.BOOKKEEPING_STAMPS and merged[name] != new[name])
+    ]
+    for name in carried:
+        db.execute(f"UPDATE {table} SET {name}=? WHERE {where}", (merged[name], *new_args))
+    if not conflict:
+        db.execute(f"DELETE FROM {table} WHERE {where}", old_args)
+    return (bool(carried) or not conflict, conflict)
+
+
+def rekey(old_key, new_key):
+    """Carry a run's project ownership from *old_key* to *new_key* (spec §6.1).
+
+    The transition that binds a slug-keyed run to its uid calls this for the
+    ``projects`` and ``threads`` stores. It moves the ``homes`` row, the
+    ``sessions`` rows' ``run_key`` and the durable thread ownership
+    (``thread_owners.owner = run:<key>`` and ``thread_owners.run_key``) in one
+    ``database()`` transaction under :func:`operation`, so a crash leaves either
+    the old ownership or the new, never a home under one key with its sessions
+    and threads under the other.
+
+    Returns ``{"moved": bool, "conflict": bool}``. ``moved`` says whether this
+    call changed any row; ``conflict`` whether a row under *new_key* holds a
+    value that differs from the one under *old_key*. Both are ``False`` for a
+    repeat call after a clean move, so the call is idempotent.
+
+    Collisions follow :func:`runs.merge_values`. A column the new row lacks
+    (NULL) is carried over; an equal one is a no-op and the old row is removed;
+    a differing one is never dropped. For a home, a differing column (a
+    different project) means the two keys disagree
+    about who owns the run, so the old home stays in place with its sessions
+    and thread owners still pointing at it: moving them would cross a project
+    boundary that only :func:`move`, with its live-worker check and notices,
+    may cross. The new home still gains what it lacked. A differing thread
+    owner keeps both rows the same way. A conflict is reported again on every
+    repeat until an operator resolves it.
+    """
+    if not enabled() or old_key == new_key:
+        return {"moved": False, "conflict": False}
+    moved = conflict = False
+    with operation(), database() as db:
+        old = db.execute("SELECT * FROM homes WHERE run_key=?", (old_key,)).fetchone()
+        if old:
+            new = db.execute("SELECT * FROM homes WHERE run_key=?", (new_key,)).fetchone()
+            moved, conflict = _carry(db, "homes", "run_key=?", (old_key,), (new_key,),
+                                     _present(old, skip={"run_key"}),
+                                     _present(new, skip={"run_key"}) if new else None,
+                                     rename={"run_key": new_key})
+        if not conflict:
+            moved = bool(db.execute("UPDATE sessions SET run_key=? WHERE run_key=?",
+                                    (new_key, old_key)).rowcount) or moved
+            old_owner = f"run:{old_key}"
+            for row in db.execute("SELECT * FROM thread_owners WHERE owner=? OR run_key=?",
+                                  (old_owner, old_key)).fetchall():
+                owner = f"run:{new_key}" if row["owner"] == old_owner else row["owner"]
+                rekeyed = {**dict(row), "run_key": new_key if row["run_key"] == old_key else row["run_key"]}
+                # A row whose owner does not name the run (``project:<id>``) keeps
+                # its primary key, so it cannot collide with anything but itself.
+                target = None if owner == row["owner"] else db.execute(
+                    "SELECT * FROM thread_owners WHERE thread=? AND owner=?", (row["thread"], owner)).fetchone()
+                changed, clash = _carry(db, "thread_owners", "thread=? AND owner=?",
+                                        (row["thread"], row["owner"]), (row["thread"], owner),
+                                        _present(rekeyed, skip={"thread", "owner"}),
+                                        _present(target, skip={"thread", "owner"}) if target else None,
+                                        rename={"owner": owner, "run_key": rekeyed["run_key"]})
+                moved, conflict = moved or changed, conflict or clash
+    if moved or conflict:
+        logger.info("platform_run_rekeyed old=%s new=%s moved=%s conflict=%s", old_key, new_key, moved, conflict)
+    return {"moved": moved, "conflict": conflict}
 
 
 def archive(workspace_id, inventory):
@@ -561,8 +705,9 @@ def archive(workspace_id, inventory):
             raise ProjectError("Resolve pending requests and events before archiving.", status=409)
         rows = {}
         for item in inventory.get("runs", []):
-            if all(item.get(field) for field in ("host", "project", "slug")):
-                rows[runs.run_key(item["host"], item["project"], item["slug"])] = item
+            key = key_of(item)
+            if key:
+                rows[key] = item
         for run in runs.list_tracked():
             home = run_home(run.key)
             if home and home["project_id"] == workspace_id:
@@ -588,6 +733,7 @@ def restore(workspace_id):
 
 
 def limit():
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import config_path
 
     value = (store.read_json(config_path()) or {}).get("max_live_assistants", 4)
@@ -595,6 +741,7 @@ def limit():
 
 
 def worker_limit(default):
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
     from .config import config_path
 
     value = (store.read_json(config_path()) or {}).get("max_concurrent_sessions", default)
@@ -613,6 +760,7 @@ def request_start(workspace_id):
 
 
 def status(workspace_id):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     project = get(workspace_id)
@@ -656,6 +804,7 @@ def inventory_sessions(sessions):
 
 
 def stop(workspace_id):
+    # deferred: cycle — lmer_platform.assistant imports this module at top
     from . import assistant
 
     get(workspace_id)
@@ -672,6 +821,7 @@ def stop(workspace_id):
 
 
 def rotate(workspace_id, config, **kwargs):
+    # deferred: cycle — lmer_platform.assistant and lmer_platform.project_requests import this module at top
     from . import assistant, project_requests
 
     get(workspace_id, active=True)
@@ -695,6 +845,7 @@ def rotate(workspace_id, config, **kwargs):
 
 
 def _failed(workspace_id, error, *, retry):
+    # deferred: cycle — lmer_platform.transcripts imports this module at top
     from .transcripts import scrub_credentials
 
     with database() as db:
@@ -710,6 +861,7 @@ def _failed(workspace_id, error, *, retry):
 
 def reconcile(config):
     """Reconcile one fleet pass; reservations include starts and rotations."""
+    # deferred: cycle — lmer_platform.assistant and lmer_platform.project_requests import this module at top
     from . import assistant, project_requests
 
     with operation():
@@ -765,6 +917,7 @@ class Supervisor:
         self._thread = None
 
     def first_start(self):
+        # deferred: cycle — lmer_platform.assistant imports this module at top, and lmer_platform.config does via uploads
         from . import assistant, config
 
         incumbents = {row["id"] for row in listing() if status(row["id"])["running"]}

@@ -38,8 +38,9 @@ ERROR-tier shape rules in every form (`index.link-not-relative`,
 ends of every target this module writes are resolved paths under the
 project dir and the link between them is `os.path.relpath`'s answer.
 One entry per (run, spec file): re-registering the same spec re-points
-the same day's link, and a later-day re-registration replaces the older
-dated entry rather than accumulating duplicates.
+the SAME link, and an existing entry's date always wins — a later-day
+re-registration (a later session start, a `work artifact` re-run) keeps
+the original date rather than re-dating the entry (#334).
 
 Spec-class predicate (is_spec_artifact): a Markdown file whose stem is
 exactly `spec`, starts with `spec` + separator, or ends with separator +
@@ -47,7 +48,8 @@ exactly `spec`, starts with `spec` + separator, or ends with separator +
 `spec-auth.md`, `foo-spec.md`, `masterplan-spec.md` qualify; `plan.md`,
 `spec.py` (not Markdown), `specifics.md`, `inspect.md` do not.
 
-Every write path here is fail-soft by contract: the index is a
+Every write path here is fail-soft after acquiring the checkout transaction:
+an inherited Git hook is refused before lookup or mutation. The index is a
 convenience view over the run area, and no index problem may ever fail the
 artifact registration (or sync) that triggered it. `rebuild()` is the
 backfill path for runs that predate the index; it asks the run-state
@@ -65,6 +67,7 @@ from pathlib import Path
 from typing import Optional
 
 from .utils import _work_repo_base, project_area, work_repo_root
+from .transactions import mutation_transaction
 
 __all__ = [
     "SPECS_DIR", "SCHEMA_SPECS_DIR", "is_spec_artifact", "specs_dir",
@@ -169,12 +172,17 @@ def run_label(rdir: Path, state: Optional[dict] = None) -> str:
     old name was `2026-08-25-develop-issue-101--spec.md`. A long name that
     names one record beats a short one that hides another.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     if state is None:
         state = run_state._read_sibling_state(rdir)
     label = None
     if isinstance(state, dict):
-        recorded = state.get("name") or state.get("slug")
+        if run_state.is_default_label(state):
+            # A default label is not a naming (D6): the entry is named under
+            # the slug, exactly as an unnamed record always was.
+            recorded = state.get("slug")
+        else:
+            recorded = state.get("name") or state.get("slug")
         if recorded:
             label = str(recorded)
     if label is None:
@@ -205,7 +213,7 @@ def _record_session_id(area_rel_name: str) -> Optional[str]:
     old directory is gone by the time it runs — the name is all that is left
     to spell it with.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     parts = [part for part in str(area_rel_name).split("/") if part]
     if len(parts) < 2:
         return None
@@ -225,11 +233,15 @@ def _entry_name(label: str, basename: str, when: Optional[datetime]) -> str:
     return f"{when.strftime(_DATE_PREFIX)}-{_safe_label(label)}--{basename}"
 
 
+@mutation_transaction
 def upsert_spec_link(
     spec_path: Path,
     label: str,
     when: Optional[datetime] = None,
     alias: Optional[str] = None,
+    *,
+    specs_directory: Optional[Path] = None,
+    project_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Upsert one specs-index entry for a spec-class file. Fail-soft.
 
@@ -258,10 +270,14 @@ def upsert_spec_link(
     has schema-form entries under the old key, so there is nothing to sweep
     in practice — only a cost to pay if this function started guessing.
 
+    *specs_directory* and *project_dir* name the index and the project dir
+    explicitly, for a caller with no session env (the `work migrate` fold);
+    left out, both resolve from the session as always.
+
     Returns the entry path, or None when nothing was indexed.
     """
     try:
-        base = _work_repo_base()
+        base = Path(project_dir) if project_dir is not None else _work_repo_base()
         basename = alias or spec_path.name
         if base is None or not is_spec_artifact(basename):
             return None
@@ -271,28 +287,39 @@ def upsert_spec_link(
         # ends are under `base`, so `relpath` can only walk up as far as it.
         if not spec_path.is_file() or not spec_path.is_relative_to(base):
             return None
-        sdir = specs_dir()
+        sdir = Path(specs_directory) if specs_directory is not None else specs_dir()
         if sdir is None:
             return None
         sdir.mkdir(parents=True, exist_ok=True)
-        entry = _entry_name(label, basename, when)
-        # One entry per (record, spec file): drop same-pair entries under
-        # other dates before (re-)pointing today's. Same-pair entries in
-        # the legacy pre-`--` name format are cleaned up too — but only
-        # when the legacy label is itself `--`-free, since a `--`-bearing
-        # legacy pattern could match a current-format entry of a DIFFERENT
-        # pair (`--rebuild` regenerates whatever this skips).
-        alternatives = [re.escape(entry[len("YYYY-MM-DD-"):])]
+        # One entry per (record, spec file), and an EXISTING entry's date
+        # always wins: `when` dates only a NEW entry (#334), so a later
+        # session start (or `work artifact` re-registration) re-points the
+        # entry in place instead of re-dating it. Same-pair entries in the
+        # legacy pre-`--` name format are matched too — but only when the
+        # legacy label is itself `--`-free, since a `--`-bearing legacy
+        # pattern could match a current-format entry of a DIFFERENT pair
+        # (`--rebuild` regenerates whatever this skips).
+        current_label = _entry_name(label, basename, None)[len("YYYY-MM-DD-"):]
+        alternatives = [re.escape(current_label)]
         legacy_label = _UNSAFE_LABEL_RE.sub("-", label).strip("-") or "run"
         if "--" not in legacy_label:
             alternatives.append(re.escape(f"{legacy_label}-{basename}"))
-        stale_re = re.compile(
-            rf"^\d{{4}}-\d{{2}}-\d{{2}}-(?:{'|'.join(alternatives)})$"
+        pair_re = re.compile(
+            rf"^(?P<date>\d{{4}}-\d{{2}}-\d{{2}})-(?:{'|'.join(alternatives)})$"
         )
-        for sibling in sdir.iterdir():
-            if sibling.name != entry and stale_re.match(sibling.name):
-                if sibling.is_symlink():
-                    sibling.unlink()
+        existing = sorted(
+            (sib for sib in sdir.iterdir() if sib.is_symlink() and pair_re.match(sib.name)),
+            key=lambda p: p.name,
+        )
+        if existing:
+            # The earliest same-pair entry's date wins (current or legacy
+            # format); the entry itself is written in the CURRENT format.
+            entry = f"{existing[0].name[:len('YYYY-MM-DD')]}-{current_label}"
+        else:
+            entry = _entry_name(label, basename, when)
+        for sibling in existing:
+            if sibling.name != entry:
+                sibling.unlink()
         target = os.path.relpath(spec_path, sdir)
         link = sdir / entry
         if link.is_symlink():
@@ -310,8 +337,12 @@ def upsert_spec_link(
         return None
 
 
+@mutation_transaction
 def repoint_run_dir_entries(
-    old_name: str, new_name: str, new_label: str
+    old_name: str, new_name: str, new_label: str, *,
+    project_dir: Optional[Path] = None,
+    specs_directory: Optional[Path] = None,
+    run_area: Optional[Path] = None,
 ) -> None:
     """Re-point index entries after a record dir moved (the freeze's
     `<slug>/` → `<slug>--<name>/`, the re-slug's move to a new address).
@@ -334,11 +365,32 @@ def repoint_run_dir_entries(
     dir no longer exists by the time this runs — so the name is what both
     ends can still spell, and the one prefix rewrite below covers both forms
     because the run area itself is resolved rather than spelled.
+
+    *project_dir*, *specs_directory* and *run_area* name the project's areas
+    explicitly, for a caller with no session env (the `work migrate` fold);
+    left out, each resolves from the session exactly as before. The new
+    entry is written before the old one goes, so an entry that cannot be
+    re-registered is kept (and warned about) rather than silently dropped.
     """
     try:
-        from . import run_state  # local: run_state imports this module
-        sdir = specs_dir()
-        runs = run_state.runs_base()
+        # deferred: cycle — work_repo.run_state imports this module at top; inside the fail-soft try, so a failed import only warns
+        from . import run_state
+        if project_dir is not None:
+            project_dir = Path(project_dir)
+        if specs_directory is not None:
+            sdir = Path(specs_directory)
+        elif project_dir is not None:
+            schema_specs = project_dir / SCHEMA_SPECS_DIR
+            sdir = schema_specs if schema_specs.is_dir() else project_dir / SPECS_DIR
+        else:
+            sdir = specs_dir()
+        if run_area is not None:
+            runs = Path(run_area)
+        elif project_dir is not None:
+            schema_runs = project_dir / "_runs"
+            runs = schema_runs if schema_runs.is_dir() else project_dir / "runs"
+        else:
+            runs = run_state.runs_base()
         if sdir is None or runs is None or old_name == new_name:
             return
         if not sdir.is_dir():
@@ -424,8 +476,14 @@ def repoint_run_dir_entries(
                     if rest.endswith(f"-{canonical_name}")
                     else rest
                 )
-            entry.unlink()
-            upsert_spec_link(new_target, new_label, when=when, alias=basename)
+            new_entry = upsert_spec_link(
+                new_target, new_label, when=when, alias=basename,
+                specs_directory=sdir, project_dir=project_dir,
+            )
+            if new_entry is None:
+                print(f"⚠️  specs index entry {entry.name} not re-pointed; left in place")
+            elif new_entry != entry and entry.is_symlink():
+                entry.unlink()
     except Exception as exc:
         print(f"⚠️  specs index re-point skipped: {exc}")
 
@@ -445,7 +503,7 @@ def _registration_when(rdir: Path, name: str, canonical: Path) -> Optional[datet
     """Best-effort registration time for a backfilled entry: the first
     `artifact_written` event for `name`, else the canonical file's mtime
     (fail-soft to None → "today", the least-wrong remaining answer)."""
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     try:
         for event in run_state.read_events(rdir, last_n=0):
             if event.get("type") == "artifact_written" and event.get("note") == name:
@@ -460,6 +518,7 @@ def _registration_when(rdir: Path, name: str, canonical: Path) -> Optional[datet
         return None
 
 
+@mutation_transaction
 def rebuild() -> list[Path]:
     """Rebuild the whole index from the run area (backfill path, `work
     specs-index --rebuild`): drop every existing symlink entry, then re-index
@@ -484,7 +543,7 @@ def rebuild() -> list[Path]:
     grouping level — and a second, form-dependent rule here is exactly the
     drift the shared walk exists to prevent.
     """
-    from . import run_state  # local: run_state imports this module
+    from . import run_state  # deferred: cycle — work_repo.run_state imports this module at top
     sdir = specs_dir()
     if sdir is None:
         return []

@@ -603,12 +603,17 @@ def _live_entries(sessions: Optional[list] = None) -> list:
 
 def _occupant_of(entry: dict) -> dict:
     run = entry.get("run") if isinstance(entry.get("run"), dict) else {}
-    return {
+    occupant = {
         "session_id": entry.get("id"),
         "host": run.get("host"),
         "project": run.get("project"),
         "slug": run.get("slug"),
     }
+    # Only a schema-2 launch's: two of them share a slug, and the UI tells the
+    # holder from its sibling by uid. A schema-1 occupant keeps its shape.
+    if run.get("uid"):
+        occupant["uid"] = run["uid"]
+    return occupant
 
 
 def _session_bindings(

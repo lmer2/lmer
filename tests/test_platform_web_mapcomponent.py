@@ -159,27 +159,16 @@ def test_the_bar_control_carries_the_orchestrators_state_and_what_it_needs():
         "the shell no longer finds the orchestrator row, so the bar control "
         "cannot be painted from its state"
     )
-    assert "orchestratorTone" in app and "orchestratorHint" in app, (
-        "the bar control has no tone or hover text of its own"
-    )
-    assert "toneColor" in app, (
-        "the bar control's colour is not coming from the app's tone table, so it "
-        "can disagree with the map about what a state looks like"
-    )
+    assert "orchestratorHint" in app, "the bar control has no hover text of its own"
     markup = _read(APP)
-    button = re.search(r'<v-btn\b[^>]*:icon="mdiRobot"[^>]*/>', markup, re.S)
+    button = re.search(r'<v-btn\b[^>]*class="ratchet-badge"[^>]*>\s*<RatchetFace\b.*?</v-btn>', markup, re.S)
     assert button, "the uber lmer bar control is no longer recognisable"
     assert ':aria-label="orchestratorHint"' in button.group(0)
-    assert ':color="orchestratorTone"' in button.group(0), (
-        "the bar control is not painted from the orchestrator's state"
-    )
-    # A project-colored bar (#547) would swallow the tone, so there a toned control
-    # sits on the theme surface the tones were chosen against; untoned, no disc.
-    assert ":class=\"{ 'robot-on-surface': barColor && orchestratorTone }\"" in button.group(0), (
-        "on a project-colored bar the orchestrator's tone has no surface it can be read on"
-    )
-    assert re.search(r"\.robot-on-surface\.v-btn \{\s*background: rgb\(var\(--v-theme-surface\)\);", markup), (
-        "the disc the robot's tone is read on is no longer drawn"
+    # The face is a picture and takes no tone, so the badge wears the bar's own
+    # colour (issue 596) and the disc a toned glyph once needed is gone.
+    assert ":color=" not in button.group(0) and "robot-on-surface" not in markup, (
+        "the bar control is painted again; on a project-coloured bar a tone needs "
+        "a disc to be read on, and the face already says the state"
     )
     tooltip = next(block for block in re.findall(r"<v-tooltip\b.*?</v-tooltip>", markup, re.S) if button.group(0) in block)
     assert ':text="orchestratorHint"' in tooltip and 'open-on-focus' in tooltip, (

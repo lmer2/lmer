@@ -544,6 +544,75 @@ class TestWriteIntentMap:
             "git.example.com/group/project/memory"
         ]
 
+    def _schema_env(self, monkeypatch, tmp_path):
+        """A schema-form tree with a launch in `widgets`, the shape whose
+        durability pushes regenerate `widgets/README.md`."""
+        from tests.schema2_fixtures import build_schema2_plexus, make_env
+
+        tree = build_schema2_plexus(tmp_path / "plexus")
+        make_env(monkeypatch, tree.root)
+        return tree
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"command": "state", "action": "set"},
+            {"command": "ledger", "action": "set"},
+            {"command": "goals", "goals_action": "freeze"},
+            {"command": "goals", "goals_action": "amend"},
+            {"command": "goals", "goals_action": "assess"},
+            {"command": "answer", "text": "x"},
+            {"command": "artifact", "name": "spec.md", "sync": False},
+            {"command": "session-end"},
+            {"command": "release", "release_action": "claim"},
+            {"command": "release", "release_action": "unclaim"},
+            {"command": "release", "release_action": "abort"},
+            {"command": "release", "release_action": "record"},
+            {"command": "memory", "memory_action": "persist"},
+        ],
+    )
+    def test_pushing_shapes_name_the_project_readme_on_a_schema_tree(self, attrs, monkeypatch, tmp_path):
+        """Every verb whose write can reach `commit_work_path` may regenerate or
+        sweep the project README, so its scope ends with that file, once."""
+        self._schema_env(monkeypatch, tmp_path)
+        paths = self._paths(**attrs)
+        assert paths and paths[-1] == "widgets/README.md"
+        assert paths.count("widgets/README.md") == 1
+        assert all(p.startswith("widgets/") or p == "_agents/memory" for p in paths), paths
+
+    @pytest.mark.parametrize("action", ["forget", "revive"])
+    def test_memory_retirements_name_the_project_readme_on_a_schema_tree(self, action, monkeypatch, tmp_path):
+        tree = self._schema_env(monkeypatch, tmp_path)
+        (tree.root / "widgets" / "_agents" / "memory").mkdir(parents=True)
+        paths = self._paths(command="memory", memory_action=action,
+                            scoped_path="widgets/_agents/memory/fact.md")
+        assert paths[-1] == "widgets/README.md"
+        assert "widgets/_agents/memory/fact.md" in paths
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"command": "log", "message": "a message long enough to pass validation"},
+            {"command": "goal", "description": "a stated goal"},
+            {"command": "name", "value": "tidy"},
+            {"command": "event", "type": "x"},
+            {"command": "verify"},
+            {"command": "report", "file": "somefile.md"},
+            {"command": "session-start"},
+        ],
+    )
+    def test_non_pushing_shapes_do_not_name_the_readme(self, attrs, monkeypatch, tmp_path):
+        """These verbs write the record without a durability push: no README in scope."""
+        self._schema_env(monkeypatch, tmp_path)
+        paths = self._paths(**attrs)
+        assert paths and not any(p.endswith("README.md") for p in paths)
+
+    def test_a_legacy_tree_names_no_readme(self, monkeypatch, tmp_path):
+        self._run_env(monkeypatch, tmp_path)
+        for attrs in ({"command": "state", "action": "set"}, {"command": "session-end"},
+                      {"command": "memory", "memory_action": "persist"}):
+            assert not any(p.endswith("README.md") for p in self._paths(**attrs))
+
     def test_artifact_covers_run_dir_and_specs(self, monkeypatch, tmp_path):
         self._run_env(monkeypatch, tmp_path)
         paths = self._paths(command="artifact", name="spec.md", sync=False)
@@ -578,6 +647,10 @@ class TestWriteIntentMapCoversTheParser:
         ("goal", ["goal", "a stated goal"], True),
         ("memory", ["memory", "restore"], False),
         ("memory", ["memory", "persist"], True),
+        ("housekeep", ["housekeep"], False),
+        ("housekeep", ["housekeep", "--apply"], True),
+        ("knowledge", ["knowledge", "index"], True),
+        ("knowledge", ["knowledge", "index", "--check"], False),
         ("setup-workspace", ["setup-workspace", "https://x/y.git"], False),
         ("state", ["state"], False),
         ("state", ["state", "set", "--phase=x"], True),
@@ -602,6 +675,12 @@ class TestWriteIntentMapCoversTheParser:
         ("artifact", ["artifact", "spec.md", "--file", "x.md"], True),
         ("specs-index", ["specs-index"], False),
         ("specs-index", ["specs-index", "--rebuild"], True),
+        ("adopt", ["adopt", "git.example.com/group/project", "widgets"], False),
+        ("adopt", ["adopt", "git.example.com/group/project", "widgets", "--apply"], True),
+        ("migrate", ["migrate", "widgets"], False),
+        ("migrate", ["migrate", "widgets", "--apply"], True),
+        ("migrate", ["migrate", "--instance"], False),
+        ("migrate", ["migrate", "--instance", "--apply"], True),
         ("seed", ["seed", "develop", "some-target"], True),
         ("release", ["release", "status"], False),
         ("release", ["release", "claim-status"], False),

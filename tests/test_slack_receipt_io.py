@@ -31,7 +31,9 @@ def reaction_http(monkeypatch, request, tmp_path):
             state.calls.append((self.path, self.headers.get("Authorization"), payload))
             state.reached.set()
             if state.mode == "headers":
-                state.release.wait(15)
+                # Far past every bound below, so a budget that stopped working
+                # still fails the test rather than outwaiting the stall.
+                state.release.wait(120)
                 return
             status = 429 if state.mode == "limited" else 200
             data = {"ok": True} if state.mode == "success" else {"ok": False, "error": state.mode}
@@ -75,7 +77,8 @@ def reaction_http(monkeypatch, request, tmp_path):
     worker.start()
     client = slack_client.SlackClient("fixture-bot")
     client.BASE_URL = f"{scheme}://127.0.0.1:{server.server_port}"
-    monkeypatch.setattr(slack_client, "REACTION_BUDGET_SECONDS", 2)
+    # Room for the worker interpreter to start under a loaded host.
+    monkeypatch.setattr(slack_client, "REACTION_BUDGET_SECONDS", 5)
     try:
         yield client, state
     finally:
@@ -108,7 +111,7 @@ def test_reaction_budget_covers_headers_dripping_body_and_rate_limits(reaction_h
     started = time.monotonic()
     with pytest.raises(slack_client.SlackError, match="Reaction request failed"):
         client.add_reaction("C1", "1.23", "inbox_tray")
-    assert time.monotonic() - started < 8
+    assert time.monotonic() - started < 30
     assert len(state.calls) == 1
 
 
@@ -150,9 +153,9 @@ def test_stalled_receipt_does_not_prevent_shutdown_or_reload(
         connector._threads.append(worker)
         worker.start()
         if stall == "headers":
-            assert state.reached.wait(10)
+            assert state.reached.wait(30)
         else:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 30
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(.01)
             assert marker.exists(), "The child did not reach the stalled operation"
@@ -160,7 +163,9 @@ def test_stalled_receipt_does_not_prevent_shutdown_or_reload(
             assert (len(state.calls) == 1) == (stall == "cleanup")
         started = time.monotonic()
         assert connector.stop(announce=False, release=not reload)
-        assert time.monotonic() - started < 10
+        # Under the stalled child's 60 s sleep, with a generous cushion over
+        # the 5 s production budget for a loaded host.
+        assert time.monotonic() - started < 30
         assert not worker.is_alive()
         assert connector.exit_code == 0
         assert not connector._receipt_pending

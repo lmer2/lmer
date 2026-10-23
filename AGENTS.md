@@ -302,7 +302,7 @@ to the instance-wide scope shared by every project in the work repo — so a fac
 about you, or about how you should work, is recalled in every project rather
 than only the one you happened to learn it in. Recall reads both scopes, with
 the project scope taking precedence on a name collision. In a legacy work repo
-(no `_plexus.yaml`) there is only one scope and everything lands in
+(no `_lmer.yaml`) there is only one scope and everything lands in
 `{host}/{project}/memory/` as before.
 
 - **Restore is automatic.** At session start, any previously-saved memory for
@@ -322,6 +322,20 @@ the project scope taking precedence on a name collision. In a legacy work repo
   Run it whenever you've recorded memory worth keeping (and again at the end of
   the task). It is a no-op when `LMER_PERSIST_AGENT_MEMORY` is disabled, so it is
   always safe to call.
+- **Only the head of `MEMORY.md` is loaded.** At session start Claude Code
+  reads at most 200 lines / 25,000 bytes of it (other harnesses read it by
+  hand, but the shared index is budgeted for the strictest reader). Once the index is split (an
+  `areas/` directory beside `MEMORY.md`), `MEMORY.md` is a map of areas:
+  **open the area index whose "read when" hook matches your task before you
+  start work**, and file new pointers in `areas/<slug>.md` (link
+  `../<file>.md`) or set `metadata.area: <slug>` in the memory's
+  frontmatter. Persist reports the index size against the limit every time,
+  moves a new pointer left in a split `MEMORY.md` into its area (or
+  `areas/unsorted.md`) — a pointer whose memory is already filed in an area
+  is dropped, so edit hooks in the area index — and refuses a persist that
+  grows an over-budget map or finds the split index badly migrated. Never
+  create the first `areas/` index yourself: splitting an index is a
+  migration, and persist ignores areas in a flat one.
 
 Only persist durable, project-level facts to memory — never credentials,
 secrets, or customer data, since the work repo is shared.

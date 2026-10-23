@@ -115,6 +115,7 @@ import { inView, layerOf } from '../conversation.js'
 import { readDraft, storeDraft } from '../projects.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
+import { assistantName } from '../ratchet.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -182,7 +183,12 @@ const props = defineProps({
     validator: (value) => ['session', 'conversation', 'transcript'].includes(value),
   },
   now: { type: Number, default: () => Date.now() },
+  // The uber lmer pane (issue 575): the card grows to the bottom of its column, and
+  // the message count and earlier-messages button are the parent's to draw.
+  fill: { type: Boolean, default: false },
 })
+
+const emit = defineEmits(['replying'])
 
 // What a turn's role is titled as, for the roles that are not the agent's. See
 // the header: the role itself is never shown.
@@ -241,6 +247,9 @@ const draft = ref(readDraft(draftKey).text)
 watch(draft, text => storeDraft(draftKey, text, []))
 const sending = ref(false)
 const pending = ref([])
+// Ratchet's "talking" mood (issue 581): an operator message is in flight or
+// has not yet shown up in the transcript.
+watch(() => sending.value || pending.value.length > 0, (value) => emit('replying', value), { immediate: true })
 const showInjected = ref(false)
 const historyGenerations = ref(new Map())
 let predecessorPoll = 0
@@ -541,6 +550,12 @@ const canLoadEarlier = computed(
     : messages.value.length > 0 && messages.value[0].seq > 0,
 )
 
+// In fill mode the row can be empty, and an empty row would still keep its margin.
+const headerRow = computed(() => !props.fill || phase.value === 'loading'
+  || (props.view === 'conversation' && !!transcriptHidden.value)
+  || props.view === 'transcript'
+  || (props.view === 'session' && !!hiddenCount.value))
+
 const historyHasGap = computed(() => props.assistantHistory
   && historyGaps(messages.value, historyGenerations.value).some((gap) => gap.internal))
 
@@ -598,11 +613,9 @@ function muted(message) {
 }
 
 // How a bus channel reads in a header (issue 407); anything unlisted is already
-// a word.
-const CHANNEL_LABELS = { 'uber-lmer': 'uber lmer' }
-
+// a word. The assistant's channel carries the configured display name (issue 581).
 function sourceLabel(source) {
-  const name = CHANNEL_LABELS[source.channel] || source.channel
+  const name = source.channel === 'uber-lmer' ? assistantName.value : source.channel
   return source.author ? `${name} · ${source.author}` : name
 }
 
@@ -648,7 +661,8 @@ function digestRef(message) {
 function digestPreview(message) {
   const run = message.digest?.run
   let text = String(message.text || '')
-  const prefix = run ? `${runKey(run)} ` : null
+  // The digest text leads with the slug-spelled ref even when the link keys by uid.
+  const prefix = run ? `${runKey({ ...run, uid: undefined })} ` : null
   if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length)
   return text.split('\n', 1)[0]
 }
@@ -873,16 +887,22 @@ function absorb(page, mode = 'append') {
     // is, and history can be renumbered by a transcript file that appeared late.
     cursor = page.cursor
   }
-  total.value = page.total
-  sessions.value = page.sessions || []
-  note.value = page.note || null
-  live.value = !!page.live
+  // What the end looks like is the end's to say. An older page describes it as it
+  // was when that page was asked for, and a poll may have moved past that since —
+  // a session that exited while the page was in flight came back live.
+  if (mode !== 'prepend') {
+    total.value = page.total
+    sessions.value = page.sessions || []
+    note.value = page.note || null
+    live.value = !!page.live
+  }
   settlePending()
   if (follow) nextTick(stickToBottom)
 }
 
 // `older`: a `before` page. Its `total` was read when it was requested and can
-// predate what polling has since seen, so it must not move the tail cursor.
+// predate what polling has since seen, so it must not move the tail cursor — nor
+// say whether the session is live, for the same reason.
 function absorbHistory(page, { older = false } = {}) {
   const conversation = page.history?.conversation
   if (historyConversation && conversation !== historyConversation) {
@@ -903,8 +923,10 @@ function absorbHistory(page, { older = false } = {}) {
   sessions.value = [...sources.values()]
   if (page.session === props.sessionId) {
     cursor = historyGenerations.value.get(page.session).cursor
-    live.value = !!page.live
-    note.value = page.note || null
+    if (!older) {
+      live.value = !!page.live
+      note.value = page.note || null
+    }
   }
   total.value = messages.value.length
   settlePending()
@@ -930,7 +952,10 @@ async function loadRecentHistory(mine) {
 }
 
 async function poll() {
-  if (polling) return
+  // Not while `start()` is still reading the tail. The cursor is 0 until that
+  // read lands, so a poll now reads from the head of the conversation rather than
+  // its end, and the tail landing after it would rewind whatever it had advanced.
+  if (polling || phase.value === 'loading') return
   const mine = generation
   polling = true
   try {
@@ -1310,18 +1335,20 @@ watch(() => props.view, () => {
 watch(rendererLoaded, () => {
   if (following.value) stickToBottom()
 }, { flush: 'post' })
+
+defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => composerMode.value === 'send') })
 </script>
 
 <template>
-  <v-card class="mb-3">
+  <v-card :class="fill ? 'chat-fill' : 'mb-3'">
     <v-card-text>
-      <div class="d-flex flex-wrap align-center ga-2 mb-3">
+      <div v-if="headerRow" class="d-flex flex-wrap align-center ga-2 mb-3">
         <span v-if="phase === 'loading'" class="text-body-small text-medium-emphasis">
           <v-progress-circular indeterminate size="12" width="2" class="me-2" />
           reading the transcript…
         </span>
         <span
-          v-else-if="total"
+          v-else-if="total && !fill"
           class="text-body-small text-medium-emphasis"
         >{{ total }} messages<template v-if="assistantHistory"> loaded</template><template v-else-if="spansSessions"> across {{ sessions.length }} sessions</template></span>
         <!-- The conversation view says what it leaves out and where the switch
@@ -1329,7 +1356,7 @@ watch(rendererLoaded, () => {
         <span
           v-if="view === 'conversation' && transcriptHidden"
           class="text-body-small text-medium-emphasis transcript-note"
-        >· {{ transcriptHidden }} transcript turns not shown — the working transcript is off in uber lmer settings</span>
+        >· {{ transcriptHidden }} transcript turns not shown — the working transcript is off in {{ assistantName }} settings</span>
         <span
           v-else-if="view === 'transcript'"
           class="text-body-small text-medium-emphasis transcript-note"
@@ -1361,7 +1388,7 @@ watch(rendererLoaded, () => {
         {{ note }}
       </v-alert>
 
-      <div v-if="canLoadEarlier" class="d-flex mb-3">
+      <div v-if="canLoadEarlier && !fill" class="d-flex mb-3">
         <v-btn
           :prepend-icon="mdiUnfoldMoreHorizontal"
           variant="tonal"
@@ -1728,7 +1755,11 @@ watch(rendererLoaded, () => {
             @paste="onPaste"
             @keydown.ctrl.enter.prevent="send"
             @keydown.meta.enter.prevent="send"
-          />
+          >
+            <template v-if="$slots['composer-inner']" #append-inner>
+              <slot name="composer-inner" />
+            </template>
+          </v-textarea>
           <!-- The picker is hidden and driven from the button below, because a
                bare file input cannot be made a comfortable tap target and reads
                as nothing on a phone. On a phone that button is also the camera
@@ -1838,6 +1869,24 @@ watch(rendererLoaded, () => {
   max-height: 50vh;
   max-height: 50dvh;
   overflow-y: auto;
+}
+/* `overflow: visible`: a v-card clips, and a clipping flex item loses the automatic
+   minimum that keeps the composer from being squeezed. */
+.chat-fill {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  overflow: visible;
+}
+.chat-fill > :deep(.v-card-text) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+}
+.chat-fill .chat {
+  flex: 1 1 0;
+  min-height: 8rem;
+  max-height: none;
 }
 
 /* The wrap is declared here, on the bubble, rather than on each kind of content

@@ -94,6 +94,7 @@ class ThreadKey:
 
     @property
     def directory(self) -> Path:
+        # deferred: cycle — slack_chat.registry imports this module at top for ThreadKey
         from slack_chat.registry import _registry_dir
 
         inherited = os.environ.get(LEASE_DIRECTORY_ENV)
@@ -161,6 +162,7 @@ class Lease:
             except BlockingIOError as exc:
                 raise OwnershipBusy("another connector owns this thread") from exc
             with key.metadata_lock():
+                # deferred: cycle — slack_chat.registry imports this module at top for ThreadKey; reached only once the flock is won
                 from slack_chat import registry
 
                 legacy = read_json(registry._entry_path(key.conversation, key.root, key.transport))

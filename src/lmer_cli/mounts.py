@@ -442,7 +442,7 @@ def read_link_marker(directory) -> Optional[dict]:
     one, a `linked` field that is not the yes/no the writer emits — because an
     uninterpretable marker is the same absence as none, not a weaker fact.
     Unknown keys are tolerated so the writer can grow a field without this
-    becoming a two-image change. See docs/PLATFORM-QUICKSTART.md, "uber lmer's
+    becoming a two-image change. See docs/PLATFORM-QUICKSTART.md, "Ratchet's
     memory", for what the record is for.
     """
     path = Path(directory) / MOUNT_LINK_MARKER

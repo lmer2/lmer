@@ -39,8 +39,8 @@ class TestSanitizeHostname:
         assert _sanitize_hostname("git.example.com") == "git_example_com"
 
     def test_hyphens_replaced(self):
-        """Test hyphens are replaced with underscores"""
-        assert _sanitize_hostname("my-gitlab.example.com") == "my_gitlab_example_com"
+        """Hyphens become ``__``, so they cannot read as dots (#544)"""
+        assert _sanitize_hostname("my-gitlab.example.com") == "my__gitlab_example_com"
 
     def test_lowercase(self):
         """Test hostname is lowercased"""
@@ -123,7 +123,7 @@ class TestGetToken:
 
     def test_get_token_with_hyphenated_hostname(self):
         """Test token lookup with hyphens in hostname"""
-        with patch.dict(os.environ, {"GITLAB_TOKEN_my_gitlab_example_com": "tok"}, clear=True):
+        with patch.dict(os.environ, {"GITLAB_TOKEN_my__gitlab_example_com": "tok"}, clear=True):
             token = get_token("my-gitlab.example.com")
             assert token == "tok"
 

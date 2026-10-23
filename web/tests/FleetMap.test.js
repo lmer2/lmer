@@ -382,7 +382,7 @@ describe('the orchestrator', () => {
     expect(wrapper.findAll('.fleet-map__core')).toHaveLength(1)
     expect(wrapper.findAll('.fleet-map__mark')).toHaveLength(0)
     const labels = wrapper.findAll('[role="button"]').map((n) => n.attributes('aria-label'))
-    expect(labels.join(' ')).not.toContain('uber lmer')
+    expect(labels.join(' ')).not.toContain('Ratchet')
     wrapper.unmount()
   })
 

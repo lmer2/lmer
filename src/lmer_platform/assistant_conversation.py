@@ -5,9 +5,13 @@ import threading
 import uuid
 import logging
 
-from . import comms
+from lmer_cli import dm_parents
+
+from . import assistant, assistant_history, comms
 from .store import utc_now_iso
 from .project_context import assistant_dir
+from .runs import UID_RE
+from .transcripts import scrub_credentials
 
 logger = logging.getLogger(__name__)
 _LOCK = threading.RLock()
@@ -31,10 +35,12 @@ MAX_RUN_FIELD_CHARS = 200
 
 
 def digest_run(data: object) -> dict | None:
-    """``host/project/slug`` (+ ``label``) off a digest payload, or ``None``.
+    """``host/project/slug`` (+ ``label``, ``uid``) off a digest payload, or ``None``.
 
     Only the label is shortened: a cut identity field would name a run that
-    does not exist, so an over-long one drops the link instead.
+    does not exist, so an over-long one drops the link instead. A well-formed
+    ``uid`` is kept because the UI keys a schema-2 row by it; without it the
+    link resolves to the slug group, which may be another execution.
     """
     if not isinstance(data, dict):
         return None
@@ -48,14 +54,14 @@ def digest_run(data: object) -> dict | None:
         return None
     if "label" in run:
         run["label"] = run["label"][:MAX_RUN_FIELD_CHARS]
+    uid = data.get("uid")
+    if isinstance(uid, str) and UID_RE.fullmatch(uid):
+        run["uid"] = uid
     return run
 
 
 def record(text: str, *, kind: str, thread: str | None = None,
            session_id: str | None = None, data: dict | None = None) -> None:
-    from .transcripts import scrub_credentials
-    from . import assistant, assistant_history
-
     with _LOCK:
         if session_id is None:
             state = assistant.read_state()
@@ -84,8 +90,6 @@ def events() -> list:
 
 
 def private_thread(ref, client) -> bool:
-    from lmer_cli import dm_parents
-
     conversation, _root = ref.registry_key()
     if ref.channel == "slack":
         return conversation.startswith("D")

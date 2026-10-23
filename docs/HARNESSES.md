@@ -120,7 +120,7 @@ gracefully and are listed explicitly:
    claude only today), which is what lets the platform mount that directory out
    of the container: the platform's assistant persists its memory through a host
    mount rather than the work repo (issue #325 — see
-   [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#uber-lmers-memory)).
+   [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#ratchets-memory)).
    **That store is read natively on claude only.** The mount and the symlink are
    made on every assistant spawn whatever harness the session runs, but a codex
    or pi assistant has no feature that reads the path and does not get the
@@ -128,7 +128,11 @@ gracefully and are listed explicitly:
    `LMER_PERSIST_AGENT_MEMORY`, which assistant spawns blank. What tells such a
    session the store exists, and where, is the `orchestrate` taskdef, which names
    the path and says to read and write it by hand. A harness that grows a native
-   store is a one-field change away from the claude treatment.
+   store is a one-field change away from the claude treatment. A native memory
+   feature that loads only the head of `MEMORY.md` also declares how much
+   (`memory_index_limit`; claude's is 200 lines / 25,000 bytes). `work memory
+   persist` budgets the shared index against the strictest declared limit,
+   because one store serves every harness (issue #435).
 9. Claude-only: codex and pi have no equivalent feature and get nothing, so
    anything *every* harness must obey belongs in the taskdef prompt rather
    than in a style. Shipping a style and selecting one are separate
@@ -183,6 +187,21 @@ variable:
 | `claude`   | `~/.claude/.credentials.json`, `~/.claude.json`         | `CLAUDE_API_KEY`                       |
 | `codex`    | `~/.codex/auth.json` (`codex login` on the host)        | `CODEX_API_KEY` (non-interactive only) |
 | `pi`       | `~/.pi/agent/auth.json` (pi's in-TUI `/login`), `~/.pi/agent/models.json` (custom provider/model registry) | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, … |
+
+Fan-out children authenticate the way the session does. Claude Code removes
+`CLAUDE_CODE_OAUTH_TOKEN` from its shell tools' environment, so the shell
+`spawn-harness` runs in can lack a token the container was started with. For a
+claude child, `spawn-harness` then takes the variable from the container's
+initial environment (`/proc/1/environ`). It fills the variable only when the
+child env lacks it, or the parent shell holds it empty; a value in the shell,
+the agent preset or `--env` still wins. A blank set by the preset or `--env`
+(`--env CLAUDE_CODE_OAUTH_TOKEN=`) stays blank: that child gets no token from
+`spawn-harness`. The value travels in the child's
+environment only; stderr names the variable, never its value, and warns when
+the source cannot be read. `spawn-harness` never adds the token for a child on
+another harness; such a child still inherits whatever the parent shell holds.
+The variables a harness declares this way are its registry `credential_env`;
+only claude declares one.
 
 ### Custom models (pi)
 
@@ -395,6 +414,16 @@ about progress), and when a child dies its `--output` file gets a
 `[spawn-harness] child FAILED` footer carrying the exit reason and the
 stderr tail, so a failed agent's output explains itself.
 
+In a [schema-2 work repository](./SCHEMA-V2.md), every child is an independent
+execution with a fresh UID and its own record. The startup trampoline becomes
+the harness process with `exec`, so recorded PID/start/hostname describe the
+actual child. Its metadata records the resolved child harness/model/effort,
+configuration and parent provenance while preserving extension fields. The
+supervisor signs the child out after reaping it. Inherited continuation source,
+answer and acknowledgement are cleared; explicit child overlays can choose
+their own continuation. Lifecycle diagnostics go to stderr and cannot make an
+empty harness response look usable. Schema-1 child behavior is unchanged.
+
 The mirrored exit code outranks the footer: once the child has run, a footer
 `spawn-harness` cannot write — a full or read-only filesystem — warns on stderr
 (`cannot append the failure footer to <path>`) and leaves the code alone, rather
@@ -465,7 +494,7 @@ wrapper would hang indefinitely while the heartbeat reported a healthy run.
 |---|---|---|---|
 | Invocation | `claude -p` | `codex exec` | `pi -p` |
 | Permission posture | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--no-approve` (pi never prompts) |
-| Statelessness | `--no-session-persistence` | `--ephemeral` | `--no-session` |
+| Harness transcript persistence | `--no-session-persistence` | `--ephemeral` | `--no-session` |
 | Model / effort | `--model` / `--effort` (accepts `max`) | `--model` / `-c model_reasoning_effort=` (`max`→`xhigh`) | `--model` / `--thinking` (`max`→`xhigh`, matching the interactive runner) |
 | Prompt safety | `--` before the prompt | `--` before the prompt | no `--` support — a prompt starting with `-` is rejected |
 

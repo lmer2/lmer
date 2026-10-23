@@ -91,6 +91,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
+from lmer_cli.memory_areas import AREAS_DIR, is_area_slug
 from lmer_schema.checks.findings import CHECKS, Form, Severity, Tier, register
 from lmer_schema.checks.walk import ProjectDir, project_dirs
 
@@ -144,8 +145,9 @@ KNOWN_HARNESSES = ("claude",)
 #: the only way "a harness named `memory`" is visible on disk.
 HARNESS_MARKERS = ("skills", "commands", "hooks", "agents")
 
-#: The per-scope memory index (§3.4).
+#: The per-scope memory index (§3.4). In a split scope it is the map.
 MEMORY_INDEX = "MEMORY.md"
+
 
 #: The bare instance surfaces §9 step 3 migrates, recognised in either form.
 LEGACY_INSTANCE_SURFACES = ("agent-files", "mirrors")
@@ -196,6 +198,7 @@ MEMORY_FILE_WITHOUT_ENTRY = "agents.memory-file-without-entry"
 MEMORY_ENTRY_WITHOUT_FILE = "agents.memory-entry-without-file"
 MEMORY_SCOPE_MISMATCH = "agents.memory-scope-mismatch"
 LEGACY_SURFACE = "agents.legacy-surface"
+MEMORY_RETIREMENT = "agents.memory-retirement"
 
 #: Every code this module emits, in emit order — the module's contract.
 AGENT_CODES = (
@@ -209,6 +212,7 @@ AGENT_CODES = (
     MEMORY_ENTRY_WITHOUT_FILE,
     MEMORY_SCOPE_MISMATCH,
     LEGACY_SURFACE,
+    MEMORY_RETIREMENT,
 )
 
 
@@ -337,7 +341,7 @@ def parse_frontmatter(text) -> Dict:
     return data
 
 
-def parse_index_entries(text) -> List[str]:
+def parse_index_entries(text, *, memory_map: bool = False) -> List[str]:
     """The entry link targets of a ``MEMORY.md``/``PLANS.md`` body.
 
     SCHEMA.md "Index lines": an entry is a line carrying a RELATIVE markdown
@@ -345,9 +349,15 @@ def parse_index_entries(text) -> List[str]:
     replaced by ``archived``/``forgotten`` and a date) and a link re-pointed
     at the ``_archive/`` mirror carry no entry, so they are returned by
     nobody and are never a finding.
+
+    With *memory_map* (a memory scope's ``MEMORY.md``), a line linking an
+    area index is a MAP line (#435): only its area link is returned — the
+    area index must exist — and the memories its read-when hook links are
+    not entries, exactly as ``work memory persist`` reads it.
     """
     targets = []
     for line in text.splitlines():
+        found = []
         for target in _LINK_RE.findall(line):
             if not target.lower().endswith(".md"):
                 continue
@@ -356,8 +366,24 @@ def parse_index_entries(text) -> List[str]:
             parts = posixpath.normpath(target).split("/")
             if any(part in ARCHIVE_MARKERS for part in parts):
                 continue
-            targets.append(target)
+            found.append(target)
+        if memory_map:
+            areas = [target for target in found if _is_area_link(target)]
+            if areas:
+                found = areas
+        targets.extend(found)
     return targets
+
+
+def _is_area_link(target: str) -> bool:
+    """Whether a ``MEMORY.md`` link names an area index, ``areas/<slug>.md``."""
+    parts = posixpath.normpath(target).split("/")
+    return (
+        len(parts) == 2
+        and parts[0] == AREAS_DIR
+        and parts[1].endswith(".md")
+        and is_area_slug(parts[1][: -len(".md")])
+    )
 
 
 @dataclass(frozen=True)
@@ -395,7 +421,15 @@ def iter_project_dirs(root) -> Tuple[ProjectDir, ...]:
 # ---------------------------------------------------------------------------
 
 
-def check_agents(root, report, *, project_dirs: Optional[Iterable] = None) -> None:
+_register(
+    MEMORY_RETIREMENT,
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary="schema-2 memory retirement state cannot be safely interpreted",
+)
+
+
+def check_agents(root, report, *, project_dirs: Optional[Iterable] = None, manifest=...) -> None:
     """Check the agent surface and memory of the plexus at *root*.
 
     Findings go into *report*, which carries the tree's form; nothing is
@@ -406,7 +440,14 @@ def check_agents(root, report, *, project_dirs: Optional[Iterable] = None) -> No
     legacy tier; a plain path leaves the tier to the report). Pass ``()`` to
     check the instance scope only.
     """
+    # deferred: import cost — work_repo (~35 ms: git_ops, clone_and_exec) stays off the lmer-schema import; the direction is work_repo -> lmer_schema
+    from work_repo.memory import MemoryRetirementError, read_memory_retirements
+
     root = Path(root)
+    try:
+        read_memory_retirements(root, manifest=manifest)
+    except MemoryRetirementError as exc:
+        report.add("agents.memory-retirement", "_memory_retirements.json", str(exc))
     _check_instance(root, report)
     scopes = iter_project_dirs(root) if project_dirs is None else project_dirs
     for project in scopes:
@@ -515,8 +556,12 @@ def _looks_like_harness(path: Path) -> bool:
 
 def _check_memory(root: Path, scope: _Scope, report) -> None:
     files: List[Path] = []
+    areas: List[Path] = []
     for entry in sorted(scope.path.iterdir()):
         if entry.name.startswith(".") or entry.name == MEMORY_INDEX:
+            continue
+        if entry.name == AREAS_DIR and entry.is_dir():
+            areas.extend(_area_indexes(root, entry, scope, report))
             continue
         if entry.is_dir() or entry.suffix != ".md":
             report.add(
@@ -531,7 +576,26 @@ def _check_memory(root: Path, scope: _Scope, report) -> None:
 
     for path in files:
         _check_memory_file(root, path, scope, report)
-    _check_memory_index(root, scope, files, report)
+    _check_memory_index(root, scope, files, report, areas)
+
+
+def _area_indexes(root: Path, directory: Path, scope: _Scope, report) -> List[Path]:
+    """The area indexes in a split scope's ``areas/``; anything else is unknown."""
+    found: List[Path] = []
+    for entry in sorted(directory.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_file() and entry.suffix == ".md" and is_area_slug(entry.stem):
+            found.append(entry)
+            continue
+        report.add(
+            MEMORY_UNKNOWN_FILE,
+            _rel(root, entry),
+            f"`{entry.name}` is not an area index",
+            detail=f"`{AREAS_DIR}/` holds `<slug>.md` area indexes only",
+            form=scope.form,
+        )
+    return found
 
 
 def _check_memory_file(root: Path, path: Path, scope: _Scope, report) -> None:
@@ -606,7 +670,9 @@ def _check_memory_file(root: Path, path: Path, scope: _Scope, report) -> None:
         )
 
 
-def _check_memory_index(root: Path, scope: _Scope, files: List[Path], report) -> None:
+def _check_memory_index(
+    root: Path, scope: _Scope, files: List[Path], report, areas: List[Path] = ()
+) -> None:
     index = scope.path / MEMORY_INDEX
     if not index.is_file():
         if files:
@@ -631,19 +697,47 @@ def _check_memory_index(root: Path, scope: _Scope, files: List[Path], report) ->
         )
         return
 
+    # The map and every area index together are the scope's index; an area
+    # index's links resolve against `areas/`, so `../fact.md` is `fact.md`.
+    indexes = [(index, rel_index, text)]
+    for area in areas:
+        try:
+            indexes.append((area, _rel(root, area), area.read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError) as exc:
+            report.add(
+                MEMORY_UNKNOWN_FILE,
+                _rel(root, area),
+                "area index could not be read",
+                detail=str(exc),
+                form=scope.form,
+            )
     listed = set()
-    for target in parse_index_entries(text):
-        resolved = (scope.path / target).resolve()
-        if resolved.is_file():
-            listed.add(resolved)
-            continue
-        report.add(
-            MEMORY_ENTRY_WITHOUT_FILE,
-            rel_index,
-            f"{MEMORY_INDEX} entry has no memory file",
-            detail=target,
-            form=scope.form,
-        )
+    peers: Optional[List[Path]] = None
+    for path, rel, body in indexes:
+        # Only a split scope has a map: a flat one ignores `areas/`, so a line
+        # linking one is an ordinary entry, as `work memory persist` reads it.
+        for target in parse_index_entries(body, memory_map=path == index and bool(areas)):
+            resolved = (path.parent / target).resolve()
+            if resolved.is_file():
+                listed.add(resolved)
+                continue
+            if path != index and _is_area_link(posixpath.join(AREAS_DIR, target)):
+                # A cross-reference to another area: restore merges every
+                # scope, so an area the other scope holds is a live link.
+                if peers is None:
+                    peers = _peer_memory_dirs(root, scope)
+                area = posixpath.normpath(posixpath.join(AREAS_DIR, target))
+                if any((peer / area).is_file() for peer in peers):
+                    continue
+            report.add(
+                MEMORY_ENTRY_WITHOUT_FILE,
+                rel,
+                f"{path.name} entry has no memory file",
+                detail=target,
+                form=scope.form,
+            )
+    if areas:
+        rel_index = f"{rel_index} (+{len(areas)} area index(es))"
     for path in files:
         if path.resolve() not in listed:
             report.add(
@@ -653,6 +747,20 @@ def _check_memory_index(root: Path, scope: _Scope, files: List[Path], report) ->
                 detail=f"index: {rel_index}",
                 form=scope.form,
             )
+
+
+def _peer_memory_dirs(root: Path, scope: _Scope) -> List[Path]:
+    """The memory scopes a restore merges with *scope* (schema form only).
+
+    A project's ``_agents/memory`` merges with the instance scope; the
+    instance scope merges with whichever project is restored, so its peers
+    are every project's. A legacy memory dir merges with nothing.
+    """
+    if scope.scope == INSTANCE_SCOPE:
+        return [Path(project) / AGENTS_DIR / MEMORY_DIR for project in iter_project_dirs(root)]
+    if scope.path.parent.name == AGENTS_DIR:
+        return [root / AGENTS_DIR / MEMORY_DIR]
+    return []
 
 
 def _is_non_empty_str(value) -> bool:

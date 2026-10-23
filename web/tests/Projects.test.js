@@ -21,6 +21,7 @@ vi.mock('../src/api.js', async importOriginal => ({
   fetchPlatformSettings: vi.fn(), fetchConversationRequests: vi.fn(), parkConversationRequest: vi.fn(),
   setAssistantInstructions: vi.fn(), updateProject: vi.fn(), archiveProject: vi.fn(), setPlatformSettings: vi.fn(),
   fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(), uploadSessionFile: vi.fn(),
+  fetchChannelRoutes: vi.fn(), setProjectChannels: vi.fn(),
 }))
 
 const projects = [
@@ -52,6 +53,8 @@ beforeEach(() => {
   api.fetchConversationRequests.mockResolvedValue({ requests: [] })
   api.setPlatformSettings.mockResolvedValue({})
   api.archiveProject.mockResolvedValue({})
+  api.fetchChannelRoutes.mockResolvedValue({ routes: [] })
+  api.setProjectChannels.mockImplementation((_id, channels) => Promise.resolve({ routes: channels.map(label => ({ label })) }))
 })
 
 it('groups every All-project status locally and keeps the actual chat destination through list switches', async () => {
@@ -87,7 +90,7 @@ it('groups every All-project status locally and keeps the actual chat destinatio
 it('shows waiting/cancel with an explicit project and keeps a draft until the assistant starts', async () => {
   const wrapper = mountPane(AssistantChat, { workspace: projects[1] })
   await flushPromises()
-  expect(wrapper.text()).toContain('Beta · uber lmer')
+  expect(wrapper.text()).toContain('Beta · Ratchet')
   expect(wrapper.text()).toContain('Waiting to start — assistant limit reached · queue position 1')
   await wrapper.get('textarea').setValue('Beta draft only')
   api.stopAssistant.mockResolvedValue({ running: false, lifecycle: 'stopped' })
@@ -255,12 +258,12 @@ it('puts the switcher in the bar row itself at desktop width', async () => {
 })
 
 it.each([
-  ['All projects', '', false],
-  ['a project sharing the tone\'s hue', 'green', true],
-  ['a dark custom project', 'night', true],
-  ['a light custom project', 'pink', true],
-  ['a project with no uber lmer run', 'alpha', false],
-])('keeps uber lmer\'s robot readable on %s', async (_label, workspace, onSurface) => {
+  ['All projects', ''],
+  ['a project sharing the tone\'s hue', 'green'],
+  ['a dark custom project', 'night'],
+  ['a light custom project', 'pink'],
+  ['a project with no Ratchet run', 'alpha'],
+])('draws Ratchet\'s badge in the bar\'s own colour, with no disc, on %s', async (_label, workspace) => {
   const extra = [{ id: 'green', name: 'Green', color: 'Green' }, { id: 'night', name: 'Night', color: '#101030' },
     { id: 'pink', name: 'Pink', color: '#ff69b4' }]
   api.fetchProjects.mockResolvedValue({ projects: [...projects, ...extra] })
@@ -272,9 +275,9 @@ it.each([
   const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
   await flushPromises()
   const supervised = workspace !== 'alpha'
-  const robot = wrapper.get(supervised ? 'header button[aria-label^="uber lmer — running"]' : 'header button[aria-label="talk to uber lmer"]')
-  expect(robot.classes().includes('text-success')).toBe(supervised)
-  expect(robot.classes().includes('robot-on-surface')).toBe(onSurface)
+  const badge = wrapper.get(supervised ? 'header button[aria-label^="Ratchet — running"]' : 'header button[aria-label^="talk to Ratchet"]')
+  expect(badge.classes()).toContain('ratchet-badge')
+  expect(badge.classes().filter((name) => name.startsWith('text-') || name === 'robot-on-surface')).toEqual([])
 })
 
 it('gives project-colored chips and buttons the contrast rule\'s text color, presets unchanged', async () => {
@@ -350,13 +353,13 @@ it.each(['toolbar', 'attention card', 'calm card'])('binds a closed drawer to th
   await flushPromises()
   await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
   await flushPromises()
-  await wrapper.get('[aria-label="close the uber lmer chat"]').trigger('click')
+  await wrapper.get('[aria-label="close the Ratchet chat"]').trigger('click')
   await chooseProject(wrapper, 'Beta')
   await flushPromises()
-  if (shortcut === 'toolbar') await wrapper.get('header button[aria-label^="uber lmer"]').trigger('click')
-  else await wrapper.getComponent(RunCard).get('[aria-label="talk to uber lmer"]').trigger('click')
+  if (shortcut === 'toolbar') await wrapper.get('header button[aria-label^="Ratchet"]').trigger('click')
+  else await wrapper.getComponent(RunCard).get('[aria-label="talk to Ratchet"]').trigger('click')
   await flushPromises()
-  const pane = wrapper.findAllComponents(AssistantChat).find(pane => pane.get('.project-chat-title').isVisible())
+  const pane = wrapper.findAllComponents(AssistantChat).find(pane => pane.get('.uber-toolbar').isVisible())
   expect(pane.props('workspace').id).toBe('beta')
   const composer = pane.getComponent(Chat).get('textarea')
   await composer.setValue('Beta destination check')
@@ -398,7 +401,7 @@ it('keeps the live Chat instance and draft through a running generation change',
   const editor = wrapper.getComponent(Chat).get('textarea').element
   await wrapper.getComponent(Chat).get('textarea').setValue('Draft across rotation')
   api.rotateAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 'second-beta' })
-  await wrapper.findAll('button').find(button => button.text() === 'restart').trigger('click')
+  await wrapper.get('[aria-label="restart Ratchet"]').trigger('click')
   await flushPromises()
   const confirm = [...document.querySelectorAll('.v-dialog button')].find(button => button.textContent.trim() === 'restart')
   confirm.click()
@@ -586,6 +589,46 @@ it.each(['alpha', 'beta', null])('shows run identity only when the toolbar does 
   if (identifiedWorkspaceId !== 'alpha') expect(wrapper.get('.run-project-identity').text()).toBe(projects[0].name)
 })
 
+it('shows only this project\'s mention channels and saves them only when edited', async () => {
+  api.fetchChannelRoutes.mockResolvedValue({ routes: [
+    { project_id: 'alpha', label: '#i-alpha', archived: false }, { project_id: 'beta', label: 'C0BETA123', archived: false },
+    { project_id: 'alpha', label: '!room:example.org', archived: false }] })
+  const wrapper = mountPane(ProjectSettings, { project: projects[0] })
+  await flushPromises()
+  const field = wrapper.get('.mention-channels textarea')
+  expect(field.element.value).toBe('#i-alpha\n!room:example.org')
+  const save = wrapper.findAll('button').find(button => button.text() === 'Save project')
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).not.toHaveBeenCalled()
+  await field.setValue(' #i-alpha \n\nhttps://example.slack.com/archives/C0NEW1234\n')
+  api.setProjectChannels.mockRejectedValueOnce(new Error('C0NEW1234 is already mapped to project Beta; remove it there first.'))
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).toHaveBeenLastCalledWith('alpha', ['#i-alpha', 'https://example.slack.com/archives/C0NEW1234'])
+  expect(wrapper.text()).toContain('already mapped to project Beta')
+  expect(field.element.value).toContain('C0NEW1234')
+  await field.setValue('')
+  await save.trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).toHaveBeenLastCalledWith('alpha', [])
+  expect(field.element.value).toBe('')
+})
+
+it('does not offer the mention channels for editing before they load', async () => {
+  const pending = deferred()
+  api.fetchChannelRoutes.mockReturnValueOnce(pending.promise)
+  const wrapper = mountPane(ProjectSettings, { project: projects[0] })
+  await flushPromises()
+  expect(wrapper.get('.mention-channels textarea').attributes('disabled')).toBeDefined()
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(api.setProjectChannels).not.toHaveBeenCalled()
+  pending.resolve({ routes: [{ project_id: 'alpha', label: 'C0ALPHA12' }] })
+  await flushPromises()
+  expect(wrapper.get('.mention-channels textarea').element.value).toBe('C0ALPHA12')
+})
+
 it('keeps standing instructions collapsed and untouched when only project metadata is saved', async () => {
   api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Keep these orders.', limit: 4000 })
   const wrapper = mountPane(ProjectSettings, { project: projects[0] })
@@ -697,7 +740,7 @@ it('posts project instructions as JSON to the explicitly scoped HTTP endpoint', 
   } finally { vi.unstubAllGlobals() }
 })
 
-it('badges uber lmer\'s open questions from its status poll and asks the shell to open them', async () => {
+it('badges Ratchet\'s open questions from its status poll and asks the shell to open them', async () => {
   vi.useFakeTimers()
   const answers = [2, 1, 0]
   api.fetchAssistant.mockImplementation(() => Promise.resolve({ running: true, lifecycle: 'running',
@@ -707,7 +750,7 @@ it('badges uber lmer\'s open questions from its status poll and asks the shell t
   const badge = () => wrapper.find('.open-questions')
   expect(badge().exists()).toBe(true)
   expect(badge().text()).toContain('2')
-  expect(badge().attributes('aria-label')).toBe('2 open questions from uber lmer — answer in its run view')
+  expect(badge().attributes('aria-label')).toBe('2 open questions from Ratchet — answer in its run view')
   await badge().trigger('click')
   expect(wrapper.emitted('questions')).toEqual([['s-alpha']])
   await vi.advanceTimersByTimeAsync(10000)
@@ -719,8 +762,369 @@ it('badges uber lmer\'s open questions from its status poll and asks the shell t
   vi.useRealTimers()
 })
 
-it('opens uber lmer\'s own run on its question badge and focuses the ask dock there', async () => {
-  const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'uber lmer', orchestrator: true,
+it('keeps the question badge inside the composer, its corner kept when it clears, the field unfocused', async () => {
+  vi.useFakeTimers()
+  const answers = [1, 0]
+  api.fetchAssistant.mockImplementation(() => Promise.resolve({ running: true, lifecycle: 'running',
+    session_id: 's-alpha', generation: 3, open_questions: answers.length > 1 ? answers.shift() : answers[0] }))
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  const slot = () => wrapper.getComponent(Chat).find('.v-field__append-inner .question-slot')
+  expect(slot().find('.open-questions').exists()).toBe(true)
+  await slot().get('.open-questions').trigger('mousedown')
+  await slot().get('.open-questions').trigger('click')
+  expect(wrapper.emitted('questions')).toEqual([['s-alpha']])
+  expect(document.activeElement).not.toBe(wrapper.getComponent(Chat).get('textarea').element)
+  await vi.advanceTimersByTimeAsync(10000)
+  expect(slot().exists()).toBe(true)
+  expect(slot().find('.open-questions').exists()).toBe(false)
+  wrapper.unmount()
+  vi.useRealTimers()
+})
+
+it('puts every Ratchet control on one toolbar, with no overflow menu and no intro lines', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  const toolbar = wrapper.get('.uber-toolbar')
+  for (const label of ['restart Ratchet', 'stop Ratchet', 'project settings', 'standing orders', 'close the Ratchet chat']) {
+    expect(toolbar.find(`[aria-label="${label}"]`).exists()).toBe(true)
+  }
+  expect(wrapper.find('[aria-label="more Ratchet controls"]').exists()).toBe(false)
+  expect(wrapper.text()).not.toContain('You are talking to')
+  expect(wrapper.text()).not.toContain('belong to this project')
+  await toolbar.get('[aria-label="project settings"]').trigger('click')
+  await toolbar.get('[aria-label="standing orders"]').trigger('click')
+  expect(wrapper.emitted('settings')).toEqual([[], ['orders']])
+  await toolbar.get('[aria-label="stop Ratchet"]').trigger('click')
+  await flushPromises()
+  expect(document.querySelector('.v-dialog')?.textContent).toContain('Stop Ratchet?')
+  wrapper.unmount()
+})
+
+it('counts loaded messages and steps back to earlier ones from the toolbar, not the card', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const said = (seq) => ({ seq, id: `m${seq}`, session: 's-alpha', generation: 3, role: 'assistant',
+    kind: 'message', source: { channel: 'agent' }, text: `turn ${seq}` })
+  const rows = (from, to) => Array.from({ length: to - from }, (_, i) => said(from + i))
+  api.fetchAssistantHistory.mockImplementation((id, request = {}) => Promise.resolve(request.before
+    ? { ...page(id), messages: rows(20, 60), from: 20, cursor: 60, total: 100 }
+    : { ...page(id), messages: rows(60, 100), from: 60, cursor: 100, total: 100 }))
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  const toolbar = wrapper.get('.uber-toolbar')
+  expect(toolbar.get('.loaded-count').text()).toBe('40 messages loaded')
+  expect(wrapper.getComponent(Chat).text()).not.toContain('messages loaded')
+  expect(wrapper.getComponent(Chat).text()).not.toContain('earlier messages')
+  await toolbar.get('[aria-label="earlier messages"]').trigger('click')
+  await flushPromises()
+  expect(api.fetchAssistantHistory).toHaveBeenCalledWith('s-alpha', expect.objectContaining({ before: 'm60' }))
+  expect(wrapper.get('.loaded-count').text()).toBe('80 messages loaded')
+  wrapper.unmount()
+})
+
+it('opens project settings on the standing instructions from Ratchet\'s toolbar', async () => {
+  api.fetchAssistant.mockImplementation(id => Promise.resolve({ running: true, lifecycle: 'running', session_id: `s-${id}` }))
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase', limit: 4000 })
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  const pane = wrapper.findAllComponents(AssistantChat).find(candidate => candidate.get('.uber-toolbar').isVisible())
+  await pane.get('[aria-label="standing orders"]').trigger('click')
+  await flushPromises()
+  const settings = wrapper.getComponent(ProjectSettings)
+  expect(settings.props('project').id).toBe('alpha')
+  expect(settings.get('.project-orders .v-expansion-panel').classes()).toContain('v-expansion-panel--active')
+  await pane.get('[aria-label="project settings"]').trigger('click')
+  await flushPromises()
+  expect(wrapper.getComponent(ProjectSettings).get('.project-orders .v-expansion-panel').classes())
+    .toContain('v-expansion-panel--active')
+  wrapper.unmount()
+})
+
+it('moves the question badge to the toolbar while there is no composer to hold it', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3, open_questions: 2 })
+  api.fetchAssistantHistory.mockRejectedValue(new Error('transcript unreadable'))
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  expect(wrapper.getComponent(Chat).find('textarea').exists()).toBe(false)
+  expect(wrapper.findAll('.open-questions')).toHaveLength(1)
+  const badge = wrapper.get('.uber-toolbar .open-questions')
+  expect(badge.text()).toContain('2')
+  await badge.trigger('click')
+  expect(wrapper.emitted('questions')).toEqual([['s-alpha']])
+  wrapper.unmount()
+})
+
+it('re-reads the standing orders on every tap and keeps an unsaved edit', async () => {
+  api.fetchAssistant.mockImplementation(id => Promise.resolve({ running: true, lifecycle: 'running', session_id: `s-${id}` }))
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase', limit: 4000 })
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  const pane = wrapper.findAllComponents(AssistantChat).find(candidate => candidate.get('.uber-toolbar').isVisible())
+  const orders = () => wrapper.getComponent(ProjectSettings).get('.project-orders textarea')
+  await pane.get('[aria-label="standing orders"]').trigger('click')
+  await flushPromises()
+  expect(orders().element.value).toBe('Always rebase')
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase, never squash', limit: 4000 })
+  await pane.get('[aria-label="standing orders"]').trigger('click')
+  await flushPromises()
+  expect(orders().element.value).toBe('Always rebase, never squash')
+  await orders().setValue('My own wording')
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Newest from the chat', limit: 4000 })
+  await pane.get('[aria-label="standing orders"]').trigger('click')
+  await flushPromises()
+  expect(orders().element.value).toBe('My own wording')
+  wrapper.unmount()
+})
+
+it('opens only the tapped project\'s standing orders, not the next project\'s settings', async () => {
+  api.fetchAssistant.mockImplementation(id => Promise.resolve({ running: true, lifecycle: 'running', session_id: `s-${id}` }))
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  const alpha = wrapper.findAllComponents(AssistantChat).find(candidate => candidate.get('.uber-toolbar').isVisible())
+  await alpha.get('[aria-label="standing orders"]').trigger('click')
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Beta"]').trigger('click')
+  await flushPromises()
+  const settings = wrapper.getComponent(ProjectSettings)
+  expect(settings.props('project').id).toBe('beta')
+  expect(settings.get('.project-orders .v-expansion-panel').classes()).not.toContain('v-expansion-panel--active')
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  const back = wrapper.getComponent(ProjectSettings)
+  expect(back.props('project').id).toBe('alpha')
+  expect(back.get('.project-orders .v-expansion-panel').classes()).not.toContain('v-expansion-panel--active')
+  wrapper.unmount()
+})
+
+const openAlphaPane = async () => {
+  api.fetchAssistant.mockImplementation(id => Promise.resolve({ running: true, lifecycle: 'running', session_id: `s-${id}` }))
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('.project-assistant[aria-label^="Chat with Alpha"]').trigger('click')
+  await flushPromises()
+  const pane = wrapper.findAllComponents(AssistantChat).find(candidate => candidate.get('.uber-toolbar').isVisible())
+  const tap = async (label = 'standing orders') => { await pane.get(`[aria-label="${label}"]`).trigger('click'); await flushPromises() }
+  const orders = () => wrapper.getComponent(ProjectSettings).get('.project-orders textarea')
+  return { wrapper, tap, orders }
+}
+
+it('re-reads the standing orders on the first tap after project settings was opened another way', async () => {
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase', limit: 4000 })
+  const { wrapper, tap, orders } = await openAlphaPane()
+  await tap('project settings')
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Rewritten from the chat', limit: 4000 })
+  await tap()
+  expect(orders().element.value).toBe('Rewritten from the chat')
+  wrapper.unmount()
+})
+
+it('lands only the newest read or save of the standing orders', async () => {
+  api.fetchAssistantInstructions.mockResolvedValue({ instructions: 'Always rebase', limit: 4000 })
+  const { wrapper, tap, orders } = await openAlphaPane()
+  await tap()
+  const [first, second, third] = [deferred(), deferred(), deferred()]
+  api.fetchAssistantInstructions.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+  await tap()
+  await tap()
+  second.resolve({ instructions: 'Newer', limit: 4000 })
+  await flushPromises()
+  first.resolve({ instructions: 'Older', limit: 4000 })
+  await flushPromises()
+  expect(orders().element.value).toBe('Newer')
+  api.fetchAssistantInstructions.mockReturnValueOnce(third.promise)
+  await tap()
+  await orders().setValue('My own wording')
+  await wrapper.getComponent(ProjectSettings).findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(api.setAssistantInstructions).toHaveBeenLastCalledWith('alpha', 'My own wording')
+  third.resolve({ instructions: 'Older', limit: 4000 })
+  await flushPromises()
+  expect(orders().element.value).toBe('My own wording')
+  wrapper.unmount()
+})
+
+it('re-reads standing orders tapped during a save only after the save has landed', async () => {
+  let stored = 'Always rebase'
+  api.fetchAssistantInstructions.mockImplementation(() => Promise.resolve({ instructions: stored, limit: 4000 }))
+  const { wrapper, tap, orders } = await openAlphaPane()
+  await tap()
+  const [get, put] = [deferred(), deferred()]
+  api.fetchAssistantInstructions.mockImplementation(() => {
+    const served = stored
+    return get.promise.then(() => ({ instructions: served, limit: 4000 }))
+  })
+  api.setAssistantInstructions.mockImplementation((_id, text) => put.promise.then(() => {
+    stored = text
+    return { instructions: text, limit: 4000 }
+  }))
+  await orders().setValue('My own wording')
+  const save = () => wrapper.getComponent(ProjectSettings).findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await save()
+  await tap()
+  get.resolve()
+  await flushPromises()
+  put.resolve()
+  await flushPromises()
+  expect(orders().element.value).toBe('My own wording')
+  stored = 'Newer from the chat'
+  await save()
+  await flushPromises()
+  expect(api.setAssistantInstructions).toHaveBeenCalledTimes(1)
+  expect(stored).toBe('Newer from the chat')
+  wrapper.unmount()
+})
+
+it('clears a failed read of the standing orders once a re-read succeeds', async () => {
+  const { wrapper, tap } = await openAlphaPane()
+  api.fetchAssistantInstructions.mockRejectedValueOnce(new Error('orders unreadable'))
+  await tap()
+  expect(wrapper.getComponent(ProjectSettings).text()).toContain('orders unreadable')
+  await tap()
+  expect(wrapper.getComponent(ProjectSettings).text()).not.toContain('orders unreadable')
+  wrapper.unmount()
+})
+
+// Issue 578: the toolbar is a neutral theme surface, not the project colour.
+it('paints Ratchet\'s toolbar with the neutral theme colour, never the project colour', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const wrapper = mountPane(AssistantChat, { workspace: { ...projects[0], color: 'Purple' } })
+  await flushPromises()
+  const toolbar = wrapper.get('.uber-toolbar')
+  expect(toolbar.classes()).toContain('bg-uber-toolbar')
+  expect(toolbar.attributes('style') || '').not.toMatch(/background|color/)
+  expect(toolbar.html()).not.toContain(projectColor('Purple'))
+  wrapper.unmount()
+})
+
+it('names the generation and its age in the robot\'s tooltip, not in the pane body', async () => {
+  const now = Date.parse('2026-10-11T12:00:00Z')
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha',
+    generation: 22, started_at: '2026-10-11T04:00:00Z' })
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0], now })
+  await flushPromises()
+  const identity = `${projects[0].name} · Ratchet · generation 22 · started 8h ago`
+  const robot = wrapper.get('.uber-toolbar .uber-identity')
+  expect(robot.attributes()).toMatchObject({ role: 'button', tabindex: '0', 'aria-label': identity })
+  expect(wrapper.get('.uber-body').text()).not.toMatch(/generation|started/)
+  expect(wrapper.findComponent({ name: 'StatusStrip' }).exists()).toBe(true)
+  // The tooltip's text is in the DOM before it opens, so its model is what says it
+  // is up. A real tap's mouseenter-then-click is pinned in web/tests/browser/projects.py.
+  const tooltip = wrapper.findAllComponents({ name: 'VTooltip' }).find(t => t.props('text') === identity)
+  expect(tooltip.props('modelValue')).toBe(false)
+  for (const activation of ['first', 'second']) {
+    await robot.trigger('click')
+    await flushPromises()
+    expect(tooltip.props('modelValue'), activation).toBe(true)
+  }
+  wrapper.unmount()
+})
+
+it('opens the robot\'s tooltip from the keyboard with Enter or Space', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3 })
+  const identity = `${projects[0].name} · Ratchet · generation 3`
+  for (const key of ['enter', 'space']) {
+    const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+    await flushPromises()
+    const tooltip = wrapper.findAllComponents({ name: 'VTooltip' }).find(t => t.props('text') === identity)
+    expect(tooltip.props('modelValue'), key).toBe(false)
+    await wrapper.get('.uber-toolbar .uber-identity').trigger(`keydown.${key}`)
+    await flushPromises()
+    expect(tooltip.props('modelValue'), key).toBe(true)
+    wrapper.unmount()
+  }
+})
+
+it('labels a stopped assistant with its lifecycle, keeping the project name', async () => {
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  expect(wrapper.get('.uber-toolbar .uber-identity').attributes('aria-label')).toBe(`${projects[0].name} · Ratchet · off: stopped`)
+  wrapper.unmount()
+})
+
+// jsdom has no layout and the suite loads no CSS, so this pins the structure that
+// keeps the notices out of the flex column: Vuetify's `.v-alert { flex: 1 1 }`
+// only applies to an alert that is itself a flex item of `.uber-body`.
+it('keeps the digest and problem notices out of the flex body so they size to their text', async () => {
+  api.fetchAssistant.mockResolvedValue({ running: true, lifecycle: 'running', session_id: 's-alpha', generation: 3, pending: 2 })
+  const wrapper = mountPane(AssistantChat, { workspace: projects[0] })
+  await flushPromises()
+  api.fetchAssistant.mockRejectedValue(new Error('daemon unreachable'))
+  await wrapper.vm.$.setupState.load()
+  await flushPromises()
+  const body = wrapper.get('.uber-body').element
+  const alerts = [...body.querySelectorAll('.v-alert')]
+  expect(alerts.map(alert => alert.textContent)).toEqual([
+    expect.stringContaining('daemon unreachable'),
+    expect.stringContaining('2 digests waiting for Ratchet'),
+  ])
+  for (const alert of alerts) {
+    expect(alert.parentElement).not.toBe(body)
+    expect(alert.parentElement.classList).toContain('uber-notices')
+    expect(alert.classList).toContain('v-alert--density-compact')
+  }
+  expect(wrapper.get('.uber-notices').element.parentElement).toBe(body)
+  wrapper.unmount()
+})
+
+const settingsWithOrders = async (orders, props = {}) => {
+  api.fetchAssistantInstructions.mockResolvedValue({ limit: 4000, ...orders })
+  const wrapper = mountPane(ProjectSettings, { project: projects[0], focus: { id: 'alpha', section: 'orders', nonce: 1 }, ...props })
+  await flushPromises()
+  return wrapper
+}
+
+it('says when the standing orders are empty, from the stored document rather than the draft', async () => {
+  const wrapper = await settingsWithOrders({ instructions: null, instructions_at: null })
+  expect(wrapper.get('.orders-empty').text()).toBe('No standing instructions yet.')
+  await wrapper.get('.project-orders textarea').setValue('A draft that is not saved yet')
+  expect(wrapper.find('.orders-empty').exists()).toBe(true)
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(wrapper.find('.orders-empty').exists()).toBe(false)
+  wrapper.unmount()
+  const stored = await settingsWithOrders({ instructions: 'Always rebase', instructions_at: '2026-10-11T10:00:00Z' })
+  expect(stored.find('.orders-empty').exists()).toBe(false)
+  stored.unmount()
+})
+
+it('hints that standing orders are usually set by telling Ratchet in chat', async () => {
+  for (const orders of [{ instructions: null }, { instructions: 'Always rebase' }]) {
+    const wrapper = await settingsWithOrders(orders)
+    expect(wrapper.get('.orders-hint').text().replace(/\s+/g, ' ')).toBe(
+      'Usually set by telling Ratchet in chat — "from now on…", "always…" — and it confirms the wording before storing them.')
+    wrapper.unmount()
+  }
+})
+
+it('shows when the standing orders last changed and refreshes it from a save', async () => {
+  const now = Date.parse('2026-10-11T13:00:00Z')
+  const wrapper = await settingsWithOrders({ instructions: 'Always rebase', instructions_at: '2026-10-11T10:00:00Z' }, { now })
+  const changed = wrapper.get('.orders-changed')
+  expect(changed.text()).toBe('last changed 3h ago')
+  expect(changed.attributes('title')).toBe('2026-10-11T10:00:00Z')
+  await wrapper.setProps({ now: now + 2 * 3600 * 1000 })
+  expect(wrapper.get('.orders-changed').text()).toBe('last changed 5h ago')
+  api.setAssistantInstructions.mockResolvedValueOnce({ instructions: 'Always rebase, never squash', limit: 4000,
+    instructions_at: '2026-10-11T14:59:00Z' })
+  await wrapper.get('.project-orders textarea').setValue('Always rebase, never squash')
+  await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  await flushPromises()
+  expect(wrapper.get('.orders-changed').text()).toBe('last changed 1m ago')
+  wrapper.unmount()
+  const never = await settingsWithOrders({ instructions: null, instructions_at: null })
+  expect(never.find('.orders-changed').exists()).toBe(false)
+  never.unmount()
+})
+
+it('opens Ratchet\'s own run on its question badge and focuses the ask dock there', async () => {
+  const orchestrator = { host: '—', project: '—', slug: 's-alpha', label: 'Ratchet', orchestrator: true,
     workspace_id: 'alpha', workspace_name: projects[0].name, workspace_color: 'Blue', live: true,
     last_session_id: 's-alpha', session: { id: 's-alpha' }, state: 'waiting_on_you', attention: { reason: 'live_question' },
     questions: [{ id: 'q1', kind: 'question', text: 'Ship it?', options: [], answered: false, closed: false }] }
@@ -743,6 +1147,23 @@ it('opens uber lmer\'s own run on its question badge and focuses the ask dock th
   wrapper.getComponent(AssistantChat).vm.$emit('questions', 's-alpha')
   await flushPromises()
   expect(wrapper.getComponent(RunDetail).props('focusQuestions')).toBeGreaterThan(first)
+})
+
+it('sets the supervisor authority, reads unset as none and clears the key for none', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const select = wrapper.getComponent('.supervisor-authority')
+  expect(select.props('modelValue')).toBe('none')
+  expect(select.props('label')).toBe('What Ratchet may approve for workers')
+  const save = () => wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
+  select.vm.$emit('update:modelValue', 'approvals')
+  await save()
+  await flushPromises()
+  expect(api.updateProject.mock.calls.at(-1)[1].settings.supervisor_authority).toBe('approvals')
+  select.vm.$emit('update:modelValue', 'none')
+  await save()
+  await flushPromises()
+  expect(api.updateProject.mock.calls.at(-1)[1].settings.supervisor_authority).toBeNull()
 })
 
 it('labels project execution overrides readably and says what an empty one inherits', async () => {

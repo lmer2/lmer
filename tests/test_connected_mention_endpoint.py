@@ -32,7 +32,7 @@ def test_cli_endpoint_reaches_connector_forwarding(transport_host, monkeypatch, 
     noop = SimpleNamespace(stop=lambda: None)
     for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
-    monkeypatch.setattr(daemon, "reattach_all", lambda: [])
+    monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     monkeypatch.setattr(connectors.ThreadConnectors, "start", lambda self: None)
     monkeypatch.setattr(connectors, "_slack_client", lambda _token: transports["slack"])
     monkeypatch.setattr(connectors, "_matrix_client", lambda _account: transports["matrix"])

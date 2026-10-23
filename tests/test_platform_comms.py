@@ -429,7 +429,7 @@ class TestRoutes:
         resp = client.post(f"/api/sessions/{session}/comms", json={"kind": "message", "text": "fix the two majors", "author": "ignored"}, headers=bearer(minted))
         assert resp.status_code == 200, resp.text
         assert resp.json()["message"]["source"] == {"channel": "uber-lmer"}
-        assert b"[uber lmer] fix the two majors" in b"".join(plane.sink)
+        assert "[Ratchet · authority=none] fix the two majors".encode() in b"".join(plane.sink)
 
     def test_a_connector_posts_as_its_bound_channel_whatever_it_claims(self, platform_root, client, plane):
         session = live_session(plane)
@@ -511,7 +511,7 @@ class TestRoutes:
             assert response.status_code == 200, response.text
             body = response.json()
             assert body["queued"] is True and body["bytes_written"] == 0
-            assert "held until startup submission" in body["note"]
+            assert "after startup submission" in body["note"]
             assert plane.log.get(1).text == "first direction" and plane.sink == []
             raw = client.post(f"/api/sessions/{session}/input", headers=auth(), json={"data": "raw"})
             assert raw.status_code == 200 and raw.json()["bytes_written"] == 3

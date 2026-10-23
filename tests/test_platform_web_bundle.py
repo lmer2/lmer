@@ -167,6 +167,7 @@ def _build_inputs():
     return [
         *_web_sources(),
         *(WEB / "src").rglob("*.css"),
+        *(WEB / "public").rglob("*"),
         WEB / "index.html",
         WEB / "package.json",
         WEB / "package-lock.json",
@@ -231,17 +232,27 @@ class Bundle:
         return sorted(name for name, text in self.files.items() if marker in text)
 
 
-@pytest.fixture(scope="module")
-def bundle():
-    # Before the lock: node_binary() takes it itself to install web deps.
-    node = node_binary()
-    # Under xdist each worker runs this fixture; the check, the build and the
-    # read share the lock so no worker reads dist/ while another rebuilds it.
+def _locked_bundle(node):
+    """Build ``dist/`` if it is stale, then read it, all under the web lock.
+
+    Under xdist each worker runs this; the check, the build and the read share
+    the lock so no worker reads dist/ while another rebuilds it. Without the
+    lock a current dist/ is still safe to read — nothing will rebuild it — but a
+    stale one is not safe to build: ENOLCK or ENOSPC on a writable tree would
+    bring back the concurrent-build race, silently.
+    """
     with contextlib.ExitStack() as held:
         try:
             held.enter_context(web_lock())
-        except OSError:
-            pass  # a read-only web/ cannot be rebuilt, so nothing races the read
+        except OSError as exc:
+            if _needs_building():
+                pytest.fail(
+                    f"web/dist is stale and the web lock is unavailable ({exc}); "
+                    "refusing to build it unlocked, where a concurrent build would "
+                    "race this one. Rebuild it with `npm run build` in web/, or "
+                    "fix the lock file web/.test-deps.lock."
+                )
+            return Bundle()
         if _needs_building():
             if not node:
                 require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
@@ -251,6 +262,39 @@ def bundle():
                 )
             _build(node)
         return Bundle()
+
+
+@pytest.fixture(scope="module")
+def bundle():
+    # Before the lock: node_binary() takes it itself to install web deps.
+    return _locked_bundle(node_binary())
+
+
+@contextlib.contextmanager
+def _unavailable_lock():
+    raise OSError(37, "No locks available")
+    yield  # pragma: no cover
+
+
+def test_a_stale_dist_is_never_built_without_the_lock(monkeypatch):
+    """#544 item 9: an unavailable lock is not a read-only tree."""
+    builds = []
+    monkeypatch.setitem(globals(), "web_lock", _unavailable_lock)
+    monkeypatch.setitem(globals(), "_needs_building", lambda: True)
+    monkeypatch.setitem(globals(), "_build", builds.append)
+    with pytest.raises(pytest.fail.Exception, match="refusing to build it unlocked"):
+        _locked_bundle("node")
+    assert builds == []
+
+
+def test_a_current_dist_is_still_read_without_the_lock(monkeypatch):
+    builds = []
+    monkeypatch.setitem(globals(), "web_lock", _unavailable_lock)
+    monkeypatch.setitem(globals(), "_needs_building", lambda: False)
+    monkeypatch.setitem(globals(), "_build", builds.append)
+    monkeypatch.setitem(globals(), "Bundle", lambda: "read")
+    assert _locked_bundle("node") == "read"
+    assert builds == []
 
 
 # --- what the first load is --------------------------------------------------
@@ -400,6 +444,25 @@ def test_every_chunk_lands_where_the_daemon_can_serve_it(bundle):
         f"{stray} sit outside dist/assets, where the daemon has no route to them"
     )
     assert bundle.files, "nothing was emitted into dist/assets at all"
+
+
+def test_ratchet_faces_are_served_from_the_assets_directory(bundle):
+    """The faces are copied verbatim under the one directory the daemon serves."""
+    served = ASSETS / "ratchet"
+    names = {path.name for path in served.iterdir()} if served.is_dir() else set()
+    expected = {
+        "ratchet_question.png", "ratchet_oops.png", "ratchet_panic.png",
+        "ratchet_strained.png", "ratchet_on_it.png", "ratchet_skeptical.png",
+        "ratchet_idle.png", "ratchet_yes.png", "ratchet_talking.png",
+        "ratchet_off.png",
+    }
+    assert expected <= names, f"missing from dist/assets/ratchet: {sorted(expected - names)}"
+
+
+def test_the_tab_icon_is_served_from_the_assets_directory(bundle):
+    index = (DIST / "index.html").read_text(encoding="utf-8")
+    assert 'rel="icon"' in index and "assets/ratchet/ratchet_talking.png" in index
+    assert (ASSETS / "ratchet" / "ratchet_talking.png").is_file()
 
 
 # --- the source decisions the build above is the consequence of --------------

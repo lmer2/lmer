@@ -328,6 +328,155 @@ def test_forget_untracked_exits_nonzero(platform_root, capsys):
     assert "not tracked" in capsys.readouterr().err
 
 
+# --- by uid (spec §6.1): a 32-hex last segment is a schema-2 run's uid -------
+
+UID = "f" * 32
+UID_KEY = f"gitlab.example.com/acme/widgets/{UID}"
+
+
+def _plant_uid_record(uid=UID, slug="chat", launcher=None):
+    import yaml
+
+    config = cfg.load()
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_lmer.yaml").write_text(
+        yaml.safe_dump({
+            "schema": 2, "name": "example-plexus",
+            "projects": {"widgets": {"repo": "ssh://git@gitlab.example.com/acme/widgets.git"}},
+        }),
+        encoding="utf-8",
+    )
+    path = config.mirror_path / "widgets" / "_runs" / slug / uid
+    path.mkdir(parents=True, exist_ok=True)
+    session = {"started_at": "2026-01-01T00:00:00+00:00"}
+    if launcher is not None:
+        session["launcher"] = launcher
+    (path / "state.yaml").write_text(
+        yaml.safe_dump({"schema": 2, "slug": slug, "status": "in-progress",
+                        "session": session}),
+        encoding="utf-8",
+    )
+
+
+def test_adopt_by_uid_tracks_the_record_under_its_uid(platform_root, capsys):
+    from lmer_platform import runs
+
+    _plant_uid_record()
+
+    assert daemon.main(["--workspace-id", "general", "adopt", UID_KEY]) == 0
+
+    captured = capsys.readouterr()
+    assert f"tracking {UID_KEY}" in captured.out
+    assert "no such run dir" not in captured.err
+    entry = runs.get_tracked("gitlab.example.com", "acme/widgets", uid=UID)
+    assert entry is not None and entry.slug == "chat", "the label is the record's slug"
+
+
+def test_adopt_by_uid_binds_the_slug_entry_the_transition_left_unresolved(
+    platform_root, capsys
+):
+    """The daemon CLI never builds state, so the entry has not been examined
+    when the adopt runs: the adopt examines it first. Two records and no
+    launcher evidence leave it unresolved with both as candidates, and the uid
+    named is one of them."""
+    from lmer_platform import runs
+
+    _plant_uid_record()
+    _plant_uid_record("0" * 32)
+    runs.track("gitlab.example.com", "acme/widgets", "chat")
+
+    assert daemon.main(["--workspace-id", "general", "adopt", UID_KEY]) == 0
+
+    index = runs.load_index()
+    assert set(index) == {UID_KEY}
+    assert index[UID_KEY]["aliases"] == ["gitlab.example.com/acme/widgets/chat"]
+
+
+def test_adopt_by_uid_never_moves_another_launchs_state_onto_it(platform_root, capsys):
+    """Review !387 round 3, discussion 8. The slug entry's last session is
+    launch Y by the launcher rule, so the transition binds it to Y; adopting X
+    then tracks X as a row of its own. Binding the unexamined entry to X would
+    have carried Y's title onto X and dropped Y's row."""
+    import socket
+
+    from lmer_platform import meta, registry, runs
+
+    host, project = "gitlab.example.com", "acme/widgets"
+    other = "0" * 32
+    other_key = f"{host}/{project}/{other}"
+    _plant_uid_record()
+    _plant_uid_record(other, launcher={
+        "pid": 4242, "hostname": socket.gethostname(),
+        "started_at": "2026-02-01T00:00:05+00:00",
+    })
+    registry.register("s-launch-y", pid=4242, started_at="2026-02-01T00:00:00Z",
+                      run={"host": host, "project": project, "slug": "chat"})
+    runs.track(host, project, "chat", session_id="s-launch-y")
+    meta.write(host, project, "chat", title="launch Y")
+
+    assert daemon.main(["--workspace-id", "general", "adopt", UID_KEY]) == 0
+
+    index = runs.load_index()
+    assert set(index) == {UID_KEY, other_key}
+    assert index[other_key]["aliases"] == [f"{host}/{project}/chat"]
+    assert index[UID_KEY]["source"] == "adopted"
+    assert meta.read(host, project, other).title == "launch Y"
+    assert meta.read(host, project, UID).title == ""
+
+
+def test_adopt_by_a_uid_the_mirror_does_not_hold_exits_two(platform_root, capsys):
+    from lmer_platform import runs
+
+    assert daemon.main(["--workspace-id", "general", "adopt", UID_KEY]) == 2
+    assert UID in capsys.readouterr().err
+    assert runs.load_index() == {}
+
+
+def test_forget_by_uid_forgets_that_launch(platform_root, capsys):
+    from lmer_platform import runs
+
+    runs.track("gitlab.example.com", "acme/widgets", "chat", uid=UID)
+    runs.track("gitlab.example.com", "acme/widgets", "chat", uid="0" * 32)
+
+    assert daemon.main(["forget", UID_KEY]) == 0
+
+    assert f"no longer tracking {UID_KEY}" in capsys.readouterr().out
+    assert set(runs.load_index()) == {f"gitlab.example.com/acme/widgets/{'0' * 32}"}
+
+
+def test_forget_by_the_slug_a_bind_left_forgets_the_bound_launch(platform_root, capsys):
+    """Review !387 round 3, discussion 10: the old slug key is an alias of the
+    bound entry, and ``lmer-ctl runs forget`` and the UI follow it."""
+    from lmer_platform import run_transition, runs
+
+    _plant_uid_record()
+    runs.track("gitlab.example.com", "acme/widgets", "chat")
+    run_transition.bind(cfg.load(), "gitlab.example.com", "acme/widgets", "chat", UID)
+    assert set(runs.load_index()) == {UID_KEY}
+
+    assert daemon.main(["forget", "gitlab.example.com/acme/widgets/chat"]) == 0
+
+    assert f"no longer tracking {UID_KEY}" in capsys.readouterr().out
+    assert runs.load_index() == {}
+
+
+def test_resume_by_uid_addresses_the_launch(platform_root, monkeypatch, capsys):
+    from lmer_platform import resume
+
+    seen = []
+
+    def refuse(config, request):
+        seen.append(request)
+        raise resume.ResumeError("stop here")
+
+    monkeypatch.setattr(daemon, "resume_run", refuse)
+
+    daemon.main(["--workspace-id", "general", "resume", UID_KEY])
+
+    (request,) = seen
+    assert request.uid == UID and not request.slug
+
+
 @pytest.mark.parametrize("raw,expected", [
     ("gitlab.example.com/agents/global/develop-1",
      ("gitlab.example.com", "agents/global", "develop-1")),
@@ -383,7 +532,7 @@ CANDIDATE_SECONDARY = "github.com/acme/widgets"
 def _register_widgets_for_daemon(config):
     """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
     config.mirror_path.mkdir(parents=True, exist_ok=True)
-    (config.mirror_path / "_plexus.yaml").write_text(
+    (config.mirror_path / "_lmer.yaml").write_text(
         "schema: 1\nname: example-plexus\nprojects:\n  widgets:\n"
         f"    repo: {CANDIDATE_PRIMARY}\n    remotes: [{CANDIDATE_SECONDARY}]\n",
         encoding="utf-8",

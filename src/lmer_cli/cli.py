@@ -17,18 +17,22 @@ import hashlib
 import json
 import os
 import secrets
-import time
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 import re
 from typing import Iterable, Mapping
 from dotenv import dotenv_values
+from work_repo import session_record
+from work_repo.run_state import derive_slug
+from work_repo.utils import classify_target, is_secret_env_name, repository_of, strip_url_credentials
 
 from . import resolve
 from .clone_cache import (
@@ -38,6 +42,7 @@ from .clone_cache import (
 )
 from .container import sources as container_sources
 from .container_home import ensure_container_home
+from .env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
@@ -75,6 +80,7 @@ from .mounts import (
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
 from .keep_id import image_id as remap_image_id, record_remap, remap_recorded
 from .harness import (
+    CODEX_SEED_ERROR_ENV,
     HARNESS_ENV,
     HARNESSES,
     LLM_NAME_ENV,
@@ -121,11 +127,20 @@ from .presets import (
     select_preset_name,
     task_preset_env_name,
 )
+from .container_follow import (
+    create as create_container,
+    follow as follow_container,
+    main as follow_main,
+    read_container_id,
+    remove as remove_container,
+)
 from .runtime import (
     ambient_container_user,
     apply_env_file_defaults,
     base_run_args,
     build_container_env,
+    container_labels,
+    container_name,
     ContainerEnvError,
     CPUS_HINT,
     default_env_file_candidates,
@@ -139,6 +154,7 @@ from .runtime import (
     lmer_state_dir,
     MEMORY_HINT,
     repo_root_path,
+    resolve_gate_ci_baseline,
     resource_limit_plan,
     RUNTIME_ENV,
     _valid_cpus,
@@ -154,6 +170,7 @@ from .service import (
 )
 from .container.target_switch import DEFAULT_TARGET_FILE as CONTAINER_SERVICE_TARGET_FILE
 from .tokens import (
+    EVIDENCE_TOKEN_PREFIX,
     _get_gitlab_token,
     _prefer_ssh,
     _convert_ssh_to_https_if_token_available,
@@ -313,6 +330,7 @@ def _resolve_fastapi_host_port(
             raise ValueError(f"LMER_FASTAPI_PORT must be 1-65535, got {port}")
         return port
 
+    # deferred: import cost — only the no-preset-port branch picks one; supervisor + pydantic add ~140 ms
     from .supervisor import _parse_port_range, _pick_port
 
     port_range = _parse_port_range(cli_range or DEFAULT_FASTAPI_PORT_RANGE)
@@ -342,6 +360,10 @@ def _make_sigterm_cleanup_handler(container_env):
     strands the session's mode-0600 env file in ``$TMPDIR`` holding the
     tokenized work-repo URL and every forwarded token (issue #158).
 
+    Active while the container is being created; once it exists,
+    :func:`lmer_cli.container_follow.follow` installs its own handler, which
+    stops the container instead.
+
     It deliberately does NOT raise. ``subprocess.call`` is::
 
         with Popen(...) as p:
@@ -352,13 +374,10 @@ def _make_sigterm_cleanup_handler(container_env):
                 raise
 
     so raising ``SystemExit`` here would unwind through that bare ``except``
-    and SIGKILL the ``docker``/``podman run`` client. In a non-TTY spawn the
-    client forwarding SIGTERM is exactly what stops the container (docker's
-    ``--sig-proxy`` is non-TTY-only), and ``--rm`` removal is daemon-side and
-    conditional on that exit — so killing the client leaves a running
-    container behind. That is why this restores the default disposition and
-    re-raises the signal at itself instead: process semantics stay identical
-    to having no handler at all, and the file still gets deleted.
+    and SIGKILL the runtime client mid-create. That is why this restores the
+    default disposition and re-raises the signal at itself instead: process
+    semantics stay identical to having no handler at all, and the file still
+    gets deleted.
 
     "Identical to having no handler" is exact for the CLI, whose SIGTERM
     disposition IS the default. It is not exact for a hypothetical in-process
@@ -398,6 +417,7 @@ def _start_thread_servicer(
     if not host_port or not control_token:
         return None
     try:
+        # deferred: import cost — thread_access (~10 ms) loads only for a launch with a control port and token
         from lmer_cli.thread_access import CLI_ENVIRONMENT, ThreadServicer, UploadStore
 
         servicer = ThreadServicer(
@@ -451,6 +471,7 @@ def _apply_port_passthrough(
 
     port_bind = _resolve_port_bind(getattr(ns, "port_bind", None), os.environ)
 
+    # deferred: import cost — only a launch that requests ports picks them; supervisor + pydantic add ~150 ms
     from .supervisor import _parse_port_range, _pick_ports
 
     try:
@@ -616,11 +637,13 @@ def parse_args(
     parser.add_argument("--branch", dest="branch")
     parser.add_argument("--ref", dest="ref")
     parser.add_argument("--remote", dest="remote", help="Git remote name to use (required when local repo has multiple remotes)")
+    parser.add_argument("--repo-url", dest="repo_url", help="Repository URL to clone, independent of the target. The primary target is then only the task's target (LMER_TASK_TARGET and the run slug): a label, an issue/MR URL, or a Slack/matrix thread permalink, which lets a non-chat task run per thread. A bare word is never probed as a local checkout; a target spelled as a path (/x, ./x, ../x) or a repository URL is refused as a second repository, as is --repo beside --repo-url.")
     parser.add_argument("--exec", dest="exec_mode", action="store_true", help="Run an arbitrary command in the container")
     parser.add_argument("--no-clone", dest="no_clone", action="store_true", help="Skip git clone, just run command (requires --exec)")
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
     parser.add_argument("--service-group", dest="service_group", help="Compose project whose running services this session may target (service-group mode); the agent retargets with the in-container target-switch")
     parser.add_argument("--checkout", dest="checkout", help="Path to existing local source checkout (mounted as /workspace)")
+    parser.add_argument("--repo", dest="repo", metavar="URL_OR_PATH", help="Explicit repository for this launch (URL or local path). It beats a repository derived from a work-item, reference or thread target; refused as 'two repositories named' beside a repository positional, and also beside --checkout, LMER_NO_REPO, --no-clone or --no-task. `lmer <taskdef> --repo <url>` with no positional is the plain project session, launched from anywhere. Nothing new reaches the container.")
     parser.add_argument("--user", dest="user", help="Container user (e.g., developer or 0:0)")
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
     parser.add_argument("--memory", dest="memory", help="Container memory cap for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__MEMORY, LMER_<TASK>_MEMORY, LMER_MEMORY). Same grammar as LMER_MEMORY — an integer with an optional b/k/m/g suffix, at least 6m. Unlike the environment tiers, an invalid value here aborts the run rather than falling through: an explicit request is not something to silently substitute.")
@@ -647,7 +670,12 @@ def parse_args(
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
-    parser.add_argument("--session", dest="session", help="Session id of the run record this launch continues, exported to the container as LMER_SESSION_ID. In a schema-form work repo that variable decides which record everything in the container writes in (<project>/_runs/<slug>/<session-id>[--<name>]/, spec D22), so a resume that names one lands IN the record the operator asked to continue instead of opening a fresh one beside it. This flag is the only supported source: an LMER_SESSION_ID in the host environment is deliberately NOT read (see the env dict), because every lmer container exports one.")
+    parser.add_argument("--name", dest="run_name", help="kebab-case run name recorded at session start, exported to the container as LMER_RUN_NAME and applied once by `work session-start` (on the call that opens the record's session). A name is a LABEL: on schema 2 the launch name replaces a default or inherited name; only a legacy tree enforces per-project uniqueness, where a held name is reported in the session's start output and the run stays unnamed. This flag is the only source: a host-exported or .env LMER_RUN_NAME is never forwarded. Refused with --no-task (no run context to record it in); with --exec it applies only if the command runs `work session-start`.")
+    parser.add_argument("--goal", dest="run_goal", help="Run goal recorded at session start, exported to the container as LMER_RUN_GOAL and applied once by `work session-start` (it replaces a goal inherited from a continuation source). This flag is the only source: a host-exported or .env LMER_RUN_GOAL is never forwarded. Refused with --no-task; with --exec it applies only if the command runs `work session-start`.")
+    parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. The new execution inherits the source's name label; a never-started `work seed` record is a valid source and needs no --allow-unsigned-source. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
+    parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID and inherits the source's name label; a never-started `work seed` record is a valid source without --allow-unsigned-source.")
+    parser.add_argument("--launch-uid", dest="launch_uid", metavar="UID", help="The fresh execution uid this launch records under; a caller that mints one never reuses it. Exported to the container as LMER_LAUNCH_UID, where a uid that already names a record is refused. This flag is the only source: a host-exported or .env LMER_LAUNCH_UID is never forwarded, and a child session mints its own.")
+    parser.add_argument("--allow-unsigned-source", dest="allow_unsigned_source", metavar="SESSION_UID", help="Explicitly continue fresh when the selected schema-2 source has no final session_end. Must exactly equal --session, so the decision authorizes only that source; omit it to cancel/wait after a refusal.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--model", dest="model", help="Model the harness runs, exported to the container as LMER_LLM_NAME (env: LMER_LLM_NAME; the flag wins over it, and over a preset's env). Forwarded verbatim to the harness's own --model flag by the runner scripts — lmer never validates it, the harness rejects what it does not know. Also implies the harness when neither --harness nor LMER_HARNESS is set (e.g. --model gpt-5.5 selects codex).")
@@ -661,6 +689,13 @@ def parse_args(
     parser.add_argument("--port-bind", dest="port_bind", help=f"Host bind address for --ports publishing (default {DEFAULT_PORT_BIND}; pass 0.0.0.0 to expose ports beyond loopback; env: LMER_PORT_BIND)")
 
     ns, extra = parser.parse_known_args(argv)
+    # argparse leaves a positional that follows an option in `extra`, where only
+    # --exec reads it; a value after an unknown flag is that flag's, not a target.
+    ns.stray_positionals = [
+        token for index, token in enumerate(extra)
+        if not token.startswith("-")
+        and not (index and extra[index - 1].startswith("-") and "=" not in extra[index - 1])
+    ]
     # Combine any extra unknown args with the -- separated rest
     rest = extra + rest
     return ns, rest
@@ -729,9 +764,16 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
 
     Returns:
         Tuple of (host, project_path) or (None, None) if parsing fails
+
+    What is parsed is the repository the URL belongs to
+    (``work_repo.utils.repository_of``, spec §2), so a work-item or reference
+    URL — ``.../group/project/-/issues``, ``.../owner/repo/pull/9`` — yields
+    the project and not the route: ``LMER_REPO_PROJECT`` never contains
+    ``/-/`` (#391). A repository URL is its own answer and parses as before.
     """
     if not repo_url:
         return None, None
+    repo_url = repository_of(repo_url) or repo_url
 
     # Handle SSH format: git@host:path
     if repo_url.startswith("git@"):
@@ -770,69 +812,83 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
     return host, path
 
 
+def container_task_target(primary_target: str | None, klass: str) -> str:
+    """The ``LMER_TASK_TARGET`` a launch exports for its primary target.
+
+    The exported target is the session's *task context*, never its repository
+    (spec §4/§2, A1-wave0.host-export). A ``repository`` target — a local
+    filesystem path (``.``, ``./``, ``../x``, an absolute checkout path) or a
+    bare repository URL — is a plain project session: the repository comes
+    from the checkout's git origin or the URL, and the spelling carries no
+    identity worth a slug, so the export is the **empty string** (delivered
+    empty, never absent, because every container reader treats ``""`` as "no
+    target" while an absent variable falls back to whatever the environment
+    holds). ``none`` (no positional at all) is the same empty export. A
+    ``work-item``, ``reference`` or ``other`` target is exported verbatim: a
+    work item is the session's target, a document URL is context, and an
+    ``other`` URL reached here only because ``--repo`` named the repository.
+    ``primary_target`` itself — the value the GitLab MR parsing, the
+    host-repo mount and the secondary-target list read — is never touched.
+    Pure: no filesystem, no environment.
+    """
+    if klass in ("repository", "none"):
+        return ""
+    return primary_target
+
+
 def _derive_repo_url_from_task_target(target: str) -> str | None:
     """
     Best-effort derivation of a base repository URL from a task target URL
-    such as PR/MR/issue links.
+    such as PR/MR/issue links — and, since A1-wave0.repository-of, from a
+    reference URL inside a repository (a file, a tree, a wiki page, a commit
+    listing, an id-less list page), so a document target derives the
+    repository its clone comes from (#523).
 
     For GitLab hosts with available API tokens, returns HTTPS URL with token auth.
-    Otherwise returns SSH-format URL for git cloning.
+    Otherwise returns SSH-format URL for git cloning. A repository URL, a thread
+    permalink, a non-forge URL and a non-URL target derive None.
 
     Supports:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
-    - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project (if token available)
+    - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project.git (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
     - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
+    - GitLab: https://gitlab.com/group/project/-/blob/main/docs/x.md -> same as /-/issues/ (#523)
+    - GitLab: https://gitlab.com/group/project/-/issues (a list page) -> same as /-/issues/N (#391)
     """
-    try:
-        parsed = urlparse(target)
-    except Exception:
+    # The repository is repository_of's answer — the one definition behind
+    # this helper in both its copies and behind _parse_repo_url (#391) — for
+    # a work item or a reference and for nothing else. A repository URL
+    # derives None on purpose: spawn._plain_repo_url_from_target,
+    # clone_secondary_mr and _resolve_clone_url fall back to the target
+    # itself as the clone URL: the one class repository_of answers for that
+    # this helper must not, hence the class check ahead of it.
+    if classify_target(target) not in ("work-item", "reference"):
         return None
-
-    if not parsed.scheme or not parsed.netloc or not parsed.path:
+    repository = repository_of(target)
+    if repository is None:
         return None
-
+    parsed = urlparse(repository)
     host = parsed.hostname
-    if not host:
+    project_path = parsed.path.strip("/")
+    if not host or not project_path:
         return None
 
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if len(path_parts) < 2:
-        return None
-
-    # Heuristics: only attempt derive when a known resource path is present.
-    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
-    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
-    # match so a repo merely named 'work_items' isn't misread as a resource link.
-    lowered = '/'.join(path_parts).lower()
-    indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
-    )
-    if not any(tok in lowered for tok in indicators):
-        return None
-
-    # GitLab URLs use /-/ separator: group/project/-/merge_requests/123
-    # Find the /-/ separator and extract everything before it
-    if '/-/' in parsed.path:
-        # Split on /-/ and take everything before it
-        project_path = parsed.path.split('/-/')[0].strip('/')
-        if project_path:
-            # Check if we have a GitLab token for this host
-            token = _get_gitlab_token(host)
-            if token:
-                # Use HTTPS with token authentication
-                return f"https://oauth2:{token}@{host}/{project_path}.git"
-            # Fall back to SSH
-            return f"git@{host}:{project_path}"
-
-    # GitHub and simple URLs: owner/repo/pull/123 or owner/repo/issues/123
-    owner = path_parts[0]
-    repo = path_parts[1]
-
-    # Strip trailing .git if present in repo segment from some URLs
-    repo = re.sub(r"\.git$", "", repo)
-
-    return f"git@{host}:{owner}/{repo}"
+    # GitLab-shaped (a /-/ route): HTTPS with the host's token when there is
+    # one, SSH otherwise. The GitHub shape never looks a token up — it never
+    # did, and _get_gitlab_token reads GH_TOKEN for github.com and refuses a
+    # generic GITLAB_TOKEN with a notice, both of which would be new.
+    if "/-/" in urlparse(target).path:
+        token = _get_gitlab_token(host)
+        if token:
+            # Preserve the repository's authority: a non-default HTTPS port
+            # (gitlab.example.com:8443) must survive the credential insert.
+            try:
+                authority = host if parsed.port is None else f"{host}:{parsed.port}"
+            except ValueError:
+                authority = host
+            return f"https://oauth2:{token}@{authority}/{project_path}.git"
+    return f"git@{host}:{project_path}"
 
 
 def _get_taskdef_paths(repo_root: Path | None) -> list[Path]:
@@ -1167,8 +1223,6 @@ def _redact_env_value(name: str, value: str) -> str:
     #285); only the ``value[:4] + "***"`` hint for name-matched vars is
     display behavior of this surface.
     """
-    from work_repo.utils import is_secret_env_name, strip_url_credentials
-
     if is_secret_env_name(name):
         if len(value) <= 4:
             return "***"
@@ -1217,7 +1271,7 @@ def _display_env_config_cli(
     print("---")
 
 
-def _announce_resource_limits(limits: "list", gpu=None) -> None:
+def _announce_resource_limits(limits: "list", gpu=None, ci_baseline=None) -> None:
     """Say what bounds this container gets and what set each one (issue #453).
 
     Rendered from the plan the run arguments are built from, so the line and
@@ -1227,13 +1281,16 @@ def _announce_resource_limits(limits: "list", gpu=None) -> None:
     ladder, or ``default``; with three tiers per knob, which one won is the
     thing an operator cannot infer from the value alone.
     """
-    if not limits and gpu is None:
+    if not limits and gpu is None and ci_baseline is None:
         return
     shown = [
         f"{limit.flag.lstrip('-')}={limit.value} ({limit.source})" for limit in limits
     ]
     if gpu is not None:
         shown.append(f"gpu={gpu.value or 'none'} ({gpu.source})")
+    if ci_baseline is not None:
+        value, source = ci_baseline
+        shown.append(f"gate-ci-baseline={'on' if value == '1' else 'off'} ({source})")
     info(f"📐 Limits: {', '.join(shown)}")
 
 
@@ -1285,13 +1342,41 @@ def _display_sources_config_cli() -> None:
     # `declared:` line on the one surface an operator uses to understand
     # what their declaration is doing (review finding).
     load_warnings: "list[str]" = []
+    # A cached `_lmer.yaml` names the tier of every declared row (issue
+    # #370 point 4): the manifest tier is read here from the same clone
+    # cache, through the ONE manifest parser, and handed to E.loader's
+    # tiered `load_sources` so precedence, the stale-legacy WARN and every
+    # trust rule are the container's, not a re-implementation.
+    manifest_tiered = False
     if not work_repo_url:
         declared_status = "unknown (LMER_WORK_REPO not set)"
     else:
         cached, cache_reason = read_cached_repo_file_status(
             work_repo_url, container_sources.SOURCES_FILENAME
         )
-        if cached is None:
+        cached_manifest, _manifest_reason = read_cached_repo_file_status(
+            work_repo_url, container_sources.MANIFEST_FILENAME
+        )
+        manifest = None
+        manifest_error: "Exception | None" = None
+        if cached_manifest is not None:
+            try:
+                # Display-only, so a broken import renders rather than raises.
+                # deferred: optional dependency — only a cached manifest needs the core; no manifest, no import
+                from lmer_schema.manifest import parse_manifest
+
+                manifest = parse_manifest(
+                    cached_manifest, path=container_sources.MANIFEST_FILENAME
+                )
+            except Exception as exc:  # ManifestError, ImportError, ...
+                manifest_error = exc
+        if manifest_error is not None:
+            # Decision (c) over the manifest tier: render, never raise. The
+            # rows fall back to env-only/unset-fallback.
+            declared_status = (
+                f"invalid ({container_sources.scrub_credentials(str(manifest_error))})"
+            )
+        elif cached is None and manifest is None:
             if cache_reason == CACHE_FILE_ABSENT:
                 # Warm mirror, no declaration — the expected state for every
                 # work repo until the cutover lands, so it must not read as a
@@ -1308,12 +1393,20 @@ def _display_sources_config_cli() -> None:
             try:
                 # load_sources reads a file path; hand the cached bytes to it
                 # as a throwaway sources.yaml so schema/credential/trust-rule
-                # validation runs exactly as the container will run it.
+                # validation runs exactly as the container will run it. A miss
+                # on sources.yaml leaves the temp path unwritten — the legacy
+                # tier is then absent, exactly as on disk.
                 with tempfile.TemporaryDirectory() as td:
                     tmp = Path(td) / container_sources.SOURCES_FILENAME
-                    tmp.write_text(cached, encoding="utf-8")
+                    if cached is not None:
+                        tmp.write_text(cached, encoding="utf-8")
                     config, raw_warnings = container_sources.load_sources(
-                        tmp, work_repo_url=work_repo_url
+                        tmp,
+                        work_repo_url=work_repo_url,
+                        manifest_sources=(
+                            manifest.sources if manifest is not None else None
+                        ),
+                        manifest_path=container_sources.MANIFEST_FILENAME,
                     )
                 # Warnings name the file by the path load_sources was given
                 # — the throwaway copy. Rewrite it to the real filename, the
@@ -1322,7 +1415,38 @@ def _display_sources_config_cli() -> None:
                     w.replace(str(tmp), container_sources.SOURCES_FILENAME)
                     for w in raw_warnings
                 ]
-                declared_status = "sources.yaml from work-repo cache (cached, possibly stale)"
+                manifest_tiered = manifest is not None
+                tiers = set((config or {}).get("tiers", {}).values())
+                if config is None:
+                    # The loader found nothing declared in either tier (a
+                    # cached manifest without a `sources:` section, and no
+                    # legacy file): the same "none" wording the pre-#370
+                    # output used, never a manifest declaration that is not
+                    # there.
+                    if cached is not None:
+                        declared_status = "none (no sources declared in the work repo)"
+                    elif cache_reason == CACHE_FILE_ABSENT:
+                        declared_status = (
+                            f"none (no {container_sources.SOURCES_FILENAME} in the work repo)"
+                        )
+                    elif cache_reason == CACHE_ERROR:
+                        declared_status = "unknown (work-repo cache unreadable)"
+                    else:
+                        declared_status = "unknown (work repo not cached)"
+                elif (container_sources.TIER_MANIFEST in tiers
+                      and container_sources.TIER_LEGACY in tiers):
+                    declared_status = (
+                        "manifest and sources.yaml from work-repo cache "
+                        "(cached, possibly stale)"
+                    )
+                elif container_sources.TIER_MANIFEST in tiers:
+                    declared_status = (
+                        "manifest from work-repo cache (cached, possibly stale)"
+                    )
+                else:
+                    declared_status = (
+                        "sources.yaml from work-repo cache (cached, possibly stale)"
+                    )
             except container_sources.SourcesConfigError as exc:
                 # Decision (c): render, never raise. Strip the throwaway temp
                 # path so the message names the real file, and scrub before
@@ -1337,6 +1461,7 @@ def _display_sources_config_cli() -> None:
                 config = None
 
     declared_sources = (config or {}).get("sources") or {}
+    declared_tiers = (config or {}).get("tiers") or {}
     rows = []
     for label, name, key, env_var in (
         ("taskdef repo", "taskdef", "repo", "LMER_TASKDEF_REPO"),
@@ -1363,7 +1488,17 @@ def _display_sources_config_cli() -> None:
             else:
                 value, origin = env_value, "env-override"
         elif declared_value:
-            value, origin = declared_value, "declared (cached, possibly stale)"
+            value = declared_value
+            if manifest_tiered:
+                # The tier is named whenever a manifest is present (spec §8):
+                # the loader's ONE origin spelling, with the cache caveat.
+                origin = container_sources.declared_origin_label(
+                    declared_tiers.get(name, container_sources.TIER_LEGACY),
+                    "cached",
+                    "possibly stale",
+                )
+            else:
+                origin = "declared (cached, possibly stale)"
         elif env_value:
             value, origin = env_value, "env-only"
         else:
@@ -1378,7 +1513,7 @@ def _display_sources_config_cli() -> None:
     name_width = max(len(r[0]) for r in rows)
     value_width = max(len(r[1]) for r in rows)
     print("---")
-    print("📚 Canonical Sources (sources.yaml):\n")
+    print("📚 Canonical Sources:\n")
     print(f"  declared: {declared_status}\n")
     for warning in load_warnings:
         # Scrub unconditionally, the same rule the rows below follow.
@@ -1437,6 +1572,36 @@ def _session_id_refusal(session: str) -> str | None:
     return None
 
 
+def _continuation_env(ns: argparse.Namespace) -> dict[str, str | None]:
+    """Environment handshake for schema-aware direct CLI continuation."""
+    selected = ns.session if ns.session else None
+    return {
+        "LMER_SESSION_ID": selected,
+        "LMER_SESSION_IS_SOURCE": "1" if selected else None,
+        "LMER_SOURCE_SESSION_ID": ns.source_session or None,
+        "LMER_ALLOW_UNSIGNED_SOURCE": (
+            ns.allow_unsigned_source if ns.allow_unsigned_source else None
+        ),
+        # A pre-minted execution uid, from the flag ONLY — the same flag-only
+        # rule as the entries above: a stale exported uid would make every
+        # launch of a container reuse one record's identity.
+        "LMER_LAUNCH_UID": getattr(ns, "launch_uid", None) or None,
+    }
+
+
+def _launch_session_metadata(
+    *, harness: str, model: str | None, effort: str | None, config: dict
+) -> dict:
+    """Compose host metadata through the shared session-record policy."""
+    return session_record.compose_launch_metadata(
+        session_record.provided_metadata(),
+        harness=harness,
+        model=model,
+        effort=effort,
+        config=config,
+    )
+
+
 def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     """Validate mutually exclusive / dependent options on a parsed namespace.
 
@@ -1462,9 +1627,50 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     if ns.no_task and not ns.exec_mode:
         error("--no-task requires --exec mode")
         return 2
+    # --repo names the repository explicitly (A1-wave0.host-export). The
+    # refusals that need the positional classified ('two repositories named')
+    # live in main(), where the classifier runs; these need only the flags.
+    if ns.repo is not None:
+        if not ns.repo.strip():
+            error("--repo requires a non-empty URL or path")
+            return 2
+        if ns.checkout:
+            error("Cannot specify both --repo and --checkout")
+            return 2
+        if ns.no_clone:
+            error("Cannot specify both --repo and --no-clone")
+            return 2
+        if ns.no_task:
+            error("--repo needs a task and is refused with --no-task")
+            return 2
+        if get_bool_env("LMER_NO_REPO"):
+            error("Cannot specify both --repo and LMER_NO_REPO")
+            return 2
     if not ns.no_task and not ns.task and not ns.show_env:
         error("Task type is required unless --no-task is specified")
         return 2
+    # --name / --goal are recorded by `work session-start` inside the
+    # container; the host refuses only what the container could not record
+    # (normalisation itself stays in the container, with `work name`).
+    if ns.run_name is not None:
+        if not ns.run_name.strip():
+            error("--name requires a non-empty value")
+            return 2
+        if "\n" in ns.run_name or "\r" in ns.run_name:
+            error("--name must be a single line (a run name is a kebab-case label)")
+            return 2
+    if ns.run_goal is not None and not ns.run_goal.strip():
+        error("--goal requires a non-empty value")
+        return 2
+    if ns.run_name is not None or ns.run_goal is not None:
+        if ns.no_task:
+            error("--name/--goal need a run to record them in and are refused with --no-task")
+            return 2
+        if ns.exec_mode:
+            warning(
+                "ℹ️  --name/--goal are recorded by work session-start; "
+                "this --exec command must run it for them to apply"
+            )
     if ns.service and not ns.checkout:
         error("--service requires --checkout (path to local source checkout)")
         return 2
@@ -1512,6 +1718,38 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
                 "(<project>/_runs/<slug>/<session-id>), never a path or a "
                 "pattern — copy one from `work sessions` or from the fleet "
                 "view's row for the run."
+            )
+            return 2
+    if getattr(ns, "launch_uid", None) is not None:
+        if ns.session:
+            error(
+                "--launch-uid cannot be combined with --session: a schema-1 "
+                "continuation already names the record it writes"
+            )
+            return 2
+        if session_record.UID_RE.fullmatch(ns.launch_uid or "") is None:
+            error(
+                f"--launch-uid {ns.launch_uid!r} is not a usable execution uid: "
+                "it must be 32 lowercase hex characters"
+            )
+            return 2
+    if ns.source_session is not None:
+        if ns.session:
+            error("--session and --source-session are mutually exclusive")
+            return 2
+        refusal = _session_id_refusal(ns.source_session)
+        if refusal is not None:
+            error(f"--source-session is not a usable session id: {refusal}")
+            return 2
+    if ns.allow_unsigned_source is not None:
+        selected_source = ns.source_session or ns.session
+        if not selected_source:
+            error("--allow-unsigned-source requires --session or --source-session")
+            return 2
+        if ns.allow_unsigned_source != selected_source:
+            error(
+                "--allow-unsigned-source must exactly match --session or --source-session; use the "
+                "source UID shown in the unsigned-session refusal"
             )
             return 2
     return None
@@ -2043,8 +2281,6 @@ def _handle_build(argv: list[str]) -> int:
     Returns:
         Exit code (0 for success, non-zero for errors)
     """
-    import argparse
-
     parser = argparse.ArgumentParser(prog="lmer build", description="Build the container image")
     parser.add_argument("--no-pull", action="store_true", help="Don't pass --pull to docker build (skip refreshing base image layers)")
     parser.add_argument("--force", action="store_true", help="Delete existing image before building")
@@ -2248,21 +2484,20 @@ def main(argv: list[str] | None = None) -> int:
     # Handle build subcommand early (before normal arg parsing)
     if argv and argv[0] == "build":
         return _handle_build(argv[1:])
+    if argv and argv[0] == "follow":
+        return follow_main(argv[1:])
     if argv and argv[0] == "rebuild":
         error("'lmer rebuild' has been renamed to 'lmer build'. Please use 'lmer build' instead.")
         return 1
     # The orchestrator platform (issue #141) owns its own argument grammar, so it
-    # is dispatched before task parsing like `build` is. Imported lazily: the
-    # daemon pulls in FastAPI/uvicorn, and every other lmer invocation should
-    # keep paying nothing for that.
+    # is dispatched before task parsing like `build` is.
     if argv and argv[0] == "platform":
+        # deferred: cycle — lmer_platform.daemon imports this module at top (via lmer_platform.api); only `lmer platform` needs it
         from lmer_platform.daemon import main as platform_main
 
         return platform_main(argv[1:])
 
     ns, rest = parse_args(argv)
-
-    from lmer_cli.env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
 
     inherited_env_sources = consume_env_defaults()
     if ns.verbose or ns.debug:
@@ -2373,6 +2608,13 @@ def main(argv: list[str] | None = None) -> int:
             _display_sources_config_cli()
         error(f"❌ {e}")
         return 2
+    # The platform daemon could not read its Codex seed and left the call to us,
+    # since only this point knows the harness (#544 item 7). Dropped either way so
+    # it never reaches the container.
+    seed_error = os.environ.pop(CODEX_SEED_ERROR_ENV, "").strip()
+    if seed_error and harness.name == "codex":
+        error(f"❌ {seed_error}; this session resolved the codex harness, which needs it")
+        return 2
     user_tag = " [user-installed]" if harness.source_dir is not None else ""
     if harness_source == "model":
         info(f"🤖 Harness: {harness.name}{user_tag} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
@@ -2420,8 +2662,18 @@ def main(argv: list[str] | None = None) -> int:
     # primary/secondary selection so the clone path (~repo resolution)
     # never sees them. Each claimed type is represented by a handler that
     # owns its type-specific behavior (see lmer_cli.targets).
+    if ns.stray_positionals and not ns.exec_mode:
+        error(f"❌ {len(ns.stray_positionals)} argument(s) after an option would be ignored: "
+              "put the task and every target before the options")
+        return 2
     _raw_targets: list[str] = ns.target if ns.target else []
     targets, special_targets = partition_targets(_raw_targets)
+    if ns.repo_url and not resolve.is_likely_url(ns.repo_url):
+        error("❌ --repo-url needs a repository URL (http(s)://, ssh://, git@ or file:///)")
+        return 2
+    if ns.repo_url and not targets and _raw_targets:
+        # The thread is then the target too; its handler still connects it.
+        targets = [_raw_targets[0]]
     primary_target: str | None = targets[0] if targets else None
     secondary_targets: list[str] = targets[1:] if len(targets) > 1 else []
 
@@ -2528,17 +2780,122 @@ def main(argv: list[str] | None = None) -> int:
     # targets whose handler allows repo-less mode for the selected task,
     # and no git origin can be inferred from cwd).
     no_repo_session = False
+    # What kind of target this session was given (spec §2, D2). `none` when
+    # there is no positional; a `special` target was partitioned out above.
+    target_class = classify_target(primary_target)
     if not skip_repo_resolve:
         cwd = Path.cwd()
 
-        # If task provides a PR/MR/issue URL, try to derive base repo URL
-        # Only use primary target for repo resolution
+        # --repo (spec §6.5) and --repo-url (#545) each name the repository;
+        # both at once name two.
+        if ns.repo and ns.repo_url:
+            error(
+                "❌ two repositories named: --repo "
+                f"{strip_url_credentials(ns.repo)} and --repo-url "
+                f"{strip_url_credentials(ns.repo_url)}"
+            )
+            return 2
+
+        # A non-URL positional that names an existing local checkout is the
+        # repository, exactly as before. The probe returns None for a target
+        # that names no filesystem entry, so a branch, a SHA, a shorthand or a
+        # document URL reaches the classifier instead of failing as a missing
+        # path; a target that names an existing entry which is not a checkout
+        # (a plain directory, a file) is refused, never read as a branch.
+        # Beside --repo-url the positional is only the task's target and is
+        # never probed as a local checkout (#545); one spelled as a path still
+        # classifies as a repository and is refused below.
+        if (
+            primary_target
+            and not ns.repo_url
+            and not resolve.is_likely_url(primary_target)
+        ):
+            try:
+                local_checkout = resolve.probe_local_repo(primary_target, cwd)
+            except resolve.NotACheckoutError as exc:
+                error(f"❌ {strip_url_credentials(str(exc))}")
+                return 2
+            if local_checkout is not None:
+                target_class = "repository"
+
+        # --repo names the repository explicitly, so it must BE one: a local
+        # path goes through the same probe, anything else through the shared
+        # classifier, and a non-repository value is refused rather than used
+        # as a clone URL that fails inside the container.
+        if ns.repo:
+            if not resolve.is_likely_url(ns.repo):
+                try:
+                    repo_checkout = resolve.probe_local_repo(ns.repo, cwd)
+                except resolve.NotACheckoutError as exc:
+                    error(f"❌ --repo {strip_url_credentials(str(exc))}")
+                    return 2
+                if repo_checkout is None:
+                    error(
+                        "❌ --repo "
+                        f"{strip_url_credentials(ns.repo)} names no existing "
+                        "path or repository URL"
+                    )
+                    return 2
+            elif classify_target(ns.repo) != "repository":
+                error(
+                    "❌ --repo "
+                    f"{strip_url_credentials(ns.repo)} is not a repository URL"
+                )
+                return 2
+
+        # --repo names the repository explicitly. It is refused beside a
+        # repository-class positional ('two repositories named'); the flag
+        # refusals that need no classification are in _validate_parsed_args.
+        named_repo = ns.repo or ns.repo_url
+        if named_repo and target_class == "repository":
+            flag = "--repo" if ns.repo else "--repo-url"
+            error(
+                "❌ two repositories named: the positional "
+                f"{strip_url_credentials(primary_target)} and {flag} "
+                f"{strip_url_credentials(named_repo)}"
+            )
+            return 2
+
+        # `other` is a URL that is neither a repository, a work item nor a
+        # known thread. Without --repo there is nothing to clone; with it the
+        # URL stays the session's target as context.
+        if target_class == "other" and not named_repo:
+            error(
+                "❌ not a repository, a work item or a known thread: "
+                f"{strip_url_credentials(primary_target)}. "
+                "Name its repository with --repo."
+            )
+            return 2
+
+        # If the task provides a PR/MR/issue URL, try to derive base repo URL.
+        # Only the primary target takes part in repo resolution.
         derived_repo_url = None
-        if primary_target and isinstance(primary_target, str):
+        if primary_target and target_class in ("work-item", "reference"):
             derived_repo_url = _derive_repo_url_from_task_target(primary_target)
 
         try:
-            target_to_resolve = derived_repo_url or (primary_target or "")
+            if ns.repo:
+                target_to_resolve = ns.repo
+            elif ns.repo_url:
+                # The target keeps its own identity; the clone is the named
+                # repository, not one derived from the target (#545).
+                target_to_resolve = ns.repo_url
+            elif target_class == "repository":
+                target_to_resolve = primary_target or ""
+            elif target_class in ("work-item", "reference"):
+                # The cwd-origin fallback is for a branch, a SHA or a shorthand
+                # (a non-URL work item). A URL that derives no repository is
+                # refused rather than silently cloning the cwd's origin.
+                if derived_repo_url is None and resolve.is_likely_url(primary_target):
+                    error(
+                        "❌ cannot derive a repository from "
+                        f"{strip_url_credentials(primary_target)}; "
+                        "name it with --repo"
+                    )
+                    return 2
+                target_to_resolve = derived_repo_url or ""
+            else:  # none
+                target_to_resolve = ""
             # With --checkout, target is optional (may not have a repo URL)
             if checkout_path and not target_to_resolve:
                 # No target and using checkout — resolve from the checkout's git remote
@@ -2551,6 +2908,11 @@ def main(argv: list[str] | None = None) -> int:
             if repo_url:
                 repo_url = _inject_gitlab_token_if_available(repo_url)
         except resolve.ResolveError as e:
+            if ns.repo:
+                # An explicit repository is never substituted: the repo-less
+                # fallback exists for an INFERRED repository, not a named one.
+                error(f"❌ {e}")
+                return 2
             if checkout_path:
                 # With --checkout, repo URL resolution failure is non-fatal
                 warning(f"⚠️  Could not resolve repo URL: {e}")
@@ -2661,7 +3023,10 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     gpu = gpu_grant_plan(runtime, scope)
-    _announce_resource_limits(limits, gpu)
+    # Resolved on the host for the same scope (#452): the session's gate only
+    # ever sees this one value, never the scoped spellings.
+    ci_baseline = resolve_gate_ci_baseline(scope)
+    _announce_resource_limits(limits, gpu, ci_baseline)
     run += base_run_args(runtime, exec_mode, container_user, limits, gpu)
 
     # In developer mode, mount local repo dirs into the container to override
@@ -2734,6 +3099,7 @@ def main(argv: list[str] | None = None) -> int:
     chat_uploads_container: str | None = None
     chat_uploads_host: Path | None = None
     if chat_connected and not ns.no_thread_connectors:
+        # deferred: import cost — only a chat-connected launch needs it; lmer_platform.uploads adds ~12 ms to every lmer launch
         from lmer_platform.uploads import CONTAINER_UPLOADS_DIR
 
         store_id = ns.session or f"chat-{os.getpid()}-{int(time.time())}"
@@ -3005,6 +3371,23 @@ def main(argv: list[str] | None = None) -> int:
         container_taskdef_dir = f"/Agents/global/taskdef/{task_id}" if task_id else None
         container_task_instructions = f"/Agents/global/taskdef/{task_id}/instructions.txt" if task_id else None
 
+    try:
+        launch_metadata = _launch_session_metadata(
+            harness=harness.name,
+            model=session_model,
+            effort=os.environ.get("LMER_REASONING_EFFORT"),
+            config={
+                "preset": os.environ.get("LMER_SESSION_PRESET"),
+                "agents": list(resolved_agents or {}),
+                "taskdef": task_id if not ns.no_task else None,
+                "service": service_start_name if service_mode else None,
+                "service_group": ns.service_group if service_mode else None,
+            },
+        )
+    except ValueError as exc:
+        error(f"❌ {exc}")
+        return 2
+
     # When a shared taskdef repo is configured it is cloned to /taskdef inside
     # the container; append it AFTER any external taskdef mounts so it lands
     # between the work-repo taskdefs and the lmer built-in (taskdef_search_dirs
@@ -3050,6 +3433,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_GITLAB_TOKEN_HOST": os.environ.get("LMER_GITLAB_TOKEN_HOST"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
         "LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET"),
+        session_record.METADATA_ENV: json.dumps(
+            launch_metadata, ensure_ascii=False, separators=(",", ":")
+        ),
         # No human attached (cron/scheduled launches): the AGENTS.md gates
         # report instead of asking when this is set. Never inferred from the
         # launch shape — only an explicit host value crosses over, while
@@ -3104,6 +3490,7 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_CONTAINER_RUNTIME": None,
         DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        "LMER_GATE_CI_BASELINE": ci_baseline[0],
         # User-installed harnesses (issue #132): where the host mounted
         # ~/.lmer/harnesses inside the container (consumed by
         # clone_and_exec.py runner dispatch, lmer-supervisor, and
@@ -3210,7 +3597,16 @@ def main(argv: list[str] | None = None) -> int:
         **gpg_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
-        "LMER_TASK_TARGET": primary_target if not ns.no_task else None,
+        # Empty (delivered as `LMER_TASK_TARGET=`, never absent) for a
+        # repository target (a local path or a bare repository URL) and for no
+        # target at all, so every slug copy derives the bare taskdef; the
+        # work-item, reference or `other` URL spelling otherwise. The class is
+        # the shared classifier's answer; `primary_target` itself is untouched.
+        "LMER_TASK_TARGET": (
+            container_task_target(primary_target, target_class)
+            if not ns.no_task
+            else None
+        ),
         "LMER_SESSION_KIND": os.environ.get("LMER_SESSION_KIND"),
         "LMER_WORKSPACE_ID": os.environ.get("LMER_WORKSPACE_ID"),
         "LMER_SECONDARY_TARGETS": ",".join(secondary_targets) if secondary_targets else None,
@@ -3259,6 +3655,15 @@ def main(argv: list[str] | None = None) -> int:
         # question-stop. Applied in-container by `work session-start` before
         # the brief prints.
         "LMER_ANSWER": ns.answer if ns.answer else None,
+        # A run's name and goal from the launch (`--name` / `--goal`), applied
+        # once in-container by `work session-start` on the call that opens
+        # the record's session. Sourced from the flags ONLY — no os.environ
+        # fallback, the LMER_ANSWER rule above: a name is one-shot launch
+        # data, and a stale export would name (or re-goal) every future run
+        # on the project. The None seeds block the .env merge below. A
+        # multi-line goal rides the `-e NAME` marker leg on its own.
+        "LMER_RUN_NAME": ns.run_name or None,
+        "LMER_RUN_GOAL": ns.run_goal or None,
         # The record this launch continues (issue #353 D22). Sourced from
         # --session ONLY — no os.environ fallback, and the reason is stronger
         # here than for the two flag-only entries above. LMER_SESSION_ID is
@@ -3271,7 +3676,7 @@ def main(argv: list[str] | None = None) -> int:
         # because clone_and_exec.mint_session_id mints with setdefault: an
         # empty string is a value it would NOT replace, and the launch would
         # run with no usable id and open no record at all.
-        "LMER_SESSION_ID": ns.session if ns.session else None,
+        **_continuation_env(ns),
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.
@@ -3289,6 +3694,8 @@ def main(argv: list[str] | None = None) -> int:
         # so host-set values reach the supervisor running inside the container.
         "LMER_AUTO_START_SETTLE_DELAY": os.environ.get("LMER_AUTO_START_SETTLE_DELAY"),
         "LMER_WINSIZE_RECHECK_DELAY": os.environ.get("LMER_WINSIZE_RECHECK_DELAY"),
+        # The Codex delivery adapter runs inside the container (issue #460).
+        "LMER_CODEX_RPC_TIMEOUT": os.environ.get("LMER_CODEX_RPC_TIMEOUT"),
         # Forward the harness-profile overrides for the injected start command
         # and the self-shutdown quit sequence — HARNESSES.md promises every
         # profile field can be patched via env without a release, which needs
@@ -3310,6 +3717,10 @@ def main(argv: list[str] | None = None) -> int:
         # whether it mirrors what a human types at the terminal (issue #407).
         "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": os.environ.get("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"),
+        "LMER_PLATFORM_ASSISTANT_NAME": os.environ.get("LMER_PLATFORM_ASSISTANT_NAME"),
+        # The worker's launch-time delegation to the assistant (issue #594),
+        # read by the orchestrator-ask prompt fragment.
+        "LMER_SUPERVISOR_AUTHORITY": os.environ.get("LMER_SUPERVISOR_AUTHORITY"),
         "LMER_COMMS_TERMINAL_MIRROR": os.environ.get("LMER_COMMS_TERMINAL_MIRROR"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
@@ -3472,6 +3883,12 @@ def main(argv: list[str] | None = None) -> int:
             error(f"❌ {exc}")
             return 2
 
+    # The CI-baseline evidence token reads as a Maintainer, CI/CD variable
+    # values included, so only a session whose baseline is on receives it.
+    if ci_baseline[0] != "1":
+        for name in [key for key in env if key.startswith(EVIDENCE_TOKEN_PREFIX)]:
+            del env[name]
+
     # Container environment. Values ride a mode-0600 --env-file (plus bare
     # -e NAME inheritance markers for the few that a line-oriented file
     # cannot carry), never argv — /proc/<pid>/cmdline is world-readable and
@@ -3496,7 +3913,27 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         previous_sigterm = None
     run += container_env.args
+    # The platform names the session and run it spawned; a plain CLI run has
+    # neither (#444).
+    platform_session = os.environ.get("LMER_PLATFORM_SESSION_ID") or None
+    run += container_labels(
+        repo_host=repo_host,
+        repo_project=repo_project,
+        run_slug=os.environ.get("LMER_PLATFORM_RUN_SLUG") or None,
+        platform_session=platform_session,
+        platform_instance=os.environ.get("LMER_PLATFORM_INSTANCE") or None,
+    )
+    name_slug = os.environ.get("LMER_PLATFORM_RUN_SLUG") or _cli_run_slug(
+        None if ns.no_task else task_id,
+        container_task_target(primary_target, target_class),
+    )
+    name = container_name(name_slug, platform_session)
+    run += ["--name", name]
+    cid_dir = None
     try:
+        cid_dir = Path(tempfile.mkdtemp(prefix="lmer-cid-"))
+        cid_file = cid_dir / "cid"
+        run += ["--cidfile", str(cid_file)]
         # Image name was resolved earlier (before ensure_image). Remember where
         # it lands: under keep-id the launch re-resolves it to an ID below and
         # substitutes it here, so the marker and the container name the same
@@ -3563,7 +4000,7 @@ def main(argv: list[str] | None = None) -> int:
                     chat_uploads_host, chat_uploads_container, task_id,
                 )
 
-        success(f"🚀 Launching container ({runtime} run {image})")
+        success(f"🚀 Launching container {name} ({runtime} create {image})")
         # Warn when this launch faces the remap, which is a question about the
         # IMAGE and not about this process: `lmer build` then a separate spawn
         # is cold with materialized=False, and that is the longest wait there
@@ -3598,7 +4035,35 @@ def main(argv: list[str] | None = None) -> int:
                 "minutes)"
             )
         try:
-            rc = subprocess.call(run, env=container_env.subprocess_env())
+            try:
+                rc, container, name = create_container(
+                    runtime, run, cid_file,
+                    rename=lambda: container_name(name_slug, platform_session, retry=True),
+                    env=container_env.subprocess_env(),
+                )
+            finally:
+                # The runtime has read the env file once create returns, so the
+                # secrets in it need not outlive this call (#444).
+                container_env.cleanup()
+            # podman pays the keep-id remap while create builds the container's
+            # storage, so a successful create is the evidence the marker needs.
+            if keep_id and rc == 0:
+                record_remap(launch_image_id)
+            if rc != 0:
+                if container:
+                    remove_container(runtime, container)
+            elif not container:
+                error(f"❌ {runtime} create reported success but no container id")
+                return 125
+            else:
+                _record_platform_facts(container={"id": container, "name": name})
+                # 125 from here means the start never ran — where a runtime
+                # rejects a GPU it cannot grant.
+                rc = follow_container(
+                    runtime, container, started=False, interactive=sys.stdin.isatty(),
+                    detach_note=_detach_note(announce_session, special_targets, thread_servicer),
+                    name=name,
+                )
             if gpu.value and rc == 125:
                 error(
                     "❌ The GPU-enabled container invocation failed before its "
@@ -3606,16 +4071,13 @@ def main(argv: list[str] | None = None) -> int:
                     "without the requested GPU."
                 )
                 error(f"   To fix GPU support, {gpu_remediation(runtime)}.")
-            # 125 is podman failing before the container ran, which is the one
-            # exit status that says nothing about whether the remap was paid.
-            # A negative status is subprocess's spelling for "the client died
-            # on a signal" — killed mid-remap, it is likewise no evidence the
-            # chown finished (!309 adversarial review, F5). Both err toward
-            # re-printing the notice, which this module prefers over silence.
-            if keep_id and rc >= 0 and rc != 125:
-                record_remap(launch_image_id)
             return rc
         except KeyboardInterrupt:
+            # Interrupted mid-create, or a Ctrl-C that escaped the follow: a
+            # container may exist that nothing will follow any more.
+            container = read_container_id(cid_file)
+            if container:
+                remove_container(runtime, container)
             return 130
         finally:
             if announce_session:
@@ -3630,8 +4092,34 @@ def main(argv: list[str] | None = None) -> int:
         # guaranteed to still exist, and the reaper's ladder makes a second
         # SIGTERM unexceptional.
         container_env.cleanup()
+        if cid_dir is not None:
+            shutil.rmtree(cid_dir, ignore_errors=True)
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def _detach_note(announce_session, special_targets, thread_servicer) -> str | None:
+    """What a detach costs a session whose thread services this process hosts:
+    they stop with it, and `lmer follow` does not restart them."""
+    hosting = announce_session and (
+        thread_servicer is not None
+        or any(getattr(h, "hosts_connectors", False) for h in special_targets)
+    )
+    if not hosting:
+        return None
+    return (
+        "this session's Slack/Matrix thread connection and `lmer-signal` thread "
+        "service end with this process; the agent keeps running without them"
+    )
+
+
+def _cli_run_slug(task: str | None, target: str | None) -> str | None:
+    """The run slug the container will derive for itself, for a CLI run's
+    container name; ``None`` for a run with no task."""
+    if not task:
+        return None
+
+    return derive_slug(task, target or "")
 
 
 if __name__ == "__main__":

@@ -631,16 +631,18 @@ class _Tracked:
     """
 
     def __init__(self, slug, *, host="gitlab.example.com", project="agents/global",
-                 taskdef=None, target=None, last_seen=None, last_session_id=None):
+                 taskdef=None, target=None, last_seen=None, last_session_id=None,
+                 uid=None):
         self.host = host
         self.project = project
         self.slug = slug
+        self.uid = uid
         self.taskdef = taskdef
         self.target = target
         self.last_seen = last_seen
         self.last_session_id = last_session_id
         self.first_seen = last_seen
-        self.key = f"{host}/{project}/{slug}"
+        self.key = f"{host}/{project}/{uid or slug}"
 
 
 def test_tracked_run_without_a_dir_gets_a_row(tmp_path):
@@ -892,6 +894,8 @@ SESSION_FIELD_READERS = {
               "the record that decides crashed-vs-dormant beside a wind-down mark",
     "activity": "RunCard.vue: 'idle 22m' beside the run's age (idle_seconds), "
                 "with last_output_at as its tooltip",
+    "container_name": "RunDetail.vue: the live-session card's container, the name "
+                      "to give `podman ps` or `lmer follow` (#444)",
 }
 
 #: Stands in for the token file's path, which is what the entry carries — the
@@ -916,6 +920,7 @@ def full_entry(**extra):
         control={"host": "127.0.0.1", "port": 8931, "token_ref": TOKEN_REF},
         transcript={"path": "/home/dev/.claude/projects/-work/abc.jsonl"},
         container_id="9f3ca1b2c3d4",
+        container_name="lmer-r1-ff2b",
         slot="slot-1",
         ports=[{"host": 30021, "container": 3000}],
         log_path="/home/dev/.lmer/platform/logs/s-full.log",
@@ -989,6 +994,7 @@ def test_the_detail_view_still_gets_every_field_it_reads(tmp_path, platform_root
     assert block["started_at"] == entry["started_at"]
     assert block["log_path"] == "/home/dev/.lmer/platform/logs/s-full.log"
     assert block["lifecycle"]["verb"] == "wind_down"
+    assert block["container_name"] == "lmer-r1-ff2b"
 
 
 @pytest.mark.parametrize("exited, served", [
@@ -2449,3 +2455,128 @@ def test_a_tracked_schema_form_run_with_no_dir_still_has_no_rel_path(tmp_path):
     assert run.state == "dormant"
     assert run.rel_path is None
     assert run.to_dict()["rel_path"] is None
+
+
+# --- the key segment (spec §6.1, A2.fleet) -----------------------------------
+#
+# A schema-2 launch is keyed by its execution uid; its slug only names the
+# group. Two launches of one ``_runs/chat/`` group are two runs, so the fleet
+# joins sessions, records, titles and the tracked index by (host, project, uid)
+# and never by the shared slug. A ref is paired with the tracked entry that
+# resolved it, so a slug-keyed entry is never re-keyed from its directory name.
+
+UID_ONE = "1" * 32
+UID_TWO = "2" * 32
+
+
+def uid_session(uid, *, slug="chat", live=True):
+    entry = session(slug, live=live, project="acme/widgets")
+    entry["id"] = f"s-{uid[:4]}"
+    entry["run"] = {**entry["run"], "uid": uid}
+    return entry
+
+
+def test_two_uid_rows_in_one_group_stay_two_rows(tmp_path):
+    one = plant_session_run(
+        tmp_path, "chat", session_id=UID_ONE,
+        state_yaml=state_yaml(status="in-progress", goal="the first chat"),
+    )
+    two = plant_session_run(
+        tmp_path, "chat", session_id=UID_TWO,
+        state_yaml=state_yaml(status="in-progress", goal="the second chat"),
+    )
+    first = _Tracked("chat", project="acme/widgets", uid=UID_ONE, last_session_id="s-old1")
+    second = _Tracked("chat", project="acme/widgets", uid=UID_TWO, last_session_id="s-old2")
+
+    inv = inventory.build_inventory(
+        [(first, one), (second, two)],
+        [uid_session(UID_ONE), uid_session(UID_TWO)],
+        tracked=[first, second],
+        titles={
+            f"gitlab.example.com/acme/widgets/{UID_ONE}": "first title",
+            f"gitlab.example.com/acme/widgets/{UID_TWO}": "second title",
+        },
+        activity={},
+    )
+
+    rows = {run.uid: run for run in inv.runs}
+    assert len(inv.runs) == 2, [r.to_dict() for r in inv.runs]
+    assert set(rows) == {UID_ONE, UID_TWO}
+    assert rows[UID_ONE].goal == "the first chat"
+    assert rows[UID_TWO].goal == "the second chat"
+    assert rows[UID_ONE].session["id"] == f"s-{UID_ONE[:4]}"
+    assert rows[UID_TWO].session["id"] == f"s-{UID_TWO[:4]}"
+    assert rows[UID_ONE].title == "first title"
+    assert rows[UID_TWO].title == "second title"
+    assert rows[UID_ONE].slug == rows[UID_TWO].slug == "chat"
+    assert rows[UID_ONE].to_dict()["uid"] == UID_ONE
+    assert all(run.state == "running" for run in inv.runs)
+
+
+def test_a_uid_tracked_entry_without_a_record_is_its_own_row(tmp_path):
+    """Its uid sibling's record and session must not swallow it."""
+    one = plant_session_run(
+        tmp_path, "chat", session_id=UID_ONE,
+        state_yaml=state_yaml(status="in-progress"),
+    )
+    first = _Tracked("chat", project="acme/widgets", uid=UID_ONE)
+    second = _Tracked("chat", project="acme/widgets", uid=UID_TWO, last_session_id="s-2")
+
+    inv = inventory.build_inventory(
+        [(first, one)], [uid_session(UID_ONE)], tracked=[first, second], activity={},
+    )
+
+    rows = {run.uid: run for run in inv.runs}
+    assert set(rows) == {UID_ONE, UID_TWO}
+    assert rows[UID_TWO].state == "dormant"
+    assert rows[UID_TWO].session is None
+    assert rows[UID_TWO].session_id_for_history == "s-2"
+
+
+def test_a_slug_keyed_entry_is_not_rekeyed_by_the_record_it_resolved(tmp_path):
+    """Pre-transition: the entry resolved to a schema-2 record by slug, and the
+    row stays keyed by the slug the entry carries — the directory's uid is not
+    adopted here, so the row still joins its slug-keyed session and title."""
+    ref = plant_session_run(
+        tmp_path, "chat", session_id=UID_ONE,
+        state_yaml=state_yaml(status="in-progress"),
+    )
+    ref = RunDirRef(
+        host=ref.host, project=ref.project, slug=ref.slug, path=ref.path,
+        dir_name=ref.dir_name, address=ref.address, uid=UID_ONE,
+    )
+    entry = _Tracked("chat", project="acme/widgets")
+    live = session("chat", project="acme/widgets")
+
+    inv = inventory.build_inventory(
+        [(entry, ref)], [live], tracked=[entry],
+        titles={"gitlab.example.com/acme/widgets/chat": "slug title"}, activity={},
+    )
+
+    assert len(inv.runs) == 1
+    run = inv.runs[0]
+    assert run.uid is None
+    assert run.title == "slug title"
+    assert run.session["id"] == "s-chat"
+
+
+def test_a_schema_1_row_is_unchanged_and_carries_no_uid(tmp_path):
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = _Tracked("r1", last_session_id="s-old")
+
+    for refs in ([ref], [(entry, ref)]):
+        inv = inventory.build_inventory(refs, [session("r1")], tracked=[entry], activity={})
+        assert len(inv.runs) == 1
+        run = inv.runs[0]
+        assert run.slug == "r1"
+        assert run.uid is None
+        assert run.to_dict()["uid"] is None
+        assert run.session["id"] == "s-r1"
+
+
+def test_a_uid_session_with_no_record_is_its_own_row(tmp_path):
+    inv = inventory.build_inventory(
+        [], [uid_session(UID_ONE), uid_session(UID_TWO)], activity={},
+    )
+    assert sorted(run.uid for run in inv.runs) == [UID_ONE, UID_TWO]
+    assert {run.slug for run in inv.runs} == {"chat"}

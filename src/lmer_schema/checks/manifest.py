@@ -1,6 +1,6 @@
 """Manifest-envelope checks — the validator's first check module (spec §4/§7).
 
-This module answers one question: is the ``_plexus.yaml`` at the root of this
+This module answers one question: is the ``_lmer.yaml`` at the root of this
 tree a manifest lmer can use, and what should the operator know about it? It
 checks the ENVELOPE — presence, parseability, the ``schema:`` int in both
 directions, ``name:``, unknown keys, the ``sources:`` mounts and the
@@ -100,7 +100,7 @@ register(
     Severity.INFO,
     tier=Tier.LEGACY,
     summary=(
-        "no `_plexus.yaml` at the plexus root: the tree is legacy form, "
+        "no `_lmer.yaml` at the plexus root: the tree is legacy form, "
         "recognised and read in place (never an error)"
     ),
 )
@@ -109,7 +109,7 @@ register(
     Severity.ERROR,
     tier=Tier.MACHINE,
     summary=(
-        "a present `_plexus.yaml` that cannot be read or interpreted "
+        "a present `_lmer.yaml` that cannot be read or interpreted "
         "(unusable input: a broken manifest never demotes a tree to legacy)"
     ),
 )
@@ -294,7 +294,9 @@ def _report_broken(report, path, exc) -> None:
         finding = schema_finding(raw.get("schema"))
         if finding is not None:
             report.add(finding[0], _MANIFEST_PATH, finding[1])
-            diagnosed = True
+            # An older supported version is a warning, not the reason this
+            # document failed to parse. Keep the underlying error visible.
+            diagnosed = finding[0] != "manifest.schema-older"
         name = raw.get("name")
         if not isinstance(name, str) or not name:
             report.add(
@@ -397,10 +399,10 @@ def _check_sources(report, manifest, plexus_repo_url) -> None:
             _unknown_key(report, where)
             continue
         # Per NAME: `ref:` is taskdef's alone (SCHEMA.md sources table), and
-        # `load_sources` refuses it under any other name at start. The
-        # manifest tier is declared-only until its loader lands (issue #370),
-        # so an unwarned `sources.napkin.ref` does nothing at all today and
-        # refuses to start the day it does.
+        # `load_sources` refuses it under any other name at start — at the
+        # manifest tier too, since its loader landed (issue #370): a
+        # `sources.napkin.ref` here is a tree that refuses to start, so this
+        # warning is the operator's advance notice.
         _unknown_entry_keys(report, where, entry, core.source_entry_keys(name))
 
         repo = entry.get("repo")

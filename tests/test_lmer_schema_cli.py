@@ -29,24 +29,45 @@ depends on:
 - the console entry ``lmer-schema = lmer_schema.cli:main`` really resolving,
   and ``main(argv)`` being callable with a list so none of this needs a
   subprocess. ``python -m lmer_schema.cli`` is the same command before an
-  editable reinstall puts the script on PATH.
+  editable reinstall puts the script on PATH;
+- ``index PATH [--write] [--diff] [--json]``, the backfill of the generated
+  README index blocks (the legible-work-repo design): one action per file
+  (``create``, ``update``, ``unchanged``, ``refused`` with its reason), exit
+  ``0`` when nothing is pending or everything was written, ``1`` for a dry
+  run with pending changes or any refused file, ``2`` for a tree it cannot
+  index (legacy form, an unreadable manifest, not a directory); a write runs
+  under the checkout's mutation lock and never commits; on a git checkout the
+  rows are the tracked records and an ignored README is refused, exactly as
+  the publication choke point behaves. The git calls those tests drive go
+  through the shared fixture helpers, so their budgets are the suite's.
 """
 
 import importlib
 import json
 import re
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import yaml
 
 from lmer_schema.checks import CHECKS, Form, Report, Severity, Tier
+from lmer_schema.checks import walk
 from lmer_schema.checks.findings import EXIT_CLEAN, EXIT_ERRORS, EXIT_UNUSABLE
 from lmer_schema.checks.record import STALE_AFTER_SECONDS
-from lmer_schema.manifest import CURRENT_SCHEMA, SUPPORTED_SCHEMAS
+from lmer_schema.manifest import CURRENT_SCHEMA, SUPPORTED_SCHEMAS, load_manifest
 from lmer_schema import cli
 from tests import plexus_fixtures as pf
+from tests.schema2_fixtures import (
+    RecordSpec,
+    build_schema2_plexus,
+    git,
+    isolate_git,
+    stamp,
+    uid_for,
+)
+from work_repo import project_index as pi
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -176,8 +197,10 @@ class TestUsage:
             ("validate",),           # validate needs its path
             ("nonsense",),           # not a command
             ("--list-checks", "validate", "."),  # the inventory takes no command
+            ("index",),              # index needs its path too
         ],
-        ids=["no-command", "no-path", "unknown-command", "list-checks-with-command"],
+        ids=["no-command", "no-path", "unknown-command", "list-checks-with-command",
+             "index-no-path"],
     )
     def test_a_bad_invocation_is_exit_2_on_stderr(self, capsys, argv):
         code, out, err = _run(capsys, *argv)
@@ -338,10 +361,11 @@ class TestJsonDocument:
         assert isinstance(doc["unusable"], str) and doc["unusable"]
         assert [f["code"] for f in doc["findings"]] == ["runner.no-such-path"]
 
-    def test_a_clean_tree_is_an_empty_finding_list(self, capsys, schema_plexus):
+    def test_schema_one_has_only_the_upgrade_warning(self, capsys, schema_plexus):
         _code, doc, _err = _json(capsys, "validate", str(schema_plexus.root), "--json")
         assert doc["unusable"] is None
-        assert doc["counts"]["error"] == doc["counts"]["warn"] == 0
+        assert doc["counts"]["error"] == 0
+        assert [f["code"] for f in doc["findings"] if f["severity"] == "WARN"] == ["manifest.schema-older"]
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +435,8 @@ class TestTextOutput:
         # "Clean" is about severity, not silence: the fixture's host bucket is
         # listed (informational) and the tree is conformant all the same.
         _code, out, _err = _run(capsys, "validate", str(schema_plexus.root))
-        assert {severity for _n, severity, _c, _p in _entries(out)} <= {"INFO"}
+        assert [(severity, code) for _n, severity, code, _p in _entries(out)
+                if severity != "INFO"] == [("WARN", "manifest.schema-older")]
         assert "conformant" in out.lower()
         assert "not conformant" not in out.lower()
 
@@ -462,6 +487,13 @@ class TestTextOutput:
 
 
 class TestListChecks:
+    def test_the_inventory_has_sixty_two_rows(self, capsys):
+        # The count SCHEMA-GUIDE §5 quotes: 59 before the two README index
+        # codes (`index.readme-missing`, `index.readme-stale`), 62 with them
+        # and `record.plain-session-slug`.
+        _code, out, _err = _run(capsys, "--list-checks")
+        assert len([line for line in out.splitlines() if line.strip()]) == 62
+
     def test_one_row_per_registered_code_in_code_order(self, capsys):
         code, out, err = _run(capsys, "--list-checks")
         assert code == EXIT_CLEAN
@@ -503,19 +535,16 @@ class TestListChecks:
         assert "ERROR" in row
         assert "WARN" in row
 
-    def test_an_unreachable_code_is_flagged_not_advertised(self, capsys):
-        # At schema 1 `SUPPORTED_SCHEMAS == (1,)`: nothing older is supported,
-        # so `manifest.schema-older` cannot fire (an older int is unsupported
-        # input, exit 2). The inventory must not promise that WARN.
-        assert not any(value < CURRENT_SCHEMA for value in SUPPORTED_SCHEMAS)
+    def test_older_schema_warning_is_reachable(self, capsys):
+        assert any(value < CURRENT_SCHEMA for value in SUPPORTED_SCHEMAS)
         _code, out, _err = _run(capsys, "--list-checks")
         row = next(line for line in out.splitlines() if line.startswith("manifest.schema-older"))
-        assert "unreachable" in row
+        assert "unreachable" not in row
 
     def test_reachable_codes_are_not_flagged(self, capsys):
         _code, out, _err = _run(capsys, "--list-checks")
         flagged = [line for line in out.splitlines() if "unreachable" in line]
-        assert [line.split()[0] for line in flagged] == ["manifest.schema-older"]
+        assert flagged == []
 
     def test_the_json_inventory_is_the_registry_document(self, capsys):
         code, doc, _err = _json(capsys, "--list-checks", "--json")
@@ -531,11 +560,10 @@ class TestListChecks:
             assert entry["legacy"] == registered.legacy.value
             assert entry["tier"] == registered.tier.value
 
-    def test_the_json_inventory_marks_the_unreachable_code(self, capsys):
+    def test_the_json_inventory_has_no_unreachable_codes(self, capsys):
         _code, doc, _err = _json(capsys, "--list-checks", "--json")
         unreachable = {e["code"]: e["unreachable"] for e in doc["checks"] if e["unreachable"]}
-        assert set(unreachable) == {"manifest.schema-older"}
-        assert str(CURRENT_SCHEMA) in unreachable["manifest.schema-older"]
+        assert unreachable == {}
 
 
 # ---------------------------------------------------------------------------
@@ -818,3 +846,756 @@ class TestTheCodeTableMatchesTheDocument:
             f"{sorted(filled)}, but the tier-sensitive codes (D14) are "
             f"{sorted(sensitive)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# `migrate`: the verb the cutover docs prescribe running before `--apply`
+# ---------------------------------------------------------------------------
+
+
+def _schema_one_tree(tmp_path, *, in_progress):
+    """A schema-1 tree with one record; ``in_progress`` makes it a blocker
+    (no recorded sign-out, so the cutover must refuse)."""
+    root = tmp_path / "plexus"
+    record = root / "widgets" / "_runs" / "chat" / "20260917-120000-1-7"
+    record.mkdir(parents=True)
+    (root / "_lmer.yaml").write_text(
+        "schema: 1\nname: example\nprojects:\n  widgets:\n"
+        "    repo: git.example.test/acme/widgets\n",
+        encoding="utf-8",
+    )
+    status = "in-progress" if in_progress else "complete"
+    (record / "state.yaml").write_text(f"schema: 1\nstatus: {status}\n", encoding="utf-8")
+    return root
+
+
+def _tree_bytes(root):
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+class TestMigrate:
+    """The CLI wrapper around ``lmer_schema.migration.migrate``: the library
+    is covered by ``tests/test_schema_v2_migration.py``; what these pin is the
+    verb's exit code and output on each outcome — a blocked preview crashing
+    with a ``NameError`` shipped green because nothing drove the verb here."""
+
+    @pytest.mark.parametrize("extra", [(), ("--json",), ("--apply",)], ids=["text", "json", "apply"])
+    def test_a_blocked_preview_reports_the_blocker_and_exits_errors(self, capsys, tmp_path, extra):
+        root = _schema_one_tree(tmp_path, in_progress=True)
+        before = _tree_bytes(root)
+        code, out, err = _run(capsys, "migrate", str(root), *extra)
+        assert code == EXIT_ERRORS
+        assert "Traceback" not in err and "NameError" not in err
+        if "--json" in extra:
+            doc = json.loads(out)
+            assert doc["applied"] is False
+            assert any("sign-out" in blocker for blocker in doc["blockers"])
+        else:
+            assert "Blocked:" in out and "sign-out" in out
+            assert "Schema 2 applied" not in out
+        assert _tree_bytes(root) == before, "a blocked preview must write nothing"
+
+    def test_an_unblocked_preview_is_clean_and_writes_nothing(self, capsys, tmp_path):
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        before = _tree_bytes(root)
+        code, out, _err = _run(capsys, "migrate", str(root))
+        assert code == EXIT_CLEAN
+        assert "+schema: 2" in out and "Preview only" in out
+        assert _tree_bytes(root) == before
+
+    def test_apply_changes_only_the_version_and_reports_clean(self, capsys, tmp_path):
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        before = _tree_bytes(root)
+        code, out, _err = _run(capsys, "migrate", str(root), "--apply")
+        assert code == EXIT_CLEAN
+        assert "Schema 2 applied locally." in out
+        after = _tree_bytes(root)
+        manifest = Path("_lmer.yaml")
+        assert after[manifest] == before[manifest].replace(b"schema: 1", b"schema: 2")
+        assert {k: v for k, v in after.items() if k != manifest} == {
+            k: v for k, v in before.items() if k != manifest
+        }
+
+    def test_a_tree_without_a_manifest_is_unusable_input(self, capsys, tmp_path):
+        code, _out, err = _run(capsys, "migrate", str(tmp_path))
+        assert code == EXIT_UNUSABLE
+        assert "Migration refused" in err
+
+    def test_the_preview_prints_each_directory_move_and_blocks(self, capsys, tmp_path):
+        from tests import plexus_fixtures as pf
+
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        pf.plant_plain_session_records(root / "widgets")
+        code, out, _err = _run(capsys, "migrate", str(root))
+        assert code == EXIT_ERRORS
+        assert out.count("Directory move:") == len(pf.PLAIN_SESSION_GROUPS)
+        for _taskdef, _target, slug in pf.PLAIN_SESSION_GROUPS:
+            assert slug in out
+        assert "Blocked:" in out and "work migrate" in out
+        assert "Directory moves: none" not in out
+
+
+# ---------------------------------------------------------------------------
+# `index`: the backfill of the generated README index blocks
+# ---------------------------------------------------------------------------
+
+#: One per-file action line of an `index` run: the action, the repo-relative
+#: path, then either the `(+N -M)` line delta or ` — <reason>` for a refusal.
+INDEX_LINE_RE = re.compile(
+    r"^(create|update|unchanged|refused)\s+(\S+)(?: \(\+(\d+) -(\d+)\))?(?: — (.+))?$"
+)
+
+WROTE_LINE = "not committed — publish through the normal process (in a session: work commit)"
+#: The summary tail when the root README is among the written files: no
+#: session's push stages the root, so `work commit` would leave it behind.
+WROTE_ROOT_LINE = (
+    "not committed — commit the root README.md explicitly through the normal gated commit "
+    "(work commit publishes project READMEs only)"
+)
+
+FIRST = RecordSpec(uid=uid_for(1, "cli"), slug="chat", started_at=stamp(1),
+                   updated=stamp(1, 11), name="first-run")
+SECOND = RecordSpec(uid=uid_for(2, "cli"), slug="chat", started_at=stamp(2),
+                    updated=stamp(2, 11), name="second-run")
+
+
+@pytest.fixture
+def index_tree(tmp_path):
+    """A schema-2 tree: `widgets` holds one record, `gadgets` is registered
+    and empty, and no README exists anywhere yet."""
+    return build_schema2_plexus(tmp_path / "plexus", {"widgets": [FIRST], "gadgets": []})
+
+
+def _index_lines(text):
+    """``{path: (action, added, removed, reason)}`` from an `index` run's output."""
+    found = {}
+    for line in text.splitlines():
+        match = INDEX_LINE_RE.match(line)
+        if match:
+            action, rel, added, removed, reason = match.groups()
+            found[rel] = (
+                action,
+                None if added is None else int(added),
+                None if removed is None else int(removed),
+                reason,
+            )
+    return found
+
+
+def _actions(text):
+    return {rel: entry[0] for rel, entry in _index_lines(text).items()}
+
+
+def _checkout(tree, monkeypatch, tmp_path):
+    """Turn the built tree into a git checkout with the manifest and the
+    `widgets` records committed; whatever is added afterwards is untracked."""
+    isolate_git(monkeypatch, tmp_path)
+    git(tree.root, "init", "-q", "--initial-branch=main")
+    git(tree.root, "add", "--", "_lmer.yaml", "widgets")
+    git(tree.root, "commit", "-q", "-m", "fixture")
+
+
+class TestIndexDryRun:
+    def test_a_dry_run_lists_every_file_exits_1_and_writes_nothing(self, capsys, index_tree):
+        before = _tree_bytes(index_tree.root)
+        code, out, err = _run(capsys, "index", str(index_tree.root))
+        assert code == EXIT_ERRORS
+        assert err == ""
+        lines = _index_lines(out)
+        assert list(lines) == ["README.md", "widgets/README.md", "gadgets/README.md"]
+        for rel, (action, added, removed, reason) in lines.items():
+            assert action == "create", rel
+            assert added > 0 and removed == 0, rel
+            assert reason is None
+        assert "Preview only. Re-run with --write to write 3 file(s)." in out
+        assert WROTE_LINE not in out and WROTE_ROOT_LINE not in out
+        assert _tree_bytes(index_tree.root) == before
+
+    def test_the_root_comes_first_then_the_registered_projects_in_manifest_order(
+        self, capsys, index_tree
+    ):
+        _code, out, _err = _run(capsys, "index", str(index_tree.root))
+        assert list(_index_lines(out)) == ["README.md", "widgets/README.md", "gadgets/README.md"]
+
+    def test_diff_prints_a_unified_diff_per_changed_file(self, capsys, index_tree):
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--diff")
+        assert code == EXIT_ERRORS
+        for rel in ("README.md", "widgets/README.md", "gadgets/README.md"):
+            assert f"--- a/{rel}" in out and f"+++ b/{rel}" in out
+        assert f"+{pi.START_MARKER}" in out
+        assert f"+{pi.END_MARKER}" in out
+        rows = [line for line in out.splitlines() if line.startswith("+| ")]
+        assert any(f"[{FIRST.name}](_runs/chat/{FIRST.uid}/)" in row for row in rows)
+
+    def test_a_dry_run_prints_no_diff_without_the_flag(self, capsys, index_tree):
+        _code, out, _err = _run(capsys, "index", str(index_tree.root))
+        assert "+++ b/" not in out
+        assert pi.START_MARKER not in out
+
+    def test_a_dry_run_takes_no_lock(self, capsys, index_tree, monkeypatch):
+        from work_repo import transactions
+
+        monkeypatch.setattr(
+            transactions, "work_mutation",
+            lambda tree=None: pytest.fail("a dry run must not take the checkout lock"),
+        )
+        assert cli.main(["index", str(index_tree.root)]) == EXIT_ERRORS
+        capsys.readouterr()
+
+    def test_an_update_reports_its_line_delta(self, capsys, index_tree):
+        assert cli.main(["index", str(index_tree.root), "--write"]) == EXIT_CLEAN
+        capsys.readouterr()
+        index_tree.add("widgets", SECOND)
+        code, out, _err = _run(capsys, "index", str(index_tree.root))
+        assert code == EXIT_ERRORS
+        lines = _index_lines(out)
+        assert lines["widgets/README.md"] == ("update", 1, 0, None)
+        assert lines["README.md"] == ("unchanged", 0, 0, None)
+        assert lines["gadgets/README.md"] == ("unchanged", 0, 0, None)
+        assert "Preview only. Re-run with --write to write 1 file(s)." in out
+
+
+class TestIndexWrite:
+    def test_write_writes_every_file_and_a_second_run_is_all_unchanged(
+        self, capsys, index_tree
+    ):
+        code, out, err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert err == ""
+        assert set(_actions(out).values()) == {"create"}
+        assert f"Wrote 3 file(s); {WROTE_ROOT_LINE}" in out
+        for rel in ("README.md", "widgets/README.md", "gadgets/README.md"):
+            text = (index_tree.root / rel).read_text(encoding="utf-8")
+            assert pi.extract_block(text) is not None, rel
+        after = _tree_bytes(index_tree.root)
+        code, out, _err = _run(capsys, "index", str(index_tree.root))
+        assert code == EXIT_CLEAN
+        assert set(_actions(out).values()) == {"unchanged"}
+        assert "Nothing to write" in out
+        assert "Preview only" not in out
+        assert _tree_bytes(index_tree.root) == after
+
+    def test_write_on_an_up_to_date_tree_writes_nothing_and_says_so(self, capsys, index_tree):
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        before = _tree_bytes(index_tree.root)
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert "Nothing to write" in out
+        assert "Wrote" not in out
+        assert _tree_bytes(index_tree.root) == before
+
+    def test_a_written_root_readme_is_sent_to_an_explicit_gated_commit(self, capsys, index_tree):
+        """`work commit` stages records, specs, memory and project READMEs,
+        never the root README, so a summary that sent a written root to
+        `work commit` would let the file vanish with the container. Only the
+        run that wrote the root says to commit it explicitly."""
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert _actions(out)["README.md"] == "create"
+        assert f"Wrote 3 file(s); {WROTE_ROOT_LINE}" in out.splitlines()
+        assert WROTE_LINE not in out
+
+        index_tree.add("widgets", SECOND)
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert _actions(out) == {
+            "README.md": "unchanged", "widgets/README.md": "update", "gadgets/README.md": "unchanged",
+        }
+        assert f"Wrote 1 file(s); {WROTE_LINE}" in out.splitlines()
+        assert "root README.md" not in out
+
+    def test_the_written_project_readme_is_the_kernels_render(self, capsys, index_tree):
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        readme = index_tree.readme("widgets")
+        text = readme.read_text(encoding="utf-8")
+        assert text.startswith("# widgets\n\n")
+        assert pi.extract_block(text) == pi.render_project_block(
+            pi.scan_project(index_tree.project_dir("widgets"))
+        )
+        assert text == pi.render_project_readme(index_tree.project_dir("widgets"), heading="widgets")
+        assert f"| [{FIRST.name}](_runs/chat/{FIRST.uid}/)" in text
+
+    def test_a_registered_project_without_records_gets_the_zero_record_readme(
+        self, capsys, index_tree
+    ):
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        text = index_tree.readme("gadgets").read_text(encoding="utf-8")
+        assert text.startswith("# gadgets\n\n")
+        assert pi.EMPTY_BODY in pi.extract_block(text)
+
+    def test_the_root_readme_carries_the_manifest_render(self, capsys, index_tree):
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        text = (index_tree.root / "README.md").read_text(encoding="utf-8")
+        document = load_manifest(index_tree.root).document
+        assert text == pi.render_root_readme(index_tree.root, document)
+        assert text.startswith(f"# {document['name']}\n\n")
+        assert pi.extract_block(text) == pi.render_root_block(document)
+        assert text.index("| [widgets](widgets/)") < text.index("| [gadgets](gadgets/)")
+
+    def test_hand_text_is_preserved_byte_for_byte_after_the_first_append(
+        self, capsys, index_tree
+    ):
+        readme = index_tree.readme("widgets")
+        readme.write_text("# widgets\n\nMy notes, *kept*.\n\n\n", encoding="utf-8")
+        root_readme = index_tree.root / "README.md"
+        root_readme.write_text("# my plexus\n\nRoot notes.\n", encoding="utf-8")
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert _actions(out)["widgets/README.md"] == "update"
+        assert _actions(out)["README.md"] == "update"
+        text = readme.read_text(encoding="utf-8")
+        assert text.startswith(f"# widgets\n\nMy notes, *kept*.\n\n{pi.START_MARKER}\n")
+        assert pi.strip_block(text) == "# widgets\n\nMy notes, *kept*."
+        assert text.endswith(f"{pi.END_MARKER}\n")
+        assert pi.strip_block(root_readme.read_text(encoding="utf-8")) == "# my plexus\n\nRoot notes."
+        written = _tree_bytes(index_tree.root)
+        assert cli.main(["index", str(index_tree.root), "--write"]) == EXIT_CLEAN
+        capsys.readouterr()
+        assert _tree_bytes(index_tree.root) == written
+
+    def test_a_later_write_replaces_only_the_block(self, capsys, index_tree):
+        readme = index_tree.readme("widgets")
+        readme.write_text("# widgets\n\nBefore.\n", encoding="utf-8")
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        text = readme.read_text(encoding="utf-8")
+        readme.write_text(text + "\nAfter the block.\n", encoding="utf-8")
+        index_tree.add("widgets", SECOND)
+        assert cli.main(["index", str(index_tree.root), "--write"]) == EXIT_CLEAN
+        capsys.readouterr()
+        text = readme.read_text(encoding="utf-8")
+        assert text.startswith("# widgets\n\nBefore.\n\n")
+        assert text.endswith(f"{pi.END_MARKER}\n\nAfter the block.\n")
+        assert SECOND.name in text and FIRST.name in text
+
+    def test_write_runs_under_the_checkouts_mutation_lock(self, capsys, index_tree, monkeypatch):
+        from work_repo import transactions
+
+        readme = index_tree.readme("widgets")
+        seen = []
+
+        @contextmanager
+        def recording(tree=None):
+            seen.append(("enter", Path(tree), readme.exists()))
+            yield
+            seen.append(("exit", Path(tree), readme.exists()))
+
+        monkeypatch.setattr(transactions, "work_mutation", recording)
+        code, _out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert seen == [("enter", index_tree.root, False), ("exit", index_tree.root, True)]
+
+    def test_write_plans_inside_the_lock_not_before_it(self, capsys, index_tree, monkeypatch, tmp_path):
+        """The plan is what a session regenerating in between would
+        invalidate — the tracked-filter snapshot (`git ls-files`) and the
+        record scans — so it is computed under the same lock as the writes,
+        never before taking it."""
+        from work_repo import transactions
+
+        _checkout(index_tree, monkeypatch, tmp_path)
+        events = []
+
+        @contextmanager
+        def recording(tree=None):
+            events.append("enter")
+            yield
+            events.append("exit")
+
+        real_scan, real_filter = pi.scan_project, pi.tracked_record_filter
+        monkeypatch.setattr(transactions, "work_mutation", recording)
+        monkeypatch.setattr(
+            pi, "scan_project", lambda *a, **k: events.append("scan") or real_scan(*a, **k)
+        )
+        monkeypatch.setattr(
+            pi, "tracked_record_filter",
+            lambda *a, **k: events.append("filter") or real_filter(*a, **k),
+        )
+        code, _out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        assert events[0] == "enter" and events[-1] == "exit"
+        assert events.count("enter") == events.count("exit") == 1
+        # The plan's two filter snapshots and two scans sit between enter and
+        # exit; the kernel writer re-scans each project it writes, inside too.
+        assert events.count("filter") == 2 and events.count("scan") >= 2
+        assert set(events[1:-1]) == {"scan", "filter"}
+
+    def test_write_changes_only_readmes_and_leaves_every_record_byte_identical(
+        self, capsys, index_tree
+    ):
+        index_tree.add("widgets", SECOND)
+        before = _tree_bytes(index_tree.root)
+        records_before = {rel: data for rel, data in before.items() if "_runs" in rel.parts}
+        assert records_before
+
+        code, _out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+
+        assert code == EXIT_CLEAN
+        after = _tree_bytes(index_tree.root)
+        changed = {rel for rel in set(before) | set(after) if before.get(rel) != after.get(rel)}
+        assert changed == {Path("README.md"), Path("widgets/README.md"), Path("gadgets/README.md")}
+        assert {rel: data for rel, data in after.items() if "_runs" in rel.parts} == records_before
+
+    def test_a_refused_lock_is_unusable_input(self, capsys, index_tree, monkeypatch):
+        from work_repo import transactions
+
+        @contextmanager
+        def refusing(tree=None):
+            raise OSError("work-repo transaction is held by the invoking process")
+            yield  # pragma: no cover - the generator shape work_mutation has
+
+        monkeypatch.setattr(transactions, "work_mutation", refusing)
+        code, out, err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert "Index refused" in err
+        assert not index_tree.readme("widgets").exists()
+
+
+class TestIndexRefusals:
+    @pytest.mark.parametrize(
+        "shape, reason",
+        [
+            ("symlink", "symlink"),
+            ("directory", "directory"),
+            ("malformed", "malformed markers"),
+            ("newer", "newer format"),
+            ("marker", "marker line in hand text"),
+        ],
+    )
+    def test_a_readme_the_generator_must_not_touch_is_refused(
+        self, capsys, index_tree, tmp_path, shape, reason
+    ):
+        readme = index_tree.readme("widgets")
+        if shape == "symlink":
+            target = tmp_path / "elsewhere.md"
+            target.write_text("# elsewhere\n", encoding="utf-8")
+            readme.symlink_to(target)
+        elif shape == "directory":
+            readme.mkdir()
+        elif shape == "malformed":
+            readme.write_text(f"# widgets\n\n{pi.START_MARKER}\n\nno end\n", encoding="utf-8")
+        elif shape == "newer":
+            fresh = pi.render_project_readme(index_tree.project_dir("widgets"), heading="widgets")
+            readme.write_text(
+                fresh.replace(f"(lmer index format {pi.FORMAT})", f"(lmer index format {pi.FORMAT + 1})"),
+                encoding="utf-8",
+            )
+        else:
+            readme.write_text("widgets\n=======\n\nA setext underline.\n", encoding="utf-8")
+        before = _tree_bytes(index_tree.root) if shape != "symlink" else None
+        link_target = readme.readlink() if shape == "symlink" else None
+        code, out, _err = _run(capsys, "index", str(index_tree.root))
+        assert code == EXIT_ERRORS
+        assert _index_lines(out)["widgets/README.md"][0] == "refused"
+        assert _index_lines(out)["widgets/README.md"][3].startswith(reason)
+        assert "1 file(s) refused" in out
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_ERRORS
+        assert _actions(out)["widgets/README.md"] == "refused"
+        assert _actions(out)["README.md"] == "create"
+        assert _actions(out)["gadgets/README.md"] == "create"
+        assert f"Wrote 2 file(s); {WROTE_ROOT_LINE}" in out
+        if shape == "symlink":
+            assert readme.is_symlink() and readme.readlink() == link_target
+        elif shape == "directory":
+            assert readme.is_dir()
+        else:
+            assert readme.read_bytes() == before[Path("widgets/README.md")]
+
+    def test_a_marker_line_in_the_root_readmes_hand_text_is_no_refusal(self, capsys, index_tree):
+        """The publication choke point never stages the root README, so a
+        setext underline in its hand text cannot trip the staged-marker gate
+        and the backfill writes the block beneath it; the same line in a
+        project README is refused, because every push of that project would
+        stage the file."""
+        root_readme = index_tree.root / "README.md"
+        hand = "Plexus\n=======\n\nHand text.\n"
+        root_readme.write_text(hand, encoding="utf-8")
+        project_hand = "widgets\n=======\n\nA setext underline.\n"
+        index_tree.readme("widgets").write_text(project_hand, encoding="utf-8")
+
+        code, out, _err = _run(capsys, "index", str(index_tree.root))
+
+        assert code == EXIT_ERRORS
+        lines = _index_lines(out)
+        assert lines["README.md"][0] == "update"
+        assert lines["widgets/README.md"][0] == "refused"
+        assert lines["widgets/README.md"][3].startswith("marker line in hand text")
+
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+
+        assert code == EXIT_ERRORS
+        assert _actions(out)["README.md"] == "update"
+        text = root_readme.read_text(encoding="utf-8")
+        assert text.startswith(hand + "\n" + pi.START_MARKER)
+        assert pi.hand_text_has_marker(text)
+        assert index_tree.readme("widgets").read_text(encoding="utf-8") == project_hand
+
+    def test_the_json_document_carries_the_reason_only_for_a_refusal(self, capsys, index_tree):
+        index_tree.readme("widgets").write_text(f"# widgets\n\n{pi.START_MARKER}\n", encoding="utf-8")
+        code, doc, err = _json(capsys, "index", str(index_tree.root), "--json")
+        assert code == EXIT_ERRORS
+        assert err == ""
+        assert set(doc) == {"schema", "tool", "form", "write", "files"}
+        assert doc["schema"] == cli.OUTPUT_SCHEMA == 1
+        assert doc["tool"] == "lmer-schema"
+        assert doc["form"] == "schema"
+        assert doc["write"] is False
+        assert [entry["path"] for entry in doc["files"]] == [
+            "README.md", "widgets/README.md", "gadgets/README.md"
+        ]
+        by_path = {entry["path"]: entry for entry in doc["files"]}
+        assert set(by_path["README.md"]) == {"path", "action", "added", "removed"}
+        assert by_path["README.md"]["action"] == "create"
+        assert by_path["README.md"]["added"] > 0 and by_path["README.md"]["removed"] == 0
+        assert set(by_path["widgets/README.md"]) == {"path", "action", "added", "removed", "reason"}
+        assert by_path["widgets/README.md"]["action"] == "refused"
+        assert by_path["widgets/README.md"]["reason"] == "malformed markers"
+        assert str(index_tree.root) not in json.dumps(doc)
+
+    def test_json_with_write_reports_what_was_written(self, capsys, index_tree):
+        code, out, err = _run(capsys, "index", str(index_tree.root), "--write", "--json")
+        assert code == EXIT_CLEAN
+        assert err == ""
+        doc = json.loads(out)
+        assert doc["write"] is True
+        assert [entry["action"] for entry in doc["files"]] == ["create", "create", "create"]
+        assert index_tree.readme("widgets").is_file()
+
+    def test_the_json_flag_reads_either_side_of_the_command(self, capsys, index_tree):
+        code, doc, _err = _json(capsys, "--json", "index", str(index_tree.root))
+        assert code == EXIT_ERRORS
+        assert doc["tool"] == "lmer-schema" and doc["write"] is False
+
+    def test_a_registered_project_without_a_directory_is_refused_not_a_crash(
+        self, capsys, index_tree, monkeypatch
+    ):
+        real = walk.project_dirs
+
+        def with_a_ghost(root, *, registry=None, form=None):
+            found = list(real(root, registry=registry, form=form))
+            found.append(walk.ProjectDir(
+                path=Path(root) / "ghost", rel="ghost", name="ghost",
+                kind=walk.REGISTERED, form=found[0].form if found else None,
+            ))
+            return tuple(found)
+
+        monkeypatch.setattr(walk, "project_dirs", with_a_ghost)
+        code, out, err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_ERRORS
+        assert "Traceback" not in err
+        assert _index_lines(out)["ghost/README.md"] == ("refused", None, None, "missing directory")
+        assert not (index_tree.root / "ghost").exists()
+        assert index_tree.readme("widgets").is_file()
+
+
+#: A registered short name whose directory is a symlink: the walk hands it
+#: over by name (`is_dir()` follows the link), so the writer must refuse it.
+ALIAS = "aliased"
+DONE = RecordSpec(uid=uid_for(3, "cli"), slug="chat", started_at=stamp(3),
+                  updated=stamp(3, 11), status="complete", name="done-run")
+
+
+def _register_alias(tree, target):
+    """Register :data:`ALIAS` in *tree*'s manifest and make its directory a
+    symlink to *target* (a path relative to the root, or absolute)."""
+    _edit_manifest(tree, lambda doc: doc["projects"].update(
+        {ALIAS: {"repo": f"git.example.test/acme/{ALIAS}"}}))
+    (tree.root / ALIAS).symlink_to(target, target_is_directory=True)
+
+
+def _outside_project(tmp_path):
+    """A project directory beside the plexus, not in it, whose README carries
+    a generated block that is stale (rendered before its one record was
+    written), so a write through an alias would rewrite it."""
+    outside = build_schema2_plexus(tmp_path / "elsewhere", {"outside": []})
+    pi.write_project_readme(outside.project_dir("outside"), heading="outside")
+    outside.add("outside", RecordSpec(uid=uid_for(4, "cli"), slug="chat", started_at=stamp(4),
+                                      updated=stamp(4, 11), name="outside-run"))
+    return outside.project_dir("outside")
+
+
+class TestIndexWriteBoundary:
+    """A project directory the index writes into must be the real directory
+    its name says: not a symlink, resolving inside the plexus root, and never
+    inside a `_runs/` record (SCHEMA-GUIDE §4 keeps historical records byte
+    for byte). The README's own symlink check sees only the final file, so an
+    alias directory is refused before anything is written; a root reached
+    through a symlink is still fine (the root is resolved)."""
+
+    @pytest.mark.parametrize("write", [False, True], ids=["preview", "write"])
+    def test_an_alias_to_a_directory_outside_the_plexus_is_refused(
+        self, capsys, index_tree, tmp_path, write
+    ):
+        outside = _outside_project(tmp_path)
+        before = _tree_bytes(outside)
+        _register_alias(index_tree, outside)
+
+        code, out, _err = _run(capsys, "index", str(index_tree.root), *(["--write"] if write else []))
+
+        assert code == EXIT_ERRORS
+        assert _index_lines(out)[f"{ALIAS}/README.md"] == (
+            "refused", None, None, "project directory resolves outside the work repo")
+        assert "1 file(s) refused" in out
+        assert _tree_bytes(outside) == before
+        assert sorted(path.name for path in outside.iterdir()) == ["README.md", "_runs"]
+        if write:
+            assert _actions(out)["widgets/README.md"] == "create"
+            assert index_tree.readme("widgets").is_file()
+
+    @pytest.mark.parametrize("write", [False, True], ids=["preview", "write"])
+    def test_an_alias_into_a_completed_record_is_refused_and_the_record_is_untouched(
+        self, capsys, index_tree, write
+    ):
+        record = index_tree.add("widgets", DONE)[0]
+        before = _tree_bytes(record)
+        _register_alias(index_tree, record.relative_to(index_tree.root))
+
+        code, out, _err = _run(capsys, "index", str(index_tree.root), *(["--write"] if write else []))
+
+        assert code == EXIT_ERRORS
+        assert _index_lines(out)[f"{ALIAS}/README.md"] == (
+            "refused", None, None, "project directory lies inside a _runs/ record")
+        assert not (record / "README.md").exists()
+        assert _tree_bytes(record) == before
+        assert sorted(path.name for path in record.iterdir()) == sorted(
+            path.as_posix() for path in before)
+
+    def test_an_alias_to_another_project_inside_the_plexus_is_refused(self, capsys, index_tree):
+        _register_alias(index_tree, "gadgets")
+
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+
+        assert code == EXIT_ERRORS
+        assert _index_lines(out)[f"{ALIAS}/README.md"] == (
+            "refused", None, None, "project directory is a symlink")
+        assert _actions(out)["gadgets/README.md"] == "create"
+        text = index_tree.readme("gadgets").read_text(encoding="utf-8")
+        assert text.startswith("# gadgets\n\n")
+
+    @pytest.mark.parametrize("checkout", [False, True], ids=["plain", "git"])
+    def test_a_root_reached_through_a_symlink_still_indexes(
+        self, capsys, index_tree, monkeypatch, tmp_path, checkout
+    ):
+        if checkout:
+            _checkout(index_tree, monkeypatch, tmp_path)
+        link = tmp_path / "plexus-link"
+        link.symlink_to(index_tree.root, target_is_directory=True)
+
+        code, out, _err = _run(capsys, "index", str(link), "--write")
+
+        assert code == EXIT_CLEAN
+        assert _actions(out) == {
+            "README.md": "create", "widgets/README.md": "create", "gadgets/README.md": "create",
+        }
+        assert FIRST.name in index_tree.readme("widgets").read_text(encoding="utf-8")
+        code, out, _err = _run(capsys, "index", f"{link}/")
+        assert code == EXIT_CLEAN
+        assert set(_actions(out).values()) == {"unchanged"}
+
+
+class TestIndexUnusableInput:
+    def test_a_legacy_tree_is_refused_with_the_adopt_message(self, capsys, tmp_path):
+        legacy = tmp_path / "legacy"
+        (legacy / "example.com" / "group" / "repo" / "_runs").mkdir(parents=True)
+        code, out, err = _run(capsys, "index", str(legacy))
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert err.strip() == (
+            "Index refused: no _lmer.yaml — legacy trees are out of scope for the "
+            "index; adopt the schema first"
+        )
+        assert not (legacy / "README.md").exists()
+
+    def test_a_legacy_tree_is_refused_even_with_write_and_json(self, capsys, tmp_path):
+        legacy = tmp_path / "legacy"
+        legacy.mkdir()
+        code, out, err = _run(capsys, "index", str(legacy), "--write", "--json")
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert "adopt the schema first" in err
+        assert list(legacy.iterdir()) == []
+
+    def test_an_unreadable_manifest_is_refused(self, capsys, index_tree):
+        index_tree.manifest.write_text("schema: [unterminated\n", encoding="utf-8")
+        code, out, err = _run(capsys, "index", str(index_tree.root))
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert err.startswith("Index refused: ")
+
+    def test_a_missing_path_is_refused(self, capsys, tmp_path):
+        code, out, err = _run(capsys, "index", str(tmp_path / "nope"))
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert err.startswith("Index refused: ")
+
+    def test_a_file_path_is_refused(self, capsys, index_tree):
+        code, out, err = _run(capsys, "index", str(index_tree.manifest))
+        assert code == EXIT_UNUSABLE
+        assert out == ""
+        assert "Index refused" in err
+
+
+class TestIndexOnAGitCheckout:
+    def test_tracked_records_render_untracked_ones_do_not_and_an_ignored_readme_is_refused(
+        self, capsys, index_tree, monkeypatch, tmp_path
+    ):
+        _checkout(index_tree, monkeypatch, tmp_path)
+        index_tree.add("widgets", SECOND)
+        (index_tree.root / ".gitignore").write_text("gadgets/README.md\n", encoding="utf-8")
+        code, out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_ERRORS
+        lines = _index_lines(out)
+        assert lines["gadgets/README.md"][0] == "refused"
+        assert lines["gadgets/README.md"][3].startswith("ignored")
+        assert lines["widgets/README.md"][0] == "create"
+        assert lines["README.md"][0] == "create"
+        text = index_tree.readme("widgets").read_text(encoding="utf-8")
+        assert FIRST.name in text
+        assert SECOND.name not in text and SECOND.uid not in text
+        assert not index_tree.readme("gadgets").exists()
+        assert f"Wrote 2 file(s); {WROTE_ROOT_LINE}" in out
+
+    def test_the_backfill_renders_what_the_choke_point_would(self, capsys, index_tree, monkeypatch, tmp_path):
+        """The same tracked filter the publication path applies: a clean
+        clone's render of the committed records is what lands on disk."""
+        _checkout(index_tree, monkeypatch, tmp_path)
+        index_tree.add("widgets", SECOND)
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        include = pi.tracked_record_filter(index_tree.root, "widgets")
+        expected = pi.render_project_block(
+            pi.scan_project(index_tree.project_dir("widgets"), include=include, project_rel="widgets")
+        )
+        assert pi.extract_block(index_tree.readme("widgets").read_text(encoding="utf-8")) == expected
+
+    def test_after_the_record_is_committed_it_renders(self, capsys, index_tree, monkeypatch, tmp_path):
+        _checkout(index_tree, monkeypatch, tmp_path)
+        index_tree.add("widgets", SECOND)
+        git(index_tree.root, "add", "--", "widgets")
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        text = index_tree.readme("widgets").read_text(encoding="utf-8")
+        assert FIRST.name in text and SECOND.name in text
+
+    def test_nothing_is_committed_or_staged(self, capsys, index_tree, monkeypatch, tmp_path):
+        _checkout(index_tree, monkeypatch, tmp_path)
+        head = git(index_tree.root, "rev-parse", "HEAD").stdout.strip()
+        cli.main(["index", str(index_tree.root), "--write"])
+        capsys.readouterr()
+        assert git(index_tree.root, "rev-parse", "HEAD").stdout.strip() == head
+        assert git(index_tree.root, "diff", "--cached", "--name-only").stdout == ""
+        status = git(index_tree.root, "status", "--porcelain").stdout
+        assert "?? README.md" in status and "?? widgets/README.md" in status
+
+    def test_on_a_non_git_tree_every_record_on_disk_is_rendered(self, capsys, index_tree):
+        index_tree.add("widgets", SECOND)
+        assert not (index_tree.root / ".git").exists()
+        code, _out, _err = _run(capsys, "index", str(index_tree.root), "--write")
+        assert code == EXIT_CLEAN
+        text = index_tree.readme("widgets").read_text(encoding="utf-8")
+        assert FIRST.name in text and SECOND.name in text

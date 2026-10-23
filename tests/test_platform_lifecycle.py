@@ -408,7 +408,7 @@ def test_wind_down_types_the_prompt_into_the_session(platform_root, control_plan
 
     report = lifecycle.wind_down("s-1")
 
-    assert control_plane.calls == [{
+    assert control_plane.posts == [{
         "path": "/input",
         "authorization": f"Bearer {CONTROL_TOKEN}",
         "body": {"data": lifecycle.WIND_DOWN_PROMPT, "append_newline": True},
@@ -421,7 +421,7 @@ def test_wind_down_presses_enter(platform_root, control_plane):
     plant_session("s-1", port=control_plane.port)
     lifecycle.wind_down("s-1")
 
-    assert control_plane.calls[0]["body"]["append_newline"] is True
+    assert control_plane.posts[0]["body"]["append_newline"] is True
 
 
 def test_codex_wind_down_reaches_the_framed_submit_path(
@@ -562,7 +562,7 @@ def test_wind_down_reaches_a_session_that_survived_a_daemon_restart(
     report = lifecycle.wind_down("s-1")
 
     assert report.recorded is True
-    assert control_plane.calls[0]["body"]["data"] == lifecycle.WIND_DOWN_PROMPT
+    assert control_plane.posts[0]["body"]["data"] == lifecycle.WIND_DOWN_PROMPT
 
 
 def test_wind_down_on_a_session_with_no_control_plane_is_refused(platform_root):
@@ -1050,10 +1050,17 @@ def test_a_process_that_goes_between_the_check_and_the_signal_is_fine(
     between that check and ``killpg`` raising ProcessLookupError.
     """
     result = live_session(config)
+    real_alive = lifecycle._alive
 
     def vanished(pid, sig):
         reap(pid)
-        assert wait_for(lambda: not alive(pid))
+        # By the watcher's record, not the pid: under load the freed pid can name
+        # a new process before the ladder looks again, which is reuse, not this
+        # race — so the ladder's second look is pinned to the process's own fate.
+        assert spawn.wait_for_exit_recorded(result.session_id)
+        monkeypatch.setattr(
+            lifecycle, "_alive", lambda probed: False if probed == pid else real_alive(probed)
+        )
         return False
 
     monkeypatch.setattr(lifecycle, "_signal_group", vanished)
@@ -1101,7 +1108,7 @@ def test_the_wind_down_route_takes_no_body_at_all(
     response = client.post("/api/sessions/s-1/wind-down", headers=bearer_header())
 
     assert response.status_code == 202
-    assert control_plane.calls[0]["body"]["data"] == lifecycle.WIND_DOWN_PROMPT
+    assert control_plane.posts[0]["body"]["data"] == lifecycle.WIND_DOWN_PROMPT
 
 
 def test_the_wind_down_route_404s_for_an_unknown_session(client, platform_root):

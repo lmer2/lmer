@@ -268,7 +268,10 @@ class TestIterMessages:
 
 def _run_hook(payload, env_extra):
     env = os.environ.copy()
-    env.pop("LMER_SLACK_CHANNEL", None)
+    # Every variable the hook reads as "this is a chat session": a chat-bridged
+    # session running this suite exports one of them.
+    for name in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL"):
+        env.pop(name, None)
     env.update(env_extra)
     return subprocess.run(
         [sys.executable, str(HOOK)],

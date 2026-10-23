@@ -15,10 +15,12 @@ of those agents non-interactively::
         --env LMER_REVIEW_ON_MR=0 --output agents/sol-review.md
 
 One invocation runs one child and blocks until it exits; the orchestrating
-agent parallelizes with its own background-shell tooling. Children are
-stateless — no run dirs, no work-repo writes, no supervisor — and run with
-their harness's permission checks bypassed (the lmer container is the
-security boundary; see :class:`lmer_cli.harness.ExecProfile`).
+agent parallelizes with its own background-shell tooling. In schema 2 each
+child owns a fresh execution record, created before the harness exec and
+signed out after it exits. Harness-native transcript persistence stays
+disabled. Children run with their harness's permission checks bypassed
+(the lmer container is the security boundary; see
+:class:`lmer_cli.harness.ExecProfile`).
 
 Child environment: parent env, overlaid with the agent's preset ``env``,
 overlaid with ``--env KEY=VAL`` pairs (last wins). Both fan-out pairs — the
@@ -63,7 +65,9 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
+from pathlib import Path
 from typing import Dict, Optional
 
 from lmer_cli.harness import (
@@ -103,6 +107,9 @@ STDERR_TAIL_LINES = 40
 
 #: Only the tally is kept, so this batches syscalls rather than holding an answer.
 STDOUT_CHUNK_BYTES = 65536
+
+#: The container's initial environment, as the runtime started it.
+CONTAINER_ENVIRON = Path("/proc/1/environ")
 
 #: Below this many non-whitespace-padded characters, a successful child's
 #: output counts as degenerate. Deliberately low: a legitimately terse answer
@@ -217,7 +224,24 @@ def build_child_env(
     file, so the orchestrator consolidates from N-1 agents with nothing to
     show it lost one.
     """
+    # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
+    from work_repo import session_record
+
     child = dict(parent_env)
+    # The parent's launch name and goal (`lmer --name/--goal`) describe the
+    # PARENT's record. A child starts through ``harness_session`` →
+    # ``work session-start``, which would otherwise apply them to the child's
+    # own record on schema 2 — and names exist on schema 1 too, where a child
+    # shares the parent's run dir and the same start would re-name it. So
+    # both go, for every child, before the overlays.
+    for key in ("LMER_RUN_NAME", "LMER_RUN_GOAL"):
+        child.pop(key, None)
+    if session_record.schema_version(Path(child.get("LMER_WORK_REPO_PATH", "/work"))) >= 2:
+        # These are one-shot launch decisions. Only a new explicit overlay
+        # can select context for this independent execution.
+        for key in (session_record.SOURCE_ENV, session_record.SOURCE_ACK_ENV,
+                    "LMER_SESSION_IS_SOURCE", "LMER_ANSWER"):
+            child.pop(key, None)
     child.update(agent_env)
     child.update(extra_env)
     for key in (
@@ -342,6 +366,49 @@ def select_harness(
             child_env.pop(LLM_NAME_ENV, None)
     child_env[HARNESS_ENV] = name
     return registry[name]
+
+
+def restore_credential_env(
+    child_env: Dict[str, str], harness: Harness, overlay: Dict[str, str]
+) -> None:
+    """Fill the child harness's credential variables from the container env.
+
+    Claude Code strips ``CLAUDE_CODE_OAUTH_TOKEN`` from its shell tools, and
+    ``spawn-harness`` runs from such a shell, so a claude child would silently
+    fall back to the shared credentials file (issue #588). A key the preset or
+    ``--env`` *overlay* sets is the caller's choice, even when blank; only the
+    inherited shell layer's blank counts as stripped, since a blanked and a
+    deleted variable look the same there. An unreadable source warns and
+    leaves the child as it was. stderr names the variable, never its value.
+    """
+    missing = [
+        key
+        for key in harness.credential_env
+        if key not in overlay and not child_env.get(key)
+    ]
+    if not missing:
+        return
+    try:
+        raw = CONTAINER_ENVIRON.read_bytes()
+    except OSError as exc:
+        print(
+            f"⚠️  spawn-harness: cannot read {CONTAINER_ENVIRON} "
+            f"({exc.strerror}); {', '.join(missing)} not restored",
+            file=sys.stderr,
+        )
+        return
+    initial = {}
+    for entry in raw.split(b"\0"):
+        key, sep, value = entry.partition(b"=")
+        if sep:
+            initial[os.fsdecode(key)] = value
+    for key in missing:
+        if initial.get(key):
+            child_env[key] = os.fsdecode(initial[key])
+            print(
+                f"🔑 spawn-harness: {key} taken from the container environment",
+                file=sys.stderr,
+            )
 
 
 def apply_harness_extra_env(child_env: Dict[str, str], harness: Harness) -> None:
@@ -887,6 +954,31 @@ def run_child(
     wins over our own I/O trouble: a footer or close we cannot complete
     warns and leaves the code alone (:func:`_write_failure_footer`).
     """
+    # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
+    from work_repo import session_record
+
+    own_session = session_record.schema_version(
+        Path(child_env.get("LMER_WORK_REPO_PATH", "/work"))
+    ) >= 2
+    if own_session:
+        child_env = dict(child_env)
+        supplied = json.loads(child_env.get(session_record.METADATA_ENV, "{}"))
+        metadata = session_record.compose_launch_metadata(
+            supplied, harness=child_env.get("LMER_HARNESS"),
+            model=child_env.get(LLM_NAME_ENV),
+            effort=child_env.get("LMER_REASONING_EFFORT"),
+            config={"agent": agent_name, "unattended": True},
+        )
+        metadata["parent"] = session_record.scrub_metadata(supplied)
+        metadata["uid"] = uuid.uuid4().hex
+        # Only the child exec trampoline can report the actual harness PID.
+        for key in ("pid", "started_at", "execution_hostname",
+                    "source_session_uid", "unsigned_source_acknowledged"):
+            metadata.pop(key, None)
+        child_env["LMER_SESSION_ID"] = metadata["uid"]
+        child_env[session_record.METADATA_ENV] = json.dumps(metadata)
+        argv = [sys.executable, "-m", "lmer_cli.container.harness_session", "exec", *argv]
+    proc = None
     try:
         stdout = open(output, "w") if output else None
     except OSError as exc:
@@ -990,6 +1082,17 @@ def run_child(
     finally:
         if stdout:
             _close_output(stdout, output)
+        if own_session and proc is not None:
+            # The wrapper has waited for (or killed/reaped) the exec'd harness.
+            # Teardown is a helper of that execution and inherits its UID.
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "lmer_cli.container.harness_session", "end"],
+                    env=child_env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, timeout=180, check=True,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"⚠️  child session-end failed: {exc}", file=sys.stderr)
 
 
 def _list_agents(config: Dict[str, dict]) -> None:
@@ -1071,7 +1174,9 @@ def main(argv: Optional[list] = None) -> None:
         dict(os.environ),
     )
     warn_missing_credentials(ns.agent, harness, dict(os.environ))
+    restore_credential_env(child_env, harness, {**agent_env, **extra_env})
     apply_harness_extra_env(child_env, harness)
+    child_env["LMER_HARNESS"] = harness.name
     prepend_user_harness_path(child_env, harness)
     if harness.name == "pi":
         prepare_pi_registry(

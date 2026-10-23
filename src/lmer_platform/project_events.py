@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 
-from . import assistant, projects, runs, store
+from . import assistant, mute, projects, spool_merge, store
 
 
 def enqueue(session, message, run=None, session_kind=None):
@@ -14,9 +14,15 @@ def enqueue(session, message, run=None, session_kind=None):
     if ((message.get("source") or {}).get("channel") == "uber-lmer" or meta.get("session_origin") is True
             or meta.get("notification_class") == "connector_health" or session_kind == "assistant"):
         return
+    if mute.suppressed(session, message, run):
+        return
     data = {"session": session, **{key: (run or {}).get(key) for key in ("host", "project", "slug")}}
-    if all(data.get(key) for key in ("host", "project", "slug")):
-        data["run_key"] = runs.run_key(data["host"], data["project"], data["slug"])
+    # Only a run that has a uid carries one, so a schema-1 payload keeps its shape.
+    if (run or {}).get("uid"):
+        data["uid"] = run["uid"]
+    run_key = projects.key_of(data)
+    if run_key:
+        data["run_key"] = run_key
     owner = projects.destination(data)
     if not owner:
         return
@@ -39,17 +45,19 @@ def flush():
         with projects.database() as db:
             for (owner, session), records in groups.items():
                 row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (owner,)).fetchone()
-                state = assistant.AssistantState.from_dict(json.loads(row[0]))
+                state = assistant.AssistantState.from_dict(json.loads(row[0]), memo_spool=owner)
                 data = {**records[-1][1]["data"], "workspace_id": owner, "count": len(records)}
                 lines = []
                 for _identity, payload in records[-8:]:
                     message = payload["message"]
                     who = (message.get("source") or {}).get("channel", "?")
                     lines.append(f"[{who}] {message.get('kind')}: {str(message.get('text') or '')[:300]}")
-                entry = assistant.PendingNote(at=store.utc_now_iso(), kind="session_comms",
-                                              note=(f"Session {session}: " + " | ".join(lines))[:assistant.MAX_NOTE_CHARS], data=data)
-                updated = replace(state, pending=(*state.pending, entry),
-                                  pending_since=state.pending_since or entry.at,
+                routine = spool_merge.routine(payload["message"] for _identity, payload in records)
+                at = store.utc_now_iso()
+                pending = spool_merge.add_comms(list(state.pending), at=at, session=session,
+                                                lines=lines, routine=routine, data=data)
+                updated = replace(state, pending=tuple(pending),
+                                  pending_since=state.pending_since or at,
                                   pending_seq=state.pending_seq + (not state.pending))
                 db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(updated.to_dict()), owner))
                 db.executemany("UPDATE event_queue SET done=1 WHERE id=?", [(identity,) for identity, _ in records])

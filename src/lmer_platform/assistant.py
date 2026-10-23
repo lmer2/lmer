@@ -327,6 +327,7 @@ from __future__ import annotations
 
 from .projects import serialized
 
+import hashlib
 import json
 import logging
 import os
@@ -340,8 +341,9 @@ from typing import Optional
 
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
+from lmer_cli.comms import assistant_display_name
 
-from . import ask, memory, registry, spawn, statusline
+from . import ask, assistant_history, containers, memory, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -361,7 +363,7 @@ from .config import (
 # "what a credential looks like" is a second thing to forget a pattern from, and
 # this one covers the platform's own shared secret *by value*, which no
 # reimplementation here would.
-from .transcripts import _scrub, _scrub_decoded
+from .transcripts import _scrub, _scrub_decoded, scrub_pass
 from .store import (
     StoreError,
     TS_FORMAT,
@@ -373,6 +375,7 @@ from .store import (
     write_json,
 )
 from .project_context import assistant_dir
+from .thread_targets import MAX_THREAD_TARGETS, validate_thread_targets
 from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.assistant")
@@ -461,6 +464,11 @@ STOP_REASONS = ("operator", "rotation", "replaced")
 #: assistant needs, and the full history is in ``events.jsonl``.
 MAX_PENDING = 50
 
+def ended_episode(state: "AssistantState") -> dict:
+    """The fields a take resets: the nudge clock and its episode (#317, #584)."""
+    return {"nudged_at": None, "nudges": 0, "nudge_session": None, "stalled_at": None,
+            "episode": state.episode + 1}
+
 #: Caps on caller-supplied text. Both values reach this module from reachable
 #: input (the assistant writes its own handoff through the API), and both end up
 #: in a state file the daemon reads on every start.
@@ -522,6 +530,11 @@ _LOCK = threading.RLock()
 #: cover process spawn or bounded termination waits; status polling must not pay
 #: for either operation.
 _PUBLICATION_LOCK = threading.RLock()
+
+#: Scrub results per spool (issue #583): ``spool -> (credentials, {digest: note})``.
+#: Each load replaces its spool's entry with the notes it just read, so a taken
+#: note leaves the memo; a change in the credentials masked by value empties it.
+_SCRUBBED_NOTES: dict = {}
 
 
 
@@ -663,8 +676,26 @@ class AssistantState:
     #: :func:`take_pending`; a future value is durably bounded to the current
     #: time by :func:`clamp_future_nudged_at` before the detector reads it.
     nudged_at: Optional[str] = None
+    #: Nudges typed in this episode, and the incarnation they were typed into
+    #: (#584). An episode ends at a take or a new incarnation, so a count that
+    #: names another session is zero. Cleared by :func:`take_pending`.
+    nudges: int = 0
+    nudge_session: Optional[str] = None
+    #: Advanced by every take (:func:`ended_episode`), so a mark computed before
+    #: a take can tell it landed after one and refuse.
+    episode: int = 0
+    #: When the one "not taking its spool" signal went out for this episode.
+    stalled_at: Optional[str] = None
     codex_wake: Optional[str] = None
     conversation_seen: tuple = ()
+
+    def episode_nudges(self, session_id: Optional[str]) -> int:
+        """Nudges already typed into *session_id* during this episode."""
+        return self.nudges if self.nudge_session == session_id else 0
+
+    def episode_stalled(self, session_id: Optional[str]) -> bool:
+        """Whether this episode's stall signal has gone out for *session_id*."""
+        return self.stalled_at is not None and self.nudge_session == session_id
 
     def to_dict(self) -> dict:
         return {
@@ -681,12 +712,17 @@ class AssistantState:
             "pending_since": self.pending_since,
             "pending_seq": self.pending_seq,
             "nudged_at": self.nudged_at,
+            "nudges": self.nudges,
+            "nudge_session": self.nudge_session,
+            "episode": self.episode,
+            "stalled_at": self.stalled_at,
             "codex_wake": self.codex_wake,
             "conversation_seen": list(self.conversation_seen),
         }
 
     @classmethod
-    def from_dict(cls, payload: Optional[dict]) -> "AssistantState":
+    @scrub_pass()
+    def from_dict(cls, payload: Optional[dict], *, memo_spool: Optional[str] = None) -> "AssistantState":
         """Rebuild from a snapshot, repairing rather than rejecting.
 
         An absent file is the empty state — the normal case on a host where the
@@ -706,6 +742,9 @@ class AssistantState:
         notes get theirs in :meth:`PendingNote.from_dict` for the same reason; the
         standing orders keep their own pair (:func:`set_instructions` on the way
         in, ``api._instructions_reply`` on the way out).
+
+        *memo_spool* names the project whose spool this is and turns on reuse of
+        that spool's previous scrub results (:func:`_pending_notes`).
         """
         if not isinstance(payload, dict):
             return cls()
@@ -719,15 +758,10 @@ class AssistantState:
             or pending_seq < 0
         ):
             pending_seq = 0
+        nudges = _count(payload.get("nudges"))
+        episode = _count(payload.get("episode"))
         raw_pending = payload.get("pending")
-        pending = tuple(
-            note
-            for note in (
-                PendingNote.from_dict(item)
-                for item in (raw_pending if isinstance(raw_pending, list) else [])
-            )
-            if note is not None
-        )
+        pending = _pending_notes(raw_pending if isinstance(raw_pending, list) else [], memo_spool)
         return cls(
             session_id=_opt_str(payload.get("session_id")),
             started_at=_opt_str(payload.get("started_at")),
@@ -742,6 +776,10 @@ class AssistantState:
             pending_since=_opt_str(payload.get("pending_since")),
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
+            nudges=nudges,
+            nudge_session=_opt_str(payload.get("nudge_session")),
+            episode=episode,
+            stalled_at=_opt_str(payload.get("stalled_at")),
             codex_wake=_opt_str(payload.get("codex_wake")),
             conversation_seen=tuple(
                 item for item in (payload.get("conversation_seen")
@@ -812,8 +850,6 @@ class AssistantStatus:
         return _age_seconds(self.started_at)
 
     def to_dict(self) -> dict:
-        from . import assistant_history
-
         history = assistant_history.latest()
         return {
             "running": self.running,
@@ -839,9 +875,49 @@ class AssistantStatus:
         }
 
 
+def _pending_notes(raw: list, memo_spool: Optional[str]) -> tuple:
+    """:meth:`PendingNote.from_dict` over *raw*, reusing *memo_spool*'s earlier results.
+
+    A hit is the result an earlier load computed from the same stored note under
+    the same credentials, so it is exactly what a scrub would return now. Notes
+    are not skipped for having been scrubbed on write: the scrub is not
+    idempotent (``a://b@c@d`` loses one userinfo segment per pass).
+    """
+    if memo_spool is None:
+        notes = (PendingNote.from_dict(item) for item in raw)
+        return tuple(note for note in notes if note is not None)
+    with scrub_pass() as known:
+        cached_known, cached = _SCRUBBED_NOTES.get(memo_spool, (None, {}))
+        if cached_known != known:
+            cached = {}
+        kept: dict = {}
+        notes = []
+        for item in raw:
+            digest = hashlib.sha256(json.dumps(item).encode("utf-8")).hexdigest()
+            if digest in cached:
+                entry = cached[digest]
+            else:
+                note = PendingNote.from_dict(item)
+                # The data travels as JSON so that no caller holding a note
+                # can change what a later load is handed.
+                entry = None if note is None else (
+                    replace(note, data=None), None if note.data is None else json.dumps(note.data))
+            kept[digest] = entry
+            if entry is not None:
+                note, data = entry
+                notes.append(note if data is None else replace(note, data=json.loads(data)))
+        _SCRUBBED_NOTES[memo_spool] = (known, kept)
+    return tuple(notes)
+
+
 def _opt_str(value: object) -> Optional[str]:
     """A non-empty string, or ``None`` for anything else."""
     return value if isinstance(value, str) and value else None
+
+
+def _count(value: object) -> int:
+    """A non-negative int, or ``0`` for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _opt_scrubbed(value: object) -> Optional[str]:
@@ -891,7 +967,7 @@ def read_state() -> AssistantState:
             "platform_assistant_state_unreadable error=%s — starting from empty", exc
         )
         return AssistantState()
-    return AssistantState.from_dict(stored)
+    return AssistantState.from_dict(stored, memo_spool=project_context.current() or projects.GENERAL)
 
 
 def _write_state(state: AssistantState) -> bool:
@@ -922,8 +998,6 @@ def _write_state(state: AssistantState) -> bool:
 
 def history_for(session_id: str) -> Optional[dict]:
     """Resolve a generation, migrating only the explicitly recorded incumbent."""
-    from . import assistant_history
-
     with _LOCK:
         known = assistant_history.generation(session_id)
         state = read_state()
@@ -1011,8 +1085,6 @@ def refuse_full_thread_list(session_id: object) -> None:
     the stored list, not about the link, and a thread about to be created cannot
     already be in it. So: capacity, and the same verdict on what is stored.
     """
-    from .thread_targets import MAX_THREAD_TARGETS
-
     if not _writes_the_launch_list(session_id):
         return
     current = _stored_threads()
@@ -1030,8 +1102,6 @@ def _writes_the_launch_list(session_id: object) -> bool:
 
 def _refuse_unusable(candidate: list) -> None:
     """Refuse when *candidate* is not a list uber lmer could launch with."""
-    from .thread_targets import validate_thread_targets
-
     try:
         validate_thread_targets(candidate)
     except ValueError as exc:
@@ -1040,7 +1110,7 @@ def _refuse_unusable(candidate: list) -> None:
 
 def _threads_full(reason: str) -> None:
     raise AssistantThreadsFull(
-        f"uber lmer's standing thread list would become unusable: {reason}. "
+        f"{assistant_display_name()}'s standing thread list would become unusable: {reason}. "
         "Remove one in its settings first — the list there is what each "
         "start and rotation reads."
     ) from None
@@ -1058,6 +1128,7 @@ def _refuse_held_explicit_threads(
     """
     if sources.get("threads") != "override":
         return
+    # deferred: cycle — lmer_platform.connectors imports this module at top (via comms); only a threads override needs it
     from . import connectors as thread_connectors
 
     component = thread_connectors.get_connectors()
@@ -1107,7 +1178,6 @@ def note_thread_change(session_id: object, permalink: object, *, connected: bool
         if permalink not in current:
             return False
         current = [entry for entry in current if entry != permalink]
-    from .thread_targets import validate_thread_targets
 
     try:
         # ``update_stored`` tolerates an unusable launch setting rather than
@@ -1232,6 +1302,7 @@ def _connected_threads(session_id: str) -> list:
     same reason: an assistant whose pane cannot be drawn because a thread record
     could not be read is a worse answer than a pane with no icons.
     """
+    # deferred: cycle — lmer_platform.connectors imports this module at top (via lmer_platform.comms)
     from . import connectors
 
     component = connectors.get_connectors()
@@ -1273,7 +1344,7 @@ def _with_link_age(snapshot: dict, live: Optional[dict]) -> dict:
     with no record at all the snapshot is returned untouched. Both stamps are
     parsed rather than string-compared for the same reason: a lexicographic
     compare answers confidently for input it cannot judge. See
-    docs/PLATFORM-QUICKSTART.md, "uber lmer's memory".
+    docs/PLATFORM-QUICKSTART.md, "Ratchet's memory".
     """
     record = snapshot.get("link")
     if not isinstance(record, dict):
@@ -1480,7 +1551,11 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
         sources[key] = setting.source
     project_overrides = {}
     if projects.enabled():
-        project_overrides = projects.get(project_context.current() or projects.GENERAL)["settings"]
+        project_overrides = {
+            key: value
+            for key, value in projects.get(project_context.current() or projects.GENERAL)["settings"].items()
+            if key not in projects.WORKER_SETTING_KEYS
+        }
         if project_context.current() not in (None, projects.GENERAL):
             values["threads"], sources["threads"] = [], "project"
     for key, value in {**project_overrides, **(overrides or {})}.items():
@@ -1634,6 +1709,7 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
     if project_context.current():
         values["LMER_WORKSPACE_ID"] = project_context.current()
         values["LMER_WORKSPACE_NAME"] = projects.get(project_context.current())["name"]
+    values["LMER_PLATFORM_ASSISTANT_NAME"] = config.assistant_name
     path = env_file_path()
     body = "".join(_dotenv_line(name, value) for name, value in values.items())
     try:
@@ -1674,8 +1750,6 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
 
 
 def _remember_generation(state) -> None:
-    from . import assistant_history
-
     assistant_history.remember(state)
     if state.session_id:
         assistant_history.bind_credential(state.session_id, active_assistant_credential())
@@ -1683,8 +1757,6 @@ def _remember_generation(state) -> None:
 
 def authenticated_generation(credential: str) -> dict | None:
     """Resolve an authenticated identity; migrate an incumbent under the lifecycle lock."""
-    from . import assistant_history
-
     owner = assistant_history.credential_owner(credential)
     if owner:
         return owner
@@ -1801,7 +1873,6 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
-        from . import assistant_history
 
         previous = assistant_history.latest()
         published = False
@@ -1917,6 +1988,10 @@ def stop(
 
         session_id = live.get("id")
         gone = _terminate(live.get("pid"))
+        if gone and isinstance(session_id, str):
+            # Its container is detached (#444): a follower killed before it could
+            # stop it would leave the old assistant running beside its successor.
+            containers.stop_for_session(session_id)
         if gone:
             # The spawn path keeps the entry of a session that exited unclean,
             # because that entry is how a crash is detected — but this exit was
@@ -1990,7 +2065,7 @@ def rotate(
         # anything start() would refuse has to refuse while there is still an
         # assistant to keep. Both questions are settled here, and start() is told
         # not to re-ask the thread one — its answer can change between the stop
-        # and the respawn. docs/COMMS.md §9, "Rotating uber lmer", has the why.
+        # and the respawn. docs/COMMS.md §9, "Rotating Ratchet", has the why.
         launch, launch_sources = _launch_settings(settings)
         live = _live_assistant()
         try:
@@ -2594,6 +2669,10 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
     would be stored, and what is weighed against :data:`MAX_PENDING` is the entry
     that is actually written.
     """
+    # deferred: cycle — spool_merge (directly and via checkin) and assistant_conversation (via comms) import this module at top
+    from . import spool_merge
+    from . import assistant_conversation
+
     text = _scrubbed_text(note, field="note", limit=MAX_NOTE_CHARS)
     label = _validated_text(kind, field="kind", limit=64)
     payload = _scrubbed_data(data)
@@ -2606,10 +2685,12 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
             note=text,
             data=payload,
         )
-        pending = list(state.pending) + [entry]
-        dropped = max(0, len(pending) - MAX_PENDING)
         if projects.enabled():
+            pending = spool_merge.add_check_in(list(state.pending), entry)
             dropped = 0
+        else:
+            pending = list(state.pending) + [entry]
+            dropped = max(0, len(pending) - MAX_PENDING)
         if dropped:
             discard = next((i for i, item in enumerate(pending)
                             if item.kind != "conversation_request"), len(pending) - 1)
@@ -2638,8 +2719,6 @@ def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None
         append_event(
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
-        from . import assistant_conversation
-
         if label in assistant_conversation.DIGEST_KINDS:
             assistant_conversation.record(text, kind=label, data=payload)
         return _live_assistant() is not None
@@ -2678,8 +2757,15 @@ def mark_codex_wake(session_id: str, pending_seq: int, delivery_id: str) -> bool
         return _write_state(replace(state, codex_wake=delivery_id, nudged_at=utc_now_iso()))
 
 
-def mark_nudged() -> Optional[str]:
+def mark_nudged(session_id: Optional[str] = None, *, counted: bool = True,
+                episode: Optional[int] = None, nudges: Optional[int] = None) -> Optional[str]:
     """Record that the platform has just nudged about the current spool (#317).
+
+    *counted* records *nudges* (default: one more than stored) as *session_id*'s
+    count for this episode (#584); ``counted=False`` only restarts the interval
+    clock. Given *episode*, a take that landed since the caller read the state
+    makes this a no-op returning ``None``: the nudge belonged to a spool that is
+    gone, and its count must not leak into the next one.
 
     Returns the stamp it wrote, or ``None`` when the write failed — best-effort
     like :func:`notify` and for a sharper reason: the nudge has already been
@@ -2693,8 +2779,38 @@ def mark_nudged() -> Optional[str]:
     """
     with _LOCK:
         state = read_state()
+        if episode is not None and state.episode != episode:
+            return None
         stamped = utc_now_iso()
-        if not _write_state(replace(state, nudged_at=stamped)):
+        updated = replace(state, nudged_at=stamped)
+        if counted:
+            same = state.nudge_session == session_id
+            updated = replace(
+                updated,
+                nudges=nudges if nudges is not None else state.episode_nudges(session_id) + 1,
+                nudge_session=session_id,
+                stalled_at=state.stalled_at if same else None,
+            )
+        if not _write_state(updated):
+            return None
+        return stamped
+
+
+def mark_stalled(session_id: Optional[str], *, episode: Optional[int] = None) -> Optional[str]:
+    """Record that this episode's stall signal went out (#584).
+
+    Returns the stamp, or ``None`` when the write failed or *episode* has ended
+    since the caller read it; the caller bounds the episode in memory either way.
+    """
+    with _LOCK:
+        state = read_state()
+        if episode is not None and state.episode != episode:
+            return None
+        stamped = utc_now_iso()
+        if not _write_state(replace(
+            state, stalled_at=stamped, nudge_session=session_id,
+            nudges=state.episode_nudges(session_id),
+        )):
             return None
         return stamped
 
@@ -2759,6 +2875,7 @@ def take_pending() -> list:
     empty either way, and a mark left behind by a take that raced the last digest
     out would suppress the next accumulation's first nudge for a window.
     """
+    # deferred: cycle — lmer_platform.project_requests imports this module at top
     from . import project_requests
 
     with _LOCK:
@@ -2766,12 +2883,13 @@ def take_pending() -> list:
         if projects.enabled():
             return project_requests.drain(state)
         if not state.pending:
-            if state.nudged_at is not None or state.pending_since is not None:
-                _write_state(replace(state, nudged_at=None, pending_since=None))
+            if (state.nudged_at is not None or state.pending_since is not None
+                    or state.nudges or state.stalled_at is not None):
+                _write_state(replace(state, pending_since=None, **ended_episode(state)))
             return []
         notes = [note.to_dict() for note in state.pending]
         _write_state(
-            replace(state, pending=(), nudged_at=None, pending_since=None)
+            replace(state, pending=(), pending_since=None, **ended_episode(state))
         )
         return notes
 

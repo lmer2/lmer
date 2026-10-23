@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 from unittest.mock import patch
 
-from lmer_cli.cli import _validate_parsed_args, parse_args
+from lmer_cli.cli import (
+    _continuation_env,
+    _launch_session_metadata,
+    _validate_parsed_args,
+    parse_args,
+)
 
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
 
@@ -131,17 +136,56 @@ class TestSessionFlag:
         ns, _ = parse_args(["develop", "https://example.com/x/y"])
         assert ns.session is None
 
+    def test_direct_continuation_marks_session_as_schema_dependent_source(self):
+        uid = "a" * 32
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--session", uid])
+        assert _validate_parsed_args(ns) is None
+        assert _continuation_env(ns) == {
+            "LMER_SESSION_ID": uid,
+            "LMER_SESSION_IS_SOURCE": "1",
+            "LMER_SOURCE_SESSION_ID": None,
+            "LMER_ALLOW_UNSIGNED_SOURCE": None,
+            "LMER_LAUNCH_UID": None,
+        }
+
+    def test_unsigned_confirmation_is_bound_to_the_selected_session(self):
+        uid = "a" * 32
+        ns, _ = parse_args([
+            "develop", "https://example.com/x/y", "--session", uid,
+            "--allow-unsigned-source", uid,
+        ])
+        assert _validate_parsed_args(ns) is None
+        assert _continuation_env(ns)["LMER_ALLOW_UNSIGNED_SOURCE"] == uid
+
+    @pytest.mark.parametrize("ack", ["1", "true", "b" * 32])
+    def test_unsigned_confirmation_never_becomes_a_boolean_force_flag(
+        self, ack, capsys
+    ):
+        ns, _ = parse_args([
+            "develop", "https://example.com/x/y", "--session", "a" * 32,
+            "--allow-unsigned-source", ack,
+        ])
+        assert _validate_parsed_args(ns) == 2
+        assert "must exactly match --session" in capsys.readouterr().out
+
+    def test_unsigned_confirmation_requires_a_selected_source(self, capsys):
+        ns, _ = parse_args([
+            "develop", "https://example.com/x/y",
+            "--allow-unsigned-source", "a" * 32,
+        ])
+        assert _validate_parsed_args(ns) == 2
+        assert "requires --session" in capsys.readouterr().out
+
     def test_cli_env_dict_declares_session(self):
-        """Source-level guard against the entry being dropped or given a
-        fallback (same pattern as test_cli_env_dict_declares_answer): the
-        value is the flag's, and the no-flag case is None — never ""."""
-        source = CLI_PY.read_text()
-        pattern = re.compile(
-            r"""["']LMER_SESSION_ID["']\s*:\s*ns\.session\s+if\s+ns\.session\s+else\s+None"""
-        )
-        assert pattern.search(source), (
-            "LMER_SESSION_ID entry missing from cli.py env dict"
-        )
+        """No flag means no inherited writer or source identity."""
+        ns, _ = parse_args(["develop", "https://example.com/x/y"])
+        assert _continuation_env(ns) == {
+            "LMER_SESSION_ID": None,
+            "LMER_SESSION_IS_SOURCE": None,
+            "LMER_SOURCE_SESSION_ID": None,
+            "LMER_ALLOW_UNSIGNED_SOURCE": None,
+            "LMER_LAUNCH_UID": None,
+        }
 
     def test_host_env_session_id_is_not_forwarded(self):
         """The strongest of the flag-only cases. LMER_SESSION_ID is exported
@@ -175,6 +219,41 @@ class TestSessionFlag:
             except SystemExit:
                 pass
         assert "(env: LMER_SESSION_ID" not in capsys.readouterr().out
+
+
+def test_launch_metadata_preserves_extensions_and_records_host_provenance(monkeypatch):
+    monkeypatch.setenv(
+        "LMER_SESSION_METADATA",
+        '{"extension":{"x":1},"model":"predecessor-model",'
+        '"effort":"low","config":{"api_token":"private","future":true}}',
+    )
+
+    metadata = _launch_session_metadata(
+        harness="codex",
+        model="gpt-example",
+        effort="high",
+        config={"preset": "review", "custom": [1, 2]},
+    )
+
+    assert metadata["extension"] == {"x": 1}
+    assert metadata["config"]["future"] is True
+    assert metadata["config"]["api_token"] == "***REDACTED***"
+    assert metadata["config"]["preset"] == "review"
+    assert metadata["config"]["custom"] == [1, 2]
+    assert metadata["operator"]
+    assert metadata["hostname"]
+    assert metadata["harness"] == "codex"
+    assert metadata["model"] == "gpt-example"
+    assert metadata["effort"] == "high"
+    assert metadata["launcher"]["pid"] == os.getpid()
+    assert metadata["launcher"]["model"] == "gpt-example"
+    assert metadata["launcher"]["effort"] == "high"
+    assert metadata["launcher"]["config"] == {
+        "api_token": "***REDACTED***",
+        "future": True,
+        "preset": "review",
+        "custom": [1, 2],
+    }
 
 
 class TestSessionIdIsRefusedWhereTheOperatorCanSeeIt:
@@ -437,6 +516,26 @@ class TestResourceLimitDiagnostic:
                 )
         out = buffer.getvalue()
         assert "cpus=2 (LMER_CPUS), gpu=0,1 (LMER_DEVELOP_GPU)" in out
+
+    def test_ci_baseline_toggle_is_shown_with_its_source(self):
+        import contextlib
+        import io
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import ResourceLimit
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits(
+                    [ResourceLimit("--cpus", "2", "LMER_CPUS")], None,
+                    ("1", "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE"),
+                )
+                _announce_resource_limits([], None, ("0", "default"))
+        out = buffer.getvalue()
+        assert ("cpus=2 (LMER_CPUS), gate-ci-baseline=on "
+                "(LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE)") in out
+        assert "gate-ci-baseline=off (default)" in out
 
     def test_unsupported_gpu_request_is_shown_as_no_grant(self):
         import contextlib

@@ -16,6 +16,7 @@ from datetime import datetime
 import yaml
 
 from lmer_cli import gate_lock
+from lmer_cli.container import clone_and_exec
 
 from .loggers import get_logger
 from .info_reader import read_project_info
@@ -27,6 +28,9 @@ from .git_ops import (
     commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
+    fetch_publication_head,
+    publish_overlay_commit,
+    published_file,
     push_napkin_if_separate,
     report_uncommitted_work_items,
     run_dir_push_status,
@@ -34,10 +38,22 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, plan_index, release_run, run_state, specs_index, write_journal
-from .memory import memory_write_rel_paths, persist_memory, restore_memory
+from . import (
+    git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
+    specs_index, write_journal,
+)
+from .memory import (
+    MemoryRetirementError, forget_memory, memory_retirement_paths, memory_write_rel_paths,
+    persist_memory, restore_memory, revive_memory,
+)
+from .session_record import current_metadata, seeded_session
+from .transactions import (
+    checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
+    work_mutation, work_transaction,
+)
 from .utils import (
     MANIFEST_PROBLEM,
+    SchemaContextError,
     redact_secrets,
     task_target_dir,
     work_repo_form,
@@ -240,6 +256,63 @@ Examples:
         "--message",
         "-m",
         help="Commit message (defaults to auto-generated)",
+    )
+    memory_persist_parser.add_argument(
+        "--allow-unbaselined-delete",
+        action="store_true",
+        help=(
+            "On a persist with no restore baseline (a session that never "
+            "restored), also delete the scope files the agent dir does not "
+            "hold, listing each. Any persist records a baseline, so this "
+            "acts only on such a first persist; later, retire a memory with "
+            "`work memory forget`"
+        ),
+    )
+    for action in ("forget", "revive"):
+        retirement_parser = memory_subparsers.add_parser(
+            action, help=f"Explicitly {action} a scoped schema-2 memory"
+        )
+        retirement_parser.add_argument("scoped_path", help="Work-repo-relative memory path")
+        retirement_parser.add_argument("--message", "-m", help="Commit message")
+
+    # knowledge command (#372): generate `_knowledge/<org>/INDEX.md`.
+    knowledge_parser = subparsers.add_parser(
+        "knowledge", help="Generate knowledge-area indexes"
+    )
+    knowledge_subparsers = knowledge_parser.add_subparsers(
+        dest="knowledge_action", help="Knowledge action to perform"
+    )
+    knowledge_index_parser = knowledge_subparsers.add_parser(
+        "index", help="Generate (or check) `_knowledge/<org>/INDEX.md`"
+    )
+    knowledge_index_parser.add_argument(
+        "--check", action="store_true",
+        help="Write nothing; exit 1 when any generated index is out of date",
+    )
+    knowledge_index_parser.add_argument(
+        "--org", metavar="NAME", help="Limit the run to one organisation",
+    )
+
+    # housekeep command (#371): dry-run-first archival and index maintenance.
+    housekeep_parser = subparsers.add_parser(
+        "housekeep",
+        help="Archive stale content and maintain indexes (dry run by default)",
+    )
+    housekeep_parser.add_argument(
+        "--apply", action="store_true",
+        help="Perform the planned changes and make one commit (default: dry run)",
+    )
+    housekeep_parser.add_argument(
+        "--area", choices=housekeep.AREAS,
+        help="Limit the run to one area (default: every area)",
+    )
+    housekeep_parser.add_argument(
+        "--project", metavar="NAME",
+        help="Restrict the walk to one project (registry short name or host/project)",
+    )
+    housekeep_parser.add_argument(
+        "--archive-stale", action="store_true",
+        help="Include stale-run archiving (the runs area's opt-in)",
     )
 
     # setup-workspace command
@@ -457,6 +530,64 @@ Examples:
         help="Rebuild the index from runs/ (backfill for specs that predate it)",
     )
 
+    # adopt command (issue #367 — name a host-bucket tree and register it).
+    # An operator-shell verb: it writes records it does not own and is
+    # exempt from the session-uid gate, but still declares its write scope.
+    adopt_parser = subparsers.add_parser(
+        "adopt",
+        help="Name a host-bucket tree and register it in one commit (dry run by default)",
+    )
+    adopt_parser.add_argument(
+        "bucket",
+        help="the host bucket, `<host>/<project>` relative to the work-repo root",
+    )
+    adopt_parser.add_argument("name", help="the short name the bucket moves to")
+    adopt_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the adoption; without it the command is a read-only dry run",
+    )
+    adopt_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at the old bucket path",
+    )
+    adopt_parser.add_argument(
+        "--description", help="registry description for the project",
+    )
+    adopt_parser.add_argument(
+        "--remote", action="append", default=None,
+        help="an additional remote for the project; may be repeated",
+    )
+    adopt_parser.add_argument(
+        "--force", action="store_true",
+        help="adopt despite schema-tier ERRORs in the fix list",
+    )
+
+    # migrate command (issue #368 — bare-name to schema-form tree migration).
+    # An operator-shell verb like `adopt`: exempt from the session-uid gate,
+    # but still declaring its write scope.
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Migrate a registered project or the instance surfaces to schema form "
+             "(dry run by default)",
+    )
+    migrate_target = migrate_parser.add_mutually_exclusive_group()
+    migrate_target.add_argument(
+        "project", nargs="?",
+        help="a registered project's short name",
+    )
+    migrate_target.add_argument(
+        "--instance", action="store_true",
+        help="migrate the instance surfaces and fold a standalone sources.yaml",
+    )
+    migrate_parser.add_argument(
+        "--apply", action="store_true",
+        help="perform the migration; without it the command is a read-only dry run",
+    )
+    migrate_parser.add_argument(
+        "--compat-link", action="store_true",
+        help="leave a relative symlink at each old project path (project form only)",
+    )
+
     # release command (single-flight release claim — RUN-STATE.md §7).
     # Verb names and flags are FROZEN verbatim (§7 R5): taskdef bodies
     # reference them by these exact names.
@@ -656,6 +787,7 @@ def render_truncated_log(log_file: Path, max_lines: int = 50) -> int:
     return 0
 
 
+@work_transaction
 def cmd_log(message: str | None, metadata: list[str]) -> int:
     """
     Execute log command.
@@ -717,6 +849,8 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
         # logging — the entry still lands at the resolved run path.
         try:
             run_state.ensure_run()
+        except run_state.RunStateError:
+            raise  # ownership/version refusals are a write boundary
         except Exception:
             pass
 
@@ -739,10 +873,11 @@ def _sync_masterplan_links() -> list[str]:
     now present at the run-dir root ([] when there is nothing to sync).
     """
     try:
-        rdir = run_state.run_dir()
-        if rdir is None or not rdir.is_dir():
-            return []
-        return run_state.sync_masterplan_artifacts(rdir)
+        with work_mutation():
+            rdir = run_state.run_dir()
+            if rdir is None or not rdir.is_dir():
+                return []
+            return run_state.sync_masterplan_artifacts(rdir)
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
         return []
@@ -783,6 +918,7 @@ def cmd_commit(message: str | None) -> int:
     return rc
 
 
+@work_transaction
 def cmd_report(file_path: str) -> int:
     """
     Execute report command.
@@ -818,6 +954,8 @@ def cmd_report(file_path: str) -> int:
         # dir. Fail-soft: a state-layer problem must not lose the report.
         try:
             rdir, _ = run_state.ensure_run()
+        except run_state.RunStateError:
+            raise  # never place output in a record this writer cannot own
         except Exception:
             pass
 
@@ -863,6 +1001,7 @@ def _goal_file() -> Path:
     return Path(GOAL_FILE_DIR or "/tmp") / f"lmer_work_goal.{stem}.txt"
 
 
+@work_transaction
 def cmd_goal(
     description: str | None,
     estimate_sessions: int | None = None,
@@ -954,7 +1093,10 @@ def cmd_goal(
         return 1
 
 
-def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser) -> int:
+@work_transaction
+def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser,
+               scoped_path: str | None = None,
+               allow_unbaselined_delete: bool = False) -> int:
     """
     Execute memory command.
 
@@ -969,7 +1111,24 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     if action == "restore":
         return restore_memory()
     elif action == "persist":
-        return persist_memory(message)
+        return persist_memory(message, allow_unbaselined_delete)
+    elif action in ("forget", "revive"):
+        try:
+            operation = forget_memory if action == "forget" else revive_memory
+            rels = memory_retirement_paths(scoped_path)
+            write_journal.record_write_intent(f"memory {action}", rels)
+            pending = queue_paths(_work_repo_root(), rels)
+            try:
+                rels = operation(scoped_path)
+            except (MemoryRetirementError, OSError):
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
+                raise
+            write_journal.record_write_intent(f"memory {action}", rels)
+            return commit_work_path(rels, message or f"memory: {action} {scoped_path}")
+        except (MemoryRetirementError, OSError) as exc:
+            print(f"Memory {action} refused: {exc}", file=sys.stderr)
+            return 1
     else:
         parser.print_help()
         return 1
@@ -1015,20 +1174,9 @@ def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
     Returns:
         Exit code (0 success, 1 on any setup failure including already-set-up).
     """
-    # Lazy import: only setup-workspace needs lmer_cli. Plain `work log`/`commit`
-    # invocations should not pay to import the lmer_cli package.
     try:
-        from lmer_cli.container.clone_and_exec import (
-            setup_workspace,
-            WorkspaceExistsError,
-        )
-    except ImportError as e:
-        print(f"❌ Could not load workspace setup support: {e}", file=sys.stderr)
-        return 1
-
-    try:
-        result = setup_workspace(target, task=task, sync_deps=sync_deps)
-    except WorkspaceExistsError as e:
+        result = clone_and_exec.setup_workspace(target, task=task, sync_deps=sync_deps)
+    except clone_and_exec.WorkspaceExistsError as e:
         print(f"❌ {e}", file=sys.stderr)
         print(
             "   Remove the existing /workspace contents first if you really "
@@ -1091,6 +1239,7 @@ def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
     return 0
 
 
+@mutation_transaction
 def _require_run() -> tuple[Path, dict] | tuple[None, None]:
     """Resolve (and if needed create) the current run for mutations.
 
@@ -1110,6 +1259,23 @@ def _require_run() -> tuple[Path, dict] | tuple[None, None]:
         return None, None
 
 
+def _run_state_subject(state: dict, detail: str = "") -> str:
+    """The `run-state:` commit subject for a record: `<slug> <name> <detail>`.
+
+    One helper for every `run-state: {slug} ...` site (D14): the record's
+    label (including a default label — it is what makes the subject unique
+    when two launches share a slug) rides beside the slug. An unnamed record
+    keeps today's `<slug> <detail>` byte for byte.
+    """
+    parts = [str(state.get("slug"))]
+    name = state.get("name")
+    if isinstance(name, str) and name.strip():
+        parts.append(name)
+    if detail:
+        parts.append(detail)
+    return "run-state: " + " ".join(parts)
+
+
 def _push_run_dir(
     state: dict,
     detail: str,
@@ -1126,7 +1292,7 @@ def _push_run_dir(
         old_rel = run_state.run_rel_for_dir_name(old_dir_name)
         if old_rel and old_rel not in rels:
             rels.append(old_rel)
-    rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
+    rc = commit_work_path(rels, _run_state_subject(state, detail))
     if rc != 0:
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
@@ -1204,6 +1370,7 @@ def _redact_json_values(obj):
     return obj
 
 
+@work_transaction
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -1328,6 +1495,7 @@ def cmd_state(args) -> int:
     return 0
 
 
+@work_transaction
 def cmd_answer(text: str) -> int:
     """Execute answer command (issue #98 — resume-on-answer).
 
@@ -1397,8 +1565,15 @@ def cmd_verify(name: str, command: list[str]) -> int:
     do around `gate-check`. The marker never defers THIS process (see
     `gate_lock.active_gate`'s self-exclusion), so the receipt still lands.
     """
-    with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
-        return _run_verify(name, command)
+    # Only setup and receipt mutation acquire the checkout lock. Holding it
+    # while the external command runs would make that command's work helpers
+    # look like nested Git-hook writers and refuse valid writes.
+    try:
+        with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
+            return _run_verify(name, command)
+    except OSError as exc:
+        print(f"❌ Verify setup refused: {exc}", file=sys.stderr)
+        return 1
 
 
 def _run_verify(name: str, command: list[str]) -> int:
@@ -1494,6 +1669,7 @@ def _run_verify(name: str, command: list[str]) -> int:
     return exit_code
 
 
+@work_transaction
 def cmd_event(args) -> int:
     """Execute event command."""
     data = None
@@ -1617,6 +1793,7 @@ def _name_conflict(rdir: Path, name: str, slug: str | None = None) -> str | None
     return None
 
 
+@work_transaction
 def cmd_name(value: str | None) -> int:
     """Execute name command (spec §1 `work name`).
 
@@ -1654,7 +1831,11 @@ def cmd_name(value: str | None) -> int:
     if state.get("name") == name:
         print(f"✅ Name unchanged: {name}")
         return 0
-    holder = _name_conflict(rdir, name, state.get("slug"))
+    # D4: uniqueness is a LEGACY-tree rule. On a process record a name is a
+    # label, so two continuations of one source may carry the same label.
+    holder = None
+    if not run_state.is_process_record():
+        holder = _name_conflict(rdir, name, state.get("slug"))
     if holder is not None:
         print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
         return 1
@@ -1662,9 +1843,15 @@ def cmd_name(value: str | None) -> int:
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "run_named", note=name)
     print(f"✅ Run named: {name}")
+    if state.get("frozen"):
+        # The freeze took the one directory rename (or deliberately skipped
+        # it); a post-freeze name cannot move the dir, so say so (D14/§9.5).
+        old_rel = run_state.run_area_rel_name(rdir) or rdir.name
+        print(f"   directory frozen at `{old_rel}`; it will not be renamed")
     return 0
 
 
+@work_transaction
 def cmd_ledger(args) -> int:
     """Execute ledger / ledger set commands (issue #89).
 
@@ -1725,7 +1912,7 @@ def cmd_ledger(args) -> int:
     # not at session end (non-fatal, like artifact writes).
     rc = commit_work_path(
         run_state.run_rel_path_candidates(),
-        f"run-state: {state['slug']} ledger {task_id}={args.status}",
+        _run_state_subject(state, f"ledger {task_id}={args.status}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (ledger saved locally)")
@@ -1887,6 +2074,7 @@ def _cmd_goals_check() -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_freeze(note: str | None) -> int:
     """`work goals freeze`: the spec-approval gate (spec D2 + decision 1).
 
@@ -1921,8 +2109,9 @@ def _cmd_goals_freeze(note: str | None) -> int:
 
     old_dir_name = None
     if not state.get("frozen"):
-        if not state.get("name"):
-            # A run can still be unnamed at spec approval, and the
+        if not state.get("name") or run_state.is_default_label(state):
+            # A run can still be unnamed at spec approval (or carry only a
+            # default label, D5), and the
             # frozen stamp would forfeit the one-shot name-bearing rename
             # forever ("no second chance") — leave the seam to the phase
             # gate, which fires at the first execution-family transition.
@@ -1953,6 +2142,7 @@ def _cmd_goals_freeze(note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_amend(note: str | None) -> int:
     """`work goals amend`: explicit post-freeze change (spec D2). Validates
     the edited goals.md against the last agreed set with the
@@ -2003,6 +2193,7 @@ def _cmd_goals_amend(note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
     """`work goals assess`: the finish gate (spec D2 + D3, nudge-don't-block).
 
@@ -2115,6 +2306,7 @@ def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def cmd_goals(args) -> int:
     """Execute goals verbs (issue #91 — frozen goal-sets)."""
     if args.verdict and args.goals_action != "assess":
@@ -2241,18 +2433,31 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
     row. A legacy run dir has no session id — several sessions interleave in
     one dir, so none of them names it — and prints `-` in that column rather
     than a directory name pretending to be a launch.
+
+    A schema-2 row (one carrying `signed_out`, `run_state.list_sessions`)
+    has no `orphaned` verdict, so it ends with the state the listing derived
+    from the record and its own clock — `state=<word>` — and a listing with
+    any such row heads with the non-zero state buckets instead of the
+    schema-1 running/orphaned pair. Nothing is derived here: `state` is
+    `list_sessions`'s. `⚠️  state unreadable` marks a record whose state
+    really could not be read (every state field None), never a readable
+    record that simply has no claim verdict. A schema-1-only listing prints
+    exactly what it always did.
     """
     if not rows:
         return "No sessions running" if running_only else "No sessions recorded"
     id_width = max(len(row["id"] or "-") for row in rows)
     slug_width = max(len(str(row["slug"] or "?")) for row in rows)
-    orphaned = sum(1 for row in rows if row["orphaned"] is True)
-    running = sum(
-        1 for row in rows if row["status"] == "in-progress" and row["orphaned"] is False
-    )
-    head = f"Running sessions: {len(rows)}" if running_only else (
-        f"Sessions: {len(rows)} ({running} running, {orphaned} orphaned)"
-    )
+    if running_only:
+        head = f"Running sessions: {len(rows)}"
+    elif any("signed_out" in row for row in rows):
+        head = f"Sessions: {len(rows)}{_state_buckets(rows)}"
+    else:
+        orphaned = sum(1 for row in rows if row["orphaned"] is True)
+        running = sum(
+            1 for row in rows if row["status"] == "in-progress" and row["orphaned"] is False
+        )
+        head = f"Sessions: {len(rows)} ({running} running, {orphaned} orphaned)"
     lines = [head]
     for row in rows:
         parts = [
@@ -2264,10 +2469,42 @@ def _format_sessions(rows: list[dict], running_only: bool) -> str:
                 parts.append(f"{key}={row[key]}")
         if row["orphaned"] is True:
             parts.append("⚠️  orphaned (no live owner)")
-        if row["orphaned"] is None:
+        if "signed_out" in row:
+            parts.append(f"state={row['state']}")
+        if row["orphaned"] is None and row["slug"] is None and row["status"] is None:
             parts.append("⚠️  state unreadable")
         lines.append(" ".join(parts).rstrip())
     return "\n".join(lines)
+
+
+#: The `work sessions` header buckets for a schema-2 listing, in print order:
+#: the row's derived state word and the label the header counts it under.
+_STATE_BUCKETS = (
+    ("active", "active"),
+    ("stale", "stale"),
+    ("seeded", "seeded"),
+    ("ended, not closed", "ended not closed"),
+    ("waiting on question", "waiting on question"),
+    ("closed", "closed"),
+)
+
+
+def _state_buckets(rows: list[dict]) -> str:
+    """The non-zero state buckets of a schema-2 listing, as the header's tail.
+
+    `" (1 active, 2 closed)"` — buckets with no row are left out. The tail is
+    empty rather than empty parentheses when no row's state is a bucket word:
+    a schema-2 row whose `updated` cannot be parsed reads `open` under the
+    listing's clock (`session_record.display_state`), which no bucket counts.
+    (A record whose state could not be read carries no `signed_out`, so a
+    listing of only such records never reaches this header at all.)
+    """
+    counts = [
+        (label, sum(1 for row in rows if row.get("state") == word))
+        for word, label in _STATE_BUCKETS
+    ]
+    shown = ", ".join(f"{count} {label}" for label, count in counts if count)
+    return f" ({shown})" if shown else ""
 
 
 def _session_json_entry(row: dict) -> dict:
@@ -2287,6 +2524,11 @@ def _session_json_entry(row: dict) -> dict:
     blanket coercion over the whole document (`default=str`) would instead
     reshape good rows to rescue a bad one, and the reader could no longer
     tell a recorded timestamp from a repr of something else.
+
+    The entry is the row as `list_sessions` built it, so it carries every
+    key the row does — `stop_reason` on every row, `session`, `signed_out`
+    and the derived `state` on a schema-2 row — and the clearing below nulls
+    those with the rest, since they too were read out of the state file.
     """
     entry = dict(row)
     entry["path"] = str(row["path"])
@@ -2322,6 +2564,9 @@ def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
     the flag: it is the resumable one, and hiding it is how a crashed
     session is mistaken for a finished one. A record whose state cannot be
     read has no verdict at all, so it is never `--running` and always listed.
+    Nor is a `seeded` record running (schema form; `work seed` wrote it and
+    nothing has started in it — D13): it is listed without the flag, and the
+    `--json` entry carries `seeded` so a reader can tell it from a crash.
 
     Read-only, and always exits 0 — the `work ledger` convention. No run
     context is a normal state (a `chat` session without a repo), not a
@@ -2341,7 +2586,10 @@ def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
     if running_only:
         rows = [
             row for row in rows
-            if row["status"] == "in-progress" and row["orphaned"] is False
+            if row["status"] == "in-progress" and not row.get("seeded") and (
+                row.get("signed_out") is False if "signed_out" in row
+                else row["orphaned"] is False
+            )
         ]
     if as_json:
         payload = [_session_json_entry(row) for row in rows]
@@ -2442,6 +2690,7 @@ def cmd_resume(as_json: bool = False, session: str | None = None) -> int:
             # Web (tree) URL of the run dir (issue #104) — fail-soft None
             # keeps the brief byte-identical when no URL is derivable.
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     return 0
 
@@ -2499,6 +2748,7 @@ def _materialize_artifact(source: Path, dest: Path, rdir: Path) -> str | None:
     return linked
 
 
+@work_transaction
 def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
     """Execute artifact command (spec §4.3 `work artifact`, §6 `--sync`)."""
     if sync:
@@ -2585,13 +2835,14 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
         stage_paths.append(specs_index.specs_rel_path())
     rc = commit_work_path(
         stage_paths,
-        f"run-state: {state['slug']} artifact {name}",
+        _run_state_subject(state, f"artifact {name}"),
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
     return 0
 
 
+@work_transaction
 def cmd_specs_index(rebuild: bool) -> int:
     """Execute specs-index command (issue #101 — central specs directory).
 
@@ -2624,14 +2875,20 @@ def cmd_specs_index(rebuild: bool) -> int:
     return 0
 
 
+@work_transaction
 def cmd_seed(args) -> int:
     """Execute seed command (issue #87 D3 — out-of-session run creation).
 
     Creates a run for a slug OTHER than the current session's, through the
     same create-tmp → write-state → rename lifecycle as session seeding,
     recording CLI-shaped events (run_seeded, then goal_set / run_named as
-    applicable). Seeding is not owning: no `owner` claim is made. Writes
-    only — the caller batches the push with `work commit`.
+    applicable) — all of it inside the temp dir, before the one rename.
+    Seeding is not owning: no `owner` claim is made, and on schema 2 the
+    record is not even this launch's (#535, D13): it carries a fresh uid
+    with this launch in `session.seeded_by`, so the launch's own `run_dir()`
+    keeps resolving to one record and the seed is read-only to it once
+    renamed — the launch that picks it up is the one printed at the end.
+    Writes only — the caller batches the push with `work commit`.
     """
     base = run_state.runs_base()
     if base is None:
@@ -2639,53 +2896,88 @@ def cmd_seed(args) -> int:
         return 1
 
     slug = run_state.derive_slug(args.taskdef, args.target)
-    # match_names too: a sibling run NAMED like this slug would make the
-    # new run unfindable by name lookups — refuse the ambiguity outright.
-    existing = run_state.find_run_dir(slug, match_names=True)
-    if existing is not None:
-        print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
-        return 1
-    if (base / slug).exists():
-        print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
-        return 1
+    seeded = None
+    if run_state.is_process_record():
+        # Schema 2: the slug labels a GROUP and the record is its uid (D1),
+        # so a group that already holds records is where the seed goes
+        # beside them, never a collision — say so and carry on.
+        held = len(run_state._session_dirs(base / slug))
+        if held:
+            print(f"group {slug} already holds {held} record(s)")
+
+        try:
+            seeded = seeded_session()
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+    else:
+        # match_names too: a sibling run NAMED like this slug would make the
+        # new run unfindable by name lookups — refuse the ambiguity outright.
+        existing = run_state.find_run_dir(slug, match_names=True)
+        if existing is not None:
+            print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
+            return 1
+        # Kept for the legacy tree on purpose: here the directory IS the
+        # record, and the seed's rename onto it would clobber it.
+        if (base / slug).exists():
+            print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
+            return 1
 
     name = None
     if args.name:
         name = _validate_name(args.name)
         if name is None:
             return 1
-        holder = _name_conflict(base / slug, name, slug)
+        holder = None
+        if not run_state.is_process_record():
+            holder = _name_conflict(base / slug, name, slug)
         if holder is not None:
             print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
             return 1
 
+    # Agent-typed free text bound for the (shared) work repo — redacted once
+    # here so state.goal and the goal_set event agree, as `work goal` does.
+    # Goal and name travel INTO the seed: in both forms they land in the temp
+    # dir before the rename, which on schema 2 is the only moment this launch
+    # may write a record that is not its own.
+    goal = redact_secrets(args.goal)
     try:
-        rdir, state = run_state.seed_run_dir(
+        rdir, _ = run_state.seed_run_dir(
             slug,
             args.taskdef,
             args.target,
             note=f"seeded via `work seed` ({args.taskdef}, target: {args.target})",
             adopt_existing=False,  # seeding must never mutate a run it didn't create
+            seeded=seeded,
+            goal=goal,
+            name=name,
         )
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
 
-    # Agent-typed free text bound for the (shared) work repo — redacted once
-    # here so state.goal and the goal_set event agree, as `work goal` does.
-    goal = redact_secrets(args.goal)
-    if goal:
-        state["goal"] = goal
-    if name:
-        state["name"] = name
-    if goal or name:
-        run_state.write_state(rdir, state)
-        if goal:
-            run_state.append_event(rdir, "goal_set", note=goal)
-        if name:
-            run_state.append_event(rdir, "run_named", note=name)
+    # Remember the seed on the launch's own state, so `work commit` (which
+    # stages only the launch's own group) publishes it too (#535). Schema 2
+    # only; a no-op in a legacy tree.
+    try:
+        run_state.note_seeded_record(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        # The seed is still written; only its publication record is lost, so
+        # `work commit` will report it as a stray. Say so rather than letting
+        # it disappear silently.
+        print(
+            f"⚠️  could not record the seed for publication ({exc}); "
+            "`work commit` may report it as a stray",
+            file=sys.stderr,
+        )
 
     print(f"✅ Run seeded: {rdir}")
+    if seeded is not None:
+        route = run_state.continuation_route(
+            args.taskdef, args.target, seeded["uid"]
+        )
+        print(f"   uid: {seeded['uid']}")
+        print(f"   Pick it up with: {route}")
     print("   Not pushed — run `work commit` to publish it.")
     return 0
 
@@ -2705,7 +2997,11 @@ def _cas_stage_rels(extra_rels: list[str] | None = None) -> list[str]:
     its address. The specs-index file rides along for the same reason it
     does at session end: a dirty tracked file anywhere in the staged set
     would make ``pull --rebase`` refuse."""
-    rels = run_state.run_rel_path_candidates()
+    if run_state.is_process_record():
+        own = run_state.run_dir()
+        rels = [own.relative_to(_work_repo_root()).as_posix()] if own else []
+    else:
+        rels = run_state.run_rel_path_candidates()
     for extra in extra_rels or []:
         if extra not in rels:
             rels.append(extra)
@@ -2730,11 +3026,13 @@ def _sync_remote_head() -> tuple[bool, str]:
     remote head is the normal integration path; the §7 invariant (a CLAIM
     commit is never rebased onto an unchecked head) is preserved because
     the rebase runs only while no claim commit exists locally (the
-    lost-race path drops ours before looping back). The snapshot also makes
-    the lost-race ``reset --hard`` genuinely safe: every pre-existing file
-    — tracked or previously untracked (e.g. an uncommitted retro.md) — is
-    committed BEFORE the pre-claim head is captured, so dropping the claim
-    commit can never destroy anything the verb did not itself write.
+    lost-race path drops ours before looping back).
+
+    Schema 1 only. Every schema-2 claim transition — claim, unclaim, the
+    session-end release and abort — publishes an object built in a
+    temporary index instead (_shared_release_claim, _shared_release_abort),
+    because this rebase refuses outright on a shared checkout whenever any
+    sibling session has an uncommitted tracked file.
     """
     repo = _work_repo_root()
     ok, detail = _commit_claim_write(
@@ -2783,7 +3081,12 @@ def _commit_claim_write(
         # Content already committed (e.g. a same-second refresh) — the CAS
         # push still arbitrates below; nothing to commit is not a failure.
         return True, ""
-    rc, output = run_git_command(["commit", "-m", message], repo, check=False)
+    command = ["commit", "-m", message]
+    if run_state.is_process_record():
+        # Preserve unrelated staged edits as staged edits; a release snapshot
+        # is not permission to include someone else's index in our commit.
+        command += ["--only", "--", *rels]
+    rc, output = run_git_command(command, repo, check=False)
     if rc != 0:
         return False, f"git commit failed: {output}"
     return True, ""
@@ -2795,13 +3098,34 @@ def _drop_claim_commit(pre_head: str) -> None:
     The invariant: a claim commit is NEVER rebased onto a remote head that
     has not been re-checked for a foreign claim — so the loop discards the
     commit and rebuilds the claim from the re-fetched head each attempt.
-    ``reset --hard`` is safe exactly here: _sync_remote_head snapshot-
-    committed every pre-existing change (tracked AND untracked) before
-    ``pre_head`` was captured, so the dropped commit carries only what this
-    verb itself just wrote.
+    Schema 1 does this with a hard reset after snapshotting the run's files.
+
+    The schema-2 branch below is retained for a record-claim rollback on a
+    schema-2 tree; no schema-2 RELEASE transition reaches it any more, since
+    none of them creates a local claim commit to drop.
     """
     if pre_head:
-        run_git_command(["reset", "--hard", pre_head], _work_repo_root(), check=False)
+        repo = _work_repo_root()
+        if run_state.is_process_record():
+            # Only HEAD and this transaction's claim are rolled back. Hooks
+            # or helper commands may have written other files while Git ran.
+            rc, detail = run_git_command(["reset", "--soft", pre_head], repo, check=False)
+            if rc:
+                raise OSError(f"claim HEAD rollback failed: {detail}")
+            rel = release_claims.claim_rel_path()
+            rc, tracked = run_git_command(["ls-tree", "--name-only", pre_head, "--", rel], repo, check=False)
+            if rc:
+                raise OSError(f"claim rollback inspection failed: {tracked}")
+            if tracked.strip():
+                rc, detail = run_git_command(["restore", f"--source={pre_head}", "--staged", "--worktree", "--", rel], repo, check=False)
+            else:
+                rc, detail = run_git_command(["rm", "--cached", "--ignore-unmatch", "--", rel], repo, check=False)
+                if rc == 0:
+                    (repo / rel).unlink(missing_ok=True)
+            if rc:
+                raise OSError(f"claim file rollback failed: {detail}")
+        else:
+            run_git_command(["reset", "--hard", pre_head], repo, check=False)
 
 
 def _cas_commit_and_push(
@@ -2826,6 +3150,9 @@ def _cas_commit_and_push(
     pre_head = _git_head()
     ok, detail = _commit_claim_write(message, extra_rels)
     if not ok:
+        # A failed commit can still leave a staged claim. It must not ride
+        # along in a later ordinary commit and bypass arbitration.
+        _drop_claim_commit(pre_head)
         return CLAIM_PUSH_ERROR, detail
     outcome, detail = claim_push_once(_work_repo_root())
     if outcome != CLAIM_PUSH_WON:
@@ -2962,6 +3289,119 @@ def _roll_over_terminal_release(
     return fresh_rdir, fresh_state, moved_names
 
 
+def _shared_release_claim(
+    *, release: bool = False, force: bool = False, as_json: bool = False
+) -> int:
+    """Arbitrate schema-2 executions on one shared project resource.
+
+    The arbitration never touches the live checkout: the claim commit is
+    assembled in a temporary index seeded from the freshly fetched remote head
+    and pushed as an object. A work-repo checkout is shared — spawn-harness
+    children run beside their parent against one /work — so nothing here may
+    stash, rebase, reset or write it: a sibling session's uncommitted record
+    must not be able to leave the worktree because another session claimed a
+    release. There is correspondingly nothing to roll back on a lost race.
+    """
+    root = _work_repo_root()
+    if inherited_transaction(root):
+        return _claim_fail_closed("invoking Git transaction still owns this checkout", as_json)
+    try:
+        with checkout_lock(root):
+            result = _shared_release_claim_locked(release=release, force=force, as_json=as_json)
+        if isinstance(result, dict):
+            action = "unclaim" if release else "claim"
+            if as_json:
+                print(json.dumps({"result": "won", "action": action, **result}))
+            else:
+                print(f"Release {action} published for session {run_state.current_session_id()}")
+            return 0
+        return result
+    except (OSError, run_state.RunStateError, ValueError) as exc:
+        return _claim_fail_closed(str(exc), as_json)
+
+
+def _published_release_claim(expected_holder):
+    """Read the holder from a freshly fetched published tree, not our write."""
+    root = _work_repo_root()
+    destination = git_ops._publication_destination(root, "work repo")
+    if destination is None:
+        raise run_state.RunStateError("cannot resolve published claim destination")
+    remote, ref = destination
+    rc, output = run_git_command(["fetch", "--no-tags", remote, ref], root, check=False)
+    if rc:
+        raise run_state.RunStateError(f"cannot verify published claim: {output}")
+    rc, output = run_git_command(["show", f"FETCH_HEAD:{release_claims.claim_rel_path()}"], root, check=False)
+    if rc:
+        raise run_state.RunStateError(f"cannot read published claim: {output}")
+    claim = yaml.safe_load(output)
+    if not isinstance(claim, dict) or claim.get("schema") != 1 or claim.get("holder") != expected_holder:
+        raise run_state.RunStateError("published release holder differs from the requested transition")
+    return claim
+
+
+def _published_claim_at(root, commit: str, claim_rel: str) -> dict:
+    """The claim document a published head holds; unclaimed when absent."""
+    present, text = published_file(root, commit, claim_rel)
+    if not present:
+        return dict(release_claims.UNCLAIMED)
+    return release_claims.parse_claim(text, f"{commit}:{claim_rel}")
+
+
+def _shared_release_claim_locked(*, release=False, force=False, as_json=False):
+    """One claim transaction under the checkout lock: evaluate the PUBLISHED
+    claim, build the transition on top of it, and arbitrate with one push.
+
+    Each attempt re-reads the claim from the head it just fetched, so a lost
+    race re-evaluates a foreign claim before retrying — the §7 invariant that
+    a claim is never stacked onto an unchecked head. What the attempt builds
+    is an object graph, not checkout state, so the retry needs no rollback.
+    """
+    root = _work_repo_root()
+    session = run_state.current_session_id()
+    action = "unclaim" if release else "claim"
+    claim_rel = release_claims.claim_rel_path()
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        try:
+            rdir, state = _require_run()
+            if rdir is None:
+                return 1
+            if not release and state.get("status") != "in-progress":
+                raise run_state.RunStateError(
+                    "this execution has finished; start a fresh session"
+                )
+            # Commit-first, as every other verb: what this publishes is the
+            # record the local branch already holds, so the next ordinary
+            # `pull --rebase` drops this snapshot as applied rather than
+            # merging two spellings of one session's own files.
+            ok, detail = _commit_claim_write(
+                f"run-state: local snapshot before release {action}"
+            )
+            if not ok:
+                return _claim_fail_closed(detail, as_json)
+            ok, base = fetch_publication_head(root, "work repo")
+            if not ok:
+                return _claim_fail_closed(base, as_json)
+            claim = release_claims.next_claim(
+                _published_claim_at(root, base, claim_rel),
+                session, release=release, force=force,
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc), as_json)
+        outcome, detail, _commit = publish_overlay_commit(
+            root,
+            base=base,
+            message=_run_state_subject(state, f"release {action}"),
+            blobs={claim_rel: release_claims.serialize_claim(claim)},
+            subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
+        )
+        if outcome == CLAIM_PUSH_WON:
+            return _published_release_claim(None if release else session)
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"{action} push failed: {detail}", as_json)
+    return _claim_fail_closed("release claim push attempts exhausted", as_json)
+
+
+@work_transaction
 def cmd_release_claim(as_json: bool = False) -> int:
     """Execute `work release claim` (RUN-STATE.md §7 — frozen verb table).
 
@@ -2971,6 +3411,10 @@ def cmd_release_claim(as_json: bool = False) -> int:
     (git_ops.claim_push_once — never the rebase-retry path). A
     non-fast-forward rejection re-fetches and re-evaluates, bounded to
     RELEASE_CLAIM_ATTEMPTS.
+
+    On a schema-2 tree the shared claim takes over (_shared_release_claim):
+    the same CAS, the same bound, but published as an object built in a
+    temporary index so the shared checkout is never touched.
 
     A resolved run that is already FINISHED is not refused: it is the
     previous release, parked on the address this one derives, so it is
@@ -2986,6 +3430,8 @@ def cmd_release_claim(as_json: bool = False) -> int:
     written), or the claim could not be established (remote unreachable /
     attempts exhausted): fail closed, never proceed unlocked.
     """
+    if run_state.is_process_record():
+        return _shared_release_claim(as_json=as_json)
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
@@ -3072,7 +3518,7 @@ def cmd_release_claim(as_json: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc), as_json)
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release claim", extra_rels
+            _run_state_subject(state, "release claim"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             action = {
@@ -3120,6 +3566,29 @@ def cmd_release_claim(as_json: bool = False) -> int:
     )
 
 
+def _last_published_claim():
+    """The claim as of the last fetch, read from the upstream tracking ref.
+
+    The shared claim lives on the remote; the claim verb publishes it as an
+    object and deliberately never writes the checkout, so the worktree copy
+    is only as fresh as the last `pull`. This reads what the last fetch
+    brought down — no network, and current as of this session's own claim.
+    Returns None when there is no upstream ref or no claim recorded in it.
+    """
+    root = _work_repo_root()
+    rc, head = run_git_command(
+        ["rev-parse", "--verify", "--quiet", "@{upstream}"], root, check=False
+    )
+    if rc != 0 or not head.strip():
+        return None
+    try:
+        rel = release_claims.claim_rel_path()
+        present, text = published_file(root, head.strip(), rel)
+        return release_claims.parse_claim(text, f"@{{upstream}}:{rel}") if present else dict(release_claims.UNCLAIMED)
+    except (run_state.RunStateError, OSError):
+        return None
+
+
 def cmd_release_claim_status(as_json: bool = False) -> int:
     """Execute `work release claim-status` (§7 frozen verb table).
 
@@ -3128,6 +3597,18 @@ def cmd_release_claim_status(as_json: bool = False) -> int:
     convention, like `work ledger`); a broken state layer degrades to a
     warning, never a failure.
     """
+    if run_state.is_process_record():
+        try:
+            claim = _last_published_claim() or release_claims.read_claim()
+            holder = claim.get("holder")
+            verdict = ("unclaimed" if not holder else "ours"
+                       if holder == run_state.current_session_id() else "foreign")
+            payload = {**claim, "verdict": verdict}
+            print(json.dumps(payload) if as_json else
+                  f"Release claim: {verdict} (holder: {holder})")
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"Release claim unreadable: {exc}", file=sys.stderr)
+        return 0
     rdir = run_state.run_dir()
     if rdir is None:
         if as_json:
@@ -3169,6 +3650,7 @@ def cmd_release_claim_status(as_json: bool = False) -> int:
     return 0
 
 
+@work_transaction
 def cmd_release_unclaim(force: bool = False) -> int:
     """Execute `work release unclaim` (§7 frozen verb table).
 
@@ -3178,6 +3660,8 @@ def cmd_release_unclaim(force: bool = False) -> int:
     stranded-claim cleanup. No claim recorded is an idempotent no-op
     success. Mutating-verb rules: no run context is an error (exit 1).
     """
+    if run_state.is_process_record():
+        return _shared_release_claim(release=True, force=force)
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
@@ -3205,7 +3689,7 @@ def cmd_release_unclaim(force: bool = False) -> int:
         except (run_state.RunStateError, OSError) as exc:
             return _claim_fail_closed(str(exc))
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim"
+            _run_state_subject(state, "release unclaim")
         )
         if outcome == CLAIM_PUSH_WON:
             if holder != session:
@@ -3223,6 +3707,142 @@ def cmd_release_unclaim(force: bool = False) -> int:
     )
 
 
+def _shared_release_abort(*, reason: str | None, force: bool) -> int:
+    """`work release abort` on a schema-2 tree (§7).
+
+    The terminal record writes keep their documented crash-safe order and
+    their exact semantics — `release_run.record_abort` marks the release
+    record terminal first, then `run_state.abort_run` flips status, stop
+    reason and claim in one atomic state write. What changes is only how the
+    transition reaches the remote: the same object publication claim and
+    unclaim take, instead of `pull --rebase` on a shared checkout. That
+    rebase refused outright whenever a sibling session had an uncommitted
+    tracked file — a `work log` away, and the resting state of a shared
+    checkout — so an abort could not complete until every sibling had
+    committed.
+
+    The refusal checks read the PUBLISHED claim rather than the checkout's
+    copy of it, for the reason session end does: the claim verbs no longer
+    write that copy. Already-aborted records retry publication without
+    rewriting history; success verifies the cleared claim and the complete
+    execution record together on a freshly fetched head.
+    """
+    root = _work_repo_root()
+    if inherited_transaction(root):
+        return _claim_fail_closed("invoking Git transaction still owns this checkout")
+    session = run_state.current_session_id()
+    claim_rel = release_claims.claim_rel_path()
+    rdir = run_state.run_dir()
+    try:
+        state = run_state.load_state(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    if state is None:
+        print("❌ No release run recorded — nothing to abort", file=sys.stderr)
+        return 1
+    already_aborted = (
+        state.get("status") != "in-progress"
+        and state.get("stop_reason") == "aborted"
+    )
+    if state.get("status") != "in-progress" and not already_aborted:
+        # Checked BEFORE record_abort so a refused abort never marks the
+        # release record terminal.
+        print(f"❌ run '{state.get('slug')}' is already "
+              f"{state.get('status')} (stop_reason: "
+              f"{state.get('stop_reason')}) — nothing to abort", file=sys.stderr)
+        return 1
+    ok, base = fetch_publication_head(root, "work repo")
+    if not ok:
+        return _claim_fail_closed(base)
+    try:
+        published = _published_claim_at(root, base, claim_rel)
+        release_claims.available(published, session, force=force)
+    except (run_state.RunStateError, OSError) as exc:
+        return _claim_fail_closed(str(exc))
+    holder = published.get("holder")
+    if run_state.is_claimed_by_other(state, session) and not force:
+        status = run_state.claim_status(state, session)
+        return _report_claim_lost(
+            run_state.claim_pointer(rdir, state, session),
+            False,
+            f"run '{state.get('slug')}' is claimed by session "
+            f"{status['holder']} ({int(status['age_minutes'])} min ago) — "
+            f"refusing to abort a release another session is driving "
+            f"(pass --force if that session is known dead)",
+        )
+    if not already_aborted:
+        try:
+            release_run.record_abort(rdir, reason=reason)
+            state = run_state.abort_run(
+                rdir, state, reason=reason, session=session, force=force)
+        except (run_state.RunStateError, run_state.ClaimRefusedError, OSError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+    # A previous attempt may have saved these terminal writes but failed to
+    # publish them. Retry publication without rewriting the original reason
+    # or events, and recheck the remote holder even for an already-aborted run.
+    last_detail = "no push attempted"
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _commit_claim_write(
+            "run-state: local snapshot before release abort"
+        )
+        if not ok:
+            return _claim_fail_closed(detail)
+        ok, base = fetch_publication_head(root, "work repo")
+        if not ok:
+            return _claim_fail_closed(base)
+        try:
+            claim = release_claims.next_claim(
+                _published_claim_at(root, base, claim_rel),
+                session, release=True, force=force,
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc))
+        outcome, detail, _commit = publish_overlay_commit(
+            root,
+            base=base,
+            message=_run_state_subject(state, "release abort"),
+            blobs={claim_rel: release_claims.serialize_claim(claim)},
+            subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
+        )
+        if outcome == CLAIM_PUSH_WON:
+            try:
+                _published_release_claim(None)
+                # Check the record on the SAME freshly fetched head as the
+                # claim. A cleared claim alone does not prove the abort's
+                # state, reason and events reached the remote.
+                rc, detail = run_git_command(
+                    ["diff", "--quiet", "--no-ext-diff", "HEAD", "FETCH_HEAD",
+                     "--", rdir.relative_to(root).as_posix()],
+                    root, check=False,
+                )
+                if rc:
+                    raise run_state.RunStateError(
+                        "published abort record differs from the local snapshot"
+                        + (f": {detail}" if detail else "")
+                    )
+            except (run_state.RunStateError, OSError) as exc:
+                return _claim_fail_closed(str(exc))
+            cleared = f" (claim cleared: session {holder})" if holder else ""
+            print(f"✅ Release run aborted: {state.get('slug')}{cleared}")
+            # Precise about WHERE the next release goes: this run keeps its
+            # address until the next `work release claim` rolls it aside —
+            # the abort is a terminal write and nothing else.
+            print("   Bump commit stays on prep-release; the next "
+                  "`work release claim` rolls this run aside and starts the "
+                  "next release run.")
+            return 0
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"abort push failed: {detail}")
+        last_detail = detail
+    return _claim_fail_closed(
+        f"push attempts exhausted after {RELEASE_CLAIM_ATTEMPTS} "
+        f"non-fast-forward rejections: {last_detail}"
+    )
+
+
+@work_transaction
 def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
     """Execute `work release abort [--reason] [--force]` (release-flow spec §7: the
     abandoned release — bump merged, human declines the release MR).
@@ -3258,6 +3878,8 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
+    if run_state.is_process_record():
+        return _shared_release_abort(reason=reason, force=force)
     last_detail = "no push attempted"
     for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
         ok, detail = _sync_remote_head()
@@ -3287,6 +3909,14 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
         claim = state.get("claim")
         holder = claim.get("session_id") if isinstance(claim, dict) else None
         session = run_state.current_session_id()
+        extra_rels = None
+        if run_state.is_process_record():
+            try:
+                shared = release_claims.require_available(session, force=force)
+                holder = shared.get("holder")
+                extra_rels = [release_claims.claim_rel_path()]
+            except (run_state.RunStateError, OSError) as exc:
+                return _claim_fail_closed(str(exc))
         # Evaluated BEFORE record_abort: a refused abort must leave the
         # release record untouched.
         if run_state.is_claimed_by_other(state, session) and not force:
@@ -3303,11 +3933,13 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
             release_run.record_abort(rdir, reason=reason)
             state = run_state.abort_run(
                 rdir, state, reason=reason, session=session, force=force)
+            if extra_rels:
+                release_claims.change_claim(session, release=True, force=force)
         except (run_state.RunStateError, run_state.ClaimRefusedError, OSError) as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release abort"
+            _run_state_subject(state, "release abort"), extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             cleared = f" (claim cleared: session {holder})" if holder else ""
@@ -3373,6 +4005,7 @@ def _ensure_release_slug(
     return run_state.reslug_run(rdir, state, target)
 
 
+@work_transaction
 def cmd_release_record(args) -> int:
     """Execute `work release record <field>` (§7 frozen verb table —
     release-flow spec §3).
@@ -3487,7 +4120,10 @@ def _answer_marker_path(answer: str) -> Path:
     container's lifetime — exactly the env var's — so "applied once in this
     container" is the right scope.
     """
-    digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
+    # A schema-2 execution may reuse a container but never its predecessor's
+    # identity. The same answer can legitimately answer both fresh records.
+    scope = f"{run_state.current_session_id()}:" if run_state.is_process_record() else ""
+    digest = hashlib.sha256((scope + answer).encode("utf-8")).hexdigest()[:16]
     return Path(ANSWER_MARKER_DIR or "/tmp") / f".lmer-answer-applied-{digest}"
 
 
@@ -3525,6 +4161,151 @@ def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
     return state, answered
 
 
+def _apply_launch_identity(rdir: Path, state: dict, *, opened: bool) -> dict:
+    """Apply `lmer --name/--goal` (`LMER_RUN_NAME`/`LMER_RUN_GOAL`) once, on
+    the `work session-start` call that opened the record's session.
+
+    Both variables are flag-only host exports that live for the whole
+    container, so `opened` — "this call appended the record's first
+    `session_start`" — is what keeps a later start of the same launch from
+    naming or re-goaling the run again (the `LMER_ANSWER` consume-once idea,
+    decided from the record rather than a marker file). The name goes through
+    the same rules as `work name` (`_validate_name`, then `_name_conflict`
+    over the whole project). On a process record (schema 2) the launch name
+    always applies on the opening call (D5/§5.1: it replaces a default or an
+    inherited name); a legacy/schema-1 record keeps the old rule and is named
+    only when it has none. A held or unusable name is a one-line stdout
+    warning and the run keeps its default label (or stays unnamed), because a
+    cosmetic label must never refuse a session. The goal is
+    redacted like every other free-text writer and replaces a goal inherited
+    from a continuation source — an explicit launch goal outranks the
+    predecessor's.
+
+    Persistence is this function's own (`write_state` before the events, the
+    `cmd_name` / `cmd_seed` shape), so it never depends on which branch the
+    caller takes afterwards: the legacy claimed-by-other branch writes no
+    state of its own. The shared `state` is updated only after the write
+    succeeded, so a failed write leaves the caller's later owner write with
+    nothing to persist and the record truthfully unnamed.
+
+    Returns the fields that landed — `{"name": ..., "goal": ...}`, either
+    key absent when it was not applied, `{}` when nothing was — and announces
+    nothing itself on success: the callers run it BEFORE building the brief
+    they print, so the brief (and, for a schema-2 record, the launch lines
+    from :func:`_launch_identity_lines`) is what tells the agent.
+    `hooks/start.py` hands the agent session-start's stdout and nothing else;
+    a name and goal that only reached state.yaml would leave it naming the
+    run again, or working from a predecessor's goal.
+
+    Fail-soft, whole: every exception becomes one stdout warning and the
+    call returns `{}` — the hook that runs session-start drops the entire
+    brief on a non-zero exit, and `_start_process_record` turns a kernel
+    error into exit 2, so nothing here may raise.
+    """
+    try:
+        if not opened:
+            return {}
+        name_text = os.environ.get("LMER_RUN_NAME") or ""
+        goal_text = os.environ.get("LMER_RUN_GOAL") or ""
+        if not name_text.strip() and not goal_text.strip():
+            return {}
+        candidate = dict(state)
+        events: list[tuple[str, str]] = []
+        # On a process record a launch `--name` always applies on the opening
+        # call (D5/§5.1: it replaces a default OR an inherited name). A
+        # legacy/schema-1 record keeps today's rule (only an absent name is
+        # filled). `opened` already limits this to the call that opened the
+        # record.
+        existing_name = state.get("name")
+        name_replaceable = existing_name is None or run_state.is_process_record()
+        if name_text.strip() and name_replaceable:
+            name = _validate_name(name_text)
+            keeps = ("this run keeps its label" if run_state.is_process_record()
+                     else "this run stays unnamed")
+            if name is None:
+                print(f"⚠️  launch name '{name_text}' not applied: not a usable name; "
+                      f"{keeps} — work name <other>")
+            else:
+                # D4: the held-by check is a legacy rule; on a process record
+                # a label never conflicts.
+                holder = None
+                if not run_state.is_process_record():
+                    holder = _name_conflict(rdir, name, state.get("slug"))
+                if holder is not None:
+                    print(f"⚠️  launch name '{name}' not applied: held by run '{holder}' "
+                          f"(names are unique per project); {keeps} — "
+                          "work name <other>")
+                else:
+                    candidate["name"] = name
+                    events.append(("run_named", name))
+        if goal_text.strip():
+            goal = redact_secrets(goal_text)
+            candidate["goal"] = goal
+            events.append(("goal_set", goal))
+        if not events:
+            return {}
+        run_state.write_state(rdir, candidate)
+        state.update(candidate)
+        applied = {}
+        for event_type, note in events:
+            applied["name" if event_type == "run_named" else "goal"] = note
+            run_state.append_event(rdir, event_type, note=note, data={"source": "launch"})
+        return applied
+    except Exception as exc:
+        print(f"⚠️  launch name/goal not applied (continuing): {exc}")
+        return {}
+
+
+def _launch_identity_lines(applied: dict, replaced_goal: str | None = None) -> list[str]:
+    """The lines a schema-2 `work session-start` prints for what
+    :func:`_apply_launch_identity` recorded, or `[]` when nothing landed.
+
+    A schema-2 record has no resume brief of its own to carry them: a fresh
+    launch prints none at all, and a continuation's brief is the
+    predecessor's read-only context. These lines are therefore the agent's
+    only sight of the launch's name and goal, worded as the CURRENT ones — the
+    `Run name:` line is what `taskdef/run-state.jinja2` tells the agent to
+    skip `work name` for. `replaced_goal` is the goal a continuation inherited
+    and the launch goal replaced: it stays visible, but labelled as context,
+    so the predecessor's goal is never read as this session's.
+    """
+    if not applied:
+        return []
+    lines = ["This launch (lmer --name/--goal, already recorded):"]
+    if applied.get("name"):
+        lines.append(f"Run name: {applied['name']}")
+    if applied.get("goal"):
+        lines.append(f"Goal: {applied['goal']}")
+        if replaced_goal and replaced_goal != applied["goal"]:
+            lines.append(
+                f"Predecessor goal (context only, replaced by the launch goal): {replaced_goal}"
+            )
+    return lines
+
+
+def _source_slug_warning(context: dict, slug: str | None) -> str | None:
+    """The line `work session-start` prints when a continuation's source was
+    recorded under another slug, or None when the groups agree.
+
+    A local-path launch used to export `.` and file under `chat-.`; the host
+    now exports an empty target, so a continuation of such a record lands
+    under the bare taskdef (`chat`) with `source_session_uid` provenance into
+    the old group. Nothing moves and nothing is renamed — the old group is
+    history — but the operator looking for the record under its old group
+    deserves to be told where the new one went.
+    """
+    source_state = context.get("state") if isinstance(context, dict) else None
+    recorded = source_state.get("slug") if isinstance(source_state, dict) else None
+    if recorded in (None, slug):
+        return None
+    return (
+        f"⚠️  continuing session {context.get('source_session_uid')} recorded under "
+        f"slug '{recorded}'; this execution is filed under '{slug}' "
+        "(the old group stays as history)"
+    )
+
+
+@work_transaction
 def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
     ALWAYS exits 0 — a broken state layer must never break session start.
@@ -3538,6 +4319,12 @@ def cmd_session_start(session: str | None = None) -> int:
     forwarded into the container and kept in step with the directory. A
     legacy tree keeps one shared run dir per target and chains nothing.
     """
+    try:
+        if run_state.is_process_record():
+            return _start_process_record(session)
+    except SchemaContextError as exc:
+        print(f"No run context: {exc} — run state skipped")
+        return 0
     try:
         session = _launch_session(session)
         rdir = run_state.run_dir(session=session)
@@ -3601,11 +4388,24 @@ def cmd_session_start(session: str | None = None) -> int:
 
         state, answered = _apply_pushed_answer(rdir, state)
 
-        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
-        # All events for the sessions-used count (issue #99) — this session's
-        # own session_start lands after the decide, so the count reads
+        # All events for the sessions-used count (issue #99), read BEFORE
+        # this session's own session_start is appended, so the count reads
         # "sessions used so far"; the brief still shows the last 5.
         all_events = run_state.read_events(rdir, last_n=0)
+        run_state.append_event(rdir, "session_start")
+        # `lmer --name/--goal` land once, on the call that opened the record's
+        # first session; `all_events` was read before the append, so it says
+        # whether this is that call. Isolated: never a refusal, and it
+        # persists itself because the claimed-by-other branch below does not.
+        # Applied BEFORE the decide: the brief printed below is the agent's
+        # only sight of the run (`hooks/start.py` injects this stdout), so it
+        # must already carry the launch name and goal.
+        _apply_launch_identity(
+            rdir, state,
+            opened=not any(e.get("type") == "session_start" for e in all_events),
+        )
+
+        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
         try:
             ledger = run_state.load_ledger(rdir)
         except (run_state.RunStateError, OSError):
@@ -3616,7 +4416,6 @@ def cmd_session_start(session: str | None = None) -> int:
             release=_release_record_for_brief(rdir, state),
         )
 
-        run_state.append_event(rdir, "session_start")
         if run_state.is_claimed_by_other(state, run_state.current_session_id()):
             # A LIVE foreign release claim (RUN-STATE.md §7) is enforced,
             # not advisory: a session starting on a claimed release run
@@ -3641,12 +4440,60 @@ def cmd_session_start(session: str | None = None) -> int:
             seed=os.environ.get("LMER_START_PROMPT") or None,
             answered=answered,
             run_dir_url=web_url_for(rdir),
+            dir_name=rdir.name,
         ))
     except Exception as exc:  # never break a session (spec §6)
         print(f"⚠️  run-state session-start failed (continuing): {exc}")
     return 0
 
 
+def _start_process_record(source_session: str | None = None) -> int:
+    """Schema-2 hook: seed our record and print read-only predecessor context,
+    then this launch's own name and goal when `lmer --name/--goal` set them."""
+    try:
+        rdir, state = run_state.ensure_run(session=source_session)
+        state, answered = _apply_pushed_answer(rdir, state)
+        context = state.get("context") or {}
+        events = run_state.read_events(rdir, last_n=0)
+        # The predecessor's view, taken before the launch identity lands: the
+        # context brief is what this record inherited, never this launch's.
+        inherited = dict(state)
+        starts = [e for e in events if e.get("type") == "session_start"]
+        if not starts:
+            run_state.append_event(rdir, "session_start", data={"session": state["session"]})
+        # `lmer --name/--goal`, once, on the call that opened the session
+        # (`starts` was read before the append). Isolated: cannot reach the
+        # exit-2 branch below. Applied before anything is printed, so the
+        # output below can say which goal is current.
+        applied = _apply_launch_identity(rdir, state, opened=not starts)
+        if context:
+            decision = run_state.decide(
+                inherited, events[-25:], run_state.current_session_id()
+            )
+            if applied.get("goal"):
+                # The launch goal replaced the inherited one: the context
+                # brief must not present the old goal as the goal, so it moves
+                # to the launch lines below, labelled as replaced.
+                decision["goal"] = None
+            print(f"Context from session {context['source_session_uid']} (read-only):")
+            print(run_state.format_brief(decision, answered=answered, dir_name=rdir.name))
+            warning = _source_slug_warning(context, state.get("slug"))
+            if warning:
+                print(warning)
+        for line in _launch_identity_lines(
+            applied, replaced_goal=inherited.get("goal") if context else None
+        ):
+            print(line)
+        state["owner"] = {"session_id": run_state.current_session_id(), "claimed_at": run_state.utc_now_iso()}
+        run_state.write_state(rdir, state)
+        print(f"Session {state['session']['uid']} owns {rdir}")
+        return 0
+    except (run_state.RunStateError, ValueError) as exc:
+        print(f"Session start refused: {exc}", file=sys.stderr)
+        return 2
+
+
+@work_transaction
 def _release_claim_at_session_end(rdir) -> None:
     """Release a release claim THIS session holds, at clean session end (§7).
 
@@ -3661,6 +4508,9 @@ def _release_claim_at_session_end(rdir) -> None:
     backstop.
     """
     session = run_state.current_session_id()
+    if run_state.is_process_record():
+        _shared_release_claim(release=True)
+        return
     for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
         ok, detail = _sync_remote_head()
         if not ok:
@@ -3678,7 +4528,7 @@ def _release_claim_at_session_end(rdir) -> None:
             print(f"⚠️  session-end claim release failed: {exc}")
             return
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release unclaim (session end)"
+            _run_state_subject(state, "release unclaim (session end)")
         )
         if outcome == CLAIM_PUSH_WON:
             print(f"✅ Release claim released at session end: {state.get('slug')}")
@@ -3690,9 +4540,10 @@ def _release_claim_at_session_end(rdir) -> None:
           "leaving the claim to the stale threshold")
 
 
+@work_transaction(failure_result=0)
 def cmd_session_end() -> int:
     """Record session end, release a claim we hold, and push the run dir.
-    Hook-facing: ALWAYS exits 0."""
+    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write."""
     rdir = run_state.run_dir()
     if rdir is None:
         return 0
@@ -3715,12 +4566,30 @@ def cmd_session_end() -> int:
         run_state.write_state(rdir, state)
         # The single-flight release claim (§7) is a separate lock from
         # `owner` and must be released through the CAS path, not a plain
-        # state write — check on the LOCAL view first so non-release
-        # sessions never pay the git round-trips.
-        if (run_state.claim_status(state, run_state.current_session_id())
-                ["verdict"] == run_state.CLAIM_OURS):
+        # state write — decided without a network round trip, so non-release
+        # sessions pay nothing for it.
+        if run_state.is_process_record():
+            # From the PUBLISHED claim, not the checkout's copy: the claim
+            # verb publishes an object and deliberately leaves that copy
+            # alone, so it is absent or stale unless something has pulled
+            # since. Reading it here made a holder skip its own release and
+            # strand the claim — and schema 2 has no age expiry to clear one
+            # (`available`), so only `unclaim --force` could. The upstream
+            # tracking ref was updated by this session's own claim, and
+            # reading it costs no network.
+            claim = _last_published_claim() or release_claims.read_claim()
+            held = claim.get("holder") == run_state.current_session_id()
+        else:
+            held = (run_state.claim_status(state, run_state.current_session_id())
+                    ["verdict"] == run_state.CLAIM_OURS)
+        if held:
             _release_claim_at_session_end(rdir)
         rels = run_state.run_rel_path_candidates()
+        # Records this launch seeded into another group (D13) — the last push
+        # of the session must carry them or they are stranded locally (#535).
+        for seeded_rel in run_state.seeded_record_rel_paths():
+            if seeded_rel not in rels:
+                rels.append(seeded_rel)
         # Masterplan-sync (and freeze-rename) specs-index entries ride along —
         # this is the last push of the session, so leaving them unstaged
         # strands them locally (review on !126).
@@ -3733,7 +4602,9 @@ def cmd_session_end() -> int:
         # them — and a deferral here has no later commit to flush it.
         rc = commit_work_path(
             rels,
-            f"run-state: session end {state['slug']}",
+            "run-state: session end "
+            + str(state["slug"])
+            + (f" {state['name']}" if state.get("name") else ""),
             allow_during_gate=True,
         )
         if rc != 0:
@@ -3763,36 +4634,55 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         except Exception:
             return []
 
+    def pushing(rels: list[str]) -> list[str]:
+        """The scope of a verb whose write reaches `commit_work_path`: it may
+        regenerate or sweep the project README index block as well."""
+        rels = list(rels)
+        rels.extend(rel for rel in _index_rel_paths() if rel not in rels)
+        return rels
+
     if command == "log":
         return None if args.message is None else run_candidates()
     if command == "goal":
         return None if args.description is None else run_candidates()
     if command == "name":
         return None if args.value is None else run_candidates()
-    if command in ("event", "answer", "verify", "report",
-                   "session-start", "session-end"):
+    if command in ("event", "verify", "report", "session-start"):
         return run_candidates()
+    if command in ("answer", "session-end"):
+        return pushing(run_candidates())
     if command == "release":
         action = getattr(args, "release_action", None)
         if action in ("claim", "unclaim", "abort", "record"):
-            return run_candidates()
+            rels = run_candidates()
+            if run_state.is_process_record():
+                rels.append(release_claims.claim_rel_path())
+            return pushing(rels)
         return None
     if command in ("state", "ledger"):
-        return run_candidates() if getattr(args, "action", None) == "set" else None
+        return pushing(run_candidates()) if getattr(args, "action", None) == "set" else None
     if command == "goals":
         action = getattr(args, "goals_action", None)
-        return run_candidates() if action in ("freeze", "amend", "assess") else None
+        return pushing(run_candidates()) if action in ("freeze", "amend", "assess") else None
     if command == "artifact":
         rels = run_candidates()
         specs_rel = specs_index.specs_rel_path()
         if specs_rel:
             rels.append(specs_rel)
-        return rels
+        return pushing(rels)
     if command == "specs-index":
         if not getattr(args, "rebuild", False):
             return None
         specs_rel = specs_index.specs_rel_path()
         return [specs_rel] if specs_rel else []
+    if command == "adopt":
+        # deferred: import cost — only `work adopt` needs it; adopt/migrate add ~10 ms to every `work` call
+        from . import adopt
+        return adopt.write_rel_paths(args)
+    if command == "migrate":
+        # deferred: import cost — only `work migrate` needs it; adopt/migrate add ~10 ms to every `work` call
+        from . import migrate
+        return migrate.write_rel_paths(args)
     if command == "seed":
         try:
             slug = run_state.derive_slug(args.taskdef, args.target)
@@ -3800,14 +4690,58 @@ def _write_intent_rel_paths(args) -> list[str] | None:
             return [rel] if rel else []
         except Exception:
             return []
+    if command == "knowledge":
+        if getattr(args, "knowledge_action", None) != "index":
+            return None
+        if getattr(args, "check", False):
+            return None  # --check writes nothing
+        return [knowledge.KNOWLEDGE_DIR]
+    if command == "housekeep":
+        if not getattr(args, "apply", False):
+            return None  # dry run writes nothing
+        # The scope the apply may write: the selected project dirs, the
+        # archive area and the napkin area. Non-empty in a legacy tree too.
+        rels = ["_archive", "_napkin", "napkin"]
+        try:
+            projects = housekeep.project_dirs(
+                _work_repo_root(), getattr(args, "project", None)
+            )
+            rels.extend(entry.rel for entry in projects)
+        except Exception:
+            pass  # an unknown --project exits 2 in main() before any write
+        rels.extend(run_candidates())
+        return pushing(rels)
     if command == "memory":
+        if getattr(args, "memory_action", None) in ("forget", "revive"):
+            return pushing(memory_retirement_paths(args.scoped_path))
         if getattr(args, "memory_action", None) != "persist":
             return None
         # The writer owns the shape: memory has one scope in a legacy tree and
         # two in a schema-form one (issue #353 D17), and a hand-built
         # {host}/{project}/memory would journal a path persist never touches.
-        return memory_write_rel_paths()
+        return pushing(memory_write_rel_paths())
     return None
+
+
+def _index_rel_paths() -> list[str]:
+    """The project README a durability push may regenerate or sweep.
+
+    In schema form every push through `commit_work_path` renders this
+    session's project README index block from the records the commit will
+    contain and stages it with them (`git_ops._refresh_project_indexes`), and
+    sweeps a generated README a crashed session left dirty — so the honest
+    scope of every pushing verb names the file, whether or not this push
+    happens to change it. A legacy tree has no index. Fail-soft: no layout,
+    no path.
+    """
+    try:
+        layout = work_repo_layout()
+        if not layout.is_schema or layout.base is None:
+            return []
+        rel = Path(layout.base).relative_to(layout.root).as_posix()
+    except Exception:
+        return []
+    return [f"{rel}/README.md"]
 
 
 def _journal_write_intent(args) -> None:
@@ -3835,6 +4769,20 @@ def _journal_write_intent(args) -> None:
         pass
 
 
+#: A schema-2 record belongs to a launch, so a shell with no session UID cannot
+#: record an answer; this is where the human's answer goes instead.
+_ANSWER_ROUTE_HINT = (
+    "   A schema-2 record must belong to a launch, so a bare shell cannot record "
+    "an answer.\n"
+    "   Answer through the platform instead: the run's answer card in the UI, or "
+    "POST /api/runs/answer\n"
+    "   (`lmer-ctl runs answer KEY TEXT`); either starts a session that carries "
+    "the answer.\n"
+    "   From a host shell, `lmer ... --session <asking UID> --answer \"<text>\"` "
+    "does the same."
+)
+
+
 def main() -> int:
     """Main entry point for work CLI.
 
@@ -3856,6 +4804,23 @@ def main() -> int:
         parser.print_help()
         return 1
 
+    # Record-writing helpers inherit their execution's UID. Without one,
+    # a read resolver may choose the latest record, but a writer must refuse.
+    if args.command not in (
+        "memory", "specs-index", "adopt", "migrate", "housekeep", "knowledge"
+    ):
+        try:
+            if run_state.is_process_record() and _write_intent_rel_paths(args) is not None:
+                current_metadata()
+        except SchemaContextError:
+            # Existing dispatch reports the manifest cause, retaining each
+            # read-only/hook verb's documented exit behavior.
+            pass
+        except ValueError as exc:
+            print(f"Session write refused: {exc}", file=sys.stderr)
+            if args.command == "answer":
+                print(_ANSWER_ROUTE_HINT, file=sys.stderr)
+            return 2
     _journal_write_intent(args)
     try:
         return _dispatch(args, parser)
@@ -3876,7 +4841,13 @@ def _dispatch(args, parser) -> int:
     elif args.command == "goal":
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
-        return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+        return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
+                          getattr(args, "scoped_path", None),
+                          getattr(args, "allow_unbaselined_delete", False))
+    elif args.command == "housekeep":
+        return housekeep.cmd_housekeep(args)
+    elif args.command == "knowledge":
+        return knowledge.cmd_knowledge(args)
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
@@ -3918,6 +4889,14 @@ def _dispatch(args, parser) -> int:
         return cmd_artifact(args.name, args.file, args.sync)
     elif args.command == "specs-index":
         return cmd_specs_index(args.rebuild)
+    elif args.command == "adopt":
+        # deferred: import cost — only `work adopt` needs it; adopt/migrate add ~10 ms to every `work` call
+        from . import adopt
+        return adopt.cmd_adopt(args)
+    elif args.command == "migrate":
+        # deferred: import cost — only `work migrate` needs it; adopt/migrate add ~10 ms to every `work` call
+        from . import migrate
+        return migrate.cmd_migrate(args)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "release":

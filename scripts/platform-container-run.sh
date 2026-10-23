@@ -556,7 +556,10 @@ for name in $(compgen -e | sort || true); do
         # above. Listed after LMER_PLATFORM_* so those keep the blocked and
         # path-checked handling below. ~/.lmer/.env remains the alternative:
         # the daemon loads it and it rides the state mount.
+        # The CI-baseline toggle (#452) rides the same ladder for the same
+        # reason.
         LMER_MEMORY|LMER_CPUS|LMER_GPU|LMER_*_MEMORY|LMER_*_CPUS|LMER_*_GPU) add_env "$name"; continue ;;
+        LMER_GATE_CI_BASELINE|LMER_*_GATE_CI_BASELINE) add_env "$name"; continue ;;
         *) continue ;;
     esac
     blocked=0

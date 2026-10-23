@@ -75,11 +75,19 @@ FIXED_NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
 #: probe that proves the record check read its state file.
 LATE_NOW = FIXED_NOW + timedelta(days=90)
 
-#: What a conformant schema-form plexus reports: ONE informational finding,
-#: for the host bucket the fixture carries on purpose (D9 — an unnamed repo's
-#: work, awaiting adoption, which never blocks). Anything else appearing here
-#: is a new statement about the form and belongs in a review, not in a diff.
-CLEAN_FINDINGS = (("tree.host-bucket", "INFO"),)
+#: What a conformant schema-form plexus reports: the schema-older warning,
+#: then two informational findings — the host bucket the fixture carries on
+#: purpose (D9 — an unnamed repo's work, awaiting adoption, which never
+#: blocks) and the project README the fixture does not write
+#: (`index.readme-missing`: `lmer/` holds run records and no generated index
+#: block; the project's next durability push or `lmer-schema index --write`
+#: creates it). Anything else appearing here is a new statement about the
+#: form and belongs in a review, not in a diff.
+CLEAN_FINDINGS = (
+    ("manifest.schema-older", "WARN"),
+    ("tree.host-bucket", "INFO"),
+    ("index.readme-missing", "INFO"),
+)
 
 #: One defect per check family: the family, the code it must produce and the
 #: repo-relative path it must be reported against. The tests below inject them
@@ -143,7 +151,7 @@ def _only_error(document, code, path):
 
 
 def _edit_manifest(tree, mutate):
-    """Round-trip ``_plexus.yaml`` through *mutate* (comments are not kept —
+    """Round-trip ``_lmer.yaml`` through *mutate* (comments are not kept —
     the manifest's shape is what these tests change, never its prose)."""
     document = yaml.safe_load(tree.manifest.read_text(encoding="utf-8"))
     mutate(document)
@@ -175,13 +183,13 @@ class TestGreenEndToEnd:
         assert document["counts"]["error"] == 0
         assert [f for f in document["findings"] if f["severity"] == "ERROR"] == []
 
-    def test_it_is_not_warned_about_either(self, capsys, schema_plexus):
+    def test_only_the_older_schema_is_warned_about(self, capsys, schema_plexus):
         # Warnings never block (D14), so a WARN would not move the exit code —
-        # which is exactly why it has to be asserted separately. A conformant
-        # tree earns none: every remaining finding is informational.
+        # which is exactly why it has to be asserted separately. The schema-1
+        # fixture earns only the explicit newer-version availability warning.
         _code, document = _cli_json(capsys, schema_plexus)
-        assert document["counts"]["warn"] == 0
-        assert {f["severity"] for f in document["findings"]} <= {"INFO"}
+        assert document["counts"]["warn"] == 1
+        assert {f["code"] for f in document["findings"] if f["severity"] == "WARN"} == {"manifest.schema-older"}
 
     def test_the_text_report_says_conformant(self, capsys, schema_plexus):
         code = cli.main(["validate", str(schema_plexus.root)])

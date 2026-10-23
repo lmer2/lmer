@@ -504,7 +504,7 @@ def test_the_operator_chat_pane_is_this_runs_channel_not_the_supervisor():
             "a session pane names uber lmer: the supervisor chat is the fleet's, "
             "not a run's (T31)"
         )
-    assert "uber lmer" in _header(), (
+    assert "{{ assistantName }}" in _header(), (
         "the detail header no longer marks the orchestrator's own run (T85)"
     )
 
@@ -1429,12 +1429,12 @@ def test_the_header_marks_the_orchestrators_own_run():
         "the badge draws a different shape from the drawer that opens the same "
         "session, so nothing connects the two"
     )
-    assert ">uber lmer<" in header, "the badge has no word, only a colour and a shape"
+    assert ">{{ assistantName }}<" in header, "the badge has no word, only a colour and a shape"
     # Beside the signal and before the name, on the line that already carries both:
     # the identity line below is deliberately one row and is about the *run*.
     assert (
         header.index("toneColor(meta.tone)")
-        < header.index(">uber lmer<")
+        < header.index(">{{ assistantName }}<")
         < header.index("{{ run.title || run.label }}")
     ), "the badge is not between the state chip and the run's name"
 
@@ -1523,3 +1523,16 @@ def test_the_link_gate_is_format_js_and_not_a_second_test_in_the_view():
         assert grammar not in stripped, (
             f"RunDetail.vue decides for itself what a link is ({grammar})"
         )
+
+
+def test_the_live_session_card_names_the_container():
+    """#444: the name an operator gives `podman ps` or `lmer follow`, beside the
+    session's id and pid, and nothing at all for a session with none yet."""
+    overview = _panels("tab")["overview"]
+    card = overview[overview.index("live session"):]
+    card = card[:card.index("</dl>")]
+    assert "{{ session.container_name }}" in card
+    assert card.count('v-if="session.container_name"') == 2, (
+        "the label and the value must disappear together"
+    )
+    assert card.index("session.pid") < card.index("session.container_name")

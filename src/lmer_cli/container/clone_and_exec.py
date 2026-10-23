@@ -39,13 +39,23 @@ normalized remotes (D8/D21), which has exactly one definition —
 Mirroring that here would be a second implementation of identity, so
 ``_resolve_work_repo_placement`` imports the core lazily and guarded,
 exactly as ``_import_yaml`` does, and answers "legacy" without importing
-anything when the tree carries no ``_plexus.yaml`` (a single stat — the
+anything when the tree carries no ``_lmer.yaml`` (a single stat — the
 same presence test the core itself uses). A tree that DOES carry one and a
 build that cannot import the core is a refusal to place anything, never a
 fall back to the legacy names: that fallback would write a schema-form
 tree's record at ``{host}/{project}/runs/`` and split the tree in two
 (D20). This is the one exception to the stdlib-only rule above and it is
 a degrade-to-legacy exception, not a dependency.
+
+The same seam serves the manifest's ``sources:`` tier (issue #370): a
+present ``_lmer.yaml`` is the second declaration file, and
+``_resolve_declared_sources`` reads it through the core's ONE manifest
+parser (``lmer_schema.manifest.load_manifest``, imported function-locally
+and guarded exactly like the placement code's) and hands the raw section
+to the standalone loader (``load_sources(..., manifest_sources=,
+manifest_path=)``). A tree with neither declaration file stays stdlib-only
+and silent; a present manifest that PyYAML or the core cannot read refuses
+start, exactly as a present ``sources.yaml`` does.
 """
 from __future__ import annotations
 
@@ -62,7 +72,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # Git config that disables the LFS smudge/process filters and marks them
 # non-required. Used when git-lfs is not installed so a target repo that
@@ -92,6 +102,10 @@ KNOWN_HARNESS_RUNNERS = {
     "pi-runner",
 }
 
+#: How long the session-end backstop may take (a work-repo push). The container's
+#: stop timeout (lmer_cli.runtime.STOP_TIMEOUT_SECONDS) must exceed it.
+SESSION_END_TIMEOUT_SECONDS = 180
+
 # The canonical source config (sources.yaml, issue #105) file name at the
 # work-repo root (single source of truth for the refusal check and the
 # resolution step — see the section banner further down).
@@ -104,7 +118,7 @@ SOURCES_CONFIG_NAME = "sources.yaml"
 # it; the core owns the name for every read (lmer_schema.manifest), and the
 # probe is deliberately the same test the core's own detection uses
 # (is_symlink() first, so a dangling manifest symlink still reads as present).
-PLEXUS_MANIFEST_NAME = "_plexus.yaml"
+PLEXUS_MANIFEST_NAME = "_lmer.yaml"
 
 # The two project-scope area names container start creates in a schema-form
 # tree: the run area (D22 — a launch's session dir hangs under
@@ -157,6 +171,14 @@ _SOURCE_DESTS = {"taskdef": "/taskdef", "napkin": "/napkin"}
 # ORIGIN_UNSET_FALLBACK never prints a banner — silent legacy mode is
 # literally zero output (spec G5) — but stays in the shared vocabulary for
 # --show-env parity.
+# ORIGIN_DECLARED is the legacy-only spelling (mirrored by sources.py's
+# ORIGIN_DECLARED). Once a `_lmer.yaml` is present (issue #370) a declared
+# row names its tier instead — `declared (manifest)` / `declared
+# (sources.yaml)` — and that label is spelled by the standalone loader's
+# declared_origin_label, never by hand here, so the banner and --show-env
+# cannot drift. The env rows (env-match, env-override, env-only) keep their
+# spelling at either tier: the value in effect came from the env, not from a
+# file. tests/test_clone_and_exec_sources.py pins both mirrors.
 ORIGIN_DECLARED = "declared"
 ORIGIN_ENV_MATCH = "env-match"
 ORIGIN_ENV_OVERRIDE = "env-override"
@@ -393,17 +415,21 @@ def _clear_lmer_git_credential_helper(
         )
 
 
-# --- Canonical source config (sources.yaml, issue #105) ---------------------
-# {work_repo}/sources.yaml declares the canonical taskdef/napkin sources.
-# Reading it needs PyYAML — the one sanctioned non-stdlib import in this
-# module (see the docstring contract above). The import seam below keeps the
-# entrypoint runnable stdlib-only when no sources.yaml exists, while a
-# present-but-unreadable config refuses start instead of being silently
+# --- Canonical source config (sources.yaml / _lmer.yaml, #105, #370) -------
+# {work_repo}/sources.yaml declares the canonical taskdef/napkin sources; in
+# a schema-form tree the same declaration is the manifest's `sources:`
+# section ({work_repo}/_lmer.yaml, issue #370), which outranks the legacy
+# file per source key. Reading either needs PyYAML — the one sanctioned
+# non-stdlib import in this module (see the docstring contract above) — and
+# the manifest additionally needs the lmer-schema core, imported lazily and
+# guarded like the placement code's. The import seam below keeps the
+# entrypoint runnable stdlib-only when neither file exists, while a
+# present-but-unreadable declaration refuses start instead of being silently
 # ignored. Resolution (_resolve_declared_sources and helpers, further down)
-# runs in main() between the work-repo clone and clone_aux_repos, where
-# sources.yaml is guaranteed present and fresh. The section's constants
-# (SOURCES_CONFIG_NAME, _TASKDEF_REF_ENV, _SOURCE_DESTS, ORIGIN_*) live in
-# the top-of-file constants block, per house style.
+# runs in main() between the work-repo clone and clone_aux_repos, where the
+# declaration files are guaranteed present and fresh. The section's constants
+# (SOURCES_CONFIG_NAME, PLEXUS_MANIFEST_NAME, _TASKDEF_REF_ENV, _SOURCE_DESTS,
+# ORIGIN_*) live in the top-of-file constants block, per house style.
 
 
 def _import_yaml():
@@ -416,41 +442,141 @@ def _import_yaml():
     interpreters that lack it (host-side test runs, older images).
     """
     try:
+        # deferred: optional dependency — yaml may be absent from the container interpreter
         import yaml  # type: ignore[import-not-found]
     except ImportError:
         return None
     return yaml
 
 
-def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
-    """Refuse start when ``{work_repo}/sources.yaml`` exists but PyYAML doesn't.
+def _declaration_files_present(work_repo_path: Path) -> "tuple[bool, bool]":
+    """Which declaration files the work repo carries: ``(manifest, legacy)``.
 
-    A present config that cannot be read must never be silently ignored —
-    running without the declared canonical sources is exactly the failure
-    class sources.yaml exists to kill. Returns 0 when startup may proceed
-    (no sources.yaml, or PyYAML importable) and 2 (the refuse-start exit
-    code, matching existing CLI refusals) after printing a
-    credential-scrubbed error otherwise. Called by the resolution step
-    (later task) after the work-repo clone, before ``clone_aux_repos``.
+    Two stdlib stats and nothing else — this is the question that decides
+    whether the resolution seam does any work at all, and a tree with neither
+    file must stay on the stdlib-only path. The manifest probe is the one
+    ``_resolve_work_repo_placement`` and the core itself use (``is_symlink()``
+    first, so a dangling manifest symlink still reads as present); the legacy
+    probe is the pre-#370 ``exists()``.
     """
-    sources = Path(work_repo_path) / SOURCES_CONFIG_NAME
-    if not sources.exists():
+    root = Path(work_repo_path)
+    manifest = root / PLEXUS_MANIFEST_NAME
+    return (manifest.is_symlink() or manifest.exists()), (root / SOURCES_CONFIG_NAME).exists()
+
+
+def _declaration_present_clause(work_repo_path: Path, manifest_present: bool, legacy_present: bool) -> str:
+    """``"<file> is present"`` / ``"<manifest> and <legacy> are present"`` —
+    the subject of a refuse-start message, naming exactly the declaration
+    file(s) found."""
+    root = Path(work_repo_path)
+    files = []
+    if manifest_present:
+        files.append(str(root / PLEXUS_MANIFEST_NAME))
+    if legacy_present:
+        files.append(str(root / SOURCES_CONFIG_NAME))
+    return f"{' and '.join(files)} {'is' if len(files) == 1 else 'are'} present"
+
+
+def _without_declarations_hint(manifest_present: bool) -> str:
+    """The "run without declarations" remediation: which file to edit."""
+    if manifest_present:
+        return (
+            f"remove the `sources:` section from {PLEXUS_MANIFEST_NAME} (and "
+            f"{SOURCES_CONFIG_NAME}, if present) to run without declarations"
+        )
+    return f"remove {SOURCES_CONFIG_NAME} from the work repo to run without declarations"
+
+
+def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
+    """Refuse start when a declaration file exists but PyYAML doesn't.
+
+    A present declaration that cannot be read must never be silently
+    ignored — running without the declared canonical sources is exactly the
+    failure class the declaration exists to kill. Both files need PyYAML:
+    the legacy ``sources.yaml`` is parsed by the standalone loader and the
+    manifest's ``sources:`` tier (issue #370) by ``lmer_schema.manifest``,
+    which imports PyYAML at module scope — so this guard runs FIRST and a
+    missing PyYAML is blamed on PyYAML, never reported as a missing core.
+    Returns 0 when startup may proceed (no declaration file, or PyYAML
+    importable) and 2 (the refuse-start exit code, matching existing CLI
+    refusals) after printing a credential-scrubbed error otherwise. Called
+    by the resolution step after the work-repo clone, before
+    ``clone_aux_repos``.
+    """
+    manifest_present, legacy_present = _declaration_files_present(work_repo_path)
+    if not (manifest_present or legacy_present):
         # No declaration — silent legacy mode, stdlib-only path untouched.
         return 0
     if _import_yaml() is not None:
         return 0
+    # Removing the legacy file is a way out only while it is the sole
+    # declaration: a manifest needs PyYAML to be read at all.
+    hint = f" (Or {_without_declarations_hint(False)}.)" if not manifest_present else ""
     print(
         _scrub_credentials(
-            f"❌ {sources} is present but PyYAML is not importable in the "
-            f"container interpreter — refusing to start rather than silently "
-            f"ignoring the declared sources. Rebuild the image with a lmer "
-            f"version that guarantees PyYAML: lmer build. (Or remove "
-            f"{SOURCES_CONFIG_NAME} from the work repo to run without "
-            f"declarations.)"
+            f"❌ {_declaration_present_clause(work_repo_path, manifest_present, legacy_present)} "
+            f"but PyYAML is not importable in the container interpreter — refusing to start "
+            f"rather than silently ignoring the declared sources. Rebuild the image with a lmer "
+            f"version that guarantees PyYAML: lmer build.{hint}"
         ),
         file=sys.stderr,
     )
     return 2
+
+
+def _read_manifest_sources_tier(work_repo_path: Path) -> "tuple[int, object | None]":
+    """Read the manifest for its ``sources:`` tier (issue #370).
+
+    Returns ``(0, None)`` when the work repo carries no ``_lmer.yaml`` —
+    decided by the stdlib probe alone, so a legacy tree never imports the
+    core — ``(0, manifest)`` with the parsed ``lmer_schema.manifest.Manifest``
+    when it does, and ``(2, None)`` after printing a credential-scrubbed
+    refusal when the manifest is present but cannot be read: the core is not
+    importable (PyYAML is ruled out first by
+    ``_refuse_start_if_sources_unreadable``, so the blame here is the
+    core's), or ``load_manifest`` raises ``ManifestError`` (unparseable, a
+    ``schema:`` bool or an int this lmer does not understand, …). A present
+    manifest is never demoted to the legacy file beside it (D20) — the rule
+    the placement code applies, and the loader applies to a present
+    ``sources.yaml``. The core is the ONE manifest parser: nothing here
+    opens the file, and ``Manifest.warnings`` (the validator's findings)
+    are never printed.
+    """
+    root = Path(work_repo_path)
+    manifest_path = root / PLEXUS_MANIFEST_NAME
+    if not (manifest_path.is_symlink() or manifest_path.exists()):
+        return 0, None
+    try:
+        # deferred: optional dependency — only a present manifest needs the core, which this standalone script may lack
+        from lmer_schema.manifest import ManifestError, load_manifest
+    except ImportError as exc:
+        print(
+            _scrub_credentials(
+                f"❌ {manifest_path} is present but the lmer-schema core API "
+                f"(lmer_schema.manifest) is not importable in the container "
+                f"interpreter ({exc}) — refusing to start rather than silently "
+                f"ignoring its `sources:` declarations. Rebuild the image with a "
+                f"lmer version that ships the core: lmer build."
+            ),
+            file=sys.stderr,
+        )
+        return 2, None
+    try:
+        manifest = load_manifest(root)
+    except ManifestError as exc:
+        # A YAML error can quote the offending line, so scrub it like a
+        # SourcesConfigError. The core's message carries the specific fix
+        # (upgrade lmer for a newer `schema:`, repair the file otherwise).
+        print(
+            f"❌ {_scrub_credentials(str(exc))} — refusing to start: a present "
+            f"{PLEXUS_MANIFEST_NAME} this lmer cannot read is never treated as a "
+            f"legacy tree.",
+            file=sys.stderr,
+        )
+        return 2, None
+    if manifest is None:  # removed between the stat and the read
+        return 0, None
+    return 0, manifest
 
 
 def _load_sources_module():
@@ -478,7 +604,10 @@ def _load_sources_module():
     return module
 
 
-def _prompt_source_choice(name, field, declared_value, env_value, env_var, input_fn=input) -> str:
+def _prompt_source_choice(
+    name, field, declared_value, env_value, env_var, input_fn=input, *,
+    declared_in=SOURCES_CONFIG_NAME,
+) -> str:
     """Mismatch-row prompt (spec §2 row 3): ask once which value wins.
 
     Returns ``"declared"``, ``"env"``, or ``PROMPT_ABORTED`` when stdin
@@ -493,10 +622,13 @@ def _prompt_source_choice(name, field, declared_value, env_value, env_var, input
     credential-scrubbed — everything this function prints is
     operator-visible. Kept separate from the matrix so a fake-TTY unit test
     can drive it via *input_fn* (and so the matrix stays pure-ish).
+    *declared_in* names the file the declaration came from (issue #370: a
+    manifest-tier row prints ``_lmer.yaml``; the default is the legacy
+    spelling, byte for byte).
     """
     print(
         f"⚠️  source {name}: {field} mismatch —\n"
-        f"     sources.yaml declares: {declared_value}\n"
+        f"     {declared_in} declares: {declared_value}\n"
         f"     {env_var} is set to:   {env_value}",
         file=sys.stderr,
     )
@@ -571,6 +703,15 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
     Performs no env mutation, no filesystem I/O, and no cloning — main()
     applies the returned plan via _apply_sources_resolution.
 
+    Declaration tiers (issue #370): ``config["tiers"]`` rides on the loader's
+    result only when the manifest tier was consulted. Without it every label
+    below is today's legacy spelling, byte for byte; with it every declared
+    row names its tier — the origin through the loader's one label helper
+    (``declared (manifest)`` / ``declared (sources.yaml)``), the file by name
+    in the prompt, the error, the ref note and the clone remediation — and
+    an undeclared row's note names both files that were searched. The env
+    updates are the same at either tier.
+
     Returns a dict:
     - ``exit_code``: 0 (proceed) or 2 (headless mismatch — refuse start
       before any aux clone)
@@ -586,7 +727,8 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
       env-override) main() must clone LOUDLY
       (spec N3), each carrying the scrubbed URL for messages, the
       derivation mode (either anonymous mode drives the anonymous hint,
-      each with its own reason), and
+      each with its own reason), the file the declaration came from
+      (``declared_in``, named by the clone-failure remediation), and
       the ``legacy_env`` state continue-legacy reverts to.
     """
     result = {
@@ -600,6 +742,17 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
     }
     scrub = sources_mod.scrub_credentials
     declared_sources = (config or {}).get("sources") or {}
+    # Declaration tiers (issue #370): the loader attaches `tiers` only when
+    # the manifest tier was consulted. Without it every label below is the
+    # legacy spelling, byte for byte; with it an undeclared row's note names
+    # both files that were searched, and a declared row names its own tier
+    # (resolved per row below).
+    tiers = (config or {}).get("tiers")
+    searched = (
+        f"{PLEXUS_MANIFEST_NAME} or {SOURCES_CONFIG_NAME}"
+        if tiers is not None
+        else SOURCES_CONFIG_NAME
+    )
     for name, env_var in sources_mod.SOURCE_ENV_OVERRIDES.items():
         declared = declared_sources.get(name)
         env_repo = (env.get(env_var) or "").strip() or None
@@ -609,7 +762,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 # declaration exists (plus the greppable banner).
                 result["origins"][name] = ORIGIN_ENV_ONLY
                 result["notes"].append(
-                    f"ℹ️  source {name}: no declaration in {SOURCES_CONFIG_NAME} — "
+                    f"ℹ️  source {name}: no declaration in {searched} — "
                     f"using {env_var} (env-only)"
                 )
                 result["banners"].append(
@@ -621,6 +774,14 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
             continue
 
         declared_repo = declared["repo"]
+        # The file this row's declaration came from and the origin its banner
+        # prints: the legacy spelling without a manifest; otherwise the tier,
+        # through the loader's ONE label helper (never spelled by hand).
+        if tiers is None:
+            declared_in, declared_origin = SOURCES_CONFIG_NAME, ORIGIN_DECLARED
+        else:
+            declared_in = _declaration_file(tiers[name], sources_mod)
+            declared_origin = sources_mod.declared_origin_label(tiers[name])
         conflicts = []  # (field, declared_value, env_value, env_var)
 
         # repo field, rows 1-3.
@@ -649,7 +810,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
             elif declared_ref is None:
                 ref_choice = "env"
                 ref_note = (
-                    f"ℹ️  source taskdef: no ref declared in {SOURCES_CONFIG_NAME} — "
+                    f"ℹ️  source taskdef: no ref declared in {declared_in} — "
                     f"using {_TASKDEF_REF_ENV} (env-only)"
                 )
             elif declared_ref == env_ref:
@@ -664,7 +825,8 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 # Row 3 interactive: prompt once per conflicting field.
                 for field, declared_value, env_value, var in conflicts:
                     choice = _prompt_source_choice(
-                        name, field, scrub(declared_value), scrub(env_value), var, input_fn
+                        name, field, scrub(declared_value), scrub(env_value), var, input_fn,
+                        declared_in=declared_in,
                     )
                     if choice == PROMPT_ABORTED:
                         # Stdin closed mid-prompt: stop asking and fall into
@@ -702,15 +864,15 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                             " the prompt."
                         )
                     fix = (
-                        f" Fix: update {SOURCES_CONFIG_NAME}, or change or unset"
+                        f" Fix: update {declared_in}, or change or unset"
                         f" {var} to match."
                         if aborted
-                        else f" Fix: update {SOURCES_CONFIG_NAME}, change or"
+                        else f" Fix: update {declared_in}, change or"
                         f" unset {var} to match, or launch interactively to"
                         " choose."
                     )
                     result["errors"].append(
-                        f"source {name}: {field} mismatch — {SOURCES_CONFIG_NAME} "
+                        f"source {name}: {field} mismatch — {declared_in} "
                         f"declares {scrub(declared_value)} but {var} is set to "
                         f"{scrub(env_value)}.{note}{fix}"
                     )
@@ -722,7 +884,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
         derived_mode = None
         if repo_choice == "declared":
             clone_url, derived_mode = sources_mod.derive_clone_url(declared_repo, work_repo_url)
-            origin = ORIGIN_DECLARED
+            origin = declared_origin
             result["env_updates"][env_var] = clone_url
             if name == "taskdef":
                 # The host appends /taskdef to LMER_TASKDEF_PATHS only when
@@ -757,6 +919,7 @@ def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, inp
                 "ref": resolved_ref,
                 "derived_mode": derived_mode,
                 "env_var": env_var,
+                "declared_in": declared_in,
                 "legacy_env": _legacy_env_state(name, env),
             }
         )
@@ -815,7 +978,7 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
                 f"verify {clone['scrubbed_url']} exists and the work-repo "
                 f"credential can read it, set {clone['env_var']} to an "
                 f"accessible URL, or remove the {name} declaration from "
-                f"{SOURCES_CONFIG_NAME}."
+                f"{clone['declared_in']}."
             )
             if not isatty:
                 print(
@@ -849,43 +1012,65 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
     return 0
 
 
+def _declaration_file(tier, sources_mod) -> str:
+    """The file a declared row came from, by tier (issue #370): the manifest
+    tier is ``_lmer.yaml``, the legacy tier ``sources.yaml``. What the
+    mismatch prompt and error, the ref note and the declared-clone
+    remediation name once a manifest is in play."""
+    return PLEXUS_MANIFEST_NAME if tier == sources_mod.TIER_MANIFEST else SOURCES_CONFIG_NAME
+
+
 def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=None, input_fn=input) -> int:
     """Container-side canonical source resolution (spec §2) — the seam
     main() calls between the work-repo clone and clone_aux_repos.
 
-    Absent ``sources.yaml`` → silent legacy mode: return 0 with literally
-    zero output and no imports beyond stdlib. Present → load it through the
-    standalone sources module (never via lmer_cli), resolve the matrix, and
-    apply propagation plus the loud declared clones. Returns 0 to proceed
-    or 2 to refuse start (before any aux clone). *env*/*isatty*/*input_fn*
-    default to the real process environment, ``sys.stdin.isatty()`` (the
-    headless predicate), and ``input`` — injectable for tests.
+    Neither ``sources.yaml`` nor ``_lmer.yaml`` present → silent legacy
+    mode: return 0 with literally zero output and no imports beyond stdlib
+    (two stats). Either present → the PyYAML guard; then the manifest tier
+    through the core's one parser (issue #370 — a legacy tree never reaches
+    that import); then the standalone sources module (never via lmer_cli),
+    whose ``load_sources`` validates both tiers and merges them (env >
+    manifest > legacy); then the matrix, propagation and the loud declared
+    clones. Returns 0 to proceed or 2 to refuse start (before any aux
+    clone): PyYAML or the core missing while a manifest is present, a
+    ``ManifestError``, a ``SourcesConfigError`` from either tier, a headless
+    mismatch, a failed declared clone. The loader's warnings — including the
+    stale-legacy WARN for a key both files declare — are printed; the
+    manifest's own (``Manifest.warnings``) are the validator's and are not.
+    A manifest that declares nothing, with no legacy file, is silent legacy
+    mode too. *env*/*isatty*/*input_fn* default to the real process
+    environment, ``sys.stdin.isatty()`` (the headless predicate), and
+    ``input`` — injectable for tests.
     """
     work_repo_path = Path(work_repo_path)
+    manifest_present, legacy_present = _declaration_files_present(work_repo_path)
+    if not (manifest_present or legacy_present):
+        # Silent legacy mode: the matrix never engages (spec G5).
+        return 0
     rc = _refuse_start_if_sources_unreadable(work_repo_path)
     if rc:
         return rc
+    rc, manifest = _read_manifest_sources_tier(work_repo_path)
+    if rc:
+        return rc
     sources_path = work_repo_path / SOURCES_CONFIG_NAME
-    if not sources_path.exists():
-        # Silent legacy mode: the matrix never engages (spec G5).
-        return 0
     try:
         sources_mod = _load_sources_module()
     except Exception as e:
         # Same failure class as the PyYAML guard above — a present
-        # sources.yaml we cannot read — so it takes the same refuse-start
+        # declaration we cannot read — so it takes the same refuse-start
         # path instead of a raw traceback after the work-repo clone
         # (review finding). The realistic trigger is a dev session
         # live-mounting a partial src/ tree over the baked image.
         print(
             _scrub_credentials(
-                f"❌ {sources_path} is present but the resolver "
+                f"❌ {_declaration_present_clause(work_repo_path, manifest_present, legacy_present)} "
+                f"but the resolver "
                 f"({Path(__file__).resolve().parent / 'sources.py'}) could not "
                 f"be loaded: {type(e).__name__}: {e}. Refusing to start rather "
                 f"than silently ignoring the declared sources. Rebuild or "
                 f"un-mount a partial source checkout (see LMER_SOURCE_COMMIT in "
-                f"bin/doctor), or remove {SOURCES_CONFIG_NAME} from the work "
-                f"repo to run without declarations."
+                f"bin/doctor), or {_without_declarations_hint(manifest_present)}."
             ),
             file=sys.stderr,
         )
@@ -895,12 +1080,26 @@ def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=No
     if isatty is None:
         isatty = sys.stdin.isatty()
     try:
-        config, warnings = sources_mod.load_sources(sources_path, work_repo_url)
+        if manifest is not None:
+            # The manifest tier: the raw `sources:` section the core already
+            # parsed, plus the path to name in messages — the loader never
+            # opens the manifest itself (one parser).
+            config, warnings = sources_mod.load_sources(
+                sources_path, work_repo_url,
+                manifest_sources=manifest.sources, manifest_path=manifest.path,
+            )
+        else:
+            config, warnings = sources_mod.load_sources(sources_path, work_repo_url)
     except sources_mod.SourcesConfigError as e:
         print(f"❌ {sources_mod.scrub_credentials(str(e))}", file=sys.stderr)
         return 2
     for warning in warnings:
         print(f"⚠️  {sources_mod.scrub_credentials(warning)}", file=sys.stderr)
+    if config is None:
+        # Neither tier declares anything (a manifest without `sources:`, no
+        # legacy file): the loader's silent legacy mode — the matrix never
+        # engages, exactly as for a tree with no declaration file at all.
+        return 0
     result = _resolve_sources_matrix(
         config, env, isatty, work_repo_url, sources_mod, input_fn=input_fn
     )
@@ -1408,6 +1607,391 @@ def sanitize_task_target(task_target: str) -> str:
     return sanitized if sanitized else "default"
 
 
+# ---------------------------------------------------------------------------
+# The target classifier — standalone copy of work_repo.utils (spec §2, D2)
+# ---------------------------------------------------------------------------
+# NOTE: verbatim copy of the classifier block in ``work_repo.utils`` (same
+# reason as the ``sanitize_task_target`` copy above: this module runs without
+# the package). Edit both or neither — ``tests/test_work_repo_classify_target.py``
+# holds the two copies AST-identical and runs the §2 table against both.
+
+#: Row 3 of the §2 table — a URL naming ONE work item inside a forge
+#: repository — as ``(segment, id)`` pairs. ``segment`` is the path segment as
+#: both forges spell it, bare: ``issues`` reads GitLab's ``/-/issues/N`` and
+#: GitHub's ``/issues/N`` through one entry, because the ``/-/`` is GitLab's
+#: project/route separator and not part of the route. ``id`` is the regex the
+#: NEXT segment must match, and one is always required: this is the indicator
+#: set ``_derive_repo_url_from_task_target`` reads today made id-aware — the
+#: id-less list pages are :data:`REFERENCE_INDICATORS`. Tickets take a number;
+#: a commit or a compare range takes any one segment (``/-/commit/main`` names
+#: a commit by ref and derives a repository today, so it stays a work item
+#: rather than falling to ``other``). The segment is read in the forge's ROUTE
+#: position only (:func:`_forge_route`: the first segment after GitLab's
+#: ``/-/``, the third on GitHub's shape) — never later in the path, where
+#: ``issues/123`` is a filename (astra, !380).
+#:
+#: The shape is chosen so ONE definition can serve its three readers: the
+#: classifier (the regex below), the repository derivation (membership of a
+#: path segment, exactly the test it makes on its literal tuple today) and the
+#: web run card's vocabulary seam (``web/src/format.js`` ``TARGET_KINDS`` is
+#: keyed by the bare segment and ``tests/test_platform_web_runcard.py`` reads
+#: the Python list). Rewiring those readers is a later task: the literal
+#: ``indicators = (…)`` tuples in ``lmer_cli.cli`` and ``clone_and_exec`` stay
+#: in place until then.
+WORK_ITEM_INDICATORS = (
+    ("merge_requests", r"\d+"),
+    ("issues", r"\d+"),
+    ("work_items", r"\d+"),
+    ("pull", r"\d+"),
+    ("pulls", r"\d+"),
+    ("commit", r"[^/]+"),
+    ("compare", r"[^/]+"),
+)
+
+#: Row 4 — content inside a forge repository (#523, #391), read in the same
+#: route position as row 3. GitLab's ``-/`` spellings are the route after
+#: ``/-/``, with or without a tail, so the id-less list pages ``/-/issues``,
+#: ``/-/work_items`` and ``/-/merge_requests`` land here once row 3 has passed
+#: on them; the ``/-/`` is the forge's own marker, so they need no host rule.
+#: GitHub's bare spellings are the route in GitHub's ``/<owner>/<repo>/<route>``
+#: position AND need a known forge host (:func:`_known_http_forge`), so a
+#: MediaWiki ``/wiki/`` page or a docs site's ``/a/b/tree/x`` is not read as
+#: forge content and ``repository_of`` invents no clone URL for it. ``commits``
+#: (GitLab ``/-/commits/<ref>``, GitHub ``/commits/<ref>``) is a reference and
+#: not a work item: it names a listing the way ``/tree/`` does, and it derives
+#: a repository today, so it may not fall to ``other``.
+REFERENCE_INDICATORS = (
+    "-/blob", "-/tree", "-/raw", "-/wikis", "-/commits",
+    "-/issues", "-/work_items", "-/merge_requests",
+    "blob", "tree", "wiki", "commits", "issues", "pulls",
+)
+
+#: The two sets as the classifier reads them, by route: the id regex each
+#: work-item route requires of the segment after it, and the reference routes
+#: by forge shape — GitLab's after its ``/-/`` (the ``-/`` prefix dropped),
+#: GitHub's bare.
+_WORK_ITEM_IDS = {segment: re.compile(id_re) for segment, id_re in WORK_ITEM_INDICATORS}
+_GITLAB_REFERENCE_ROUTES = frozenset(
+    route.removeprefix("-/") for route in REFERENCE_INDICATORS if route.startswith("-/")
+)
+_GITHUB_REFERENCE_ROUTES = frozenset(
+    route for route in REFERENCE_INDICATORS if not route.startswith("-/")
+)
+
+#: A scheme URL (``scheme://…``) and git's scp form (``[user@]host:path``,
+#: with the user required here — the userless form is indistinguishable from
+#: free text with a colon in it).
+_TARGET_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_TARGET_RE = re.compile(r"^(?P<user>[^/@\s]+)@(?P<host>[^/:@\s]+):(?P<path>\S*)$")
+
+#: ``lmer_platform.spawn``'s forge rules, carried over: hosts on which a
+#: suffix-less HTTP project URL is unambiguous, by allowlist or first label.
+_KNOWN_HTTP_FORGES = frozenset({"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"})
+_FORGE_FIRST_LABELS = frozenset({"git", "gitlab", "github", "bitbucket", "codeberg"})
+
+#: The handlers' claims, re-encoded (``slack_chat.permalink`` and
+#: ``matrix_chat.permalink``): the Slack ``p<TS>`` token needs seven
+#: characters after the ``p`` (the length check the handler makes — it does
+#: not test that they are digits); a Matrix room is ``!id:server`` or
+#: ``#alias:server`` and an event ``$…``, read from the fragment.
+_SLACK_MIN_TS_DIGITS = 7
+_MATRIX_ROOM_RE = re.compile(r"^[!#][^/\s]+:[^/\s]+$")
+_MATRIX_EVENT_RE = re.compile(r"^\$[^/\s?#]+$")
+
+
+def _slack_thread_target(parsed) -> bool:
+    """``slack_chat.permalink.is_slack_thread_url`` on an already-parsed URL."""
+    if parsed.scheme != "https" or not parsed.netloc.endswith(".slack.com"):
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) < 2 or segments[0] != "archives":
+        return False
+    if "thread_ts" in parse_qs(parsed.query):
+        return True
+    if len(segments) < 3 or not segments[2].startswith("p"):
+        return False
+    return len(segments[2]) - 1 >= _SLACK_MIN_TS_DIGITS
+
+
+def _matrix_thread_target(parsed) -> bool:
+    """``matrix_chat.permalink.parse_matrix_permalink`` on an already-parsed URL:
+    the matrix.to form and the Element ``https://<host>/#/room/…`` form alike."""
+    if parsed.scheme not in ("https", "http") or not parsed.fragment:
+        return False
+    fragment = parsed.fragment.split("?", 1)[0]
+    parts = [unquote(part) for part in fragment.strip("/").split("/") if part]
+    if parts and parts[0] == "room":
+        parts = parts[1:]
+    return (
+        len(parts) == 2
+        and _MATRIX_ROOM_RE.match(parts[0]) is not None
+        and _MATRIX_EVENT_RE.match(parts[1]) is not None
+    )
+
+
+def _known_http_forge(host: str) -> bool:
+    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
+    host = host.lower()
+    return host in _KNOWN_HTTP_FORGES or host.split(".", 1)[0] in _FORGE_FIRST_LABELS
+
+
+def _github_http_forge(host: str) -> bool:
+    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
+    host = host.lower()
+    return host == "github.com" or host.split(".", 1)[0] == "github"
+
+
+def _forge_route(parsed) -> tuple[bool, str, str, list[str]] | None:
+    """Split a parsed http(s) URL at its forge's route boundary — the SHAPE
+    decided first, by host, then the route read where that shape puts it.
+
+    GitHub's shape (:func:`_github_http_forge`): the project is the fixed
+    ``/<owner>/<repo>`` (a ``.git`` on the repo dropped), the route the third
+    segment, and everything after it the route's payload — a later ``/-/``
+    included, so ``/blob/main/-/issues/123`` is a file. Elsewhere the first
+    ``/-/`` is GitLab's boundary: the project is everything before it (nested
+    groups included), the route the segment after it. A path with no ``/-/``
+    off GitHub is read in GitHub's position too (codeberg, every Gitea, an
+    unknown host). Returns ``(gitlab, project, route, payload)`` — which
+    boundary was read, the project path, the route lowercased, the segments
+    after it — or ``None`` for a path with no route (a project root, a bare
+    ``/-/``). :func:`repository_of` reads the same split, so a filename is
+    never a route for one reader and a project for the other (astra, !380).
+    """
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if _github_http_forge(parsed.hostname or "") or "/-/" not in parsed.path:
+        gitlab = False
+        project = "/".join(segments[:2]).removesuffix(".git")
+        segments = segments[2:]
+    else:
+        gitlab = True
+        project, _, tail = parsed.path.partition("/-/")
+        project = project.strip("/")
+        segments = [segment for segment in tail.split("/") if segment]
+    if not segments:
+        return None
+    return gitlab, project, segments[0].lower(), segments[1:]
+
+
+def _repository_url_target(parsed) -> bool:
+    """Row 5 for a scheme URL: ``spawn._plain_repo_url_from_target``'s rules
+    with §2's deltas (``.git`` first, ``file://`` and ``git://`` accepted)."""
+    if parsed.query or parsed.fragment or "/-/" in parsed.path:
+        return False
+    scheme = parsed.scheme.lower()
+    project = parsed.path.strip("/").removesuffix(".git")
+    if scheme == "file":
+        return bool(project)
+    if not parsed.hostname or not project:
+        return False
+    if scheme in ("http", "https"):
+        if parsed.path.rstrip("/").endswith(".git"):
+            return True
+        if _github_http_forge(parsed.hostname):
+            return len(project.split("/")) == 2
+        return _known_http_forge(parsed.hostname)
+    if scheme in ("ssh", "git"):
+        return parsed.password is None
+    return False
+
+
+def classify_target(target: str | None) -> str:
+    """Sort a task target into exactly one of six classes (spec §2, D2).
+
+    Pure — no filesystem, no environment. The host CLI resolves local
+    checkouts BEFORE calling this (a positional naming a checkout is the
+    repository and never reaches here); the platform, which has no
+    filesystem, classifies the raw string. Rows are tested in the table's
+    order and the first match wins:
+
+    ``none``        ``None``, ``""``, whitespace.
+    ``special``     a URL a ``TargetHandler`` claims — the handlers' own
+                    claims re-encoded (:func:`_slack_thread_target`: https,
+                    a host ending in ``.slack.com``, ``/archives/<channel>/``
+                    then either ``?thread_ts=`` or a ``p``-token;
+                    :func:`_matrix_thread_target`: http or https on ANY
+                    host, a fragment ``#/[room/]<!id|#alias>:<server>/
+                    $<event>`` read after percent-decoding, so the Element
+                    ``https://<host>/#/room/…`` form as much as matrix.to).
+                    The handler owns it; never a repository.
+    ``work-item``   an http(s) URL whose forge ROUTE (:func:`_forge_route`:
+                    the first segment after GitLab's ``/-/``, the third on
+                    GitHub's shape) is an id-bearing indicator
+                    (:data:`WORK_ITEM_INDICATORS`) followed by its id.
+    ``reference``   an http(s) URL whose route names content inside a forge
+                    repository (:data:`REFERENCE_INDICATORS`): a GitLab
+                    ``-/`` route on any host, a GitHub-position route on a
+                    known forge host — #523, #391.
+    ``repository``  a clone source: ``spawn._plain_repo_url_from_target``'s
+                    rules carried over (the ``_KNOWN_HTTP_FORGES`` allowlist
+                    and the first-label heuristic; exactly two path segments
+                    on a GitHub-shaped host; no query, fragment or ``/-/``)
+                    with §2's three deltas — ``.git`` is tested first, so
+                    ``github.com/a/b/c.git`` is a repository; ``file:///path``
+                    is accepted; ``git://`` is accepted — plus scp form
+                    ``git@host:path`` (the one scp user spawn and
+                    ``resolve.is_likely_url`` know), ``ssh://host/path``,
+                    and anything beginning with ``/`` or ``.`` (a path; git
+                    refuses ref names starting with either, so no branch is
+                    lost).
+    ``other``       any other URL: a non-forge host, a forge URL with a
+                    query or an unknown route (``/discussions/5``,
+                    ``/-/pipelines/1691``), a GitHub-position reference
+                    route off the forges (``docs.example.com/a/b/tree/x``),
+                    an unsupported transport.
+    ``work-item``   anything else — a commit SHA, a branch name, an
+                    ``mr-N``/``pr-N``/``issue-N`` shorthand, free text.
+
+    Decisions recorded here (A1-wave0.classifier):
+
+    - The indicator constant's shape: ``(segment, id)`` pairs with bare
+      segments and an id always required — see :data:`WORK_ITEM_INDICATORS`.
+    - GitHub ``/commits/<ref>`` joins the reference row beside GitLab's
+      ``/-/commits/`` — see :data:`REFERENCE_INDICATORS`.
+    - An embedded credential on a non-HTTP transport
+      (``ssh://user:secret@host/path``, ``user:secret@host:path``) is
+      ``other``: spawn refuses it as a plain repository and the container's
+      no-secrets rule (``sources.url_has_embedded_credential``) refuses it at
+      start, so it never becomes a repository of record and — ``other``
+      never reaching a slug — never a directory name either. An HTTP(S)
+      credential is transport material spawn already scrubs, so that URL
+      stays a repository; the scrub is the consumer's job, not this one's.
+    - A scp-form string with any user but ``git`` (``deploy@host:path``) or
+      with no path (``git@host:``) is ``other`` as well: spawn and
+      ``is_likely_url`` agree it is not a repository URL, and it is not a
+      work item.
+    - The route decides, by position (astra, !380): the path is split at the
+      forge's route boundary — GitLab's ``/-/``, or GitHub's fixed
+      ``/<owner>/<repo>/<route>`` — and only that segment, with the id rule
+      on the one after it, sorts work item from reference. Nothing later in
+      the path can: ``/blob/main/issues/123`` and
+      ``/-/blob/main/compare/result.md`` name files and are references, not
+      work items sharing a group with the issue they happen to spell.
+    - The shape is decided before the route, by host (round two): on a
+      GitHub-shaped host the route is the third segment and a later ``/-/``
+      is payload — ``/blob/main/-/issues/123`` is a file, not GitLab's
+      boundary — while elsewhere the FIRST ``/-/`` is that boundary, so a
+      nested group ``/g/sub/p/-/issues/1`` keeps its whole project and
+      ``/-/blob/main/-/issues/123`` still reads ``blob``. :func:`repository_of`
+      derives from the same split (:func:`_forge_route`), so no URL is a
+      reference here and a nonexistent repository there.
+    - A GitHub-position reference route (``tree``, ``blob``, ``wiki``,
+      ``commits``, the ``issues``/``pulls`` list pages) reads as forge
+      content on a known forge host only (:func:`_known_http_forge`), so
+      ``https://docs.example.com/a/b/tree/x`` is ``other`` and
+      :func:`repository_of` never invents a clone URL for a docs site.
+      GitLab's ``/-/`` is the forge's own marker and needs no host rule. An
+      id-bearing route in GitHub's position stays host-agnostic — codeberg
+      and every Gitea spell ``/o/r/issues/5`` that way, and an unknown
+      host's ``/pull/9`` derived a repository before this rule — so
+      ``https://x/org/p/pull/9`` is still a work item.
+
+    Mirrored verbatim in ``lmer_cli/container/clone_and_exec.py``, which runs
+    without this package; ``tests/test_work_repo_classify_target.py`` holds
+    the two copies AST-identical and runs the §2 table against both.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "none"
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (_slack_thread_target(parsed) or _matrix_thread_target(parsed)):
+        return "special"
+    if _TARGET_URL_RE.match(text):
+        if parsed is None:
+            return "other"
+        if parsed.scheme.lower() in ("http", "https"):
+            split = _forge_route(parsed)
+            if split is not None:
+                gitlab, _, name, payload = split
+                id_re = _WORK_ITEM_IDS.get(name)
+                if id_re is not None and payload and id_re.fullmatch(payload[0]):
+                    return "work-item"
+                if gitlab and name in _GITLAB_REFERENCE_ROUTES:
+                    return "reference"
+                if (
+                    not gitlab
+                    and name in _GITHUB_REFERENCE_ROUTES
+                    and _known_http_forge(parsed.hostname or "")
+                ):
+                    return "reference"
+        return "repository" if _repository_url_target(parsed) else "other"
+    scp = _SCP_TARGET_RE.match(text)
+    if scp is not None:
+        if scp.group("user") == "git" and scp.group("path"):
+            return "repository"
+        return "other"
+    if text.startswith(("/", ".")):
+        return "repository"
+    return "work-item"
+
+
+def is_work_item(target: str | None) -> bool:
+    """Whether *target* names a work unit: ``work-item`` or ``special`` (§2).
+
+    A thread permalink counts — the handler-owned chat IS the work, and its
+    slug is derived from the permalink as today.
+    """
+    return classify_target(target) in ("work-item", "special")
+
+
+def repository_of(url: str | None) -> str | None:
+    """The repository a ``work-item``, ``reference`` or ``repository`` URL
+    belongs to, as a URL — ``None`` when there is none (spec §2).
+
+    One answer behind every reader of "which repository is this": the clone
+    URL (``_derive_repo_url_from_task_target``, both copies), the identity
+    ``LMER_REPO_HOST``/``LMER_REPO_PROJECT`` are parsed from
+    (``lmer_cli.cli._parse_repo_url`` parses ``repository_of(url) or url``)
+    and, in A2, the platform's repository of record and its identity
+    prediction. So ``LMER_REPO_PROJECT`` never contains a ``/-/`` route or a
+    ``/pull/N`` tail (#391), and a document URL names the repository its
+    clone comes from (#523). By class (:func:`classify_target`):
+
+    ``work-item``, ``reference``
+        A derived answer, ``<scheme>://<host[:port]>/<project>`` with the
+        project the classifier's own split (:func:`_forge_route`, shape
+        first): on a GitHub-shaped host the fixed ``<owner>/<repo>``, a
+        ``.git`` on the repo segment dropped (what the derivation did) and
+        a later ``/-/`` being payload; elsewhere the path before the first
+        ``/-/``, nested groups included.
+        The host and port are the target's — the port is part of the
+        address; userinfo is NOT carried over: this answer is read into run
+        identities and platform logs, and a credential in a work-item link
+        is transport material that belongs to whoever clones. The query and
+        the fragment go with the route. A non-URL work item (a SHA, a
+        branch, ``mr-7``, free text) names no repository: ``None``. So does
+        a route with no project before it (``https://host/-/issues/5``).
+    ``repository``
+        Itself, as given (whitespace aside): the clone source in the
+        spelling the caller chose, a path included. A credential embedded
+        in it is the consumer's to scrub, as the classifier records.
+    ``none``, ``special``, ``other``
+        ``None`` — a thread permalink is the handler's; ``other`` is context
+        only when ``--repo`` names the repository.
+
+    Never adds a credential: no token lookup, no environment. Pure, like the
+    classifier, and mirrored with it in ``lmer_cli/container/clone_and_exec.py``
+    under the same AST guard.
+    """
+    text = (url or "").strip()
+    klass = classify_target(text)
+    if klass == "repository":
+        return text
+    if klass not in ("work-item", "reference") or not _TARGET_URL_RE.match(text):
+        return None
+    parsed = urlparse(text)
+    netloc = parsed.netloc.rpartition("@")[2]
+    # The classifier's own split: the project is whatever sits before the
+    # route it read, never a second guess at the path.
+    split = _forge_route(parsed)
+    if not netloc or split is None or not split[1]:
+        return None
+    return f"{parsed.scheme}://{netloc}/{split[1]}"
+
+
 #: Refusal notices already printed by _get_gitlab_token — see the identical
 #: set in lmer_cli/tokens.py.
 _warned: set[str] = set()
@@ -1456,13 +2040,47 @@ def _gitlab_token_issuing_host() -> str | None:
     return _host_from_git_url(os.environ.get("LMER_WORK_REPO", ""))
 
 
+def _sanitize_hostname(host: str) -> str:
+    """Environment variable suffix for ``host``: lowercased, each hyphen
+    turned into ``__`` and each dot into ``_``, so no two valid hostnames
+    share one (#544). Standalone copy of the tokens.py helper.
+    """
+    return host.lower().replace("-", "__").replace(".", "_")
+
+
+def _legacy_sanitize_hostname(host: str) -> str:
+    """The pre-#544 suffix (dots and hyphens both ``_``), recognised only to
+    refuse it. Standalone copy of the tokens.py helper."""
+    return re.sub(r"[.\-]", "_", host.lower())
+
+
+def _per_host_env(prefix: str, host: str) -> str | None:
+    """Read ``<prefix><sanitized host>``, refusing a hyphenated host's old
+    name, which the dotted lookalike host shares. Standalone copy of the
+    tokens.py helper, notice text included.
+    """
+    name = prefix + _sanitize_hostname(host)
+    value = os.environ.get(name)
+    if value:
+        return value
+    legacy = prefix + _legacy_sanitize_hostname(host)
+    if legacy != name and os.environ.get(legacy):
+        _warn_once(
+            f"⚠️  {legacy} not used for {host}: that name now means "
+            f"{host.lower().replace('-', '.')} only — if it holds the token "
+            f"for {host}, rename it to {name}"
+        )
+    return None
+
+
 def _get_gitlab_token(host: str) -> str | None:
     """
     Look up an API token for ``host`` from environment variables.
 
     Despite the name, supports both GitLab and GitHub hosts. Lookup:
       1. ``GITLAB_TOKEN_{sanitized_host}`` — host-specific (provider-agnostic
-         in practice; the prefix is historical)
+         in practice; the prefix is historical). A hyphenated host's pre-#544
+         name is refused, see :func:`_per_host_env`.
       2. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
          ``GITHUB_TOKEN``
       3. ``GITLAB_TOKEN`` — generic fallback, but only for the host that
@@ -1479,8 +2097,8 @@ def _get_gitlab_token(host: str) -> str | None:
     ``LMER_WORK_REPO`` before the container starts. Keep this in sync with
     tokens.py for the host-shared behavior.
     """
-    suffix = re.sub(r"[.\-]", "_", host.lower())
-    token = os.environ.get(f"GITLAB_TOKEN_{suffix}")
+    suffix = _sanitize_hostname(host)
+    token = _per_host_env("GITLAB_TOKEN_", host)
     if token:
         return token
 
@@ -1513,64 +2131,56 @@ def _get_gitlab_token(host: str) -> str | None:
 def _derive_repo_url_from_task_target(target: str) -> str | None:
     """
     Best-effort derivation of a base repository URL from a task target URL
-    such as PR/MR/issue links.
+    such as PR/MR/issue links — and, since A1-wave0.repository-of, from a
+    reference URL inside a repository (a file, a tree, a wiki page, a commit
+    listing, an id-less list page), so a document target derives the
+    repository its clone comes from (#523).
 
     For GitLab hosts with available API tokens, returns HTTPS URL with token auth.
-    Otherwise returns SSH-format URL for git cloning.
+    Otherwise returns SSH-format URL for git cloning. A repository URL, a thread
+    permalink, a non-forge URL and a non-URL target derive None.
 
     Supports:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
     - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project.git (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
     - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
+    - GitLab: https://gitlab.com/group/project/-/blob/main/docs/x.md -> same as /-/issues/ (#523)
+    - GitLab: https://gitlab.com/group/project/-/issues (a list page) -> same as /-/issues/N (#391)
     """
-    try:
-        parsed = urlparse(target)
-    except Exception:
+    # The repository is repository_of's answer — the one definition behind
+    # this helper in both its copies and behind _parse_repo_url (#391) — for
+    # a work item or a reference and for nothing else. A repository URL
+    # derives None on purpose: spawn._plain_repo_url_from_target,
+    # clone_secondary_mr and _resolve_clone_url fall back to the target
+    # itself as the clone URL: the one class repository_of answers for that
+    # this helper must not, hence the class check ahead of it.
+    if classify_target(target) not in ("work-item", "reference"):
         return None
-
-    if not parsed.scheme or not parsed.netloc or not parsed.path:
+    repository = repository_of(target)
+    if repository is None:
         return None
-
+    parsed = urlparse(repository)
     host = parsed.hostname
-    if not host:
+    project_path = parsed.path.strip("/")
+    if not host or not project_path:
         return None
 
-    path_parts = [p for p in parsed.path.split('/') if p]
-    if len(path_parts) < 2:
-        return None
-
-    # Heuristics: only attempt derive when a known resource path is present.
-    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
-    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
-    # match so a repo merely named 'work_items' isn't misread as a resource link.
-    lowered = '/'.join(path_parts).lower()
-    indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
-    )
-    if not any(tok in lowered for tok in indicators):
-        return None
-
-    # GitLab URLs use /-/ separator: group/project/-/merge_requests/123
-    # Find the /-/ separator and extract everything before it
-    if '/-/' in parsed.path:
-        # Split on /-/ and take everything before it
-        project_path = parsed.path.split('/-/')[0].strip('/')
-        if project_path:
-            # Check if we have a GitLab token for this host
-            token = _get_gitlab_token(host)
-            if token:
-                return f"https://oauth2:{token}@{host}/{project_path}.git"
-            return f"git@{host}:{project_path}"
-
-    # GitHub and simple URLs: owner/repo/pull/123 or owner/repo/issues/123
-    owner = path_parts[0]
-    repo = path_parts[1]
-
-    # Strip trailing .git if present in repo segment from some URLs
-    repo = re.sub(r"\.git$", "", repo)
-
-    return f"git@{host}:{owner}/{repo}"
+    # GitLab-shaped (a /-/ route): HTTPS with the host's token when there is
+    # one, SSH otherwise. The GitHub shape never looks a token up — it never
+    # did, and _get_gitlab_token reads GH_TOKEN for github.com and refuses a
+    # generic GITLAB_TOKEN with a notice, both of which would be new.
+    if "/-/" in urlparse(target).path:
+        token = _get_gitlab_token(host)
+        if token:
+            # Preserve the repository's authority: a non-default HTTPS port
+            # (gitlab.example.com:8443) must survive the credential insert.
+            try:
+                authority = host if parsed.port is None else f"{host}:{parsed.port}"
+            except ValueError:
+                authority = host
+            return f"https://oauth2:{token}@{authority}/{project_path}.git"
+    return f"git@{host}:{project_path}"
 
 
 def _parse_gitlab_mr_url(target: str) -> tuple[str | None, str | None, str | None]:
@@ -1728,7 +2338,7 @@ def clone_secondary_mr(
 class WorkRepoPlacement:
     """Where this launch's work goes in the work repo, and in which form.
 
-    ``schema`` is True for a tree carrying a ``_plexus.yaml`` (spec D20);
+    ``schema`` is True for a tree carrying a ``_lmer.yaml`` (spec D20);
     ``base`` is the project dir the launch records under — the env trio's
     ``{host}/{project}`` in a legacy tree, the registry-resolved short name
     (or, for a repo nobody has named yet, its ``{host}/{project}`` host
@@ -1775,11 +2385,10 @@ def _resolve_work_repo_placement(
         return WorkRepoPlacement(schema=False, base=legacy_base, problem=None)
 
     try:
-        # Guarded and lazy, like PyYAML above: reached only once a manifest is
-        # known to be present, so a legacy tree never imports the core, and an
-        # lmer built without it degrades instead of dying at container start.
+        # An lmer built without the core degrades instead of dying at container start.
+        # deferred: optional dependency — only a present manifest needs the core, so a legacy tree never imports it
         from lmer_schema.form import Form, detect_form
-        from lmer_schema.manifest import ManifestError
+        from lmer_schema.manifest import ManifestError, load_manifest
         from lmer_schema.registry import (
             RegistryError,
             load_registry,
@@ -1802,6 +2411,7 @@ def _resolve_work_repo_placement(
 
     registry, problem = None, None
     try:
+        manifest_schema = load_manifest(root).schema
         registry = load_registry(root)
     except RegistryError as exc:
         problem = str(exc)
@@ -1820,7 +2430,10 @@ def _resolve_work_repo_placement(
 
     base = legacy_base
     if url:
-        resolution = resolve_project_dir(root, url, registry=registry)
+        try:
+            resolution = resolve_project_dir(root, url, registry=registry, schema=manifest_schema)
+        except RegistryError as exc:
+            return WorkRepoPlacement(schema=True, base=None, problem=str(exc))
         if resolution.path is not None:
             base = resolution.path
         elif resolution.bucket_path is not None:
@@ -1872,11 +2485,24 @@ def _derive_run_slug(task_type: str | None, task_target: str | None) -> str:
 
     Standalone mirror of ``work_repo.run_state.derive_slug`` (same reason as
     the ``sanitize_task_target`` copy above: this module runs without the
-    package). The two must agree exactly or container start prepares a
-    different group than the one ``work seed`` writes into — pinned by
+    package), minus that function's env fallback — the caller already read
+    ``LMER_TASK`` / ``LMER_TASK_TARGET``. The two must agree exactly or
+    container start prepares a different group than the one ``work seed``
+    writes into — pinned equal over the §9.1 derive-slug table by
     ``tests/test_clone_and_exec_session_dir.py``.
+
+    **No work item means the bare taskdef** (run-identity spec §3): a target
+    that is nothing, a path, a bare repository URL or a document URL derives
+    ``<taskdef>`` — the container classifies the value it is given, so a
+    lagging host that still exports ``.`` or the clone URL lands in the bare
+    group anyway, and two plain chats on one project are two records in ONE
+    group (#311, #81). A work item, a thread permalink included (``special``,
+    :func:`is_work_item`), keeps the slug the full-SHA truncation and
+    :func:`sanitize_task_target` derive below.
     """
     taskdef = task_type or "default"
+    if not is_work_item(task_target):
+        return taskdef
     if task_target and _FULL_SHA_RE.fullmatch(task_target):
         return f"{taskdef}-{task_target[:12].lower()}"
     safe = sanitize_task_target(task_target) if task_target else "default"
@@ -1989,7 +2615,7 @@ def ensure_work_repo_directory(work_repo_path: Path, host: str | None, project: 
     """
     Ensure this launch's directories exist in the work repo, by FORM.
 
-    Legacy tree (no ``_plexus.yaml``) — unchanged, byte for byte:
+    Legacy tree (no ``_lmer.yaml``) — unchanged, byte for byte:
     {host}/{project}/{task_type}/{task_target}, plus info directories at
     - {host}/{project}/info/ (global project info)
     - {host}/{project}/{task_type}/info/ (project+task specific info)
@@ -2079,9 +2705,11 @@ def _is_self_dev_workspace(workspace: Path) -> bool:
     if not pyproject.is_file():
         return False
     try:
+        # deferred: optional dependency — stdlib only from Python 3.11; read only when pyproject.toml exists
         import tomllib  # type: ignore[import-not-found]
     except ImportError:
         try:
+            # deferred: optional dependency — the tomli backport, for an older container interpreter that has it
             import tomli as tomllib  # type: ignore[no-redef,import-not-found]
         except ImportError:
             return False
@@ -2659,12 +3287,12 @@ def run_state_session_end() -> None:
     if not work:
         return
     try:
-        subprocess.call([work, "session-end"], timeout=180)
+        subprocess.call([work, "session-end"], timeout=SESSION_END_TIMEOUT_SECONDS)
     except Exception as e:  # teardown cleanup must never fail the session
         print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
 
 
-def mint_session_id() -> None:
+def mint_session_id(*, fresh: bool = False) -> None:
     """Ensure LMER_SESSION_ID exists BEFORE the runner spawns.
 
     The id used to be minted only inside claude-runner.sh — a child — so it
@@ -2675,10 +3303,53 @@ def mint_session_id() -> None:
     preserves an inherited value) gives runner, hooks, and backstop one id.
     A host-injected id is preserved the same way (setdefault).
     """
+    if fresh:
+        # deferred: optional dependency — only a fresh mint needs it; this standalone script may lack work_repo
+        from work_repo.session_record import start_launch
+
+        start_launch()
+        return
     os.environ.setdefault(
         "LMER_SESSION_ID",
         f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
         f"-{os.getpid()}-{random.randint(0, 32767)}",
+    )
+
+
+def _launch_uid_names_a_record(uid: str) -> bool:
+    """True when *uid* already names a record in this project's run area.
+
+    The check has to run BEFORE ``mint_session_id(fresh=True)``:
+    ``_record_address`` resolves by launch uid first, so a reused uid would
+    otherwise adopt the existing record instead of starting a new one.
+
+    A launch with no project run area — a repo-less thread chat, or
+    ``LMER_NO_REPO`` — holds no record: ``_record_address`` only ever adopts
+    from a resolved base, so a uid with nowhere to resolve cannot collide.
+    Otherwise it fails closed: "no record" is only an answer when the area was
+    read, so a base that exists and cannot be listed raises — inside main()'s
+    session-start try, that refuses the launch. A base that does not exist yet
+    is a project with no runs, which holds no record. A group inside a listed
+    base that cannot be read is still skipped by the shared walk
+    (``run_state._record_scan``), the same walk ``_record_address`` adopts by,
+    so a record it cannot see is one this launch could not adopt either.
+    """
+    # deferred: optional dependency — standalone container entrypoint; work_repo may not be importable here
+    from work_repo import run_state
+
+    base = run_state.runs_base()
+    if base is None or not base.exists():
+        return False
+    try:
+        next(iter(base.iterdir()), None)
+    except OSError as exc:
+        raise RuntimeError(
+            f"the run area {base} cannot be listed ({exc.strerror or exc}), so "
+            "whether the launch uid already names a record cannot be checked"
+        ) from exc
+    return any(
+        run_state.session_id_of(record.name) == uid
+        for record in run_state.iter_record_dirs(base)
     )
 
 
@@ -2864,12 +3535,42 @@ def main(argv: list[str] | None = None) -> int:
         # probes without reconstructing a credential-bearing URL.
         os.environ["LMER_WORK_REPO_CREDENTIAL_FILE"] = str(work_credential.path)
 
-    # Canonical source resolution (sources.yaml, issue #105): runs here —
-    # after the work-repo clone (the declaration is now present and fresh)
-    # and before every aux clone below. Propagates declared sources
-    # into the env vars the aux-clone and napkin/link steps read, and
-    # refuses start (exit 2) on a headless mismatch or an untrustable
-    # config. Absent sources.yaml is silent legacy mode: zero output.
+    # The freshly cloned manifest owns the writer contract. A schema-2
+    # process never inherits the UID of a preceding execution.
+    process_records = False
+    manifest = work_repo_path / PLEXUS_MANIFEST_NAME
+    if manifest.exists() or manifest.is_symlink():
+        try:
+            # deferred: optional dependency — only a work repo with a manifest needs it; this standalone script may lack work_repo
+            from work_repo.session_record import schema_version
+
+            process_records = schema_version(work_repo_path) >= 2
+            if process_records:
+                launch_uid = os.environ.get("LMER_LAUNCH_UID")
+                if launch_uid and _launch_uid_names_a_record(launch_uid):
+                    print(
+                        "Session start refused: launch uid already names a record",
+                        file=sys.stderr,
+                    )
+                    return 2
+                inherited_source = os.environ.pop("LMER_SESSION_ID", None)
+                if inherited_source and os.environ.get("LMER_SESSION_IS_SOURCE") == "1":
+                    os.environ.setdefault("LMER_SOURCE_SESSION_ID", inherited_source)
+                mint_session_id(fresh=True)
+        except Exception as exc:
+            print(f"Session start refused: {_scrub_credentials(str(exc))}", file=sys.stderr)
+            return 2
+    if not process_records:
+        # A schema-1 (or manifest-less) tree has no execution uid to record.
+        os.environ.pop("LMER_LAUNCH_UID", None)
+
+    # Canonical source resolution (sources.yaml, issue #105; the manifest's
+    # `sources:` tier, issue #370): runs here — after the work-repo clone
+    # (the declaration files are now present and fresh) and before every
+    # aux clone below. Propagates declared sources into the env vars the
+    # aux-clone and napkin/link steps read, and refuses start (exit 2) on a
+    # headless mismatch, an untrustable config or a manifest this build
+    # cannot read. Neither file present is silent legacy mode: zero output.
     rc = _resolve_declared_sources(work_repo_path, work_repo_url)
     if rc:
         return rc
@@ -2897,6 +3598,17 @@ def main(argv: list[str] | None = None) -> int:
     repo_project = os.environ.get("LMER_REPO_PROJECT")
     task_type = os.environ.get("LMER_TASK")
     task_target = os.environ.get("LMER_TASK_TARGET")
+    if process_records:
+        # deferred: optional dependency — only a schema-2 launch needs it; this standalone script may lack work_repo
+        from work_repo import run_state
+
+        try:
+            # Check the source before creating a destination or starting the
+            # harness: hooks are fail-soft and cannot enforce this decision.
+            run_state._source_context(run_state.derive_slug(), os.environ.get("LMER_SOURCE_SESSION_ID"))
+        except run_state.RunStateError as exc:
+            print(f"Session start refused: {exc}", file=sys.stderr)
+            return 2
     try:
         ensure_work_repo_directory(work_repo_path, repo_host, repo_project, task_type, task_target)
     except OSError as e:

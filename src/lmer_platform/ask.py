@@ -290,7 +290,7 @@ def pending_questions(session_id: str) -> list:
 def open_question_count(session_id: str) -> int:
     """How many of :func:`pending_questions` there are; ``0`` if unreadable.
 
-    For uber lmer's header badge (issue #507): the ask route's data and rule, so
+    For uber lmer's question badge (issue #507): the ask route's data and rule, so
     it agrees with the run view's ask dock — and with ``lmer-signal list --open``
     for as long as the supervisor mirrors the bus into this directory
     (``lmer_cli.comms.AskDirProjection``). Best-effort like
@@ -360,6 +360,7 @@ def _session_io():
     ``spawn`` — a top-level import here would close that cycle. Same lazy-import
     shape, and same one named seam, as ``lmer_platform.spawn._transcripts``.
     """
+    # deferred: cycle — lmer_platform.session_io imports this module at top (via lmer_platform.spawn)
     from . import session_io
 
     return session_io
@@ -410,16 +411,14 @@ def _run_ref(session_id: str) -> Optional[str]:
     ``/api/runs/resume`` takes.
     """
     entry = registry.read_session(session_id)
-    run = entry.get("run") if isinstance(entry, dict) else None
-    if not isinstance(run, dict):
-        return None
-    try:
-        return runs.run_key(
-            run.get("host") or "", run.get("project") or "", run.get("slug") or ""
-        )
-    except runs.RunIndexError:
+    parts = runs.run_key_of_entry(entry)
+    if parts is None:
         # A session with no run identity yet — spawned, nothing committed. The
         # refusal simply names one less thing.
+        return None
+    try:
+        return runs.run_key(*parts)
+    except runs.RunIndexError:
         return None
 
 

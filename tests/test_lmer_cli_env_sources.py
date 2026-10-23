@@ -288,6 +288,19 @@ class TestDisplayEnvConfigCli:
         assert "LMER_TRUST_MISE" in output
         assert ".env (lmer state dir)" in output
 
+    def test_scoped_ci_baseline_toggle_is_listed_with_its_source(self, monkeypatch):
+        monkeypatch.setenv("LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE", "1")
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_env_config_cli(
+                host_lmer_vars=set(),
+                env_file_sources={
+                    "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE": ".env (lmer state dir)"},
+            )
+        line = next(l for l in f.getvalue().splitlines()
+                    if "LMER_DEVELOP__AGENTS_GLOBAL__GATE_CI_BASELINE" in l)
+        assert ".env (lmer state dir)" in line
+
     def test_table_has_fenced_delimiters(self, monkeypatch):
         monkeypatch.setenv("LMER_TASK", "review")
 
@@ -378,24 +391,31 @@ sources:
 
 
 def _render_sources_block(monkeypatch, cached, env=None,
-                          reason=clone_cache.CACHE_NO_MIRROR):
+                          reason=clone_cache.CACHE_NO_MIRROR,
+                          manifest=None):
     """Render the block with a stubbed clone cache and a clean LMER_* env.
 
     `cached` is what the clone-cache reader pretends the work repo's cached
-    sources.yaml contains (None = miss, reported with `reason`); `env` is the
+    sources.yaml contains (None = miss, reported with `reason`); `manifest`
+    is the cached `_lmer.yaml` content (None = no manifest, so the
+    no-manifest output is byte-identical to before #370); `env` is the
     complete LMER_* environment for the render (everything else is stripped
     first).
     """
     strip_lmer_env(monkeypatch)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setattr(
-        cli,
-        "read_cached_repo_file_status",
-        lambda url, path="sources.yaml": (
-            (cached, clone_cache.CACHE_HIT) if cached is not None else (None, reason)
-        ),
-    )
+
+    def _reader(url, path="sources.yaml"):
+        if path == "_lmer.yaml":
+            if manifest is None:
+                return None, clone_cache.CACHE_FILE_ABSENT
+            return manifest, clone_cache.CACHE_HIT
+        if cached is None:
+            return None, reason
+        return cached, clone_cache.CACHE_HIT
+
+    monkeypatch.setattr(cli, "read_cached_repo_file_status", _reader)
     f = io.StringIO()
     with redirect_stdout(f):
         _display_sources_config_cli()
@@ -724,6 +744,98 @@ class TestSourcesOriginMatrix:
         output = f.getvalue()
         assert "declared: unknown (LMER_WORK_REPO not set)" in output
         assert output.count("unset-fallback") == 3
+
+
+MANIFEST_YAML = """\
+schema: 2
+name: example
+sources:
+  napkin:
+    repo: https://git.example.com/org/napkin.git
+"""
+
+
+class TestSourcesManifestTier:
+    """#370 point 4: `--show-env` names the manifest tier (plan task 58)."""
+
+    def test_a_cached_manifest_declaration_is_labelled_manifest(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch, None, env={"LMER_WORK_REPO": WORK_REPO}, manifest=MANIFEST_YAML
+        )
+        assert "declared: manifest from work-repo cache (cached, possibly stale)" in output
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/napkin.git",
+            "declared (manifest, cached, possibly stale)",
+        )
+
+    def test_both_tiers_manifest_wins_and_the_stale_legacy_warn_renders(
+        self, monkeypatch
+    ):
+        manifest = MANIFEST_YAML.replace("org/napkin.git", "org/manifest-napkin.git")
+        output = _render_sources_block(
+            monkeypatch, VALID_SOURCES_YAML,
+            env={"LMER_WORK_REPO": WORK_REPO}, manifest=manifest,
+        )
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/manifest-napkin.git",
+            "declared (manifest, cached, possibly stale)",
+        )
+        # The outranked legacy entry keeps its own tier label and warns.
+        assert _sources_row(output, "taskdef repo") == (
+            "https://git.example.com/org/taskdefs.git",
+            "declared (sources.yaml, cached, possibly stale)",
+        )
+        assert "stale" in output
+
+    def test_a_manifest_without_sources_is_not_reported_as_a_declaration(self, monkeypatch):
+        """A schema-2 repo always has `_lmer.yaml`; one without a
+        `sources:` section must read as no declaration, not as one."""
+        output = _render_sources_block(
+            monkeypatch, None,
+            env={"LMER_WORK_REPO": WORK_REPO},
+            reason=clone_cache.CACHE_FILE_ABSENT,
+            manifest="schema: 2\nname: example\n",
+        )
+        assert "declared: none" in output
+        assert "manifest from work-repo cache" not in output
+        assert output.count("unset-fallback") == 3
+
+    def test_no_cached_manifest_output_is_unchanged(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch, VALID_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/napkin.git",
+            "declared (cached, possibly stale)",
+        )
+        assert "manifest" not in output
+
+    def test_a_broken_cached_manifest_renders_invalid_and_keeps_env_rows(
+        self, monkeypatch
+    ):
+        output = _render_sources_block(
+            monkeypatch, None,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "https://git.example.com/org/env-napkin.git",
+            },
+            manifest="schema: 2\nname: example\nsources: [not-a-map]\n",
+        )
+        assert "declared: invalid (" in output
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/env-napkin.git", "env-only"
+        )
+
+    def test_a_credentialed_env_value_never_reaches_stdout(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch, None,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "https://oauth2:glpat-SECRETtoken@git.example.com/org/napkin.git",
+            },
+            manifest=MANIFEST_YAML,
+        )
+        assert "glpat-" not in output and "oauth2" not in output
 
 
 class TestSourcesBlockInvalidCachedYaml:

@@ -11,7 +11,7 @@ thread connections live in Project settings. The color picker accepts any hex
 color, and the 20 named colors are its swatches. Picking one of them stores its
 name, so preset projects look the same as before. Repository associations supply
 launch suggestions and never adopt existing runs. Expand Standing instructions
-in Project settings to edit them; the project's assistant chat shows a read-only copy.
+in Project settings to edit them; Ratchet's standing-orders button opens them there.
 
 The project switcher at the left of the app header selects the main view. It
 shows the selected project's name (or **All projects**); on a phone it takes a
@@ -174,7 +174,7 @@ The existing forge `project` parameter continues to mean the repository path.
 | --- | --- |
 | `GET /api/projects` | Projects and lifecycle/queue status; assistants see their own project |
 | `POST /api/projects` | `{name}` creates and queues a project |
-| `PATCH /api/projects/{workspace_id}` | Name, color (a named color or `#rrggbb`, stored lowercase), repository URLs and execution `settings` |
+| `PATCH /api/projects/{workspace_id}` | Name, color (a named color or `#rrggbb`, stored lowercase), repository URLs, execution `settings` and `supervisor_authority` |
 | `POST /api/projects/{workspace_id}/archive` | Stop/archive an eligible project |
 | `POST /api/projects/{workspace_id}/restore` | Restore its identity/history, stopped |
 | `GET`, `POST /api/settings` | Platform defaults and shared capacity |
@@ -286,6 +286,98 @@ no assistant is spawned, resumed, rotated or connected just to deliver. Looking
 up a retained receipt for an old address does not deliver anything to that
 address or its successor.
 
+## Supervisor authority
+
+`supervisor_authority` is a project setting that says how far the operator has
+delegated to the project's assistant when it talks to that project's workers
+(issue #594). It is `none` unless the operator sets it, for every project,
+existing or new, and in legacy no-project mode. Projects opt in.
+
+| Level | What a worker accepts from the assistant |
+| --- | --- |
+| `none` | Nothing on the operator's behalf. The worker acts on the assistant's messages only where it needed no approval anyway, and asks the operator for the rest. |
+| `approvals` | Answers to the worker's own approval and confirmation asks, and "go" on a brief or direction inside the run's task. Not wider scope or new work. |
+| `full` | Direction and scope within the run's target, as the operator would give them. |
+
+No level reaches the operator-only gates:
+- spec and plan approval, including goal freeze and amend;
+- creating or placing a repository;
+- merging any merge request, and releases and tags;
+- pushes outside the push allow list;
+- destructive or remote-deleting operations;
+- authorising work on a new target;
+- anything the taskdef or the assistant's own message marks operator-only.
+
+A message's text can narrow what the worker accepts, never widen it (the limit
+issue #518 drew).
+
+**What the platform does:**
+- **The stamp.** On a `message` or `answer` the assistant's credential posts
+  through the session comms, steering and ask-answer routes, the daemon
+  resolves the level and sends it to the session's bus. The worker sees
+  `[Ratchet · authority=approvals] …` as the tag that opens the turn, and
+  `lmer-signal` shows `· authority=…` beside an answer it was handed. The level
+  comes from the credential and the settings, never from the body: a caller's
+  `meta.authority` is dropped, and operator, connector and peer-UL records carry
+  no stamp. An assistant tag with no level (an older daemon or container image)
+  carries `none`. A `command` must be one line starting with `/`, since it is
+  typed untagged; above `none` the only command the assistant may send is a
+  bare `/followup`, since a harness may pass any other name to its model as an
+  untagged turn. No typed text, author or option keeps a control character
+  (newline and tab aside in prose), since one could erase the tag at the
+  worker's terminal: the assistant's are refused, and a human's are cleaned.
+  On a drop-in harness, which gets no paste framing, every tagged record is
+  typed on one line, whoever sent it, so a later line cannot open a turn behind
+  a stamp of its own. See [COMMS.md](./COMMS.md) §4.
+- **Resolution.** The level is resolved at send time, from the session's spawn
+  override if it has one, else the project's current setting, else `none`. A
+  changed setting applies to the next message.
+- **The override.** `lmer-ctl spawn … --supervisor-authority LEVEL`
+  (`POST /api/sessions` `supervisor_authority`) sets a per-run override. From
+  the operator it stands as given. From the assistant's credential it may only
+  narrow the project's level: a higher one is refused with a 400, and later
+  resolution caps it at the project's current level.
+- **The startup context.** The worker gets its level at launch in
+  `LMER_SUPERVISOR_AUTHORITY`. The orchestrator-ask prompt fragment explains
+  the levels, the stamp rule, the operator-only gates and the audit rule (log
+  the message id and level it acted on).
+- **Operator-only questions.** `lmer-signal ask --operator-only` marks a gate
+  question. The bus refuses an answer or a close to it from `uber-lmer` or
+  `peer-ul` at any level. Neither connector binds the assistant's own thread
+  posts as its answer; Slack also refuses any other bot's, while matrix knows
+  only lmer's own account. On a session with a bus, the ask-directory answer
+  route refuses the assistant (409) until the question reaches the bus, where
+  the same refusal applies ([COMMS.md](./COMMS.md) §6). A question the session
+  has closed unanswered is answered by file for every caller, which returns the
+  reason the session gave.
+
+**Who can change the setting.** It is written with
+`PATCH /api/projects/{workspace_id}` `{"settings": {"supervisor_authority": …}}`
+(null clears it) or the selector in Project settings, both operator-only. The
+assistant's own settings routes (`POST /api/assistant/config`, `/start`,
+`/rotate`) refuse the key, so the assistant cannot grant itself a level. It is
+not an assistant launch setting and never reaches an assistant start.
+
+**Limits.** The platform enforces the stamp and the operator-only refusals
+above. Everything else about what a level permits is honoured by the worker
+following its instructions. Some doors the platform does not close:
+- **Raw keystrokes at `none`.** `lmer-ctl send --no-newline` (`POST /input`
+  without `sanitize`), terminal tickets and the no-bus fallback type into a
+  worker untagged, and so does a wind-down's note. When the worker's effective
+  level is above `none`, the assistant's credential is refused all of them (403;
+  an open terminal is checked on every input frame, in the same operation that
+  writes it, and closed) and must use the bus. A session whose registry entry is
+  missing or unreadable counts as a worker here. A wind-down the assistant asks
+  for names it, not the operator, as the note's author. At `none` they stay
+  open, so the assistant can still answer a worker's terminal dialog. That also
+  means it could type a turn that looks stamped there.
+- **`/api/runs/answer`.** An answer through this route reaches the restarted
+  run with no provenance.
+- **Operator overrides.** An operator's per-run override stands for that
+  session's life: lowering the project's level does not reach it.
+- **Restarted runs.** A run restarted through `/api/runs/answer` or a resume
+  starts with the project's level, not a previous session's override.
+
 ## Moves and archive
 
 A move waits for the shared control boundary, then refuses any live worker. It
@@ -355,6 +447,61 @@ identity deduplicates admission, notices and delivery. UI selection and recent
 assistant activity never choose the destination.
 DM replies retain their exact recorded assistant parent; they do not use name
 matching or the General default when that parent's project cannot be resolved.
+
+### Channel → project mapping
+
+A Slack channel or Matrix room can be mapped to one project, so that a plain
+`@bot hi` there routes as if it began with that project's name. Precedence for a
+top-level mention is:
+
+1. thread ownership (an owned thread stays with its owner);
+2. an explicit leading project name, which may name a different project than
+   the channel's;
+3. the channel mapping;
+4. General.
+
+DM replies and connected-thread routing are unchanged, and the sender allow
+list applies first as always. A channel maps to at most one project: mapping it
+to a second project is refused (HTTP 409, naming the current holder) until it is
+removed from the first. The mapping lives in `projects.sqlite3` (table
+`channel_routes`), never in the work repo, and every mention reads it, so a
+change takes effect without a daemon restart.
+
+Archiving a project keeps its mappings but disables them. A mention in such a
+channel gets a source-thread notice ("This channel is mapped to project X,
+which is archived; restore it or remap the channel …") and never falls back to
+General. Restore the project, or remove the mapping with
+`lmer-ctl projects channels remove CHANNEL`. Removal works whichever project
+holds the channel, archived or not.
+
+Channels are given as:
+
+- **Slack**: a channel ID (`C…`/`G…`), a channel or message link
+  (`https://<workspace>.slack.com/archives/C…[/p…]`, `https://app.slack.com/client/T…/C…`),
+  or `#name`. A `#name` is resolved with one `conversations.list` call over public
+  and private channels, which needs both of the bot token's `channels:read` and
+  `groups:read` scopes; without them the name is refused with a request for the
+  ID or a link. DM conversations (`D…`) are refused.
+- **Matrix**: a room ID (`!room:server`), an alias (`#alias:server`, resolved
+  through the room directory), or a `https://matrix.to/#/…` or Element
+  `https://<host>/#/room/…` link to either.
+
+Edit a project's channels in **Project settings → Mention channels**, one per
+line. The same data is available through the API and `lmer-ctl`:
+
+| | API | lmer-ctl |
+|---|---|---|
+| List all (any caller) | `GET /api/channel-routes` | `lmer-ctl projects channels list` |
+| Replace a project's set (operator) | `PUT /api/projects/{id}/channel-routes {"channels": [...]}` | `lmer-ctl projects channels set PROJECT [CHANNEL...]` |
+| Remove one (operator) | `DELETE /api/channel-routes?channel=CHANNEL` | `lmer-ctl projects channels remove CHANNEL` |
+
+Each listed route carries `transport`, `conversation`, `label` (as entered or
+resolved), `project_id`, `project_name` and `archived`. Every project's assistant
+can read the whole list, so a Ratchet can report it; that includes other
+projects' channel IDs and labels. A stored label or ID is matched against the
+project's own routes before anything is looked up, so re-saving `#name` after the
+channel was renamed keeps the channel it was mapped to rather than following the
+name to a different one, and `remove` takes exactly what `list` shows.
 
 Queued requests retain project, source conversation/root, sender, message and
 ownership revision. A stopped/unavailable/waiting assistant leaves the request
@@ -525,8 +672,10 @@ editing through the existing scoped instruction endpoint; Save project is kept
 at the top of the form. Collapsing preserves the draft. Unedited, unavailable or
 still-loading instructions are never posted as empty text when other settings
 are saved. Existing non-empty-text and length validation still applies, and a
-refused write leaves the edit visible for correction. The assistant chat continues
-to show a read-only copy.
+refused write leaves the edit visible for correction. The section says when the
+stored orders last changed, says when there are none, and notes that they are
+usually set by telling Ratchet in chat, which confirms the wording before
+storing them.
 
 Archived project rows and Restore stopped use the stored project color. Fleet
 worker and assistant capacity use adjacent integer inputs; existing limits,
