@@ -1,7 +1,0 @@
-changed:
-- "uber lmer's toolbar uses a neutral surface a shade darker than the pane, in light and dark themes, instead of the project colour (#578)."
-- "uber lmer's generation and start time move from a line in the pane to the toolbar robot's tooltip (#578)."
-added:
-- "Standing instructions in Project settings show when they last changed, say when there are none, and note they are usually set in chat (#578)."
-fixed:
-- "The 'digests waiting for uber lmer' notice no longer stretches to fill the uber lmer pane; it sizes to its text (#578)."

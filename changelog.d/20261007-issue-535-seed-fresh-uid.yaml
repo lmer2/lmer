@@ -1,4 +1,0 @@
-fixed:
-- "`work seed` no longer reuses the launch uid or breaks the seeding session's own record: on schema 2 the seed is a fresh-uid record, written whole in its temp dir and read-only to the seeder once renamed (#535)"
-changed:
-- "a seeded record is continued with `--source-session <uid>` (the launch line `work seed` prints), needs no unsigned-source acknowledgement, and is left out of `work sessions --running`"

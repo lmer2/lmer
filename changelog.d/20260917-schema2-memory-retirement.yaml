@@ -1,6 +1,0 @@
-added:
-- "schema 2 agent-memory retirement markers with archive-backed forget and revive operations"
-fixed:
-- "stale agent-memory persists no longer recreate files deleted by another session"
-- "a forget tombstone stays in its own scope's memory index; restore and persist no longer copy a project-scope tombstone into the instance index (or the reverse)"
-- "an instance-scope forget no longer makes sessions that restored earlier write the retired memory's live entry into their project index on the next persist"

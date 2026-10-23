@@ -1,2 +1,0 @@
-changed:
-- "The work-repo manifest is now `_lmer.yaml`, renamed from `_plexus.yaml`. The old name is no longer read or accepted anywhere, so rename an existing `_plexus.yaml` to `_lmer.yaml` (#587)"

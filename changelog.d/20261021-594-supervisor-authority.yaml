@@ -1,7 +1,0 @@
-added:
-- "Project setting `supervisor_authority` (none, approvals, full; default none) stamps the assistant's delegated level on its messages to workers."
-- "`lmer-signal ask --operator-only` marks a gate question no assistant can answer, at any authority level."
-changed:
-- "Nothing typed into a worker can erase the tag in front of it: the bus refuses control characters from the assistant and in commands, authors and options, and cleans them out of anyone else's text (a pasted coloured log arrives without its escape codes)."
-- "A Slack or Matrix connector drops an inbound message the bus refuses outright, instead of retrying it ahead of every later message, and tells the thread which post did not arrive and why."
-- "On a drop-in harness, every tagged message is typed on one line, whichever route it came by, so a later line cannot open a turn with a stamp of its own."

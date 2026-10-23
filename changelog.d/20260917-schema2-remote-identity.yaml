@@ -1,3 +1,0 @@
-fixed:
-- "schema 2 repository routing now preserves non-default ports and path case across registry lookup, fallback buckets, and platform run inventory"
-- "schema 1 Registry construction remains backward compatible, and platform inventory tolerates opaque session records disappearing during a scan"

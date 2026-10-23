@@ -1,3 +1,0 @@
-added:
-- "`work memory persist` reports the memory index size against the harness's session-start load limit, and restore warns when it is over."
-- "Memory scopes can split their index into a map plus `areas/<slug>.md` indexes; persist files entries into areas, refuses growing an over-budget map, and refuses a badly migrated split index."
