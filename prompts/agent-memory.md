@@ -10,15 +10,23 @@ that absolute path. Never create a `memory/` directory inside the project
 repository or workspace: memory lives outside the repo, and a stray
 `memory/` folder pollutes the project's git status.
 
-- **At session start**, read `MEMORY.md` in that directory — it is the
-  index, one line per memory. Open any linked memory file whose
-  description looks relevant to your task.
+- **At session start**, read `MEMORY.md` in that directory. It is the
+  index: one line per memory, or, once the index is split, a **map** with
+  one line per area, each pointing at `areas/<slug>.md` and saying when to
+  read it. **Before you start work, open the area index whose "read when"
+  hook matches your task**, then open any linked memory file whose
+  description looks relevant. Only `MEMORY.md` is loaded for you; the area
+  indexes are read only when you open them.
 - **To save a durable fact**, write a new markdown file in that directory
   with frontmatter (`name:` short-kebab-case slug, `description:` one-line
   summary, `metadata.type:` one of `user` | `feedback` | `project` |
-  `reference`), then add a one-line pointer for it in `MEMORY.md`
-  (`- [Title](file.md) — hook`). Update an existing file instead of
-  creating a near-duplicate; delete memories that turn out to be wrong.
+  `reference`, and, in a split index, `metadata.area:` the area's slug).
+  Then add a one-line pointer for it (`- [Title](file.md) — hook`) to
+  `MEMORY.md`, or, in a split index, to the area index as
+  `- [Title](../file.md) — hook`. A pointer left in a split `MEMORY.md` is
+  moved to its area (or to `areas/unsorted.md`) when you persist. Update an
+  existing file instead of creating a near-duplicate; delete memories that
+  turn out to be wrong.
 - **Save only durable, project-level facts** that are not derivable from
   the repository itself (code structure, git history, and CLAUDE.md
   content do not belong in memory). Never store credentials, secrets, or

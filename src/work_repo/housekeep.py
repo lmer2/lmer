@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -665,29 +666,44 @@ def _plan_index(plan, *, root, project, policy, now=None, **_):
 
 
 def _plan_memory_index(plan, root, scope_dir, manifest, date):
+    """Tombstone a scope's dangling index entries, in every index file it has.
+
+    A flat scope's index is ``MEMORY.md``, where a link to ``areas/<slug>.md``
+    is an ordinary entry. A split scope's entries live in its area indexes
+    and ``MEMORY.md`` is the map (#435); a link from an area index is planned
+    as it is written there (``../fact.md``), so the applier finds it.
+    """
     index = scope_dir / "MEMORY.md"
     if not index.is_file():
         return
-    try:
-        text = index.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return
+    split = memory._is_split(scope_dir)
+    indexes = [(index, memory.MEMORY_INDEX)]
+    if split:
+        indexes += [
+            (path, rel.as_posix()) for rel, path in sorted(memory._area_indexes(scope_dir).items())
+        ]
     scope_rel = scope_dir.relative_to(root).as_posix()
-    for line in text.splitlines():
-        if memory._is_tombstone(line):
+    for path, index_rel in indexes:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
             continue
-        for target in memory._entry_targets(line):
-            if (scope_dir / target).exists():
-                continue  # the file is present: not dangling
-            key = f"{scope_rel}/{target}"
-            archive_rel = memory._retirement_archive_rel(key, manifest)
-            if (root / archive_rel).exists():
-                new_target = os.path.relpath(root / archive_rel, scope_dir)
-                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
-                                dst=new_target, detail=target))
-            else:
-                plan.add(Action("tombstone", "index", index.relative_to(root).as_posix(),
-                                detail=target, date=date))
+        base = posixpath.dirname(index_rel) or "."
+        src = path.relative_to(root).as_posix()
+        for line in text.splitlines():
+            if memory._is_tombstone(line):
+                continue
+            for target in memory._entry_targets(line, index_rel, split=split):
+                if (scope_dir / target).exists():
+                    continue  # the file is present: not dangling
+                written = posixpath.relpath(target, base)
+                key = f"{scope_rel}/{target}"
+                archive_rel = memory._retirement_archive_rel(key, manifest)
+                if (root / archive_rel).exists():
+                    new_target = os.path.relpath(root / archive_rel, path.parent)
+                    plan.add(Action("tombstone", "index", src, dst=new_target, detail=written))
+                else:
+                    plan.add(Action("tombstone", "index", src, detail=written, date=date))
 
 
 def _plan_plans_index(plan, root, project_dir, date):
@@ -842,7 +858,7 @@ def _apply_tombstone(root: Path, action: Action) -> bool:
         return False
     if updated is None or updated == text:
         return False
-    if index.name == "MEMORY.md":
+    if index.name == "MEMORY.md" or index.parent.name == "areas":
         with memory._memory_retirement_lock(root):
             index.write_text(updated, encoding="utf-8")
     else:

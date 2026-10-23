@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 from jinja2 import Environment, FileSystemLoader
 
+from lmer_cli.harness import CLAUDE_MEMORY_INDEX_LIMIT
+
 REPO_ROOT = Path(__file__).parent.parent
 
 
@@ -136,6 +138,31 @@ class TestRunStateFragment:
         assert "work plan check" in out
         assert "green" in out.lower()
         assert "shared_files" in out
+
+    @pytest.mark.parametrize("value", ["1", "true", "YES"])
+    def test_memory_sessions_are_told_to_open_their_area_index(self, monkeypatch, value):
+        out = self._render(monkeypatch, {
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "org/repo",
+            "LMER_PERSIST_AGENT_MEMORY": value,
+        })
+        assert "open the area index" in out
+        assert "areas/<slug>.md" in out
+        assert "200 lines / 25,000 bytes" in out
+
+    @pytest.mark.parametrize("value", [None, "", "0", "false"])
+    def test_sessions_without_persisted_memory_get_no_memory_section(
+        self, monkeypatch, value
+    ):
+        context = {"LMER_REPO_HOST": "git.example.com", "LMER_REPO_PROJECT": "org/repo"}
+        if value is not None:
+            context["LMER_PERSIST_AGENT_MEMORY"] = value
+        assert "area index" not in self._render(monkeypatch, context)
+
+    def test_the_memory_load_numbers_match_the_harness_constant(self):
+        text = (REPO_ROOT / "taskdef" / "memory-index.jinja2").read_text()
+        limit = CLAUDE_MEMORY_INDEX_LIMIT
+        assert f"{limit.max_lines} lines / {limit.max_bytes:,} bytes" in text
 
     def test_completed_run_contract(self, monkeypatch):
         """Issue #96: the brief block teaches the completed-run direction

@@ -1156,9 +1156,12 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
         return MemoryLift(files=files, lines=(), writes=())
 
     text = memory._read_text(index)
+    # A flat index reads a link to `areas/<slug>.md` as an ordinary entry, as
+    # persist does (#435); only a split one has map lines.
+    split = memory._is_split(memory_dir)
     pieces, indexed = [], set()
     for number, line in enumerate(text.splitlines(keepends=True), 1):
-        targets = memory._entry_targets(line)
+        targets = memory._entry_targets(line, split=split)
         indexed.update(targets)
         for target in targets:
             if target not in scope_of:
@@ -1171,7 +1174,7 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
                 f"{index_name} line {number}: {_count(len(targets), 'entry', 'entries')} on one line "
                 "(a lost newline) — split, one line per scope"
             )
-            pieces.extend(_split_entries(line))
+            pieces.extend(_split_entries(line, split=split))
         else:
             pieces.append(line)
     notes.extend(
@@ -1182,8 +1185,10 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
     routed = {memory.PROJECT_SCOPE: [], memory.INSTANCE_SCOPE: []}
     rows = []
     for piece in pieces:
-        split = memory._split_index(piece, scope_of, restored)
-        owners = [scope for scope in (memory.PROJECT_SCOPE, memory.INSTANCE_SCOPE) if split[scope]]
+        per_scope = memory._split_index(piece, scope_of, restored, split=split)
+        owners = [
+            scope for scope in (memory.PROJECT_SCOPE, memory.INSTANCE_SCOPE) if per_scope[scope]
+        ]
         rows.append((BOTH if len(owners) == 2 else owners[0], piece.rstrip("\n")))
         for scope in owners:
             routed[scope].append(piece)
@@ -1210,7 +1215,7 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
     return MemoryLift(files=files, lines=tuple(rows), writes=tuple(writes))
 
 
-def _split_entries(line: str) -> list:
+def _split_entries(line: str, *, split: bool) -> list:
     """One physical index line carrying entries for both scopes — a newline
     lost somewhere — cut back into one line per entry. Each later entry
     starts at the list bullet that introduces it (at its link when there is
@@ -1218,7 +1223,7 @@ def _split_entries(line: str) -> list:
     index already carried."""
     cuts, previous_end = [], None
     for match in memory._LINK_RE.finditer(line):
-        if not memory._entry_targets(match.group(0)):
+        if not memory._entry_targets(match.group(0), split=split):
             continue
         if previous_end is not None:
             bullet = _BULLET_RE.search(line, previous_end, match.start())
