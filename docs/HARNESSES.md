@@ -128,7 +128,11 @@ gracefully and are listed explicitly:
    `LMER_PERSIST_AGENT_MEMORY`, which assistant spawns blank. What tells such a
    session the store exists, and where, is the `orchestrate` taskdef, which names
    the path and says to read and write it by hand. A harness that grows a native
-   store is a one-field change away from the claude treatment.
+   store is a one-field change away from the claude treatment. A native memory
+   feature that loads only the head of `MEMORY.md` also declares how much
+   (`memory_index_limit`; claude's is 200 lines / 25,000 bytes). `work memory
+   persist` budgets the shared index against the strictest declared limit,
+   because one store serves every harness (issue #435).
 9. Claude-only: codex and pi have no equivalent feature and get nothing, so
    anything *every* harness must obey belongs in the taskdef prompt rather
    than in a style. Shipping a style and selecting one are separate

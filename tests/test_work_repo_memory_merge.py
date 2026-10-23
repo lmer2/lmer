@@ -358,7 +358,7 @@ def _entries(directory: Path) -> set:
     index = directory / memory.MEMORY_INDEX
     targets: set = set()
     for line in index.read_text().splitlines() if index.is_file() else []:
-        targets.update(memory._entry_targets(line))
+        targets.update(memory._entry_targets(line, split=False))
     return targets
 
 
@@ -954,7 +954,7 @@ class TestGapEIndexReconciliation:
         text = "# Memory\nArchived deployment notes remain useful.\n"
         (scope / memory.MEMORY_INDEX).write_text(text)
 
-        reconciled = memory._reconcile_index(text, scope, set())
+        reconciled = memory._reconcile_index(text, scope, set(), split=False)
 
         assert "(deployment.md)" in reconciled, reconciled
         assert "Archived deployment notes remain useful." in reconciled, reconciled
@@ -976,7 +976,7 @@ class TestGapEIndexReconciliation:
         text = f"# Memory\n- [deployment guide]({other}) — old\n"
         (scope / memory.MEMORY_INDEX).write_text(text)
 
-        reconciled = memory._reconcile_index(text, scope, set())
+        reconciled = memory._reconcile_index(text, scope, set(), split=False)
 
         assert "(deployment.md)" in reconciled, reconciled
         assert other in reconciled, reconciled
@@ -998,7 +998,7 @@ class TestGapEIndexReconciliation:
         text = f"# Memory\n- [fact]({target}) — a fact\n"
         (scope / memory.MEMORY_INDEX).write_text(text)
 
-        reconciled = memory._reconcile_index(text, scope, set())
+        reconciled = memory._reconcile_index(text, scope, set(), split=False)
 
         assert "- [fact](fact.md)" not in reconciled, reconciled
         assert target in reconciled, reconciled
@@ -1010,7 +1010,7 @@ class TestGapEIndexReconciliation:
         scope = plexus.scope(alpha)
         (scope / "fact.md").write_text(frontmatter)
         (scope / memory.MEMORY_INDEX).write_text("# Memory\n")
-        return memory._reconcile_index("# Memory\n", scope, set())
+        return memory._reconcile_index("# Memory\n", scope, set(), split=False)
 
     def test_a_bracketed_name_round_trips_and_is_idempotent(self, schema2_plexus):
         plexus = schema2_plexus
@@ -1026,9 +1026,9 @@ class TestGapEIndexReconciliation:
             "---\n\nbody\n",
         )
         line = next(line for line in first.splitlines() if "fact.md" in line)
-        assert memory._entry_targets(line) == ["fact.md"], line
+        assert memory._entry_targets(line, split=False) == ["fact.md"], line
         assert parse_index_entries(line) == ["fact.md"], line
-        assert memory._reconcile_index(first, plexus.scope(alpha), set()) == first
+        assert memory._reconcile_index(first, plexus.scope(alpha), set(), split=False) == first
 
     def test_a_multiline_name_round_trips_and_is_idempotent(self, schema2_plexus):
         plexus = schema2_plexus
@@ -1045,6 +1045,6 @@ class TestGapEIndexReconciliation:
         )
         line = next(line for line in first.splitlines() if "fact.md" in line)
         assert "\n" not in line, line
-        assert memory._entry_targets(line) == ["fact.md"], line
+        assert memory._entry_targets(line, split=False) == ["fact.md"], line
         assert parse_index_entries(line) == ["fact.md"], line
-        assert memory._reconcile_index(first, plexus.scope(alpha), set()) == first
+        assert memory._reconcile_index(first, plexus.scope(alpha), set(), split=False) == first

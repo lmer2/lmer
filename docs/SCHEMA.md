@@ -253,6 +253,68 @@ selects its scope:
   whose file is gone is tombstoned in place per [Index lines](#index-lines) —
   never silently dropped. Non-entry lines — headings, hand-written commentary
   and the tombstones `forget` wrote — are preserved verbatim.
+- **Split index.** A harness loads only the head of `MEMORY.md` at session
+  start (Claude Code: the first 200 lines or 25 KB). A scope MAY therefore
+  split its index. In a split scope `MEMORY.md` is the **map**: one line per
+  area, linking to `areas/<slug>.md` (slug `[a-z0-9][a-z0-9-]*`), with a
+  hook saying when to read it. The entry lines live in the area indexes,
+  with links relative to the area file (`../<name>.md`). The memory files
+  themselves stay flat in the scope directory. A scope is split exactly when
+  `areas/` holds an area index; there is no other marker. A memory MAY name
+  its area in `metadata.area`. A writer filing an entry that is in no area
+  index (one added to the map, or one generated for an unindexed file) MUST
+  put it in that area, or in `areas/unsorted.md` when the memory names none,
+  and MUST give a new area a map line with a read-when hook. In a split
+  scope a `MEMORY.md` line that links an area index is a map line, whatever
+  else its hook links: the memories a hook links are not entries. A link
+  from one area index to another (`<slug>.md`) is a cross-reference, not an
+  entry. Restore merges both scopes, so a hook link or a cross-reference is
+  live when what it names — a memory or an area — exists in either scope, or
+  is a file that exists (`../notes.md`). The instance scope is merged with
+  every project's, so its links are live when any project's scope has what
+  they name. A map line's own area (its first area link) must be this
+  scope's. Liveness is judged on what the persist leaves behind: an area or
+  memory another session deleted, or this persist deletes, is dead even
+  where the session's copy still holds it. A dead one — a map line's area, a
+  hook link, a cross-reference to an area no merged scope has — is
+  tombstoned like any other link, and a map line whose area is gone keeps
+  its hook with its links reduced to their text. A `forget` tombstone is
+  kept verbatim by every pass. Every merge, tombstone and reconcile rule
+  above applies to each area index as it does to `MEMORY.md`, including
+  the deletion rule: an area index another session deleted or emptied is
+  not recreated from what a session was given, only from what it added. (A
+  `MEMORY.md` blanked or deleted outside a writer is rebuilt from the
+  session's copy, as it always was.) A writer MUST NOT delete an index file
+  because a file list says it was given it: an index file is merged line
+  by line, never held whole.
+- **Splitting is a migration with a contract.** Every file in `areas/` is a
+  `<slug>.md` area index, every area-index link to a memory is
+  `../<name>.md`, and `lmer-schema validate` reports the scope clean. A
+  persist judges a split scope's merged result against both scopes: a
+  non-slug file, or a link that stays in `areas/` where no area of that name
+  exists in either scope and the memory it names does (`x.md` for
+  `../x.md`). When the session holds that line or file, the persist refuses,
+  names each one in the session's memory dir, and writes nothing: repairing
+  it would tombstone the entry or file the memory into `unsorted`. A line or
+  file another writer added after the session restored is no edit of the
+  session's to make, so the persist warns and goes on, and the dead link is
+  tombstoned. A flat scope ignores `areas/`: a line there that links one is
+  an ordinary entry, and its dead area link is tombstoned like any other —
+  by persist, by `work housekeep` and by `work migrate`'s lift alike, and in
+  mixed form too, where a flat scope's edited entry leading with its memory
+  link stays that scope's entry. `work housekeep` plans a split scope's
+  dangling entries in its area indexes, where they are.
+- **Load budget.** `work memory persist` reports the size of the index a
+  session will load (the scope's `MEMORY.md`, or both scopes' merged) against
+  the strictest limit a built-in harness declares, every time it runs. A flat
+  scope over the budget is warned and never refused, and so is a load that
+  includes any flat scope's index. When every scope with an index is split,
+  a persist that would grow an over-budget map is refused and the work repo
+  is left untouched. A writer MUST NOT split a flat scope as a side effect:
+  persist ignores area indexes for a scope with no `areas/`, and splitting
+  is a deliberate migration. An entry left in a split map whose memory is
+  already filed in an area is dropped, and an area index a session restored
+  and deleted is removed once no other session's entries remain in it.
 
 ### record
 
@@ -790,14 +852,18 @@ configuration and mirrors.
 | `<scope>/mirrors/<name>/` | mirror tooling (foreign writer) | vendored agent tooling | optional | opaque |
 | `<scope>/memory/` | `work memory persist`; connectors' `remember` and `forget` | directory of memory files plus `MEMORY.md` | optional | machine |
 | `<scope>/memory/<name>.md` | same | markdown with YAML frontmatter `name`, `description`, `metadata.type` in `user`, `feedback`, `project`, `reference`; missing or malformed frontmatter is an error; a type that does not select this scope is a warning (informational in a legacy tree); the body is free-form | optional | machine |
-| `<scope>/memory/MEMORY.md` | same | one line per memory carrying a relative link to its file (see [Index lines](#index-lines)); an entry without a file is an error (a warning in a legacy tree), a file without an entry is a warning | expected when memory files exist | machine |
+| `<scope>/memory/MEMORY.md` | same | one line per memory carrying a relative link to its file (see [Index lines](#index-lines)), or in a split scope one map line per area linking to `areas/<slug>.md`; an entry without a file is an error (a warning in a legacy tree), a file without an entry in any index is a warning | expected when memory files exist | machine |
+| `<scope>/memory/areas/<slug>.md` | same | a split scope's area index: entry lines whose links resolve against `areas/` (`../<name>.md`); entries are checked like `MEMORY.md`'s, and a cross-reference to another area (`<slug>.md`) resolves in this scope or the one restore merges it with; anything in `areas/` that is not `<slug>.md` is an unknown file | optional | machine |
 
 ### Index lines
 
-`MEMORY.md` and `PLANS.md` are line indexes. For the validator an **entry**
-is a line that carries a relative markdown link to a `.md` file, resolved
-against the index's own directory; a line with no such link (a heading, prose,
-or a tombstone) is never an entry and never a finding. **Tombstoning** a line
+`MEMORY.md`, a split memory scope's `areas/<slug>.md` and `PLANS.md` are line
+indexes. For the validator an **entry** is a line that carries a relative
+markdown link to a `.md` file, resolved against the index's own directory; a
+line with no such link (a heading, prose, or a tombstone) is never an entry
+and never a finding. A map line in `MEMORY.md` links to an area index rather
+than a memory: the area index must exist, and the line is otherwise not an
+entry. **Tombstoning** a line
 means replacing its link with the word `archived` or `forgotten` and the date,
 or re-pointing the link at the `_archive/` mirror; either way the line stays
 and the file's disappearance is not a dangling entry.

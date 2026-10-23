@@ -209,6 +209,24 @@ class ExecProfile:
 
 
 @dataclass(frozen=True)
+class MemoryIndexLimit:
+    """How much of the memory index (``MEMORY.md``) a harness loads at start.
+
+    Whichever limit is reached first ends the load, at a line boundary.
+    """
+
+    max_bytes: int
+    max_lines: int
+
+
+#: Claude Code loads "the first 200 lines of MEMORY.md, or the first 25KB,
+#: whichever comes first" (code.claude.com/docs/en/memory). Measured on
+#: 2.1.306 the 25KB is 25,000 *characters*; the docs promise no unit, so it is
+#: budgeted here in UTF-8 bytes, which is never looser (issue #435).
+CLAUDE_MEMORY_INDEX_LIMIT = MemoryIndexLimit(max_bytes=25_000, max_lines=200)
+
+
+@dataclass(frozen=True)
 class Harness:
     """Registry entry describing one supported agent harness."""
 
@@ -249,6 +267,11 @@ class Harness:
     #: orchestrator can mount it out of a ``--rm`` container (issue #325).
     #: ``None`` for a harness with no *native* memory feature.
     memory_dir: Optional[str] = None
+    #: How much of ``MEMORY.md`` the harness's native memory feature loads at
+    #: session start; ``work memory persist`` budgets the shared index against
+    #: the strictest one declared (:func:`memory_index_budget`). ``None`` for a
+    #: harness that reads the index by hand, in full.
+    memory_index_limit: Optional[MemoryIndexLimit] = None
     #: For user-installed harnesses (lmer_cli.user_harnesses): the host
     #: directory the definition was loaded from. ``None`` for built-ins —
     #: the "is this a user harness" discriminator.
@@ -301,6 +324,7 @@ HARNESSES: dict[str, Harness] = {
         # parent. ``-workspace`` is claude's encoding of the container cwd, the
         # same encoding work_repo.memory relies on.
         memory_dir="/home/developer/.claude/projects/-workspace/memory",
+        memory_index_limit=CLAUDE_MEMORY_INDEX_LIMIT,
     ),
     "codex": Harness(
         name="codex",
@@ -410,6 +434,21 @@ def known_harnesses() -> dict[str, Harness]:
     from .user_harnesses import load_user_harnesses
 
     return {**load_user_harnesses(), **HARNESSES}
+
+
+def memory_index_budget() -> Optional[MemoryIndexLimit]:
+    """The strictest session-start ``MEMORY.md`` load any built-in declares.
+
+    The work-repo memory store is shared by every harness, so its index must
+    fit the tightest reader. ``None`` when no harness declares a limit.
+    """
+    limits = [h.memory_index_limit for h in HARNESSES.values() if h.memory_index_limit]
+    if not limits:
+        return None
+    return MemoryIndexLimit(
+        max_bytes=min(limit.max_bytes for limit in limits),
+        max_lines=min(limit.max_lines for limit in limits),
+    )
 
 
 def get_harness(name: str) -> Harness:

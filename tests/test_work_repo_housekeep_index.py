@@ -84,7 +84,7 @@ def test_every_rewritten_line_is_a_non_entry(tmp_path):
         tree.project_dir() / "_plans/PLANS.md",
     ):
         for line in index.read_text().splitlines():
-            assert memory._entry_targets(line) == []
+            assert memory._entry_targets(line, split=False) == []
 
 
 def test_non_entry_lines_stay_byte_identical(tmp_path):
@@ -122,3 +122,40 @@ def test_no_entry_without_file_finding_afterwards(tmp_path):
     doc = json.loads(proc.stdout)
     codes = {f.get("code") for f in doc.get("findings", [])}
     assert "index.entry-without-file" not in codes
+
+
+def _tombstones_in(plan, index_rel):
+    return sorted(
+        action.detail for action in plan.actions
+        if action.kind == "tombstone" and action.src.endswith(index_rel)
+    )
+
+
+def test_a_flat_line_linking_an_area_plans_both_dangling_links(tmp_path):
+    # A flat scope ignores `areas/`: the area link is an ordinary entry (#435).
+    tree = _build(tmp_path)
+    project = tree.project_dir() / "_agents" / "memory"
+    (project / "MEMORY.md").write_text(
+        "# Project memory\n\n- [Gone](gone.md) — gone. Related: [dev](areas/dev.md)\n"
+    )
+    project_index = f"{tree.project_dir().name}/_agents/memory/MEMORY.md"
+    plan = _plan(tree)
+    assert _tombstones_in(plan, project_index) == ["areas/dev.md", "gone.md"]
+    _apply(tree, plan)
+    assert (project / "MEMORY.md").read_text().count("archived 2027-01-01") == 2
+
+
+def test_a_split_scopes_area_index_is_planned_as_written(tmp_path):
+    tree = _build(tmp_path)
+    project = tree.project_dir() / "_agents" / "memory"
+    (project / "areas").mkdir()
+    (project / "areas" / "dev.md").write_text("# dev\n\n- [Lost](../lost.md) — lost\n")
+    (project / "MEMORY.md").write_text("# Memory map\n\n- [dev](areas/dev.md) — read when dev\n")
+    plan = _plan(tree)
+    assert _tombstones_in(plan, "_agents/memory/areas/dev.md") == ["../lost.md"]
+    assert _tombstones_in(plan, f"{tree.project_dir().name}/_agents/memory/MEMORY.md") == []
+    _apply(tree, plan)
+    assert (project / "areas" / "dev.md").read_text() == (
+        "# dev\n\n- archived 2027-01-01 — lost\n"
+    )
+    assert (project / "MEMORY.md").read_text().endswith("- [dev](areas/dev.md) — read when dev\n")

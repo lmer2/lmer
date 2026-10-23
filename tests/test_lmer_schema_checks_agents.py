@@ -614,3 +614,71 @@ class TestEntryPoint:
         report = Report(Form.SCHEMA)
         ag.check_agents(str(schema_plexus.root), report)
         assert report.findings == ()
+
+
+class TestSplitMemoryIndex:
+    """#435: a split scope's `areas/<slug>.md` files are indexes, not memories.
+
+    `MEMORY.md` becomes a map of areas and the entry lines move into the area
+    indexes, whose links resolve against `areas/`.
+    """
+
+    @staticmethod
+    def _split(scope):
+        names = sorted(
+            path.name for path in scope.glob("*.md") if path.name != ag.MEMORY_INDEX
+        )
+        _write(
+            scope / ag.MEMORY_INDEX,
+            "# Memory map\n- [dev](areas/dev.md) — read before development work.\n",
+        )
+        _write(
+            scope / ag.AREAS_DIR / "dev.md",
+            "# dev\n" + "".join(f"- [{n[:-3]}](../{n}) — fixture memory.\n" for n in names),
+        )
+
+    def test_a_split_scope_is_clean(self, schema_plexus):
+        self._split(schema_plexus.instance_memory_dir)
+        assert _run(schema_plexus).findings == ()
+
+    def test_an_area_entry_without_a_file_is_reported_on_the_area_index(
+        self, schema_plexus
+    ):
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        with (scope / ag.AREAS_DIR / "dev.md").open("a", encoding="utf-8") as handle:
+            handle.write("- [gone](../user_gone.md) — gone.\n")
+        finding = _only(_run(schema_plexus), ag.MEMORY_ENTRY_WITHOUT_FILE)
+        assert finding.path == "_agents/memory/areas/dev.md"
+
+    def test_a_memory_filed_in_no_index_is_a_file_without_entry(self, schema_plexus):
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        _write(scope / "user_loose.md", _memory("user"))
+        finding = _only(_run(schema_plexus), ag.MEMORY_FILE_WITHOUT_ENTRY)
+        assert finding.path.endswith("user_loose.md")
+
+    def test_a_map_line_to_a_missing_area_is_an_entry_without_file(self, schema_plexus):
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        with (scope / ag.MEMORY_INDEX).open("a", encoding="utf-8") as handle:
+            handle.write("- [ops](areas/ops.md) — read before ops work.\n")
+        finding = _only(_run(schema_plexus), ag.MEMORY_ENTRY_WITHOUT_FILE)
+        assert finding.path == "_agents/memory/MEMORY.md"
+
+    @pytest.mark.parametrize("name", ["Notes.md", "notes.txt", "nested"])
+    def test_anything_but_a_slug_index_in_areas_is_unknown(self, schema_plexus, name):
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        target = scope / ag.AREAS_DIR / name
+        if name == "nested":
+            target.mkdir()
+        else:
+            _write(target, "x\n")
+        finding = _only(_run(schema_plexus), ag.MEMORY_UNKNOWN_FILE)
+        assert finding.path.endswith(f"areas/{name}")
+
+    def test_a_directory_named_otherwise_is_still_unknown(self, schema_plexus):
+        (schema_plexus.instance_memory_dir / "topics").mkdir()
+        finding = _only(_run(schema_plexus), ag.MEMORY_UNKNOWN_FILE)
+        assert finding.path.endswith("topics")
