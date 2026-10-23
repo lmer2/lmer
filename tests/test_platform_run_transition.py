@@ -14,8 +14,8 @@ import pytest
 import yaml
 
 from lmer_platform import (
-    api, checkin, meta, projects, references, registry, relations, run_transition, runs,
-    store,
+    api, checkin, meta, mute, projects, references, registry, relations, run_transition,
+    runs, store,
 )
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
@@ -249,6 +249,7 @@ def test_one_record_is_bound_with_everything_carried(config, home):
     relations.relate((HOST, PROJECT, SLUG), (HOST, PROJECT, "other"))
     checkin.record_check(HOST, PROJECT, SLUG)
     references.add(HOST, PROJECT, SLUG, THREAD, title="the design thread")
+    mute.set_run(HOST, PROJECT, SLUG, muted=True)
     projects.bind_run(SLUG_KEY, home)
     with projects.database() as db:
         db.execute("INSERT INTO thread_owners VALUES (?,?,?,?)",
@@ -256,6 +257,9 @@ def test_one_record_is_bound_with_everything_carried(config, home):
     marks_before = checkin.read_marks()[SLUG_KEY]
 
     summary = run_transition.reconcile(config)
+
+    assert mute.is_muted((HOST, PROJECT, UID_A))
+    assert SLUG_KEY not in mute.load_all()
 
     assert summary["bound"] == [SLUG_KEY]
     index = _index()
@@ -332,6 +336,7 @@ _FAULT_POINTS = {
     "relations": (relations, "rekey"),
     "checkin": (checkin, "rekey"),
     "references": (references, "rekey"),
+    "mute": (mute, "rekey"),
     "projects": (projects, "rekey"),
     "registry": (run_transition, "_canonicalize"),
 }

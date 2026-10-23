@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import {
   mdiAccountMultipleOutline, mdiRobotOutline, mdiChevronRight,
   mdiClipboardTextOutline, mdiEyeOffOutline, mdiLinkVariant, mdiOpenInNew,
-  mdiProgressClock, mdiReplyOutline, mdiRobot, mdiSourceMerge, mdiSourcePull,
+  mdiProgressClock, mdiReplyOutline, mdiRobot, mdiBellOffOutline, mdiSourceMerge, mdiSourcePull,
   mdiSourceRepository, mdiTicketOutline, mdiTuneVariant,
 } from '@mdi/js'
 import {
@@ -223,6 +223,17 @@ const forgettable = computed(
           title="the platform's own orchestrating session, not one of the runs"
           variant="tonal"
         >{{ assistantName }}</v-chip>
+        <!-- Muted (issue 458): said on the row so nobody wonders why a run the
+             operator is steering has gone quiet. Outlined: a setting on the run,
+             like the preset, not a state that needs anyone. -->
+        <v-chip
+          v-if="run.muted"
+          class="run-muted"
+          :prepend-icon="mdiBellOffOutline"
+          size="small"
+          :title="`muted: routine messages do not reach ${assistantName}; questions, crashes and completion still do`"
+          variant="outlined"
+        >muted</v-chip>
         <!-- The title this orchestrator gave the run, where the run is named, and
              the label only when there is none: a title nobody sees outside its own
              tab is not something you can identify a run by, which is the entire

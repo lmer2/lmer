@@ -62,6 +62,8 @@ The fleet this orchestrator tracks::
     runs forget KEY                 POST /api/runs/forget
     runs meta get KEY               GET  /api/runs/meta
     runs meta set KEY               POST /api/runs/meta
+    runs mute KEY|--session ID      POST /api/runs/mute, or /api/sessions/ID/mute
+    runs unmute KEY|--session ID    POST /api/runs/unmute, or /api/sessions/ID/unmute
     runs relations KEY              GET  /api/runs/relations
     runs relate KEY OTHER           POST /api/runs/relate
     runs unrelate KEY OTHER         POST /api/runs/unrelate
@@ -613,6 +615,24 @@ def _call_runs_meta_set(args) -> Call:
             **_given(args, ("title", "description")),
         },
     )
+
+
+def _mute_call(args, verb: str) -> Call:
+    """A run key mutes by run; ``--session`` by the session's own path, which
+    the daemon scopes to that session's project."""
+    if (args.key is None) == (args.session is None) or args.session == "":
+        raise CtlError("name exactly one of: a run KEY, or --session ID")
+    if args.session is not None:
+        return Call("POST", f"/api/sessions/{args.session}/{verb}")
+    return Call("POST", f"/api/runs/{verb}", body=_run_fields(args.key))
+
+
+def _call_runs_mute(args) -> Call:
+    return _mute_call(args, "mute")
+
+
+def _call_runs_unmute(args) -> Call:
+    return _mute_call(args, "unmute")
 
 
 def _call_runs_relations(args) -> Call:
@@ -1347,6 +1367,27 @@ def _add_runs(sub) -> None:
     meta_set.add_argument("--title", help="The label the fleet view shows.")
     meta_set.add_argument("--description", help="A longer note.")
     meta_set.set_defaults(call=_call_runs_meta_set)
+
+    for verb, call, summary in (
+        ("mute", _call_runs_mute,
+         "Stop a run's routine records reaching the assistant; questions, "
+         "milestones, the platform's own notices, crashes and complete still "
+         "do (POST /api/runs/mute)."),
+        ("unmute", _call_runs_unmute,
+         "Undo mute, and any session mute of the run; nothing suppressed is "
+         "replayed (POST /api/runs/unmute)."),
+    ):
+        parser = runs_sub.add_parser(verb, help=summary)
+        parser.add_argument(
+            "key", nargs="?",
+            help="A run, as host/project/<slug|uid>. Omit it with --session.",
+        )
+        parser.add_argument(
+            "--session",
+            help="A session id, for a session with no tracked run (a chat run "
+                 "with no identity). A tracked run's session mutes the run.",
+        )
+        parser.set_defaults(call=call)
 
     relations = runs_sub.add_parser(
         "relations",

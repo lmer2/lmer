@@ -111,7 +111,7 @@ from typing import Optional
 from work_repo import run_state
 from work_repo.utils import classify_target
 
-from . import runs
+from . import mute, runs
 from .config import PlatformConfig
 # ANSWER_FLAG is spelled and refused in spawn.py (it owns both ends of it) and
 # re-exported here, which is where a reader of this feature looks for it.
@@ -829,6 +829,16 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
             ),
             source_session_id=source_session_id,
             allow_unsigned_source=unsigned_source_ack,
+            # The answering execution founds a new uid-keyed run, or for a
+            # renamed legacy run files its session under the recorded slug; the
+            # spawn mutes that key before it is published when this run is muted
+            # (#458).
+            mute_from=(
+                mute.source_of(request.host, request.project, execution)
+                if execution is not None
+                else mute.source_of(request.host, request.project, request.slug)
+                if recorded_slug != request.slug else None
+            ),
         ),
     )
 

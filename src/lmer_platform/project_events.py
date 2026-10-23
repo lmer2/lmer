@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 
-from . import assistant, projects, spool_merge, store
+from . import assistant, mute, projects, spool_merge, store
 
 
 def enqueue(session, message, run=None, session_kind=None):
@@ -13,6 +13,8 @@ def enqueue(session, message, run=None, session_kind=None):
     meta = message.get("meta") or {}
     if ((message.get("source") or {}).get("channel") == "uber-lmer" or meta.get("session_origin") is True
             or meta.get("notification_class") == "connector_health" or session_kind == "assistant"):
+        return
+    if mute.suppressed(session, message, run):
         return
     data = {"session": session, **{key: (run or {}).get(key) for key in ("host", "project", "slug")}}
     # Only a run that has a uid carries one, so a schema-1 payload keeps its shape.

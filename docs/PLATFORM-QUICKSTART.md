@@ -682,6 +682,63 @@ with no kind, or a kind added later. Notes
 spooled before this change carry no `routine` tag and are left as they are until
 they are taken.
 
+### Muting a run
+
+A run you are steering directly, such as a `chat` run attached to a Slack
+thread, still sends every message, reply and note to the assistant as
+`session_comms`. Mute it to stop that:
+
+```
+lmer-ctl runs mute <host>/<project>/<slug|uid>
+lmer-ctl runs mute --session <session-id>     # by session
+lmer-ctl runs unmute <host>/<project>/<slug|uid>
+```
+
+The routes are `POST /api/runs/mute` and `POST /api/runs/unmute` with
+`{host, project, slug|uid}` for a tracked run, and
+`POST /api/sessions/<id>/mute` and `/unmute` by session. A session's routes are
+scoped to that session's project like every other session route. The run view's
+exit tab has the same toggle beside forget, and the fleet row shows a `muted`
+chip and carries `muted: true` (so `lmer-ctl status` shows it too). Each change
+is a `run_muted` or `run_unmuted` platform event that names who made it.
+
+While a run is muted:
+
+- Routine records are not spooled to the assistant: messages, replies and notes
+  the agent wrote, and messages, answers, relayed commands and closes a person
+  sent from a terminal, a chat thread, the platform's UI or API, or the
+  assistant itself. They are still journaled, so the chat pane and connected
+  threads show them as before.
+- Everything else still spools: questions, milestones, any record kind added
+  later, and anything the platform says on its own account, such as a Codex
+  delivery that needs review or a thread that disconnected. The detector's
+  digests for the run (`live_question`, `question`, `crashed`,
+  `critical_error`, `yield`, `complete` and answered questions) are unchanged.
+- The run is left out of `stale_runs` check-ins and its row shows no stale
+  marker. A `stalled` condition is not spooled, though the fleet view still lists
+  it under attention. That covers every way a stall is recognised: silence,
+  input nothing answered, and the provider refusing every turn.
+
+Unmuting restores delivery from that point. Nothing suppressed while muted is
+replayed, including a `stalled` condition that is still standing. A run still
+idle after unmuting is named by the next `stale_runs` check-in as usual.
+
+Mute is platform state on this orchestrator, like run titles: it is not visible to
+another orchestrator or to the agent in the container. Muting a session whose run
+is tracked mutes the run, and the run stays muted across resumes and answers;
+on a schema-2 mirror the new execution's row inherits the mute before its session
+starts. A legacy run renamed to `<slug>--<name>` stays muted for the sessions
+that register under its slug, unless the bare `<slug>` is tracked as a run of
+its own, which keeps its own mute. Resuming or answering the renamed run tracks
+its slug too, so the mute is carried there before the session starts.
+Unmuting either one, the renamed row by key or the live row by its session,
+clears both, so the next resume starts unmuted. A resume that names a
+different taskdef starts a different run, which starts unmuted. A session with no tracked run is muted on
+its own registry entry and the flag ends with that session; its answers and
+withdrawn questions still reach the assistant, because nothing else would tell
+it the question was settled. Unmuting a run also clears a mute set on one of its
+sessions before the run was tracked. Forgetting a run drops its mute.
+
 ### Confirming a crash
 
 A `crashed` digest claims two things: that a session died, and that its run

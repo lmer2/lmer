@@ -36,10 +36,11 @@ import time
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from lmer_platform import config as cfg
 from lmer_platform import (
-    registry, resume as resume_mod, runs, spawn, store, workrepo,
+    api, mute, registry, resume as resume_mod, runs, spawn, store, workrepo,
 )
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
@@ -2527,6 +2528,142 @@ def test_a_schema_two_resume_event_names_both_executions(config):
     resumed = [e for e in store.read_events() if e["type"] == "run_resumed"][-1]
     assert resumed["data"]["run"]["uid"] == UID
     assert resumed["data"]["started"]["uid"] == result.session.uid
+
+
+def muted_at_registration(monkeypatch):
+    """The run keys muted at the moment each session is registered — the point
+    after which the daemon reads that session's records."""
+    seen = []
+    real = registry.register
+
+    def register(session_id, **fields):
+        seen.append(set(mute.load_all()))
+        return real(session_id, **fields)
+
+    monkeypatch.setattr(registry, "register", register)
+    return seen
+
+
+def test_a_schema_two_continue_carries_a_muted_runs_mute(config, monkeypatch):
+    """A continue is a new uid-keyed row (issue 458) and stays muted — from
+    before its session is published, so no record it writes is read unmuted."""
+    plant_schema_two_manifest(config)
+    plant_execution(config)
+    tracked = track_execution()
+    mute.set_run(tracked.host, tracked.project, uid=UID, muted=True)
+    seen = muted_at_registration(monkeypatch)
+
+    result = resume_mod.resume_run(config, uid_request())
+
+    assert result.continued is True
+    started = runs.run_key(tracked.host, tracked.project, result.session.uid)
+    assert mute.is_muted((tracked.host, tracked.project, result.session.uid))
+    assert seen and started in seen[0]
+
+
+def test_a_schema_two_override_does_not_carry_the_mute(config):
+    """An override starts a different run, which starts unmuted."""
+    plant_schema_two_manifest(config)
+    plant_execution(config)
+    tracked = track_execution()
+    mute.set_run(tracked.host, tracked.project, uid=UID, muted=True)
+
+    result = resume_mod.resume_run(config, uid_request(taskdef="review"))
+
+    assert result.continued is False
+    assert not mute.is_muted((tracked.host, tracked.project, result.session.uid))
+    assert mute.is_muted((tracked.host, tracked.project, UID))
+
+
+def test_an_unmuted_continue_starts_unmuted(config):
+    plant_schema_two_manifest(config)
+    plant_execution(config)
+    tracked = track_execution()
+
+    result = resume_mod.resume_run(config, uid_request())
+
+    assert mute.load_all() == {}
+    assert not mute.is_muted((tracked.host, tracked.project, result.session.uid))
+
+
+def test_resuming_a_muted_renamed_run_carries_the_mute_to_its_recorded_slug(
+    config, monkeypatch
+):
+    """The resumed session registers under the recorded slug, which the spawn
+    now tracks as a run too — and a tracked bare slug is never matched to its
+    renamed neighbour by name. So the resume carries the mute there, before the
+    session is published (issue 458)."""
+    recorded = run_state.derive_slug(TASKDEF, TARGET)
+    renamed = f"{recorded}--nice-name"
+    plant_run(config, slug=renamed, recorded_slug=recorded)
+    track_run(slug=renamed)
+    mute.set_run(HOST, PROJECT, renamed, muted=True)
+    seen = muted_at_registration(monkeypatch)
+
+    result = resume_mod.resume_run(config, request_for(slug=renamed))
+
+    assert result.session.slug == recorded
+    assert runs.get_tracked(HOST, PROJECT, recorded) is not None
+    bare = runs.run_key(HOST, PROJECT, recorded)
+    assert seen and bare in seen[0]
+    assert mute.load_all()[bare]["carried_from"] == runs.run_key(HOST, PROJECT, renamed)
+    block = {"host": HOST, "project": PROJECT, "slug": recorded}
+    note = {"kind": "note", "text": "x", "source": {"channel": "agent"}}
+    assert mute.suppressed(result.session.session_id, note, block) is True
+    # And unmuting the run the operator muted lets that session speak again.
+    mute.set_run(HOST, PROJECT, renamed, muted=False)
+    assert mute.suppressed(result.session.session_id, note, block) is False
+
+
+def test_unmuting_a_resumed_renamed_runs_live_row_survives_the_next_resume(
+    config, monkeypatch
+):
+    """The UI's live-row toggle unmutes by session, which resolves to the bare
+    key the resumed session runs under. That must take the renamed key's mute
+    with it, or the next resume reads it and carries it back (issue 458)."""
+    recorded = run_state.derive_slug(TASKDEF, TARGET)
+    renamed = f"{recorded}--nice-name"
+    plant_run(config, slug=renamed, recorded_slug=recorded)
+    track_run(slug=renamed)
+    mute.set_run(HOST, PROJECT, renamed, muted=True)
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    first = resume_mod.resume_run(config, request_for(slug=renamed))
+    try:
+        assert mute.run_muted((HOST, PROJECT, recorded))
+        client = TestClient(api.create_app(
+            config, "test-secret-value",
+            state_builder=lambda config, force_pull=False: {},
+        ))
+        reply = client.post(
+            f"/api/sessions/{first.session.session_id}/unmute",
+            headers={"Authorization": "Bearer test-secret-value"}, json={},
+        )
+        assert reply.status_code == 200, reply.text
+        assert mute.load_all() == {}
+        assert mute.source_of(HOST, PROJECT, renamed) is None
+    finally:
+        os.kill(first.session.pid, 9)
+    assert wait_for(lambda: not registry.list_sessions(live_only=True))
+
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "0")
+    second = resume_mod.resume_run(config, request_for(slug=renamed))
+
+    assert second.continued is True
+    assert mute.load_all() == {}
+    note = {"kind": "note", "text": "x", "source": {"channel": "agent"}}
+    block = {"host": HOST, "project": PROJECT, "slug": recorded}
+    assert mute.suppressed(second.session.session_id, note, block) is False
+
+
+def test_resuming_an_unmuted_renamed_run_carries_nothing(config):
+    recorded = run_state.derive_slug(TASKDEF, TARGET)
+    renamed = f"{recorded}--nice-name"
+    plant_run(config, slug=renamed, recorded_slug=recorded)
+    track_run(slug=renamed)
+
+    resume_mod.resume_run(config, request_for(slug=renamed))
+
+    assert mute.load_all() == {}
 
 
 def test_a_legacy_resume_event_keeps_its_shape(config, stopped_run):

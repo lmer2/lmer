@@ -203,6 +203,7 @@ from .store import StoreError, append_event, logs_dir, utc_now_iso
 from .thread_targets import validate_thread_targets
 from . import store
 from . import projects, project_context
+from . import mute
 
 logger = logging.getLogger("lmer_platform.spawn")
 
@@ -774,6 +775,12 @@ class SpawnRequest:
     #: set when the caller is not the operator: then it may only narrow.
     supervisor_authority: Optional[str] = None
     supervisor_authority_capped: bool = True
+    #: The muted run this launch continues (#458), as ``(host, project, key
+    #: segment)``: a schema-2 resume or answer founds a new uid-keyed run, and the
+    #: operator's mute must hold on it from its first record. Like ``answer``, no
+    #: HTTP body fills it — only :mod:`lmer_platform.resume` and
+    #: :mod:`lmer_platform.answer` do, after checking the source is muted.
+    mute_from: Optional[tuple] = None
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -3635,6 +3642,27 @@ def _cleanup_failed_publications() -> None:
         del _FAILED_PUBLICATIONS[session_id]
 
 
+def _prime_mute(request: SpawnRequest, parts: Optional[tuple]) -> bool:
+    """Carry *request*'s source mute onto the run this launch founds (#458)."""
+    if request.mute_from is None or parts is None:
+        return False
+    try:
+        return mute.prime(tuple(request.mute_from), parts)
+    except StoreError as exc:
+        logger.warning(
+            "platform_spawn_mute_not_carried from=%s to=%s error=%s — the session "
+            "starts unmuted; mute it again", request.mute_from, parts, exc,
+        )
+        return False
+
+
+def _unprime_mute(parts: tuple) -> None:
+    try:
+        mute.drop(*parts)
+    except StoreError as exc:
+        logger.warning("platform_spawn_mute_not_dropped run=%s error=%s", parts, exc)
+
+
 def spawn_session(
     config: PlatformConfig,
     request: SpawnRequest,
@@ -3969,6 +3997,12 @@ def _spawn_session(
                 projects.bind_run(run_ref, workspace_id)
                 projects.remember_launch(run_ref, request.slot, request.preset)
 
+    # Before publication (#458): once the entry is registered the daemon reads
+    # the session's records, and one read against an unmuted key would spool.
+    # Best-effort, because the process is already running; a launch that fails to
+    # publish drops it again below, since it will never be tracked.
+    primed = _prime_mute(request, parts)
+
     # Most sessions publish only their registry entry. The assistant also has a
     # lifecycle-state pointer that must become visible with that entry, so it
     # supplies a tiny publication wrapper. It runs only after process startup and
@@ -3985,6 +4019,8 @@ def _spawn_session(
             if error:
                 raise SpawnError(f"cannot start {command[0]} ({error.decode(errors='replace')})")
     except BaseException:
+        if primed:
+            _unprime_mute(parts)
         _FAILED_PUBLICATIONS[session_id] = _UnpublishedLaunch(
             process, master_fd, token_file, session_id,
         )
