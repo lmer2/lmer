@@ -1,6 +1,0 @@
-added:
-- "Slack channels and Matrix rooms can map to a project, routing plain bot mentions there to it (project settings or `lmer-ctl projects channels`)."
-- "`lmer --repo-url` names the repository apart from the target, so label or thread targets give non-chat taskdefs one run per request."
-fixed:
-- "A `repo_url` given to a platform spawn now reaches the session when the target is a label or a thread permalink, instead of being dropped."
-- "`lmer` refuses a target given after an option instead of silently ignoring it, outside `--exec`."

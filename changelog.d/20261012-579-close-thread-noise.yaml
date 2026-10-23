@@ -1,2 +1,0 @@
-fixed:
-- "Slack and matrix threads no longer post the '⏹ the session stopped waiting for an answer' line when a question is withdrawn (#579)."

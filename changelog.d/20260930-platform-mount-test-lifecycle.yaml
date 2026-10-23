@@ -1,2 +1,0 @@
-fixed:
-- "platform mount validation tests check real launch arguments before session cleanup can remove their host directories, avoiding a CI timing race"

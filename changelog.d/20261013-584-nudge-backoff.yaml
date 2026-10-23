@@ -1,3 +1,0 @@
-changed:
-- "Digest nudges stop after 3 unanswered reminders, and the operator gets one message per episode in the assistant's thread, naming the known marker its terminal shows (such as `Login expired`)."
-- "Projects mode merges repeated stale-run check-ins and note-only session comms in the assistant spool; questions, milestones and other records are never merged."

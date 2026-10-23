@@ -1,5 +1,0 @@
-added:
-- "the run view lists every launch of a schema-2 target by uid; resume continues that one launch, and untracked launches are read-only (#374)"
-- "a Work repo panel in the fleet view shows `lmer-schema validate --json` findings for the mirror, cached per HEAD, with re-validate (#374)"
-- "unnamed repos awaiting adoption are listed with a copyable `work adopt <host>/<project> <short-name>` line; the platform never picks the name (#374)"
-- "`GET /api/runs/sessions` and `GET /api/workrepo/schema` serve these views; neither pulls, and a legacy work repo shows no change (#374)"

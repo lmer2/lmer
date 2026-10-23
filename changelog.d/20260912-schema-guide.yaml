@@ -1,4 +1,0 @@
-added:
-- '`docs/SCHEMA-GUIDE.md`: a plain-language guide to the lmer schema for operators — what it
-  is, who writes and reads each path, a step-by-step migration plan for an existing work repo
-  with the validator findings to expect at each step, and a test checklist.'

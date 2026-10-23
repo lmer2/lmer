@@ -1,4 +1,0 @@
-fixed:
-- "Fixed the assistant's answers to worker questions being refused with a 409; `lmer-ctl answer` now also takes a full bus id."
-changed:
-- "The operator's answer to a question a worker asked on its bus now lands on the bus (first answer wins, a late one is a 409) instead of by file."

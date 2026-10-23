@@ -1,9 +1,0 @@
-added:
-- "schema 2 execution records with opaque UIDs and extensible session metadata"
-- "explicit migration preview preserving historical records and manifest extensions"
-fixed:
-- "continuations create fresh records and require a decision for unsigned predecessors"
-- "schema 2 releases arbitrate one shared project claim without automatic age-based takeover"
-- "`lmer-schema migrate` reports a blocked cutover with exit 1 instead of crashing on the preview"
-- "session metadata scrubbing also redacts token-shaped values (GitLab, GitHub, AWS key ids, Slack, PEM private keys) under benign keys that this process does not hold"
-- "token redaction never depends on what precedes a prefix, so a token after an ANSI colour code, an escaped newline or inside a slug is still redacted; AWS key ids are caught whatever surrounds them"

@@ -1,3 +1,0 @@
-changed:
-- "The platform header centres Ratchet's badge and moves its actions right, and sidebar Ratchet rows show Ratchet's face (#596)"
-- "The platform sidebar shows the product name and the lmer version the daemon is running below the project list; `/api/state` serves `config.version` (#596)"

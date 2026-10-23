@@ -1,4 +1,0 @@
-fixed:
-- "supported work commands and direct mutation helpers serialize before file writes, preventing release stash cleanup from deleting successful concurrent reports, logs, state, or artifacts"
-- "nested Git-hook record writers refuse before mutation while durability-only commits keep their deferred publication behavior"
-- "the work-repo mutation lock is keyed on the checkout the written path belongs to, so a write elsewhere never holds the configured checkout's lock"

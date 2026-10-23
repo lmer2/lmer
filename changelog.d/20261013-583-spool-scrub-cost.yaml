@@ -1,2 +1,0 @@
-fixed:
-- "A large assistant spool no longer stalls the platform: loading it resolves credentials once per pass and reuses earlier scrub results."

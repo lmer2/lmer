@@ -1,2 +1,0 @@
-fixed:
-- "schema-2 release abort retries failed publication without rewriting the original reason or events, rechecks successor claims, and verifies the published claim and record before reporting success"
