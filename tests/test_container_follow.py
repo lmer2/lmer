@@ -20,12 +20,15 @@ FAKE = Path(__file__).with_name("fake_container_runtime.py")
 
 @pytest.fixture
 def fake_runtime(tmp_path, monkeypatch):
-    """``docker`` on PATH is the fake; returns a helper that creates containers."""
+    """``docker`` and ``podman`` on PATH are the fake; returns a helper that
+    creates containers."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    shim = bin_dir / "docker"
-    shim.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE} "$@"\n')
-    shim.chmod(0o755)
+    # podman too, so a real one on the host cannot answer the --sig-proxy probe.
+    for name in ("docker", "podman"):
+        shim = bin_dir / name
+        shim.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE} "$@"\n')
+        shim.chmod(0o755)
     state = tmp_path / "containers"
     monkeypatch.setenv("FAKE_RUNTIME_STATE", str(state))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
@@ -187,8 +190,8 @@ def test_console_commands_carry_the_detach_keys(fake_runtime):
         "podman", "start", "--attach", "--interactive",
         "--detach-keys", runtime.DETACH_KEYS, "c1",
     ]
-    # Asked of the runtime: the fake answers as docker does, whose attach takes
-    # --sig-proxy and whose start does not.
+    # Asked of the runtime: the fake answers as docker does (for podman too),
+    # whose attach takes --sig-proxy and whose start does not.
     assert container_follow._console_command(
         "docker", "c1", started=True, interactive=False
     ) == ["docker", "attach", "--no-stdin", "--sig-proxy=false",
