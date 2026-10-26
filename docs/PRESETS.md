@@ -253,9 +253,9 @@ Guard rails (these apply to every CLI selector — `--preset`,
 - Preset `args` must be known lmer flags — a bare positional, a literal `--`,
   or an unrecognized token fails fast (exit 2) rather than silently rebinding
   your command line.
-- A preset-supplied `--env-file` never loads: it is ignored (with a warning
-  when it isn't already overridden by your own `--env-file`) — pass it on the
-  command line instead.
+- A preset-supplied `--env-file` or `--env-only` never applies: it is ignored
+  (with a warning when it isn't already overridden by your own flag) — pass
+  it on the command line instead.
 
 CLI quick reference: [Startup presets in docs/LMER-CLI.md](./LMER-CLI.md#startup-presets---preset--lmer_preset).
 

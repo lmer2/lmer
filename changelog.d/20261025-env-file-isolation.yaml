@@ -1,0 +1,6 @@
+added:
+- "--env-only and LMER_ENV_ISOLATED let a launch load only its --env-file, so a second identity no longer inherits ~/.lmer/.env keys."
+fixed:
+- "A cwd .env now overrides ~/.lmer/.env in the container, matching host precedence."
+changed:
+- "A non-isolated --env-file now warns when repo-routing or token keys come from another .env file."

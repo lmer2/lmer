@@ -418,6 +418,18 @@ def default_env_file_candidates(
     ]
 
 
+def env_files_isolated() -> bool:
+    """Whether this launch should skip the default ``.env`` files.
+
+    ``LMER_ENV_ISOLATED`` is read from the exported environment only. The
+    default files are exactly what isolation skips, so a value living in one
+    of them cannot turn isolation on for the launch that would have read it.
+    ``--env-only`` is the per-invocation flag equivalent; callers combine the
+    two and pass the result explicitly rather than re-reading here.
+    """
+    return get_bool_env("LMER_ENV_ISOLATED")
+
+
 @dataclass(frozen=True)
 class LaunchScope:
     """What a launch is, for the scoped resource variables (issue #453).

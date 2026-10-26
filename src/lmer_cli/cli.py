@@ -144,6 +144,7 @@ from .runtime import (
     ContainerEnvError,
     CPUS_HINT,
     default_env_file_candidates,
+    env_files_isolated,
     detect_runtime,
     gpu_grant_plan,
     gpu_remediation,
@@ -657,6 +658,7 @@ def parse_args(
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--mount-dir", dest="mount_dir", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a host directory into the container at an explicit destination (repeatable). Same grammar and strictness as --mount-file, but HOST must be an existing directory; MODE is ro (default) or rw. The mount shadows whatever the image has at CONTAINER. Invalid entries abort the run. (env: LMER_MOUNT_DIRS, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
+    parser.add_argument("--env-only", dest="env_only", action="store_true", help="Load only the explicit --env-file (plus already-exported variables), skipping cwd/.env and ~/.lmer/.env on both the host and the container side. Requires --env-file. The exported equivalent is LMER_ENV_ISOLATED=1, which also works without --env-file (exported variables only).")
     parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_<TASK>_PRESET for one taskdef, e.g. LMER_REVIEW_PRESET, then LMER_PRESET for any task; the flag wins over both). Flags and explicit exported variables override the preset; preset env overrides .env defaults, including defaults loaded by the platform.")
     parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
     parser.add_argument("--agents", dest="agents", help="Comma-delimited preset names the session's agent may fan a task out to via spawn-harness (env: LMER_AGENTS; the flag wins). Names are resolved against LMER_PRESETS_FILE host-side (unknown names fail fast); each preset contributes its env overlay plus --harness/--prompt folded from its args — the remaining launch-shaping fields (checkout/service/other args) are ignored with a warning — and only that resolved config is forwarded into the container.")
@@ -1230,6 +1232,77 @@ def _redact_env_value(name: str, value: str) -> str:
     return strip_url_credentials(value)
 
 
+#: Keys that route a session to a repository. A value for one of these that
+#: leaks in from a different ``.env`` file than the explicit one can make a
+#: personal launch write to an org repository (issue #609).
+_ROUTING_ENV_KEYS = frozenset(
+    {
+        "LMER_WORK_REPO",
+        "LMER_NAPKIN_REPO",
+        "LMER_TASKDEF_REPO",
+        "LMER_TASKDEF_REF",
+    }
+)
+
+_EXPLICIT_ENV_FILE_SOURCE = ".env (--env-file)"
+
+
+def _env_isolation_requested(
+    ns: argparse.Namespace, inherited_env_sources: dict[str, str]
+) -> bool:
+    """Whether this launch should skip the default ``.env`` files.
+
+    ``--env-only`` is the per-invocation switch. ``LMER_ENV_ISOLATED`` counts
+    only when the operator exported it: a value the platform daemon loaded
+    from a ``.env`` file (and forwarded with its source label) is ignored,
+    because that file is exactly what isolation is meant to skip.
+    """
+    if ns.env_only:
+        return True
+    if "LMER_ENV_ISOLATED" in inherited_env_sources:
+        return False
+    return env_files_isolated()
+
+
+def _warn_env_file_bleed(
+    env_file_sources: dict[str, str],
+    explicit_env_file: "Path | None",
+    inherited_env_sources: dict[str, str],
+) -> None:
+    """Warn when ``--env-file`` is not isolating routing/credential keys.
+
+    Only keys that came from *another* ``.env`` file can leak: a key the
+    explicit file supplied has source ``.env (--env-file)``, and an exported
+    key never appears in the source map at all. Keys the platform daemon
+    loaded from its own defaults are skipped: the daemon owns those and a
+    spawned assistant passes ``--env-file`` on purpose, so warning there
+    would fire on every routine platform launch and teach operators to
+    ignore it. Values are deliberately not printed — a leaked key is often a
+    token.
+    """
+    if explicit_env_file is None:
+        return
+    leaked = [
+        (name, source)
+        for name, source in sorted(env_file_sources.items())
+        if name not in inherited_env_sources
+        and source != _EXPLICIT_ENV_FILE_SOURCE
+        and (name in _ROUTING_ENV_KEYS or is_secret_env_name(name))
+    ]
+    if not leaked:
+        return
+    warning(
+        "⚠️  --env-file does not isolate this launch: "
+        f"{len(leaked)} routing/credential key(s) came from another .env file:"
+    )
+    for name, source in leaked:
+        warning(f"      {name}  {source}")
+    warning(
+        "    Pass --env-only (or export LMER_ENV_ISOLATED=1) to load only "
+        "--env-file."
+    )
+
+
 def _display_env_config_cli(
     host_lmer_vars: set[str],
     env_file_sources: dict[str, str],
@@ -1626,6 +1699,9 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
         return 2
     if ns.no_task and not ns.exec_mode:
         error("--no-task requires --exec mode")
+        return 2
+    if ns.env_only and not ns.env_file:
+        error("--env-only requires --env-file (isolation with no named file would load no .env at all; export LMER_ENV_ISOLATED=1 for that)")
         return 2
     # --repo names the repository explicitly (A1-wave0.host-export). The
     # refusals that need the positional classified ('two repositories named')
@@ -2040,6 +2116,7 @@ def _resolve_and_apply_preset(
     preset_tokens = preset.cli_tokens()
     if preset_tokens:
         original_env_file = ns.env_file
+        original_env_only = ns.env_only
         ns, rest = parse_args(preset_tokens + argv)
         if ns.verbose or ns.debug:
             os.environ["LMER_VERBOSE"] = "1"
@@ -2052,6 +2129,13 @@ def _resolve_and_apply_preset(
                 "pass it on the lmer command line instead"
             )
             ns.env_file = original_env_file
+        # Same reason: isolation changes which files the early load read.
+        if ns.env_only != original_env_only:
+            warning(
+                "⚠️  --env-only inside preset args is ignored — "
+                "pass it on the lmer command line instead"
+            )
+            ns.env_only = original_env_only
 
     for key, value in preset.env.items():
         if key not in os.environ or key in early_env_file_sources:
@@ -2504,6 +2588,19 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["LMER_VERBOSE"] = "1"
         inherited_env_sources.pop("LMER_VERBOSE", None)
 
+    # Resolve isolation once, before anything reads the environment: the same
+    # value must drive the early load, the host-side seeding and the container
+    # merge, or they disagree about which files this launch read (issue #609).
+    env_isolated = _env_isolation_requested(ns, inherited_env_sources)
+    if env_isolated:
+        # Every key in inherited_env_sources came from a default .env file in
+        # the platform daemon, which then passed it through the carrier. An
+        # isolated launch must drop those, not just skip the files this
+        # process would read — otherwise the daemon's ~/.lmer/.env values
+        # still reach the container through the passthrough (review of !429).
+        for name in inherited_env_sources:
+            os.environ.pop(name, None)
+
     # Discover tasks from filesystem and validate provided task
     repo_root = repo_root_path()  # None in installed mode
     state_dir = lmer_state_dir()  # Always ~/.lmer/
@@ -2541,13 +2638,18 @@ def main(argv: list[str] | None = None) -> int:
     # guard below (all three agree, and the "skipping" warning stays accurate).
     if explicit_env_file is not None and explicit_env_file.is_file():
         env_file_candidates.append(("--env-file", explicit_env_file))
-    env_file_candidates += default_env_file_candidates(
-        state_dir=state_dir, cwd=cwd_env_file.parent
-    )
+    if not env_isolated:
+        env_file_candidates += default_env_file_candidates(
+            state_dir=state_dir, cwd=cwd_env_file.parent
+        )
     early_env_file_sources = {
         **inherited_env_sources,
         **apply_env_file_defaults(env_file_candidates),
     }
+    if not env_isolated and explicit_env_file is not None:
+        _warn_env_file_bleed(
+            early_env_file_sources, explicit_env_file, inherited_env_sources
+        )
 
     # Handle --list-presets: a pure query, so it runs before any preset is
     # resolved or a task is required — but after the early .env load so an
@@ -3781,24 +3883,22 @@ def main(argv: list[str] | None = None) -> int:
         if key not in env:
             env[key] = value
 
-    # Merge all variables from .env file into container env dict
-    # Check state dir (~/.lmer/) and cwd for .env files
-    # Working directory takes highest priority — load in reverse order
-    # (highest priority first) since we use a first-wins pattern (if key not in env).
+    # Merge all variables from .env files into the container env dict.
+    # The merge below is last-wins, so the queue is ordered lowest precedence
+    # first: state dir, then cwd, then --env-file. That is the inverse of the
+    # host's first-wins seeding order (the early load above), which is what
+    # makes the effective winner agree on both sides (issue #609).
     cwd_env_file = Path.cwd() / ".env"
+    state_env_file = state_dir / ".env"
 
     env_files_to_load = []
 
-    # Load from cwd first (highest priority)
-    if cwd_env_file.exists():
-        env_files_to_load.append(("working directory", cwd_env_file))
-
-    # Load from state dir (~/.lmer/)
-    state_env_file = state_dir / ".env"
-    if state_env_file.exists():
-        already_listed = any(f == state_env_file for _, f in env_files_to_load)
-        if not already_listed and state_env_file != cwd_env_file:
+    if not env_isolated:
+        # State dir first: cwd/.env overrides it, matching the host.
+        if state_env_file.exists():
             env_files_to_load.append(("lmer state dir", state_env_file))
+        if cwd_env_file.exists() and cwd_env_file != state_env_file:
+            env_files_to_load.append(("working directory", cwd_env_file))
 
     # An explicit --env-file (resolved above) is appended LAST so it wins: the
     # merge below lets later .env files override earlier ones, so last == the
@@ -3821,7 +3921,8 @@ def main(argv: list[str] | None = None) -> int:
             success(f"📋 Loaded {len(dotenv_vars)} variables from .env file in {location}")
             # Merge .env variables into env dict
             # - Hardcoded env values (set above) take precedence over .env
-            # - Later .env files (cwd) override earlier ones (repo root)
+            # - Later .env files override earlier ones, so the queue order
+            #   (state dir, cwd, --env-file) is the precedence order
             merged_count = 0
             for key, value in dotenv_vars.items():
                 if value is None:
@@ -3833,6 +3934,11 @@ def main(argv: list[str] | None = None) -> int:
                     env_file_keys.add(key)
                     merged_count += 1
             success(f"✅ Merged {merged_count} variables from {location} .env into container environment")
+    elif env_isolated:
+        success(
+            "⚠️  .env isolation on: no .env files loaded "
+            "(exported variables only)"
+        )
     else:
         searched = [str(cwd_env_file), str(state_env_file)]
         success(f"⚠️  .env file not found at: {' or '.join(searched)}")
