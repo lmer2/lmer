@@ -107,9 +107,20 @@ function slotsFor(row) {
 // #542's gate, read off the row: a launch that moved projects is continued only
 // once the operator has confirmed its current one. Handed off is handed off — a
 // second tap before the fleet poll catches up would only earn a refusal.
+//
+// The reason travels with the verdict (issue 617): a disabled control that says
+// nothing is what made the answer box's equivalent gate read as broken.
+function reasonFor(row) {
+  if (outcomeOf(row)?.started) return 'A session already started for this launch.'
+  if (busy.value) return 'Starting a session…'
+  if (row.confirm_project && !confirmed.value) {
+    return `Tick "Authorize this launch in ${row.workspace_name || 'its project'}" above to resume.`
+  }
+  return null
+}
+
 function canSubmit(row) {
-  return !busy.value && !outcomeOf(row)?.started
-    && (!row.confirm_project || confirmed.value)
+  return !reasonFor(row)
 }
 
 function toggle(row) {
@@ -274,11 +285,6 @@ onBeforeUnmount(() => {
                 persistent-hint
                 class="mb-3"
               />
-              <v-checkbox
-                v-if="row.confirm_project"
-                v-model="confirmed"
-                :label="`Continue this launch in ${row.workspace_name || 'its project'} with its current project settings`"
-              />
               <v-textarea
                 v-model="direction"
                 :disabled="busy"
@@ -301,12 +307,28 @@ onBeforeUnmount(() => {
                 placeholder="https://git.example.com/group/project.git"
                 class="mb-3"
               />
-              <v-btn
-                :loading="busy"
-                :disabled="!canSubmit(row)"
-                color="primary"
-                @click="resume(row)"
-              >resume this launch</v-btn>
+              <!-- Directly above the control it gates (issue 617), and labelled as
+                   the required step it is. -->
+              <v-checkbox
+                v-if="row.confirm_project"
+                v-model="confirmed"
+                :label="`Authorize this launch in ${row.workspace_name || 'its project'} — required to resume`"
+                :hint="`This launch was moved to ${row.workspace_name || 'another project'}, so resuming it needs a confirmation that it runs with that project's current settings.`"
+                persistent-hint
+                class="mb-2"
+              />
+              <div class="d-flex flex-wrap align-center ga-3">
+                <v-btn
+                  :loading="busy"
+                  :disabled="!canSubmit(row)"
+                  color="primary"
+                  @click="resume(row)"
+                >resume this launch</v-btn>
+                <span
+                  v-if="reasonFor(row)"
+                  class="launch-reason text-body-small text-medium-emphasis"
+                >{{ reasonFor(row) }}</span>
+              </div>
             </div>
 
             <template v-if="outcomeOf(row)">

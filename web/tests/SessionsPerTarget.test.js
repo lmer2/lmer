@@ -245,3 +245,47 @@ it('RunDetail mounts nothing and asks nothing for a legacy row', async () => {
   expect(wrapper.text()).not.toContain('launches of this target')
   expect(calls('api/runs/sessions')).toHaveLength(0)
 })
+
+// Issue 617: the moved launch's resume button used to grey out with nothing on
+// screen saying that the confirmation above it was the reason.
+it('says why a moved launch cannot be resumed until it is authorized', async () => {
+  bothTrackedInTwoHomes()
+  const wrapper = await mountView()
+  const [, second] = rows(wrapper)
+  await button(second, 'resume').trigger('click')
+  await flushPromises()
+
+  const resumeButton = () => button(second, 'resume this launch')
+  expect(resumeButton().attributes('disabled')).toBeDefined()
+  expect(second.get('.launch-reason').text()).toBe(
+    'Tick "Authorize this launch in Alpha" above to resume.',
+  )
+  // The checkbox is where the reason says, and its label is the required step.
+  const checkbox = second.get('input[type="checkbox"]')
+  expect(checkbox.element.closest('.v-input').textContent)
+    .toContain('Authorize this launch in Alpha — required to resume')
+
+  await checkbox.setValue(true)
+  await flushPromises()
+  expect(second.find('.launch-reason').exists()).toBe(false)
+  expect(resumeButton().attributes('disabled')).toBeUndefined()
+})
+
+it('RunDetail says why its continue control is disabled on a moved run', async () => {
+  const moved = { ...parent, confirm_project: true, workspace_name: 'Example Alpha' }
+  const wrapper = mountPane(RunDetail, { run: moved }, stubs)
+  await flushPromises()
+
+  const continueButton = () => wrapper.findAll('button').find(
+    (candidate) => candidate.text().trim() === 'continue this run',
+  )
+  expect(continueButton().attributes('disabled')).toBeDefined()
+  expect(wrapper.get('.resume-reason').text()).toBe(
+    'Tick "Authorize this run in Example Alpha" above to continue.',
+  )
+
+  await wrapper.get('input[type="checkbox"]').setValue(true)
+  await flushPromises()
+  expect(wrapper.find('.resume-reason').exists()).toBe(false)
+  expect(continueButton().attributes('disabled')).toBeUndefined()
+})

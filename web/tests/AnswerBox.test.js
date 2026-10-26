@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AnswerBox from '../src/components/AnswerBox.vue'
 import { answerRun } from '../src/api.js'
-import { mountPane } from './mount.js'
+import { deferred, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ answerRun: vi.fn() }))
 
@@ -214,4 +214,131 @@ it('shows no warning when the answer reply carries none', async () => {
   expect(wrapper.findAll('.v-alert').map((node) => node.classes())).not.toContainEqual(
     expect.arrayContaining(['bg-warning']),
   )
+})
+
+// Issue 617: the answer button is unsendable four ways and used to say none of
+// them — on a moved run the required confirmation sat above an unrelated field
+// and the operator reported a working gate as a broken button. Every case below
+// asserts the reason the operator is given, not just that the control is off.
+function answerButton(wrapper) {
+  return wrapper.findAll('button').find((button) => button.text() === 'answer')
+}
+
+function movedRun(extra = {}) {
+  return {
+    host: 'git.example', project: 'acme/widget', slug: 'develop-1',
+    workspace_id: 'beta', home_revision: 2, confirm_project: true,
+    workspace_name: 'Example Beta', attention: { note: 'Proceed?' },
+    ...extra,
+  }
+}
+
+it('says an empty answer is why the button is disabled', async () => {
+  const wrapper = mountPane(AnswerBox, { run: movedRun() })
+
+  expect(answerButton(wrapper).attributes('disabled')).toBeDefined()
+  expect(wrapper.get('.send-reason').text()).toBe('Type an answer to send.')
+  // The control points at the reason it is disabled for.
+  expect(answerButton(wrapper).attributes('aria-describedby')).toBe(
+    wrapper.get('.send-reason').attributes('id'),
+  )
+})
+
+it('says a moved run needs its authorization before the answer can be sent', async () => {
+  const wrapper = mountPane(AnswerBox, { run: movedRun() })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+
+  expect(answerButton(wrapper).attributes('disabled')).toBeDefined()
+  expect(wrapper.get('.send-reason').text()).toBe(
+    'Tick "Authorize this answer in Example Beta" above to send.',
+  )
+  // The checkbox is where the reason says it is, and its label is the required
+  // step rather than an acknowledgement.
+  const checkbox = wrapper.get('input[type="checkbox"]')
+  expect(checkbox.element.closest('.v-input').textContent).toContain(
+    'Authorize this answer in Example Beta — required to send',
+  )
+  // And it says, in plain words, why it is there.
+  expect(checkbox.element.closest('.v-input').textContent)
+    .toContain('This run was moved to Example Beta')
+
+  await checkbox.setValue(true)
+  expect(wrapper.find('.send-reason').exists()).toBe(false)
+  expect(answerButton(wrapper).attributes('disabled')).toBeUndefined()
+})
+
+it('announces a blocked Ctrl+Enter and clears the highlight when the state changes', async () => {
+  const wrapper = mountPane(AnswerBox, { run: movedRun() })
+  const box = wrapper.get('textarea')
+  const announcer = () => wrapper.get('.send-announcer')
+
+  // The chord is refused, and says so to a screen reader — the reason text on
+  // screen has not changed, so a colour change alone would announce nothing.
+  await box.trigger('keydown', { key: 'Enter', ctrlKey: true })
+  await flushPromises()
+  expect(announcer().attributes('aria-live')).toBe('polite')
+  expect(announcer().text()).toBe('Type an answer to send.')
+  expect(wrapper.get('.send-reason').classes()).toContain('send-reason--pressed')
+
+  // The condition behind the reason changed, so neither the highlight nor the
+  // announcement outlives it — this new reason was never pressed against.
+  await box.setValue('Proceed carefully')
+  expect(wrapper.get('.send-reason').text()).toContain('Authorize this answer')
+  expect(wrapper.get('.send-reason').classes()).not.toContain('send-reason--pressed')
+  expect(announcer().text()).toBe('')
+
+  // A second refusal, of the new reason, is audible too.
+  await box.trigger('keydown', { key: 'Enter', ctrlKey: true })
+  await flushPromises()
+  expect(announcer().text()).toBe(
+    'Tick "Authorize this answer in Example Beta" above to send.',
+  )
+
+  // And once the reason is gone the chord sends, as it always did.
+  await wrapper.get('input[type="checkbox"]').setValue(true)
+  await box.trigger('keydown', { key: 'Enter', ctrlKey: true })
+  await flushPromises()
+  expect(answerRun).toHaveBeenCalledTimes(1)
+  expect(announcer().text()).toBe('')
+  // The control only points at a reason that is rendered.
+  expect(answerButton(wrapper).attributes('aria-describedby')).toBeUndefined()
+})
+
+it('says a session is starting while the answer is in flight', async () => {
+  const pending = deferred()
+  answerRun.mockReturnValueOnce(pending.promise)
+  const wrapper = mountPane(AnswerBox, { run: movedRun() })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+  await wrapper.get('input[type="checkbox"]').setValue(true)
+
+  await answerButton(wrapper).trigger('click')
+  expect(wrapper.get('.send-reason').text()).toBe(
+    'Sending — a new session is starting for this run.',
+  )
+
+  pending.resolve({ session: { session_id: 's-answer' } })
+  await flushPromises()
+  expect(wrapper.get('.send-reason').text()).toBe(
+    'This answer already started s-answer — wait for it to pick the run up.',
+  )
+})
+
+it('says the answer was already handed off rather than looking ready to send', async () => {
+  answerRun.mockResolvedValueOnce({ session: { session_id: 's-answer' } })
+  const wrapper = mountPane(AnswerBox, { run: movedRun() })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+  await wrapper.get('input[type="checkbox"]').setValue(true)
+  await answerButton(wrapper).trigger('click')
+  await flushPromises()
+
+  expect(answerButton(wrapper).attributes('disabled')).toBeDefined()
+  expect(wrapper.get('.send-reason').text()).toContain('already started s-answer')
+})
+
+it('explains nothing when there is nothing to explain', async () => {
+  const wrapper = mountPane(AnswerBox, { run: movedRun({ confirm_project: false }) })
+  await wrapper.get('textarea').setValue('Proceed carefully')
+
+  expect(wrapper.find('.send-reason').exists()).toBe(false)
+  expect(answerButton(wrapper).attributes('disabled')).toBeUndefined()
 })

@@ -541,8 +541,19 @@ const canResume = computed(() => !props.run.live)
 // seconds and this section goes with it, and a second tap in the gap would only
 // earn the daemon's "already has a live session" refusal.
 const resumeHandedOff = computed(() => !!resumeStarted.value)
-const canSubmitResume = computed(() => !resuming.value && !resumeHandedOff.value
-  && (!props.run.confirm_project || projectConfirmed.value))
+
+// Why continuing is off, in the operator's words, or null when it can run
+// (issue 617): a moved run's confirmation checkbox used to grey the button out
+// with nothing on screen saying which of the reasons it was.
+const resumeDisabledReason = computed(() => {
+  if (resumeHandedOff.value) return 'A session already started for this run — wait for it to pick it up.'
+  if (resuming.value) return 'Starting a session…'
+  if (props.run.confirm_project && !projectConfirmed.value) {
+    return `Tick "Authorize this run in ${props.run.workspace_name || 'this project'}" above to continue.`
+  }
+  return null
+})
+const canSubmitResume = computed(() => !resumeDisabledReason.value)
 
 // Both are refusals; only one of them is a problem. Being asked for the repository
 // URL is the designed path — the platform will not invent that field — and painting
@@ -1052,7 +1063,6 @@ async function forget() {
               <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
           item-title="name" item-value="name" label="Service slot" clearable
           hint="Leave empty to reuse this run's remembered slot. Choose an applicable slot if its assignment changed." persistent-hint />
-      <v-checkbox v-if="run.confirm_project" v-model="projectConfirmed" :label="`Continue this run in ${run.workspace_name} with its current project settings`" />
               <v-alert
                 v-if="resumeError"
                 :type="resumeAsksForAField ? 'warning' : 'error'"
@@ -1094,7 +1104,7 @@ async function forget() {
                    filled in: continuing is meant to be one tap. -->
               <v-text-field
                 v-model="resumeTaskdef"
-                :disabled="!canSubmitResume"
+                :disabled="resuming || resumeHandedOff"
                 label="taskdef"
                 :placeholder="run.taskdef || 'develop'"
                 :hint="RESUME_TASKDEF_HINT"
@@ -1103,7 +1113,7 @@ async function forget() {
               />
               <v-textarea
                 v-model="resumeDirection"
-                :disabled="!canSubmitResume"
+                :disabled="resuming || resumeHandedOff"
                 :error="resumeNeeds === RESUME_NEEDS_DIRECTION"
                 label="direction"
                 :hint="RESUME_DIRECTION_HINT"
@@ -1121,13 +1131,27 @@ async function forget() {
               <v-text-field
                 v-if="repoUrlAsked"
                 v-model="resumeRepoUrl"
-                :disabled="!canSubmitResume"
+                :disabled="resuming || resumeHandedOff"
                 :error="resumeNeeds === RESUME_NEEDS_REPO_URL"
                 label="repository URL"
                 :prepend-inner-icon="mdiLinkVariant"
                 :hint="RESUME_REPO_URL_HINT"
                 persistent-hint
                 placeholder="https://git.example.com/group/project.git"
+                class="mb-3"
+              />
+
+              <!-- Directly above the control it gates, and saying that it gates
+                   it (issue 617): a required step, not an acknowledgement. The
+                   fields above stay editable — what the confirmation gates is the
+                   send, and an inert form under a greyed-out button is the same
+                   silent refusal in a different place. -->
+              <v-checkbox
+                v-if="run.confirm_project"
+                v-model="projectConfirmed"
+                :label="`Authorize this run in ${run.workspace_name || 'this project'} — required to continue`"
+                :hint="`This run was moved to ${run.workspace_name || 'another project'}, so continuing it needs a confirmation that it runs with that project's current settings.`"
+                persistent-hint
                 class="mb-3"
               />
 
@@ -1140,7 +1164,11 @@ async function forget() {
                   size="large"
                   @click="resume"
                 >{{ resumeLabel }}</v-btn>
-                <span class="text-body-small text-medium-emphasis">
+                <span
+                  v-if="resumeDisabledReason"
+                  class="resume-reason text-body-small text-medium-emphasis"
+                >{{ resumeDisabledReason }}</span>
+                <span v-else class="text-body-small text-medium-emphasis">
                   <template v-if="resumeStartsSibling">
                     this starts a different run against the same target — this one is
                     left as it is
