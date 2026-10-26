@@ -3668,6 +3668,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
+        # Branch to check this session's work-repo clone out at before the
+        # manifest is read (issue #613). Read in-container by
+        # clone_and_exec; branch-only, and refused before start if it is not a
+        # branch on the work repo.
+        "LMER_WORK_REPO_REF": os.environ.get("LMER_WORK_REPO_REF"),
         # Container-side path of the persistent clone-cache mount, read by
         # clone_and_exec.py (#112). None — i.e. not forwarded, and not
         # overridable from a .env — when LMER_CLONE_CACHE=0 or the host
