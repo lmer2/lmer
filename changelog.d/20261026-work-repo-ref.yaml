@@ -1,0 +1,2 @@
+added:
+- "`LMER_WORK_REPO_REF` checks a session's work-repo clone out at a branch before the manifest is read, so manifest and layout changes can be live-tested before merging."
