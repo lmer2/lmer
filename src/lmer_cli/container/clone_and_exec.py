@@ -2571,9 +2571,9 @@ def _ensure_session_dir(
     creating the bare address unconditionally then leaves an empty
     ``<session-id>/`` beside the very record the launch is about to write in.
     Nothing mis-routes — both resolvers count only children carrying a state
-    file — but it is litter at the one level D22 keeps clean, the validator
-    warns on it, and an operator reading the group finds two directories for
-    one launch and no way to tell which is the run.
+    file — but it is litter at the one level D22 keeps clean, and an operator
+    reading the group finds two directories for one launch and no way to tell
+    which is the run.
 
     Two refusals. With no base there is nothing to create and the reason is
     printed (a present manifest this build cannot read). With no usable
