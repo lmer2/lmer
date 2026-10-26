@@ -30,9 +30,11 @@ Pinned here:
 - ``events.jsonl`` line parseability, including a truncated trailing line
   reported precisely instead of aborting the walk;
 - the D22 session-unit shape: nothing is written at the grouping level, a
-  session dir SHOULD carry a ``state.yaml``, a session id SHOULD be in the
-  ``LMER_SESSION_ID`` form, and an ``in-progress`` session older than the
-  staleness window is informational "possibly orphaned";
+  session dir SHOULD carry a ``state.yaml`` (an EMPTY one is skipped: a
+  launch pre-creates it as an address, and git cannot track an empty
+  directory), a session id SHOULD be in the ``LMER_SESSION_ID`` form, and an
+  ``in-progress`` session older than the staleness window is informational
+  "possibly orphaned";
 - masterplan opacity (D12): the bundle is checked for existence only — a
   defect INSIDE it is provably not walked — while the pre-D12 nested
   ``masterplan/<mp-slug>/`` shape is reported, never errored;
@@ -994,8 +996,39 @@ class TestSessionUnitShape:
         assert _codes(report) == ["record.grouping-level-entry"]
         assert report.findings[0].path.endswith("/scratch")
 
-    def test_a_session_dir_without_state_is_a_warning(self, schema_plexus):
-        (_group_dir(schema_plexus) / "20260824-120000-9-99999").mkdir()
+    def test_a_non_empty_session_dir_without_state_is_a_warning(self, schema_plexus):
+        # Half a record — a crash, or a writer that got as far as a log file.
+        half = _group_dir(schema_plexus) / "20260824-120000-9-99999"
+        half.mkdir()
+        (half / "log.yaml").write_text("[]\n", encoding="utf-8")
+        assert _codes(_report(schema_plexus)) == ["record.session-dir-without-state"]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "20260824-120000-9-99999",
+            "9b7ee9313efc4bc5aa92e3a3af6cd4d2",
+        ],
+        ids=["timestamp-id", "hex-id"],
+    )
+    def test_an_empty_session_dir_is_skipped(self, schema_plexus, name):
+        # Issue #614: a launch pre-creates this address before `work
+        # session-start` writes state.yaml. It is not a record and can never
+        # be committed, so the validator says nothing about it. The hex form
+        # is the schema-2 opaque UID the issue reported.
+        (_group_dir(schema_plexus) / name).mkdir()
+        assert _codes(_report(schema_plexus)) == []
+
+    def test_an_empty_named_session_dir_is_skipped(self, schema_plexus):
+        (_group_dir(schema_plexus) / "20260824-120000-9-99999--a-name").mkdir()
+        assert _codes(_report(schema_plexus)) == []
+
+    def test_a_session_dir_holding_only_a_dotfile_still_warns(self, schema_plexus):
+        # A dotfile makes the directory committable, so the state-file
+        # expectation applies again.
+        dot = _group_dir(schema_plexus) / "20260824-120000-9-99999"
+        dot.mkdir()
+        (dot / ".gitkeep").write_text("", encoding="utf-8")
         assert _codes(_report(schema_plexus)) == ["record.session-dir-without-state"]
 
     def test_a_session_id_out_of_form_is_a_warning_when_it_holds_a_record(self, schema_plexus):

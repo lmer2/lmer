@@ -138,7 +138,11 @@ Severity choices, and where they come from
 - The session-unit codes are warnings because none of them makes the record
   unreadable, and the staleness code is informational because "in-progress
   with nobody home" is a state a human resolves (`work sessions` lists it),
-  never an error (§3.5, D22).
+  never an error (§3.5, D22). An EMPTY session directory is not a finding at
+  all: a launch pre-creates one as an address before its state file exists,
+  and git cannot track an empty directory, so it can never be part of a
+  committed record. Skipping it keeps validation a function of the tree
+  rather than of the caller's `LMER_SESSION_ID` (issue #614).
 
 Masterplan bundles are opaque (D12): a bundle is checked for existence and
 for ONE thing beyond it — the pre-D12 nested ``masterplan/<mp-slug>/`` shape,
@@ -405,7 +409,7 @@ register(
     "record.session-dir-without-state",
     Severity.WARN,
     tier=Tier.MACHINE,
-    summary="a session directory with no `state.yaml` (a session SHOULD carry one)",
+    summary="a NON-EMPTY session directory with no `state.yaml` (a session SHOULD carry one; an empty one is a prepared address)",
 )
 register(
     "record.session-id-malformed",
@@ -711,6 +715,10 @@ def _check_slug_group(root, group, report, *, now, stale_after, plain_session) -
             )
             continue
         state = _state_file(child)
+        if state is None and in_form and not _children(child):
+            # A launch pre-creates this empty address before writing state;
+            # git cannot track an empty directory, so it is never a record.
+            continue
         if state is None and not in_form:
             report.add(
                 "record.grouping-level-entry",

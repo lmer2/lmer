@@ -621,7 +621,10 @@ self-contained; nothing about it is shared with any other launch.
   the timestamp and pid in a directory name are always the launch that opened
   it — which is what keeps that listing in start order however often a record
   is resumed. A session dir SHOULD carry a `state.yaml`; a session-id not
-  matching this pattern is a warning.
+  matching this pattern is a warning. An EMPTY session directory is passed
+  over: a launch pre-creates it as an address before `work session-start`
+  writes the state file, and git cannot track an empty directory, so it can
+  never be part of a committed record.
 - **`--<name>`** is appended to the directory name when the session is named
   at its pre-execution freeze; the rename happens at most once. Index symlinks
   are re-pointed by the tool that renames.
@@ -826,7 +829,7 @@ Every file below keeps exactly the shape and the single writer documented in
 
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
-| `<session-dir>/` | session (`work` CLI creates and, at most once, renames it) | directory named `<session-id>[--<name>]`, session-id `YYYYMMDD-HHMMSS-<pid>-<random>`; a name not in this form is a warning | optional | machine |
+| `<session-dir>/` | session (`work` CLI creates and, at most once, renames it) | directory named `<session-id>[--<name>]`, session-id `YYYYMMDD-HHMMSS-<pid>-<random>`; a name not in this form is a warning; an EMPTY session directory is passed over (git cannot track an empty directory, so it can never be part of a committed record) | optional | machine |
 | `<session-dir>/state.yaml` | `work state` (single writer) | RUN-STATE.md §2, plus the `sessions:` lineage chain; unparseable, wrong integer or enum is an error in every form | expected | machine |
 | `<session-dir>/events.jsonl` | `work event` (append-only) | one JSON object per line, RUN-STATE.md §2; a line that does not parse is an error | optional | machine |
 | `<session-dir>/ledger.yaml` | `work ledger set` | RUN-STATE.md `ledger.yaml` | optional | machine |
@@ -976,7 +979,7 @@ tier: a corrupt state file is broken in every form.
 | `record.release-claim` | ERROR | | machine | a schema-2 shared release claim cannot be safely interpreted; arbitration must refuse |
 | `record.events-line-unparseable` | ERROR | | machine | an `events.jsonl` line that is not one JSON object |
 | `record.grouping-level-entry` | WARN | | machine | a file or a non-session directory at a `_runs/<slug>/` grouping level, where nothing is written |
-| `record.session-dir-without-state` | WARN | | machine | a session directory with no `state.yaml`: a session SHOULD carry one |
+| `record.session-dir-without-state` | WARN | | machine | a NON-EMPTY session directory with no `state.yaml`: a session SHOULD carry one. An empty one is a prepared address and is passed over |
 | `record.session-id-malformed` | WARN | | machine | a session directory whose name is not `<session-id>[--<name>]` in the `LMER_SESSION_ID` form |
 | `record.seed-dir-leftover` | WARN | | machine | a `.new-<session-id>-*` seed directory left behind by a crash — transient state the cleaner sweeps |
 | `record.session-stale` | INFO | | machine | an `in-progress` session untouched for longer than the staleness window: possibly orphaned, resumable, never auto-ended |
