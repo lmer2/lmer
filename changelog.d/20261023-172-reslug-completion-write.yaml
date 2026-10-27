@@ -1,0 +1,2 @@
+fixed:
+- "`work commit` now pushes a re-slugged release run's completion write, and later `work` verbs no longer seed a phantom run at its old address."

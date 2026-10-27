@@ -3446,6 +3446,14 @@ def cmd_release_claim(as_json: bool = False) -> int:
         rdir, state = _require_run()
         if rdir is None:
             return 1
+        derived = run_state.derive_slug()
+        if (state.get("status") != "in-progress" and state.get("slug") != derived
+                and run_state.has_vacated(state, derived)):
+            # This launch's own finished release, reached through the address
+            # it vacated (#172). The roll-over below is for a finished run
+            # still parked ON the address; this one already left it.
+            return _claim_fail_closed(
+                "this execution has finished; start a fresh session", as_json)
         rolled_aside: str | None = None
         extra_rels: list[str] | None = None
         if state.get("status") != "in-progress":
@@ -4371,6 +4379,11 @@ def cmd_session_start(session: str | None = None) -> int:
                 run_state.write_state(rdir, state)
                 run_state.append_event(rdir, "run_seeded")
             else:
+                try:
+                    run_state.refuse_contextless_phantom(run_state.derive_slug())
+                except run_state.RunStateError as exc:
+                    print(f"⚠️  run-state session-start skipped: {exc}")
+                    return 0
                 # Fresh run: create through the tmp-dir-then-rename
                 # lifecycle (issue #87 D2).
                 rdir, state = run_state.seed_run_dir(
