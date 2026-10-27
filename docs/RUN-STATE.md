@@ -1324,8 +1324,38 @@ dirs that address it.
   `derive_slug`'s "no aliasing between the two forms" still holds for
   legacy full-SHA runs. A relaunch, scheduled or manual, therefore lands on
   the in-flight release without any launch parameter carrying the version.
-- **Terminal runs never resolve through that fallback**, which is exactly
-  what frees the bare address for the next release.
+- **Terminal runs never resolve through that fallback for another
+  launch**, which is exactly what frees the bare address for the next
+  release. The launch that wrote the finished run is the exception
+  (issue #172). Without it, the session that closes a release with
+  `work state set --status=complete` loses its own run at once: its
+  `work commit` stages the vacated address and leaves the completion write
+  behind, and its next `work` verb seeds a phantom in-progress run exactly
+  where the next release's claim looks. "Wrote" is asked of facts the
+  kernel records itself: the session dir's id or `sessions:` lineage, else
+  an `events.jsonl` line whose `session` is this `LMER_SESSION_ID` — or
+  the id `work session-start --session` names, since a resume continues
+  that launch and its own harness id joins the lineage only once the record
+  is found (`find_successor_run_dir`). Among the runs that vacated the
+  address, one this launch wrote wins over a live one it did not.
+  Known gap: this is the *fallback*, so an exact slug match still comes
+  first. If the next release has already claimed the bare address while the
+  finished launch is still running, that launch's later `work` verbs resolve
+  the new run: in a legacy tree they write into it, and in session form they
+  open a session dir in its group. That happened before #172 too. Closing it
+  would mean reading the matched run's events on every `work` call.
+- **An invocation with no `LMER_SESSION_ID` does not seed there**, with
+  or without `--session` (a resume of the finished run's launch has resolved
+  it before any seed). It has no identity to match, so "the finished run is mine" and "I am the next
+  release" look the same to it. `ensure_run` (every mutating verb) refuses
+  that seed loudly and names the finished run. `work session-start`, which is
+  hook-facing, skips with a warning and exits 0. Neither guesses "new run"
+  and leaves a phantom. A launched session (which always carries an id)
+  seeds as before, and so does an explicit `work seed`.
+- **A claim from the launch that finished the release refuses**, with the
+  schema-2 wording: "this execution has finished; start a fresh session".
+  That run already left the address, so the roll-over below, which moves a
+  finished run OFF the address, does not apply to it.
 - **`work release claim` rolls a terminal run aside.** Some runs never
   reach `record version` — a release aborted in leg 1, a session that died
   after completing but before its re-slug pushed, a run closed out by hand.

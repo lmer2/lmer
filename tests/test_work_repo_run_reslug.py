@@ -165,16 +165,124 @@ class TestSuccessorResolution:
         assert run_state.resolve_run_dir("release-main") == new_dir
         assert run_state.run_dir() == new_dir
 
-    def test_a_terminal_reslugged_run_never_resolves(self, runs):
+    def test_a_terminal_reslugged_run_never_resolves_for_another_launch(
+            self, runs, monkeypatch):
         """A finished release has given its address up — that is what lets
         the next release seed there instead of being refused forever."""
         rdir, state = _seed(runs, "release-main")
         new_dir, state, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
         state["status"] = "complete"
         run_state.write_state(new_dir, state)
+        monkeypatch.setenv("LMER_SESSION_ID", "s-next-release")
 
         assert run_state.resolve_run_dir("release-main") is None
         assert run_state.run_dir() == runs / "release-main"  # creation address
+
+    def test_a_terminal_reslugged_run_resolves_for_the_launch_that_wrote_it(
+            self, runs):
+        """#172: the completing session must still find the run it just
+        finished, or its commit stages the vacated address and its next
+        `work` verb seeds a phantom there. Its `run_reslugged` event is the
+        record that it wrote here."""
+        rdir, state = _seed(runs, "release-main")
+        new_dir, state, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
+        state["status"] = "complete"
+        run_state.write_state(new_dir, state)
+
+        assert run_state.resolve_run_dir("release-main") == new_dir
+        assert run_state.run_dir() == new_dir
+
+    def test_a_launch_with_no_session_id_wrote_nothing(self, runs, monkeypatch):
+        """The `unknown` label events carry for a contextless writer is not an
+        identity — two operator shells would otherwise share every run."""
+        monkeypatch.delenv("LMER_SESSION_ID")
+        rdir, state = _seed(runs, "release-main")
+        new_dir, state, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
+        state["status"] = "complete"
+        run_state.write_state(new_dir, state)
+
+        assert run_state.read_events(new_dir)[-1]["session"] == "unknown"
+        assert run_state.resolve_run_dir("release-main") is None
+
+    def test_a_torn_multibyte_event_in_a_finished_run_does_not_break_resolution(
+            self, runs, monkeypatch):
+        """Every later launch reads the events of a finished run that vacated
+        its address, so one crash mid-append (notes are not ASCII-escaped)
+        must not wedge resolution for all of them."""
+        rdir, state = _seed(runs, "release-main")
+        new_dir, state, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
+        state["status"] = "complete"
+        run_state.write_state(new_dir, state)
+        with open(new_dir / run_state.EVENTS_FILE, "ab") as fh:
+            fh.write(b'{"ts": "x", "session": "s-1", "note": "caf\xc3')
+        monkeypatch.setenv("LMER_SESSION_ID", "s-next-release")
+
+        assert run_state.resolve_run_dir("release-main") is None
+        assert run_state.read_events(new_dir)[-1]["type"] == "run_reslugged"
+
+    def _finished_by(self, runs, monkeypatch, writer):
+        monkeypatch.setenv("LMER_SESSION_ID", writer)
+        rdir, state = _seed(runs, "release-main")
+        new_dir, state, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
+        state["status"] = "complete"
+        run_state.write_state(new_dir, state)
+        return new_dir, state
+
+    def test_a_launch_in_the_lineage_wrote_the_run(self, runs, monkeypatch):
+        new_dir, state = self._finished_by(runs, monkeypatch, "s-old")
+        state["sessions"] = ["s-old", "s-resumed"]
+        run_state.write_state(new_dir, state)
+        monkeypatch.setenv("LMER_SESSION_ID", "s-resumed")
+
+        assert "s-resumed" not in {
+            e["session"] for e in run_state.read_events(new_dir, last_n=0)}
+        assert run_state.resolve_run_dir("release-main") == new_dir
+
+    def test_a_lineage_that_is_not_a_list_records_no_launch(self, runs, monkeypatch):
+        new_dir, state = self._finished_by(runs, monkeypatch, "s-old")
+        state["sessions"] = "s-resumed"
+        run_state.write_state(new_dir, state)
+        monkeypatch.setenv("LMER_SESSION_ID", "s-resumed")
+
+        assert run_state.resolve_run_dir("release-main") is None
+
+    @pytest.mark.parametrize("launch", [None, "s-resumed"])
+    def test_the_session_a_resume_names_wrote_the_run(self, runs, monkeypatch,
+                                                      launch):
+        """The resumed launch's own id is not on the run yet — `attach_session`
+        chains it only after the record is found."""
+        new_dir, _ = self._finished_by(runs, monkeypatch, "s-old")
+        if launch is None:
+            monkeypatch.delenv("LMER_SESSION_ID")
+        else:
+            monkeypatch.setenv("LMER_SESSION_ID", launch)
+
+        assert run_state.resolve_run_dir("release-main") is None
+        assert run_state.resolve_run_dir("release-main", session="s-old") == new_dir
+        assert run_state.resolve_run_dir("release-main", session="s-other") is None
+
+    def test_an_unhashable_event_stamp_is_skipped(self, runs, monkeypatch):
+        new_dir, _ = self._finished_by(runs, monkeypatch, "s-old")
+        with open(new_dir / run_state.EVENTS_FILE, "a", encoding="utf-8") as fh:
+            fh.write('{"ts": "x", "session": []}\n')
+        monkeypatch.setenv("LMER_SESSION_ID", "s-resumed")
+        run_state.append_event(new_dir, "note")
+
+        assert run_state.resolve_run_dir("release-main") == new_dir
+
+    def test_the_run_this_launch_wrote_wins_over_a_foreign_live_one(
+            self, runs, monkeypatch):
+        mine, state = _seed(runs, "release-main")
+        mine, state, _ = run_state.reslug_run(mine, state, "release-main-v0.6.0")
+        state["status"] = "complete"
+        state["created"] = "2026-07-01T00:00:00Z"
+        run_state.write_state(mine, state)
+        monkeypatch.setenv("LMER_SESSION_ID", "s-other")
+        live, state = _seed(runs, "release-main", dirname="release-main-x")
+        live, state, _ = run_state.reslug_run(live, state, "release-main-v0.7.0")
+        monkeypatch.setenv("LMER_SESSION_ID", "s-1")
+
+        assert run_state.resolve_run_dir("release-main") == mine
 
     def test_an_exact_slug_match_wins_over_a_successor(self, runs):
         live, state = _seed(runs, "release-main")
