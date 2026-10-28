@@ -777,6 +777,11 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     default, so an operator who never touches the switch lands exactly where they
     did before.
 
+    The next three are the project memory of #627 — which projects the sidebar has
+    folded, the project last open, and the project this browser opens on load.
+    None of them is the drawer either: they choose which project the page lands
+    on, and the landing screen is still the fleet with the drawer closed.
+
     What stays true is the actual rule: nothing writes the drawer's own open
     state, so closing it is still forgotten by the next load.
     """
@@ -787,6 +792,8 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     keys = re.findall(r"localStorage\.\w+\(\s*([A-Za-z0-9_.]+)", _read(APP))
     assert set(keys) == {
         "THEME_STORAGE_KEY", "NARROW_STORAGE_KEY", "FLEET_VIEW_STORAGE_KEY",
+        "COLLAPSED_PROJECTS_STORAGE_KEY", "LAST_PROJECT_STORAGE_KEY",
+        "DEFAULT_PROJECT_STORAGE_KEY",
     }, (
         f"the shell now stores {sorted(set(keys))}; the drawer's open state is "
         "deliberately not remembered, and a further key here is a decision"
@@ -838,6 +845,7 @@ const source = compiled.content
   .replace(/from ['"]@mdi\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
   .replace(/from ['"]\.\.\/operatorChat.js['"]/g, `from '${import.meta.resolve('./src/operatorChat.js')}'`)
   .replace(/from ['"]\.\.\/ratchet.js['"]/g, `from '${import.meta.resolve('./src/ratchet.js')}'`)
+  .replace(/from ['"]\.\.\/launchSettings.js['"]/g, `from '${import.meta.resolve('./src/launchSettings.js')}'`)
   .replace(/import .* from ['"]\.\.\/api.js['"]/, `
     const fetchAssistantConfig = async () => ({ settings: {} });
     const setAssistantConfig = async (body) => {
@@ -974,7 +982,7 @@ globalThis.fetch = async (url, options = {}) => {
 const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
-  .replace(/from ['"]\\.\\.\\/(api|format|operatorChat|ratchet)\\.js['"]/g,
+  .replace(/from ['"]\\.\\.\\/(api|format|launchSettings|operatorChat|ratchet)\\.js['"]/g,
     (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
 const component = (await import(
   `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`

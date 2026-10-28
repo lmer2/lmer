@@ -3,13 +3,19 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { archiveProject, fetchAssistantInstructions, fetchChannelRoutes, setAssistantInstructions, setProjectChannels,
   updateProject } from '../api.js'
 import { ago } from '../format.js'
+import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_KEYS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
 import { assistantName } from '../ratchet.js'
 
 // `focus` is `{ id, section, nonce }`; the nonce makes a repeat tap count.
+// `isDefault` is whether this browser opens this project on load; `default` reports a change.
 const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null },
-  now: { type: Number, default: () => Date.now() } })
-const emit = defineEmits(['changed', 'close', 'focused'])
+  now: { type: Number, default: () => Date.now() }, isDefault: Boolean })
+const emit = defineEmits(['changed', 'close', 'default', 'focused'])
+const openOnLoad = computed({
+  get: () => props.isDefault,
+  set: (on) => emit('default', on ? props.project.id : ''),
+})
 const form = ref({})
 const orders = ref(null)
 const instructions = ref('')
@@ -33,8 +39,6 @@ const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
   return rows
 }, [])
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
-const overrideKeys = ['model', 'harness', 'preset', 'agents']
-const overrideLabels = { model: 'Model', harness: 'Harness', preset: 'Preset', agents: 'Fan-out presets' }
 const authorityLevels = [
   { value: 'none', title: 'None: its messages carry no approval' },
   { value: 'approvals', title: 'Approvals: answer workers\' asks and say go within the task' },
@@ -146,56 +150,120 @@ async function archive() {
     <v-card-actions class="project-actions">
       <v-btn :loading="busy" color="primary" variant="tonal" @click="save">Save project</v-btn>
       <v-spacer /><v-btn :disabled="busy" @click="emit('close')">Close</v-btn>
-      <v-btn color="warning" :disabled="busy" @click="archive">Archive project</v-btn>
     </v-card-actions>
     <v-card-text>
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
       <v-alert v-if="ordersError" type="error" class="mb-3">{{ ordersError }}</v-alert>
-      <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" />
-      <fieldset class="project-color mb-4" :disabled="busy">
-        <legend class="text-body-medium mb-2">Project color
-          <v-chip variant="flat" :color="pickedColor" :style="{ color: projectTextColor(pickedColor) }" size="small" class="ms-2">{{ colorName }}</v-chip>
-        </legend>
-        <v-color-picker v-model="pickedColor" mode="hex" :modes="['hex']" show-swatches :swatches="swatches"
-          swatches-max-height="none" :disabled="busy" elevation="0" width="100%" max-width="400" />
-      </fieldset>
-      <v-textarea v-model="form.repositories" label="Repositories (one URL per line)" :disabled="busy" rows="2" />
-      <p class="mb-3">Execution overrides apply at the next start or rotation. Empty fields inherit platform defaults.</p>
-      <v-text-field v-for="key in overrideKeys" :key="key" v-model="form.settings[key]" :label="overrideLabels[key]"
-        hint="Empty inherits the platform default." persistent-hint class="mb-2" :disabled="busy" />
-      <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy" />
-      <v-select v-model="supervisorAuthority" :items="authorityLevels" class="supervisor-authority mb-4"
-        :label="`What ${assistantName} may approve for workers`" :disabled="busy" persistent-hint
-        hint="Stamped on each of its messages to this project's workers. No level passes an operator-only gate such as spec approval or a merge." />
-      <v-textarea v-model="channels" class="mention-channels mb-4" label="Mention channels (one per line)" rows="2"
-        :disabled="busy || savedChannels === null" persistent-hint spellcheck="false"
-        hint="Bot mentions here route to this project unless they name another one. Slack channel ID, #name or link; Matrix room ID, alias or link." />
-      <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
-        <v-expansion-panel title="Standing instructions">
-          <v-expansion-panel-text>
-            <p v-if="orders && !savedInstructions" class="orders-empty text-medium-emphasis mb-3">
-              No standing instructions yet.
-            </p>
-            <v-textarea v-model="instructions" label="Standing instructions" :disabled="busy || !orders"
-              :maxlength="orders?.limit" :counter="orders?.limit" rows="6" />
-            <p class="mb-2">Saved with this project. Each new assistant incarnation reads these instructions.</p>
-            <p class="orders-hint text-body-small text-medium-emphasis mb-2">
-              Usually set by telling {{ assistantName }} in chat — "from now on…", "always…" — and it
-              confirms the wording before storing them.
-            </p>
-            <p v-if="orders?.instructions_at" :title="orders.instructions_at"
-              class="orders-changed text-body-small text-medium-emphasis mb-0">
-              last changed {{ ago(orders.instructions_at, now) }}
-            </p>
-          </v-expansion-panel-text>
-        </v-expansion-panel>
-      </v-expansion-panels>
+
+      <section class="settings-group" aria-labelledby="project-identity">
+        <h3 id="project-identity" class="text-title-small mb-1">Identity</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          How the project is named and coloured everywhere, and which repositories its workers use.
+        </p>
+        <div class="settings-field">
+          <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" hide-details="auto" />
+        </div>
+        <fieldset class="project-color settings-field" :disabled="busy">
+          <legend class="text-body-medium mb-2">Project color
+            <v-chip variant="flat" :color="pickedColor" :style="{ color: projectTextColor(pickedColor) }" size="small" class="ms-2">{{ colorName }}</v-chip>
+          </legend>
+          <v-color-picker v-model="pickedColor" mode="hex" :modes="['hex']" show-swatches :swatches="swatches"
+            swatches-max-height="none" :disabled="busy" elevation="0" width="100%" max-width="400" />
+        </fieldset>
+        <div class="settings-field">
+          <v-textarea v-model="form.repositories" label="Repositories" :disabled="busy" rows="2" auto-grow
+            persistent-hint hint="One URL per line." />
+        </div>
+      </section>
+
+      <section class="settings-group" aria-labelledby="project-browser">
+        <h3 id="project-browser" class="text-title-small mb-1">This browser</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          Kept in this browser only, and applied now. Other browsers and devices are not affected.
+        </p>
+        <div class="settings-field">
+          <v-switch v-model="openOnLoad" class="project-default" color="primary" density="compact" hide-details
+            label="Open this project when the page loads" />
+          <p class="text-body-small text-medium-emphasis setting-source">
+            Takes priority over the project you last had open; a link that names a project still wins.
+            Turn it off to return to opening the last project.
+          </p>
+        </div>
+      </section>
+
+      <section class="settings-group" aria-labelledby="project-execution">
+        <h3 id="project-execution" class="text-title-small mb-1">Execution</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          Applies at the next start or rotation. Empty fields inherit the platform defaults.
+        </p>
+        <div v-for="key in LAUNCH_SETTING_KEYS" :key="key" class="settings-field">
+          <v-text-field v-model="form.settings[key]" :label="LAUNCH_SETTING_LABELS[key]" :hint="LAUNCH_SETTING_HINTS[key]"
+            persistent-hint :disabled="busy" />
+        </div>
+        <div class="settings-field">
+          <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy"
+            persistent-hint hint="Slack or Matrix thread permalinks. Press Enter after each one." />
+        </div>
+      </section>
+
+      <section class="settings-group" aria-labelledby="project-assistant">
+        <h3 id="project-assistant" class="text-title-small mb-1">Assistant</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          What {{ assistantName }} may decide on its own, and the instructions every new incarnation reads.
+        </p>
+        <div class="settings-field">
+          <v-select v-model="supervisorAuthority" :items="authorityLevels" class="supervisor-authority"
+            :label="`What ${assistantName} may approve for workers`" :disabled="busy" persistent-hint
+            hint="Stamped on each of its messages to this project's workers. No level passes an operator-only gate such as spec approval or a merge." />
+        </div>
+        <v-expansion-panels ref="ordersPanel" v-model="ordersOpen" class="project-orders">
+          <v-expansion-panel title="Standing instructions">
+            <v-expansion-panel-text>
+              <p v-if="orders && !savedInstructions" class="orders-empty text-medium-emphasis mb-3">
+                No standing instructions yet.
+              </p>
+              <v-textarea v-model="instructions" label="Standing instructions" :disabled="busy || !orders"
+                :maxlength="orders?.limit" :counter="orders?.limit" rows="6" />
+              <p class="mb-2">Saved with this project. Each new assistant incarnation reads these instructions.</p>
+              <p class="orders-hint text-body-small text-medium-emphasis mb-2">
+                Usually set by telling {{ assistantName }} in chat — "from now on…", "always…" — and it
+                confirms the wording before storing them.
+              </p>
+              <p v-if="orders?.instructions_at" :title="orders.instructions_at"
+                class="orders-changed text-body-small text-medium-emphasis mb-0">
+                last changed {{ ago(orders.instructions_at, now) }}
+              </p>
+            </v-expansion-panel-text>
+          </v-expansion-panel>
+        </v-expansion-panels>
+      </section>
+
+      <section class="settings-group" aria-labelledby="project-channels">
+        <h3 id="project-channels" class="text-title-small mb-1">Chat channels</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          Bot mentions in these channels route to this project unless they name another one.
+        </p>
+        <div class="settings-field">
+          <v-textarea v-model="channels" class="mention-channels" label="Mention channels" rows="2" auto-grow
+            :disabled="busy || savedChannels === null" persistent-hint spellcheck="false"
+            hint="One per line: a Slack channel ID, #name or link; a Matrix room ID, alias or link." />
+        </div>
+      </section>
+
+      <section class="settings-group" aria-labelledby="project-archive">
+        <h3 id="project-archive" class="text-title-small mb-1">Archive</h3>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          Takes the project out of the switcher and the sidebar. It can be restored from Platform settings.
+        </p>
+        <v-btn color="warning" :disabled="busy" @click="archive">Archive project</v-btn>
+      </section>
     </v-card-text>
   </v-card>
 </template>
 
 <style scoped>
 .project-settings { overflow: visible; }
-.project-color { border: 0; padding: 0; margin: 0; min-width: 0; }
+.project-color { border: 0; padding: 0; min-width: 0; }
+.project-color legend { display: flex; align-items: center; flex-wrap: wrap; padding: 0; }
 .project-actions { position: sticky; top: var(--v-layout-top, 64px); z-index: 1; flex-wrap: wrap; background: rgb(var(--v-theme-surface)); }
 </style>

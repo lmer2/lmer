@@ -35,6 +35,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { mdiRestart } from '@mdi/js'
 import { fetchAssistantConfig, setAssistantConfig } from '../api.js'
+import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
 import { applyChatSettings } from '../operatorChat.js'
 import { assistantName } from '../ratchet.js'
 
@@ -115,20 +116,8 @@ const TICK_SOURCES = {
   ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.api, [spec.group, spec.key]])),
   rotation_context_threshold: ['rotation', 'context_threshold'],
 }
-const SETTING_LABELS = {
-  model: 'Model',
-  harness: 'Harness',
-  preset: 'Preset',
-  agents: 'Fan-out presets',
-  threads: 'Chat threads',
-}
-const SETTING_HINTS = {
-  model: 'The model the session runs, handed to the harness verbatim.',
-  harness: 'Agent harness, for example claude, codex or pi.',
-  preset: 'A named startup preset from the host’s presets file.',
-  agents: 'Comma-separated preset names the session may fan out to.',
-  threads: 'Slack or matrix thread permalinks, one per line.',
-}
+const SETTING_LABELS = { ...LAUNCH_SETTING_LABELS, threads: 'Chat threads' }
+const SETTING_HINTS = { ...LAUNCH_SETTING_HINTS, threads: 'Slack or matrix thread permalinks, one per line.' }
 
 const reply = ref(null)
 const problem = ref(null)
@@ -627,18 +616,3 @@ onBeforeUnmount(() => {
     </v-card>
   </v-dialog>
 </template>
-
-<style scoped>
-.settings-group + .settings-group {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-}
-.settings-field {
-  margin-bottom: 12px;
-}
-.setting-source {
-  margin: 4px 0 0;
-  overflow-wrap: anywhere;
-}
-</style>
