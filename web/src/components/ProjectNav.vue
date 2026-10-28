@@ -12,9 +12,16 @@ const props = defineProps({
   currentKey: { type: String, default: null },
   now: { type: Number, default: () => Date.now() },
   face: { type: Object, default: null },
+  // Only where the section starts; the section owns the state after that, and
+  // `toggle` reports each change for the parent to remember.
+  collapsed: Boolean,
 })
-defineEmits(['chat', 'open'])
-const expanded = ref(true)
+const emit = defineEmits(['chat', 'open', 'toggle'])
+const expanded = ref(!props.collapsed)
+function toggle() {
+  expanded.value = !expanded.value
+  emit('toggle', { id: props.project.id, collapsed: !expanded.value })
+}
 const status = computed(() => {
   const assistant = props.project.assistant
   const lifecycle = (assistant?.lifecycle || 'unavailable').replaceAll('_', ' ')
@@ -34,7 +41,7 @@ const chatLabel = computed(() => `Chat with ${props.project.name} — assistant 
       <button type="button" class="project-toggle" :aria-expanded="expanded"
         :aria-controls="`project-runs-${project.id}`" :aria-label="`${expanded ? 'Collapse' : 'Expand'} ${project.name}`"
         :title="project.name"
-        @click="expanded = !expanded">
+        @click="toggle">
         <v-icon :icon="expanded ? mdiChevronDown : mdiChevronRight" size="18" />
         <span class="project-name">{{ project.name }}</span>
         <span v-if="attention.length" class="project-attention" :aria-label="`${attention.length} need you`">{{ attention.length }}</span>

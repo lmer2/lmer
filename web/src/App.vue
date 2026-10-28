@@ -40,7 +40,7 @@ import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
 } from './format.js'
 import {
-  rememberChoice, rememberFlag, storedChoice, storedFlag,
+  rememberChoice, rememberFlag, rememberId, rememberIds, storedChoice, storedFlag, storedId, storedIds,
 } from './preferences.js'
 import { onRunRef, runKey } from './runref.js'
 
@@ -99,6 +99,43 @@ function rememberFleetView(value) {
 }
 // --- end of fleet view mode --------------------------------------------------
 
+// --- projects this browser comes back to (#627) ------------------------------
+// A page loads on its link's project, else the default, else the last one open.
+// The default is not a platform setting: the platform has one shared secret and no
+// operator identity, so that default would be everyone's.
+const COLLAPSED_PROJECTS_STORAGE_KEY = 'lmer.projects.collapsed'
+const LAST_PROJECT_STORAGE_KEY = 'lmer.project.last'
+const DEFAULT_PROJECT_STORAGE_KEY = 'lmer.project.default'
+
+const collapsedProjects = ref(storedIds(
+  () => window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY),
+))
+const defaultProject = ref(storedId(
+  () => window.localStorage.getItem(DEFAULT_PROJECT_STORAGE_KEY),
+))
+const restoreCandidates = [
+  defaultProject.value,
+  storedId(() => window.localStorage.getItem(LAST_PROJECT_STORAGE_KEY)),
+].filter(Boolean)
+
+function rememberCollapsed({ id, collapsed }) {
+  const others = collapsedProjects.value.filter(
+    (known) => known !== id && projects.value.some((project) => project.id === known),
+  )
+  collapsedProjects.value = collapsed ? [...others, id] : others
+  rememberIds(
+    (value) => window.localStorage.setItem(COLLAPSED_PROJECTS_STORAGE_KEY, value),
+    collapsedProjects.value,
+  )
+}
+
+function setDefaultProject(id) {
+  defaultProject.value = id
+  rememberId(
+    (value) => window.localStorage.setItem(DEFAULT_PROJECT_STORAGE_KEY, value), id,
+  )
+}
+
 const THEME_ICONS = {
   system: mdiThemeLightDark,
   light: mdiWeatherSunny,
@@ -124,7 +161,20 @@ const now = ref(Date.now())
 const view = ref('fleet')
 const selectedKey = ref(null)
 const projects = ref([])
-const activeProject = ref(new URLSearchParams(window.location.search).get('workspace') || '')
+// history.state survives a reload, so it tells the URL this page wrote itself from a
+// link someone followed: only the second is a link, and only a link beats the default.
+const OWN_URL_STATE = 'lmerProjectUrl'
+const urlProject = new URLSearchParams(window.location.search).get('workspace') || ''
+const ownUrl = Boolean(window.history.state?.[OWN_URL_STATE])
+const linkedProject = ownUrl ? '' : urlProject
+// The page's own URL is the last candidate, so a reload still keeps the project
+// when storage remembers nothing.
+if (ownUrl && urlProject) restoreCandidates.push(urlProject)
+const activeProject = ref(linkedProject || restoreCandidates[0] || '')
+// What storage chose; a link is never second-guessed, it gets the unavailable notice.
+const restoredProject = linkedProject ? '' : activeProject.value
+// No "unavailable" notice for a restored id until the first list: a failed fetch is not a dead project.
+const unconfirmedProject = ref(restoredProject)
 const workspace = computed(() => projects.value.find(project => project.id === activeProject.value))
 const projectGroups = computed(() => projects.value.filter(project => !project.archived))
 const projectDialog = ref(false)
@@ -147,10 +197,13 @@ const switcherEvents = {
   settings: () => { projectSettingsFocus.value = null; view.value = 'project-settings' },
   create: () => { projectDialog.value = true },
 }
+const unavailableLabel = computed(() => (
+  activeProject.value === unconfirmedProject.value ? 'Loading project…' : 'Unavailable project'
+))
 const switcherProps = computed(() => ({
   projects: projectGroups.value,
   activeProject: activeProject.value,
-  label: activeProject.value ? workspace.value?.name || 'Unavailable project' : 'All projects',
+  label: activeProject.value ? workspace.value?.name || unavailableLabel.value : 'All projects',
   current: barProject.value,
   attention: projectAttention,
 }))
@@ -289,13 +342,47 @@ watch(uberOpen, (open) => {
   if (open) uberSeen.value = true
   if (open) rememberChat(chatProject.value)
 })
-watch(activeProject, (id) => {
+function showProjectInUrl(id) {
   const url = new URL(window.location.href)
   if (id) url.searchParams.set('workspace', id)
   else url.searchParams.delete('workspace')
-  window.history.replaceState({}, '', url)
+  window.history.replaceState({ [OWN_URL_STATE]: true }, '', url)
+}
+function rememberLastProject(id) {
+  rememberId((value) => window.localStorage.setItem(LAST_PROJECT_STORAGE_KEY, value), id)
+}
+// Not immediate, so the restore at load is not recorded as a visit: clearing the
+// default must bring back what the operator last chose, not what the default loaded.
+let skipLastWrite = false
+watch(activeProject, (id) => {
+  showProjectInUrl(id)
+  if (skipLastWrite) skipLastWrite = false
+  else rememberLastProject(id)
   if (id && uberOpen.value) { chatProject.value = id; rememberChat(id) }
 })
+
+let projectsSettled = false
+function settleRestoredProject() {
+  if (projectsSettled) return
+  projectsSettled = true
+  unconfirmedProject.value = ''
+  const live = (id) => projectGroups.value.some((project) => project.id === id)
+  // A followed link is a visit; a stored id that is not live is skipped, and the
+  // stored last project is left alone for when it is live again.
+  if (linkedProject) {
+    if (live(linkedProject) && activeProject.value === linkedProject) rememberLastProject(linkedProject)
+    return
+  }
+  const restored = restoredProject
+  if (!restored || activeProject.value !== restored) return
+  if (live(restored)) {
+    showProjectInUrl(restored)
+    return
+  }
+  skipLastWrite = true
+  activeProject.value = restoreCandidates.find(live) || ''
+  if (chatProject.value === restored) chatProject.value = activeProject.value
+}
 
 let poll = null
 let tick = null
@@ -704,6 +791,7 @@ function load() {
       previousRunStates.value = next
       justFinishedByProject.value = finished
       projects.value = (await fetchProjects()).projects
+      settleRestoredProject()
       if (uberOpen.value) rememberChat(chatProject.value)
       fleetOnline.value = true
       error.value = null
@@ -992,7 +1080,8 @@ onUnmounted(() => {
       <ProjectNav v-for="project in projectGroups" :key="project.id" :project="project"
         :selected="project.id === activeProject" :runs="projectRuns(project.id)" :attention="projectAttention(project.id)"
         :current-key="view === 'detail' && selected?.workspace_id === project.id ? selectedKey : null" :now="now"
-        :face="projectFaces[project.id]" @open="open" @chat="showProjectChat" />
+        :face="projectFaces[project.id]" :collapsed="collapsedProjects.includes(project.id)"
+        @open="open" @chat="showProjectChat" @toggle="rememberCollapsed" />
       <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs">
         <h2 class="text-title-small pa-3">Unassigned</h2>
         <RunNav :runs="unassignedRuns" :attention="unassignedAttention"
@@ -1031,12 +1120,14 @@ onUnmounted(() => {
 
     <v-main>
       <v-container max-width="900" class="pa-3">
-        <v-alert v-if="!loading && activeProject && (!workspace || workspace.archived)" type="warning" class="mb-3">
+        <v-alert v-if="!loading && activeProject && activeProject !== unconfirmedProject && (!workspace || workspace.archived)"
+          type="warning" class="mb-3">
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
         </v-alert>
         <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
-          :project="workspace" :focus="projectSettingsFocus" :now="now" @changed="load" @close="view = 'fleet'"
-          @focused="projectSettingsFocus = null" />
+          :project="workspace" :focus="projectSettingsFocus" :now="now" :is-default="defaultProject === workspace.id"
+          @changed="load" @close="view = 'fleet'" @focused="projectSettingsFocus = null"
+          @default="setDefaultProject" />
         <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail

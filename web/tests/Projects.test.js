@@ -1172,5 +1172,279 @@ it('labels project execution overrides readably and says what an empty one inher
   const labels = wrapper.findAll('.v-field-label, label.v-label').map(node => node.text())
   for (const label of ['Model', 'Harness', 'Preset', 'Fan-out presets']) expect(labels).toContain(label)
   for (const raw of ['model', 'harness', 'preset', 'agents']) expect(labels).not.toContain(raw)
-  expect(wrapper.text()).toContain('Empty inherits the platform default.')
+  expect(wrapper.text()).toContain('Empty fields inherit the platform defaults.')
+})
+
+it('groups project settings into titled sections, each saying what it applies to', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const sections = wrapper.findAll('section.settings-group')
+  expect(sections.map(section => section.get('h3').text()))
+    .toEqual(['Identity', 'This browser', 'Execution', 'Assistant', 'Chat channels', 'Archive'])
+  for (const section of sections) {
+    expect(section.get('h3').attributes('id')).toBe(section.attributes('aria-labelledby'))
+    expect(section.get('p').text().length).toBeGreaterThan(20)
+  }
+  const topActions = wrapper.get('.project-actions').findAll('button').map(button => button.text())
+  expect(topActions).toEqual(['Save project', 'Close'])
+  expect(sections.at(-1).findAll('button').map(button => button.text())).toEqual(['Archive project'])
+})
+
+it('remembers which projects were collapsed across a reload, keyed by project id', async () => {
+  const first = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  const toggle = (wrapper, index) => wrapper.findAllComponents(ProjectNav)[index].get('.project-toggle')
+  await toggle(first, 0).trigger('click')
+  expect(toggle(first, 0).attributes('aria-expanded')).toBe('false')
+  expect(JSON.parse(window.localStorage.getItem('lmer.projects.collapsed'))).toEqual(['alpha'])
+  first.unmount()
+
+  const second = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(toggle(second, 0).attributes('aria-expanded')).toBe('false')
+  expect(toggle(second, 1).attributes('aria-expanded')).toBe('true')
+  await toggle(second, 0).trigger('click')
+  expect(JSON.parse(window.localStorage.getItem('lmer.projects.collapsed'))).toEqual([])
+})
+
+it('renders every project expanded when the stored collapse list is unusable or storage throws', async () => {
+  window.localStorage.setItem('lmer.projects.collapsed', '{"alpha":true}')
+  const garbled = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(garbled.findAllComponents(ProjectNav).map(nav => nav.get('.project-toggle').attributes('aria-expanded')))
+    .toEqual(['true', 'true'])
+  garbled.unmount()
+
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const failures = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+    await flushPromises()
+    const navs = wrapper.findAllComponents(ProjectNav)
+    expect(navs).toHaveLength(2)
+    await navs[0].get('.project-toggle').trigger('click')
+    expect(navs[0].get('.project-toggle').attributes('aria-expanded')).toBe('false')
+    expect(failures).not.toHaveBeenCalled()
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+    failures.mockRestore()
+  }
+})
+
+const switcherLabel = wrapper => wrapper.get('.project-switcher').text()
+
+it('reopens the project last viewed, and writes it only when the operator moves', async () => {
+  const first = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(first)).toBe('All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBeNull()
+  await chooseProject(first, 'Beta')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  first.unmount()
+
+  const second = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(second)).toBe('Beta')
+  expect(window.location.search).toBe('?workspace=beta')
+  await chooseProject(second, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  second.unmount()
+
+  const third = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(third)).toBe('All projects')
+})
+
+it('skips a remembered project that is gone or archived, and keeps it stored for when it returns', async () => {
+  window.localStorage.setItem('lmer.project.last', 'gone')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('All projects')
+  expect(window.location.search).toBe('')
+  expect(wrapper.find('.v-alert').exists()).toBe(false)
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('gone')
+  wrapper.unmount()
+
+  api.fetchProjects.mockResolvedValue({ projects: [...projects, { id: 'old', name: 'Old', archived: true }] })
+  window.localStorage.setItem('lmer.project.default', 'old')
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const fallback = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(fallback)).toBe('Beta')
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('old')
+})
+
+it('does not call a remembered project unavailable when the project list cannot be fetched', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  api.fetchProjects.mockRejectedValue(new Error('daemon down'))
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(wrapper.text()).not.toContain('This project link is unavailable or archived.')
+})
+
+it('records a project opened from a link as the last viewed one, once it is confirmed live', async () => {
+  window.localStorage.setItem('lmer.project.last', 'alpha')
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  wrapper.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=gone')
+  const dead = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  dead.unmount()
+})
+
+it('lets a link win over the remembered project and shows its own notice for a dead link', async () => {
+  window.localStorage.setItem('lmer.project.default', 'alpha')
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+  wrapper.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=gone')
+  const dead = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(dead)).toBe('Unavailable project')
+  expect(dead.text()).toContain('This project link is unavailable or archived.')
+})
+
+it('opens the default project on every load, over the last viewed, until it is cleared', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+  await chooseProject(wrapper, 'Project settings for Beta')
+  const flag = () => wrapper.getComponent(ProjectSettings).get('.project-default input')
+  expect(flag().element.checked).toBe(false)
+  await chooseProject(wrapper, 'Alpha research and development')
+  await chooseProject(wrapper, 'Project settings for Alpha research and development')
+  await flag().setValue(true)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('alpha')
+  expect(flag().element.checked).toBe(true)
+  await chooseProject(wrapper, 'Beta')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  wrapper.unmount()
+
+  const reloaded = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  await chooseProject(reloaded, 'Project settings for Alpha research and development')
+  await reloaded.getComponent(ProjectSettings).get('.project-default input').setValue(false)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('')
+  reloaded.unmount()
+
+  const cleared = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(cleared)).toBe('Beta')
+})
+
+it('renders and switches projects when storage refuses every read and write', async () => {
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const failures = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+    await flushPromises()
+    expect(switcherLabel(wrapper)).toBe('All projects')
+    await chooseProject(wrapper, 'Beta')
+    expect(switcherLabel(wrapper)).toBe('Beta')
+    await chooseProject(wrapper, 'Project settings for Beta')
+    await wrapper.getComponent(ProjectSettings).get('.project-default input').setValue(true)
+    expect(wrapper.getComponent(ProjectSettings).get('.project-default input').element.checked).toBe(true)
+    expect(failures).not.toHaveBeenCalled()
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+    failures.mockRestore()
+  }
+})
+
+const mountApp = async () => {
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  return wrapper
+}
+
+it('treats the URL the app wrote itself as its own on a reload, but a link someone followed as a link', async () => {
+  window.localStorage.setItem('lmer.project.default', 'alpha')
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const first = await mountApp()
+  expect(switcherLabel(first)).toBe('Alpha research and development')
+  expect(window.location.search).toBe('?workspace=alpha')
+  first.unmount()
+
+  const reloaded = await mountApp()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  reloaded.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const linked = await mountApp()
+  expect(switcherLabel(linked)).toBe('Beta')
+  linked.unmount()
+  const relinked = await mountApp()
+  expect(switcherLabel(relinked)).toBe('Beta')
+})
+
+it('keeps the current project across a reload through the URL when storage refuses everything', async () => {
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const first = await mountApp()
+    await chooseProject(first, 'Beta')
+    first.unmount()
+    const reloaded = await mountApp()
+    expect(switcherLabel(reloaded)).toBe('Beta')
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+  }
+})
+
+it('does not write a remembered project into the URL before the project list confirms it', async () => {
+  window.localStorage.setItem('lmer.project.last', 'gone')
+  api.fetchProjects.mockRejectedValue(new Error('daemon down'))
+  const failed = await mountApp()
+  expect(window.location.search).toBe('')
+  failed.unmount()
+
+  api.fetchProjects.mockResolvedValue({ projects })
+  const reloaded = await mountApp()
+  expect(switcherLabel(reloaded)).toBe('All projects')
+  expect(reloaded.text()).not.toContain('This project link is unavailable or archived.')
+})
+
+it('labels a remembered project neutrally until the first project list arrives', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const pending = deferred()
+  api.fetchProjects.mockReturnValue(pending.promise)
+  const wrapper = await mountApp()
+  expect(switcherLabel(wrapper)).toBe('Loading project…')
+  pending.resolve({ projects })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+})
+
+it('does not record a followed link as last viewed once the operator has moved away', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  window.history.replaceState({}, '', '/?workspace=alpha')
+  const pending = deferred()
+  api.fetchProjects.mockReturnValue(pending.promise)
+  const wrapper = await mountApp()
+  await chooseProject(wrapper, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  pending.resolve({ projects })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
 })

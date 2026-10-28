@@ -493,6 +493,15 @@ ALLOWED_STORAGE_KEYS = {
     # preference for that one pane, default shown; run-view and run-list strips are
     # not governed by it, and hiding it fetches nothing less.
     "ASSISTANT_STRIP_STORAGE_KEY",
+    # Which projects this browser has folded in the sidebar, as a JSON list of
+    # project ids (#627). Per browser, like the view preferences above: an operator
+    # who folds a project has no run or session to hang that on.
+    "COLLAPSED_PROJECTS_STORAGE_KEY",
+    # The project last open, and the project this browser opens on every load
+    # (#627). Candidates only: one that names no live project is skipped when the
+    # project list arrives.
+    "LAST_PROJECT_STORAGE_KEY",
+    "DEFAULT_PROJECT_STORAGE_KEY",
 }
 
 

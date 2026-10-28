@@ -73,3 +73,25 @@ export function storedFlag(read, fallback) {
 export function rememberFlag(write, value) {
   guarded(() => write(value ? FLAG_ON : FLAG_OFF))
 }
+
+// A remembered id, such as a project's. It is only a candidate: whether it still
+// names anything is for the caller to check against what exists now.
+export function storedId(read) {
+  const stored = guarded(read, null)
+  return typeof stored === 'string' ? stored : ''
+}
+
+export function rememberId(write, value) {
+  guarded(() => write(value || ''))
+}
+
+// A remembered set of ids, kept as JSON. Entries that are not strings are dropped,
+// and anything that is not a list reads back as empty.
+export function storedIds(read) {
+  const stored = guarded(() => JSON.parse(read()), null)
+  return Array.isArray(stored) ? stored.filter((id) => typeof id === 'string') : []
+}
+
+export function rememberIds(write, ids) {
+  guarded(() => write(JSON.stringify(ids)))
+}
