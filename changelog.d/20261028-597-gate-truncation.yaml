@@ -1,0 +1,2 @@
+fixed:
+- "gate-check capped finding lists now state how many were dropped, and the full Security Check list is written to /tmp/gate-check.log."
