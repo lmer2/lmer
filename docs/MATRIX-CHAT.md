@@ -656,6 +656,114 @@ slice 1 only ever needs new messages.
 
 ---
 
+## Encrypted threads
+
+The thread connector (`lmer chat <permalink>`, `lmer-ctl threads connect`) and
+the host's thread verbs (`lmer-signal read`, `post --thread`, `thread open`,
+`dm`) work in an end-to-end encrypted room **by borrowing this bridge's
+device**. They never hold keys of their own.
+
+### Why the bridge, and only the bridge
+
+A device belongs to one user, and one process has to own it. mautrix keeps the
+Olm account and Olm sessions in process memory. A second process writing the
+same store would desynchronise the ratchets and lose one-time keys, and room
+keys would then stop arriving with no error anywhere. Room keys for the bridge's
+device also arrive only on the homeserver's pushes to the appservice, not on
+`/sync`. So the bridge does the crypto and the others ask it, over
+`/_lmer/crypto/v1/` on the bridge's own listener: encrypt, decrypt, and the
+attachment ciphers. The device, store and recovery-key export are the ones in
+the section above. There is no second key set.
+
+### Setting it up
+
+The connector and the thread verbs must act **as the bridge's appservice user**.
+In the daemon's (or host `lmer`'s) environment, usually `~/.lmer/.env`:
+
+```bash
+LMER_MATRIX_HOMESERVER=https://matrix.example.org
+LMER_MATRIX_USER_ID=@lmer-<name>:<server_name>   # the bridge's sender, from `name`
+LMER_MATRIX_ACCESS_TOKEN=<the bridge's as_token>  # LMER_MATRIX_AS_TOKEN's value
+LMER_MATRIX_BRIDGE_URL=http://127.0.0.1:29331     # where *this host* reaches the bridge
+```
+
+`LMER_MATRIX_BRIDGE_URL` is the bridge's listener as seen from the host: the
+`PublishPort=` address of the container deployment (§5), or `bind_address` and
+`bind_port` for a host-run bridge. It is host-only and never enters a session
+container. The bridge must be running. Without it, an encrypted thread fails to
+connect or retries, and a plaintext room is unaffected.
+
+The bearer for the crypto API is the `as_token`, so any other token is answered
+`401`, and the connector reports that by name. Whoever holds the `as_token` could
+already act as this user. What the API adds is this device's **room keys**,
+meaning it can decrypt what the bridge can. The homeserver holds the `as_token`
+in the bridge's registration and knows the listener's URL, so whoever
+administers the homeserver can read these rooms too; that matters little when
+you run the homeserver yourself. If `url` puts the listener behind a
+reverse proxy, you may also deny `/_lmer/` there; the host reaches the bridge
+directly.
+
+### The first time, in Element
+
+1. Invite the bridge's user (`@lmer-<name>:<server_name>`) to the room. lmer
+   joins nothing by itself.
+2. Leave its session **unverified**. The bridge accepts unverified devices and
+   shares keys with them, the same rule as the allowlist ("trust is the
+   allowlist's job"). Element sends room keys to unverified sessions unless
+   *Never send encrypted messages to unverified sessions* is on, either in
+   Security & Privacy or in the room's settings. Turn that off for this room,
+   or verify the session. The bridge's device is not cross-signed, so the same
+   applies to any client that sends keys only to verified or cross-signed
+   devices.
+3. Messages from before the bot joined stay unreadable to it. Megolm shares
+   forward only (#395).
+
+### What the connector does with what it cannot read
+
+- **A live reply whose key has not arrived yet is held, not dropped.** It is
+  retried on every sync, survives a connector restart, and is relayed once the
+  key lands. After 10 minutes it is given up and logged as
+  `matrix_connector_undecryptable_dropped` with the sender, so it is not posted
+  to the thread. Ask the person to send it again. At most 200 replies are held
+  at once, and past that the oldest is given up first.
+- **Replies that arrive while the bridge is unreachable at the moment a room
+  turns encryption on** are held until it answers, however long that takes.
+  The 10 minutes start only then. The 200 cap still applies. Sends into the
+  room are retried until it answers too, so nothing goes out in the clear.
+- **History** that will not decrypt when the connector attaches is left out of
+  the attach notice's count and not waited for, whether its key never reached
+  the bridge or is merely late.
+  A thread **read** shows it as `[an encrypted message lmer cannot decrypt]`.
+- **Files** go up as ciphertext with the key in the event, and inbound
+  encrypted files are decrypted into the session's upload store.
+  `LMER_MATRIX_AUTHENTICATED_MEDIA` still gates the agent's outbound files.
+- Nothing is sent in the clear into a room lmer knows is encrypted. With no
+  bridge, with a bridge that cannot encrypt, or with a bridge owned by another
+  user, the send or the connection is refused. A send the bridge could not
+  encrypt never reached the homeserver, so the connector retries it rather than
+  asking for manual recovery.
+- An encrypted upload carries no filename to the media repository. The name is
+  only inside the encrypted event.
+
+### Limits
+
+- The platform's mention ingress (`LMER_MATRIX_ROOMS`, docs/ASSISTANT-MENTIONS.md)
+  does not decrypt. Mentions in encrypted rooms are not seen.
+- The bridge's group session goes to the members joined or invited when it is
+  created, and is not re-shared or rotated when membership changes (#395).
+  Someone who joins later cannot read the bot's messages until the session
+  rotates, and a member who leaves can still read them until then.
+- A room that turns on encryption *after* a connector has connected is noticed
+  when the room's `m.room.encryption` state arrives in the connector's sync.
+  From then on the connector borrows the bridge, or refuses its sends and logs
+  `matrix_connector_encrypted_event`. An `m.room.encrypted` event in a room
+  whose state says plaintext is skipped and logged; it does not switch the
+  room. The thread verbs ask the room's state each time they run.
+- Posts come from `@lmer-<name>`. That is the account the room sees for every
+  lmer session, as it already was for the bot account the connector used before.
+
+---
+
 ## Attachments
 
 The bridge may attach a file to a thread, and refuses unless **all three** hold:

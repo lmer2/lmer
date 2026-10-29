@@ -60,9 +60,12 @@ class FakeSlack:
 
 
 class FakeMatrix:
-    def __init__(self, *, existing=None, encrypted=False):
+    def __init__(self, *, existing=None, encrypted=False, can_encrypt=False):
         self.existing = existing
         self.encrypted = encrypted
+        #: Whether the client borrows lmer-matrix-bridge's device (#478); the
+        #: encryption itself is MatrixClient's, pinned in test_matrix_crypto_api.
+        self.can_encrypt = can_encrypt
         self.calls = []
         self.sent = []
 
@@ -277,8 +280,15 @@ class TestMatrixDelivery:
         with pytest.raises(ThreadError) as caught:
             thread_access.send_dm(
                 "@someone:example.org", "hi", env=env("@someone:example.org"), client=matrix)
-        assert "encrypted" in str(caught.value)
+        assert "encrypted" in str(caught.value) and "LMER_MATRIX_BRIDGE_URL" in str(caught.value)
+        assert "docs/MATRIX-CHAT.md" in str(caught.value)
         assert matrix.sent == []
+
+    def test_an_encrypted_matrix_room_is_used_when_the_bridge_lends_its_device(self):
+        matrix = FakeMatrix(existing="!dm:example.org", encrypted=True, can_encrypt=True)
+        thread_access.send_dm(
+            "@someone:example.org", "hi", env=env("@someone:example.org"), client=matrix)
+        assert matrix.sent == [("!dm:example.org", {"msgtype": "m.text", "body": "hi"})]
 
     def test_a_malformed_matrix_id_is_refused_before_a_room_is_made(self):
         matrix = FakeMatrix()

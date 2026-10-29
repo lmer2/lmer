@@ -114,6 +114,8 @@ class FakeMatrix:
     def joined_rooms(self):
         return list(self.joined)
 
+    encrypts = room_is_encrypted
+
     def send_message(self, room_id, content):
         """A root event, which `open` sends rather than `send_thread_text`. Its
         stamp is recorded like every other send's: a root nothing attributes is

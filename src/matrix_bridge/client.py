@@ -86,6 +86,18 @@ class MatrixClientError(RuntimeError):
     """The bridge cannot do this, and says which precondition failed."""
 
 
+class CryptoUnavailable(MatrixClientError):
+    """The crypto store is not open, so nothing can be encrypted or decrypted."""
+
+
+class SessionMissing(RuntimeError):
+    """This device holds no room key for the event yet."""
+
+
+class Undecryptable(RuntimeError):
+    """The event or file will not decrypt, now or later."""
+
+
 @dataclass(frozen=True)
 class UploadDecision:
     """Whether an attachment may be sent, and what to say if it may not.
@@ -348,6 +360,28 @@ class Homeserver:
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         """Deliver inbound room events to *callback*."""
+        raise NotImplementedError
+
+    # --- the crypto lent to other processes (matrix_bridge.crypto_api) -------
+
+    async def crypto_identity(self) -> dict:
+        """``{"user_id", "device_id"}`` of the device; raises :class:`CryptoUnavailable`."""
+        raise NotImplementedError
+
+    async def encrypt_content(self, room_id: str, event_type: str, content: dict) -> dict:
+        """Megolm content for *room_id*; raises rather than return cleartext."""
+        raise NotImplementedError
+
+    async def decrypt_event(self, event: dict) -> dict:
+        """The plaintext event; raises :class:`SessionMissing` or :class:`Undecryptable`."""
+        raise NotImplementedError
+
+    async def encrypt_attachment(self, data: bytes) -> tuple:
+        """``(ciphertext, file)`` — *file* is the event's ``file`` object without ``url``."""
+        raise NotImplementedError
+
+    async def decrypt_attachment(self, data: bytes, file: dict) -> bytes:
+        """The plaintext; raises :class:`Undecryptable`."""
         raise NotImplementedError
 
     async def aclose(self) -> None:
@@ -656,6 +690,7 @@ class MautrixHomeserver(Homeserver):
         self._database = None
         self._store = None
         self._ssss_key = None
+        self._share_locks: dict = {}
         self._callback: Optional[Callable[[Any], Any]] = None
 
     async def open_store(self, path: Path, *, restore: bool) -> None:
@@ -848,7 +883,13 @@ class MautrixHomeserver(Homeserver):
         return await self._send_encrypted(room_id, content)
 
     async def listen(self, host: str, port: int) -> None:
-        await self._appservice().start(host, port)
+        # deferred: cycle — crypto_api imports this module
+        from matrix_bridge import crypto_api
+
+        appservice = self._appservice()
+        # Before start(): aiohttp freezes the router when the app starts.
+        crypto_api.register(appservice.app, self, token=self._secrets.as_token)
+        await appservice.start(host, port)
         self._listening = True
         logger.info("matrix_appservice_listening host=%s port=%s", host, port)
 
@@ -934,39 +975,117 @@ class MautrixHomeserver(Homeserver):
         """Encrypt and send, sharing the group session when there is not one.
 
         The retry is not defensive coding: ``encrypt_megolm_event`` raises
-        ``EncryptionError`` precisely when the room has no current outbound
-        session — a new room, a rotated session, a member who just joined — and
-        sharing then retrying is the documented answer (``mautrix``' own
-        bridge does exactly this).
+        ``EncryptionError`` precisely when the store holds no outbound session
+        for the room — the first send into it, since nothing here discards one
+        (``handle_member_event`` is not wired, #395) — and sharing then
+        retrying is the documented answer (``mautrix``' own bridge does exactly
+        this).
         """
         # deferred: optional dependency — mautrix ships in the `matrix` extra
-        from mautrix.errors import EncryptionError
         from mautrix.types import EventType
 
-        client = self._appservice_client()
-        if self._crypto is None or not await self.room_is_encrypted(room_id):
+        encrypted = await self._encrypt(room_id, EventType.ROOM_MESSAGE, content)
+        return await self._appservice_client().send_message_event(
+            room_id, EventType.ROOM_ENCRYPTED, encrypted,
+        )
+
+    async def _encrypt(self, room_id: str, event_type, content):
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.errors import EncryptionError
+        from mautrix.types import Membership
+
+        if self._crypto is None:
+            raise CryptoUnavailable(
+                f"refusing to send into {room_id} unencrypted: the crypto store is not open"
+            )
+        if not await self.room_is_encrypted(room_id):
             # Never a fallback. An unencrypted send here is the leak the whole
             # design forbids, and it would happen silently at exactly the
             # moment something else had already gone wrong (!243 review).
             raise MatrixClientError(
-                f"refusing to send into {room_id} unencrypted: "
-                + ("the crypto store is not open" if self._crypto is None
-                   else "the room is not encrypted")
+                f"refusing to send into {room_id} unencrypted: the room is not encrypted"
             )
+        try:
+            return await self._crypto.encrypt_megolm_event(room_id, event_type, content)
+        except EncryptionError:
+            pass
+        # mautrix refuses a second concurrent share for a room, and the crypto
+        # API serves several connectors at once.
+        async with self._share_locks.setdefault(room_id, asyncio.Lock()):
+            try:
+                return await self._crypto.encrypt_megolm_event(room_id, event_type, content)
+            except EncryptionError:
+                # Invited too, as mautrix's own bridge does: a DM goes out
+                # before its recipient has accepted.
+                members = await self._appservice_client().get_members(room_id)
+                await self._crypto.share_group_session(room_id, [
+                    member.state_key for member in members
+                    if member.content.membership in (Membership.JOIN, Membership.INVITE)
+                ])
+            return await self._crypto.encrypt_megolm_event(room_id, event_type, content)
+
+    # --- matrix_bridge.crypto_api ---------------------------------------------
+
+    async def crypto_identity(self) -> dict:
+        if self._crypto is None:
+            raise CryptoUnavailable("the bridge's crypto store is not open yet")
+        return {"user_id": self.config.sender, "device_id": self._crypto_client.device_id}
+
+    async def encrypt_content(self, room_id: str, event_type: str, content: dict) -> dict:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.types import EventType
+
+        kind = EventType.find(event_type, t_class=EventType.Class.MESSAGE)
+        encrypted = await self._encrypt(room_id, kind, content)
+        return encrypted.serialize()
+
+    async def decrypt_event(self, event: dict) -> dict:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.errors import SessionNotFound
+        from mautrix.types import EncryptedEvent
+
+        if self._crypto is None:
+            raise CryptoUnavailable("the bridge's crypto store is not open yet")
+        try:
+            encrypted = EncryptedEvent.deserialize(event)
+        except Exception as exc:
+            raise Undecryptable(f"not an encrypted event: {exc}") from None
+        try:
+            plain = (await self._crypto.decrypt_megolm_event(encrypted)).serialize()
+        except SessionNotFound:
+            raise SessionMissing(encrypted.content.session_id) from None
+        except Exception as exc:
+            # The class only: a payload that fails to parse is quoted in the
+            # message, and that is plaintext a sender chose.
+            raise Undecryptable(f"the event did not decrypt ({exc.__class__.__name__})") from None
+        # Only the event's own fields: the library adds a trust annotation
+        # that is neither JSON nor anyone else's business.
+        return {key: plain[key] for key in (
+            "room_id", "event_id", "sender", "origin_server_ts", "type", "content", "unsigned",
+        ) if key in plain}
+
+    async def encrypt_attachment(self, data: bytes) -> tuple:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.crypto.attachments import encrypt_attachment
+
+        ciphertext, keys = encrypt_attachment(data)
+        file = keys.serialize()
+        file.pop("url", None)
+        return ciphertext, file
+
+    async def decrypt_attachment(self, data: bytes, file: dict) -> bytes:
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.crypto.attachments import decrypt_attachment
+        from mautrix.errors import DecryptionError
+        from mautrix.types import EncryptedFile
 
         try:
-            encrypted = await self._crypto.encrypt_megolm_event(
-                room_id, EventType.ROOM_MESSAGE, content,
-            )
-        except EncryptionError:
-            members = await client.get_joined_members(room_id)
-            await self._crypto.share_group_session(room_id, list(members))
-            encrypted = await self._crypto.encrypt_megolm_event(
-                room_id, EventType.ROOM_MESSAGE, content,
-            )
-        return await client.send_message_event(
-            room_id, EventType.ROOM_ENCRYPTED, encrypted,
-        )
+            keys = EncryptedFile.deserialize(file)
+            return decrypt_attachment(data, keys.key.key, keys.hashes["sha256"], keys.iv)
+        except DecryptionError as exc:
+            raise Undecryptable(str(exc)) from None
+        except Exception as exc:
+            raise Undecryptable(f"not an encrypted file: {exc}") from None
 
     async def _ssss(self):
         """The SSSS machine and the key the recovery passphrase unlocks.

@@ -215,6 +215,27 @@ def test_pre_receipt_checkpoints_still_restore(receipts):
     assert rig.connector._receipt_pending == {}
 
 
+def test_pre_e2ee_matrix_checkpoints_still_restore(tmp_path):
+    rig = MatrixRig(tmp_path)
+    rig.connector._bus_poll_seconds = 0
+    rig.connector._inbound_once()
+    old = rig.connector
+    path = checkpoint_path(old._lease.key, old._state.session)
+    assert old.stop(timeout=30, announce=False)
+    saved = json.loads(path.read_text())
+    saved["transport"].pop("_undecrypted")
+    path.write_text(json.dumps(saved))
+    rig.connector = type(old)(old.config, bus_client=rig.bus, matrix=rig.matrix)
+    try:
+        rig.connector._ensure_ready()
+        assert rig.connector._state.session == old._state.session
+        assert rig.connector._undecrypted == {}
+    finally:
+        assert rig.connector.stop(timeout=30, announce=False)
+        rig.bus._session._http.close()
+        rig.log.close()
+
+
 def test_reaction_failure_does_not_block_delivery_or_post_a_bubble(receipts, monkeypatch, caplog):
     channel, rig = receipts
     receive(channel, rig)
