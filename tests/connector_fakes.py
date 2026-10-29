@@ -127,6 +127,7 @@ class Remote:
             while mode() == "join-block": time.sleep(.01)
         return conversation
     def room_is_encrypted(self, room): return False
+    def encrypts(self, room): return False
     def get_replies(self, room, thread, oldest=None):
         if mode() == "inbound-fail": raise RuntimeError("injected persistent inbound failure")
         result = [{"ts": thread_root, "text": "root", "user": "U1"}]
