@@ -557,6 +557,25 @@ export function uploadSessionFile(sessionId, { name, data, workspaceId }) {
   })
 }
 
+// Send Privately (issue 510). The text becomes a 0400 file in the session's store;
+// the reply's `reference` is the only thing that goes into the chat.
+export function sendPrivately(sessionId, { text, workspaceId }) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/private`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ text, workspace_id: workspaceId }),
+  })
+}
+
+// Deletes a private file whose reference never reached the session.
+export function withdrawPrivate(sessionId, name, workspaceId) {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''
+  return request(
+    `api/sessions/${encodeURIComponent(sessionId)}/private/${encodeURIComponent(name)}${query}`,
+    { method: 'DELETE' },
+  )
+}
+
 // Where the browser reads one back — an `<img>` src, so it is a URL rather than a
 // fetch. Resolved against the document like every other path here, so the UI keeps
 // working behind a reverse proxy on a subpath; the browser attaches the same

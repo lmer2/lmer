@@ -3298,6 +3298,12 @@ def record_exit(session_id: str, code: Optional[int]) -> None:
     session whose container exited while no daemon was up
     (:mod:`lmer_platform.reattach`)."""
     clean = code == 0
+    # Clean or crashed, the session can no longer use its Send Privately files
+    # (#510), and the crash evidence a kept entry preserves does not include them.
+    try:
+        uploads.discard_private(session_id)
+    except Exception as exc:  # noqa: BLE001 - the detector's sweep retries it
+        logger.warning("platform_private_discard_failed id=%s error=%s", session_id, exc)
     append_event(
         "session_exited",
         note=session_id,

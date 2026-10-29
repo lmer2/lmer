@@ -320,7 +320,7 @@ from lmer_cli import runref
 
 from . import (
     ask, assistant, checkin, comms, nudge, registry, rotation, runs, stall, statusline,
-    teardown, transcripts,
+    teardown, transcripts, uploads,
 )
 from .api import build_state
 from . import config as config_module
@@ -1545,6 +1545,15 @@ class Detector:
             self._absorb("signals", exc)
         else:
             self._clear("signals")
+
+        # Send Privately files of every session that is no longer live (#510);
+        # ``spawn.record_exit`` deletes them sooner for an exit it watched.
+        try:
+            uploads.sweep_private()
+        except Exception as exc:  # noqa: BLE001 - one failed stage must not stop detection
+            self._absorb("private", exc)
+        else:
+            self._clear("private")
 
         try:
             self._pending_teardowns.update(teardown.sweep(self.config.stuck_teardown_seconds))

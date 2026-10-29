@@ -2400,7 +2400,7 @@ def create_app(
     """
     # deferred: import cost — fastapi adds ~320 ms; anyio, starlette.requests and GZipMiddleware ~58 ms together
     import anyio
-    from fastapi import Depends, FastAPI, Header, HTTPException, Query
+    from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
         FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
     )
@@ -2718,7 +2718,10 @@ def create_app(
             "  POST /api/sessions/{id}/uploads      store one {name,data:base64};\n"
             "                                       the reply's `reference` is the\n"
             "                                       line to put in the message\n"
-            "  GET  /api/sessions/{id}/uploads/{name}  read one back\n\n"
+            "  GET  /api/sessions/{id}/uploads/{name}  read one back\n"
+            "  POST /api/sessions/{id}/private      Send Privately {text}; 0400\n"
+            "                                       file, reply's `reference` only\n"
+            "  DELETE /api/sessions/{id}/private/{name}  withdraw an undelivered one\n\n"
             "Stored host-side and bind-mounted into the container, because the\n"
             "input route types bytes at a PTY and has nowhere for a file. A\n"
             "session started before this existed has no store and is told so.\n\n"
@@ -4115,6 +4118,67 @@ def create_app(
                 "Content-Disposition": f'{disposition}; filename="{stored}"',
             },
         )
+
+    # Send Privately (issue #510): the operator's text becomes a 0400 file in the
+    # session's own store and the reply carries only a reference line, which the
+    # client sends like an attachment's. ``body`` is typed ``object`` so a
+    # malformed body is refused here, in words that never repeat it, rather than
+    # by a validation error that echoes the input back.
+
+    def _private_caller(caller: Caller) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(
+                status_code=403,
+                detail="Send Privately is for the operator; this credential cannot use it",
+            )
+
+    @app.post(
+        "/api/sessions/{session_id}/private", dependencies=guard, status_code=201
+    )
+    def session_private(
+        session_id: str,
+        body: object = Body(default=None),
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Store private text for a live session and say how to refer to it."""
+        _private_caller(caller)
+        try:
+            entry = session_io.require_session(session_id)
+            live = session_io.session_is_live(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        if not live:
+            raise HTTPException(
+                status_code=410,
+                detail="this session has exited, so nothing was sent to it",
+            )
+        try:
+            stored = uploads.store_private(
+                session_id,
+                entry,
+                body.get("text") if isinstance(body, dict) else None,
+                max_bytes=upload_settings()["max_bytes"].value,
+            )
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return stored.to_dict()
+
+    @app.delete(
+        "/api/sessions/{session_id}/private/{name}", dependencies=guard
+    )
+    def session_private_withdraw(
+        session_id: str, name: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Delete a private file whose reference never reached the session."""
+        _private_caller(caller)
+        try:
+            entry = session_io.require_session(session_id)
+            withdrawn = uploads.withdraw_private(session_id, entry, name)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"session": session_id, "name": name, "withdrawn": withdrawn}
 
     # --- ending one session (spec §7.5 / D22, T27) ---------------------------
     #

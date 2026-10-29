@@ -826,6 +826,10 @@ class TestOldPathCompatibility:
         hub.subscribe(session)
         _until(lambda: hub.question_for_ask_entry(
             session, f"{question.seq:06d}", mirrored=True))
+        # The route asks /healthz whether the session has a bus, on a 1 s budget,
+        # and caches only a yes. One slow probe under load sent it down the file
+        # path, so the bus is confirmed here first.
+        _until(lambda: hub.supports(session))
 
         reply = client.post(
             f"/api/sessions/{session}/ask/{question.seq:06d}/answer",

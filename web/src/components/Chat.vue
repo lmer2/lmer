@@ -101,6 +101,7 @@ import {
   mdiCogOutline,
   mdiDraw,
   mdiFileDocumentOutline,
+  mdiLockOutline,
   mdiPaperclip,
   mdiRefresh,
   mdiSend,
@@ -116,6 +117,9 @@ import { readDraft, storeDraft } from '../projects.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
 import { assistantName } from '../ratchet.js'
+// Send Privately (issue 510). Static: too small to earn a chunk of its own, and
+// mounted only while open, so its text exists only then.
+import PrivateSend from './PrivateSend.vue'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -1100,6 +1104,23 @@ async function loadEarlier() {
   }
 }
 
+const privateOpen = ref(false)
+const privateButton = ref(null)
+const privateNotice = ref(null)
+
+// The dialog has no activator, so focus goes back to the button by hand.
+function privateClosed(reason) {
+  privateOpen.value = false
+  if (reason) privateNotice.value = reason
+  nextTick(() => privateButton.value?.$el?.focus())
+}
+
+function privateSent() {
+  following.value = true
+  nextTick(stickToBottom)
+  poll()
+}
+
 async function send() {
   if (props.readOnly || props.sendPaused) return
   const typed = draft.value.trim()
@@ -1371,6 +1392,17 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
         >{{ showInjected ? 'hide' : 'show' }} {{ hiddenCount }} internal</v-btn>
       </div>
 
+      <!-- Send Privately's outcome stays until dismissed: polling clears
+           `problem`, and one of these asks the operator to act. -->
+      <v-alert
+        v-if="privateNotice"
+        type="warning"
+        density="compact"
+        class="mb-3 private-notice"
+        role="status"
+        closable
+        @click:close="privateNotice = null"
+      >{{ privateNotice }}</v-alert>
       <v-alert v-if="problem" type="error" density="compact" class="mb-3">
         {{ problem }}
         <v-btn
@@ -1768,6 +1800,14 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
                in that row is what an operator can tap, and a hidden element in
                it is indistinguishable from a control that disappears at some
                width (tests/test_platform_web_composer.py). -->
+          <PrivateSend
+            v-if="privateOpen"
+            :session-id="sessionId"
+            :workspace-id="workspaceId"
+            :send-paused="sendPaused"
+            @close="privateClosed"
+            @sent="privateSent"
+          />
           <!-- Only while something is being marked up: the component is a
                separate chunk, and mounting it unconditionally would fetch a
                canvas editor for every conversation anybody opens. -->
@@ -1798,6 +1838,15 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
               aria-label="attach a file to this message"
               @click="picker?.click()"
             >attach</v-btn>
+            <v-btn
+              ref="privateButton"
+              :prepend-icon="mdiLockOutline"
+              :disabled="sending || sendPaused"
+              variant="tonal"
+              size="large"
+              aria-label="send privately: text the run can use, kept out of the chat"
+              @click="privateOpen = true"
+            >send privately</v-btn>
             <v-spacer />
             <v-btn
               :prepend-icon="mdiSend"
