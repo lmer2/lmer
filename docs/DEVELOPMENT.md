@@ -237,3 +237,29 @@ attribute, hoist the module (`from lmer_cli import runtime`) and call
 
 **Enforced by** `tests/test_import_placement.py`, which names each import
 that lacks a valid comment.
+
+## Gate checks: a capped `details` list says what it dropped
+
+**Decision (#597):** a gate check never shortens a `CheckResult.details`
+list silently. Pass the complete list as `details` with `details_limit=N`
+(and `details_keep_tail=True` for the end of captured output) and
+`CheckResult` keeps the entries it shows, records `dropped`, and keeps the
+complete list as `full_details` unless the check carries `full_output`,
+which already holds the rest. The marker line is rendered by
+`dropped_note`, not stored in `details`, because it must say whether the
+rest can be found: `print_results` points at `/tmp/gate-check.log` only if
+`write_log_file` wrote it (`run_commit_gate` writes it first, on every run,
+and the next run overwrites it), and otherwise says no log was written. The
+log writes `full_details` instead of `details`, so it is where a blocked
+author audits every finding in one pass, with no flag or re-run.
+
+A critical check that fails on a capped list of findings puts the total in
+its `message`, because `details` print only under `--verbose`. Python Tests
+carries pytest's own summary line ("Tests failed: 1 failed, 5 passed in
+0.2s") when pytest printed one, since the grepped failure lines are not a
+test count; Pre-commit says how many output lines it has and that the last 15
+are shown. The Documentation check lists at most four names, uncapped, and
+carries no count.
+
+Findings put in `details` or `full_details` name a location and a rule,
+never the matched text: the log is a plain file under `/tmp`.

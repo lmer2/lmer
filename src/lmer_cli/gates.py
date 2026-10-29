@@ -13,7 +13,7 @@ import json
 import fnmatch
 import textwrap
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import List, Tuple, Optional, Dict, Any
 from urllib.parse import urlsplit
 from enum import Enum
@@ -50,6 +50,12 @@ class CheckResult:
     # untruncated stdout+stderr, persisted to the gate-check log so failures can
     # be investigated without re-running the slow checks.
     full_output: Optional[str] = None
+    # The complete list behind a `details` that `details_limit` shortened from
+    # the head. The gate-check log writes this instead of `details`, so the log
+    # is where a blocked author audits every finding in one pass. None when
+    # `details` was never capped, or the check carries `full_output`, which
+    # holds the rest.
+    full_details: Optional[List[str]] = None
     # Set when the check ran something other than the unqualified thing its
     # name implies: the text-diff test subset, a reused cached run, or the
     # suite a project's own runner declared it took (TEST_MODE_MARKER).
@@ -67,6 +73,54 @@ class CheckResult:
     # values; environment misses name variables only.
     cache_verdict: Optional[str] = None
     cache_reason: Optional[str] = None
+    # How many entries `details_limit` dropped (#597), and whether they were
+    # the earliest ones. The marker line is rendered where the log's fate is
+    # known (`dropped_note`), never baked into `details`: a pointer to a log
+    # that was not written would be a false statement.
+    dropped: int = 0
+    dropped_earlier: bool = False
+    # Construction-time cap: pass the complete list as `details`. The head is
+    # kept unless `details_keep_tail`, for output whose end is what matters.
+    details_limit: InitVar[Optional[int]] = None
+    details_keep_tail: InitVar[bool] = False
+
+    def __post_init__(self, details_limit, details_keep_tail):
+        if details_limit is None or not self.details or len(self.details) <= details_limit:
+            return
+        complete = self.details
+        if details_keep_tail and self.full_output is None:
+            raise ValueError("a tail-capped details list needs full_output to hold the rest")
+        self.dropped = len(complete) - details_limit
+        self.dropped_earlier = details_keep_tail
+        if details_keep_tail:
+            self.details = complete[-details_limit:]
+        else:
+            self.details = complete[:details_limit]
+            # A check that captured output has the rest in `full_output`;
+            # repeating its matched lines in the log would double them.
+            if self.full_output is None:
+                self.full_details = complete
+
+    def dropped_note(self, log_path: Optional[Path], in_log: bool = False) -> Optional[str]:
+        """The line saying what `details` dropped, or None when it dropped nothing.
+
+        `log_path` is the gate-check log only if it was written; None says so
+        instead of pointing at a file that is not there. `in_log` renders the
+        note for the log itself, which already holds the head in full.
+        """
+        if not self.dropped:
+            return None
+        if self.dropped_earlier:
+            where = ("full output below" if in_log else
+                     f"full output in {log_path}" if log_path else
+                     "no gate-check log was written, so they are not available")
+            return f"… {self.dropped} earlier line(s) not shown ({where})"
+        if in_log:
+            return None if self.full_details is not None else (
+                f"… and {self.dropped} more not shown here (full output below)")
+        where = (f"the rest are in {log_path}" if log_path else
+                 "no gate-check log was written, so they are not available")
+        return f"… and {self.dropped} more ({where})"
 
 
 @dataclass
@@ -317,6 +371,9 @@ class GateSystem:
         self.debug = debug
         self.commit_handoff = commit_handoff
         self.results: List[CheckResult] = []
+        # Set only by a successful write_log_file: capped lists point at the
+        # log only when it exists.
+        self.log_path_written: Optional[Path] = None
         self.project_root = Path.cwd()
         self.timestamp = time.time()
         # Push-gate context for the text-diff fast path (#269). run_push_gate
@@ -384,8 +441,9 @@ class GateSystem:
             return CheckResult(
                 name="Git Status",
                 status=CheckStatus.FAILED,
-                message="Unstaged or untracked changes detected",
-                details=all_issues[:10]  # Show first 10 files
+                message=f"Unstaged or untracked changes detected ({len(all_issues)} paths)",
+                details=all_issues,
+                details_limit=10,
             )
 
         return CheckResult(
@@ -423,13 +481,15 @@ class GateSystem:
             for pattern in suspicious_patterns:
                 if pattern in file:
                     suspicious_staged.append(file)
+                    break
 
         if suspicious_staged:
             return CheckResult(
                 name="Staged Files Check",
                 status=CheckStatus.FAILED,
-                message="Suspicious files staged (likely from git add -A)",
-                details=suspicious_staged[:10]
+                message=f"Suspicious files staged ({len(suspicious_staged)}; likely from git add -A)",
+                details=suspicious_staged,
+                details_limit=10,
             )
 
         # Warning if too many files staged at once
@@ -438,7 +498,8 @@ class GateSystem:
                 name="Staged Files Check",
                 status=CheckStatus.WARNING,
                 message=f"Large number of files staged ({len(staged_files)}) - verify intentional",
-                details=staged_files[:10],
+                details=staged_files,
+                details_limit=10,
                 is_critical=False
             )
 
@@ -576,12 +637,14 @@ class GateSystem:
             # Surface a tail of the runner's output so a verbose `gate-check`
             # run can confirm something actually executed (the pytest path
             # gets this for free via its `N tests passed` summary parsing).
-            details = non_empty[-5:] if non_empty else None
+            details = non_empty or None
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.PASSED,
                 message=f"Custom test runner passed ({script.name}){mode_suffix}",
                 details=details,
+                details_limit=5,
+                details_keep_tail=True,
                 full_output=combined_output,
                 # The terminal line is overwritten every run (/tmp/gate-check.log)
                 # and never pushed; the receipt is the only durable record. Carry
@@ -592,12 +655,14 @@ class GateSystem:
                 scope=label,
             )
 
-        details = non_empty[-5:] if non_empty else ["Custom test runner failed - no output"]
+        details = non_empty or ["Custom test runner failed - no output"]
         return CheckResult(
             name="Python Tests",
             status=CheckStatus.FAILED,
             message=f"Custom test runner failed ({script.name}){mode_suffix}",
             details=details,
+            details_limit=5,
+            details_keep_tail=True,
             full_output=combined_output,
             scope=label,
         )
@@ -791,7 +856,9 @@ class GateSystem:
                 return CheckResult(
                     name="Python Tests", status=CheckStatus.FAILED,
                     message="Parallel test command description failed",
-                    details=details.splitlines()[-5:], full_output=details,
+                    details=details.splitlines(),
+                    details_limit=5, details_keep_tail=True,
+                    full_output=details,
                     scope=scope, scope_targets=list(targets),
                 )
 
@@ -903,12 +970,18 @@ class GateSystem:
             if scope is not None:
                 failures = [f"ran: {', '.join(targets)}"] + failures
 
+            message = "Tests failed" if scope is None else f"Tests failed ({scope})"
+            # The runner's own count, not a tally of the grepped lines above
+            # (one failing test yields several); absent when it printed none.
+            summary = pytest_summary_line(combined_output)
+            if summary:
+                message += f": {summary}"
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.FAILED,
-                message="Tests failed" if scope is None
-                        else f"Tests failed ({scope})",
-                details=failures[:5],  # Show first 5 failures
+                message=message,
+                details=failures,
+                details_limit=5,
                 full_output=combined_output,
                 scope=scope,
                 scope_targets=list(targets),
@@ -1232,15 +1305,21 @@ class GateSystem:
         combined = combined_output.rstrip()
         if combined:
             lines = [line for line in combined.split('\n') if line.strip()]
-            details = lines[-15:]
+            details = lines
         else:
+            lines = []
             details = [f"pre-commit exited {code} with no output"]
 
+        message = f"pre-commit exited {code}"
+        if len(lines) > 15:
+            message += f" ({len(lines)} output lines, last 15 shown)"
         return CheckResult(
             name="Pre-commit Hooks",
             status=CheckStatus.FAILED,
-            message=f"pre-commit exited {code}",
+            message=message,
             details=details,
+            details_limit=15,
+            details_keep_tail=True,
             full_output=combined_output,
         )
 
@@ -1399,8 +1478,9 @@ class GateSystem:
             return CheckResult(
                 name="Security Check",
                 status=CheckStatus.FAILED,
-                message="Potential secrets detected",
-                details=findings[:5]
+                message=f"Potential secrets detected ({len(findings)} findings)",
+                details=findings,
+                details_limit=5,
             )
 
         return CheckResult(
@@ -1439,7 +1519,8 @@ class GateSystem:
                 name="Code Quality",
                 status=CheckStatus.WARNING,
                 message="Quality issues found",
-                details=issues[:5],
+                details=issues,
+                details_limit=5,
                 is_critical=False
             )
 
@@ -1658,15 +1739,17 @@ class GateSystem:
                 offenders.append(file)
 
         if offenders:
+            deliverable_details = [
+                f"{f}: specs, plans, and reports deliver as Markdown (.md) "
+                "— never docx/pdf/binary documents"
+                for f in offenders
+            ]
             return CheckResult(
                 name="Deliverable Format",
                 status=CheckStatus.WARNING,
                 message="Spec-class deliverable staged in a binary document format",
-                details=[
-                    f"{f}: specs, plans, and reports deliver as Markdown (.md) "
-                    "— never docx/pdf/binary documents"
-                    for f in offenders[:5]
-                ],
+                details=deliverable_details,
+                details_limit=5,
                 is_critical=False
             )
 
@@ -1705,8 +1788,9 @@ class GateSystem:
             return CheckResult(
                 name="File Permissions",
                 status=CheckStatus.FAILED,
-                message="Permission issues found",
-                details=issues[:5]
+                message=f"Permission issues found ({len(issues)})",
+                details=issues,
+                details_limit=5,
             )
 
         return CheckResult(
@@ -1823,6 +1907,9 @@ class GateSystem:
             if result.details and self.verbose:
                 for detail in result.details:
                     print(f"      • {detail}")
+                note = result.dropped_note(self.log_path_written)
+                if note:
+                    print(f"      {note}")
 
         # Summary
         print(f"\n{Colors.BLUE}{'═' * 60}{Colors.NC}")
@@ -1845,11 +1932,11 @@ class GateSystem:
     def write_log_file(self, path: Optional[Path] = None) -> Optional[Path]:
         """Persist the full results of this run to a plain-text log file.
 
-        The terminal output only shows a short tail of each check's details
+        The terminal output only shows a capped slice of each check's details
         (and only when --verbose). This writes every check's status, message,
-        all details, and the complete captured subprocess output (for tests
-        and pre-commit) so a failure can be investigated by reading the file
-        instead of re-running the slow checks.
+        the uncapped details, and the complete captured subprocess output
+        (for tests and pre-commit) so a failure can be investigated by
+        reading the file instead of re-running the slow checks.
 
         Returns the path written, or None if writing failed (writing the log
         must never break gate-check itself).
@@ -1878,10 +1965,15 @@ class GateSystem:
                 lines.append(f"  Message: {result.message}")
             if not result.is_critical and result.status == CheckStatus.FAILED:
                 lines.append("  (non-critical)")
-            if result.details:
+            log_details = (result.full_details if result.full_details is not None
+                           else result.details)
+            if log_details:
                 lines.append("  Details:")
-                for detail in result.details:
+                for detail in log_details:
                     lines.append(f"    - {detail}")
+                note = result.dropped_note(path, in_log=True)
+                if note:
+                    lines.append(f"    {note}")
             if result.full_output is not None:
                 trimmed = result.full_output.strip("\n")
                 lines.append("  Full output:")
@@ -1898,11 +1990,15 @@ class GateSystem:
         lines.append(sep)
         lines.append("")
 
+        self.log_path_written = None
         try:
-            path.write_text("\n".join(lines), encoding="utf-8")
+            # backslashreplace: a file name that is not valid UTF-8 is
+            # surrogate-escaped by rglob and would otherwise raise here.
+            path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
         except OSError as e:
             print(f"{Colors.YELLOW}⚠️  Could not write gate-check log to {path}: {e}{Colors.NC}")
             return None
+        self.log_path_written = path
         return path
 
     def _critical_failures_so_far(self) -> List[str]:
@@ -1983,11 +2079,11 @@ class GateSystem:
             result = check()
             self.results.append(result)
 
-        passed = self.print_results()
-
         # Always persist the full results so failures can be investigated by
-        # reading the log instead of re-running the (often slow) checks.
+        # reading the log instead of re-running the (often slow) checks. Written
+        # before the results print so capped lists point at it only if it exists.
         log_path = self.write_log_file()
+        passed = self.print_results()
         if log_path is not None:
             print(f"\n{Colors.CYAN}📝 Full check log written to: {log_path}{Colors.NC}")
 
