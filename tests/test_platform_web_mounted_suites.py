@@ -4,7 +4,8 @@ The gate and CI run pytest only, so a ``web/tests/*.test.js`` file runs there
 only through a wrapper like this one (issue #507: its regressions for the chat
 cursor, digest rows, the question badge, the status strip and the settings
 dialog live in these files; issue #617 added the answer box and the per-launch
-resume rows, whose disabled-send reasons are only observable here).
+resume rows, whose disabled-send reasons are only observable here; issue #510
+the Send Privately editor).
 """
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ SUITES = [
     "tests/Chat.test.js",
     "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",
+    "tests/PrivateSend.test.js",
     "tests/Projects.test.js",
     "tests/Ratchet.test.js",
     "tests/RequestRecovery.test.js",

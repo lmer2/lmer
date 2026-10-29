@@ -1110,6 +1110,60 @@ the message, and the message names the path the agent will find it at.
   screenshot rather than a path. A file the store no longer holds — one a run
   copied out and deleted — leaves the path line and drops the thumbnail.
 
+### Send Privately
+
+**send privately**, beside **attach** in both chats, is for a secret or other
+private text (issue #510). It opens an editor; what you type there never goes
+into the chat.
+
+- **How it travels.** `POST /api/sessions/{id}/private` with `{text}` writes the
+  text to `<store>/.lmer-private/<session-id>/<stamp>-private.txt`, mode **0400**,
+  in the same upload store and mount as attachments. The reply carries only a
+  `reference`, and the composer sends that line as the message:
+  `[lmer private] /home/developer/.lmer-uploads/.lmer-private/<session-id>/<name> — …`.
+  The line has no content, no size and no name you chose. The route is
+  operator-only, and its refusals never repeat the text.
+- **Where it does not appear:** chat and comms records, the container bus, the
+  fleet journal, assistant history and digest, Slack and Matrix, reference lines,
+  filenames, previews, error messages and the daemon's logs. The attachment
+  read-back route does not serve it, and `lmer-signal --attach` refuses a path
+  inside `.lmer-private/` (a copy made elsewhere is not caught; see the next
+  point).
+- **What it does not cover.** Once the agent reads the file, the platform cannot
+  keep its contents out of the harness transcript, terminal scrollback or
+  captured tool output. The reference line and the uploads prompt fragment ask
+  the agent to use the file in place (a `--password-file` style flag, or
+  `"$(< FILE)"` inside the one command that needs it), never to print it, and to
+  `chmod 000` the file once used. That is an instruction, not a guarantee, and code in
+  the container runs as the same user as the file's reader.
+- **Lifetime.** A session's private directory is deleted when its exit is
+  recorded, clean or crashed, and the detector sweeps every 30 seconds for any
+  session that is no longer live (an exit no daemon watched, a rotated assistant
+  generation). Owner bits a run took away (`chmod 000` on the file, its
+  directory or `.lmer-private/` itself) are restored before removal, on Linux
+  and macOS daemons alike. Cleanup only ever acts inside `.lmer-private/`, and
+  only on one the platform created (it carries a `.lmer-owned` marker), so an
+  ordinary upload, or a folder the assistant named `private/`, is never touched.
+  If the marker is deleted, a `.lmer-private/` holding nothing but session
+  directories of `<stamp>-private.txt` files is re-marked and cleaned as usual;
+  anything else in it keeps it foreign, and sends to that store are refused
+  until it is moved aside.
+  A failed delivery withdraws the file it had stored
+  (`DELETE /api/sessions/{id}/private/{name}`).
+- **In the editor.** The text lives only in the open dialog: never in the
+  composer draft or browser storage, and cleared on send or cancel. A failed send
+  keeps it for retry. The dialog belongs to the session it was opened for:
+  - **Switching runs** unmounts the chat and the dialog with it, so nothing is
+    shown. A store still in flight is withdrawn; a reference already in flight is
+    delivered to the run the dialog was opened for, never the new one.
+  - **A rotation of Ratchet starting**, or the session changing in place, closes
+    an idle dialog with nothing sent. While it is sending, the dialog stays until
+    the outcome is known and then says which it was: withdrawn before delivery
+    (nothing sent), or delivered to the session it was opened for. That notice
+    stays until dismissed, because the rotation one asks you to send again.
+- **Same limits as attach:** the per-file cap applies, and a session started
+  before uploads existed has no store and is refused.
+
 ## Where things live
 
 | what | where |

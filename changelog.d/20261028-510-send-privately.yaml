@@ -1,0 +1,2 @@
+added:
+- "Both chats have a **send privately** button beside attach. The operator can paste a secret or other private text, and the run receives it as a read-only file deleted when the session ends; the chat shows only the file's path. Once the agent reads the file, its contents can still reach the harness transcript."

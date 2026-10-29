@@ -63,6 +63,8 @@
    agree on, and `size="large"` is Vuetify's own name for it. */
 .send-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-end;
   margin-top: 10px;
 }

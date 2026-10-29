@@ -72,6 +72,9 @@ __all__ = [
     "decode_payload", "sniff", "stored_name", "store_upload", "open_stored",
     "HEAD_BYTES",
     "reference_line",
+    "PRIVATE_DIRNAME", "PRIVATE_MARKER", "PRIVATE_FILE_MODE", "PRIVATE_PREFIX", "StoredPrivate",
+    "store_private", "withdraw_private", "discard_private", "sweep_private",
+    "private_reference_line",
 ]
 
 #: Suffix of a worker session's store, beside its PTY log, transcript and ask
@@ -100,6 +103,25 @@ DIR_MODE = store.STATE_DIR_MODE
 #: Owner-only for the file too: an upload is operator content of unknown
 #: sensitivity, and it sits in a directory other accounts must not read out of.
 FILE_MODE = 0o600
+
+#: Send Privately (issue #510): ``<store>/.lmer-private/<session id>/``, so the
+#: assistant's host-wide store still deletes one generation's files and not
+#: its successor's. Read-only for the run; the reference line asks the agent to
+#: ``chmod 000`` the file once used, and the directory goes when the session
+#: ends (:func:`discard_private`, :func:`sweep_private`).
+#:
+#: The name is reserved rather than natural because cleanup deletes what is in
+#: it: an assistant sorting its own store into a ``private/`` folder must never
+#: have it swept. :data:`PRIVATE_MARKER` is written when the platform creates the
+#: directory; one without it is never written to or swept unless it holds only
+#: what Send Privately itself writes (:func:`_owned`).
+PRIVATE_DIRNAME = ".lmer-private"
+PRIVATE_MARKER = ".lmer-owned"
+PRIVATE_FILE_MODE = 0o400
+PRIVATE_PREFIX = "[lmer private]"
+_PRIVATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_PRIVATE_FILE = re.compile(r"\d{8}-\d{6}-private(?:-\d+)?\.txt")
 
 
 @dataclass(frozen=True)
@@ -765,3 +787,337 @@ def _human_bytes(count: int) -> str:
     if count < 1024 * 1024:
         return f"{count / 1024:.1f} KB"
     return f"{count / (1024 * 1024):.1f} MB"
+
+
+# --- Send Privately (issue #510) ---------------------------------------------
+#
+# The same store and the same mount as an attachment, so a session that takes
+# files takes these. What differs is everything the private file must not share
+# with an attachment: no name from the operator, no size in the reference, a
+# 0400 mode, no read-back route, and a lifetime that ends with the session.
+#
+# Every path component under the store is inside the ``rw`` mount, so the
+# container can swap any of them for a symlink, or chmod any of them, at any
+# moment. Everything below the store is therefore walked by descriptor with
+# ``O_NOFOLLOW``, and a directory's owner bits are given back before it is
+# opened; the store itself is resolved from the session id on the host side,
+# like every other store operation here.
+
+
+@dataclass(frozen=True)
+class StoredPrivate:
+    """One private file as stored, without anything about its content."""
+
+    session_id: str
+    name: str
+    container_path: str
+
+    def to_dict(self) -> dict:
+        return {
+            "session": self.session_id,
+            "name": self.name,
+            "container_path": self.container_path,
+            "reference": private_reference_line(self),
+        }
+
+
+def private_reference_line(stored: StoredPrivate) -> str:
+    """The line the session receives in place of the text."""
+    return (
+        f"{PRIVATE_PREFIX} {stored.container_path} — private text for this "
+        "session only. Use it in place without printing it (a --password-file "
+        "style flag, or \"$(< FILE)\" inside the one command that needs it), "
+        "then chmod 000 this file (the file, not its directory). It is deleted "
+        "when this session ends."
+    )
+
+
+def _restore_owner_bits(parent_fd: int, name: str) -> None:
+    """Give directory *name* under *parent_fd* its owner bits, never through a symlink."""
+    o_path = getattr(os, "O_PATH", None)
+    if o_path is None:
+        # macOS has neither O_PATH nor /proc; fchmodat(AT_SYMLINK_NOFOLLOW) is
+        # its no-follow route, and the open that follows refuses a symlink.
+        os.chmod(name, DIR_MODE, dir_fd=parent_fd, follow_symlinks=False)
+        return
+    handle = os.open(name, o_path | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        os.chmod(f"/proc/self/fd/{handle}", DIR_MODE)
+    finally:
+        os.close(handle)
+
+
+def _child_dir(parent_fd: int, name: str, *, create: bool) -> int:
+    """Open (and optionally create) directory *name* under *parent_fd*, owner-only."""
+    if create:
+        try:
+            os.mkdir(name, DIR_MODE, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    _restore_owner_bits(parent_fd, name)
+    fd = os.open(name, _OPEN_DIR, dir_fd=parent_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError(f"{name} is not a directory this platform owns")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _only_private_layout(root_fd: int) -> bool:
+    """Whether every entry is a session directory holding only files :func:`store_private` names."""
+    for name in os.listdir(root_fd):
+        if not _is_session_name(name):
+            return False
+        if not stat.S_ISDIR(os.stat(name, dir_fd=root_fd, follow_symlinks=False).st_mode):
+            return False
+        _restore_owner_bits(root_fd, name)
+        fd = os.open(name, _OPEN_DIR, dir_fd=root_fd)
+        try:
+            if not all(_PRIVATE_FILE.fullmatch(child) for child in os.listdir(fd)):
+                return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def _owned(root_fd: int) -> bool:
+    """Whether this private root is the platform's, marking it if it is but has lost the mark.
+
+    Unmarked, it is claimed in two cases: empty (nothing cleanup could take, and
+    what a crash between ``mkdir`` and the marker leaves), or holding nothing but
+    Send Privately's own layout (the marker was deleted from under it, which
+    would otherwise wedge the store for every later session).
+    """
+    try:
+        info = os.stat(PRIVATE_MARKER, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not _only_private_layout(root_fd):
+            return False
+        marker = os.open(
+            PRIVATE_MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE, dir_fd=root_fd,
+        )
+        os.close(marker)
+        return True
+    return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+
+
+def _private_root(store_fd: int, *, create: bool) -> int:
+    """Descriptor of ``<store>/.lmer-private``, refused unless the platform owns it."""
+    fd = _child_dir(store_fd, PRIVATE_DIRNAME, create=create)
+    try:
+        if not _owned(fd):
+            raise OSError(f"{PRIVATE_DIRNAME} was not made by this platform and is left alone")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _private_dir(session_id: str, entry: Optional[dict], *, create: bool) -> int:
+    """Descriptor of ``<store>/.lmer-private/<session id>`` for a session with a store."""
+    store_fd = os.open(mounted_store(session_id, entry), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        root_fd = _private_root(store_fd, create=create)
+    finally:
+        os.close(store_fd)
+    try:
+        return _child_dir(root_fd, session_id, create=create)
+    finally:
+        os.close(root_fd)
+
+
+def store_private(
+    session_id: str, entry: Optional[dict], text: object, *, max_bytes: int = DEFAULT_MAX_BYTES,
+) -> StoredPrivate:
+    """Write the operator's private text for *session_id* and name it.
+
+    No refusal here quotes or measures the text: a size refusal names the cap,
+    not the length.
+    """
+    if not isinstance(text, str):
+        raise UploadRejected("a private send needs a string 'text' field")
+    if not text.strip():
+        raise UploadRejected("there is nothing to send: the private text is empty")
+    raw = text.encode("utf-8")
+    if len(raw) > max_bytes:
+        raise UploadTooLarge(
+            f"the private text is over this platform's {max_bytes}-byte cap "
+            "(LMER_PLATFORM_UPLOAD_MAX_BYTES)"
+        )
+    try:
+        dir_fd = _private_dir(session_id, entry, create=True)
+    except OSError as exc:
+        raise UploadError(f"the private store could not be prepared ({exc.strerror or exc})") from exc
+    kind = KNOWN_TYPES["txt"]
+    try:
+        filename = stored_name("private", kind)
+        name, attempt = filename, 1
+        while True:
+            try:
+                descriptor = os.open(
+                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    PRIVATE_FILE_MODE, dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                attempt += 1
+                name = _collision_name(filename, kind, attempt)
+                continue
+            except OSError as exc:
+                raise UploadError(f"the private store would not take the file ({exc.strerror or exc})") from exc
+            break
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), PRIVATE_FILE_MODE)
+                handle.write(raw)
+        except OSError as exc:
+            os.unlink(name, dir_fd=dir_fd)
+            raise UploadError(f"the private text could not be written ({exc.strerror or exc})") from exc
+    finally:
+        os.close(dir_fd)
+    logger.info("platform_private_stored id=%s name=%s", session_id, name)
+    return StoredPrivate(
+        session_id=session_id,
+        name=name,
+        container_path=f"{CONTAINER_UPLOADS_DIR}/{PRIVATE_DIRNAME}/{session_id}/{name}",
+    )
+
+
+def withdraw_private(session_id: str, entry: Optional[dict], name: object) -> bool:
+    """Delete one private file the client stored but could not deliver."""
+    if not isinstance(name, str) or not _PRIVATE_NAME.fullmatch(name):
+        raise UploadNotFound("no private file of that name")
+    try:
+        dir_fd = _private_dir(session_id, entry, create=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise UploadError(f"the private store cannot be read ({exc.strerror or exc})") from exc
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False
+    except IsADirectoryError as exc:
+        raise UploadNotFound("no private file of that name") from exc
+    finally:
+        os.close(dir_fd)
+    logger.info("platform_private_withdrawn id=%s name=%s", session_id, name)
+    return True
+
+
+def _private_stores() -> list:
+    """Every store on this host that can hold private files, worker and assistant."""
+    stores = list(logs_dir().glob(f"*{SESSION_DIR_SUFFIX}"))
+    platform = store.platform_dir()
+    stores.append(platform / ASSISTANT_DIRNAME)
+    stores.extend((platform / "projects").glob(f"*/{ASSISTANT_DIRNAME}"))
+    return stores
+
+
+def _is_session_name(name: str) -> bool:
+    try:
+        _validated(name)
+    except UploadNotFound:
+        return False
+    return True
+
+
+def _purge(parent_fd: int, name: str) -> None:
+    """Remove *name* under *parent_fd* recursively, never following a symlink."""
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    _restore_owner_bits(parent_fd, name)
+    fd = os.open(name, _OPEN_DIR, dir_fd=parent_fd)
+    try:
+        for child in os.listdir(fd):
+            _purge(fd, child)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _open_private_root(path: Path) -> Optional[int]:
+    """Descriptor of the private root under store *path*, or ``None`` if there is none to clean."""
+    try:
+        store_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    try:
+        return _private_root(store_fd, create=False)
+    except FileNotFoundError:
+        return None
+    finally:
+        os.close(store_fd)
+
+
+def _discard_in(path: Path, names) -> list:
+    """Purge each of *names* from the private root of store *path*; return those removed."""
+    try:
+        root_fd = _open_private_root(path)
+    except Exception as exc:
+        logger.warning("platform_private_root_unusable store=%s error=%s", path, exc)
+        return []
+    if root_fd is None:
+        return []
+    removed = []
+    try:
+        for name in names:
+            try:
+                _purge(root_fd, name)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # one bad entry must not end the pass over the rest
+                logger.warning("platform_private_discard_failed store=%s name=%s error=%s", path, name, exc)
+                continue
+            removed.append(name)
+    finally:
+        os.close(root_fd)
+    return removed
+
+
+def discard_private(session_id: str) -> int:
+    """Delete every private file sent to *session_id*, in whichever store holds it."""
+    _validated(session_id)
+    removed = sum(len(_discard_in(path, [session_id])) for path in _private_stores())
+    if removed:
+        logger.info("platform_private_discarded id=%s", session_id)
+    return removed
+
+
+def sweep_private() -> list:
+    """Delete the private files of every session that is no longer live.
+
+    The listing is taken *before* the live set is read: a directory created
+    after that read belongs to a session the store route found live, and is
+    not in the listing this pass acts on. Only session-shaped names in a root
+    the platform made are candidates.
+    """
+    listed = []
+    for path in _private_stores():
+        try:
+            fd = _open_private_root(path)
+            if fd is None:
+                continue
+        except Exception as exc:
+            logger.warning("platform_private_root_unusable store=%s error=%s", path, exc)
+            continue
+        try:
+            listed.append((path, [name for name in os.listdir(fd) if _is_session_name(name)]))
+        except OSError as exc:
+            logger.warning("platform_private_root_unusable store=%s error=%s", path, exc)
+        finally:
+            os.close(fd)
+    if not listed:
+        return []
+    live = {entry.get("id") for entry in registry.list_sessions(live_only=True)}
+    removed = []
+    for path, names in listed:
+        removed += _discard_in(path, [name for name in names if name not in live])
+    if removed:
+        logger.info("platform_private_swept count=%d", len(removed))
+    return removed

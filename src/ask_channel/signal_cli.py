@@ -318,10 +318,14 @@ def _stage_attachments(paths: List[str]) -> list:
             f"({UPLOADS_DIR_ENV} unset or not mounted) — describe the file in the text instead"
         )
     staged = []
+    private = Path(store).resolve() / ".lmer-private"  # uploads.PRIVATE_DIRNAME
     for raw in paths:
         source = Path(raw)
         if not source.is_file():
             raise ArgsError(f"--attach {raw!r}: not a file")
+        # Send Privately files (#510) never leave the session.
+        if source.resolve().is_relative_to(private):
+            raise ArgsError(f"--attach {raw!r}: a private file is never attached to a message")
         target = Path(store) / f"{time.strftime('%Y%m%d-%H%M%S')}-{source.name}"
         counter = 1
         while target.exists():
