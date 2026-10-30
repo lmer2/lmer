@@ -1,0 +1,4 @@
+fixed:
+- "matrix bridge: crypto-store backups larger than 25 MB upload correctly instead of failing with `memoryview: a bytes-like object is required, not 'str'`"
+changed:
+- "matrix bridge: a crypto-store export that fails to upload now refuses the start with a clean error naming `--no-backup`, instead of an uncaught traceback. `lmer-matrix-bridge run --no-backup` starts without the refresh for a deployment whose export cannot be uploaded (#634) and logs a warning that backups are disabled"

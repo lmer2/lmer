@@ -342,6 +342,149 @@ async def test_an_empty_export_never_replaces_a_backup(client, homeserver):
     assert homeserver.backups_written == 0, "nothing was written at all"
 
 
+def _plan_on_disk(client, homeserver, plan):
+    """Put the disk in the state that makes ``open_store`` take *plan*."""
+    if plan == mxclient.STORE_OPEN:
+        write_store(client)
+    elif plan == mxclient.STORE_RESTORE:
+        unreadable_store(client)
+        homeserver.backup = b"a good export"
+    elif plan == mxclient.STORE_FRESH:
+        pass  # nothing on disk and no backup
+    else:  # pragma: no cover - a new plan needs a decision here
+        raise AssertionError(f"no fixture for plan {plan}")
+    return client
+
+
+@pytest.mark.parametrize(
+    "plan", [mxclient.STORE_FRESH, mxclient.STORE_OPEN, mxclient.STORE_RESTORE],
+)
+async def test_a_backup_that_fails_to_upload_stops_the_start(
+    client, homeserver, plan,
+):
+    """Fatal by default, on every plan — including ``fresh``, where there is no
+    earlier backup to fall back on (MR !438 review).
+
+    A 33 MB store's export failed on upload every start, so an earlier cut of
+    this MR made the refresh non-fatal and the bridge started without one. The
+    operator's ruling: a failed refresh stops the start again, because a
+    bridge running on a backup it can no longer refresh is a silent loss of
+    the safety net. ``--no-backup`` is the explicit way to run without it.
+    """
+    _plan_on_disk(client, homeserver, plan)
+    homeserver.back_up_store_error = ConnectionError("upload failed")
+    with pytest.raises(mxclient.MatrixClientError) as excinfo:
+        await client.start()
+    assert "upload failed" in str(excinfo.value)
+    assert "--no-backup" in str(excinfo.value), (
+        "the refusal names the way to start without the refresh"
+    )
+    assert homeserver.joined == [], "the room was never joined"
+
+
+async def test_no_backup_skips_the_refresh_and_says_so(client, homeserver, caplog):
+    """``--no-backup``: the bridge starts, nothing is uploaded, and the start
+    says at WARNING that the export is not being refreshed."""
+    write_store(client)
+    homeserver.backup = b"a good export"
+    homeserver.back_up_store_error = ConnectionError("upload failed")
+    with caplog.at_level("WARNING", logger=mxclient.__name__):
+        await client.start(back_up=False)
+    assert homeserver.joined == [STORED["room_id"]], "the start went on"
+    assert homeserver.backups_written == 0, "no backup was attempted"
+    assert homeserver.backup == b"a good export", "the old backup is untouched"
+    assert "matrix_backup_disabled" in caplog.text
+    assert "--no-backup" in caplog.text
+    assert "stays as it was" in caplog.text, "there is a backup to stay"
+
+
+@pytest.mark.parametrize("plan", [mxclient.STORE_FRESH, mxclient.STORE_OPEN])
+async def test_no_backup_with_no_export_says_there_is_no_backup(
+    client, homeserver, caplog, plan,
+):
+    """With no export on the homeserver, the WARNING must not tell the
+    operator there is one to restore from (MR !438 review). That is ``fresh``,
+    and also ``open`` on every start after a ``--no-backup`` first start: the
+    store is readable, so the plan is ``open``, but no export was ever
+    written. A host lost from here finds no store and no backup."""
+    if plan == mxclient.STORE_OPEN:
+        write_store(client)  # a readable store, and still no backup
+    else:
+        _plan_on_disk(client, homeserver, plan)
+    with caplog.at_level("WARNING", logger=mxclient.__name__):
+        assert await client.open_store(back_up=False) == plan
+    assert homeserver.backups_written == 0, "no backup was attempted"
+    assert "matrix_backup_disabled" in caplog.text
+    assert "there is no backup on the homeserver" in caplog.text
+    assert "cannot be restored" in caplog.text
+    assert "stays as it was" not in caplog.text, (
+        "no backup exists for the message to promise"
+    )
+
+
+async def test_a_backup_past_the_chunking_threshold_round_trips(
+    tmp_path, monkeypatch,
+):
+    """The transport's own upload, driven at a homeserver over HTTP.
+
+    mautrix sends a body past ``min_iter_size`` (25 MB) through
+    ``async_iter_bytes``, which takes bytes only — and ``set_account_data``
+    gives it the JSON as a ``str``. A 33 MB store failed that way on every
+    start. The threshold is lowered here so a small blob takes the same path.
+    """
+    pytest.importorskip("mautrix")
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from mautrix.api import HTTPAPI
+    from mautrix.crypto.ssss import Key
+
+    account_data = {}
+
+    async def put(request):
+        account_data[request.match_info["type"]] = await request.read()
+        return web.json_response({})
+
+    async def get(request):
+        body = account_data.get(request.match_info["type"])
+        if body is None:
+            return web.json_response(
+                {"errcode": "M_NOT_FOUND", "error": "not found"}, status=404,
+            )
+        return web.Response(body=body, content_type="application/json")
+
+    app = web.Application()
+    route = "/_matrix/client/v3/user/{user}/account_data/{type}"
+    app.router.add_put(route, put)
+    app.router.add_get(route, get)
+
+    request = HTTPAPI.request
+
+    def small_iter(self, *args, **kwargs):
+        kwargs["min_iter_size"] = 1024
+        return request(self, *args, **kwargs)
+
+    monkeypatch.setattr(HTTPAPI, "request", small_iter)
+
+    blob = os.urandom(8 * 1024)
+    async with TestServer(app) as server:
+        homeserver = mxclient.MautrixHomeserver(
+            mxcfg.load({**STORED, "homeserver": str(server.make_url(""))}),
+            mxcfg.Secrets(as_token="as", hs_token="hs", recovery_key="rk"),
+        )
+        homeserver._ssss_key = Key.generate()
+
+        async def export():
+            return blob
+
+        monkeypatch.setattr(homeserver, "_export_store", export)
+        try:
+            await homeserver.back_up_store()
+            assert mxclient.BACKUP_EVENT_TYPE in account_data, "it was sent"
+            assert await homeserver._read_backup() == blob
+        finally:
+            await homeserver.aclose()
+
+
 # --- the store the transport actually builds ---------------------------------
 
 async def test_the_opened_store_has_the_tables_every_send_needs(tmp_path):
