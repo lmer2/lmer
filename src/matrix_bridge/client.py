@@ -44,6 +44,7 @@ messages.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -457,13 +458,25 @@ class MatrixClient:
         """Release what the transport opened."""
         await self.homeserver.aclose()
 
-    async def start(self) -> None:
-        """Open the crypto store, then the room. Refuses rather than degrades."""
-        await self.open_store()
+    async def start(self, *, back_up: bool = True) -> None:
+        """Open the crypto store, then the room. Refuses rather than degrades.
+
+        ``back_up=False`` (``run --no-backup``) is the one deliberate
+        degradation: the store and the room are opened as usual, but the export
+        is not refreshed, and the start says so at WARNING. Every other
+        precondition — a store that cannot be read and has no backup, a backup
+        whose existence cannot be determined, a room that is not encrypted —
+        still refuses.
+        """
+        await self.open_store(back_up=back_up)
         await self.ensure_room()
 
-    async def open_store(self) -> str:
-        """Apply :func:`store_plan` to what is on disk. Returns the plan taken."""
+    async def open_store(self, *, back_up: bool = True) -> str:
+        """Apply :func:`store_plan` to what is on disk. Returns the plan taken.
+
+        ``back_up=False`` skips the export refresh that follows a successful
+        open, and logs at WARNING that it did — see :meth:`start`.
+        """
         status = inspect_store(self.store_path)
         try:
             backup_present = await self.homeserver.has_backup()
@@ -512,7 +525,48 @@ class MatrixClient:
         # restore it exists for would have produced a store that decrypts
         # nothing (!243 review). A backup written from a store this process has
         # just opened is never worse than the one it replaces.
-        await self.homeserver.back_up_store()
+        #
+        # The refresh is **fatal by default** (MR !438 review, operator ruling).
+        # A bridge that starts without a fresh export is a bridge running on a
+        # backup it can no longer keep up to date — silently, since the only
+        # trace is one line in the journal. On ``fresh`` there is not even an
+        # earlier export to fall back on. ``--no-backup`` is the explicit way
+        # to run without it, for a deployment whose export cannot be uploaded
+        # (a 33 MB store's export gets a Cloudflare 502, #634) and whose
+        # operator would rather have the service up.
+        if not back_up:
+            # With no export on the homeserver there is nothing to stay as it
+            # was: a host lost from here finds no store and no backup, and
+            # mints another device. Keyed on ``backup_present``, not ``plan``
+            # (MR !438 review): the start after a ``--no-backup`` first start
+            # is ``open`` with no backup, not ``fresh``.
+            if not backup_present:
+                consequence = (
+                    "there is no backup on the homeserver. A host lost from "
+                    "here cannot be restored."
+                )
+            else:
+                consequence = (
+                    "the backup on the homeserver stays as it was. A host "
+                    "lost from here restores only as far as that backup."
+                )
+            logger.warning(
+                "matrix_backup_disabled — --no-backup: this start does not "
+                "refresh the store export at %s, so %s",
+                status.path, consequence,
+            )
+            return plan
+        try:
+            await self.homeserver.back_up_store()
+        except Exception as exc:
+            raise MatrixClientError(
+                f"the crypto store at {status.path} opened, but its export "
+                f"could not be uploaded ({exc}). Refusing to start rather than "
+                f"run on a backup that is no longer refreshed — the bridge "
+                f"would look healthy while the export it restores from went "
+                f"stale. Fix the upload, or start with --no-backup to run "
+                f"without a fresh export."
+            ) from exc
         return plan
 
     async def ensure_room(self) -> str:
@@ -782,8 +836,26 @@ class MautrixHomeserver(Homeserver):
                 "the existing backup",
             )
             return
+        # deferred: optional dependency — mautrix ships in the `matrix` extra
+        from mautrix.api import Method, Path as ApiPath
+        from mautrix.crypto.ssss.types import EncryptedAccountDataEventContent
+
         machine, key = await self._ssss()
-        await machine.set_encrypted_account_data(BACKUP_EVENT_TYPE, blob, key)
+        # What `machine.set_encrypted_account_data` does, but the body goes to
+        # the homeserver as **bytes**. Given a dict, `HTTPAPI.request` dumps it
+        # to a `str`, and past its 25 MB `min_iter_size` hands that `str` to
+        # `async_iter_bytes`, whose `memoryview()` takes bytes only — so any
+        # store big enough for that threshold could never be backed up
+        # (mautrix 0.21.1). Bytes are sent as-is, chunked or not.
+        content = EncryptedAccountDataEventContent(
+            encrypted={key.id: key.encrypt(BACKUP_EVENT_TYPE, blob)},
+        )
+        client = machine.client
+        await client.api.request(
+            Method.PUT,
+            ApiPath.v3.user[client.mxid].account_data[BACKUP_EVENT_TYPE],
+            json.dumps(content.serialize()).encode(),
+        )
 
     async def create_room(self, *, invite: Sequence[str]) -> str:
         # deferred: optional dependency — mautrix ships in the `matrix` extra

@@ -51,6 +51,8 @@ class FakeHomeserver(Homeserver):
     open_store_error: Optional[Exception] = None
     #: Set to raise from :meth:`has_backup`, for "the homeserver cannot say".
     backup_error: Optional[Exception] = None
+    #: Set to raise from :meth:`back_up_store`, for "the export upload failed".
+    back_up_store_error: Optional[Exception] = None
     #: What the store exports. ``b""`` is the "the store gave us nothing" case
     #: the real transport refuses to write over a backup with.
     export: Optional[bytes] = None
@@ -117,6 +119,8 @@ class FakeHomeserver(Homeserver):
         non-empty export, and an **empty** export never replaces one that is
         already there.
         """
+        if self.back_up_store_error is not None:
+            raise self.back_up_store_error
         if self.export == b"":
             return
         self.backups_written += 1
