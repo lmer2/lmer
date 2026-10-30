@@ -158,7 +158,7 @@ __all__ = [
     "ENV_ROTATION_CONTEXT_THRESHOLD", "rotation_settings",
     "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
     "DEFAULT_UPLOAD_TYPES", "DEFAULT_UPLOAD_MAX_BYTES", "MAX_UPLOAD_MAX_BYTES",
-    "upload_settings", "upload_types", "chat_settings",
+    "upload_settings", "upload_types", "chat_settings", "dock_settings",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
@@ -397,8 +397,10 @@ class _IntSettingRule:
     arrived with a second.
     """
 
-    #: The default the warn-and-default posture falls back to.
-    default: int
+    #: The default the warn-and-default posture falls back to. ``None`` where
+    #: unset is itself a setting with a meaning of its own, distinct from every
+    #: number — ``dock_keep_last_notes``, whose unset means "keep every note".
+    default: Optional[int]
     #: Smallest usable value. ``0`` where zero is the off-switch, ``1`` where an
     #: off-switch lives on a neighbouring setting instead.
     minimum: int
@@ -441,13 +443,19 @@ INT_SETTINGS = {
         unit="seconds",
         singular_unit="second",
     ),
-    "chat_keep_last": _IntSettingRule(
-        default=0,
+    # Replaces ``chat_keep_last`` (#465), which pruned the operator chat tab and
+    # whose 0 meant "keep everything" — here 0 is the opposite, so a stored
+    # ``chat_keep_last`` is not carried over; :func:`load` ignores it as unknown.
+    "dock_keep_last_notes": _IntSettingRule(
+        default=None,
         minimum=0,
-        floor_reason="the count cannot be negative — 0 disables chat auto-clear",
-        log_key="platform_chat_keep_last_invalid",
-        unit="entries",
-        singular_unit="entry",
+        floor_reason=(
+            "the count cannot be negative — 0 shows open questions only, and "
+            "clearing the setting shows every note"
+        ),
+        log_key="platform_dock_keep_last_notes_invalid",
+        unit="notes",
+        singular_unit="note",
     ),
     "checkin_window_seconds": _IntSettingRule(
         default=DEFAULT_CHECKIN_WINDOW_SECONDS,
@@ -640,11 +648,17 @@ class PlatformConfig:
     #: The assistant's human-facing name (issue #581); always resolved, never
     #: ``None``. See :data:`ENV_ASSISTANT_NAME`.
     assistant_name: str = DEFAULT_ASSISTANT_NAME
-    chat_keep_last: int = 0
+    #: How many notes every run's operator channel dock keeps (issue #465): the
+    #: newest N, beside every open question, which the dock always shows. ``0``
+    #: is open questions only; ``None`` keeps every note. The operator chat tab
+    #: is the full record and is not governed by it. A browser display setting:
+    #: no env var, read on config refresh.
+    dock_keep_last_notes: Optional[int] = None
     #: Whether the uber lmer chat pane draws the harness transcript — tool
     #: calls, watch events, hook re-prompts, unposted prose — beside the
-    #: conversation (issue #488). Off, the pane draws bus records only. A pane
-    #: display setting like ``chat_keep_last``: no env var, read on config refresh.
+    #: conversation (issue #488). Off, the pane draws bus records only. A
+    #: display setting like ``dock_keep_last_notes``: no env var, read on config
+    #: refresh.
     chat_show_transcript: bool = False
     #: Visual graph groups; read fresh for UI requests, independent of run ownership.
     fleet_groups: list[dict] = field(default_factory=list)
@@ -930,7 +944,7 @@ def _upload_types_value(value: object) -> tuple:
     return tuple(names)
 
 
-def _int_setting_value(value: object, *, field: str) -> int:
+def _int_setting_value(value: object, *, field: str) -> Optional[int]:
     """A usable value for one integer setting, or its default with a warning.
 
     :func:`_assistant_value`'s posture: this resolves inside ``load()``, so
@@ -939,10 +953,17 @@ def _int_setting_value(value: object, *, field: str) -> int:
     gets the opposite treatment (:func:`validate_int_setting`).
     """
     rule = INT_SETTINGS[field]
+    if value is None and rule.default is None:
+        return None
     coerced = _coerced_int(value)
     reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
+    if rule.default is None:
+        logger.warning(
+            "%s value=%r — %s; leaving it unset instead", rule.log_key, value, reason,
+        )
+        return None
     unit = rule.singular_unit if rule.default == 1 else rule.unit
     logger.warning(
         "%s value=%r — %s; using the default of %d %s instead",
@@ -1610,18 +1631,26 @@ def fleet_group_settings() -> dict:
 def chat_settings() -> dict:
     """The chat panes' display settings, read fresh from stored configuration.
 
-    ``keep_last`` is the operator chat's retention; ``show_transcript`` is
-    whether the uber lmer pane draws the harness transcript beside the
-    conversation (issue #488). Neither has an environment variable: they are
-    browser display settings, and the pane re-reads them on config refresh.
+    ``show_transcript`` is whether the uber lmer pane draws the harness
+    transcript beside the conversation (issue #488). No environment variable:
+    it is a browser display setting, and the pane re-reads it on config refresh.
     """
-    resolved = _int_group_settings(
-        {"keep_last": ("chat_keep_last", None)}, group="chat",
-    )
-    resolved.update(_bool_group_settings(
+    return _bool_group_settings(
         {"show_transcript": ("chat_show_transcript", None)}, group="chat",
-    ))
-    return resolved
+    )
+
+
+def dock_settings() -> dict:
+    """The operator channel dock's display settings, read fresh (issue #465).
+
+    ``keep_last_notes`` is how many notes every run's dock keeps beside its open
+    questions: ``None`` (the default) keeps them all, ``0`` none. One global
+    preference rather than a per-run one, and no environment variable, for
+    :func:`chat_settings`' reason.
+    """
+    return _int_group_settings(
+        {"keep_last_notes": ("dock_keep_last_notes", None)}, group="dock",
+    )
 
 
 def checkin_settings() -> dict:

@@ -19,7 +19,7 @@ import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
 import { forgetRun, muteRun, resumeRun, moveRun } from '../api.js'
-import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
+import { useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
   targetLink, targetRef, toneColor,
@@ -1363,17 +1363,11 @@ async function forget() {
 
             <v-tabs-window-item value="chat" class="pt-3">
               <p class="text-medium-emphasis mb-3">
-                This session’s notes and questions, with your replies, oldest first.
-                <template v-if="chatKeepLast">Auto-clear shows the newest {{ chatKeepLast }} entries.</template>
-                <template v-else>Auto-clear is off; all entries are shown.</template>
-                Change it in settings. Clearing the dock does not change
-                this pane. The journal and transcript keep the full history.
+                This session’s notes and questions, with your replies, oldest first —
+                the whole channel. The dock above may keep fewer notes (Platform
+                settings), and clearing it does not change this pane.
               </p>
-              <v-alert v-if="chatConfigProblem" type="warning" density="compact" class="mb-3">
-                Could not load chat display settings: {{ chatConfigProblem }}
-              </v-alert>
               <AskHistory
-                :keep-last="chatKeepLast"
                 :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
                 :live="!!run.live"

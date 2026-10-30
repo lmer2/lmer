@@ -39,6 +39,18 @@ RENDER_SOURCE = os.environ.get("LMER_RENDER_SOURCE")
 WORK_MODES = ("finish", "phasic")
 # provider name -> LMER_REPO_HOST value that selects it
 PROVIDERS = {"gitlab": "git.example.com", "github": "github.com"}
+# Every taskdef the chat pivot section lists whatever the tiers carry (#445).
+PIVOT_TASKDEFS = (
+    "develop",
+    "review",
+    "spec",
+    "masterplan",
+    "modernize",
+    "followup",
+    "release",
+    "chat",
+    "orchestrate",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +98,37 @@ def _assert_thread_policy(out):
     assert "a silent session is indistinguishable from a dead one" not in prose
     policy = (REPO_TASKDEF / "thread-updates.jinja2").read_text()
     assert prose.count(_prose(policy)) == 1
+
+
+def _pivot_section(out):
+    """The chat taskdef's pivot section, up to the next top-level heading —
+    the taskdef list must render inside it in every branch a chat run
+    takes, not merely somewhere in the output."""
+    start = out.index("## Pivoting to development work")
+    end = out.find("\n## ", start + 1)
+    return out[start:] if end == -1 else out[start:end]
+
+
+def _assert_taskdef_pivot(out, paths):
+    """The pivot section lists every taskdef with its purpose, points at
+    the winning instructions.txt (``paths``: name -> path) or says none
+    resolves, and names the two common pivots (#445)."""
+    section = _pivot_section(out)
+    for name in PIVOT_TASKDEFS:
+        line = next(
+            ln for ln in section.splitlines() if ln.startswith(f"- **{name}** — ")
+        )
+        if name in paths:
+            assert f"Instructions: `{paths[name]}`." in line
+        else:
+            assert "No tier this session searches carries" in line
+    prose = _prose(section)
+    assert "read that taskdef's `instructions.txt` **before** doing the work" in prose
+    assert "Stay in chat mode for the conversation itself" in prose
+    assert '**"Fix this"** — the develop taskdef' in prose
+    assert '**"Look at this MR" / "review this"** — the review taskdef' in prose
+    # The bootstrap stays the develop case's first step.
+    assert "work setup-workspace <TARGET_URL>" in section
 
 
 def _assert_mode(out, work_mode, has_phasic_include=True):
@@ -203,8 +246,46 @@ class TestRenderMatrix:
         _assert_fully_rendered(out)
         _assert_thread_policy(out)
         assert "no fixed script" in out
+        # Zero config: only the builtin tier resolves, so develop and review
+        # are listed from the builtin purpose table without a path.
+        _assert_taskdef_pivot(
+            out,
+            {
+                name: REPO_TASKDEF / name / "instructions.txt"
+                for name in ("release", "chat", "orchestrate")
+            },
+        )
         banner = capsys.readouterr().out
         assert f"taskdef source: {REPO_TASKDEF} (schema 1)" in banner
+
+    @pytest.mark.parametrize("config", ("workrepo", "dedicated"))
+    def test_chat_lists_the_taskdefs_its_tiers_resolve(
+        self, config, tmp_path, monkeypatch
+    ):
+        """The list follows the tiers the start hook searches: a tier that
+        ships develop/review points the run at that file, a name only a
+        project knows still appears, and the first tier wins (#445)."""
+        _, root = _configure_source(config, "schema1", tmp_path, monkeypatch)
+        for name in ("develop", "review", "triage", "chat"):
+            (root / name).mkdir()
+            (root / name / "instructions.txt").write_text(f"# {name}\n")
+
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        paths = {
+            name: root / name / "instructions.txt"
+            for name in ("develop", "review", "chat")
+        }
+        paths["release"] = REPO_TASKDEF / "release" / "instructions.txt"
+        paths["orchestrate"] = REPO_TASKDEF / "orchestrate" / "instructions.txt"
+        _assert_taskdef_pivot(out, paths)
+        section = _pivot_section(out)
+        assert (
+            "- **triage** — a taskdef from this session's tiers; its "
+            "instructions say what it covers. Instructions: "
+            f"`{root / 'triage' / 'instructions.txt'}`."
+        ) in section
 
     @pytest.mark.parametrize("task", ("develop", "review"))
     @pytest.mark.parametrize("config", ("workrepo", "dedicated"))

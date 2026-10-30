@@ -68,6 +68,33 @@ the options a wrapper takes.
 
 ## Pivoting to development work
 
+A chat often turns into work that another taskdef describes. These are the
+taskdefs this run can draw on:
+{% for td in available_taskdefs %}
+- **{{ td.name }}** — {{ td.purpose }}.
+{%- if td.path %} Instructions: `{{ td.path }}`.
+{%- else %} No tier this session searches carries its `instructions.txt`.
+{%- endif %}
+{%- endfor %}
+
+When the conversation turns into work one of them describes, read that
+taskdef's `instructions.txt` **before** doing the work, and follow it for that
+stretch: its branching rules, its gates, its MR description rules, its review
+posting rules. Stay in chat mode for the conversation itself — the user still
+steers, and replies still go where this file says they go. The file is a
+template, so skip the branches whose conditions do not hold for this session.
+A taskdef whose instructions this session cannot reach still names the
+conventions to keep; ask the user rather than guess its finer rules.
+
+The two common pivots:
+
+- **"Fix this"** — the develop taskdef. Its first step is the workspace
+  bootstrap below, then its instructions.
+- **"Look at this MR" / "review this"** — the review taskdef. If `/workspace`
+  is not that checkout, bootstrap it with `work setup-workspace <MR_URL>
+  --task review`, then follow its instructions for reading the diff and
+  posting findings.
+
 If the conversation turns from chat into actual development on a specific
 repository — implementing an issue, fixing a bug, opening an MR — and
 `/workspace` is not already a checkout of that repo, do **not** hand-clone it

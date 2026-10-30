@@ -78,7 +78,6 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +85,7 @@ from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple)
 
 from .gate_lock import format_age
+from .private_tmp import open_no_follow, owned_dir
 from .util import get_bool_env
 
 #: Where recorded passes live. ``/tmp`` is deliberate — see the module
@@ -555,35 +555,13 @@ def safe_cache_dir(create: bool = False) -> Optional[Path]:
     With the directory owner-only, the entries inside it can only be written
     by this uid or by root, and root needs no cache entry to forge a gate.
     """
-    directory = cache_dir()
-    try:
-        if directory.is_symlink():
-            return None
-        if not directory.is_dir():
-            if not create:
-                return None
-            directory.mkdir(mode=CACHE_DIR_MODE, parents=True, exist_ok=True)
-            # Behind the mkdir, which a umask can only have narrowed further.
-            directory.chmod(CACHE_DIR_MODE)
-            return directory
-        info = directory.stat()
-        if info.st_uid != os.geteuid():
-            return None
-        if stat.S_IMODE(info.st_mode) & ~CACHE_DIR_MODE:
-            directory.chmod(CACHE_DIR_MODE)
-        return directory
-    except OSError:
-        return None
+    return owned_dir(cache_dir(), create=create, mode=CACHE_DIR_MODE)
 
 
-def _open_no_follow(path: str, flags: int) -> int:
-    """``open`` opener that refuses a symlink at the final component.
-
-    The directory mode is the real defence (:func:`safe_cache_dir`); this is
-    the cheap second one, for the window in which a directory that used to be
-    somebody else's still holds their names.
-    """
-    return os.open(path, flags | os.O_NOFOLLOW)
+#: ``open`` opener that refuses a symlink at the final component. The
+#: directory mode is the real defence (:func:`safe_cache_dir`); this is the
+#: cheap second one (:mod:`lmer_cli.private_tmp`).
+_open_no_follow = open_no_follow
 
 
 def cache_enabled() -> bool:

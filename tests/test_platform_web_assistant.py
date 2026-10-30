@@ -1047,7 +1047,7 @@ def _settings_reply(**overrides):
             key: setting(None) for key in
             ("model", "harness", "preset", "agents", "threads")
         },
-        "chat": {"keep_last": setting(0, 0)},
+        "chat": {"show_transcript": setting(False)},
         "checkin": {"window_seconds": setting(3600)},
         "nudge": {
             "after_seconds": setting(180),

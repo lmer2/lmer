@@ -9,6 +9,7 @@ just the one path that bit first.
 import ast
 import json
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -105,6 +106,23 @@ def _hold_other_process_marker(monkeypatch, gate="gate-check"):
     return pid
 
 
+def _foreign_file(monkeypatch, path):
+    """Make the file at *path* look owned by another uid to ``os.fstat``
+    (keyed by inode: the reads under test fstat their own descriptor)."""
+    inode = path.stat().st_ino
+    real_fstat = os.fstat
+
+    def fstat(descriptor):
+        info = real_fstat(descriptor)
+        if info.st_ino != inode:
+            return info
+        fields = list(info[:10])
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
 def _events(repo):
     path = repo / RUN_REL / "events.jsonl"
     if not path.exists():
@@ -177,6 +195,42 @@ class TestDeferral:
 
         deferred = [e for e in _events(work_repo) if e["type"] == "commit_deferred"]
         assert len(deferred) == 1, "a flushed deferral must not replay"
+
+    def test_the_parked_queue_is_owner_only(self, work_repo, monkeypatch):
+        _hold_other_process_marker(monkeypatch)
+        commit_work_path(RUN_REL, "run-state: test")
+        queue = gate_lock.lock_dir() / git_ops.DEFERRAL_QUEUE_NAME
+        assert stat.S_IMODE(queue.stat().st_mode) == 0o600
+
+    def test_a_planted_queue_symlink_is_not_written_through(
+        self, work_repo, monkeypatch, tmp_path
+    ):
+        """Neither the append nor the flush's rewrite follows it (#262)."""
+        _hold_other_process_marker(monkeypatch)
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        queue = gate_lock.lock_dir() / git_ops.DEFERRAL_QUEUE_NAME
+        queue.symlink_to(target)
+
+        assert commit_work_path(RUN_REL, "run-state: test") == 0
+        (gate_lock.lock_dir() / f"{os.getppid()}.json").unlink()
+        commit_work_path(RUN_REL, "run-state: test")
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+        assert not any(e["type"] == "commit_deferred" for e in _events(work_repo))
+
+    def test_a_queue_owned_by_another_uid_is_not_flushed(self, work_repo, monkeypatch):
+        """Records in a planted queue would be forged deferrals (#262)."""
+        _hold_other_process_marker(monkeypatch)
+        commit_work_path(RUN_REL, "run-state: test")
+        queue = gate_lock.lock_dir() / git_ops.DEFERRAL_QUEUE_NAME
+        assert queue.exists()
+        (gate_lock.lock_dir() / f"{os.getppid()}.json").unlink()
+        _foreign_file(monkeypatch, queue)
+
+        commit_work_path(RUN_REL, "run-state: test")
+
+        assert not any(e["type"] == "commit_deferred" for e in _events(work_repo))
 
     def test_clean_paths_defer_silently(self, work_repo, monkeypatch, capsys):
         """A no-op commit has nothing to defer, so it must not cry wolf."""

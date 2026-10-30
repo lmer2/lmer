@@ -1666,48 +1666,86 @@ def test_session_api_threads_reach_the_launch(client, monkeypatch):
     assert bad.status_code == 400, bad.text
 
 
-def test_chat_retention_defaults_off_and_round_trips_through_config(client, platform_root):
+# The operator channel dock's retention (issue #465): one global display
+# preference, edited from Platform settings through ``/api/settings``. Unset keeps
+# every note, 0 keeps none — open questions are the dock's to show either way.
+
+
+def test_dock_retention_defaults_unset_and_round_trips_through_platform_settings(client, platform_root):
     headers = bearer_header()
-    initial = client.get("/api/assistant/config", headers=headers)
+    initial = client.get("/api/settings", headers=headers)
     assert initial.status_code == 200
-    assert initial.json()["chat"]["keep_last"] == {
-        "value": 0, "source": "default", "stored": None,
+    assert initial.json()["dock"]["keep_last_notes"] == {
+        "value": None, "source": "default", "stored": None,
     }
+    assert cfg.load().dock_keep_last_notes is None
     cfg.update_stored({"assistant_model": "kept"})
-    for value in (25, 0, None):
+    for value in (3, 0, None):
         reply = client.post(
-            "/api/assistant/config", headers=headers, json={"chat_keep_last": value},
+            "/api/settings", headers=headers, json={"dock_keep_last_notes": value},
         )
-        assert reply.status_code == 200
+        assert reply.status_code == 200, reply.text
         expected = {
-            "value": value or 0,
+            "value": value,
             "source": "default" if value is None else "config.json",
             "stored": value,
         }
-        assert reply.json()["changed"] == ["chat_keep_last"]
-        assert reply.json()["chat"]["keep_last"] == expected
-        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["keep_last"] == expected
-        assert cfg.load().chat_keep_last == (value or 0)
+        assert reply.json()["dock"]["keep_last_notes"] == expected
+        assert client.get("/api/settings", headers=headers).json()["dock"]["keep_last_notes"] == expected
+        # The run view reads its display settings from the assistant config reply.
+        assert client.get("/api/assistant/config", headers=headers).json()["dock"]["keep_last_notes"] == expected
+        assert cfg.load().dock_keep_last_notes == value
         stored = store.read_json(cfg.config_path())
         assert stored["assistant_model"] == "kept"
         if value is None:
-            assert "chat_keep_last" not in stored
+            assert "dock_keep_last_notes" not in stored
         else:
-            assert stored["chat_keep_last"] == value
+            assert stored["dock_keep_last_notes"] == value
 
 
 @pytest.mark.parametrize("bad", [-1, True, 1.5, "many", [], {}])
-def test_chat_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
+def test_dock_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
     reply = client.post(
-        "/api/assistant/config", headers=bearer_header(), json={"chat_keep_last": bad},
+        "/api/settings", headers=bearer_header(), json={"dock_keep_last_notes": bad},
     )
-    assert reply.status_code == 400
-    assert "chat_keep_last" in reply.json()["detail"]
+    assert reply.status_code == 400, reply.text
+    assert "dock_keep_last_notes" in reply.json()["detail"]
     assert not cfg.config_path().exists()
 
 
-# The uber lmer pane's transcript toggle (issue #488): a boolean beside
-# ``keep_last`` in the ``chat`` group, stored platform-side so it survives
+def test_the_retired_chat_keep_last_is_refused_and_a_stored_one_is_ignored(client, platform_root, caplog):
+    """Not migrated: its 0 meant "keep everything", the dock's 0 means "no notes".
+
+    An old ``config.json`` that still carries it must load, keep the key on the
+    next write (unknown keys survive, :func:`cfg.mutate_stored`), and leave the
+    dock at its own default.
+    """
+    headers = bearer_header()
+    store.write_json(cfg.config_path(), {"chat_keep_last": 4, "assistant_model": "kept"})
+    assert cfg.load().dock_keep_last_notes is None
+    reply = client.get("/api/settings", headers=headers)
+    assert reply.status_code == 200
+    assert reply.json()["dock"]["keep_last_notes"]["value"] is None
+    assert "keep_last" not in reply.json()["chat"]
+    refused = client.post("/api/settings", headers=headers, json={"chat_keep_last": 2})
+    assert refused.status_code == 400, refused.text
+    assert "chat_keep_last" in refused.json()["detail"]
+    client.post("/api/settings", headers=headers, json={"dock_keep_last_notes": 1})
+    stored = store.read_json(cfg.config_path())
+    assert stored["chat_keep_last"] == 4
+    assert stored["dock_keep_last_notes"] == 1
+    assert "platform_dock_keep_last_notes_invalid" not in caplog.text
+
+
+def test_an_unusable_stored_dock_retention_reads_as_unset(platform_root, caplog):
+    store.write_json(cfg.config_path(), {"dock_keep_last_notes": -2})
+    assert cfg.load().dock_keep_last_notes is None
+    assert cfg.dock_settings()["keep_last_notes"].value is None
+    assert "platform_dock_keep_last_notes_invalid" in caplog.text
+
+
+# The uber lmer pane's transcript toggle (issue #488): a boolean in the
+# ``chat`` group, stored platform-side so it survives
 # browsers, applied on the pane's next config refresh rather than at a rotate.
 
 
@@ -1739,7 +1777,7 @@ def test_chat_transcript_toggle_defaults_off_and_round_trips_through_config(clie
             assert "chat_show_transcript" not in stored
         else:
             assert stored["chat_show_transcript"] is value
-    # The pane's own note about scope names it beside keep_last.
+    # The pane's own note about scope names it among the display settings.
     assert "chat_show_transcript" in reply.json()["note"]
 
 

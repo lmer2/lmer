@@ -45,6 +45,7 @@ from lmer_platform import connectors, memory, registry, runs, spawn, store
 from matrix_chat.client import MatrixError
 from slack_chat.client import SlackError
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import SETTLE, outlast
 
 
 @pytest.fixture(autouse=True)
@@ -128,9 +129,10 @@ def long_lived(monkeypatch):
 
     A clean exit reaps the registry entry, and the registry is what this module
     reads to answer "is an assistant running" — so without this every assertion
-    about a live assistant races the watcher thread.
+    about a live assistant races the watcher thread. Outlasting every wait a
+    test makes: a 30 s stub died before a loaded gate's status read (#636).
     """
-    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    monkeypatch.setenv("FAKE_LMER_SLEEP", str(outlast(SETTLE)))
 
 
 def kill(pid):

@@ -464,7 +464,7 @@ class TestPosting:
         )
         _channel, _ts, text = slack.posted[0]
         assert text.startswith("[unified comms (agents/global/…)] the review is posted")
-        assert "📎 review.md" in text
+        assert "📎 `review.md`" in text
         assert result["posted"]["ref"].endswith(":1712345679.000100")
 
     def test_an_empty_post_is_refused_before_any_call(self, slack):

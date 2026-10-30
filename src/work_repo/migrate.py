@@ -336,6 +336,9 @@ class IndexWrite:
     path: str
     text: str
     note: str
+    #: The legacy index file the text comes from, project-relative; ``None``
+    #: is ``memory/MEMORY.md``. A split dir's area index names itself.
+    source: Optional[str] = None
 
     @property
     def kind(self) -> str:
@@ -345,7 +348,7 @@ class IndexWrite:
         return f"write {_join(prefix, self.path)}"
 
     def event(self, prefix: str) -> tuple:
-        src = _join(prefix, f"{LEGACY_MEMORY}/{memory.MEMORY_INDEX}")
+        src = _join(prefix, self.source or f"{LEGACY_MEMORY}/{memory.MEMORY_INDEX}")
         dst = _join(prefix, self.path)
         return f"{src} -> {dst} ({self.note})", {"kind": INDEX, "from": src, "to": dst}
 
@@ -1032,8 +1035,10 @@ class _Planner:
                 f"{LEGACY_MEMORY}/ and {SCHEMA_MEMORY}/ both exist; merge them by hand, then re-run"
             )
             return
+        # Both ends of the lift are written: a newer lmer's store refuses it (#598).
+        self.blockers.extend(memory._store_format_problems((src, instance_dir)))
         routes = _memory_routes(src)
-        stays = (src / memory.MEMORY_INDEX).is_file()
+        stays = (src / memory.MEMORY_INDEX).is_file() or memory._is_split(src)
         for rel, scope, remark in routes:
             if remark:
                 self.notes.append(f"{LEGACY_MEMORY}/{rel}: {remark}")
@@ -1100,19 +1105,19 @@ def _relocated(rel: str, renames: list) -> Optional[str]:
 
 
 def _memory_routes(memory_dir: Path) -> list:
-    """`(rel, scope, remark)` per file under *memory_dir* (the index
-    excluded), sorted. :func:`memory.scope_for_memory` is the ONE routing
-    rule and is used unchanged; a file it cannot route — no frontmatter, no
-    `metadata.type`, a type nobody routes — stays in :data:`memory.DEFAULT_SCOPE`
-    and the remark says so when it is a memory file."""
+    """`(rel, scope, remark)` per file under *memory_dir* (the index, a
+    split dir's area indexes and the store-format marker excluded: they are
+    no memories, and ride along with the directory), sorted.
+    :func:`memory.scope_for_memory` is the ONE routing rule and is used
+    unchanged; a file it cannot route — no frontmatter, no `metadata.type`, a
+    type nobody routes — stays in :data:`memory.DEFAULT_SCOPE` and the remark
+    says so when it is a memory file."""
     if memory_dir.is_symlink() or not memory_dir.is_dir():
         return []
     routes = []
-    for path in sorted(memory_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(memory_dir).as_posix()
-        if rel == memory.MEMORY_INDEX:
+    for rel, path in sorted(memory._files_under(memory_dir).items()):
+        rel = rel.as_posix()
+        if memory._is_index_rel(rel):
             continue
         scope = memory.scope_for_memory(memory._read_text(path))
         remark = None
@@ -1141,7 +1146,9 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
     entry (:func:`_split_entries`) before the splitter sees it, since the
     splitter files a whole line by its first link. Nothing is generated: a
     file with no line is reported for D.index's reconcile, an entry with no
-    file stays in the project index as it is.
+    file stays in the project index as it is. A split legacy dir's area
+    indexes are read too, and their lines for instance memories lifted
+    (:func:`_lift_area_lines`).
     """
     index_name = f"{LEGACY_MEMORY}/{memory.MEMORY_INDEX}"
     scope_of = {rel: scope for rel, scope, _remark in routes}
@@ -1159,24 +1166,16 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
     # A flat index reads a link to `areas/<slug>.md` as an ordinary entry, as
     # persist does (#435); only a split one has map lines.
     split = memory._is_split(memory_dir)
-    pieces, indexed = [], set()
-    for number, line in enumerate(text.splitlines(keepends=True), 1):
-        targets = memory._entry_targets(line, split=split)
-        indexed.update(targets)
-        for target in targets:
-            if target not in scope_of:
-                notes.append(
-                    f"{index_name} line {number}: entry without a file ({target}); "
-                    "stays in the project index, untouched"
-                )
-        if len({scope_of.get(target, memory.DEFAULT_SCOPE) for target in targets}) > 1:
-            notes.append(
-                f"{index_name} line {number}: {_count(len(targets), 'entry', 'entries')} on one line "
-                "(a lost newline) — split, one line per scope"
+    indexed = set()
+    pieces = _index_pieces(text, index_name, None, scope_of, split, notes, indexed)
+    areas = {}
+    if split:
+        for rel, path in sorted(memory._area_indexes(memory_dir).items()):
+            area_rel = rel.as_posix()
+            areas[area_rel] = _index_pieces(
+                memory._read_text(path), f"{LEGACY_MEMORY}/{area_rel}", area_rel,
+                scope_of, split, notes, indexed,
             )
-            pieces.extend(_split_entries(line, split=split))
-        else:
-            pieces.append(line)
     notes.extend(
         f"{LEGACY_MEMORY}/{rel}: {unindexed}" for rel, _scope, _remark in routes if rel not in indexed
     )
@@ -1201,10 +1200,15 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
             f"{SCHEMA_MEMORY}/{memory.MEMORY_INDEX}", project_text,
             f"project index: {_count(lifted, 'entry', 'entries')} moved out to the instance index",
         ))
+    area_lines, area_writes = _lift_area_lines(
+        areas, scope_of, memory._is_split(instance_dir), notes
+    )
+    writes.extend(area_writes)
+    lifted += len(area_lines)
     if lifted:
         existing = instance_dir / memory.MEMORY_INDEX
         current = memory._read_text(existing) if existing.is_file() else ""
-        instance_text = "".join(routed[memory.INSTANCE_SCOPE])
+        instance_text = "".join(routed[memory.INSTANCE_SCOPE] + area_lines)
         if current.strip():
             merged = memory._merge_index([current, instance_text])
             note = f"merged into the existing instance index: {_count(lifted, 'entry', 'entries')} added"
@@ -1215,7 +1219,87 @@ def _plan_memory_lift(memory_dir, routes, instance_dir, instance_rel, notes) -> 
     return MemoryLift(files=files, lines=tuple(rows), writes=tuple(writes))
 
 
-def _split_entries(line: str, *, split: bool) -> list:
+def _index_pieces(text, index_name, index_rel, scope_of, split, notes, indexed) -> list:
+    """One legacy index file's lines, each cut back into one line per scope
+    where a lost newline joined two (:func:`_split_entries`). Every entry
+    target lands in *indexed*; an entry with no file is reported to *notes*.
+    *index_rel* is the file's path inside the memory dir (``None``:
+    ``MEMORY.md``), which its links resolve against."""
+    pieces = []
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        targets = memory._entry_targets(line, index_rel, split=split)
+        indexed.update(targets)
+        for target in targets:
+            if target not in scope_of:
+                notes.append(
+                    f"{index_name} line {number}: entry without a file ({target}); "
+                    "stays in the project index, untouched"
+                )
+        if len({scope_of.get(target, memory.DEFAULT_SCOPE) for target in targets}) > 1:
+            notes.append(
+                f"{index_name} line {number}: {_count(len(targets), 'entry', 'entries')} on one line "
+                "(a lost newline) — split, one line per scope"
+            )
+            pieces.extend(_split_entries(line, split=split, index_rel=index_rel))
+        else:
+            pieces.append(line)
+    return pieces
+
+
+def _lift_area_lines(areas, scope_of, instance_split, notes) -> tuple:
+    """Lift a split legacy dir's area lines for instance memories (#601).
+
+    *areas* maps each area index (``areas/<slug>.md``) to its lines. A line
+    whose entries all route to the instance scope leaves its area for the
+    instance ``MEMORY.md``, its links rebased from the area index
+    (:func:`memory._rebase_links`): the hand-written hook survives the lift
+    instead of being tombstoned in the project and replaced by a generated
+    line. Every other line — the project's entries, commentary, a ``forget``
+    tombstone — stays where it is. Returns ``(lines, writes)``: the lifted
+    lines and the project area indexes' :class:`IndexWrite`s.
+
+    Only a FLAT instance scope takes them. Into an instance scope that is
+    already split a line would have to be filed into one of its areas, which
+    this tool does not decide: those lines stay in the project's areas, as
+    before, and *notes* says so.
+    """
+    lifted, writes, held_back = [], [], 0
+    for area_rel, pieces in areas.items():
+        kept, moved = [], []
+        for piece in pieces:
+            targets = memory._entry_targets(piece, area_rel, split=True)
+            if targets and {scope_of.get(t, memory.DEFAULT_SCOPE) for t in targets} == {
+                memory.INSTANCE_SCOPE
+            }:
+                moved.append(piece)
+            else:
+                kept.append(piece)
+        if not moved:
+            continue
+        if instance_split:
+            held_back += len(moved)
+            continue
+        lifted.extend(
+            memory._rebase_links(piece, area_rel, memory.MEMORY_INDEX) for piece in moved
+        )
+        writes.append(IndexWrite(
+            f"{SCHEMA_MEMORY}/{area_rel}", "".join(kept),
+            f"project area index: {_count(len(moved), 'entry', 'entries')} moved out to the "
+            "instance index, links rebased",
+            source=f"{LEGACY_MEMORY}/{area_rel}",
+        ))
+    if held_back:
+        notes.append(
+            f"{LEGACY_MEMORY}/{memory.AREAS_DIR}/: {_count(held_back, 'line')} for memories "
+            "moving to the instance scope NOT lifted — the instance memory scope is already "
+            "split, and filing a line into one of its areas is not supported yet "
+            "(#637); they stay in the project's area indexes, where the next persist "
+            "tombstones them and files a generated entry in the instance scope"
+        )
+    return lifted, writes
+
+
+def _split_entries(line: str, *, split: bool, index_rel: Optional[str] = None) -> list:
     """One physical index line carrying entries for both scopes — a newline
     lost somewhere — cut back into one line per entry. Each later entry
     starts at the list bullet that introduces it (at its link when there is
@@ -1223,7 +1307,7 @@ def _split_entries(line: str, *, split: bool) -> list:
     index already carried."""
     cuts, previous_end = [], None
     for match in memory._LINK_RE.finditer(line):
-        if not memory._entry_targets(match.group(0), split=split):
+        if not memory._entry_targets(match.group(0), index_rel, split=split):
             continue
         if previous_end is not None:
             bullet = _BULLET_RE.search(line, previous_end, match.start())

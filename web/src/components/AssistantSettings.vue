@@ -35,7 +35,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { mdiRestart } from '@mdi/js'
 import { fetchAssistantConfig, setAssistantConfig } from '../api.js'
-import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
+import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_KEYS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
 import { applyChatSettings } from '../operatorChat.js'
 import { assistantName } from '../ratchet.js'
 
@@ -56,7 +56,7 @@ const open = computed({
   set: (value) => emit('update:modelValue', value),
 })
 
-const SETTING_KEYS = ['model', 'harness', 'preset', 'agents', 'threads']
+const SETTING_KEYS = [...LAUNCH_SETTING_KEYS, 'threads']
 
 // The daemon's own reminder intervals (#244, #317, #446). A different kind of
 // setting from the five above and captioned as one: they are read on the next
@@ -140,7 +140,7 @@ const savedTickShadowed = ref(false)
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
 const fields = reactive({
-  model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0',
+  model: '', harness: '', preset: '', agents: '', threads: '',
   showTranscript: false,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
@@ -190,7 +190,6 @@ async function load() {
 }
 
 function prefill(config) {
-  fields.chatKeepLast = String(config.chat?.keep_last?.stored ?? 0)
   // The effective value is the stored layer's own reading here: the chat group
   // has no environment layer to shadow it, so nothing an export set can be
   // baked into the file by saving this.
@@ -228,12 +227,6 @@ function changes() {
     const edited = (fields[key] || '').trim()
     if (edited !== stored) named[key] = edited || null
   }
-  const keepLast = Number(fields.chatKeepLast)
-  if (!Number.isSafeInteger(keepLast) || keepLast < 0) {
-    problem.value = 'Keep last must be a whole number of 0 or more.'
-    return null
-  }
-  if (keepLast !== (reply.value?.chat?.keep_last?.stored ?? 0)) named.chat_keep_last = keepLast
   if (fields.showTranscript !== (reply.value?.chat?.show_transcript?.value === true)) {
     named.chat_show_transcript = fields.showTranscript
   }
@@ -283,7 +276,7 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = changed.includes('chat_keep_last') || changed.includes('chat_show_transcript')
+    savedDisplay.value = changed.includes('chat_show_transcript')
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -425,21 +418,6 @@ onBeforeUnmount(() => {
             <p class="text-body-small text-medium-emphasis mb-3">
               Applies now, to this pane; other open browsers follow within a poll.
             </p>
-            <div class="settings-field">
-              <v-text-field
-                v-model="fields.chatKeepLast"
-                label="Keep last (entries)"
-                type="number"
-                min="0"
-                step="1"
-                hint="Keep the newest N entries in the operator chat. 0 turns auto-clear off. History is kept."
-                persistent-hint
-                density="compact"
-                variant="outlined"
-                :disabled="saving"
-              />
-            </div>
-
             <!-- The uber lmer pane's one view switch (issue 488). Platform state,
                  not this browser's: the operator debugging a stuck session from a
                  phone should find it where they left it on the desktop. -->
@@ -563,7 +541,7 @@ onBeforeUnmount(() => {
             Saved to config.json, but every launch value you changed is still pinned by
             an exported environment variable — a restart would run the export,
             not what you saved. Remove the export first.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported
@@ -573,7 +551,7 @@ onBeforeUnmount(() => {
           </v-alert>
           <v-alert v-else-if="saved && !savedLaunch" type="success" density="compact">
             Saved. No session restart is needed.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported
@@ -584,7 +562,7 @@ onBeforeUnmount(() => {
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh {{ assistantName }} starts — restart to apply it
             from the project chat, or let the change wait for the next incarnation.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported

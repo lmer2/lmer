@@ -247,7 +247,9 @@ list silently. Pass the complete list as `details` with `details_limit=N`
 complete list as `full_details` unless the check carries `full_output`,
 which already holds the rest. The marker line is rendered by
 `dropped_note`, not stored in `details`, because it must say whether the
-rest can be found: `print_results` points at `/tmp/gate-check.log` only if
+rest can be found: `print_results` points at the gate-check log
+(`/tmp/lmer-gate-check-<euid>/gate-check.log`, `0600` in a `0700` directory
+the current uid owns, never written through a symlink) only if
 `write_log_file` wrote it (`run_commit_gate` writes it first, on every run,
 and the next run overwrites it), and otherwise says no log was written. The
 log writes `full_details` instead of `details`, so it is where a blocked

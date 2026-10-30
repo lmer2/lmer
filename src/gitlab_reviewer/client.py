@@ -50,6 +50,19 @@ class GitLabError(Exception):
     pass
 
 
+class _TokenSession(requests.Session):
+    """A Session that drops PRIVATE-TOKEN wherever requests drops auth.
+
+    requests strips only ``Authorization`` on a redirect to another host;
+    a session-level PRIVATE-TOKEN header would follow the redirect (#593).
+    """
+
+    def rebuild_auth(self, prepared_request, response):
+        if self.should_strip_auth(response.request.url, prepared_request.url):
+            prepared_request.headers.pop('PRIVATE-TOKEN', None)
+        super().rebuild_auth(prepared_request, response)
+
+
 class GitLabClient:
     """Simple GitLab API client focused on code review operations."""
 
@@ -76,7 +89,7 @@ class GitLabClient:
         # True when the most recent _paginate() call stopped at the page cap
         # while GitLab indicated more results exist (i.e. results truncated).
         self.last_page_capped = False
-        self.session = requests.Session()
+        self.session = _TokenSession()
         self.session.headers.update({
             'PRIVATE-TOKEN': self.token,
             'Content-Type': 'application/json'

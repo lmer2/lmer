@@ -45,10 +45,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .private_tmp import open_private, owned_dir, read_owned
 from .util import get_bool_env
 
 #: Where markers live. ``/tmp`` is deliberate: the marker describes a *process*
@@ -61,6 +63,10 @@ from .util import get_bool_env
 #: and lands back here, where a live `gate-check` marker would defer the very
 #: commit path it is asserting on. Same reason ``lmer_platform.store.PLATFORM_DIR``
 #: is patched rather than pointed at by an env var.
+#:
+#: Used only while it is absent or a real directory this uid owns; anyone can
+#: claim a fixed ``/tmp`` name first, so a foreign one falls back to the
+#: per-uid sibling instead (see :func:`lock_dir`, issue #262).
 DEFAULT_LOCK_DIR = "/tmp/lmer-gate-inflight"
 
 #: Override for the marker directory. Read at call time, never at import, so a
@@ -143,15 +149,19 @@ def marker_is_live(
 
     Both conditions must hold: the writing process is alive, and the marker is
     not older than *stale_after*. The age half is only the pid-reuse backstop
-    (see :data:`STALE_AFTER_SECONDS`); a marker with no readable ``started_at``
-    is judged on pid liveness alone rather than being thrown away, because the
-    pid is the fact that matters.
+    (see :data:`STALE_AFTER_SECONDS`). A marker with no readable
+    ``started_at`` is aged by ``written_at`` instead — the file's mtime, which
+    :func:`read_markers` supplies — and one with neither is stale: a marker
+    that nothing can age would defer every work-repo write for as long as its
+    pid, or any process recycling it, stays alive (issue #262).
     """
     if not pid_alive:
         return False
     started = marker.get("started_at")
     if started is None:
-        return True
+        started = marker.get("written_at")
+    if started is None:
+        return False
     return (now - started) <= stale_after
 
 
@@ -195,8 +205,59 @@ def describe_marker(marker: dict | None, now: float | None = None) -> str:
 
 
 def lock_dir() -> Path:
-    """The marker directory, honoring :data:`LOCK_DIR_ENV` at call time."""
-    return Path(os.environ.get(LOCK_DIR_ENV, "").strip() or DEFAULT_LOCK_DIR)
+    """The marker directory, honoring :data:`LOCK_DIR_ENV` at call time.
+
+    Without the override, in order:
+
+    1. the per-uid sibling ``<DEFAULT_LOCK_DIR>-<euid>`` once it exists as a
+       real directory this uid owns — sticky, so whoever claimed the default
+       cannot flip this choice back by removing their claim mid-gate, which
+       would leave every reader looking where no writer wrote;
+    2. :data:`DEFAULT_LOCK_DIR` while it is absent (the first writer creates
+       it) or a real directory this uid owns, so versions from before issue
+       #262 — which know only that path — keep seeing the markers this one
+       writes;
+    3. otherwise (another user's directory, a symlink, a file) the sibling,
+       which the first writer creates.
+
+    This one answer is shared by every reader and writer; only
+    :func:`safe_lock_dir` vouches for it.
+    """
+    override = os.environ.get(LOCK_DIR_ENV, "").strip()
+    if override:
+        return Path(override)
+    default = Path(DEFAULT_LOCK_DIR)
+    sibling = Path(f"{DEFAULT_LOCK_DIR}-{os.geteuid()}")
+    if _is_own_dir(sibling):
+        return sibling
+    try:
+        os.lstat(default)
+    except FileNotFoundError:
+        return default
+    except OSError:
+        return sibling
+    return default if _is_own_dir(default) else sibling
+
+
+def _is_own_dir(path: Path) -> bool:
+    """Whether *path* is a real directory (not a symlink) owned by this uid."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+
+
+def safe_lock_dir(
+    create: bool = False, directory: Path | None = None
+) -> Path | None:
+    """*directory* (default :func:`lock_dir`) when this uid can trust it.
+
+    None — refused or absent — reads as "no gate in flight" and makes every
+    write a no-op: a marker in a directory someone else controls is neither
+    believed nor written (:func:`lmer_cli.private_tmp.owned_dir`).
+    """
+    return owned_dir(directory or lock_dir(), create=create)
 
 
 def guard_enabled() -> bool:
@@ -284,7 +345,9 @@ def read_markers(prune: bool = True) -> list[dict]:
     skipped — "no gate in flight" is the safe answer, since it restores the
     pre-#201 behavior instead of wedging a session.
     """
-    directory = lock_dir()
+    directory = safe_lock_dir()
+    if directory is None:
+        return []
     try:
         entries = sorted(directory.glob(f"*{MARKER_SUFFIX}"))
     except OSError:
@@ -293,7 +356,7 @@ def read_markers(prune: bool = True) -> list[dict]:
     live: list[dict] = []
     for entry in entries:
         try:
-            text = entry.read_text(encoding="utf-8")
+            text, written_at = _read_marker_file(entry)
         except (OSError, UnicodeDecodeError):
             continue
         marker = parse_marker(text)
@@ -303,6 +366,7 @@ def read_markers(prune: bool = True) -> list[dict]:
             # skipped, never pruned.
             continue
         marker["path"] = str(entry)
+        marker["written_at"] = written_at
         if marker_is_live(marker, now, _pid_alive(marker["pid"])):
             live.append(marker)
             continue
@@ -313,6 +377,12 @@ def read_markers(prune: bool = True) -> list[dict]:
                 pass
     live.sort(key=lambda m: (m.get("started_at") is None, m.get("started_at") or 0))
     return live
+
+
+def _read_marker_file(entry: Path) -> tuple[str, float]:
+    """A marker's text and mtime: never through a symlink, never another uid's."""
+    text, info = read_owned(entry)
+    return text, info.st_mtime
 
 
 def active_gate(exclude_self: bool = True) -> dict | None:
@@ -366,16 +436,21 @@ def hold_gate_lock(
     :func:`parse_marker`): write journaling keys on it, deferral ignores it.
     """
     pid = os.getpid()
-    directory = directory or lock_dir()
-    path = _marker_path(pid, directory)
     written = False
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = safe_lock_dir(create=True, directory=directory)
+        if directory is None:
+            raise OSError("no lock dir this uid can trust")
+        path = _marker_path(pid, directory)
         record = {"pid": pid, "gate": label, "started_at": time.time()}
         if journal_only:
             record["journal_only"] = True
-        payload = json.dumps(record, ensure_ascii=False)
-        path.write_text(payload + "\n", encoding="utf-8")
+        payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        descriptor = open_private(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
         written = True
     except (OSError, ValueError, TypeError):
         written = False

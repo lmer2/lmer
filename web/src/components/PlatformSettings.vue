@@ -6,6 +6,7 @@ import IngressStatus from './IngressStatus.vue'
 import SlotEditor from './SlotEditor.vue'
 import SlotRow from './SlotRow.vue'
 import { projectColor, projectTextColor } from '../projects.js'
+import { applyChatSettings } from '../operatorChat.js'
 
 const props = defineProps({ state: { type: Object, default: null }, loading: Boolean, projects: { type: Array, default: () => [] }, slots: { type: Array, default: () => [] },
   runs: { type: Array, default: () => [] }, now: { type: Number, default: () => Date.now() }, focusSection: { type: String, default: null } })
@@ -17,6 +18,12 @@ const groupsReady = ref(false)
 const groupsBusy = ref(false)
 const groupsError = ref(null)
 const groupsSaved = ref(false)
+// Every run's operator channel dock (#465): '' is unset, which keeps every note.
+const dockKeepLast = ref('')
+const dockReady = ref(false)
+const dockBusy = ref(false)
+const dockError = ref(null)
+const dockSaved = ref(false)
 let groupId = 0
 const defaultsOpen = ref(false)
 const slotOpen = ref(false)
@@ -54,6 +61,8 @@ onMounted(async () => {
     workerCap.value = settings.max_concurrent_sessions
     readGroups(settings)
     groupsReady.value = true
+    readDock(settings)
+    dockReady.value = true
   } catch (exc) { error.value = exc.message }
   if (props.focusSection === 'slots') {
     await nextTick()
@@ -94,6 +103,29 @@ async function saveGroups() {
     groupsSaved.value = true
     emit('changed')
   } catch (exc) { groupsError.value = exc.message } finally { groupsBusy.value = false }
+}
+function readDock(settings) {
+  const value = settings.dock?.keep_last_notes?.value
+  dockKeepLast.value = Number.isSafeInteger(value) ? String(value) : ''
+}
+async function saveDock() {
+  const edited = String(dockKeepLast.value ?? '').trim()
+  const value = edited === '' ? null : Number(edited)
+  if (value !== null && (!Number.isSafeInteger(value) || value < 0)) {
+    dockError.value = 'Keep last must be a whole number of 0 or more, or empty to show every note.'
+    dockSaved.value = false
+    return
+  }
+  dockBusy.value = true
+  dockSaved.value = false
+  try {
+    const settings = await setPlatformSettings({ dock_keep_last_notes: value })
+    readDock(settings)
+    // This browser's docks follow at once; other browsers on their next refresh.
+    applyChatSettings(settings)
+    dockError.value = null
+    dockSaved.value = true
+  } catch (exc) { dockError.value = exc.message } finally { dockBusy.value = false }
 }
 async function restore(project) {
   try { await archiveProject(project.id, true); emit('changed') } catch (exc) { error.value = exc.message }
@@ -149,6 +181,17 @@ async function release() {
     <v-card-actions class="flex-wrap"><v-btn :loading="busy" @click="save">Save limit</v-btn><v-btn @click="defaultsOpen = true">Execution and chat defaults</v-btn></v-card-actions>
   </v-card>
   <AssistantSettings v-model="defaultsOpen" :allow-restart="false" />
+  <v-card class="dock-display mb-4" title="Operator channel dock">
+    <v-card-text>
+      <v-alert v-if="dockError" type="error" class="mb-3" role="alert">{{ dockError }}</v-alert>
+      <v-text-field v-model="dockKeepLast" label="Operator channel dock: keep last N notes" type="number"
+        inputmode="numeric" min="0" step="1" clearable persistent-hint :disabled="!dockReady || dockBusy"
+        hint="Applies to the dock above every run. Open questions are always shown. 0 shows open questions only; leave empty to show every note." />
+      <p class="text-medium-emphasis mt-2">Older notes leave the dock only: each run's operator chat tab keeps the full history.</p>
+      <p v-if="dockSaved" role="status" class="mt-2">Dock display saved.</p>
+    </v-card-text>
+    <v-card-actions><v-btn :disabled="!dockReady" :loading="dockBusy" @click="saveDock">Save dock display</v-btn></v-card-actions>
+  </v-card>
   <v-card class="fleet-groups mb-4" title="Graph groups">
     <v-card-text>
       <p id="fleet-group-help" class="mb-3">Match case-insensitive text contained in the repository path, one entry per line.

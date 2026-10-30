@@ -37,6 +37,26 @@ SUPPORTED_TASKDEF_SCHEMAS = (1, 2)
 
 TASKDEF_MANIFEST = "taskdef.yaml"
 
+# One-line purpose for each taskdef lmer ships across its tiers, in the
+# order the chat taskdef lists them (#445). Most live in the work repo or
+# the shared taskdef repo, not the built-in tier, so a session can lack the
+# file while the name still means something to the operator.
+BUILTIN_TASKDEF_PURPOSES = {
+    "develop": "implement an issue or a fix on a feature branch and open an MR",
+    "review": "review an MR/PR and post the findings on it",
+    "spec": "write a reviewable software spec for a change",
+    "masterplan": "drive a large piece of work through a masterplan plan",
+    "modernize": "modernize a Python repository's tooling and layout",
+    "followup": "address review feedback on an existing MR",
+    "release": "run a tracked two-leg software release",
+    "chat": "open-ended conversation and pairing with the user",
+    "orchestrate": "the orchestrator's assistant: talk with the operator and dispatch runs",
+}
+
+UNKNOWN_TASKDEF_PURPOSE = (
+    "a taskdef from this session's tiers; its instructions say what it covers"
+)
+
 
 def _is_github_host(host):
     """Return True for GitHub / GitHub Enterprise hosts.
@@ -394,6 +414,42 @@ def find_taskdef_instructions(taskdef_name=None):
     if available:
         print(f"📁 Available task definitions: {', '.join(sorted(set(available)))}")
     return None
+
+
+def available_taskdefs():
+    """Taskdefs a run can draw on, for the ``available_taskdefs`` context.
+
+    Returns a list of ``{"name", "purpose", "path"}`` dicts: every name in
+    BUILTIN_TASKDEF_PURPOSES (in that order), then any other directory
+    carrying ``instructions.txt`` in taskdef_search_dirs(), sorted. ``path``
+    is the winning ``instructions.txt`` — the same first-match-wins walk
+    find_taskdef_file() does — or None when no tier carries the name, so
+    the template can say so instead of pointing at a file that is not
+    there. Unreadable tiers are skipped; this never raises into the render.
+    """
+    paths = {}
+    for search_dir in taskdef_search_dirs():
+        try:
+            entries = sorted(search_dir.iterdir()) if search_dir.is_dir() else []
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                instructions = entry / "instructions.txt"
+                if entry.name not in paths and instructions.is_file():
+                    paths[entry.name] = str(instructions)
+            except OSError:
+                continue
+    names = list(BUILTIN_TASKDEF_PURPOSES)
+    names.extend(sorted(n for n in paths if n not in BUILTIN_TASKDEF_PURPOSES))
+    return [
+        {
+            "name": name,
+            "purpose": BUILTIN_TASKDEF_PURPOSES.get(name, UNKNOWN_TASKDEF_PURPOSE),
+            "path": paths.get(name),
+        }
+        for name in names
+    ]
 
 
 def configured_taskdef_root():
@@ -834,6 +890,7 @@ def render_taskdef_template(template_file, extra_context=None):
     is_github, is_gitlab = _target_provider_flags()
     context['is_github'] = is_github
     context['is_gitlab'] = is_gitlab
+    context['available_taskdefs'] = available_taskdefs()
     if extra_context:
         context.update(extra_context)
 

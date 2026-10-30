@@ -1,16 +1,15 @@
 <script setup>
-// Retention hides pane entries; the server's record stays intact.
+// The channel's whole record, oldest first: no setting prunes this view (issue
+// 465). The dock above it is what keeps only the newest notes.
 
 import {
   computed, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue'
 import AskEntry from './AskEntry.vue'
 import { fetchSessionAsk } from '../api.js'
-import { retainedEntries } from '../operatorChat.js'
 
 const props = defineProps({
   sessionId: { type: String, required: true },
-  keepLast: { type: Number, default: 0 },
   // Whether the session is still running, which here decides one thing only:
   // whether the record can still grow. Nothing on this view is answerable.
   live: { type: Boolean, default: false },
@@ -21,8 +20,7 @@ const props = defineProps({
 // end and each poll is a directory listing.
 const POLL_MS = 5000
 
-const history = ref([])
-const entries = computed(() => retainedEntries(history.value, props.keepLast))
+const entries = ref([])
 const problem = ref(null)
 const loaded = ref(false)
 let timer = null
@@ -37,7 +35,7 @@ async function load() {
   try {
     const page = await fetchSessionAsk(props.sessionId)
     if (disposed || mine !== generation) return
-    history.value = page.entries || []
+    entries.value = page.entries || []
     problem.value = null
   } catch (exc) {
     if (disposed || mine !== generation) return
@@ -51,7 +49,7 @@ async function load() {
 function start() {
   if (owner !== props.sessionId) {
     owner = props.sessionId
-    history.value = []
+    entries.value = []
     loaded.value = false
     problem.value = null
   }
@@ -86,9 +84,6 @@ watch(() => props.live, start)
       This session posted nothing on its channel.
     </p>
 
-    <p v-if="loaded && history.length > entries.length" class="text-medium-emphasis">
-      Showing the newest {{ entries.length }} entries. Older entries are hidden by your chat display setting.
-    </p>
     <v-card v-if="loaded && !empty" class="mb-3">
       <v-card-text>
         <AskEntry

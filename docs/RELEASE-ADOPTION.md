@@ -92,10 +92,10 @@ None of them are free; each one closes a specific hole.
 ### Credentials
 
 - [ ] Per-repo **fine-grained PAT** issued with `contents:write` +
-      `workflows:write` on the single mirror repo (`workflows:write` is
-      required: mirrored `main` routinely carries `.github/workflows/*`
-      changes, and GitHub rejects workflow-touching pushes from a PAT
-      without it).
+      `workflows:write` + `actions:write` (Actions read and write) on the
+      single mirror repo (`workflows:write` is required: mirrored `main`
+      routinely carries `.github/workflows/*` changes, and GitHub rejects
+      workflow-touching pushes from a PAT without it).
 - [ ] PAT provisioned via lmer credential provisioning to **release-taskdef
       sessions only**, with `push_allow` entries for the mirror repo and
       for tag pushes to GitLab origin (`refs/tags/*`).
@@ -126,7 +126,8 @@ sessions receive them.
 Fine-grained PATs **expire** (≤ 1 year). Before expiry:
 
 - [ ] Issue a new fine-grained PAT with the same scopes
-      (`contents:write` + `workflows:write`, single mirror repo).
+      (`contents:write` + `workflows:write` + `actions:write`, single
+      mirror repo).
 - [ ] Update the lmer credential-provisioning entry (reference the entry
       name — never record the token value anywhere).
 - [ ] Confirm the next release-taskdef session receives the new PAT and

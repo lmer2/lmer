@@ -702,6 +702,18 @@ exit tab has the same toggle beside forget, and the fleet row shows a `muted`
 chip and carries `muted: true` (so `lmer-ctl status` shows it too). Each change
 is a `run_muted` or `run_unmuted` platform event that names who made it.
 
+If the platform's state is briefly busy (the project database is locked by
+another writer, or the mute state could not be written), a mute route answers
+`503` with `Retry-After` and a `detail` of `{code: "state_busy", message,
+retryable: true}`. Both verbs are idempotent, so retry.
+
+Any other route that finds the project database locked also answers `503`
+`state_busy` with `Retry-After`, and `retryable` says whether a retry is known
+to be safe. It is `true` only when the lock was hit while the request was being
+bound to its project, before anything ran. Otherwise it is `false`: the
+request may have partly applied, so retry it only if it is idempotent (a spawn
+or a project create is not), and check its effect first.
+
 While a run is muted:
 
 - Routine records are not spooled to the assistant: messages, replies and notes

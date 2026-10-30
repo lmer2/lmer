@@ -239,6 +239,10 @@ _CONTROL_TOKEN_BYTES = 32
 #: See :func:`_pick_control_port`.
 _PORT_PICK_ATTEMPTS = 8
 
+#: How many session ids a launch draws before refusing. See
+#: :func:`_reserve_session_identity`.
+_SESSION_ID_ATTEMPTS = 8
+
 #: The flag ``lmer`` reads an answer from, spelled by :func:`_build_command` from
 #: :attr:`SpawnRequest.answer`. Lives here rather than in
 #: :mod:`lmer_platform.answer` because this module both emits it and refuses it in
@@ -2357,17 +2361,89 @@ def _mint_control_token(session_id: str) -> tuple:
     ``O_EXCL`` for the same reason — ``os.open`` ignores the mode argument for a
     file that already exists, so the only way to be certain of the permissions is
     to refuse anything already there.
+
+    That refusal is also what makes the create a reservation of *session_id*
+    (:func:`_reserve_session_identity`), so :class:`FileExistsError` propagates
+    for the caller to draw another id; every other failure is a
+    :class:`SpawnError`, and leaves no file behind.
     """
     token = secrets.token_urlsafe(_CONTROL_TOKEN_BYTES)
     path = token_file_for(session_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise SpawnError(f"cannot write the control token for {session_id} ({exc})")
+    try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(token)
     except OSError as exc:
+        # Ours: the exclusive create above is what proves it.
+        with _suppress_oserror():
+            path.unlink()
         raise SpawnError(f"cannot write the control token for {session_id} ({exc})")
     return token, path
+
+
+def _session_artifacts(session_id: str) -> tuple:
+    """Everything keyed by *session_id* that an earlier session may still own.
+
+    The token is not here because it is the reservation itself. A session that
+    has gone keeps some of these — the log and its directories outlive it as
+    scrollback — and an entry can outlive its token; a launch that took the id
+    over would append to, mount or overwrite another session's records.
+    """
+    return (
+        registry.session_path(session_id),
+        log_path_for(session_id),
+        container_log_dir_for(session_id),
+        ports_file_for(session_id),
+        exit_file_for(session_id),
+        transcript_dir_for(session_id),
+        ask_dir_for(session_id),
+        status_dir_for(session_id),
+        uploads.session_upload_dir(session_id),
+    )
+
+
+def _reserve_session_identity() -> tuple:
+    """Mint a session id this launch alone holds: ``(session_id, token, token_file)``.
+
+    The reservation is the token's exclusive create, made before any other
+    per-session artifact, so two launches in one second — in this daemon or
+    another sharing the state directory — can never both hold one id (#519). A
+    candidate that is taken, by a token or by anything in
+    :func:`_session_artifacts`, is skipped rather than reused, and only a token
+    this call created is ever removed. Bounded, so a broken id source is a
+    refusal and not a spin.
+    """
+    for _ in range(_SESSION_ID_ATTEMPTS):
+        session_id = registry.new_session_id()
+        try:
+            token, token_file = _mint_control_token(session_id)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                taken = any(path.exists() for path in _session_artifacts(session_id))
+            except OSError as exc:
+                # The caller's cleanup only covers a reservation this returned.
+                with _suppress_oserror():
+                    token_file.unlink()
+                raise SpawnError(
+                    f"cannot tell whether session id {session_id} is free ({exc})"
+                ) from exc
+            if not taken:
+                return session_id, token, token_file
+            with _suppress_oserror():
+                token_file.unlink()
+        logger.warning("platform_session_id_taken id=%s — drawing another", session_id)
+    raise SpawnError(
+        f"cannot reserve a session id: {_SESSION_ID_ATTEMPTS} candidates all "
+        "named an existing session — refusing to launch rather than share one"
+    )
 
 
 def _reported_model(payload: dict) -> Optional[str]:
@@ -3816,120 +3892,124 @@ def _spawn_session(
     # trace of a session that was never started.
     control_port = _pick_control_port()
 
-    session_id = registry.new_session_id()
-    log_file = log_path_for(session_id)
+    # Reserved before any other per-session artifact exists, so a clashing id is
+    # given up before it has touched anything of the session that holds it (#519).
+    session_id, control_token, token_file = _reserve_session_identity()
     try:
-        # Through the store so every level takes STATE_DIR_MODE — the bare
-        # mkdir left logs/ at the umask around 0600 log files (T93 finding).
-        store.ensure_state_dir(log_file.parent)
-    except OSError as exc:
-        raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
+        log_file = log_path_for(session_id)
+        try:
+            # Through the store so every level takes STATE_DIR_MODE — the bare
+            # mkdir left logs/ at the umask around 0600 log files (T93 finding).
+            store.ensure_state_dir(log_file.parent)
+        except OSError as exc:
+            raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
-    try:
-        config_flags, seed_error = codex_config.mount_flags(
-            host, project, slug, kind, session_id, codex=_requests_codex(request),
-        )
-    except OSError as exc:
-        raise SpawnError(f"cannot prepare persistent Codex configuration: {exc}") from exc
-    channels = _prepare_session_channels(session_id, kind)
-    # One call, because _with_host_flags inserts at a fixed anchor and two
-    # would interleave in reverse.
-    host_flags = config_flags + channels.host_flags + _assistant_resource_flags(kind)
-    if host_flags:
-        command = _with_host_flags(command, host_flags)
+        try:
+            config_flags, seed_error = codex_config.mount_flags(
+                host, project, slug, kind, session_id, codex=_requests_codex(request),
+            )
+        except OSError as exc:
+            raise SpawnError(f"cannot prepare persistent Codex configuration: {exc}") from exc
+        channels = _prepare_session_channels(session_id, kind)
+        # One call, because _with_host_flags inserts at a fixed anchor and two
+        # would interleave in reverse.
+        host_flags = config_flags + channels.host_flags + _assistant_resource_flags(kind)
+        if host_flags:
+            command = _with_host_flags(command, host_flags)
 
-    control_token, token_file = _mint_control_token(session_id)
+        # Facts the child cannot work out for itself: where to report the ports it
+        # publishes (it picks those, see ports_file_for), the port and token its
+        # control plane must use so the registry entry below is true from the start,
+        # and — when the channel directory exists — the container-side path of its ask
+        # channel. That last one is the flag an agent tests to know it was started by
+        # the orchestrator, which is why it is set here and only here: a session
+        # spawned without a usable channel directory must not claim to have one.
+        invocation_env = {
+            "LMER_WORKSPACE_ID": workspace_id or "",
+            "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
+            "LMER_FASTAPI_PORT": str(control_port),
+            "LMER_FASTAPI_TOKEN": control_token,
+            "LMER_SESSION_KIND": kind,
+            session_record.SOURCE_ENV: request.source_session_id or "",
+            session_record.SOURCE_ACK_ENV: request.allow_unsigned_source or "",
+            session_record.METADATA_ENV: json.dumps(
+                _session_metadata(request), ensure_ascii=False, separators=(",", ":")
+            ),
+            # Become labels on the session's container, which is how a restarted
+            # platform finds it again (#444).
+            "LMER_PLATFORM_SESSION_ID": session_id,
+            "LMER_PLATFORM_RUN_SLUG": slug or "",
+            "LMER_PLATFORM_EXIT_FILE": str(exit_file_for(session_id)),
+            "LMER_PLATFORM_INSTANCE": containers.platform_instance(),
+            "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
+                terminal_settings()["confirm_seconds"].value
+            ),
+            "LMER_PLATFORM_ASSISTANT_NAME": config.assistant_name,
+            authority.ENV: supervisor_level,
+            # Blank when the seed was read, never absent, so the child's .env
+            # seeding cannot supply one of its own.
+            CODEX_SEED_ERROR_ENV: seed_error,
+        }
+        invocation_env.update(channels.env)
+        invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
+        if request.no_repo:
+            # Spec D17, structurally: `lmer` skips repo resolution on this and the
+            # container skips the workspace clone, so the session has nothing to edit
+            # rather than instructions not to.
+            invocation_env[NO_REPO_ENV] = "1"
+        else:
+            # Also never inherited, and for the sharper version of the same reason: a
+            # daemon whose shell exported LMER_NO_REPO would otherwise hand every
+            # worker an empty /workspace while its request still names a repository —
+            # a session that looks like it is working on code it does not have. Blank
+            # for the same reason as above: deleting the key only hides it from this
+            # environment, and the child's own .env seeding would hand it straight
+            # back. Blank is falsy to get_bool_env on the host and never equals "1"
+            # in the container, so it reads as unset the whole way down.
+            invocation_env[NO_REPO_ENV] = ""
+        child_env = env_with_overrides(invocation_env)
 
-    # Facts the child cannot work out for itself: where to report the ports it
-    # publishes (it picks those, see ports_file_for), the port and token its
-    # control plane must use so the registry entry below is true from the start,
-    # and — when the channel directory exists — the container-side path of its ask
-    # channel. That last one is the flag an agent tests to know it was started by
-    # the orchestrator, which is why it is set here and only here: a session
-    # spawned without a usable channel directory must not claim to have one.
-    invocation_env = {
-        "LMER_WORKSPACE_ID": workspace_id or "",
-        "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
-        "LMER_FASTAPI_PORT": str(control_port),
-        "LMER_FASTAPI_TOKEN": control_token,
-        "LMER_SESSION_KIND": kind,
-        session_record.SOURCE_ENV: request.source_session_id or "",
-        session_record.SOURCE_ACK_ENV: request.allow_unsigned_source or "",
-        session_record.METADATA_ENV: json.dumps(
-            _session_metadata(request), ensure_ascii=False, separators=(",", ":")
-        ),
-        # Become labels on the session's container, which is how a restarted
-        # platform finds it again (#444).
-        "LMER_PLATFORM_SESSION_ID": session_id,
-        "LMER_PLATFORM_RUN_SLUG": slug or "",
-        "LMER_PLATFORM_EXIT_FILE": str(exit_file_for(session_id)),
-        "LMER_PLATFORM_INSTANCE": containers.platform_instance(),
-        "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
-            terminal_settings()["confirm_seconds"].value
-        ),
-        "LMER_PLATFORM_ASSISTANT_NAME": config.assistant_name,
-        authority.ENV: supervisor_level,
-        # Blank when the seed was read, never absent, so the child's .env
-        # seeding cannot supply one of its own.
-        CODEX_SEED_ERROR_ENV: seed_error,
-    }
-    invocation_env.update(channels.env)
-    invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
-    if request.no_repo:
-        # Spec D17, structurally: `lmer` skips repo resolution on this and the
-        # container skips the workspace clone, so the session has nothing to edit
-        # rather than instructions not to.
-        invocation_env[NO_REPO_ENV] = "1"
-    else:
-        # Also never inherited, and for the sharper version of the same reason: a
-        # daemon whose shell exported LMER_NO_REPO would otherwise hand every
-        # worker an empty /workspace while its request still names a repository —
-        # a session that looks like it is working on code it does not have. Blank
-        # for the same reason as above: deleting the key only hides it from this
-        # environment, and the child's own .env seeding would hand it straight
-        # back. Blank is falsy to get_bool_env on the host and never equals "1"
-        # in the container, so it reads as unset the whole way down.
-        invocation_env[NO_REPO_ENV] = ""
-    child_env = env_with_overrides(invocation_env)
-
-    master_fd, slave_fd = pty.openpty()
-    launch_pipe = os.pipe() if projects.enabled() and kind == registry.ASSISTANT_KIND else None
-    launch_error_pipe = os.pipe() if launch_pipe else None
-    child_command = ([sys.executable, str(Path(__file__).with_name("launch_guard.py")),
-                      str(launch_pipe[0]), str(launch_error_pipe[1]), *command]
-                     if launch_pipe else command)
-    try:
-        project_requests.effect()
-        process = subprocess.Popen(
-            child_command,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            env=child_env,
-            start_new_session=True,
-            **({"pass_fds": (launch_pipe[0], launch_error_pipe[1])} if launch_pipe else {}),
-        )
-    except (OSError, ValueError) as exc:
-        if launch_pipe:
-            os.close(launch_pipe[1])
-            os.close(launch_error_pipe[0])
-        os.close(master_fd)
-        os.close(slave_fd)
-        # The token was minted for a process that does not exist; nothing will
-        # ever come back to read it, so it is litter — and litter that is a
-        # credential does not get left lying around.
+        master_fd, slave_fd = pty.openpty()
+        launch_pipe = os.pipe() if projects.enabled() and kind == registry.ASSISTANT_KIND else None
+        launch_error_pipe = os.pipe() if launch_pipe else None
+        child_command = ([sys.executable, str(Path(__file__).with_name("launch_guard.py")),
+                          str(launch_pipe[0]), str(launch_error_pipe[1]), *command]
+                         if launch_pipe else command)
+        try:
+            project_requests.effect()
+            process = subprocess.Popen(
+                child_command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=child_env,
+                start_new_session=True,
+                **({"pass_fds": (launch_pipe[0], launch_error_pipe[1])} if launch_pipe else {}),
+            )
+        except (OSError, ValueError) as exc:
+            if launch_pipe:
+                os.close(launch_pipe[1])
+                os.close(launch_error_pipe[0])
+            os.close(master_fd)
+            os.close(slave_fd)
+            if isinstance(exc, projects.ProjectError):
+                raise
+            raise SpawnError(f"cannot start {command[0]} ({exc})")
+        finally:
+            if launch_pipe:
+                os.close(launch_pipe[0])
+                os.close(launch_error_pipe[1])
+            # The child holds its own copy of the slave end.
+            with _suppress_oserror():
+                os.close(slave_fd)
+    except BaseException:
+        # Only ours to remove: the reservation proved no other launch held it.
+        # It was minted for a process that does not exist, nothing will ever
+        # come back to read it, and litter that is a credential does not get
+        # left lying around.
         with _suppress_oserror():
             token_file.unlink()
-        if isinstance(exc, projects.ProjectError):
-            raise
-        raise SpawnError(f"cannot start {command[0]} ({exc})")
-    finally:
-        if launch_pipe:
-            os.close(launch_pipe[0])
-            os.close(launch_error_pipe[1])
-        # The child holds its own copy of the slave end.
-        with _suppress_oserror():
-            os.close(slave_fd)
+        raise
 
     # Register before starting the drain thread: the thread's cleanup path
     # removes the entry, and it must never run against an entry that was never
@@ -4020,8 +4100,18 @@ def _spawn_session(
         else:
             publish_registration(register, session_id, process.pid)
         if launch_pipe:
-            os.write(launch_pipe[1], b"1")
-            error = os.read(launch_error_pipe[0], 4096)
+            # After registration, never before: the guard holds the assistant
+            # back until its ownership is durable, however long that takes. A
+            # guard that is already gone (signalled) closes the pipe under this
+            # write.
+            try:
+                os.write(launch_pipe[1], b"1")
+                error = os.read(launch_error_pipe[0], 4096)
+            except OSError as exc:
+                raise SpawnError(
+                    f"cannot start {command[0]}: its launch guard exited before "
+                    f"the launch was released ({exc})"
+                ) from exc
             if error:
                 raise SpawnError(f"cannot start {command[0]} ({error.decode(errors='replace')})")
     except BaseException:

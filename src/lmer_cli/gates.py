@@ -25,6 +25,7 @@ import yaml
 from lmer_cli import ci_baseline, gate_cache, gate_descriptor, precommit_cache, push_allow, test_resources
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.gitlab_pipeline import GitLabPipelineClient, GitLabPipelineError, get_token
+from lmer_cli.private_tmp import owned_dir, write_private
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, redact_secrets, task_info_dir
 
@@ -134,8 +135,10 @@ class PassingSuite:
 
 # Fixed, predictable location for the full gate-check log. Overwritten on every
 # run so it always reflects the latest invocation. Lives under /tmp so it is
-# never committed and needs no per-project configuration.
-GATE_CHECK_LOG_PATH = Path("/tmp/gate-check.log")
+# never committed and needs no per-project configuration, in a directory of
+# this uid's own: the log holds every finding the Security Check made, and one
+# shared name let users overwrite, redirect and read each other's (#262).
+GATE_CHECK_LOG_PATH = Path(f"/tmp/lmer-gate-check-{os.geteuid()}") / "gate-check.log"
 
 # A pytest tail line ("1397 passed in 42.1s", "1 failed, 12 passed in 3s",
 # "no tests ran in 0.01s" is intentionally NOT matched — no count, no claim).
@@ -646,7 +649,7 @@ class GateSystem:
                 details_limit=5,
                 details_keep_tail=True,
                 full_output=combined_output,
-                # The terminal line is overwritten every run (/tmp/gate-check.log)
+                # The terminal line is overwritten every run (the gate-check log)
                 # and never pushed; the receipt is the only durable record. Carry
                 # the declared mode there too, so a reviewer reading the run dir a
                 # week later can tell which suite the gate accepted. `scope_targets`
@@ -1943,7 +1946,8 @@ class GateSystem:
         """
         # Resolve the default at call time (not as a default arg) so the module
         # constant can be monkeypatched and so the latest value is always used.
-        if path is None:
+        default = path is None
+        if default:
             path = GATE_CHECK_LOG_PATH
 
         lines: List[str] = []
@@ -1992,9 +1996,13 @@ class GateSystem:
 
         self.log_path_written = None
         try:
+            # Only the default's directory is made private: a caller-chosen
+            # directory is the caller's, and is not this method's to chmod.
+            if default and owned_dir(path.parent, create=True) is None:
+                raise OSError(f"{path.parent} is not a private directory of this user")
             # backslashreplace: a file name that is not valid UTF-8 is
             # surrogate-escaped by rglob and would otherwise raise here.
-            path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
+            write_private(path, "\n".join(lines), errors="backslashreplace")
         except OSError as e:
             print(f"{Colors.YELLOW}⚠️  Could not write gate-check log to {path}: {e}{Colors.NC}")
             return None

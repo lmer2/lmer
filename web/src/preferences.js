@@ -75,10 +75,13 @@ export function rememberFlag(write, value) {
 }
 
 // A remembered id, such as a project's. It is only a candidate: whether it still
-// names anything is for the caller to check against what exists now.
+// names anything is for the caller to check against what exists now. A stored ''
+// is an answer ("none"), so it comes back as '' while nothing stored, or nothing
+// readable, comes back as null: a caller with a fallback must not take the first
+// for the second.
 export function storedId(read) {
   const stored = guarded(read, null)
-  return typeof stored === 'string' ? stored : ''
+  return typeof stored === 'string' ? stored : null
 }
 
 export function rememberId(write, value) {

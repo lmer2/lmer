@@ -311,7 +311,7 @@ class TestPostIntoAThread:
             ]) == 0
         finally:
             rig.stop()
-        assert "📎 review.md" in rig.slack.posted[0][2]
+        assert "📎 `review.md`" in rig.slack.posted[0][2]
         assert rig.records()[0].attachments[0]["name"] == "review.md"
 
 

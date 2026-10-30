@@ -91,7 +91,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
-from lmer_cli.memory_areas import AREAS_DIR, is_area_slug
+from lmer_cli.memory_areas import AREAS_DIR, is_area_slug, is_forget_tombstone
 from lmer_schema.checks.findings import CHECKS, Form, Severity, Tier, register
 from lmer_schema.checks.walk import ProjectDir, project_dirs
 
@@ -120,6 +120,7 @@ __all__ = [
     "RESERVED_NAMES",
     "UNKNOWN_HARNESS",
     "check_agents",
+    "is_forget_tombstone",
     "iter_project_dirs",
     "parse_frontmatter",
     "parse_index_entries",
@@ -348,7 +349,9 @@ def parse_index_entries(text, *, memory_map: bool = False) -> List[str]:
     link to a ``.md`` file. A heading, prose, a tombstoned line (the link
     replaced by ``archived``/``forgotten`` and a date) and a link re-pointed
     at the ``_archive/`` mirror carry no entry, so they are returned by
-    nobody and are never a finding.
+    nobody and are never a finding. A ``forget`` tombstone
+    (:func:`is_forget_tombstone`) carries none at all: writers keep it
+    verbatim, so a dead link later on it is no finding either (#601).
 
     With *memory_map* (a memory scope's ``MEMORY.md``), a line linking an
     area index is a MAP line (#435): only its area link is returned — the
@@ -357,6 +360,8 @@ def parse_index_entries(text, *, memory_map: bool = False) -> List[str]:
     """
     targets = []
     for line in text.splitlines():
+        if is_forget_tombstone(line):
+            continue
         found = []
         for target in _LINK_RE.findall(line):
             if not target.lower().endswith(".md"):

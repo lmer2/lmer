@@ -1,6 +1,7 @@
 """Tests for the gate-in-flight marker (src/lmer_cli/gate_lock.py, issue #201)."""
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from lmer_cli import gate_lock
+from work_repo import git_ops, write_journal
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -109,9 +111,20 @@ class TestMarkerIsLive:
         now = gate_lock.STALE_AFTER_SECONDS + 1
         assert gate_lock.marker_is_live(marker, now=now, pid_alive=True) is False
 
-    def test_unknown_start_time_falls_back_to_pid_liveness(self):
-        marker = {"pid": 1, "started_at": None}
+    def test_unknown_start_time_is_aged_by_when_the_marker_was_written(self):
+        """The pid still decides first; the file's mtime stands in for the
+        start time so the pid-reuse backstop still applies (#262)."""
+        marker = {"pid": 1, "started_at": None, "written_at": 1e9 - 60}
         assert gate_lock.marker_is_live(marker, now=1e9, pid_alive=True) is True
+        assert gate_lock.marker_is_live(marker, now=1e9, pid_alive=False) is False
+        old = {"pid": 1, "started_at": None,
+               "written_at": 1e9 - gate_lock.STALE_AFTER_SECONDS - 60}
+        assert gate_lock.marker_is_live(old, now=1e9, pid_alive=True) is False
+
+    def test_a_marker_nothing_can_age_is_stale(self):
+        """Live forever was the alternative: an indefinite deferral (#262)."""
+        marker = {"pid": 1, "started_at": None}
+        assert gate_lock.marker_is_live(marker, now=1e9, pid_alive=True) is False
 
     def test_cap_is_far_longer_than_a_real_gate(self):
         # The full suite is ~14 minutes and a slow runner beats that; a cap
@@ -379,6 +392,245 @@ class TestHoldGateLock:
     def test_default_lock_dir_when_unset(self, monkeypatch):
         monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
         assert gate_lock.lock_dir() == Path(gate_lock.DEFAULT_LOCK_DIR)
+
+    def test_an_absent_default_is_still_the_default(self, tmp_path, monkeypatch):
+        """The first writer creates it, where older versions still look."""
+        legacy = tmp_path / "lmer-gate-inflight"
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+        assert gate_lock.lock_dir() == legacy
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert (legacy / f"{os.getpid()}.json").is_file()
+
+
+# ---- lock-dir ownership (#262) --------------------------------------------------
+
+
+def _appear_foreign(monkeypatch, *paths):
+    """Make *paths* look owned by another uid to every ``os.lstat`` caller.
+
+    The directory is what moves here, not the uid: faking ``geteuid`` would
+    also make every directory this test creates look foreign, including the
+    per-uid fallback the test needs to be accepted.
+    """
+    real_lstat = os.lstat
+    targets = {str(path) for path in paths}
+
+    def lstat(candidate, *args, **kwargs):
+        info = real_lstat(candidate, *args, **kwargs)
+        if os.fspath(candidate) not in targets:
+            return info
+        fields = list(info[:10])
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def _foreign_file(monkeypatch, path):
+    """Make the file at *path* look owned by another uid to ``os.fstat``.
+
+    Keyed by inode, not name, because the reads under test ``fstat`` the
+    descriptor they opened. The directory stays ours: what is being tested is
+    a planted file inside a lock dir this uid otherwise trusts.
+    """
+    inode = path.stat().st_ino
+    real_fstat = os.fstat
+
+    def fstat(descriptor):
+        info = real_fstat(descriptor)
+        if info.st_ino != inode:
+            return info
+        fields = list(info[:10])
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
+class TestLockDirOwnership:
+    """The default lock dir is a world-known /tmp name: whoever claims it
+    first could stall every gate's commits or redirect its writes."""
+
+    def test_a_dir_owned_by_another_uid_is_never_read(self, _lock_dir, monkeypatch):
+        _write_marker(_lock_dir, os.getppid(), started_at=time.time())
+        # Holding a live-looking marker it would otherwise defer on.
+        assert gate_lock.active_gate() is not None
+        other = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other)
+
+        assert gate_lock.active_gate() is None
+        assert gate_lock.read_markers() == []
+        assert gate_lock.safe_lock_dir() is None
+
+    def test_a_dir_owned_by_another_uid_is_never_written(self, _lock_dir, monkeypatch):
+        _lock_dir.mkdir(mode=0o700)
+        other = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other)
+
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert list(_lock_dir.iterdir()) == []
+
+    def test_a_symlinked_lock_dir_is_refused_not_followed(self, tmp_path, monkeypatch):
+        real = tmp_path / "elsewhere"
+        real.mkdir()
+        link = tmp_path / "locks-link"
+        link.symlink_to(real, target_is_directory=True)
+        monkeypatch.setenv(gate_lock.LOCK_DIR_ENV, str(link))
+
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert list(real.iterdir()) == []
+        _write_marker(real, os.getppid(), started_at=time.time())
+        assert gate_lock.active_gate() is None
+
+    def test_a_planted_marker_symlink_is_not_written_through(self, _lock_dir, tmp_path):
+        _lock_dir.mkdir(mode=0o700)
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        (_lock_dir / f"{os.getpid()}.json").symlink_to(target)
+
+        with gate_lock.hold_gate_lock("gate-check"):
+            pass
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+
+    def test_a_planted_marker_symlink_is_not_read_through(self, _lock_dir, tmp_path):
+        target = tmp_path / "outside.json"
+        target.write_text(json.dumps(
+            {"pid": os.getppid(), "gate": "gate-check", "started_at": time.time()}
+        ), encoding="utf-8")
+        _lock_dir.mkdir(mode=0o700)
+        (_lock_dir / f"{os.getppid()}.json").symlink_to(target)
+
+        assert gate_lock.active_gate() is None
+
+    def test_markers_are_owner_only(self, _lock_dir):
+        with gate_lock.hold_gate_lock("gate-check"):
+            marker = _lock_dir / f"{os.getpid()}.json"
+            assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+            assert stat.S_IMODE(_lock_dir.stat().st_mode) == 0o700
+
+    def test_a_marker_without_started_at_stops_deferring_after_the_cap(
+        self, _lock_dir
+    ):
+        """A live pid used to make such a marker defer forever (#262)."""
+        path = _write_marker(_lock_dir, os.getppid())
+        assert gate_lock.active_gate() is not None  # fresh: the pid still rules
+        old = time.time() - gate_lock.STALE_AFTER_SECONDS - 60
+        os.utime(path, (old, old))
+
+        assert gate_lock.active_gate() is None
+        assert not path.exists(), "an expired marker is pruned like a dead one"
+
+    def test_an_own_legacy_dir_is_adopted_and_tightened(self, tmp_path, monkeypatch):
+        legacy = tmp_path / "lmer-gate-inflight"
+        legacy.mkdir()
+        legacy.chmod(0o755)
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+
+        assert gate_lock.lock_dir() == legacy
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert (legacy / f"{os.getpid()}.json").is_file()
+        assert stat.S_IMODE(legacy.stat().st_mode) == 0o700
+
+    def test_removing_the_claim_mid_gate_does_not_flip_the_lock_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Once the per-uid dir is in use it stays in use: a claimant that
+        deletes its legacy dir mid-gate must not send readers back to the
+        default, where no marker, deferral or journal record was written."""
+        legacy = tmp_path / "lmer-gate-inflight"
+        legacy.mkdir()
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+        _appear_foreign(monkeypatch, legacy)
+        per_uid = tmp_path / f"lmer-gate-inflight-{os.geteuid()}"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        with gate_lock.hold_gate_lock("gate-check"):
+            _write_marker(per_uid, os.getppid(), started_at=time.time())
+            write_journal.record_write_intent("log", ["a/b"], work_repo=str(repo))
+            git_ops._queue_deferral(
+                tmp_path / "run", {"gate": "gate-check", "pid": 1}, ["a/b"]
+            )
+            legacy.rmdir()
+
+            assert gate_lock.active_gate() is not None
+            assert gate_lock.active_gate()["pid"] == os.getppid()
+            records = write_journal.consume_records(str(repo), os.getppid())
+            assert [r["command"] for r in records] == ["log"]
+            queue = git_ops._deferral_queue_path()
+            assert queue is not None and queue.parent == per_uid
+            parked = [json.loads(line) for line in queue.read_text().splitlines()]
+            assert [r["run_dir"] for r in parked] == [str(tmp_path / "run")]
+            assert gate_lock.lock_dir() == per_uid
+
+    def test_a_marker_owned_by_another_uid_is_not_believed(
+        self, _lock_dir, monkeypatch
+    ):
+        """A dir an older build made under a loose umask can hold names
+        another user planted before it was tightened (#262)."""
+        path = _write_marker(_lock_dir, os.getppid(), started_at=time.time())
+        assert gate_lock.active_gate() is not None
+        _foreign_file(monkeypatch, path)
+
+        assert gate_lock.active_gate() is None
+        assert gate_lock.read_markers() == []
+
+    def test_a_tighter_lock_dir_is_never_widened(self, _lock_dir):
+        _lock_dir.mkdir(mode=0o500)
+        assert gate_lock.read_markers() == []
+        assert stat.S_IMODE(_lock_dir.stat().st_mode) == 0o500
+
+    def test_a_foreign_legacy_dir_falls_back_to_the_per_uid_dir(
+        self, tmp_path, monkeypatch
+    ):
+        legacy = tmp_path / "lmer-gate-inflight"
+        legacy.mkdir(mode=0o777)
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+        _appear_foreign(monkeypatch, legacy)
+        per_uid = tmp_path / f"lmer-gate-inflight-{os.geteuid()}"
+
+        assert gate_lock.lock_dir() == per_uid
+        with gate_lock.hold_gate_lock("gate-check"):
+            # Writer and reader agree on the one resolved directory.
+            assert [m["pid"] for m in gate_lock.read_markers()] == [os.getpid()]
+            assert (per_uid / f"{os.getpid()}.json").is_file()
+            assert list(legacy.iterdir()) == []
+        assert stat.S_IMODE(per_uid.stat().st_mode) == 0o700
+
+    def test_a_symlinked_legacy_dir_falls_back_to_the_per_uid_dir(
+        self, tmp_path, monkeypatch
+    ):
+        real = tmp_path / "elsewhere"
+        real.mkdir()
+        legacy = tmp_path / "lmer-gate-inflight"
+        legacy.symlink_to(real, target_is_directory=True)
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+
+        assert gate_lock.lock_dir() == tmp_path / f"lmer-gate-inflight-{os.geteuid()}"
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert list(real.iterdir()) == []
+
+    def test_both_candidates_refused_is_fail_soft(self, tmp_path, monkeypatch):
+        legacy = tmp_path / "lmer-gate-inflight"
+        legacy.mkdir()
+        per_uid = tmp_path / f"lmer-gate-inflight-{os.geteuid()}"
+        per_uid.mkdir()
+        monkeypatch.delenv(gate_lock.LOCK_DIR_ENV, raising=False)
+        monkeypatch.setattr(gate_lock, "DEFAULT_LOCK_DIR", str(legacy))
+        _appear_foreign(monkeypatch, legacy, per_uid)
+        _write_marker(per_uid, os.getppid(), started_at=time.time())
+
+        assert gate_lock.active_gate() is None
+        with gate_lock.hold_gate_lock("gate-check"):
+            assert list(legacy.iterdir()) == []
+            assert [p.name for p in per_uid.iterdir()] == [f"{os.getppid()}.json"]
+        assert gate_lock.safe_lock_dir(create=True) is None
 
 
 # ---- env plumbing ---------------------------------------------------------------

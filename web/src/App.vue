@@ -100,7 +100,8 @@ function rememberFleetView(value) {
 // --- end of fleet view mode --------------------------------------------------
 
 // --- projects this browser comes back to (#627) ------------------------------
-// A page loads on its link's project, else the default, else the last one open.
+// A page loads on its link's project, else the default, else the last one open
+// (All projects included), else — when storage remembers nothing — the tab's own URL.
 // The default is not a platform setting: the platform has one shared secret and no
 // operator identity, so that default would be everyone's.
 const COLLAPSED_PROJECTS_STORAGE_KEY = 'lmer.projects.collapsed'
@@ -112,11 +113,10 @@ const collapsedProjects = ref(storedIds(
 ))
 const defaultProject = ref(storedId(
   () => window.localStorage.getItem(DEFAULT_PROJECT_STORAGE_KEY),
-))
-const restoreCandidates = [
-  defaultProject.value,
-  storedId(() => window.localStorage.getItem(LAST_PROJECT_STORAGE_KEY)),
-].filter(Boolean)
+) || '')
+// '' when the operator last chose All projects, null when nothing is remembered.
+const lastProject = storedId(() => window.localStorage.getItem(LAST_PROJECT_STORAGE_KEY))
+const restoreCandidates = [defaultProject.value, lastProject].filter(Boolean)
 
 function rememberCollapsed({ id, collapsed }) {
   const others = collapsedProjects.value.filter(
@@ -168,8 +168,9 @@ const urlProject = new URLSearchParams(window.location.search).get('workspace') 
 const ownUrl = Boolean(window.history.state?.[OWN_URL_STATE])
 const linkedProject = ownUrl ? '' : urlProject
 // The page's own URL is the last candidate, so a reload still keeps the project
-// when storage remembers nothing.
-if (ownUrl && urlProject) restoreCandidates.push(urlProject)
+// when storage remembers nothing. A remembered All projects is a choice, not
+// nothing: the URL may still name the default the operator has since cleared.
+if (ownUrl && urlProject && lastProject !== '') restoreCandidates.push(urlProject)
 const activeProject = ref(linkedProject || restoreCandidates[0] || '')
 // What storage chose; a link is never second-guessed, it gets the unavailable notice.
 const restoredProject = linkedProject ? '' : activeProject.value

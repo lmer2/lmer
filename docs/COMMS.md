@@ -725,10 +725,13 @@ else is stored as sent.
 refuses an `answer` or `close` to it from `uber-lmer` or `peer-ul` with a 400,
 whatever authority the record carries. The Slack connector never binds a
 thread post that no human typed (the platform's, a session's, any bot's) as its
-answer, and the matrix connector never binds one lmer made or its own account
-posted: each arrives as a plain message instead. The matrix connector cannot
-tell another bot account from a human, so such an account can still bind one.
-This is how a worker keeps a gate such as spec approval or a merge with the
+answer. The matrix connector cannot tell another bot account from a human, so
+it binds only a reply from an MXID listed in `LMER_MATRIX_OPERATOR_USERS`
+(host-side, comma-separated), and never one lmer made or its own account
+posted, even if listed. Every refused post arrives as a plain message instead.
+The list fails closed: unset or empty, no matrix reply answers an operator-only
+question, the connector says so once in the thread and logs it, and the
+question is answered on Slack or the platform. This is how a worker keeps a gate such as spec approval or a merge with the
 operator (issues #594 and #518). `lmer-signal list` marks such a question
 `(operator-only)`.
 

@@ -1346,6 +1346,34 @@ it('opens the default project on every load, over the last viewed, until it is c
   expect(switcherLabel(cleared)).toBe('Beta')
 })
 
+// A remembered All projects is stored as '' and is a choice: clearing the default
+// must bring it back, not the tab's own URL, which still names the old default.
+it('brings back All projects as the last viewed once the default is cleared', async () => {
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  await chooseProject(wrapper, 'Alpha research and development')
+  await chooseProject(wrapper, 'Project settings for Alpha research and development')
+  await wrapper.getComponent(ProjectSettings).get('.project-default input').setValue(true)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('alpha')
+  await chooseProject(wrapper, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  wrapper.unmount()
+
+  const reloaded = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.location.search).toBe('?workspace=alpha')
+  await chooseProject(reloaded, 'Project settings for Alpha research and development')
+  await reloaded.getComponent(ProjectSettings).get('.project-default input').setValue(false)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  reloaded.unmount()
+
+  const cleared = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(cleared)).toBe('All projects')
+})
+
 it('renders and switches projects when storage refuses every read and write', async () => {
   const refuse = () => { throw new DOMException('denied', 'SecurityError') }
   const failures = vi.spyOn(console, 'error').mockImplementation(() => {})
