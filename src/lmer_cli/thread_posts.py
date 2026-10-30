@@ -161,6 +161,15 @@ def tagged(label: object, text: str, *, slack_markup: bool) -> str:
     return f"{tag} {text}" if tag else text
 
 
+def slack_file_name(name: object) -> str:
+    """A file name as inert Slack mrkdwn: one line, entity-escaped, in a code
+    span. mrkdwn has no escape for ``*``, ``_`` or ``~``, so only the span keeps
+    ``my_draft_v2*.txt`` from rendering as formatting; a backtick in the name
+    becomes a look-alike, since the span cannot hold a real one."""
+    text = " ".join(str(name).split()).replace("`", "\u02cb")
+    return f"`{html.escape(text, quote=False)}`"
+
+
 # ---------------------------------------------------------------------------
 # matrix: on the event
 # ---------------------------------------------------------------------------

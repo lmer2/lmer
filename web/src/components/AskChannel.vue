@@ -13,8 +13,12 @@
 // every run. An empty card headed "operator channel" would be noise on every
 // detail view for a feature most sessions never use.
 //
-// Dock clearing and history retention hide entries independently. Neither
-// changes channel records; the dock must keep live questions answerable.
+// Two things hide entries here, and neither changes a channel record: the
+// operator's "clear from here", and the platform's dock retention (issue 465) —
+// one global setting that keeps the newest N notes, or none at 0, or all when
+// unset. Retention never hides an open question, whether or not a reply can
+// still reach it: that is what this dock is for. The operator chat tab is the
+// full record and neither of them touches it.
 //
 // Where the cleared state lives, and why it lives there
 // ----------------------------------------------------
@@ -64,6 +68,7 @@ import AskBox from './AskBox.vue'
 import AskEntry from './AskEntry.vue'
 import { fetchSessionAsk } from '../api.js'
 import { clearedIds, rememberCleared } from '../dismissals.js'
+import { chatConfigProblem, dockKeepLastNotes } from '../operatorChat.js'
 
 const props = defineProps({
   workspaceId: { type: String, default: undefined },
@@ -115,11 +120,21 @@ const open = computed(() => entries.value.filter(
 ))
 const waiting = computed(() => (props.live ? open.value : []))
 
-// Everything else the channel has, minus what has been cleared: notes, answered
-// questions (so a reply the operator just sent is visibly landed rather than
-// silently gone), the ones the session closed, and — on a session that has exited
-// — the questions nothing will ever read.
-const recent = computed(() => entries.value.filter(
+// Everything else the channel has, minus what retention and clearing hide: notes,
+// answered questions (so a reply the operator just sent is visibly landed rather
+// than silently gone), the ones the session closed, and — on a session that has
+// exited — the questions nothing will ever read, which retention keeps.
+//
+// Retention picks the newest notes out of the whole channel before clearing is
+// applied: the other way round, clearing the newest would bring older notes back.
+const retained = computed(() => {
+  const limit = dockKeepLastNotes.value
+  if (limit === null) return entries.value
+  const notes = entries.value.filter((entry) => !open.value.includes(entry))
+  const kept = new Set(limit > 0 ? notes.slice(-limit) : [])
+  return entries.value.filter((entry) => open.value.includes(entry) || kept.has(entry))
+})
+const recent = computed(() => retained.value.filter(
   (entry) => !waiting.value.includes(entry) && !dismissed.value.includes(entry.id),
 ))
 
@@ -201,6 +216,9 @@ watch(() => props.live, start)
     <v-alert v-if="problem" type="error" density="compact" class="mb-3">
       {{ problem }}
     </v-alert>
+    <v-alert v-if="chatConfigProblem" type="warning" density="compact" class="mb-3">
+      Could not refresh the dock's display setting: {{ chatConfigProblem }}
+    </v-alert>
 
     <!-- Open questions first, and ahead of everything else here: this is the one
          thing on the page that another human being is blocked on. Only while there
@@ -265,7 +283,7 @@ watch(() => props.live, start)
          cleared a channel has no way of knowing they can read it back. -->
     <p v-if="clearedCount" class="text-body-small text-medium-emphasis">
       {{ clearedCount }} cleared from here this visit. Nothing was deleted — the
-      channel is in the lmer tab's operator chat. Its display setting may hide older entries.
+      whole channel is in the lmer tab's operator chat.
     </p>
   </div>
 </template>

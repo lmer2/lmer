@@ -117,6 +117,9 @@ Leg 1 verifies the generic `GITLAB_TOKEN` issuing host before expanding the
 token: `LMER_GITLAB_TOKEN_HOST` names it explicitly, or the host is derived
 from `LMER_WORK_REPO` when that variable is unset. The resolved host must be
 the canonical GitLab host. Leg 2 scopes the GitHub PAT to each mirror command.
+Each `gh` command in leg 2 gets the PAT as `GH_TOKEN`, and `GH_REPO` set to
+`release.github_target`, in a subshell of its own, never shared with a `work`
+receipt or `bin/gate-push`.
 In particular, GitHub gate pushes do not use numbered Git config because the
 inherited environment also runs the test suite. As a backstop, captured
 pytest, custom test-runner, and pre-commit output is scrubbed for known token
@@ -237,15 +240,15 @@ Mechanics:
   GitLab (procedural, recorded by GitLab).
 
 **Residual risk, stated plainly.** The release PAT is fine-grained but
-carries `contents:write` + `workflows:write` on the mirror (the workflows
-scope is required: mirrored `main` routinely carries
+carries `contents:write` + `workflows:write` + `actions:write` on the
+mirror (the workflows scope is required: mirrored `main` routinely carries
 `.github/workflows/*` changes, and GitHub rejects workflow-touching pushes
 without it). An attacker holding that PAT can rewrite `main`, workflows,
-and tags together, defeating all in-repo and variable-based checks. With
-the deployment tag-pattern policy in place, the remaining exposure under
-PAT compromise is **accepted**. Mitigations are custody (release sessions
-only), minimal collaborators on the mirror, tag protection, and PAT
-expiry. The one control that fully survives PAT compromise — a
+and tags together, and re-run or cancel Actions runs, defeating all in-repo
+and variable-based checks. With the deployment tag-pattern policy in place,
+the remaining exposure under PAT compromise is **accepted**. Mitigations
+are custody (release sessions only), minimal collaborators on the mirror,
+tag protection, and PAT expiry. The one control that fully survives PAT compromise — a
 required-reviewer rule on the `pypi` environment — is **no longer
 deferred**: it is now a gating setup receipt. It costs the hands-off
 flow one one-click human approval on GitHub per release, and that trade

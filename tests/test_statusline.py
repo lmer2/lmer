@@ -33,9 +33,21 @@ from hooks.statusline import (
     rate_limit_text,
     status_document,
 )
+from tests.timing_budgets import CLI
 
 REPO_ROOT = Path(__file__).parent.parent
 SCRIPT = REPO_ROOT / "hooks" / "statusline.py"
+#: Runs the script as its ``__main__`` would, with ``GIT_TIMEOUT_SECONDS`` raised:
+#: the product's 2 s drops the branch segment on a loaded host (#636).
+RUN_SCRIPT = (
+    "import importlib.util, os, sys\n"
+    "sys.path[0] = os.path.dirname(sys.argv[1])\n"
+    "spec = importlib.util.spec_from_file_location('statusline', sys.argv[1])\n"
+    "statusline = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(statusline)\n"
+    "statusline.GIT_TIMEOUT_SECONDS = float(sys.argv[2])\n"
+    "raise SystemExit(statusline.main())\n"
+)
 
 
 def _payload(*, cwd=None, window=None, model="Fable"):
@@ -338,7 +350,7 @@ def _run_script(payload, env_extra=None, raw_stdin=None):
     env.update(env_extra or {})
     stdin = raw_stdin if raw_stdin is not None else json.dumps(payload)
     return subprocess.run(
-        [sys.executable, str(SCRIPT)],
+        [sys.executable, "-c", RUN_SCRIPT, str(SCRIPT), str(CLI)],
         input=stdin, capture_output=True, text=True, env=env,
     )
 

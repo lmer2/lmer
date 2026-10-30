@@ -51,6 +51,10 @@ HOMESERVER_ENV = "LMER_MATRIX_HOMESERVER"
 USER_ID_ENV = "LMER_MATRIX_USER_ID"
 ACCESS_TOKEN_ENV = "LMER_MATRIX_ACCESS_TOKEN"
 AUTHENTICATED_MEDIA_ENV = "LMER_MATRIX_AUTHENTICATED_MEDIA"
+#: MXIDs whose replies may answer an operator-only question (#599). Unset or
+#: empty means none may: there is no way to tell another bot account in the
+#: room from a human, so that question is answered on Slack or the platform.
+OPERATOR_USERS_ENV = "LMER_MATRIX_OPERATOR_USERS"
 
 BUS_POLL_SECONDS = 25.0
 SYNC_TIMEOUT_MS = 25000
@@ -103,6 +107,8 @@ class ConnectorConfig:
     platform_session: Optional[str] = None
     #: See :data:`matrix_chat.crypto.BRIDGE_URL_ENV`.
     bridge_url: Optional[str] = None
+    #: See :data:`OPERATOR_USERS_ENV`.
+    operator_users: frozenset = frozenset()
 
     @classmethod
     def from_env(
@@ -160,6 +166,10 @@ class ConnectorConfig:
             connect_budget=bus.connect_budget(environ),
             platform_session=(environ.get(PLATFORM_SESSION_ENV) or "").strip() or None,
             bridge_url=(environ.get(BRIDGE_URL_ENV) or "").strip() or None,
+            # Comma-separated, as LMER_MATRIX_ALLOWED_USERS is (matrix_chat.listener).
+            operator_users=frozenset(
+                item.strip() for item in (environ.get(OPERATOR_USERS_ENV) or "").split(",") if item.strip()
+            ),
         )
 
     @property
@@ -251,6 +261,9 @@ class MatrixConnector(ConnectorLifecycle):
         self._answered_freely: set = set()
         #: Whether the thread has been told this connector is listening.
         self._announced = False
+        #: Whether the thread has been told why no reply here answers an
+        #: operator-only question (OPERATOR_USERS_ENV unset).
+        self._operator_list_noted = False
         #: Who wrote the events this bot account sent (#427).
         self._posters = thread_posts.Attribution(
             poster_of=lambda event: thread_posts.poster_from_matrix(event.get("content")),
@@ -689,14 +702,21 @@ class MatrixConnector(ConnectorLifecycle):
         sender = event.get("sender")
         return sender if isinstance(sender, str) else None
 
+    def _is_operator(self, event: dict) -> bool:
+        sender = event.get("sender")
+        return bool(sender and sender != self.config.user_id and sender in self.config.operator_users)
+
     def _post_inbound(self, event, poster=None):
         event_id = event.get("event_id")
-        if poster is None and event.get("sender") != self.config.user_id:
+        human = poster is None and event.get("sender") != self.config.user_id
+        if human:
             if route_connected_mention(CHANNEL, self.room_id, event, bot_id=self.config.user_id):
                 with self._state.lock:
                     self._accept_inbound(event_id)
                     self._state.save()
                 return True
+        refused = []
+
         def prepare():
             content = event.get("content") if isinstance(event.get("content"), dict) else {}
             body, attachments = self._inbound_body(event)
@@ -714,16 +734,48 @@ class MatrixConnector(ConnectorLifecycle):
                          key=lambda question: question["seq"], default=None)
             question = related or oldest
             if question is not None:
-                bound = answer_binding(text, question, replies_to_question=related is not None,
-                                       first_since_question=self._first_since(question),
-                                       refuse_operator_only=poster is not None or event.get("sender") == self.config.user_id)
+                relation = {"replies_to_question": related is not None,
+                            "first_since_question": self._first_since(question)}
+                bound = answer_binding(text, question, **relation,
+                                       refuse_operator_only=poster is not None or not self._is_operator(event))
                 if bound is not None:
                     kind, in_reply_to, text = "answer", question["id"], bound
+                elif human and answer_binding(text, question, **relation) is not None:
+                    refused.append(question["id"])
             return {"question": question["id"] if question else None,
-                    "human_receipt": poster is None and event.get("sender") != self.config.user_id,
+                    "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
-        return bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
+        posted = bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
+        if refused:
+            self._operator_only_refused(event, refused[0])
+        return posted
+
+    def _operator_only_refused(self, event: dict, question_id: str) -> None:
+        """Say why a human's reply went in as a message, not the answer.
+
+        An unset list refuses every reply, so the thread is told once; a
+        sender missing from a set list is only logged, for a mistyped MXID.
+        """
+        if self.config.operator_users:
+            logger.info("matrix_connector_operator_only_refused question=%s sender=%s not in %s",
+                        question_id, event.get("sender"), OPERATOR_USERS_ENV)
+            return
+        if self._operator_list_noted:
+            return
+        self._operator_list_noted = True
+        logger.warning("matrix_connector_operator_only_refused question=%s reason=%s unset",
+                       question_id, OPERATOR_USERS_ENV)
+        try:
+            receipt = self._send_notice(self._tagged_notice(
+                f"Replies here can't answer an operator-only question: {OPERATOR_USERS_ENV} is not "
+                "set where this connector runs. Answer it on Slack or the platform."
+            ))
+            with self._state.lock:
+                self._remember_notice(receipt)
+                self._state.save()
+        except Exception as error:
+            logger.warning("matrix_connector_operator_notice_failed error=%s", error)
 
     def _accept_inbound(self, ref):
         self._seen.add(ref)

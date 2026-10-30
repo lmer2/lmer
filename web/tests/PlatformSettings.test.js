@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import PlatformSettings from '../src/components/PlatformSettings.vue'
 import { fetchPlatformSettings, setPlatformSettings, fetchConversationRequests } from '../src/api.js'
+import { dockKeepLastNotes } from '../src/operatorChat.js'
 import { mountPane, deferred } from './mount.js'
 
 vi.mock('../src/api.js', async (original) => ({
@@ -103,4 +104,46 @@ it('locks group editing during a save and does not overwrite a failed initial re
   expect(button('Remove group 1').attributes('disabled')).toBeDefined()
   saving.resolve(settings)
   await flushPromises()
+})
+
+// Every run's operator channel dock (issue 465): a global display preference,
+// edited here rather than in the assistant's settings dialog.
+describe('operator channel dock display', () => {
+  const dockSetting = value => ({ ...settings, dock: { keep_last_notes: { value, stored: value, source: value === null ? 'default' : 'config.json' } } })
+  const field = () => wrapper.get('.dock-display input')
+
+  it('loads the setting, saves N, 0 and empty as N, 0 and null, and applies it to this browser', async () => {
+    fetchPlatformSettings.mockResolvedValue(dockSetting(null))
+    setPlatformSettings.mockImplementation(async changes => dockSetting(changes.dock_keep_last_notes))
+    await open()
+    expect(wrapper.get('.dock-display').text()).toContain('Operator channel dock: keep last N notes')
+    expect(wrapper.get('.dock-display').text()).toContain('0 shows open questions only')
+    expect(field().element.value).toBe('')
+    for (const [typed, sent] of [['3', 3], ['0', 0], ['', null]]) {
+      await field().setValue(typed)
+      await click('Save dock display')
+      expect(setPlatformSettings).toHaveBeenLastCalledWith({ dock_keep_last_notes: sent })
+      expect(dockKeepLastNotes.value).toBe(sent)
+      expect(field().element.value).toBe(sent === null ? '' : String(sent))
+      expect(wrapper.get('.dock-display [role="status"]').text()).toBe('Dock display saved.')
+    }
+    expect(wrapper.emitted('changed')).toBeUndefined()
+  })
+
+  it('refuses a negative or fractional count before saving and shows a refused save', async () => {
+    fetchPlatformSettings.mockResolvedValue(dockSetting(2))
+    await open()
+    expect(field().element.value).toBe('2')
+    for (const typed of ['-1', '1.5']) {
+      await field().setValue(typed)
+      await click('Save dock display')
+      expect(setPlatformSettings).not.toHaveBeenCalled()
+      expect(wrapper.get('.dock-display .v-alert').text()).toContain('whole number of 0 or more')
+    }
+    setPlatformSettings.mockRejectedValueOnce(new Error('dock_keep_last_notes is unusable'))
+    await field().setValue('4')
+    await click('Save dock display')
+    expect(wrapper.get('.dock-display .v-alert').text()).toContain('dock_keep_last_notes is unusable')
+    expect(field().element.value).toBe('4')
+  })
 })

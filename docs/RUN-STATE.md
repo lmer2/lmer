@@ -432,9 +432,21 @@ The three mechanisms now know about each other, through one marker:
   `/tmp/lmer-gate-inflight`), removed in a `finally`. Liveness is the OS's
   answer, not a promise about how long a gate "should" take: a marker counts
   only while its pid is alive, dead ones are pruned on read, and the six-hour
-  age cap is a pid-reuse backstop, never a gate timeout. Writing a marker is
+  age cap is a pid-reuse backstop, never a gate timeout. A marker without a
+  readable `started_at` is aged by its file's mtime. Writing a marker is
   fail-soft — no lock problem can change a gate's exit code, exactly like
   receipt emission.
+- **Owned lock dir (#262).** The lock dir is used only when it is a real
+  directory owned by the current uid; it is tightened to `0700`, and its
+  markers, deferral queue and write journal are opened without following a
+  symlink and created `0600`. A file in it owned by another uid is treated
+  as absent: never believed, never written. When the default
+  `/tmp/lmer-gate-inflight` is another user's (or a symlink), the per-uid
+  `/tmp/lmer-gate-inflight-<euid>` is used instead, and once that exists
+  and is ours it is used from then on, so whoever claimed the default
+  cannot send readers back there by removing it. When neither can be
+  trusted, readers see no gate and writers write nothing — the pre-#201
+  race, never a wedged session.
 - **Commits defer.** `work_repo.git_ops.commit_work_path` — the single choke
   point behind `work commit` *and* the implicit pushes in `work state set` /
   `goal` / `artifact` / `ledger set` — skips add/commit/push while a marker is
@@ -1332,12 +1344,16 @@ dirs that address it.
   `work commit` stages the vacated address and leaves the completion write
   behind, and its next `work` verb seeds a phantom in-progress run exactly
   where the next release's claim looks. "Wrote" is asked of facts the
-  kernel records itself: the session dir's id or `sessions:` lineage, else
-  an `events.jsonl` line whose `session` is this `LMER_SESSION_ID` — or
-  the id `work session-start --session` names, since a resume continues
-  that launch and its own harness id joins the lineage only once the record
-  is found (`find_successor_run_dir`). Among the runs that vacated the
-  address, one this launch wrote wins over a live one it did not.
+  kernel records itself, by three routes: the session dir's id, its
+  `sessions:` lineage, and an `events.jsonl` line's `session` stamp. Two
+  ids are asked: this `LMER_SESSION_ID`, and the id `work session-start
+  --session` names, since a resume continues that launch and its own
+  harness id joins the lineage only once the record is found
+  (`find_successor_run_dir`). Both go through all three routes. `unknown`
+  is neither: it is the stamp every write without an `LMER_SESSION_ID`
+  carries, so `--session unknown` would otherwise claim any finished run
+  such a write touched. Among the runs that vacated the address, one this
+  launch wrote wins over a live one it did not.
   Known gap: this is the *fallback*, so an exact slug match still comes
   first. If the next release has already claimed the bare address while the
   finished launch is still running, that launch's later `work` verbs resolve
@@ -1345,13 +1361,19 @@ dirs that address it.
   open a session dir in its group. That happened before #172 too. Closing it
   would mean reading the matched run's events on every `work` call.
 - **An invocation with no `LMER_SESSION_ID` does not seed there**, with
-  or without `--session` (a resume of the finished run's launch has resolved
-  it before any seed). It has no identity to match, so "the finished run is mine" and "I am the next
-  release" look the same to it. `ensure_run` (every mutating verb) refuses
-  that seed loudly and names the finished run. `work session-start`, which is
-  hook-facing, skips with a warning and exits 0. Neither guesses "new run"
-  and leaves a phantom. A launched session (which always carries an id)
-  seeds as before, and so does an explicit `work seed`.
+  or without `--session`. It has no identity to match, so "the finished run
+  is mine" and "I am the next release" look the same to it. `ensure_run`
+  (every mutating verb) refuses that seed loudly and names the finished
+  run. `work session-start`, which is hook-facing, skips with a warning and
+  exits 0. Neither guesses "new run" and leaves a phantom. A `--session`
+  naming the finished run's launch usually resolves it before any seed, but
+  not always: the run is found by any of the three routes above, while the
+  session dir inside it is picked by name only (`_session_dir`). A
+  `--session` naming a lineage-only id, or the right id with a mistyped
+  `--<name>` half, finds the run and then addresses a dir that does not
+  exist, so it reaches the seed and the refusal is what stops it. A
+  launched session (which always carries an id) seeds as before, and so
+  does an explicit `work seed`.
 - **A claim from the launch that finished the release refuses**, with the
   schema-2 wording: "this execution has finished; start a fresh session".
   That run already left the address, so the roll-over below, which moves a

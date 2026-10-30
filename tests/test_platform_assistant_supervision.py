@@ -42,6 +42,7 @@ import os
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from dotenv import dotenv_values
@@ -50,7 +51,7 @@ from fastapi.testclient import TestClient
 from lmer_platform import api, assistant, daemon, projects, registry, spawn, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
-from tests.timing_budgets import JOIN
+from tests.timing_budgets import JOIN, outlast
 
 SECRET = "test-secret-value"
 
@@ -79,9 +80,10 @@ def _no_stray_supervisor(monkeypatch):
 def _supervision_ends_with_its_test(monkeypatch):
     """Stop and join every loop a test started, before its platform dir is restored.
 
-    ``Supervisor.stop`` only sets an event, so a loop already past its check
-    respawns into whichever ``PLATFORM_DIR`` is current next — another test's,
+    ``Supervisor.stop`` once only set an event, so a loop already past its check
+    respawned into whichever ``PLATFORM_DIR`` was current next — another test's,
     where it wrote a foreign assistant and deadlocked a daemon's project lock (#524).
+    It joins now (#566); this stays for a test that never calls it.
     """
     started = []
     original = assistant.Supervisor.start
@@ -985,6 +987,50 @@ def test_a_stopped_supervisor_is_never_re_armed(config):
     assert supervisor.resume() is False
     assert supervisor.gave_up is False
     assert registry.list_sessions(live_only=True) == [], "nothing may have started"
+
+
+def test_stop_waits_for_a_pass_already_past_its_check(config, monkeypatch):
+    """#566: a pass mid-start must finish before stop returns, not respawn after it."""
+    entered, release = threading.Event(), threading.Event()
+
+    def held_ensure(_config):
+        entered.set()
+        assert release.wait(JOIN)
+        raise assistant.AssistantError("released by the test")
+
+    monkeypatch.setattr(assistant, "ensure_running", held_ensure)
+    supervisor = assistant.Supervisor(config, sleep=lambda _delay: None)
+    thread = supervisor.start()
+    assert entered.wait(JOIN)
+    stopper = threading.Thread(target=supervisor.stop, daemon=True)
+    stopper.start()
+    try:
+        stopper.join(0.2)
+        assert stopper.is_alive(), "stop returned while a start was still running"
+    finally:
+        release.set()
+    stopper.join(JOIN)
+    assert not stopper.is_alive()
+    assert not thread.is_alive()
+
+
+def test_stop_does_not_wait_out_the_exit_poll(config, monkeypatch):
+    """Joining must not cost the daemon's shutdown a whole watch interval."""
+    waiting = threading.Event()
+
+    def await_exit(_session_id, timeout):
+        waiting.set()
+        time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(assistant, "status", lambda: SimpleNamespace(running=True, session_id="s-up", pid=None))
+    supervisor = assistant.Supervisor(config, await_exit=await_exit, poll=outlast(JOIN))
+    thread = supervisor.start()
+    assert waiting.wait(JOIN)
+    began = time.monotonic()
+    supervisor.stop()
+    assert not thread.is_alive()
+    assert time.monotonic() - began < JOIN
 
 
 def test_the_daemon_joins_project_supervision_before_returning(

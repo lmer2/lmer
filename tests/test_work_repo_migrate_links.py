@@ -47,7 +47,8 @@ from tests.test_work_repo_migrate import (
     _snapshot,
     _write_record,
 )
-from work_repo import git_ops, migrate, run_state
+from tests.test_work_repo_memory_areas import _index_findings
+from work_repo import git_ops, memory, migrate, run_state
 
 MOVED_ENTRY = "2026-08-24-develop-issue-12--spec.md"
 DANGLING_ENTRY = "2026-08-20-develop-issue-5--spec.md"
@@ -617,3 +618,80 @@ class TestApply:
         rc, text = _render(work, apply=True)
         assert rc == 1 and "live" in text and "nothing was changed" in text
         assert _snapshot(work) == before and commits == []
+
+
+class TestSplitLegacyMemoryLift:
+    """A split legacy `memory/` keeps its hand-written hooks (#601)."""
+
+    def test_area_lines_lift_and_the_store_round_trips_clean(
+        self, work, commits, monkeypatch, tmp_path
+    ):
+        legacy = work / PROJECT / "memory"
+        (legacy / "MEMORY.md").write_text(
+            "# lmer memory\n\n- [general](areas/general.md) — read when anything\n",
+            encoding="utf-8",
+        )
+        (legacy / "areas").mkdir()
+        (legacy / "areas" / "general.md").write_text(
+            "# general\n\n"
+            + "".join(
+                f"- [{name[:-3]}](../{name}) — HAND HOOK {name[:-3]}\n"
+                for name in MEMORY_FILES
+                if name != "orphan_fact.md"
+            ),
+            encoding="utf-8",
+        )
+        _commit_all(work, "a split legacy memory dir")
+        assert _render(work, apply=True)[0] == 0
+        instance_index = work / "_agents" / "memory" / "MEMORY.md"
+        project_area = work / PROJECT / "_agents" / "memory" / "areas" / "general.md"
+        for name in INSTANCE_FILES:
+            assert f"]({name}) — HAND HOOK {name[:-3]}\n" in instance_index.read_text()
+            assert name not in project_area.read_text()
+
+        host, project = "gitlab.example.com", "group/project"
+        agent_dir = tmp_path / "agent-memory"
+        agent_dir.mkdir()
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        monkeypatch.setenv("LMER_REPO_PROJECT", project)
+        monkeypatch.setenv("LMER_REPO_URL", f"https://{host}/{project}")
+        monkeypatch.setenv("LMER_AGENT_MEMORY_DIR", str(agent_dir))
+        monkeypatch.setenv("LMER_PERSIST_AGENT_MEMORY", "1")
+        monkeypatch.setattr(memory, "check_commit_ready", lambda *args: 0)
+        monkeypatch.setattr(memory, "commit_work_path", lambda *args, **kwargs: 0)
+        assert memory.restore_memory() == 0
+        assert memory.persist_memory() == 0
+        for name in INSTANCE_FILES:
+            assert f"]({name}) — HAND HOOK {name[:-3]}\n" in instance_index.read_text()
+        assert "archived" not in instance_index.read_text()
+        # The persist reconciled the split project scope: it filed the orphan.
+        assert "](../orphan_fact.md)" in (project_area.parent / "unsorted.md").read_text()
+        assert _index_findings(SimpleNamespace(root=work)) == []
+
+
+class TestStoreFormatMarker:
+    """A store a newer lmer wrote is never lifted (#598)."""
+
+    @pytest.mark.parametrize("scope", ["legacy", "instance"])
+    def test_a_newer_marker_blocks_the_lift(self, work, commits, scope):
+        newer = memory.MEMORY_FORMAT_MAX + 1
+        marked = work / PROJECT / "memory" if scope == "legacy" else work / "_agents" / "memory"
+        marked.mkdir(parents=True, exist_ok=True)
+        (marked / memory.MEMORY_FORMAT_FILE).write_text(f"{newer}\n", encoding="utf-8")
+        _commit_all(work, "a newer lmer's marker")
+        plan = migrate.plan_project(PROJECT, root=work)
+        assert [b for b in plan.blockers if f"store format {newer} is newer" in b]
+        before = _snapshot(work)
+        rc, _text = _render(work, apply=True)
+        assert rc != 0
+        assert _snapshot(work) == before and commits == []
+
+    def test_a_known_marker_rides_along_with_the_project_scope(self, work, commits):
+        legacy = work / PROJECT / "memory"
+        (legacy / memory.MEMORY_FORMAT_FILE).write_text("1\n", encoding="utf-8")
+        _commit_all(work, "a marker")
+        plan = migrate.plan_project(PROJECT, root=work)
+        assert memory.MEMORY_FORMAT_FILE not in {rel for rel, _s, _r in plan.memory_lift.files}
+        assert _render(work, apply=True)[0] == 0
+        assert (work / PROJECT / "_agents" / "memory" / memory.MEMORY_FORMAT_FILE).is_file()
+        assert not (work / "_agents" / "memory" / memory.MEMORY_FORMAT_FILE).exists()

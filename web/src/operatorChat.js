@@ -1,9 +1,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { fetchAssistantConfig } from './api.js'
 
-export const chatKeepLast = ref(0)
+// How many notes every run's operator channel dock keeps beside its open
+// questions (issue 465): null keeps them all, 0 none. The operator chat tab is the
+// full record and never reads it.
+export const dockKeepLastNotes = ref(null)
 // Whether the uber lmer pane draws the harness transcript beside the
-// conversation (issue 488). Platform-side like `chatKeepLast`, so it survives
+// conversation (issue 488). Platform-side like `dockKeepLastNotes`, so it survives
 // browsers; only an explicit `true` turns it on.
 export const chatShowTranscript = ref(false)
 export const chatConfigProblem = ref(null)
@@ -12,8 +15,8 @@ let configGeneration = 0
 
 export function applyChatSettings(config) {
   configGeneration += 1
-  const value = config.chat?.keep_last?.value ?? 0
-  chatKeepLast.value = Number.isSafeInteger(value) && value >= 0 ? value : 0
+  const value = config.dock?.keep_last_notes?.value ?? null
+  dockKeepLastNotes.value = Number.isSafeInteger(value) && value >= 0 ? value : null
   chatShowTranscript.value = config.chat?.show_transcript?.value === true
   chatConfigProblem.value = null
 }
@@ -28,21 +31,16 @@ export async function refreshChatSettings() {
   }
 }
 
-export function retainedEntries(entries, limit = chatKeepLast.value) {
-  return limit > 0 ? entries.slice(-limit) : entries
-}
-
 const identity = (entry) => `${entry.id}:${entry.answer?.answered_at || ''}`
 
 export function useOperatorChat(sessionId, entries, active) {
   const pageVisible = ref(document.visibilityState !== 'hidden')
   const revision = ref(0)
-  const shown = computed(() => retainedEntries(entries.value))
-  const count = computed(() => shown.value.length)
+  const count = computed(() => entries.value.length)
   const unread = computed(() => {
     revision.value
     const seen = readEntries.get(sessionId.value) || new Set()
-    return shown.value.some((entry) => !seen.has(identity(entry)))
+    return entries.value.some((entry) => !seen.has(identity(entry)))
   })
 
   function markRead() {
@@ -56,7 +54,7 @@ export function useOperatorChat(sessionId, entries, active) {
     if (pageVisible.value) refreshChatSettings()
   }
 
-  watch([sessionId, entries, active, pageVisible, chatKeepLast], markRead, { immediate: true })
+  watch([sessionId, entries, active, pageVisible], markRead, { immediate: true })
   onMounted(() => {
     refreshChatSettings()
     document.addEventListener('visibilitychange', visibilityChanged)

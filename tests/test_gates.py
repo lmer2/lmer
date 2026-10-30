@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import shutil
+import stat
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
@@ -24,6 +25,7 @@ from lmer_cli.gates import (
     CheckStatus,
     CheckResult,
     Colors,
+    GATE_CHECK_LOG_PATH,
     SUITE_IGNORE_ARGS,
     TEST_MODE_LABEL_MAX,
     TEST_MODE_MARKER,
@@ -1503,6 +1505,68 @@ class TestWriteLogFile:
         bad_path = tmp_path / "nope" / "gate-check.log"
         result = self.gate.write_log_file(path=bad_path)
         assert result is None
+
+    def test_the_default_log_is_per_user(self):
+        """One shared /tmp name let users overwrite and read each other's
+        Security Check findings (#262)."""
+        assert GATE_CHECK_LOG_PATH != Path("/tmp/gate-check.log")
+        assert GATE_CHECK_LOG_PATH.parent.name.endswith(f"-{os.geteuid()}")
+
+    def test_the_log_is_owner_only_in_a_private_dir(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "private" / "gate-check.log"
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", log_path)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file() == log_path
+
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o700
+
+    def test_an_existing_log_with_loose_bits_is_tightened(self, tmp_path):
+        log_path = tmp_path / "gate-check.log"
+        log_path.write_text("old\n")
+        log_path.chmod(0o644)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        self.gate.write_log_file(path=log_path)
+
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert "old" not in log_path.read_text()
+
+    def test_a_planted_log_symlink_is_not_written_through(self, tmp_path, capsys):
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        log_path = tmp_path / "gate-check.log"
+        log_path.symlink_to(target)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file(path=log_path) is None
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+        assert self.gate.log_path_written is None
+        assert "Could not write gate-check log" in capsys.readouterr().out
+
+    def test_a_default_dir_owned_by_another_uid_is_not_written(
+        self, tmp_path, monkeypatch
+    ):
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH",
+                            private / "gate-check.log")
+        other = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file() is None
+        assert list(private.iterdir()) == []
 
     def test_run_commit_gate_writes_log_and_prints_path(self, tmp_path, capsys, monkeypatch):
         """run_commit_gate persists the log and announces its path."""

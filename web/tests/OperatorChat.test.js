@@ -3,7 +3,7 @@ import { flushPromises } from '@vue/test-utils'
 import RunDetail from '../src/components/RunDetail.vue'
 import AskHistory from '../src/components/AskHistory.vue'
 import { fetchAssistantConfig, fetchSessionAsk, resumeRun } from '../src/api.js'
-import { applyChatSettings, retainedEntries } from '../src/operatorChat.js'
+import { applyChatSettings } from '../src/operatorChat.js'
 import { mountPane, deferred } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
@@ -20,8 +20,8 @@ beforeEach(() => {
   window.localStorage.setItem('lmer.run.tab', 'lmer')
   window.localStorage.setItem('lmer.run.pane', 'conversation')
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
-  applyChatSettings({ chat: { keep_last: { value: 0 } } })
-  fetchAssistantConfig.mockResolvedValue({ chat: { keep_last: { value: 0 } } })
+  applyChatSettings({ dock: { keep_last_notes: { value: null } } })
+  fetchAssistantConfig.mockResolvedValue({ dock: { keep_last_notes: { value: null } } })
   fetchSessionAsk.mockResolvedValue({ entries: entries(2) })
   session += 1
 })
@@ -39,26 +39,21 @@ async function detail(id = `session-${session}`) {
   return wrapper
 }
 
-it('keeps every entry by default and never mutates the feed when limiting it', () => {
-  const feed = entries(4)
-  expect(retainedEntries(feed, 0)).toEqual(feed)
-  expect(retainedEntries(feed, 2).map((entry) => entry.id)).toEqual(['3', '4'])
-  expect(feed).toHaveLength(4)
-})
-
-it('mounts retained history, hides older entries, and restores them when disabled', async () => {
-  const feed = entries(4)
-  fetchSessionAsk.mockResolvedValue({ entries: feed })
-  const wrapper = mountPane(AskHistory, { sessionId: 'history', keepLast: 2 })
-  await flushPromises()
-  await vi.dynamicImportSettled()
-  await flushPromises()
-  expect(wrapper.findAll('.entry')).toHaveLength(2)
-  expect(wrapper.text()).not.toContain('Note 1')
-  expect(wrapper.text()).toContain('Note 4')
-  await wrapper.setProps({ keepLast: 0 })
-  expect(wrapper.findAll('.entry')).toHaveLength(4)
-  expect(feed).toHaveLength(4)
+// The dock's retention (issue 465) never reaches the record: whatever the dock
+// keeps, the tab is the whole channel.
+it('mounts the whole history whatever the dock keeps', async () => {
+  for (const value of [0, 1, null]) {
+    applyChatSettings({ dock: { keep_last_notes: { value } } })
+    fetchSessionAsk.mockResolvedValue({ entries: entries(4) })
+    const wrapper = mountPane(AskHistory, { sessionId: `history-${value}` })
+    await flushPromises()
+    await vi.dynamicImportSettled()
+    await flushPromises()
+    expect(wrapper.findAll('.entry')).toHaveLength(4)
+    expect(wrapper.text()).toContain('Note 1')
+    expect(wrapper.text()).toContain('Note 4')
+    wrapper.unmount()
+  }
 })
 
 it('shows a count before the operator tab opens, clears unread on view, and remembers it on remount', async () => {
@@ -78,20 +73,20 @@ it('shows a count before the operator tab opens, clears unread on view, and reme
   expect(other.get('.operator-chat-tab').find('[aria-label="Unread messages"]').exists()).toBe(true)
 })
 
-it('counts retained entries and does not clear new arrivals while the browser is hidden', async () => {
+it('counts the full history whatever the dock keeps, and does not clear new arrivals while the browser is hidden', async () => {
   vi.useFakeTimers()
   const wrapper = await detail()
   const tab = wrapper.get('.operator-chat-tab')
   await tab.trigger('click')
   await flushPromises()
-  fetchAssistantConfig.mockResolvedValue({ chat: { keep_last: { value: 1 } } })
-  applyChatSettings({ chat: { keep_last: { value: 1 } } })
+  fetchAssistantConfig.mockResolvedValue({ dock: { keep_last_notes: { value: 1 } } })
+  applyChatSettings({ dock: { keep_last_notes: { value: 1 } } })
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
   document.dispatchEvent(new Event('visibilitychange'))
   fetchSessionAsk.mockResolvedValue({ entries: entries(3) })
   await vi.advanceTimersByTimeAsync(5000)
   await flushPromises()
-  expect(tab.text()).toContain('1')
+  expect(tab.get('.operator-count').text()).toMatch(/^3\b/)
   expect(tab.find('[aria-label="Unread messages"]').exists()).toBe(true)
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
   document.dispatchEvent(new Event('visibilitychange'))

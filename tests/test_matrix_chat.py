@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from ask_channel import bus
 from lmer_cli import comms, supervisor, targets, thread_posts
 from matrix_chat import connector, listener, permalink
 from lmer_cli.connector_delivery import verified_rejection
+from lmer_cli.connector_process import child_environment
 from matrix_chat.client import MatrixClient, MatrixError
 from matrix_chat.crypto import CryptoError
 from slack_chat import registry
@@ -675,6 +677,92 @@ class TestConnector:
         assert [sent[3] for sent in rig.matrix.sent] == ["m.text"]
 
 
+OPERATOR = "@operator:example.org"
+CI_BOT = "@ci:example.org"
+
+
+class TestOperatorOnly:
+    """Only a listed operator account answers an operator-only question (#599):
+    any account in the room can post, and a bridge or CI bot looks like a human."""
+
+    def _connect(self, rig, operators):
+        rig.connector = connector.MatrixConnector(
+            replace(rig.config, operator_users=frozenset(operators)), matrix=rig.matrix, bus_client=rig.bus,
+        )
+        rig.connector.replay()
+
+    def _gate(self, rig):
+        return rig.agent("question", "merge?", options=["approved", "rejected"],
+                         meta={comms.META_OPERATOR_ONLY: True})
+
+    def _notices(self, rig):
+        return [sent[2] for sent in rig.matrix.sent if sent[3] == "m.notice"]
+
+    def test_another_bot_account_is_refused_and_the_operator_binds(self, rig):
+        self._connect(rig, {OPERATOR})
+        question = self._gate(rig)
+        rig.matrix.human_says("approved", sender=CI_BOT)
+        assert rig.connector.sync_once() == 1
+        refused = rig.log.read_since(question.seq)[0][-1]
+        assert (refused.kind, refused.in_reply_to, refused.source.author) == ("message", None, CI_BOT)
+        assert rig.log.question(str(question.seq)).open
+        rig.matrix.human_says("approved", sender=OPERATOR)
+        assert rig.connector.sync_once() == 1
+        answer = rig.log.read_since(question.seq)[0][-1]
+        assert (answer.kind, answer.text, answer.in_reply_to, answer.source.author) == (
+            "answer", "approved", question.id, OPERATOR,
+        )
+        assert self._notices(rig) == []
+
+    def test_a_reply_to_the_question_event_from_another_bot_is_refused_too(self, rig):
+        self._connect(rig, {OPERATOR})
+        question = self._gate(rig)
+        rig.connector._post_outbound(
+            {"kind": "question", "id": question.id, "text": "merge?", "seq": question.seq,
+             "options": ["approved", "rejected"], "source": {"channel": "agent"},
+             "meta": {comms.META_OPERATOR_ONLY: True}}, {},
+        )
+        posted = rig.connector._question_events[question.id]
+        rig.matrix.human_says("ship it", sender=CI_BOT, **{"m.relates_to": {
+            "rel_type": "m.thread", "event_id": ROOT,
+            "m.in_reply_to": {"event_id": posted}, "is_falling_back": False,
+        }})
+        assert rig.connector.sync_once() == 1
+        assert rig.log.read_since(question.seq)[0][-1].kind == "message"
+        assert rig.log.question(str(question.seq)).open
+
+    def test_listing_lmers_own_account_does_not_let_its_posts_answer(self, rig):
+        self._connect(rig, {BOT, OPERATOR})
+        question = self._gate(rig)
+        rig.matrix.app_says("approved", poster=thread_posts.Poster.for_platform("Ratchet"))
+        assert rig.connector.sync_once() == 1
+        assert rig.log.read_since(question.seq)[0][-1].kind == "message"
+        assert rig.log.question(str(question.seq)).open
+
+    def test_with_no_operator_list_nothing_answers_it_and_the_thread_is_told_once(self, rig, caplog):
+        self._connect(rig, ())
+        question = self._gate(rig)
+        with caplog.at_level("WARNING", logger="matrix_chat.connector"):
+            for _ in range(2):
+                rig.matrix.human_says("approved", sender=OPERATOR)
+                assert rig.connector.sync_once() == 1
+        assert [record.kind for record in rig.log.read_since(question.seq)[0]] == ["message", "message"]
+        assert rig.log.question(str(question.seq)).open
+        (notice,) = self._notices(rig)
+        assert "LMER_MATRIX_OPERATOR_USERS" in notice and "Slack or the platform" in notice
+        assert "LMER_MATRIX_OPERATOR_USERS" in caplog.text
+
+    @pytest.mark.parametrize("operators", [(), (OPERATOR,)])
+    def test_an_ordinary_question_still_binds_from_any_matrix_user(self, rig, operators):
+        self._connect(rig, operators)
+        question = rig.agent("question", "branch?", options=["main", "prep-release"])
+        rig.matrix.human_says("2", sender=CI_BOT)
+        assert rig.connector.sync_once() == 1
+        answer = rig.log.read_since(question.seq)[0][-1]
+        assert (answer.kind, answer.text, answer.in_reply_to) == ("answer", "prep-release", question.id)
+        assert self._notices(rig) == []
+
+
 # ---------------------------------------------------------------------------
 # configuration, the target handler, the listener
 # ---------------------------------------------------------------------------
@@ -695,6 +783,21 @@ class TestConfigAndTargets:
             "LMER_MATRIX_ACCESS_TOKEN": "syt", "LMER_MATRIX_AUTHENTICATED_MEDIA": "1",
         })
         assert config.authenticated_media is True and "syt" not in repr(config)
+        assert config.operator_users == frozenset()
+
+    def test_the_operator_list_is_parsed_like_the_listeners_allow_list(self):
+        config = connector.ConnectorConfig.from_env({
+            "LMER_FASTAPI_PORT": "1", "LMER_FASTAPI_TOKEN": "t",
+            "LMER_MATRIX_ROOM_ID": ROOM, "LMER_MATRIX_THREAD_EVENT": ROOT,
+            "LMER_MATRIX_HOMESERVER": "https://hs", "LMER_MATRIX_USER_ID": BOT,
+            "LMER_MATRIX_ACCESS_TOKEN": "syt",
+            "LMER_MATRIX_OPERATOR_USERS": f" {OPERATOR} , ,@second:example.org,",
+        })
+        assert config.operator_users == {OPERATOR, "@second:example.org"}
+
+    def test_the_cli_run_connector_inherits_the_operator_list(self, monkeypatch):
+        monkeypatch.setenv("LMER_MATRIX_OPERATOR_USERS", OPERATOR)
+        assert child_environment()["LMER_MATRIX_OPERATOR_USERS"] == OPERATOR
 
     def test_the_target_handler_claims_matrix_links_and_keeps_the_token_out(self, monkeypatch):
         link = permalink.matrix_to_link(ROOM, ROOT)

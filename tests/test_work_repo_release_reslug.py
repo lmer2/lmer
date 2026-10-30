@@ -869,18 +869,45 @@ class TestTheLaunchThatFinishedARelease:
 
     def test_a_contextless_resume_of_the_finished_launch_seeds_no_run(
             self, runs, capsys, monkeypatch):
-        """`--session` names the launch: its events are on the finished run."""
+        """`--session` names the launch: its events are on the finished run.
+        No seed happens either way, so the proof it RESOLVED is that the
+        session start landed there rather than skipping."""
         with ExitStack() as stack:
             assert _claim(stack) == 0
         assert _record(["version", "0.6.0"]) == 0
         _complete_via_cli()
+        capsys.readouterr()
         monkeypatch.delenv("LMER_SESSION_ID")
 
         assert _session_start("s-rel-1") == 0
 
+        assert "session-start skipped" not in capsys.readouterr().out
         moved = runs / f"{BASE}-v0.6.0"
         assert [d.name for d in runs.iterdir()] == [moved.name]
         assert run_state.load_state(moved)["status"] == "complete"
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] == "session_start"
+
+    def test_a_resume_naming_unknown_claims_no_contextless_writers_run(
+            self, runs, capsys, monkeypatch):
+        """`unknown` is the label every contextless write is stamped with,
+        not a launch: naming it must not make the finished run anyone's."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        monkeypatch.delenv("LMER_SESSION_ID")
+        _complete_via_cli()
+        moved = runs / f"{BASE}-v0.6.0"
+        assert run_state.load_state(moved)["status"] == "complete"
+        assert run_state.read_events(moved, last_n=0)[-1]["session"] == \
+            run_state.UNKNOWN_SESSION_ID
+        capsys.readouterr()
+
+        assert _session_start("unknown") == 0
+
+        assert "run-state session-start skipped: refusing to start a new run" in \
+            capsys.readouterr().out
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] != "session_start"
+        assert [d.name for d in runs.iterdir()] == [moved.name]
 
     def test_a_contextless_resume_of_a_launch_that_wrote_nothing_skips(
             self, runs, capsys, monkeypatch):
@@ -982,9 +1009,14 @@ class TestTheLaunchThatFinishedAReleaseInSchemaForm:
             monkeypatch.delenv("LMER_SESSION_ID")
         else:
             monkeypatch.setenv("LMER_SESSION_ID", launch)
+        capsys.readouterr()
 
         assert _session_start(named) == 0
 
+        # A contextless start that failed to resolve would skip rather than
+        # seed, leaving the same tree — only landing here proves it resolved.
+        assert "session-start skipped" not in capsys.readouterr().out
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] == "session_start"
         assert not (area / SCHEMA_BASE).exists()
         if launch is not None:
             assert run_state.has_session(run_state.load_state(moved), launch)

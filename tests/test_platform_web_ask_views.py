@@ -208,14 +208,21 @@ def test_the_record_answers_nothing():
     assert "emit" not in record, "the record tells the fleet something changed"
 
 
-def test_the_record_preserves_entry_contents_with_optional_retention():
-    """Retention changes the displayed count; each retained entry stays whole.
+def test_the_record_preserves_every_entry_whole():
+    """The record is the whole channel, and each entry in it stays whole.
 
-    Mounted tests in web/tests/OperatorChat.test.js cover default-off behavior,
-    hiding the oldest entries, and restoring them when retention is disabled.
+    Retention governs the dock and never this view (issue #465): it is where an
+    operator reads back what the dock no longer keeps. Mounted tests in
+    web/tests/OperatorChat.test.js and web/tests/AskChannel.test.js cover both
+    sides of that.
     """
     record = _without_comments(_read(RECORD))
     assert re.search(r'v-for="entry in entries"', record)
+    for pruning in ("operatorChat", "keepLast", "slice(", "dockKeepLastNotes"):
+        assert pruning not in record, (
+            f"the record reads {pruning}, so a display setting can hide part of "
+            "the one view that is meant to keep everything"
+        )
     # Each entry keeps what makes it a record rather than a summary. Drawn by
     # AskEntry.vue since #274, so what an entry carries is read there — and the
     # record is checked to be handing every entry to it, which is what makes that

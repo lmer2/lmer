@@ -3583,10 +3583,12 @@ def main(argv: list[str] | None = None) -> int:
         # a .env value cannot inject a registry. The pi block below fills it in
         # for a pi session; for every other harness it is dropped.
         PROVIDERS_ENV: None,
-        # DM permissions are decided by host-side listeners and servicers.
-        # Block .env and preset seeding from carrying these lists into a run.
+        # DM permissions and operator-only answer binding are decided by
+        # host-side listeners and connectors. Block .env and preset seeding
+        # from carrying these lists into a run.
         "LMER_SLACK_DM_ALLOWED_USERS": None,
         "LMER_MATRIX_ALLOWED_USERS": None,
+        "LMER_MATRIX_OPERATOR_USERS": None,
         # Names the *host's* runtime; the session image ships only the docker
         # client. Seeded None so neither .env nor preset seeding forwards it.
         "LMER_CONTAINER_RUNTIME": None,

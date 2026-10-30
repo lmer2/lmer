@@ -2,6 +2,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -159,3 +160,49 @@ def test_a_split_scopes_area_index_is_planned_as_written(tmp_path):
         "# dev\n\n- archived 2027-01-01 — lost\n"
     )
     assert (project / "MEMORY.md").read_text().endswith("- [dev](areas/dev.md) — read when dev\n")
+
+
+def test_only_a_forget_tombstone_is_skipped_whole(tmp_path):
+    # A later archive link spares itself, not the line's dead entry (#601).
+    tree = _build(tmp_path)
+    project = tree.project_dir() / "_agents" / "memory"
+    (project / "MEMORY.md").write_text(
+        "# Project memory\n\n"
+        "- [Gone](gone.md) — gone, was [old](../../_archive/old.md)\n"
+        "- [Old](../../_archive/old.md) — retired. See also [Lost](lost.md)\n"
+    )
+    project_index = f"{tree.project_dir().name}/_agents/memory/MEMORY.md"
+    plan = _plan(tree)
+    assert _tombstones_in(plan, project_index) == ["gone.md"]
+    _apply(tree, plan)
+    assert (project / "MEMORY.md").read_text().splitlines()[2:] == [
+        "- archived 2027-01-01 — gone, was [old](../../_archive/old.md)",
+        "- [Old](../../_archive/old.md) — retired. See also [Lost](lost.md)",
+    ]
+
+
+def test_a_scope_a_newer_lmer_wrote_is_refused_and_left_alone(tmp_path):
+    # #598: the marker refuses this scope only; the instance scope still runs.
+    tree = _build(tmp_path)
+    project = tree.project_dir() / "_agents" / "memory"
+    newer = memory.MEMORY_FORMAT_MAX + 1
+    (project / memory.MEMORY_FORMAT_FILE).write_text(f"{newer}\n")
+    before = (project / "MEMORY.md").read_bytes()
+    plan = _plan(tree)
+    project_index = f"{tree.project_dir().name}/_agents/memory/MEMORY.md"
+    assert _tombstones_in(plan, project_index) == []
+    assert _tombstones_in(plan, "_agents/memory/MEMORY.md") != []
+    assert len(plan.refusals) == 1
+    assert f"store format {newer} is newer than this lmer understands" in plan.refusals[0]
+    _apply(tree, plan)
+    assert (project / "MEMORY.md").read_bytes() == before
+
+
+def test_a_refused_scope_makes_the_run_exit_non_zero(tmp_path, monkeypatch, capsys):
+    tree = _build(tmp_path)
+    project = tree.project_dir() / "_agents" / "memory"
+    (project / memory.MEMORY_FORMAT_FILE).write_text(f"{memory.MEMORY_FORMAT_MAX + 1}\n")
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
+    args = SimpleNamespace(apply=False, area="index", project=None, archive_stale=False)
+    assert housekeep.cmd_housekeep(args) == 2
+    assert "update the image" in capsys.readouterr().err

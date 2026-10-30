@@ -5,7 +5,7 @@ only through a wrapper like this one (issue #507: its regressions for the chat
 cursor, digest rows, the question badge, the status strip and the settings
 dialog live in these files; issue #617 added the answer box and the per-launch
 resume rows, whose disabled-send reasons are only observable here; issue #510
-the Send Privately editor).
+the Send Privately editor; issue #465 the operator channel dock's retention).
 """
 import os
 from pathlib import Path
@@ -20,6 +20,7 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 
 SUITES = [
     "tests/AnswerBox.test.js",
+    "tests/AskChannel.test.js",
     "tests/AssistantHistory.test.js",
     "tests/AssistantSettings.test.js",
     "tests/Chat.test.js",

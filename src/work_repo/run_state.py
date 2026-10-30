@@ -172,6 +172,9 @@ SESSION_DIR_RE = re.compile(rf"{SESSION_ID_RE.pattern}(?:--.+)?")
 # (D22 resume). Optional and additive: a record without it is a record from
 # before the field, or a legacy run dir, which never grows one.
 SESSIONS_FIELD = "sessions"
+# The label current_session_id stamps when there is no launch id — an
+# unknown writer, never an identity anything can be matched by.
+UNKNOWN_SESSION_ID = "unknown"
 # A session id names one directory inside a group, so: the segments
 # `lmer_platform.answer._reject_traversal` refuses, and the characters
 # `Path.glob` would expand rather than compare (see _usable_session_id).
@@ -247,7 +250,7 @@ def utc_now_iso() -> str:
 
 
 def current_session_id() -> str:
-    return os.environ.get("LMER_SESSION_ID", "unknown")
+    return os.environ.get("LMER_SESSION_ID", UNKNOWN_SESSION_ID)
 
 
 def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> str:
@@ -900,10 +903,13 @@ def _written_by_launch(
     Asked of facts this kernel records itself: a session dir's own id, its
     `sessions:` lineage, and the `session` every :func:`append_event` stamps —
     the last being the only one a legacy run dir has. An invocation with
-    neither id has written nowhere.
+    neither id has written nowhere. :data:`UNKNOWN_SESSION_ID` is never a
+    launch id: every contextless invocation stamps its events with it, so a
+    `--session unknown` would claim any finished run one of those wrote.
     """
     launch_ids = {
-        sid for sid in (session and session_id_of(session), launch_session_id()) if sid
+        sid for sid in (session and session_id_of(session), launch_session_id())
+        if sid and sid != UNKNOWN_SESSION_ID
     }
     if not launch_ids:
         return False
@@ -1780,9 +1786,11 @@ def refuse_contextless_phantom(slug: str) -> None:
     next release doing exactly what the re-slug freed the address for. With
     no `LMER_SESSION_ID` neither can be told apart, and guessing "new run"
     leaves a live phantom where the next release's claim resolves. A
-    `--session` is no exemption: a resume of the finished run's launch has
-    already resolved it by then, so one that reaches the seed wrote nothing
-    to tell by.
+    `--session` is no exemption. A resume of the finished run's launch has
+    usually resolved it by then, but not always: :func:`_written_by_launch`
+    finds the run by the session dir's id, its lineage or its events, while
+    :func:`_session_dir` picks the dir inside it by name only, so a
+    lineage-only id or a mistyped `--<name>` half reaches this seed too.
     """
     if launch_session_id() is not None:
         return

@@ -42,7 +42,7 @@ from slack_chat.client import SlackClient
 from slack_chat.permalink import slack_thread_link
 
 from . import dm_access, dm_parents
-from .thread_posts import Poster, tagged
+from .thread_posts import Poster, slack_file_name, tagged
 from .threads import (
     CHANNEL_MATRIX, CHANNEL_SLACK, ChannelRef, ThreadError, ThreadRef,
     parse_channel, parse_thread,
@@ -485,9 +485,10 @@ def read_from_store(
         raise ThreadError(f"not readable in this session's upload store ({exc.strerror})", status=400) from None
 
 
-def withheld_note(name: str, reason: str) -> str:
+def withheld_note(name: str, reason: str, *, slack_markup: bool = False) -> str:
     """The line a thread gets in place of a file it was not sent."""
-    return f"📎 {name} withheld: {reason}"
+    shown = slack_file_name(name) if slack_markup else name
+    return f"📎 {shown} withheld: {reason}"
 
 
 @dataclass(frozen=True)
@@ -904,7 +905,7 @@ def _post_slack(
     for item in attachments:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
-            text += f"\n📎 {name}"
+            text += f"\n📎 {slack_file_name(name)}"
     body, clipped = _clip(scrub_text(text))
     channel, thread_ts = ref.key["channel"], ref.key["thread_ts"]
     try:
@@ -939,7 +940,10 @@ def _post_slack(
                 channel, thread_ts,
                 tagged(
                     label,
-                    "\n".join(withheld_note(item["name"], item["reason"]) for item in withheld),
+                    "\n".join(
+                        withheld_note(item["name"], item["reason"], slack_markup=True)
+                        for item in withheld
+                    ),
                     slack_markup=True,
                 ),
             )

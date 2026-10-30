@@ -1,0 +1,22 @@
+security:
+- "Gate lock dir, deferral queue, write journal and gate-check log refuse foreign or symlinked paths and are owner-only; the log moved to `/tmp/lmer-gate-check-<euid>/`."
+- "GitLab API tokens are no longer sent on to a different host when a GitLab request is redirected."
+- "Matrix replies answer an operator-only question only from MXIDs in the new `LMER_MATRIX_OPERATOR_USERS`; when it is unset, none do."
+added:
+- "Memory scopes may carry a `.lmer-memory-format` marker; every memory writer refuses a store written in a newer format and asks you to update the image."
+- "Chat sessions list the available taskdefs and read the matching one's instructions when a conversation turns into develop or review work."
+removed:
+- "The `chat_keep_last` setting is retired and its stored value ignored; set `dock_keep_last_notes` in Platform settings instead."
+changed:
+- "Platform settings set how many notes every run's operator channel dock keeps (0 = open questions only); the operator chat tab shows full history."
+fixed:
+- "Release leg 2 gives each `gh` command the GitHub PAT and mirror repository; the release PAT now needs Actions read/write."
+- "presets.json is re-read only when it changes; `presets_loaded` is logged at INFO, and an invalid-file error once, per change."
+- "Platform launches in the same second no longer fail on a session ID clash; IDs are reserved before anything else is created."
+- "A project assistant's launch guard waits for its publication however long that takes, and a guard that died fails the launch cleanly, not with a broken pipe."
+- "Fixed a possible deadlock between assistant and project locks; stopping assistant supervision now waits for an in-flight start."
+- "A locked project database now answers 503 saying whether a retry is safe, and a failed mute write answers a retryable 503, not a 500."
+- "Slack thread posts show attached file names literally, so names containing `*`, `_`, `<` or `&` no longer format, link or ping."
+- "Memory persist, housekeep, the validator and `work migrate` handle six split-index edge cases without losing lines or reporting stale links."
+- "`work session-start --session unknown` no longer claims a finished release run that a session without `LMER_SESSION_ID` wrote."
+- "Clearing the default project now reopens All projects when that was last viewed, instead of the old default."

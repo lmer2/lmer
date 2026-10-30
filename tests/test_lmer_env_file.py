@@ -113,6 +113,22 @@ class TestEnvFileForwarding:
             f"got {captured.get('GITLAB_REVIEW_FILE')!r}"
         )
 
+    @pytest.mark.parametrize(
+        "name",
+        ["LMER_SLACK_DM_ALLOWED_USERS", "LMER_MATRIX_ALLOWED_USERS", "LMER_MATRIX_OPERATOR_USERS"],
+    )
+    def test_host_only_user_lists_never_reach_the_container(self, tmp_path, name):
+        """Who may DM lmer or answer an operator-only question is decided on
+        the host (#599); an env file must not carry the list into a run."""
+        env_file = tmp_path / "deploy.env"
+        env_file.write_text(f"{name}=@operator:example.org\n")
+        captured: dict = {}
+        _run_main(
+            ["--env-file", str(env_file), "--no-task", "--exec", "true", REPO_URL],
+            captured_env=captured,
+        )
+        assert captured.get(name) is None, f"{name} leaked into the container env"
+
 
     def test_env_file_overrides_conflicting_cwd_dotenv(self, tmp_path, monkeypatch):
         """The headline precedence claim: a key set in BOTH the working-dir

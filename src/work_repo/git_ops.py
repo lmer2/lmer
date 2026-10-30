@@ -30,6 +30,7 @@ from lmer_cli.container.clone_and_exec import _scrub_credentials
 # above: the decision "is a long gate running right now?" has exactly one
 # definition, and a second copy here would drift from the gates that write it.
 from lmer_cli import gate_lock
+from lmer_cli.private_tmp import read_no_follow, write_private
 
 from . import project_index, utils
 from .run_state import (
@@ -400,9 +401,15 @@ def stageable_paths(work_repo_path: Path, paths: list[str]) -> list[str]:
     ]
 
 
-def _deferral_queue_path() -> Path:
-    """The parked-deferrals file, beside the gate markers it belongs to."""
-    return gate_lock.lock_dir() / DEFERRAL_QUEUE_NAME
+def _deferral_queue_path(create: bool = False) -> Optional[Path]:
+    """The parked-deferrals file, beside the gate markers it belongs to.
+
+    None when the lock dir is not one this uid can trust
+    (:func:`gate_lock.safe_lock_dir`): records parked there could be read,
+    planted or redirected by whoever controls it.
+    """
+    directory = gate_lock.safe_lock_dir(create=create)
+    return None if directory is None else directory / DEFERRAL_QUEUE_NAME
 
 
 def _current_run_dir() -> Optional[Path]:
@@ -431,10 +438,10 @@ def _queue_deferral(rdir: Optional[Path], marker: dict, paths: list[str]) -> Non
             "started_at": marker.get("started_at"),
             "paths": list(paths),
         }
-        path = _deferral_queue_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        path = _deferral_queue_path(create=True)
+        if path is None:
+            return
+        write_private(path, json.dumps(record, ensure_ascii=False) + "\n", append=True)
     except (OSError, ValueError, TypeError):
         pass
 
@@ -450,10 +457,10 @@ def _flush_deferrals(rdir: Optional[Path]) -> int:
     if rdir is None:
         return 0
     path = _deferral_queue_path()
+    if path is None:
+        return 0
     try:
-        if not path.exists():
-            return 0
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = read_no_follow(path).splitlines()
     except (OSError, UnicodeDecodeError):
         return 0
 
@@ -500,9 +507,7 @@ def _flush_deferrals(rdir: Optional[Path]) -> int:
             remaining = others + [
                 json.dumps(r, ensure_ascii=False) for r in mine[written:]
             ]
-            path.write_text(
-                "\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8"
-            )
+            write_private(path, "\n".join(remaining) + ("\n" if remaining else ""))
     except (OSError, ValueError, TypeError):
         pass
     return written

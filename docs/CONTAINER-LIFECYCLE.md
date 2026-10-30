@@ -84,9 +84,9 @@ operator's `lmer follow <name>`.
 
 | Launch | Name | Example |
 |---|---|---|
-| Platform | `lmer-<run slug>-<session id's trailing hex>` | session `s-20261009T152516-ff2b` of run `chat-mr-389` → `lmer-chat-mr-389-ff2b` |
+| Platform | `lmer-<run slug>-<session id's trailing hex>` | session `s-20261009T152516-3fa9c1d2e4b7` of run `chat-mr-389` → `lmer-chat-mr-389-3fa9c1d2e4b7` |
 | CLI | `lmer-<run slug>-<6 random hex>` | `lmer-develop-issue-444-3fa9c1` |
-| Platform, no slug (no task) | `lmer-<session id>` | `lmer-s-20261009T152516-ff2b` |
+| Platform, no slug (no task) | `lmer-<session id>` | `lmer-s-20261009T152516-3fa9c1d2e4b7` |
 | CLI, no task (`--no-task`) | `lmer-<6 random hex>` | `lmer-3fa9c1` |
 
 The slug is the one the platform labels the run with. Without one (a CLI run),

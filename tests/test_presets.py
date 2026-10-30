@@ -1,14 +1,28 @@
 """Tests for lmer_cli.presets (startup preset config + selector parsing)."""
 
 import json
+import logging
+import os
+import time
 from pathlib import Path
+
+import pytest
 
 from lmer_cli.presets import (
     PRESETS_FILE_ENV,
     Preset,
+    clear_presets_cache,
     load_presets,
     parse_preset_token,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_presets_cache():
+    """Each test sees a cold cache, so its load warnings and INFO line fire."""
+    clear_presets_cache()
+    yield
+    clear_presets_cache()
 
 
 class TestParsePresetToken:
@@ -241,3 +255,133 @@ class TestServiceGroupField:
             "broken": {"checkout": "/srv/x", "service_group": ["stack"]},
         }))
         assert load_presets(str(path)) == {}
+
+
+def _loaded_lines(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and r.getMessage().startswith("presets_loaded ")
+    ]
+
+
+def _age(path: str, seconds: float = 60.0) -> None:
+    """Backdate the file past the racy window, as an operator's edit long ago."""
+    then = time.time_ns() - int(seconds * 1e9)
+    os.utime(path, ns=(then, then))
+
+
+class TestLoadPresetsCache:
+    """Issue #600: the daemon reads the file per request and announced it each time."""
+
+    def test_unchanged_file_is_announced_once(self, tmp_path, caplog):
+        path = _write(tmp_path, {"a": {"checkout": "/a"}, "b": {"checkout": "/b"}})
+        with caplog.at_level(logging.DEBUG, logger="lmer_cli.presets"):
+            for _ in range(3):
+                assert set(load_presets(path)) == {"a", "b"}
+        assert len(_loaded_lines(caplog)) == 1
+        assert "names=a,b" in _loaded_lines(caplog)[0]
+
+    def test_unchanged_old_file_is_not_reread(self, tmp_path, monkeypatch):
+        path = _write(tmp_path, {"a": {"checkout": "/a"}})
+        _age(path)
+        load_presets(path)
+
+        def _no_read(self):
+            raise AssertionError("an unchanged presets file was read again")
+
+        monkeypatch.setattr(Path, "read_bytes", _no_read)
+        monkeypatch.setattr(Path, "read_text", _no_read)
+        assert set(load_presets(path)) == {"a"}
+
+    def test_rewritten_file_is_announced_again(self, tmp_path, caplog):
+        path = _write(tmp_path, {"a": {"checkout": "/a"}})
+        _age(path)
+        with caplog.at_level(logging.INFO, logger="lmer_cli.presets"):
+            load_presets(path)
+            _write(tmp_path, {"other": {"checkout": "/o"}})
+            assert set(load_presets(path)) == {"other"}
+            load_presets(path)
+        lines = _loaded_lines(caplog)
+        assert len(lines) == 2
+        assert "names=a" in lines[0]
+        assert "names=other" in lines[1]
+
+    def test_same_size_rewrite_within_one_clock_tick_is_seen(self, tmp_path):
+        """A rewrite can keep mtime, size and inode when it lands in the same tick."""
+        path = _write(tmp_path, {"two": {"checkout": "/srv/w", "service": "web-two"}})
+        stamp = os.stat(path).st_mtime_ns
+        assert load_presets(path)["two"].service == "web-two"
+        _write(tmp_path, {"two": {"checkout": "/srv/w", "service": "web-one"}})
+        os.utime(path, ns=(stamp, stamp))
+        assert load_presets(path)["two"].service == "web-one"
+
+    def test_callers_get_independent_copies(self, tmp_path):
+        path = _write(tmp_path, {"svc": {"env": {"K": "v"}, "args": ["--ports", "2"]}})
+        first = load_presets(path)
+        first["svc"].env["K"] = "mutated"
+        first["svc"].args.append("--evil")
+        first["svc"].checkout = "/elsewhere"
+        del first["svc"]
+
+        second = load_presets(path)
+        assert second["svc"] == Preset(
+            name="svc", env={"K": "v"}, args=["--ports", "2"]
+        )
+        assert second["svc"] is not load_presets(path)["svc"]
+
+    def test_vanished_file_is_announced_again_when_restored(self, tmp_path, caplog):
+        path = _write(tmp_path, {"a": {"checkout": "/a"}})
+        with caplog.at_level(logging.INFO, logger="lmer_cli.presets"):
+            load_presets(path)
+            os.unlink(path)
+            assert load_presets(path) == {}
+            _write(tmp_path, {"a": {"checkout": "/a"}})
+            assert set(load_presets(path)) == {"a"}
+        assert len(_loaded_lines(caplog)) == 2
+
+
+def _errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+class TestLoadPresetsInvalidFileCache:
+    """An invalid file was re-reported at ERROR on every request (#600 review)."""
+
+    def test_invalid_file_is_reported_once_until_fixed(self, tmp_path, caplog):
+        path = tmp_path / "presets.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        with caplog.at_level(logging.DEBUG, logger="lmer_cli.presets"):
+            for _ in range(3):
+                assert load_presets(str(path)) == {}
+            assert len(_errors(caplog)) == 1
+            assert "presets_file_unreadable" in _errors(caplog)[0]
+
+            _write(tmp_path, {"fixed": {"checkout": "/f"}})
+            assert set(load_presets(str(path))) == {"fixed"}
+        assert len(_errors(caplog)) == 1
+        assert any("names=fixed" in line for line in _loaded_lines(caplog))
+
+    def test_an_old_invalid_file_is_not_reread(self, tmp_path, monkeypatch):
+        path = _write(tmp_path, ["not", "an", "object"])
+        _age(path)
+        assert load_presets(path) == {}
+
+        def _no_read(self):
+            raise AssertionError("an unchanged invalid presets file was read again")
+
+        monkeypatch.setattr(Path, "read_bytes", _no_read)
+        monkeypatch.setattr(Path, "read_text", _no_read)
+        assert load_presets(path) == {}
+
+    def test_a_different_invalid_file_is_reported_again(self, tmp_path, caplog):
+        path = tmp_path / "presets.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        with caplog.at_level(logging.ERROR, logger="lmer_cli.presets"):
+            load_presets(str(path))
+            _write(tmp_path, ["still", "not", "an", "object"])
+            assert load_presets(str(path)) == {}
+            load_presets(str(path))
+        errors = _errors(caplog)
+        assert len(errors) == 2
+        assert "presets_file_not_object" in errors[1]

@@ -27,8 +27,8 @@ needs:
   # sessions only (the negative guarantee: no other taskdef's sessions
   # receive them).
   credentials:
-    # GitHub fine-grained PAT: contents:write + workflows:write on the
-    # single mirror repo.
+    # GitHub fine-grained PAT: contents:write + workflows:write +
+    # actions:write on the single mirror repo.
     - release_github_pat
     # Release SSH signing key for tag signing — always a reference, never
     # key material.
