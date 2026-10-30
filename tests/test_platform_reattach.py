@@ -941,6 +941,51 @@ def test_a_probe_that_fails_on_a_rescan_cannot_unmark_a_working_drain(
     assert reattach._ACTIVE["s-1"] is drain
 
 
+def test_a_rescan_records_the_same_drain_position_it_reports(platform_root, plane):
+    """The entry and the report are one fact, so they come from one read (#500).
+
+    ``reattach_session`` writes the drain's position to the registry entry and
+    returns it in the report. Reading ``drain.cursor`` once for each is a race the
+    CI suite hit: the drain assigns its cursor on every poll, so an advance landing
+    between the two reads leaves the entry behind the report — the platform's
+    record of where it is reading a session from disagreeing with the offset it
+    says it is reading from. The drain here advances between reads on purpose,
+    which is the interleave a slow, coverage-instrumented runner widens by
+    accident.
+    """
+    plant_session("s-1", port=plane.port)
+
+    class AdvancingDrain:
+        """A drain whose cursor moves between reads, as a real poll's does."""
+
+        def __init__(self):
+            self.reads = 0
+
+        @property
+        def cursor(self):
+            self.reads += 1
+            return self.reads - 1
+
+        def stop(self):
+            pass
+
+        @property
+        def stopped(self):
+            return False
+
+    with reattach._ACTIVE_LOCK:
+        reattach._ACTIVE["s-1"] = AdvancingDrain()
+    try:
+        report = reattach.reattach_session("s-1", poll=FAST_POLL)
+    finally:
+        with reattach._ACTIVE_LOCK:
+            reattach._ACTIVE.pop("s-1", None)
+
+    assert detached_of("s-1")["cursor"] == report.cursor, (
+        "the entry was marked from one read and the report returned another"
+    )
+
+
 # --- the drain itself --------------------------------------------------------
 
 def test_the_drain_stops_when_the_session_process_is_gone(platform_root, plane):
