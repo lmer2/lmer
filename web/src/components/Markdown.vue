@@ -127,6 +127,15 @@ markdown.disable(['image'])
 
 markdown.validateLink = LINK_OK
 
+// A bare filename is not a hostname (issue #616). linkify's default fuzzy mode
+// reads any `name.<tld>` as a domain, and a lot of file extensions are country
+// TLDs — `.md`, `.py`, `.sh`, `.rs`, `.ai`, `.io`, `.so` — so an agent's
+// `checklist.md` became a link to a host of that name, which passes the scheme
+// allowlist above and goes nowhere. Off, so a link needs an explicit scheme or an
+// email address. It also stops `www.example.com` auto-linking, which is the same
+// switch: linkify-it has no www-only mode, and agent prose carries full URLs.
+markdown.linkify.set({ fuzzyLink: false })
+
 // A link the agent wrote leaves this page and cannot reach back into it:
 // `noopener` is the one that matters (window.opener is a live handle on this
 // document), `noreferrer` keeps the run's URL out of the other end's logs.
@@ -173,18 +182,134 @@ const SANITIZE = {
 const RENDER_CACHE_MAX = 200
 const renderCache = new Map()
 
-function renderMarkdown(text) {
-  const hit = renderCache.get(text)
+// --- the run's own files, as links (issue #616, part 2) -------------------------
+//
+// `GET /api/runs/files` already answers each file's forge URL, so a filename the
+// run itself wrote is a reference to that file rather than prose — and the fix
+// for the fake hostname above should not leave the mention dead. Only a filename
+// that is *in* the list is touched: an unknown `notes.md` stays the text the
+// agent typed, because guessing a URL is how the original bug happened.
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// A lookup of name -> forge URL. The URL is put through the same allowlist every
+// other link is: the daemon builds these, and the sanitiser should not be the
+// only thing standing between an API reply and a live href.
+function fileLookup(files) {
+  const lookup = new Map()
+  for (const file of files || []) {
+    if (!file || typeof file.name !== 'string' || typeof file.url !== 'string') continue
+    const name = file.name.trim()
+    const url = file.url.trim()
+    if (!name || !url || !LINK_OK(url)) continue
+    lookup.set(name, url)
+  }
+  return lookup
+}
+
+// One pattern per set of names, built once for the list rather than once per
+// render: every note on a run's page renders against the same list.
+const filePatternCache = new Map()
+
+function filePattern(lookup) {
+  const names = [...lookup.keys()].sort((a, b) => b.length - a.length)
+  const key = names.join('\u0000')
+  let pattern = filePatternCache.get(key)
+  if (pattern) return pattern
+  // The leading delimiter is captured rather than expressed as a lookbehind
+  // (recent Safari only), and the trailing guard refuses a name that is really
+  // the front of a longer one (`plan.md.bak`, `runs/plan.md`).
+  pattern = new RegExp(
+    `(^|[^\\w./-])(${names.map(escapeRegExp).join('|')})(?![\\w/-]|\\.[\\w-])`,
+    'g',
+  )
+  if (filePatternCache.size >= RENDER_CACHE_MAX) filePatternCache.clear()
+  filePatternCache.set(key, pattern)
+  return pattern
+}
+
+function filesKey(lookup) {
+  // The name→URL pairs, not just the names (issue #616): this cache is
+  // module-level, so it outlives a RunDetail remount, and two runs that share a
+  // filename (`plan.md`, `spec.md`, `state.yaml` — any name a taskdef reuses)
+  // and a sentence would otherwise share a key and serve one run's href in the
+  // other. `filePattern` above stays keyed on names, because the pattern really
+  // does depend on names only.
+  return [...lookup]
+    .map(([name, url]) => `${name}\u0001${url}`)
+    .sort()
+    .join('\u0000')
+}
+
+function textToken(state, content) {
+  const token = new state.Token('text', '', 0)
+  token.content = content
+  return token
+}
+
+// One text token in, the same characters out with the matched names wrapped in
+// anchors. The delimiter captured by the pattern stays in the leading text token,
+// so nothing outside a name is rewritten.
+function splitRunFiles(state, token, pattern, lookup) {
+  const text = token.content
+  const out = []
+  let last = 0
+  pattern.lastIndex = 0
+  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+    const start = match.index + match[1].length
+    if (start > last) out.push(textToken(state, text.slice(last, start)))
+    const open = new state.Token('link_open', 'a', 1)
+    open.attrs = [['href', lookup.get(match[2])]]
+    out.push(open, textToken(state, match[2]), new state.Token('link_close', 'a', -1))
+    last = start + match[2].length
+  }
+  if (!out.length) return [token]
+  if (last < text.length) out.push(textToken(state, text.slice(last)))
+  return out
+}
+
+// A core rule over the token stream, not a rewrite of the source: a filename in a
+// code span or a fence is code, and one inside a link the agent already wrote is
+// that link's label. Both are token shapes this never touches.
+markdown.core.ruler.push('run_files', (state) => {
+  const lookup = state.env && state.env.runFiles
+  if (!lookup || !lookup.size) return
+  const pattern = filePattern(lookup)
+  for (const token of state.tokens) {
+    if (token.type !== 'inline' || !token.children) continue
+    const children = []
+    let inLink = 0
+    for (const child of token.children) {
+      if (child.type === 'link_open') inLink += 1
+      if (child.type === 'link_close') inLink = Math.max(0, inLink - 1)
+      if (child.type !== 'text' || inLink > 0) children.push(child)
+      else children.push(...splitRunFiles(state, child, pattern, lookup))
+    }
+    token.children = children
+  }
+})
+// --- end of the run's own files ----------------------------------------------
+
+function renderMarkdown(text, files) {
+  const lookup = fileLookup(files)
+  // The file names *and their URLs* are part of the key: the same sentence
+  // renders differently once the run's list arrives, and a cache hit on the text
+  // alone would keep showing the unlinked copy — or, worse, another run's link
+  // for a name the two runs share.
+  const key = `${filesKey(lookup)}\u0000${text}`
+  const hit = renderCache.get(key)
   if (hit !== undefined) return hit
   // DOMPurify hands its input straight back when there is no DOM to sanitise
   // against. There always is one here — this only ever runs in a browser — so the
   // branch is not about a case that happens; it is about the belt never quietly
   // becoming a decoration if that stops being true.
   const html = DOMPurify.isSupported
-    ? DOMPurify.sanitize(markdown.render(text), SANITIZE)
+    ? DOMPurify.sanitize(markdown.render(text, { runFiles: lookup }), SANITIZE)
     : `<p>${markdown.utils.escapeHtml(text)}</p>`
   if (renderCache.size >= RENDER_CACHE_MAX) renderCache.clear()
-  renderCache.set(text, html)
+  renderCache.set(key, html)
   return html
 }
 
@@ -206,16 +331,18 @@ const SANITIZE_INLINE = {
 // the line that is actually there.
 const inlineCache = new Map()
 
-function renderMarkdownInline(text) {
-  const hit = inlineCache.get(text)
+function renderMarkdownInline(text, files) {
+  const lookup = fileLookup(files)
+  const key = `${filesKey(lookup)}\u0000${text}`
+  const hit = inlineCache.get(key)
   if (hit !== undefined) return hit
   // No <p> around the fallback, unlike the block path: this output goes inside a
   // sentence, and a paragraph would break the line it was put in.
   const html = DOMPurify.isSupported
-    ? DOMPurify.sanitize(markdown.renderInline(text), SANITIZE_INLINE)
+    ? DOMPurify.sanitize(markdown.renderInline(text, { runFiles: lookup }), SANITIZE_INLINE)
     : markdown.utils.escapeHtml(text)
   if (inlineCache.size >= RENDER_CACHE_MAX) inlineCache.clear()
-  inlineCache.set(text, html)
+  inlineCache.set(key, html)
   return html
 }
 // --- end of render path ------------------------------------------------------
@@ -229,6 +356,10 @@ const props = defineProps({
   // are one line of a card or a row. See the render path above for what that
   // costs (a heading stays a `#`) and what it buys (a row stays a row).
   inline: { type: Boolean, default: false },
+  // The run's own files, as `/api/runs/files` answers them (`{name, url}`). Only
+  // the run view passes this, and only a name in the list becomes a link
+  // (issue #616); everything else renders exactly as before.
+  files: { type: Array, default: () => [] },
 })
 
 const body = ref(null)
@@ -260,8 +391,8 @@ onMounted(addCodeButtons)
 onBeforeUnmount(clearCodeButtons)
 
 const rendered = computed(() => (props.inline
-  ? renderMarkdownInline(props.text)
-  : renderMarkdown(props.text)))
+  ? renderMarkdownInline(props.text, props.files)
+  : renderMarkdown(props.text, props.files)))
 
 watch(rendered, addCodeButtons, { flush: 'post' })
 

@@ -637,17 +637,25 @@ def test_the_file_list_is_last_in_the_overview_and_leaves_the_views_bottom_free(
     assert "run files" not in below_the_tabs
 
 
-def test_the_list_is_read_when_the_overview_opens_not_with_every_fleet_poll():
-    """One read per visit. The fleet payload is polled on a timer and feeds every
-    row; this is fetched by the one view that renders it."""
+def test_the_list_is_read_once_per_opened_run_not_with_every_fleet_poll():
+    """One read per visit, and on mount rather than on the overview tab (#616).
+
+    The fleet payload is polled on a timer and feeds every row; this is fetched by
+    the one view that renders it. It is armed on mount because the attention note
+    and the answer box sit above the tabs: a remembered terminal or chat tab must
+    still be able to resolve a filename the run's question mentions."""
     detail = RUN_DETAIL.read_text(encoding="utf-8")
     loader = _function_body(detail, "async function loadRunFiles")
 
     assert detail.count("api/runs/files") == 1, "the listing is fetched more than once"
     assert "api/runs/files" in loader
     assert "if (runFilesRequested) return" in loader, "the read is not guarded"
-    assert re.search(r"if \(value === 'overview'\) loadRunFiles\(\)", detail), (
-        "nothing arms the read when the overview panel is opened"
+    assert re.search(r"\bonMounted\(loadRunFiles\)", detail), (
+        "nothing arms the read when a run is opened"
+    )
+    assert not re.search(r"if \(value === 'overview'\) loadRunFiles\(\)", detail), (
+        "the read is still behind the overview tab, so the note above it has "
+        "nothing to resolve a filename against"
     )
 
 

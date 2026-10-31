@@ -39,6 +39,9 @@ const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 const props = defineProps({
   slots: { type: Array, default: () => [] },
   run: { type: Object, required: true },
+  // The run's own files, so a checklist mentioned in the question opens it
+  // (issue 616). Passed straight through to the renderer.
+  files: { type: Array, default: () => [] },
 })
 
 // The fleet view is what has to change after an answer — the run goes from
@@ -202,6 +205,7 @@ function cancelUnsignedSource() {
           <Markdown
             v-if="questionRecorded"
             :text="note"
+            :files="files"
             class="text-body-medium question"
           />
           <p v-else class="text-body-medium text-medium-emphasis mb-0">

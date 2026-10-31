@@ -484,3 +484,53 @@ def test_the_two_shapes_do_not_share_a_cache_entry():
         "assert.ok(renderCache !== inlineCache, 'one cache serves both shapes')",
     ])
     _probe(body)
+
+
+# --- the run view's own files (issue #616) -----------------------------------
+
+def test_the_run_view_feeds_its_files_to_every_agent_surface_it_composes():
+    """One resolver, fed once, everywhere a run's own prose is shown.
+
+    The renderer can only link a filename it was told about, and the run view is
+    the only place that has the list. Every agent-written surface this view
+    composes has to be handed it: a surface that is missed keeps the dead link the
+    issue is about, and nothing on screen says which one was forgotten.
+
+    The list is read when the run opens, not when the overview tab is selected,
+    because the attention note and the answer box sit above the tabs (the
+    operator's decision on #616).
+    """
+    detail = _component("RunDetail.vue")
+    assert "onMounted(loadRunFiles)" in detail, (
+        "the run's file list is not read when the run is opened"
+    )
+    for element in _elements(detail):
+        assert ':files="runFiles"' in element, (
+            f"a rendered surface in the run view has no file list: {element}"
+        )
+    for name in ("AnswerBox", "Chat", "AskChannel", "AskHistory"):
+        element = next(
+            (one for one in re.findall(
+                rf"<{name}\b[^>]*>", _without_comments(detail), re.S,
+            )),
+            None,
+        )
+        assert element, f"RunDetail no longer composes {name}"
+        assert ':files="runFiles"' in " ".join(element.split()), (
+            f"{name} is not handed the run's files"
+        )
+    # And each of them passes it on: a component that owns a renderer hands it to
+    # that, and one that composes a child hands it to the child.
+    for name in ("AnswerBox.vue", "AskBox.vue", "AskEntry.vue", "Chat.vue"):
+        text = _component(name)
+        for element in _elements(text):
+            assert ':files="files"' in element, (
+                f"{name} renders agent text without the run's files: {element}"
+            )
+    for name in ("AskChannel.vue", "AskHistory.vue"):
+        text = _without_comments(_component(name))
+        for child in ("AskEntry", "AskBox"):
+            for element in re.findall(rf"<{child}\b[^>]*>", text, re.S):
+                assert ':files="files"' in " ".join(element.split()), (
+                    f"{name} does not pass the run's files to {child}"
+                )

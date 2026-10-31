@@ -182,6 +182,10 @@ const props = defineProps({
     default: 'session',
     validator: (value) => ['session', 'conversation', 'transcript'].includes(value),
   },
+  // The run's own files, so a filename an agent mentions opens the file it names
+  // (issue 616). Only the run view passes this; the drawer's conversation is not a
+  // run's, and an empty list renders exactly as before.
+  files: { type: Array, default: () => [] },
   now: { type: Number, default: () => Date.now() },
   // The uber lmer pane (issue 575): the card grows to the bottom of its column, and
   // the message count and earlier-messages button are the parent's to draw.
@@ -1518,6 +1522,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
           <Markdown
             v-else-if="message.text"
             :text="message.text"
+            :files="files"
             class="text-body-medium said"
           />
 
