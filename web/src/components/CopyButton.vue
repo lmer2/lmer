@@ -63,21 +63,27 @@ onBeforeUnmount(reset)
 </template>
 
 <style scoped>
+/* A 24px target in a header line of ~20px (issue 646): the negative block margin
+   keeps the line its text's height, so the button sits on it rather than above it. */
 .copy-button {
   position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  min-width: 32px;
-  min-height: 32px;
+  width: 24px;
+  height: 24px;
+  margin-block: -2px;
+  padding: 0;
   border: 0;
   border-radius: 4px;
   color: inherit;
-  background: rgb(var(--v-theme-surface));
+  background: transparent;
   cursor: pointer;
 }
-.copy-button:hover,
+.copy-button:hover {
+  background: rgba(var(--v-theme-on-surface), 0.08);
+}
 .copy-button:focus-visible {
   outline: 1px solid currentColor;
 }

@@ -116,6 +116,7 @@ from .ingress import Ingress
 from . import references
 from . import reattach
 from . import relations
+from . import rotate_requests
 from . import run_transition
 from . import schema_report
 from . import session_io
@@ -816,8 +817,8 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin, nudge and "
     "rotation groups on its next tick, so a change there takes effect without a "
     "rotation. "
-    "chat_show_transcript and dock_keep_last_notes are browser display settings "
-    "applied on config refresh; neither requires an assistant rotation. The "
+    "chat_show_transcript, chat_tint_operator and dock_keep_last_notes are browser "
+    "display settings applied on config refresh; none requires an assistant rotation. The "
     "resources group is "
     "read-only and environment-only, and like the launch settings it applies "
     "to the next incarnation: changing it does not resize a running container."
@@ -2808,9 +2809,9 @@ def create_app(
             "                               pending count here is the only\n"
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"
-            "  POST /api/assistant/start    start it {handoff?, model?, harness?,\n"
-            "                               preset?, agents?, threads?} — 409 when one is\n"
-            "                               already up, which is how the incumbent\n"
+            "  POST /api/assistant/start    start it {handoff?, model?, effort?,\n"
+            "                               harness?, preset?, agents?, threads?} — 409\n"
+            "                               when one is already up, which is how the incumbent\n"
             "                               keeps its context window. 200, not 202:\n"
             "                               the session is up when this returns\n"
             "  POST /api/assistant/stop     stop it {reason?,handoff?}. NEVER\n"
@@ -2825,6 +2826,11 @@ def create_app(
             "                               assistant may call it for itself; the\n"
             "                               call does not return, because its own\n"
             "                               container is what this ends\n"
+            "  GET  /api/assistant/rotate-all  the assistants a rotate-all would reach\n"
+            "  POST /api/assistant/rotate-all  ask every running assistant to rotate\n"
+            "                               itself at its next breakpoint {reason?}:\n"
+            "                               a bus record each, never a stop.\n"
+            "                               Operator only\n"
             "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
             "                               model/harness/preset/agents/threads, with\n"
             "                               the layer that decided it (env /\n"
@@ -3100,10 +3106,11 @@ def create_app(
                 agents=body.get("agents"),
                 harness=body.get("harness"),
                 model=body.get("model"),
+                effort=body.get("effort"),
                 session_metadata=body.get("session_metadata"),
                 source_session_id=body.get("source_session_id"),
                 allow_unsigned_source=body.get("allow_unsigned_source"),
-                # Not a launch flag like the four above it: the slot resolves
+                # Not a launch flag like the ones above it: the slot resolves
                 # against ``config.slots`` and supplies the preset, which is why
                 # naming both is refused rather than ordered (issue #245).
                 slot=body.get("slot"),
@@ -4215,6 +4222,7 @@ def create_app(
                 entry,
                 body.get("text") if isinstance(body, dict) else None,
                 max_bytes=upload_settings()["max_bytes"].value,
+                purpose=body.get("purpose") if isinstance(body, dict) else None,
             )
         except UploadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
@@ -5316,6 +5324,31 @@ def create_app(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return rotated.to_dict()
 
+    def _operator_only(caller: Caller, action: str) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail=f"{action} is for the operator; this credential cannot use it")
+
+    @app.get("/api/assistant/rotate-all", dependencies=guard)
+    def assistant_rotate_all_targets(caller: Caller = Depends(require_secret)) -> dict:
+        """The assistants a rotate-all would address, so the modal can list them first."""
+        _operator_only(caller, "Rotating every assistant")
+        return {"targets": rotate_requests.targets(), "reason_limit": rotate_requests.MAX_REASON_CHARS}
+
+    @app.post("/api/assistant/rotate-all", dependencies=guard)
+    def assistant_rotate_all(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Ask every running assistant to rotate itself (issue #646).
+
+        A request, not a rotation: each one is told on its bus and rotates through
+        ``lmer-ctl rotate`` with a handover when it reaches a breakpoint. The
+        reply's ``generation`` per target is the one asked; a higher one later is
+        the receipt.
+        """
+        _operator_only(caller, "Rotating every assistant")
+        try:
+            return rotate_requests.request_all((body or {}).get("reason"))
+        except rotate_requests.RotateRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/assistant/handoff", dependencies=guard)
     def assistant_handoff() -> dict:
         """The note the previous incarnation left for this one (§8.3).
@@ -5489,7 +5522,8 @@ def create_app(
         Keys are the launch-setting names (including ``threads``) plus the integer settings
         (display-only ``dock_keep_last_notes`` from #465, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
-        #446) and the boolean ``chat_show_transcript`` (#488), which are spelled as their config
+        #446) and the booleans ``chat_show_transcript`` (#488) and ``chat_tint_operator`` (#646),
+        which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. A boolean takes ``true``/``false`` (the JSON
         values, or the two words as strings) and nothing looser. Omitted keys

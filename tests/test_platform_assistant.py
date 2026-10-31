@@ -2333,11 +2333,11 @@ def test_start_with_no_settings_is_todays_behaviour(config, long_lived):
     """Unset everywhere: no flags emitted, status reports all-None settings."""
     with started(config) as status:
         task = _live_task(status)
-        for key in ("model", "harness", "preset", "agents"):
+        for key in ("model", "effort", "harness", "preset", "agents"):
             assert task.get(key) is None
         assert assistant.status().settings == {
-            "model": None, "harness": None, "preset": None, "agents": None,
-            "threads": [],
+            "model": None, "effort": None, "harness": None, "preset": None,
+            "agents": None, "threads": [],
         }
     # ``started`` SIGKILLs the stub and returns; the registry entry goes when the
     # spawn's watcher thread records the exit, which is asynchronous — so this
@@ -2376,6 +2376,24 @@ def test_an_explicit_setting_beats_the_env_var(config, long_lived, monkeypatch):
         assert _live_task(status)["model"] == "explicit-model"
 
 
+def test_the_effort_resolves_like_the_model(config, long_lived, monkeypatch):
+    """Explicit > env > a fresh config.json, and the spawn records what it emitted."""
+    cfg.update_stored({"assistant_effort": "low"})
+    values, sources = assistant._launch_settings(None)
+    assert (values["effort"], sources["effort"]) == ("low", "config.json")
+
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_EFFORT, "High")
+    values, sources = assistant._launch_settings(None)
+    assert (values["effort"], sources["effort"]) == ("high", "env")
+
+    values, sources = assistant._launch_settings({"effort": "XHIGH"})
+    assert (values["effort"], sources["effort"]) == ("xhigh", "override")
+
+    with started(config, settings={"effort": "max"}) as status:
+        assert _live_task(status)["effort"] == "max"
+        assert assistant.status().settings["effort"] == "max"
+
+
 def test_a_null_setting_is_absent_not_a_forced_default(
     config, long_lived, monkeypatch
 ):
@@ -2390,7 +2408,8 @@ def test_an_unusable_explicit_setting_is_refused_before_anything_starts(
     """The caller is attached, so the answer is a refusal — never a session
     running something other than what they asked for."""
     for bad in ({"model": "   "}, {"model": 7}, {"model": "-x"},
-                {"agents": ","}, {"agents": " , ,"}, {"effort": "high"}):
+                {"agents": ","}, {"agents": " , ,"}, {"verbosity": "high"},
+                {"effort": "turbo"}):
         with pytest.raises(assistant.AssistantError):
             assistant.start(config, settings=bad)
     assert assistant.status().running is False

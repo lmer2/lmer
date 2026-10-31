@@ -29,6 +29,7 @@ import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
 import ProjectNav from './components/ProjectNav.vue'
 import PlatformSettings from './components/PlatformSettings.vue'
+import RotateAllAssistants from './components/RotateAllAssistants.vue'
 import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
@@ -1042,6 +1043,7 @@ onUnmounted(() => {
                 :prepend-icon="THEME_ICONS[mode]" :title="THEME_LABELS[mode]" @click="themeMode = mode" />
             </v-list>
           </v-menu>
+          <RotateAllAssistants v-if="!mobile" />
           <v-tooltip text="Platform settings" location="bottom" open-on-focus>
             <template #activator="{ props: tooltip }">
               <v-btn v-bind="tooltip" :icon="mdiCogOutline" variant="text" aria-label="Platform settings"

@@ -1350,6 +1350,7 @@ async function forget() {
               <Chat
                 :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
+                :project-color="run.workspace_color"
                 :question-pending="questionPending"
                 :ask-pending="askPending"
                 :now="now"

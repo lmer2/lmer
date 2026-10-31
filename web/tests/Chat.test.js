@@ -3,6 +3,7 @@ import { flushPromises } from '@vue/test-utils'
 import Chat from '../src/components/Chat.vue'
 import { fetchSessionMessages } from '../src/api.js'
 import { deferred, mountPane } from './mount.js'
+import { chatTintOperator } from '../src/operatorChat.js'
 
 vi.mock('../src/api.js', () => ({
   fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(),
@@ -446,5 +447,96 @@ it('keeps what a poll said about the end when an earlier page lands late', async
   } finally {
     wrapper.unmount()
     vi.useRealTimers()
+  }
+})
+
+// Issue 646 item 1. jsdom has no layout, so the height of the alert is measured by
+// web/tests/browser/platform_polish.py; this pins what a failed poll leaves on screen.
+it('a failed poll in the fill layout keeps the messages beside one compact error', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  try {
+    fetchSessionMessages.mockResolvedValue({ messages: [record()], total: 1, cursor: 1, live: true })
+    const wrapper = mountPane(Chat, { sessionId: 's-1', fill: true })
+    await flushPromises()
+    await vi.dynamicImportSettled()
+    await flushPromises()
+    fetchSessionMessages.mockRejectedValue(new Error('HTTP 502'))
+    vi.advanceTimersByTime(5000)
+    await flushPromises()
+    const alert = wrapper.get('.v-alert')
+    expect(alert.text()).toBe('HTTP 502')
+    expect(alert.classes()).toContain('v-alert--density-compact')
+    expect(wrapper.findAll('.turn')).toHaveLength(1)
+    expect(wrapper.get('.turn').text()).toContain(text)
+    wrapper.unmount()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+// Issue 646 item 3: a Send Privately record is a compact entry, never the agent's instructions.
+const REFERENCE_LINE = '[lmer private] /home/developer/.lmer-uploads/.lmer-private/s-1/20261030-120000-private-gitlab-deploy-token.txt — private text for: GitLab deploy token (this session only). Use it in place without printing it'
+const privateRecord = (extra = {}) => ({
+  id: 'private', seq: 3, role: 'user', kind: 'said', via: 'comms', session: 's-1',
+  source: { channel: 'platform', author: 'operator' }, comms_kind: null, text: REFERENCE_LINE, tools: [],
+  private: { purpose: 'GitLab deploy token' }, at: '2026-10-30T12:00:00Z', ...extra,
+})
+
+it('draws a private send as a compact entry with its purpose and no prompt text', async () => {
+  fetchSessionMessages.mockResolvedValue({ messages: [privateRecord()], total: 1, cursor: 1, live: true })
+  const wrapper = mountPane(Chat, { sessionId: 's-1', view: 'conversation' })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  const entry = wrapper.get('.turn')
+  expect(entry.classes()).toContain('ground-operator')
+  expect(entry.get('.private-entry').text()).toContain('Private message sent: GitLab deploy token')
+  expect(entry.text()).toContain('delivered')
+  expect(entry.text()).not.toContain('removed with the session')
+  expect(entry.text()).not.toContain('lmer-private')
+  expect(entry.text()).not.toContain('Use it in place')
+  expect(entry.find('.copy-button').exists()).toBe(false)
+  wrapper.unmount()
+})
+
+it('a private send without a purpose, from a session that has ended, says it was removed', async () => {
+  fetchSessionMessages.mockResolvedValue({
+    messages: [privateRecord({ private: { purpose: null } })], total: 1, cursor: 1, live: false,
+  })
+  const wrapper = mountPane(Chat, { sessionId: 's-1', view: 'conversation' })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  const entry = wrapper.get('.private-entry')
+  expect(entry.text()).toMatch(/Private message sent\s*·/)
+  const removed = entry.get('.inferred')
+  expect(removed.text()).toContain('removed with the session (inferred)')
+  expect(removed.attributes('title')).toContain('inferred')
+  wrapper.unmount()
+})
+
+// Issue 646 item 9: the operator ground follows the project, unless switched off or General.
+async function tinted(props) {
+  fetchSessionMessages.mockResolvedValue({ messages: [], total: 0, cursor: 0, live: true })
+  const wrapper = mountPane(Chat, { sessionId: 's-1', ...props })
+  await flushPromises()
+  const ground = wrapper.element.style.getPropertyValue('--chat-operator-ground')
+  wrapper.unmount()
+  return ground
+}
+
+it('tints the operator ground with the project color, and restores the fixed color when off', async () => {
+  const red = await tinted({ workspaceId: 'alpha', projectColor: 'Red' })
+  const teal = await tinted({ workspaceId: 'alpha', projectColor: 'Teal' })
+  expect(red).toMatch(/^#[0-9a-f]{6}$/)
+  expect(teal).toMatch(/^#[0-9a-f]{6}$/)
+  expect(red).not.toBe(teal)
+  expect(await tinted({ workspaceId: 'general', projectColor: 'Blue' })).toBe('')
+  expect(await tinted({ workspaceId: 'alpha' })).toBe('')
+  chatTintOperator.value = false
+  try {
+    expect(await tinted({ workspaceId: 'alpha', projectColor: 'Red' })).toBe('')
+  } finally {
+    chatTintOperator.value = true
   }
 })

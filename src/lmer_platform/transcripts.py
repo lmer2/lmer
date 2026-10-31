@@ -279,7 +279,7 @@ from ask_channel.protocol import KIND_QUESTION, AskError
 from lmer_cli import comms as bus
 from lmer_cli.threads import ThreadError, parse_thread
 
-from . import ask, assistant_history, registry, runs
+from . import ask, assistant_history, registry, runs, uploads
 from .config import active_assistant_credential, active_secret
 from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
@@ -870,6 +870,9 @@ class Message:
     #: ``run`` is the owning run's ``host/project/slug/label`` or ``None`` on a
     #: record written before the run was kept. The view draws these compactly.
     digest: Optional[dict] = None
+    #: A Send Privately reference the operator sent (issue #646): ``{"purpose"}``.
+    #: The view draws a compact entry in place of the agent-facing text.
+    private: Optional[dict] = None
 
     @property
     def empty(self) -> bool:
@@ -899,6 +902,7 @@ class Message:
             "thread": self.thread,
             **({"peer": self.peer} if self.peer else {}),
             **({"digest": self.digest} if self.digest else {}),
+            **({"private": self.private} if self.private else {}),
         }
 
 
@@ -1562,12 +1566,13 @@ def _claude_message(record: dict, pending: dict, *, presentation: bool = True) -
             return None
         # The operator's own words, so through exactly what a typed turn's text
         # goes through below: wrappers off, then the scrub-and-cap chokepoint.
-        text, truncated = _prompt_text(_strip_wrappers(prompt), presentation)
+        prompt = _strip_wrappers(prompt)
+        text, truncated = _prompt_text(prompt, presentation)
         if not text:
             return None
         return Message(
             role="user", kind="said", text=text, at=timestamp,
-            truncated=truncated,
+            truncated=truncated, private=_private_echo("user", None, prompt),
         )
 
     if kind_of_record not in ("user", "assistant"):
@@ -1641,12 +1646,13 @@ def _claude_message(record: dict, pending: dict, *, presentation: bool = True) -
         text = (text if isinstance(text, str) else "").strip()
         kind = "said"
 
+    private = _private_echo(role, via, text)
     text, truncated = _prompt_text(text, presentation)
     api_refusal, api_error, api_error_status = _api_error_of(record)
     result = Message(
         role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
         tools=tools, via=via, api_refusal=api_refusal,
-        api_error=api_error, api_error_status=api_error_status,
+        api_error=api_error, api_error_status=api_error_status, private=private,
     )
     return None if result.empty else result
 
@@ -1724,10 +1730,11 @@ def _pi_message(record: dict, pending: dict, *, presentation: bool = True) -> Op
     # anyone said.
     text = _strip_wrappers(text) if role == "user" else text.strip()
 
+    private = _private_echo(role, None, text)
     text, truncated = _prompt_text(text, presentation)
     result = Message(
         role=role, kind="said", text=text, at=timestamp, truncated=truncated,
-        tools=tools,
+        tools=tools, private=private,
     )
     return None if result.empty else result
 
@@ -1975,9 +1982,11 @@ def _codex_message(record: dict, pending: dict, *, presentation: bool = True) ->
     else:
         return None
 
+    private = _private_echo(role, None, text)
     text, truncated = _prompt_text(text, presentation)
     result = Message(
         role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
+        private=private,
     )
     return None if result.empty else result
 
@@ -2191,6 +2200,7 @@ def _lmer_message(record: dict, pending: dict, *, presentation: bool = True) -> 
     # could claim it would be a container asserting the operator had spoken.
     via = MONITOR_VIA if record.get("via") == MONITOR_VIA else None
 
+    private = _private_echo(role, via, text)
     text, truncated = _prompt_text(text, presentation)
     api_refusal, api_error, api_error_status = _api_error_fields(
         record.get("api_refusal"),
@@ -2200,7 +2210,7 @@ def _lmer_message(record: dict, pending: dict, *, presentation: bool = True) -> 
     result = Message(
         role=role, kind=kind, text=text, at=at, truncated=truncated, tools=tools,
         via=via, api_refusal=api_refusal, api_error=api_error,
-        api_error_status=api_error_status,
+        api_error_status=api_error_status, private=private,
     )
     return None if result.empty else result
 
@@ -2232,14 +2242,39 @@ def _message_from_record(record: dict, pending: dict, *, presentation: bool = Tr
     """
     harness = _harness_of_record(record)
     if harness == "claude":
-        return _claude_message(record, pending, presentation=presentation)
-    if harness == "pi":
-        return _pi_message(record, pending, presentation=presentation)
-    if harness == "codex":
-        return _codex_message(record, pending, presentation=presentation)
-    if harness == _LMER_HARNESS:
-        return _lmer_message(record, pending, presentation=presentation)
-    return None
+        message = _claude_message(record, pending, presentation=presentation)
+    elif harness == "pi":
+        message = _pi_message(record, pending, presentation=presentation)
+    elif harness == "codex":
+        message = _codex_message(record, pending, presentation=presentation)
+    elif harness == _LMER_HARNESS:
+        message = _lmer_message(record, pending, presentation=presentation)
+    else:
+        return None
+    if message is not None and message.private is None:
+        message.private = _private_stamp(record, message)
+    return message
+
+
+#: The key :func:`scrub_transcript` adds to a record whose user turn was a
+#: delivered private reference line, because the scrub destroys the line's shape.
+_PRIVATE_STAMP = "lmer_private"
+
+
+def _private_stamp(record: dict, message: Message) -> Optional[dict]:
+    """The private entry a scrubbed file recorded for this turn, if any.
+
+    Only on a turn that is still a reference line in the shape the scrub leaves
+    alone, its prefix and private path: that is the one record
+    :func:`_private_stamped` writes the stamp on, and the key on any other turn
+    is not lmer's.
+    """
+    stamp = record.get(_PRIVATE_STAMP)
+    if not isinstance(stamp, dict) or message.role != "user" or message.via:
+        return None
+    if not _untagged(message.text).startswith(_PRIVATE_PATH_PREFIX):
+        return None
+    return _private_entry(stamp.get("purpose"))
 
 
 def _iter_records(path: Path, *, problems: Optional[list] = None) -> Iterator[dict]:
@@ -2835,6 +2870,7 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                     "kind": str(meta.get("digest_kind") or "event"),
                     "run": digest_run(meta.get("run")),
                 } if kind == "digest" else None,
+                private=_private_send(kind, source, meta, record.get("text")),
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``
@@ -2850,7 +2886,8 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                 assistant_name=assistant_name,
             )
             if tagged:
-                copies.append(("user", _collapsed(line), None))
+                # Scrubbed like the harness turn it has to match.
+                copies.append(("user", _collapsed(_scrub(line)), None))
                 # A container started before a rename keeps typing the old tag
                 # (#581); claim every alias so the pane does not show the
                 # relayed message twice until that session rotates.
@@ -2858,8 +2895,84 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                     current = (assistant_name or "").strip() or bus.assistant_display_name()
                     for alias in bus.assistant_label_aliases(name=assistant_name):
                         if alias != current:
-                            copies.append(("user", _collapsed(line.replace(f"[{current}", f"[{alias}", 1)), None))
+                            alias_line = line.replace(f"[{current}", f"[{alias}", 1)
+                            copies.append(("user", _collapsed(_scrub(alias_line)), None))
     return turns, copies
+
+
+def _private_send(kind: object, source: dict, meta: dict, text: object) -> Optional[dict]:
+    """``{"purpose"}`` for the operator's own Send Privately record, else ``None``.
+
+    Only the operator's: any caller can set ``meta``, and a compact entry hides
+    the record's text. Records sent before ``meta.private`` existed are matched
+    on the reference line's whole delivery shape instead.
+    """
+    if kind != "message" or source.get("channel") != "platform" or source.get("author") != "operator":
+        return None
+    marker = meta.get("private")
+    if isinstance(marker, dict):
+        return _private_entry(marker.get("purpose"))
+    parsed = uploads.parse_private_reference(text)
+    return _private_entry(parsed["purpose"]) if parsed else None
+
+
+def _private_marked(record: dict) -> dict:
+    """*record* with ``meta.private`` set when it is the operator's private send.
+
+    For a store that keeps records scrubbed (:func:`assistant_history.retain`): a
+    record sent before the marker existed is matched on its reference line, which
+    the scrub can rewrite, so the match is made on the raw text and kept.
+    """
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    if isinstance(meta.get("private"), dict):
+        return record
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    private = _private_send(record.get("kind"), source, meta, record.get("text"))
+    return {**record, "meta": {**meta, "private": private}} if private else record
+
+
+def _private_echo(role: object, via: object, text: object) -> Optional[dict]:
+    """``{"purpose"}`` when a harness user turn is a delivered private reference line.
+
+    For the turns that reach the pane without their bus record: a session past
+    the bus read window, a hub that could not be read, a session with no bus.
+    The same whole-shape match as an older record, behind the operator's relay
+    tag or, typed with no bus, none. Called on the turn's raw text: the scrub
+    rewrites the line's instructions, and can rewrite its purpose and file name.
+    """
+    if role != "user" or via or not isinstance(text, str):
+        return None
+    parsed = uploads.parse_private_reference(_untagged(text))
+    return _private_entry(parsed["purpose"]) if parsed else None
+
+
+#: How every private reference line starts, and what the scrub leaves of it.
+_PRIVATE_PATH_PREFIX = f"{uploads.PRIVATE_PREFIX} {uploads.CONTAINER_UPLOADS_DIR}/{uploads.PRIVATE_DIRNAME}/"
+
+
+def _untagged(text: str) -> str:
+    """*text* without the operator's relay tag, which a delivered reference line may carry."""
+    text = text.strip()
+    tag = f"[{bus.Source(channel='platform', author='operator').label}] "
+    return text[len(tag):] if text.startswith(tag) else text
+
+
+def _private_entry(purpose: object) -> dict:
+    """``{"purpose"}`` under the writer's rule: one scrubbed line within its cap, or none.
+
+    Every route reads the purpose from somewhere the writer's validation does not
+    reach (a record's marker, a raw line, a file's stamp), so it is held to that
+    rule here, cut rather than refused, and scrubbed first like any shown text.
+    """
+    if not isinstance(purpose, str):
+        return {"purpose": None}
+    line = " ".join(_scrub(purpose).split())
+    if len(line) > uploads.MAX_PURPOSE_CHARS:
+        line = line[: uploads.MAX_PURPOSE_CHARS - 1].rstrip() + "…"
+    try:
+        return {"purpose": uploads.validated_purpose(line)}
+    except uploads.UploadRejected:
+        return {"purpose": None}
 
 
 def _thread_link(value: object) -> Optional[str]:
@@ -3382,6 +3495,10 @@ def scrub_transcript(path: Path) -> bool:
     — is scrubbed as raw text and kept: it cannot be re-serialised, and dropping
     it would destroy the evidence of the crash that produced it.
 
+    One key can be added: a user turn that was a delivered private reference line
+    keeps that verdict as :data:`_PRIVATE_STAMP`, because the scrub rewrites the
+    line out of the shape the reader matches (:func:`_private_stamped`).
+
     One lossy edge, stated rather than hidden: the file is read as UTF-8 with
     ``errors="replace"``, so a byte sequence that is not valid UTF-8 is replaced
     on the way through. That is the same substitution :func:`_iter_records`
@@ -3423,7 +3540,7 @@ def scrub_transcript(path: Path) -> bool:
                             record = None
                     if isinstance(record, dict):
                         sink.write(
-                            json.dumps(_scrub_decoded(record), ensure_ascii=False) + "\n"
+                            json.dumps(_scrub_decoded(_private_stamped(record)), ensure_ascii=False) + "\n"
                         )
                     else:
                         sink.write(_scrub(raw))
@@ -3444,6 +3561,24 @@ def scrub_transcript(path: Path) -> bool:
             pass
         return False
     return True
+
+
+def _private_stamped(record: dict) -> dict:
+    """*record* with :data:`_PRIVATE_STAMP` when its turn is a private reference line.
+
+    The scrub is about to rewrite the line out of the shape that identifies it, so
+    the match is made on the raw record first and kept beside it. A stamp already
+    on the record survives only where the reader would honour it.
+    """
+    bare = {key: value for key, value in record.items() if key != _PRIVATE_STAMP}
+    try:
+        message = _message_from_record(record, {}, presentation=False)
+    except Exception:
+        logger.debug("platform_transcript_private_stamp_skipped")
+        return bare
+    if message is None or not message.private:
+        return bare
+    return {**bare, _PRIVATE_STAMP: message.private}
 
 
 def scrub_session_transcripts(session_id: str) -> int:

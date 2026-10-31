@@ -270,6 +270,11 @@ consult relevant prior exchanges when context is missing.
   them. Platform state (`chat_show_transcript` in `config.json`): the browser
   that saved it switches at once, and every other open drawer follows on its
   next status poll. `docs/COMMS.md` §4 has the table of what each view draws.
+  Beside it, **Tint my messages with the project color** (on by default,
+  `chat_tint_operator`) paints your bubbles in each chat with that project's
+  hue, at a lightness where the message text and its header both clear WCAG AA
+  in either color scheme; off, they use the theme's one operator color. The
+  General project and a chat with no project always use that one color.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
@@ -966,6 +971,28 @@ what the operator's shared secret opens, and an unauthenticated rotate is still 
 401. The operator-initiated rotate — the chat drawer's restart, or the route by
 hand — is untouched.
 
+### Asking every Ratchet to rotate
+
+The app bar's rotate button (issue #646) asks **every** running project
+assistant to rotate itself, with an optional reason. A phone's app bar has no
+room for it, so there it is **Ask every Ratchet to rotate** under Platform
+settings, which has the same button at every width. It lists the instances it
+will reach (project and generation) before you confirm, then shows each one as
+requested, then rotated once its project reports a later generation.
+
+It asks; it does not rotate. `POST /api/assistant/rotate-all {reason?}` posts
+one record on each running assistant's bus (`channel=platform`,
+`author=operator`, `ref=rotate-request:<id>`) asking it to write a handover that
+names the request and its reason, then run `lmer-ctl rotate` at its next
+breakpoint. Nothing is stopped, so an assistant mid-task finishes its step
+first. `GET` on the same path lists who a request would reach. Both are
+operator-only: an assistant or connector credential gets a 403. A stopped or
+waiting assistant is listed and not asked, and one whose session has no message
+bus (an image older than the unified channel) is reported as not reached. The
+reason is one line of at most 500 characters, and a reason holding a character
+that does not print (a control, a format character such as a bidi override, a
+lone surrogate) is refused, the same rule as a private send's purpose.
+
 ### Configuration
 
 | variable | default | what it sets |
@@ -1124,17 +1151,41 @@ the message, and the message names the path the agent will find it at.
 
 ### Send Privately
 
-**send privately**, beside **attach** in both chats, is for a secret or other
-private text (issue #510). It opens an editor; what you type there never goes
-into the chat.
+**Private** (a lock), beside **attach** in both chats, is for a secret or other
+private text (issue #510). In a narrow composer it is the lock alone, labelled
+"Send privately". It opens an editor; what you type there never goes into the
+chat.
 
 - **How it travels.** `POST /api/sessions/{id}/private` with `{text}` writes the
   text to `<store>/.lmer-private/<session-id>/<stamp>-private.txt`, mode **0400**,
   in the same upload store and mount as attachments. The reply carries only a
   `reference`, and the composer sends that line as the message:
   `[lmer private] /home/developer/.lmer-uploads/.lmer-private/<session-id>/<name> — …`.
-  The line has no content, no size and no name you chose. The route is
-  operator-only, and its refusals never repeat the text.
+  The line has no content and no size. The route is operator-only, and its
+  refusals never repeat the text.
+- **Purpose (optional).** A short, non-secret label such as "GitLab deploy
+  token" (`{text, purpose}`; one line, at most 80 characters, nothing that
+  does not print: no control or format character, no lone surrogate). It goes into the line the session receives (`— private text for:
+  <purpose> (this session only).`), so a session given several can tell them
+  apart, and into the file name as a slug (`<stamp>-private-gitlab-deploy-token.txt`).
+  The editor says it is not secret, because it is shown in the chat.
+- **In the chat history** a send is one compact entry: a lock, "Private message
+  sent: <purpose>", the time and "delivered". Once its session has ended it adds
+  "removed with the session", which is inferred from the session being over
+  (the platform deletes the directory then) rather than read from a record.
+  The composer marks the record with `meta.private`; older sends are recognised
+  by their exact reference-line shape. So is the harness's own copy of the line
+  when the bus record is not in the read (a worker past the bus read window, a
+  hub that could not be read, a session with no bus): untagged or behind
+  `[platform · operator]`, it shows as the same entry. The match is made on the
+  raw line before the credential scrub, which can rewrite the line, its purpose
+  and its file name. Where only scrubbed text is kept, the verdict is kept
+  beside it: the assistant archive stores the record with `meta.private`, and
+  the transcript file scrubbed at a session's end keeps an `lmer_private` key on
+  that turn, honoured only on a turn that still starts with the reference
+  line's prefix and private path. Archive records written by an earlier version
+  hold no raw line to match. However it is found, a purpose is shown as one line
+  of at most 80 characters, cut when longer. The session still receives the full line.
 - **Where it does not appear:** chat and comms records, the container bus, the
   fleet journal, assistant history and digest, Slack and Matrix, reference lines,
   filenames, previews, error messages and the daemon's logs. The attachment

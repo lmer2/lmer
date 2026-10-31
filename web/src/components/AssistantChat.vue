@@ -338,6 +338,7 @@ onBeforeUnmount(() => {
           :send-paused="rotating"
           :session-id="sessionId"
           :workspace-id="workspace.id"
+          :project-color="workspace.color"
           :now="now"
           :view="chatShowTranscript ? 'transcript' : 'conversation'"
           :composer-label="`Say something to ${workspace.name} · ${assistantName}`"

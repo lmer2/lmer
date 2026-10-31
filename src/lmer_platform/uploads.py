@@ -55,7 +55,7 @@ from . import assistant_history, registry, store
 from .store import logs_dir
 from .project_context import assistant_dir
 from . import projects, project_context
-from lmer_cli.comms import assistant_display_name
+from lmer_cli.comms import CommsError, assistant_display_name, one_line_label
 
 logger = logging.getLogger("lmer_platform.uploads")
 
@@ -119,9 +119,19 @@ PRIVATE_DIRNAME = ".lmer-private"
 PRIVATE_MARKER = ".lmer-owned"
 PRIVATE_FILE_MODE = 0o400
 PRIVATE_PREFIX = "[lmer private]"
+#: What every reference line tells the agent after naming the file, word for word.
+REFERENCE_INSTRUCTIONS = (
+    " Use it in place without printing it (a --password-file style flag, or \"$(< FILE)\" inside the one "
+    "command that needs it), then chmod 000 this file (the file, not its directory). It is deleted when "
+    "this session ends."
+)
 _PRIVATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-_PRIVATE_FILE = re.compile(r"\d{8}-\d{6}-private(?:-\d+)?\.txt")
+#: ``-<purpose slug>`` and the collision marker ``-<n>`` are both optional parts.
+_PRIVATE_FILE = re.compile(r"\d{8}-\d{6}-private(?:-[a-z0-9]+)*\.txt")
+#: A purpose labels the send for the operator and the agent; it is not secret.
+MAX_PURPOSE_CHARS = 80
+_PURPOSE_SLUG_CHARS = 40
 
 
 @dataclass(frozen=True)
@@ -811,25 +821,59 @@ class StoredPrivate:
     session_id: str
     name: str
     container_path: str
+    purpose: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
             "session": self.session_id,
             "name": self.name,
             "container_path": self.container_path,
+            "purpose": self.purpose,
             "reference": private_reference_line(self),
         }
 
 
 def private_reference_line(stored: StoredPrivate) -> str:
     """The line the session receives in place of the text."""
-    return (
-        f"{PRIVATE_PREFIX} {stored.container_path} — private text for this "
-        "session only. Use it in place without printing it (a --password-file "
-        "style flag, or \"$(< FILE)\" inside the one command that needs it), "
-        "then chmod 000 this file (the file, not its directory). It is deleted "
-        "when this session ends."
-    )
+    what = f"private text for: {stored.purpose} (this session only)" if stored.purpose else (
+        "private text for this session only")
+    return f"{PRIVATE_PREFIX} {stored.container_path} — {what}.{REFERENCE_INSTRUCTIONS}"
+
+
+_REFERENCE = re.compile(
+    rf"{re.escape(PRIVATE_PREFIX)} {re.escape(CONTAINER_UPLOADS_DIR)}/{re.escape(PRIVATE_DIRNAME)}/"
+    rf"[A-Za-z0-9._-]+/(?P<name>{_PRIVATE_FILE.pattern}) — private text for"
+    r"(?:: (?P<purpose>[^\n]+) \(this session only\)| this session only)\."
+    + re.escape(REFERENCE_INSTRUCTIONS)
+)
+
+
+def parse_private_reference(text: object) -> Optional[dict]:
+    """``{name, purpose}`` when *text* is exactly a delivered reference line, else ``None``.
+
+    For history written before the bus record carried ``meta.private``: the
+    match is on the whole delivery shape, so a message that only mentions the
+    prefix is not taken for one.
+    """
+    if not isinstance(text, str):
+        return None
+    found = _REFERENCE.fullmatch(text.strip())
+    if not found:
+        return None
+    return {"name": found["name"], "purpose": found["purpose"]}
+
+
+def validated_purpose(purpose: object) -> Optional[str]:
+    """The purpose label as one plain line, ``None`` when none was given."""
+    try:
+        return one_line_label(purpose, MAX_PURPOSE_CHARS, "a private send's purpose")
+    except CommsError as exc:
+        raise UploadRejected(str(exc)) from None
+
+
+def _purpose_slug(purpose: Optional[str]) -> str:
+    slug = "-".join(re.findall(r"[a-z0-9]+", (purpose or "").lower()))
+    return slug[:_PURPOSE_SLUG_CHARS].rstrip("-")
 
 
 def _restore_owner_bits(parent_fd: int, name: str) -> None:
@@ -932,12 +976,14 @@ def _private_dir(session_id: str, entry: Optional[dict], *, create: bool) -> int
 
 def store_private(
     session_id: str, entry: Optional[dict], text: object, *, max_bytes: int = DEFAULT_MAX_BYTES,
+    purpose: object = None,
 ) -> StoredPrivate:
     """Write the operator's private text for *session_id* and name it.
 
     No refusal here quotes or measures the text: a size refusal names the cap,
     not the length.
     """
+    purpose = validated_purpose(purpose)
     if not isinstance(text, str):
         raise UploadRejected("a private send needs a string 'text' field")
     if not text.strip():
@@ -954,7 +1000,8 @@ def store_private(
         raise UploadError(f"the private store could not be prepared ({exc.strerror or exc})") from exc
     kind = KNOWN_TYPES["txt"]
     try:
-        filename = stored_name("private", kind)
+        slug = _purpose_slug(purpose)
+        filename = stored_name(f"private-{slug}" if slug else "private", kind)
         name, attempt = filename, 1
         while True:
             try:
@@ -983,6 +1030,7 @@ def store_private(
         session_id=session_id,
         name=name,
         container_path=f"{CONTAINER_UPLOADS_DIR}/{PRIVATE_DIRNAME}/{session_id}/{name}",
+        purpose=purpose,
     )
 
 

@@ -81,9 +81,11 @@ from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, re
 from .keep_id import image_id as remap_image_id, record_remap, remap_recorded
 from .harness import (
     CODEX_SEED_ERROR_ENV,
+    EFFORT_LEVELS,
     HARNESS_ENV,
     HARNESSES,
     LLM_NAME_ENV,
+    REASONING_EFFORT_ENV,
     Harness,
     UnknownHarnessError,
     get_harness,
@@ -681,6 +683,7 @@ def parse_args(
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--model", dest="model", help="Model the harness runs, exported to the container as LMER_LLM_NAME (env: LMER_LLM_NAME; the flag wins over it, and over a preset's env). Forwarded verbatim to the harness's own --model flag by the runner scripts — lmer never validates it, the harness rejects what it does not know. Also implies the harness when neither --harness nor LMER_HARNESS is set (e.g. --model gpt-5.5 selects codex).")
+    parser.add_argument("--effort", dest="effort", help=f"Reasoning effort the harness runs at, exported to the container as LMER_REASONING_EFFORT (env: LMER_REASONING_EFFORT; the flag wins over it, and over a preset's env). One of: {', '.join(EFFORT_LEVELS)} (case-insensitive); an unknown level is refused. Each harness maps it to its own effort setting (max becomes xhigh where that is the top tier; auto leaves the harness default).")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
@@ -2321,6 +2324,30 @@ def _apply_model_selection(
     return expanded
 
 
+def _apply_effort_selection(
+    explicit: str | None, env_sources: dict[str, str]
+) -> str | None:
+    """Make ``--effort`` the session's ``LMER_REASONING_EFFORT``. Returns the effective effort.
+
+    :func:`_apply_model_selection`'s contract — flag over the environment and a
+    preset's env, blank is not a value, ``--show-env`` attribution — with one
+    difference: the vocabulary is closed, so the value is lowercased and an
+    unknown level raises ``ValueError``. The environment's own value is left to
+    the runners, which skip an unknown one with a warning.
+    """
+    effort = (explicit or "").strip().lower()
+    if not effort:
+        return os.environ.get(REASONING_EFFORT_ENV) or None
+    if effort not in EFFORT_LEVELS:
+        raise ValueError(
+            f"--effort {explicit!r} is not a reasoning effort level "
+            f"(expected one of: {', '.join(EFFORT_LEVELS)})"
+        )
+    os.environ[REASONING_EFFORT_ENV] = effort
+    env_sources[REASONING_EFFORT_ENV] = "--effort flag"
+    return effort
+
+
 def _apply_dispatch_aliases(env_sources: dict[str, str]) -> None:
     """Expand an alias in each ``LMER_DISPATCH_<LANE>`` value (issue #309).
 
@@ -2688,6 +2715,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # The flag wins over preset env and can select the harness that serves it.
     session_model = _apply_model_selection(ns.model, early_env_file_sources)
+    try:
+        _apply_effort_selection(ns.effort, early_env_file_sources)
+    except ValueError as e:
+        error(f"❌ {e}")
+        return 2
     _apply_dispatch_aliases(early_env_file_sources)
 
     # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME

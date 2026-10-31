@@ -140,8 +140,9 @@ const savedTickShadowed = ref(false)
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
 const fields = reactive({
-  model: '', harness: '', preset: '', agents: '', threads: '',
+  model: '', harness: '', preset: '', agents: '', effort: '', threads: '',
   showTranscript: false,
+  tintOperator: true,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
 })
@@ -194,6 +195,7 @@ function prefill(config) {
   // has no environment layer to shadow it, so nothing an export set can be
   // baked into the file by saving this.
   fields.showTranscript = config.chat?.show_transcript?.value === true
+  fields.tintOperator = config.chat?.tint_operator?.value !== false
   applyChatSettings(config)
   for (const spec of TICK_FIELDS) {
     const stored = config[spec.group]?.[spec.key]?.stored
@@ -229,6 +231,9 @@ function changes() {
   }
   if (fields.showTranscript !== (reply.value?.chat?.show_transcript?.value === true)) {
     named.chat_show_transcript = fields.showTranscript
+  }
+  if (fields.tintOperator !== (reply.value?.chat?.tint_operator?.value !== false)) {
+    named.chat_tint_operator = fields.tintOperator
   }
   for (const spec of TICK_FIELDS) {
     const stored = reply.value?.[spec.group]?.[spec.key]?.stored ?? null
@@ -276,7 +281,7 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = changed.includes('chat_show_transcript')
+    savedDisplay.value = changed.includes('chat_show_transcript') || changed.includes('chat_tint_operator')
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -434,6 +439,21 @@ onBeforeUnmount(() => {
                 Off, the chat is the conversation only: your messages, and what {{ assistantName }}
                 posted, asked and answered. On, its tool calls, watch events, hook
                 re-prompts and unposted working notes appear muted beside them.
+              </p>
+            </div>
+            <div class="settings-field">
+              <v-switch
+                v-model="fields.tintOperator"
+                class="tint-operator"
+                color="primary"
+                density="compact"
+                hide-details
+                :disabled="saving"
+                label="Tint my messages with the project color"
+              />
+              <p class="text-body-small text-medium-emphasis setting-source">
+                On, your messages in each chat take that project's hue, kept readable in
+                both color schemes. Off, they use one color everywhere.
               </p>
             </div>
           </section>
