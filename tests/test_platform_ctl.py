@@ -381,11 +381,11 @@ ROUTE_TABLE = [
      {"taskdef": "develop", "target": "issue-141",
       "title": "auth rate-limit fix"}),
     (["spawn", "review", "mr-163", "--preset", "sol", "--agents", "2",
-      "--model", "opus", "--harness", "codex", "--ports", "2",
+      "--model", "opus", "--effort", "High", "--harness", "codex", "--ports", "2",
       "--repo-url", "git@x:y.git", "--description", "the follow-up review"],
      "POST", "/api/sessions", None,
      {"taskdef": "review", "target": "mr-163", "preset": "sol", "agents": "2",
-      "model": "opus", "harness": "codex", "ports": 2,
+      "model": "opus", "effort": "high", "harness": "codex", "ports": 2,
       "repo_url": "git@x:y.git", "description": "the follow-up review"}),
     # A slot spawn names no preset: the slot supplies it (#245).
     (["spawn", "develop", "issue-245", "--slot", "webapp"],
@@ -489,6 +489,14 @@ def test_a_verb_is_one_route_and_the_arguments_it_was_given(
     assert (call.method, call.path) == (method, path)
     assert call.params == params
     assert call.body == body
+
+
+def test_spawn_refuses_an_unknown_effort_before_the_request(configured, capsys):
+    transport = Recorder()
+    with pytest.raises(SystemExit):
+        ctl.main(["spawn", "develop", "issue-1", "--effort", "turbo"], transport=transport)
+    assert transport.calls == []
+    assert "turbo" in capsys.readouterr().err
 
 
 def test_every_route_this_cli_names_is_served_by_the_app(client):

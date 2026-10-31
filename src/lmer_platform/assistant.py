@@ -830,7 +830,7 @@ class AssistantStatus:
     #: answer an assistant can fetch.
     nudged_at: Optional[str] = None
     log_path: Optional[str] = None
-    #: What the *running* incarnation was actually launched with — the four
+    #: What the *running* incarnation was actually launched with — the
     #: launch settings (issue #234), read off its registry entry, where the
     #: spawn recorded what it emitted. ``None`` when nothing is running, and
     #: distinct on purpose from what :func:`lmer_platform.config.assistant_settings`
@@ -1543,7 +1543,7 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
 
     Two validation postures over ONE rule set
     (:func:`lmer_platform.config._unusable_reason` — shape rules mirroring what
-    ``spawn.SpawnRequest.validate`` enforces for these four fields), matching
+    ``spawn.SpawnRequest.validate`` enforces for these fields), matching
     who is asking. A value that arrived through the standing layers has already
     fallen back with a warning when unusable (inside
     :func:`lmer_platform.config.assistant_settings`) — a typo in a file must
@@ -1858,7 +1858,7 @@ def start(
             target=TARGET,
             targets=launch["threads"],
             no_repo=True,
-            # The four launch settings travel as the typed fields the platform
+            # The launch settings travel as the typed fields the platform
             # already emits as its own flags for workers — never appended to
             # extra_args, where a later spelling would win over the recorded
             # one (spawn._RESERVED_ARGS refuses exactly that).
@@ -1866,6 +1866,7 @@ def start(
             agents=launch["agents"],
             harness=launch["harness"],
             model=launch["model"],
+            effort=launch["effort"],
             extra_args=("--env-file", str(env_file)) if env_file else (),
         )
         # The backstop for rule drift, not the validation path: the values

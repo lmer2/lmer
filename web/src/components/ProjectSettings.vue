@@ -32,12 +32,14 @@ const pickedColor = computed({
   get: () => projectColor(form.value.color),
   set: (hex) => { form.value.color = storedProjectColor(hex) },
 })
-// v-color-picker draws each inner array as a column: four columns of five, in palette order.
+// v-color-picker draws each inner array as a column: ten columns of two.
 const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
-  if (index % 5 === 0) rows.push([])
+  if (index % 2 === 0) rows.push([])
   rows.at(-1).push(hex)
   return rows
 }, [])
+// The canvas, sliders and HEX field: open for a color no swatch holds.
+const customColor = ref(false)
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
 const authorityLevels = [
   { value: 'none', title: 'None: its messages carry no approval' },
@@ -69,6 +71,7 @@ watch(() => props.project.id, (id) => {
   ordersError.value = null
   form.value = { name: props.project.name, color: props.project.color,
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
+  customColor.value = !Object.hasOwn(projectColors, props.project.color || 'Gray')
   readForNonce = props.focus?.nonce
   readOrders(id)
   readChannels(id)
@@ -151,7 +154,7 @@ async function archive() {
       <v-btn :loading="busy" color="primary" variant="tonal" @click="save">Save project</v-btn>
       <v-spacer /><v-btn :disabled="busy" @click="emit('close')">Close</v-btn>
     </v-card-actions>
-    <v-card-text>
+    <v-card-text class="settings-body">
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
       <v-alert v-if="ordersError" type="error" class="mb-3">{{ ordersError }}</v-alert>
 
@@ -160,15 +163,20 @@ async function archive() {
         <p class="text-body-small text-medium-emphasis mb-3">
           How the project is named and coloured everywhere, and which repositories its workers use.
         </p>
-        <div class="settings-field">
-          <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" hide-details="auto" />
+        <div class="settings-grid">
+          <div class="settings-field">
+            <v-text-field v-model="form.name" label="Project name" :disabled="busy" maxlength="120" hide-details="auto" />
+          </div>
         </div>
         <fieldset class="project-color settings-field" :disabled="busy">
           <legend class="text-body-medium mb-2">Project color
             <v-chip variant="flat" :color="pickedColor" :style="{ color: projectTextColor(pickedColor) }" size="small" class="ms-2">{{ colorName }}</v-chip>
           </legend>
           <v-color-picker v-model="pickedColor" mode="hex" :modes="['hex']" show-swatches :swatches="swatches"
-            swatches-max-height="none" :disabled="busy" elevation="0" width="100%" max-width="400" />
+            swatches-max-height="none" :hide-canvas="!customColor" :hide-sliders="!customColor" :hide-inputs="!customColor"
+            canvas-height="120" :disabled="busy" elevation="0" width="100%" max-width="360" class="project-color-picker" />
+          <v-btn variant="text" size="small" class="custom-color" :aria-expanded="customColor" :disabled="busy"
+            @click="customColor = !customColor">{{ customColor ? 'Swatches only' : 'Custom…' }}</v-btn>
         </fieldset>
         <div class="settings-field">
           <v-textarea v-model="form.repositories" label="Repositories" :disabled="busy" rows="2" auto-grow
@@ -196,9 +204,11 @@ async function archive() {
         <p class="text-body-small text-medium-emphasis mb-3">
           Applies at the next start or rotation. Empty fields inherit the platform defaults.
         </p>
-        <div v-for="key in LAUNCH_SETTING_KEYS" :key="key" class="settings-field">
-          <v-text-field v-model="form.settings[key]" :label="LAUNCH_SETTING_LABELS[key]" :hint="LAUNCH_SETTING_HINTS[key]"
-            persistent-hint :disabled="busy" />
+        <div class="settings-grid">
+          <div v-for="key in LAUNCH_SETTING_KEYS" :key="key" class="settings-field">
+            <v-text-field v-model="form.settings[key]" :label="LAUNCH_SETTING_LABELS[key]" :hint="LAUNCH_SETTING_HINTS[key]"
+              persistent-hint :disabled="busy" />
+          </div>
         </div>
         <div class="settings-field">
           <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy"
@@ -263,7 +273,15 @@ async function archive() {
 
 <style scoped>
 .project-settings { overflow: visible; }
-.project-color { border: 0; padding: 0; min-width: 0; }
+.settings-body { container-type: inline-size; }
+/* Two columns for short values once the dialog has room for them, in DOM order so
+   keyboard order is reading order; long fields and switches stay outside the grid. */
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 16px; }
+@container (min-width: 560px) {
+  .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.project-color { border: 0; padding: 0; min-width: 0; text-align: center; }
+.project-color-picker { margin-inline: auto; }
 .project-color legend { display: flex; align-items: center; flex-wrap: wrap; padding: 0; }
 .project-actions { position: sticky; top: var(--v-layout-top, 64px); z-index: 1; flex-wrap: wrap; background: rgb(var(--v-theme-surface)); }
 </style>

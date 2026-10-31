@@ -275,15 +275,11 @@ ENV_STALL_BACKSTOP_SECONDS = "LMER_PLATFORM_STALL_BACKSTOP_SECONDS"
 ENV_STUCK_TEARDOWN_SECONDS = "LMER_PLATFORM_STUCK_TEARDOWN_SECONDS"
 
 #: How the orchestrating assistant's session is *run*, per platform instance
-#: (issue #234): the model, harness, preset and agents fan-out its ``lmer``
-#: invocation is given. Exactly the four launch facts a worker spawn already
-#: takes (:class:`lmer_platform.spawn.SpawnRequest`), because they are the four
-#: that travel as flags — a flag beats the container's environment and a
-#: preset's env, so what is configured here is what actually runs. Reasoning
-#: effort is deliberately NOT among them: ``lmer`` has no effort flag, the
-#: variable would have to ride ``--env-file``, and ``--env-file`` values lose
-#: to the daemon's own exported environment — a setting that can be silently
-#: shadowed is the failure mode this surface exists to avoid.
+#: (issue #234): the model, reasoning effort, harness, preset and agents fan-out
+#: its ``lmer`` invocation is given. Exactly the launch facts a worker spawn
+#: also takes (:class:`lmer_platform.spawn.SpawnRequest`), because they travel
+#: as flags (effort as ``--effort``) — a flag beats the container's environment
+#: and a preset's env, so what is configured here is what actually runs.
 #:
 #: Each defaults to ``None`` — today's behaviour, the session running whatever
 #: its environment and harness settle on — and resolves by the module's usual
@@ -291,6 +287,7 @@ ENV_STUCK_TEARDOWN_SECONDS = "LMER_PLATFORM_STUCK_TEARDOWN_SECONDS"
 #: ``assistant_model``): one vocabulary for the routes, the resolver and the
 #: spawn fields they end up in.
 ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
+ENV_ASSISTANT_EFFORT = "LMER_PLATFORM_ASSISTANT_EFFORT"
 ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
@@ -303,7 +300,7 @@ ENV_ASSISTANT_NAME = ASSISTANT_NAME_ENV
 #: coordinates workers rather than running their test suites, so it has no use
 #: for whatever the worker defaults happen to be — and worker defaults move.
 #:
-#: Deliberately NOT in :data:`ASSISTANT_SETTING_KEYS`: those four are persisted
+#: Deliberately NOT in :data:`ASSISTANT_SETTING_KEYS`: those are persisted
 #: in ``config.json`` and writable through ``POST /api/assistant/config``, while
 #: these resolve from the daemon's environment only and are reported read-only
 #: (the operator's call on this issue). They still travel as flags —
@@ -325,7 +322,7 @@ ASSISTANT_RESOURCE_KEYS = {
 #: The check-in window, per platform instance (issue #244) — how often to sweep
 #: what has gone quiet is a property of a host's fleet, not of a build.
 #:
-#: Deliberately **not** in :data:`ASSISTANT_SETTING_KEYS`: those four become argv
+#: Deliberately **not** in :data:`ASSISTANT_SETTING_KEYS`: those become argv
 #: tokens and are validated as such, while this is an integer the daemon reads on
 #: its own tick and hands to nobody. Served beside them in its own group, so one
 #: settings surface covers both without pretending they are one kind of thing.
@@ -538,6 +535,7 @@ INT_SETTINGS = {
 #: derives its accepted keys from this table as it does from that one.
 BOOL_SETTINGS = {
     "chat_show_transcript": False,
+    "chat_tint_operator": True,
 }
 
 #: setting key -> (PlatformConfig field, optional env var). The one table the loader,
@@ -545,6 +543,7 @@ BOOL_SETTINGS = {
 #: exactly one place. Threads have no environment layer.
 ASSISTANT_SETTING_KEYS = {
     "model": ("assistant_model", ENV_ASSISTANT_MODEL),
+    "effort": ("assistant_effort", ENV_ASSISTANT_EFFORT),
     "harness": ("assistant_harness", ENV_ASSISTANT_HARNESS),
     "preset": ("assistant_preset", ENV_ASSISTANT_PRESET),
     "agents": ("assistant_agents", ENV_ASSISTANT_AGENTS),
@@ -641,6 +640,8 @@ class PlatformConfig:
     #: would be a second, staler opinion (the same stance
     #: :class:`lmer_platform.spawn.SpawnRequest` takes).
     assistant_model: Optional[str] = None
+    #: Unlike the model, a closed vocabulary (:data:`lmer_cli.harness.EFFORT_LEVELS`).
+    assistant_effort: Optional[str] = None
     assistant_harness: Optional[str] = None
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
@@ -660,6 +661,9 @@ class PlatformConfig:
     #: display setting like ``dock_keep_last_notes``: no env var, read on config
     #: refresh.
     chat_show_transcript: bool = False
+    #: Whether the operator's chat bubbles take their project's hue (issue #646).
+    #: A display setting like ``chat_show_transcript``.
+    chat_tint_operator: bool = True
     #: Visual graph groups; read fresh for UI requests, independent of run ownership.
     fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
@@ -681,7 +685,7 @@ class PlatformConfig:
     slots: tuple = ()
     #: How long a run may go unchecked before the daemon spools a digest naming
     #: it (issue #244), in seconds. ``0`` disables check-in digests; see
-    #: :data:`ENV_CHECKIN_WINDOW` for why this sits apart from the four above.
+    #: :data:`ENV_CHECKIN_WINDOW` for why this sits apart from the launch settings above.
     checkin_window_seconds: int = DEFAULT_CHECKIN_WINDOW_SECONDS
     #: The digest nudge's interval and threshold (issue #317), in seconds and in
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
@@ -1095,7 +1099,7 @@ def _assistant_value(value: object, *, field: str) -> Optional[object]:
     which is a session the operator can be told about the typo through.
 
     "Usable" is deliberately the same set of shape rules
-    :meth:`lmer_platform.spawn.SpawnRequest.validate` enforces for these four
+    :meth:`lmer_platform.spawn.SpawnRequest.validate` enforces for these
     fields (:func:`_unusable_reason`), and this is the ONE definition of it for
     the standing layers — ``load()``, :func:`assistant_settings` and the start
     path all resolve through here. The rules living in one place is the fix for
@@ -1117,7 +1121,15 @@ def _assistant_value(value: object, *, field: str) -> Optional[object]:
             field, "<thread list>" if field == "assistant_threads" else value, reason,
         )
         return None
-    return list(value) if field == "assistant_threads" else str(value).strip()
+    return _cleaned_setting(field, value)
+
+
+def _cleaned_setting(field: str, value: object) -> object:
+    """A usable setting value in its canonical form; *field* takes either spelling."""
+    if field in ("threads", "assistant_threads"):
+        return list(value)
+    text = str(value).strip()
+    return text.lower() if field in ("effort", "assistant_effort") else text
 
 
 #: Ceiling on one launch-setting value. Names are a few dozen characters; the
@@ -1312,6 +1324,8 @@ def _unusable_reason(field: str, value: object) -> Optional[str]:
             "argv token, and an oversized one breaks the spawn itself rather "
             "than the session"
         )
+    if field in ("effort", "assistant_effort") and text.lower() not in lmer_harness.EFFORT_LEVELS:
+        return f"it is not one of {', '.join(lmer_harness.EFFORT_LEVELS)}"
     if field in ("harness", "assistant_harness"):
         return _unknown_name_reason("harness", [text])
     if field in ("preset", "assistant_preset"):
@@ -1346,7 +1360,7 @@ def validate_assistant_override(key: str, value: object) -> object:
         if key == "threads":
             raise ConfigError(f"threads is unusable: {reason}")
         raise ConfigError(f"{key} is unusable ({value!r}): {reason}")
-    return list(value) if key == "threads" else str(value).strip()
+    return _cleaned_setting(key, value)
 
 
 def load(overrides: Optional[dict] = None) -> PlatformConfig:
@@ -1636,7 +1650,8 @@ def chat_settings() -> dict:
     it is a browser display setting, and the pane re-reads it on config refresh.
     """
     return _bool_group_settings(
-        {"show_transcript": ("chat_show_transcript", None)}, group="chat",
+        {"show_transcript": ("chat_show_transcript", None), "tint_operator": ("chat_tint_operator", None)},
+        group="chat",
     )
 
 

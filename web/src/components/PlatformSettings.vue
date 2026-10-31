@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { archiveProject, fetchPlatformSettings, setPlatformSettings, fetchConversationRequests, parkConversationRequest, releaseConversationRequest } from '../api.js'
 import AssistantSettings from './AssistantSettings.vue'
 import IngressStatus from './IngressStatus.vue'
+import RotateAllAssistants from './RotateAllAssistants.vue'
 import SlotEditor from './SlotEditor.vue'
 import SlotRow from './SlotRow.vue'
 import { projectColor, projectTextColor } from '../projects.js'
@@ -178,7 +179,7 @@ async function release() {
       </div>
       <p>Projects wait in order when capacity is full. Lowering this limit keeps current assistants running. Worker capacity is separate.</p>
     </v-card-text>
-    <v-card-actions class="flex-wrap"><v-btn :loading="busy" @click="save">Save limit</v-btn><v-btn @click="defaultsOpen = true">Execution and chat defaults</v-btn></v-card-actions>
+    <v-card-actions class="flex-wrap"><v-btn :loading="busy" @click="save">Save limit</v-btn><v-btn @click="defaultsOpen = true">Execution and chat defaults</v-btn><RotateAllAssistants block /></v-card-actions>
   </v-card>
   <AssistantSettings v-model="defaultsOpen" :allow-restart="false" />
   <v-card class="dock-display mb-4" title="Operator channel dock">

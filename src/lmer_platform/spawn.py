@@ -165,7 +165,9 @@ from work_repo.utils import (
 )
 from lmer_schema.manifest import ManifestError, load_manifest
 from lmer_cli.env_sources import env_with_overrides
-from lmer_cli.harness import CODEX_SEED_ERROR_ENV, HARNESSES, known_harnesses
+from lmer_cli.harness import (
+    CODEX_SEED_ERROR_ENV, EFFORT_LEVELS, HARNESSES, REASONING_EFFORT_ENV, known_harnesses,
+)
 from lmer_cli.mounts import (
     # Imported rather than restated: credential staging (there) and the
     # session-dir acceptance rule (here) must read one literal.
@@ -292,6 +294,11 @@ AGENTS_FLAG = "--agents"
 #: still says what drove it, whenever the session settled on a name at all.
 MODEL_FLAG = "--model"
 
+#: The flag ``lmer`` takes the session's reasoning effort from, spelled by
+#: :func:`_build_command` from :attr:`SpawnRequest.effort`; host-side it becomes
+#: ``LMER_REASONING_EFFORT``, over the daemon's environment and a preset's env.
+EFFORT_FLAG = "--effort"
+
 #: The flag ``lmer`` takes the agent CLI from (``claude``, ``codex``, …), spelled
 #: by :func:`_build_command` from :attr:`SpawnRequest.harness`. Named here for the
 #: same reason as the three above: the platform emits it from a typed field and
@@ -351,7 +358,7 @@ NO_REPO_ENV = "LMER_NO_REPO"
 #: rather than a caller mistake, hence a refusal rather than a note in the docs.
 #: The first four would move, weaken or delete the control plane the session's
 #: registry entry advertises, leaving an entry that promises a session nobody can
-#: drive; the next two belong to verbs that validate before they spawn; the four
+#: drive; the next two belong to verbs that validate before they spawn; the five
 #: after those are flags this module emits itself, from typed fields, and
 #: records; the last two are the assistant's resource bounds, emitted here from
 #: the environment for one session kind.
@@ -393,11 +400,11 @@ _RESERVED_ARGS = (
     SESSION_FLAG,
     SOURCE_SESSION_FLAG,
     SOURCE_ACK_FLAG,
-    # The next four are reserved for a different reason from the rest, and it
+    # The next five are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
-    # four, from typed fields, and writes what it emitted into the registry
+    # five, from typed fields, and writes what it emitted into the registry
     # entry (``task.preset`` / ``task.agents`` / ``task.model`` /
-    # ``task.harness``).
+    # ``task.effort`` / ``task.harness``).
     # ``extra_args`` lands after them in argv and argparse is last-wins, so a
     # second spelling does not collide with the platform's — it silently beats
     # it, and the entry then names a preset the session never applied, a fan-out
@@ -418,6 +425,9 @@ _RESERVED_ARGS = (
     # codex), so text appended to a command line could change which agent CLI
     # runs a session whose entry says nothing about it.
     MODEL_FLAG,
+    # The model's case, without the self-report overwriting it: the entry
+    # records the effort the platform emitted.
+    EFFORT_FLAG,
     # ``--harness`` is the sharpest case of the recording argument, because it
     # needs no inference: ``{"harness": "claude", "extra_args": ["--harness",
     # "codex"]}`` runs codex while the entry, the fleet view and every
@@ -733,6 +743,9 @@ class SpawnRequest:
     #: its own environment, its preset or its harness settles on — and reports
     #: that back when it is a name at all (:func:`absorb_ports`).
     model: Optional[str] = None
+    #: The reasoning effort (:data:`EFFORT_FLAG`), one of
+    #: :data:`lmer_cli.harness.EFFORT_LEVELS`; ``validate`` lowercases it.
+    effort: Optional[str] = None
     ports: int = 0
     extra_args: tuple = ()
     answer: Optional[str] = None
@@ -906,6 +919,13 @@ class SpawnRequest:
             _reject_option_value(name, value)
         if request.agents is not None:
             _reject_empty_agent_selection(request.agents)
+        if request.effort is not None:
+            effort = request.effort.strip().lower() if isinstance(request.effort, str) else None
+            if effort not in EFFORT_LEVELS:
+                raise SpawnError(
+                    f"effort must be one of {', '.join(EFFORT_LEVELS)}, got {request.effort!r}"
+                )
+            request = replace(request, effort=effort)
         if request.slot is not None:
             if not isinstance(request.slot, str) or not request.slot.strip():
                 raise SpawnError(f"slot must be non-empty text, got {request.slot!r}")
@@ -1007,7 +1027,7 @@ class SpawnRequest:
 
 def _session_metadata(request: SpawnRequest) -> dict:
     """Compose platform metadata through the shared session-record policy."""
-    effort = os.environ.get("LMER_REASONING_EFFORT") or None
+    effort = request.effort or os.environ.get(REASONING_EFFORT_ENV) or None
     return session_record.compose_launch_metadata(
         request.session_metadata,
         harness=request.harness,
@@ -2870,6 +2890,8 @@ def _build_command(
         cmd += [HARNESS_FLAG, request.harness]
     if request.model:
         cmd += [MODEL_FLAG, request.model]
+    if request.effort:
+        cmd += [EFFORT_FLAG, request.effort]
     if _needs_repo_flag(request):
         # One token, like the other prose-valued flags: a URL can never be
         # read as a flag of its own.
@@ -4037,6 +4059,8 @@ def _spawn_session(
                 # this key answers "which model is driving this run" rather than
                 # only "which model was requested".
                 "model": request.model,
+                # Likewise filled from the session's report when not asked for.
+                "effort": request.effort,
                 # Recorded rather than re-derived, because the presets file is hot:
                 # a slot repointed while this session runs must not change what it
                 # is understood to be holding (issue #245).

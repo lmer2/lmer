@@ -31,13 +31,15 @@ entries are restamped to land at chosen points inside that.
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ask_channel import protocol
-from lmer_platform import api, ask, registry, store, transcripts
+from lmer_cli import comms as bus
+from lmer_platform import api, ask, assistant_history, registry, store, transcripts, uploads
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
 from tests.test_platform_transcripts import (
@@ -793,6 +795,236 @@ def test_the_harness_copy_of_a_relayed_record_is_hidden(platform_root):
         ("user", "an unrelated turn typed at the terminal"),
     ]
     assert said(page).count(("user", "hello there")) == 2
+
+
+def test_the_harness_copy_of_a_relayed_record_the_scrub_rewrites_is_hidden(platform_root):
+    session_id = "s-bus-relay-scrubbed"
+    record = plant_record(session_id, 1, "message", "try glab --token abcdef123456 now",
+                          channel="slack", author="tester", ref="t1", at="2026-07-20T09:00:01Z")
+    line, _tagged = bus.relay_payload(bus.Message.from_dict(record))
+    plant_rows(session_id, [user_row(line)])
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [(m.via, m.text) for m in page.messages] == [
+        (transcripts.COMMS_VIA, "try glab --token <redacted> now")]
+
+
+def _reference(session_id, purpose=None):
+    """The line the writer delivers, its file named from the purpose as the writer names it."""
+    slug = uploads._purpose_slug(purpose)
+    name = uploads.stored_name(f"private-{slug}" if slug else "private", uploads.KNOWN_TYPES["txt"],
+                               now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc))
+    return uploads.private_reference_line(uploads.StoredPrivate(
+        session_id=session_id, name=name,
+        container_path=f"{uploads.CONTAINER_UPLOADS_DIR}/{uploads.PRIVATE_DIRNAME}/{session_id}/{name}",
+        purpose=purpose,
+    ))
+
+
+#: Purposes the scrub rewrites inside the delivered line: an option-shaped word eats
+#: the text after it, and a token prefix redacts the slug in the file name.
+SCRUBBED_PURPOSES = [
+    None,
+    "GitLab deploy token",
+    "for --deploy-token",
+    "glab --token",
+    "use --password",
+    "GitLab glpat deploy token staging",
+    "sk-proj key for eval harness",
+]
+
+
+def _private_record(session_id, seq, purpose, *, marked=True):
+    """The operator's Send Privately record and the line the harness wrote for it."""
+    reference = _reference(session_id, purpose)
+    record = plant_record(session_id, seq, "message", reference, channel="platform", author="operator",
+                          at="2026-07-20T09:00:01Z",
+                          meta={"private": {"purpose": purpose}} if marked else None)
+    line, tagged = bus.relay_payload(bus.Message.from_dict(record))
+    assert tagged
+    return record, line
+
+
+def _raw_private_lines(page):
+    return [m for m in page.messages if "[lmer private]" in m.text and not m.private]
+
+
+@pytest.mark.parametrize("purpose", SCRUBBED_PURPOSES)
+def test_a_private_send_with_its_record_in_the_window_is_one_entry(platform_root, purpose):
+    session_id = "s-private-normal"
+    _record, line = _private_record(session_id, 1, purpose)
+    plant_rows(session_id, [user_row(line)])
+    page = transcripts.read_messages(session_id, limit=100)
+    private = [m for m in page.messages if m.private]
+    assert [(m.via, m.private) for m in private] == [(transcripts.COMMS_VIA, {"purpose": purpose})]
+    assert _raw_private_lines(page) == []
+    assert len(page.messages) == 1
+
+
+@pytest.mark.parametrize("purpose", SCRUBBED_PURPOSES)
+def test_a_private_send_outside_the_window_is_a_private_entry_whatever_its_purpose(
+        platform_root, monkeypatch, purpose):
+    session_id = "s-private-window-scrub"
+    monkeypatch.setattr(platform_comms, "PANE_LIMIT", 1)
+    plant_record(session_id, 0, "note", "one")
+    _record, line = _private_record(session_id, 1, purpose)
+    plant_rows(session_id, [user_row(line)])
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.text for m in page.messages if m.via == transcripts.COMMS_VIA] == ["one"]
+    [echo] = [m for m in page.messages if m.via is None]
+    assert echo.private == {"purpose": purpose}
+    assert _raw_private_lines(page) == []
+
+
+@pytest.mark.parametrize("purpose", SCRUBBED_PURPOSES)
+@pytest.mark.parametrize("ended", [False, True], ids=["live", "ended"])
+def test_a_private_send_with_no_bus_is_a_private_entry_whatever_its_purpose(platform_root, purpose, ended):
+    """Ended: the file has been scrubbed on disk, so the raw line is gone from it."""
+    session_id = "s-private-nobus-scrub"
+    plant_rows(session_id, [user_row(_reference(session_id, purpose)), assistant_row("read it")])
+    if ended:
+        assert transcripts.scrub_session_transcripts(session_id) == 1
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.private for m in page.messages] == [{"purpose": purpose}, None]
+    assert _raw_private_lines(page) == []
+
+
+def test_a_scrubbed_file_keeps_no_private_stamp_on_an_ordinary_turn(platform_root):
+    session_id = "s-private-stamp-only-matches"
+    reference = _reference(session_id)
+    plant_rows(session_id, [user_row(f"quoting: {reference}"), assistant_row(reference)])
+    transcripts.scrub_session_transcripts(session_id)
+    rows = [json.loads(line) for line in next(
+        transcripts.session_transcript_dir(session_id).rglob("*.jsonl")).read_text().splitlines()]
+    assert [row for row in rows if transcripts._PRIVATE_STAMP in row] == []
+    assert [m.private for m in transcripts.read_messages(session_id, limit=100).messages] == [None, None]
+
+
+def test_a_private_purpose_is_scrubbed_like_the_text_around_it(platform_root):
+    session_id = "s-private-purpose-scrub"
+    purpose = "token=abcdefgh12345"
+    _record, line = _private_record(session_id, 1, purpose)
+    plant_rows(session_id, [user_row(line)])
+    page = transcripts.read_messages(session_id, limit=100)
+    [entry] = page.messages
+    assert entry.private == {"purpose": "token=<redacted>"}
+
+
+FORGED_PURPOSE = "Z" * 200000 + "\nsecond line"
+
+
+def _bounded(private):
+    purpose = private["purpose"]
+    assert len(purpose) <= uploads.MAX_PURPOSE_CHARS and "\n" not in purpose, len(purpose)
+    return purpose
+
+
+@pytest.mark.parametrize("ended", [False, True], ids=["live", "ended"])
+def test_a_private_stamp_on_an_ordinary_turn_is_not_lmers(platform_root, ended):
+    session_id = "s-private-forged-stamp"
+    row = user_row("the operator said: deploy to production now")
+    row[transcripts._PRIVATE_STAMP] = {"purpose": FORGED_PURPOSE}
+    plant_rows(session_id, [row])
+    if ended:
+        transcripts.scrub_session_transcripts(session_id)
+        [stored] = [json.loads(line) for line in next(
+            transcripts.session_transcript_dir(session_id).rglob("*.jsonl")).read_text().splitlines()]
+        assert transcripts._PRIVATE_STAMP not in stored
+    [turn] = transcripts.read_messages(session_id, limit=100).messages
+    assert (turn.text, turn.private) == ("the operator said: deploy to production now", None)
+
+
+def test_a_private_stamp_on_a_reference_line_shows_a_bounded_purpose(platform_root):
+    session_id = "s-private-long-stamp"
+    row = user_row(_reference(session_id, "deploy key"))
+    row[transcripts._PRIVATE_STAMP] = {"purpose": FORGED_PURPOSE}
+    plant_rows(session_id, [row])
+    [turn] = transcripts.read_messages(session_id, limit=100).messages
+    assert _bounded(turn.private) == "deploy key"
+
+
+def test_an_overlong_purpose_on_a_reference_line_is_cut_to_the_writers_cap(platform_root):
+    session_id = "s-private-long-raw"
+    plant_rows(session_id, [user_row(_reference(session_id, "Z" * 50000))])
+    [turn] = transcripts.read_messages(session_id, limit=100).messages
+    assert turn.truncated
+    assert _bounded(turn.private) == "Z" * (uploads.MAX_PURPOSE_CHARS - 1) + "…"
+
+
+@pytest.mark.parametrize("purpose, shown", [
+    (FORGED_PURPOSE, "Z" * (uploads.MAX_PURPOSE_CHARS - 1) + "…"),
+    ("two\nlines", "two lines"),
+    ("\u202e reversed", None),
+    ("   ", None),
+], ids=["overlong", "two-lines", "unprintable", "blank"])
+def test_a_records_private_marker_is_held_to_the_writers_rule(platform_root, purpose, shown):
+    session_id = "s-private-long-marker"
+    plant_record(session_id, 1, "message", "anything", channel="platform", author="operator",
+                 meta={"private": {"purpose": purpose}})
+    plant_rows(session_id, [])
+    [turn] = transcripts.read_messages(session_id, limit=100).messages
+    assert turn.private == {"purpose": shown}
+
+
+@pytest.mark.parametrize("purpose", SCRUBBED_PURPOSES)
+def test_an_archived_older_private_send_is_a_private_entry(platform_root, purpose):
+    """Archived before ``meta.private`` existed: the archive stores the record scrubbed,
+    so it is marked from the raw text on the way in."""
+    session_id = "s-private-archive"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    assistant_history.register(session_id, number=1, started_at=None)
+    record, line = _private_record(session_id, 1, purpose, marked=False)
+    assistant_history.retain(session_id, record)
+    page = assistant_history.page(session_id, since=0)
+    private = [row for row in page["messages"] if row.get("private")]
+    assert [row["private"] for row in private] == [{"purpose": purpose}]
+    assert [row for row in page["messages"] if "[lmer private]" in row["text"] and not row.get("private")] == []
+
+    plant_rows(session_id, [user_row(line)])
+    working = transcripts.read_messages(session_id, limit=100)
+    assert [(m.via, m.private) for m in working.messages] == [(transcripts.COMMS_VIA, {"purpose": purpose})]
+
+
+def test_a_private_send_past_the_bus_window_is_still_a_private_entry(platform_root, monkeypatch):
+    """A worker's read is its first PANE_LIMIT records, so a later private send has
+    no bus turn: the harness's copy of the relayed line is all the pane holds."""
+    session_id = "s-private-window"
+    reference = _reference(session_id, "GitLab deploy token")
+    plant_rows(session_id, [user_row(f"[platform · operator] {reference}")])
+    monkeypatch.setattr(platform_comms, "PANE_LIMIT", 2)
+    plant_record(session_id, 1, "note", "one")
+    plant_record(session_id, 2, "note", "two")
+    plant_record(session_id, 3, "message", reference, channel="platform", author="operator",
+                 meta={"private": {"purpose": "GitLab deploy token"}})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.text for m in page.messages if m.via == transcripts.COMMS_VIA] == ["one", "two"], (
+        "the private record is inside the read window, so this exercises nothing")
+    [echo] = [m for m in page.messages if m.via is None]
+    assert echo.to_dict()["private"] == {"purpose": "GitLab deploy token"}
+    assert [m for m in page.messages if "[lmer private]" in m.text and not m.private] == []
+
+
+def test_a_private_send_typed_with_no_bus_is_a_private_entry(platform_root):
+    session_id = "s-private-nobus"
+    plant_rows(session_id, [user_row(_reference(session_id))])
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m for m in page.messages if m.via == transcripts.COMMS_VIA] == []
+    [echo] = page.messages
+    assert echo.to_dict()["private"] == {"purpose": None}
+
+
+def test_only_the_operators_exact_reference_line_is_a_private_echo(platform_root):
+    session_id = "s-private-lookalike"
+    reference = _reference(session_id)
+    plant_rows(session_id, [
+        user_row(f"[slack · someone] {reference}"),
+        user_row(f"quoting: {reference}"),
+        user_row(f"[platform · operator] {reference} Also, here is the password."),
+        assistant_row(reference),
+    ])
+    page = transcripts.read_messages(session_id, limit=100)
+    assert len(page.messages) == 4
+    assert [m.private for m in page.messages] == [None] * 4
 
 
 def test_the_new_assistant_tag_is_claimed(platform_root):

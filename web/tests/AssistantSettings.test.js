@@ -2,18 +2,19 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AssistantSettings from '../src/components/AssistantSettings.vue'
 import { fetchAssistantConfig, setAssistantConfig } from '../src/api.js'
-import { chatShowTranscript, applyChatSettings } from '../src/operatorChat.js'
+import { chatShowTranscript, chatTintOperator, applyChatSettings } from '../src/operatorChat.js'
 import { mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ fetchAssistantConfig: vi.fn(), setAssistantConfig: vi.fn() }))
-const config = (changed = [], shown = false) => ({
-  settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'threads'].map((key) => [
+const config = (changed = [], shown = false, tint = undefined) => ({
+  settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'effort', 'threads'].map((key) => [
     key, { value: null, stored: null, source: 'default' },
   ])),
   chat: {
     show_transcript: {
       value: shown, stored: shown ? true : null, source: shown ? 'config.json' : 'default',
     },
+    ...(tint === undefined ? {} : { tint_operator: { value: tint, stored: tint, source: 'config.json' } }),
   },
   changed,
 })
@@ -31,7 +32,7 @@ beforeEach(() => {
   applyChatSettings(config())
   fetchAssistantConfig.mockResolvedValue(config())
   setAssistantConfig.mockImplementation(async (named) => config(
-    Object.keys(named), named.chat_show_transcript ?? false,
+    Object.keys(named), named.chat_show_transcript ?? false, named.chat_tint_operator,
   ))
 })
 
@@ -150,4 +151,27 @@ it('says off, not zero seconds, for a reminder whose 0 is its off switch', async
   expect(lines).toContain('In effect now: 1 second (from config.json)')
   expect(lines).toContain('In effect now: 1 digest (from default)')
   expect(lines.some((line) => line.includes('0 seconds'))).toBe(false)
+})
+
+// Issue 646 item 9: the project tint is on unless the platform stores false.
+const tintSwitch = () => [...document.querySelectorAll('.v-dialog .tint-operator')][0]?.querySelector('input')
+
+it('tints by default and turning it off stores an explicit false that applies at once', async () => {
+  await open()
+  expect(chatTintOperator.value).toBe(true)
+  const input = tintSwitch()
+  expect(input.checked).toBe(true)
+  input.click()
+  await flushPromises()
+  button('save').click()
+  await flushPromises()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_tint_operator: false })
+  expect(chatTintOperator.value).toBe(false)
+  expect(document.body.textContent).toContain('applies now')
+})
+
+it('offers the launch effort beside the other launch settings', async () => {
+  await open()
+  const labels = [...document.querySelectorAll('.v-dialog .v-text-field label')].map((node) => node.textContent.trim())
+  expect(labels).toContain('Reasoning effort')
 })

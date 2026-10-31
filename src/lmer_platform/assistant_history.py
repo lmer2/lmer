@@ -175,7 +175,7 @@ def remember(state) -> dict | None:
 def retain(session_id: str, message: dict) -> None:
     """Only already-public communication records enter this archive."""
     # deferred: cycle — lmer_platform.transcripts imports this module at top (via lmer_platform.projects)
-    from .transcripts import _scrub_decoded
+    from .transcripts import _private_marked, _scrub_decoded
 
     registry.session_path(session_id)
     if not message.get("text") and message.get("kind") != "close":
@@ -183,7 +183,7 @@ def retain(session_id: str, message: dict) -> None:
     identifier = message.get("id")
     if not isinstance(identifier, str) or not identifier:
         raise StoreError("assistant communication has no stable message id")
-    payload = json.dumps(_scrub_decoded(message), ensure_ascii=False)
+    payload = json.dumps(_scrub_decoded(_private_marked(message)), ensure_ascii=False)
     with _database(session_id) as db:
         db.execute(
             "INSERT OR IGNORE INTO records (session, message_id, payload) VALUES (?, ?, ?)",

@@ -106,6 +106,16 @@ DEFAULT_HARNESS = "claude"
 #: :attr:`ExecProfile.effort_max_value`; ``auto``/unset emit no flag).
 EXEC_EFFORT_TIERS = ("low", "medium", "high", "xhigh")
 
+#: Every reasoning-effort level a launch may name (``lmer --effort``, the
+#: platform's assistant setting and spawn field) — :func:`map_exec_effort`'s
+#: accepted set.
+EFFORT_LEVELS = EXEC_EFFORT_TIERS + ("max", "auto")
+
+#: The session's reasoning effort. Set by ``lmer --effort`` the way
+#: :data:`LLM_NAME_ENV` is set by ``--model``: the flag wins over an exported
+#: value and a preset's env.
+REASONING_EFFORT_ENV = "LMER_REASONING_EFFORT"
+
 #: Start instruction injected for harnesses that have no native ``/start``
 #: slash command. The text is typed into the TUI by the supervisor exactly like
 #: a human prompt; the hook it references prints the task instructions.
@@ -617,7 +627,7 @@ def map_exec_effort(
         return tier, None
     return None, (
         f"Ignoring reasoning effort {effort!r} "
-        "(expected: low|medium|high|xhigh|max|auto)"
+        f"(expected: {'|'.join(EFFORT_LEVELS)})"
     )
 
 

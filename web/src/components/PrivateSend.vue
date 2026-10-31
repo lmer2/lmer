@@ -13,12 +13,15 @@ const props = defineProps({
   sendPaused: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close', 'sent'])
+// uploads.MAX_PURPOSE_CHARS; the server refuses a longer one.
+const MAX_PURPOSE_CHARS = 80
 
 // The session this editor was opened for. The pane can switch runs, or the
 // assistant rotate, underneath an open dialog; nothing is ever delivered anywhere
 // but here, and nothing is started once either has happened.
 const target = props.sessionId
 const text = ref('')
+const purpose = ref('')
 const busy = ref(false)
 const problem = ref(null)
 let closed = false
@@ -34,6 +37,7 @@ function moved() {
 function close(reason = null) {
   closed = true
   text.value = ''
+  purpose.value = ''
   emit('close', reason)
 }
 
@@ -66,9 +70,12 @@ async function submit() {
   problem.value = null
   let stored = null
   try {
-    stored = await sendPrivately(target, { text: value, workspaceId: props.workspaceId })
+    stored = await sendPrivately(target, { text: value, purpose: purpose.value.trim(), workspaceId: props.workspaceId })
     if (moved()) throw new Error('the conversation changed before it was delivered')
-    await sendSessionInput(target, stored.reference, { sanitize: true, workspaceId: props.workspaceId })
+    // `meta.private` is what history draws as a compact entry instead of this line.
+    await sendSessionInput(target, stored.reference, {
+      sanitize: true, workspaceId: props.workspaceId, meta: { private: { purpose: stored.purpose ?? null } },
+    })
     if (moved()) {
       if (!closed) close(delivered())
       return
@@ -102,8 +109,8 @@ async function submit() {
       <v-card-text>
         <p class="text-body-small mb-3">
           For a secret or other private text. The run receives it as a read-only
-          file, and the chat shows only that file's path. It is deleted when the
-          session ends. The agent is asked to use it in place and never print it,
+          file, and the chat shows only that a private message was sent. It is
+          deleted when the session ends. The agent is asked to use it in place and never print it,
           because anything it prints is recorded in its transcript.
         </p>
         <v-textarea
@@ -121,6 +128,16 @@ async function submit() {
           hide-details
           @keydown.ctrl.enter.prevent="submit"
           @keydown.meta.enter.prevent="submit"
+        />
+        <v-text-field
+          v-model="purpose"
+          :disabled="busy"
+          class="private-purpose mt-3"
+          label="purpose (optional)"
+          :maxlength="MAX_PURPOSE_CHARS"
+          persistent-hint
+          hint="Not secret: shown in the chat and to the agent, for example “GitLab deploy token”."
+          @keydown.enter.prevent="submit"
         />
         <v-alert v-if="problem" type="error" density="compact" class="mt-3" role="alert">
           {{ problem }}

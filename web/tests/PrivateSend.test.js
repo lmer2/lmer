@@ -47,7 +47,7 @@ async function mountChat(props = {}) {
 }
 
 function control() {
-  return wrapper.get('[aria-label="send privately: text the run can use, kept out of the chat"]')
+  return wrapper.get('[aria-label="Send privately"]')
 }
 
 function editor() {
@@ -74,12 +74,17 @@ function everythingSent() {
   ])
 }
 
-it('sits in the send row beside attach, labelled and thumb sized', async () => {
+it('sits in the send row beside attach, the same size and style, with a short label', async () => {
   await mountChat()
   const row = wrapper.get('.send-row')
-  const labels = row.findAll('.v-btn').map(node => node.text())
-  expect(labels.slice(0, 2)).toEqual(['attach', 'send privately'])
-  expect(control().classes()).toContain('v-btn--size-large')
+  const buttons = row.findAll('.v-btn')
+  expect(buttons.slice(0, 2).map(node => node.text())).toEqual(['attach', 'private'])
+  const [attach, privately] = buttons.map(node => node.classes())
+  for (const kind of ['v-btn--size-large', 'v-btn--variant-tonal']) {
+    expect(attach).toContain(kind)
+    expect(privately).toContain(kind)
+  }
+  expect(control().get('.private-label').text()).toBe('private')
 })
 
 it('sends the text to the private route and only the reference to the session', async () => {
@@ -87,8 +92,10 @@ it('sends the text to the private route and only the reference to the session', 
   await openAndType(`line one\npassword ${MARKER} ✓`)
   button('send privately').click()
   await settle()
-  expect(sendPrivately).toHaveBeenCalledWith('s-1', { text: `line one\npassword ${MARKER} ✓`, workspaceId: 'general' })
-  expect(sendSessionInput).toHaveBeenCalledWith('s-1', REFERENCE, { sanitize: true, workspaceId: 'general' })
+  expect(sendPrivately).toHaveBeenCalledWith('s-1', { text: `line one\npassword ${MARKER} ✓`, purpose: '', workspaceId: 'general' })
+  expect(sendSessionInput).toHaveBeenCalledWith('s-1', REFERENCE, {
+    sanitize: true, workspaceId: 'general', meta: { private: { purpose: null } },
+  })
   expect(everythingSent()).not.toContain(MARKER)
   expect(editor()).toBeNull()
   expect(wrapper.text()).not.toContain(MARKER)
@@ -121,7 +128,7 @@ it('a failed store keeps the text for retry, says so without quoting it, and ret
   await openAndType(MARKER)
   button('send privately').click()
   await settle()
-  const alert = document.querySelector('.private-send [role="alert"]')
+  const alert = document.querySelector('.private-send .v-alert[role="alert"]')
   expect(alert.textContent).toContain('not sent')
   expect(alert.textContent).not.toContain(MARKER)
   expect(editor().value).toBe(MARKER)
@@ -175,7 +182,9 @@ it('a switch while the reference is in flight says it was delivered, not that no
   await openAndType(MARKER)
   button('send privately').click()
   await flushPromises()
-  expect(sendSessionInput).toHaveBeenCalledWith('s-1', REFERENCE, { sanitize: true, workspaceId: undefined })
+  expect(sendSessionInput).toHaveBeenCalledWith('s-1', REFERENCE, {
+    sanitize: true, workspaceId: undefined, meta: { private: { purpose: null } },
+  })
   await wrapper.setProps({ sessionId: 's-2' })
   await settle()
   // The outcome is not known yet, so nothing is claimed about it.
@@ -259,4 +268,24 @@ it('the rotation notice outlives polls and the new generation, and goes only whe
   } finally {
     vi.useRealTimers()
   }
+})
+
+it('sends the purpose with the text and marks the delivered record private', async () => {
+  sendPrivately.mockResolvedValue({
+    session: 's-1', name: '20261028-120000-private-gitlab-deploy-token.txt', container_path: '/x',
+    purpose: 'GitLab deploy token', reference: REFERENCE,
+  })
+  await mountChat()
+  await openAndType(MARKER)
+  const purpose = document.querySelector('.private-purpose input')
+  purpose.value = '  GitLab deploy token '
+  purpose.dispatchEvent(new Event('input'))
+  await flushPromises()
+  expect(document.querySelector('.private-send').textContent).toContain('Not secret')
+  button('send privately').click()
+  await settle()
+  expect(sendPrivately).toHaveBeenCalledWith('s-1', { text: MARKER, purpose: 'GitLab deploy token', workspaceId: undefined })
+  expect(sendSessionInput).toHaveBeenCalledWith('s-1', REFERENCE, {
+    sanitize: true, workspaceId: undefined, meta: { private: { purpose: 'GitLab deploy token' } },
+  })
 })

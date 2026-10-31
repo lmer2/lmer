@@ -428,8 +428,9 @@ A preset replaces every default-tier key it supplies, including values the
 platform already loaded from its host `.env`. It does not replace a real export:
 `export LMER_REASONING_EFFORT=low` still wins over a preset's `xhigh`, and
 `export LMER_LLM_NAME=sonnet` still wins over a preset's `opus`. Explicit flags,
-such as `--model`, remain highest priority. The platform currently has no
-per-spawn effort field (#354); this change adds no effort levels or defaults.
+such as `--model` and `--effort`, remain highest priority. On the platform, a
+spawn's `effort` field and the assistant's `effort` setting are emitted as
+`--effort`, so they beat both a preset's `env` and the daemon's exports.
 
 The daemon records which values its file loader supplied in internal
 `LMER_PLATFORM_ENV_DEFAULTS` metadata and carries it to the child launcher.

@@ -9,6 +9,9 @@ export const dockKeepLastNotes = ref(null)
 // conversation (issue 488). Platform-side like `dockKeepLastNotes`, so it survives
 // browsers; only an explicit `true` turns it on.
 export const chatShowTranscript = ref(false)
+// Whether the operator's bubbles take the project's hue (issue 646). On unless
+// the platform says an explicit `false`.
+export const chatTintOperator = ref(true)
 export const chatConfigProblem = ref(null)
 const readEntries = new Map()
 let configGeneration = 0
@@ -18,6 +21,7 @@ export function applyChatSettings(config) {
   const value = config.dock?.keep_last_notes?.value ?? null
   dockKeepLastNotes.value = Number.isSafeInteger(value) && value >= 0 ? value : null
   chatShowTranscript.value = config.chat?.show_transcript?.value === true
+  chatTintOperator.value = config.chat?.tint_operator?.value !== false
   chatConfigProblem.value = null
 }
 

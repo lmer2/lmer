@@ -6,7 +6,7 @@ import PlatformSettings from '../src/components/PlatformSettings.vue'
 import Chat from '../src/components/Chat.vue'
 import RunDetail from '../src/components/RunDetail.vue'
 import RunNav from '../src/components/RunNav.vue'
-import { contrastRatio, projectColor, projectColors, projectTextColor, storedProjectColor } from '../src/projects.js'
+import { blend, contrastRatio, operatorGround, projectColor, projectColors, projectTextColor, storedProjectColor } from '../src/projects.js'
 import RunCard from '../src/components/RunCard.vue'
 import ProjectNav from '../src/components/ProjectNav.vue'
 import ProjectSettings from '../src/components/ProjectSettings.vue'
@@ -342,6 +342,66 @@ it('saves a custom hex from the picker and keeps a preset stored by name', async
   await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
   await flushPromises()
   expect(api.updateProject.mock.calls.at(-1)[1].color).toBe('Teal')
+})
+
+// Issue 646 item 9. The ink and emphasis values are what this Vuetify draws: on-surface
+// is black on the light scheme's white surface and white on the dark one, the header
+// is medium emphasis and the body high emphasis.
+const THEMES = {
+  light: { dark: false, ink: '#000', emphasis: [0.87, 0.6] },
+  dark: { dark: true, ink: '#FFF', emphasis: [1, 0.7] },
+}
+const CUSTOM = ['#ffffff', '#f0f8ff', '#ffff00', '#00ff00', '#ff00ff', '#0000ff', '#1a1a40', '#000000']
+
+it.each(Object.keys(THEMES))('tints the operator ground in each project hue and keeps %s ink at AA', (scheme) => {
+  const theme = THEMES[scheme]
+  for (const color of [...Object.keys(projectColors), ...CUSTOM]) {
+    const ground = operatorGround(color, theme)
+    expect(ground, color).toMatch(/^#[0-9a-f]{6}$/)
+    for (const alpha of theme.emphasis) {
+      expect(contrastRatio(blend(theme.ink, alpha, ground), ground), `${color} at ${alpha}`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+  // A tint, not the search's last resort, and different projects get different ones.
+  for (const color of Object.keys(projectColors)) expect(operatorGround(color, theme), color).not.toMatch(/^#(000000|ffffff)$/)
+  expect(operatorGround('Red', theme)).not.toBe(operatorGround('Teal', theme))
+})
+
+it('blends ink at an opacity onto its ground', () => {
+  expect(blend('#000000', 0.6, '#ffffff')).toBe('#666666')
+  expect(blend('#ffffff', 1, '#123456')).toBe('#ffffff')
+  expect(blend('#FFF', 0.5, '#000000')).toBe(blend('#ffffff', 0.5, '#000000'))
+  // No emphasis given checks full-strength ink rather than nothing.
+  for (const scheme of [{ dark: false, ink: '#ffffff' }, { dark: true, ink: '#000' }]) {
+    expect(operatorGround('#ffff00', { ...scheme, emphasis: [] })).toBe(operatorGround('#ffff00', { ...scheme, emphasis: [1] }))
+  }
+})
+
+it('keeps the color swatches first and the canvas behind Custom…, opening it for a custom hex', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[1], color: 'Blue', repositories: [], settings: {} } })
+  await flushPromises()
+  const picker = wrapper.getComponent({ name: 'VColorPicker' })
+  expect([picker.props('hideCanvas'), picker.props('hideSliders'), picker.props('hideInputs')]).toEqual([true, true, true])
+  const toggle = wrapper.get('.custom-color')
+  expect(toggle.attributes('aria-expanded')).toBe('false')
+  await toggle.trigger('click')
+  expect(picker.props('hideCanvas')).toBe(false)
+  expect(toggle.attributes('aria-expanded')).toBe('true')
+  const custom = mountPane(ProjectSettings, { project: { ...projects[1], color: '#ff69b4', repositories: [], settings: {} } })
+  await flushPromises()
+  expect(custom.getComponent({ name: 'VColorPicker' }).props('hideCanvas')).toBe(false)
+  for (const mounted of [wrapper, custom]) mounted.unmount()
+})
+
+it('lays the short execution fields out in a grid in reading order, effort included', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const execution = wrapper.findAll('section.settings-group')[2]
+  const grid = execution.get('.settings-grid')
+  expect(grid.findAll('.v-field-label, label.v-label').map(node => node.text()).filter((t, i, all) => all.indexOf(t) === i))
+    .toEqual(['Model', 'Harness', 'Preset', 'Fan-out presets', 'Reasoning effort'])
+  expect(grid.text()).not.toContain('Project thread connections')
+  wrapper.unmount()
 })
 
 it.each(['toolbar', 'attention card', 'calm card'])('binds a closed drawer to the selected project when reopening from %s', async shortcut => {
