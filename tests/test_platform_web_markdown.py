@@ -119,12 +119,19 @@ def _render_path():
     return text[start:end]
 
 
-def _probe(body):
+def _probe(body, *, dom=False):
     """Run *body* under Node with the component's real render path in scope.
 
     The two packages are imported by their bare names and the process runs from
     ``web/``, so Node resolves them out of the same ``node_modules`` the bundle is
     built from — not a copy that could be a different version.
+
+    *dom* gives the probe a jsdom window. Without one DOMPurify reports itself
+    unsupported and ``renderMarkdown`` takes its escape-everything fallback, so
+    anything about the *sanitised* path — the caches keyed before it, above all —
+    can only be exercised with a DOM present. DOMPurify reads ``window`` once, when
+    its module is evaluated, so a DOM-backed probe creates the window before a
+    dynamic import rather than relying on the static imports below.
 
     What happens when there is no toolchain is :func:`require_node_toolchain`'s
     decision, not this function's: on a host that says it has Node the absence is
@@ -139,13 +146,28 @@ def _probe(body):
             "web dependencies are not installed (run `npm ci` in web/)"
         )
 
+    if dom:
+        imports = [
+            "import assert from 'node:assert/strict'",
+            "import { JSDOM } from 'jsdom'",
+            "const jsdom = new JSDOM('<!doctype html><html><body></body></html>')",
+            "globalThis.window = jsdom.window",
+            "globalThis.document = jsdom.window.document",
+            "const { default: MarkdownIt } = await import('markdown-it')",
+            "const { default: DOMPurify } = await import('dompurify')",
+            "const { RUN_REF_RE } = await import('./src/runref.js')",
+        ]
+    else:
+        imports = [
+            "import MarkdownIt from 'markdown-it'",
+            "import DOMPurify from 'dompurify'",
+            "import assert from 'node:assert/strict'",
+            # The render path imports the run-reference shape from the module that
+            # owns it (issue #241), so the probe resolves it from the real file too.
+            "import { RUN_REF_RE } from './src/runref.js'",
+        ]
     script = "\n".join([
-        "import MarkdownIt from 'markdown-it'",
-        "import DOMPurify from 'dompurify'",
-        "import assert from 'node:assert/strict'",
-        # The render path imports the run-reference shape from the module that
-        # owns it (issue #241), so the probe resolves it from the real file too.
-        "import { RUN_REF_RE } from './src/runref.js'",
+        "\n".join(imports),
         _render_path(),
         body,
         "console.log('probe ok')",
@@ -188,6 +210,19 @@ HOSTILE = [
     "[click](lmer://run/h/p/s/../../etc/passwd)",
     "[click](lmer:javascript:alert(1))",
     "[click](lmerx://run/h/p/s)",
+]
+
+# One run's file list as ``GET /api/runs/files`` answers it (issue #616). The
+# middle entry is the operator's own example; the third is a file the daemon could
+# not link, which has to stay a name rather than become an anchor.
+RUN_FILES = [
+    {
+        "name": "operator-test-checklist-96ffde6e.md",
+        "url": "https://forge.example/w/-/blob/main/runs/x/"
+               "operator-test-checklist-96ffde6e.md",
+    },
+    {"name": "plan.md", "url": "https://forge.example/w/-/blob/main/runs/x/plan.md"},
+    {"name": "no-url.md", "url": ""},
 ]
 
 # Tag names that must never appear as tags, whatever else changes. The tag
@@ -430,6 +465,126 @@ def test_a_link_the_agent_wrote_can_only_be_http_https_or_mailto():
         "}",
     ])
     _probe(body)
+
+
+def test_a_bare_filename_never_becomes_a_hostname():
+    """Issue #616, part 1: linkify's fuzzy mode read files as country TLDs.
+
+    ``.md`` is Moldova, ``.py`` Paraguay, ``.sh`` Saint Helena, ``.rs`` Serbia,
+    ``.ai`` Anguilla — so an agent's filename became ``http://<filename>``, which
+    passed the scheme allowlist and went nowhere. A link now needs an explicit
+    scheme or an email address, and an unknown filename stays the text it was.
+    """
+    body = "\n".join([
+        "const plain = ['foo.md', 'plan.py', 'x.sh', 'notes.rs', 'a.ai',",
+        "               'see plan.md.']",
+        "for (const source of plain) {",
+        "  const html = markdown.render(source)",
+        "  assert.ok(!html.includes('<a'), `${source} -> ${html}`)",
+        "  assert.ok(!html.includes('href'), `${source} -> ${html}`)",
+        "}",
+        "for (const source of ['https://example.com/x', 'http://example.com',",
+        "                      'mailto:someone@example.com']) {",
+        "  assert.match(markdown.render(source), /<a /, `${source} did not link`)",
+        "}",
+        # Named because it is the one convenience the switch takes with it: the
+        # issue expected `www.` to keep linking, and linkify-it has no www-only
+        # option, so the operator chose to drop it rather than add a second rule.
+        "assert.ok(!markdown.render('www.example.com').includes('href'),",
+        "  'www. still fuzzy-links')",
+    ])
+    _probe(body)
+    assert "markdown.linkify.set({ fuzzyLink: false })" in _render_path(), (
+        "fuzzy linking is back on, so any filename with a country-code extension "
+        "is a fake hostname again"
+    )
+
+
+def test_a_run_file_name_links_to_the_url_the_daemon_gave():
+    """Issue #616, part 2: the mention is a reference to the run's own file.
+
+    The rule runs over the parser's token stream, so it is exercised through
+    ``markdown.render`` rather than ``renderMarkdown`` — the latter takes the
+    escape-everything fallback in Node, where there is no DOM to sanitise in.
+    """
+    body = "\n".join([
+        f"const files = {json.dumps(RUN_FILES)}",
+        "const render = (text, list) => markdown.render(text, { runFiles: fileLookup(list) })",
+        "const checklist = files[0]",
+        "const html = render('ready per ' + checklist.name, files)",
+        "assert.match(html, new RegExp(`href=\"${checklist.url}\"`), html)",
+        "assert.match(html, new RegExp(`>${checklist.name}<`), html)",
+        # A forge URL is external, so it gets the same opener protection as any
+        # other link the agent wrote.
+        "assert.match(html, /target=\"_blank\"/, html)",
+        "assert.match(html, /rel=\"noopener noreferrer\"/, html)",
+        # Only a name in the list: guessing is how the original bug happened.
+        "assert.ok(!render('notes.md', files).includes('<a'), 'an unknown name linked')",
+        # A file the daemon could not link is a name, not an anchor.
+        "assert.ok(!render('no-url.md', files).includes('<a'), 'an unlinked file linked')",
+        # Code is code, and an existing link's label is not a second link.
+        "assert.ok(!render('`plan.md`', files).includes('<a'), 'a code span linked')",
+        "assert.ok(!render('```\\nplan.md\\n```', files).includes('<a'), 'a fence linked')",
+        "const linked = render('[plan.md](https://elsewhere.example/x)', files)",
+        "assert.equal((linked.match(/<a /g) || []).length, 1, linked)",
+        # Not the front of a longer name, and not a path segment.
+        "for (const source of ['plan.md.bak', 'runs/plan.md']) {",
+        "  assert.ok(!render(source, files).includes('<a'), `${source} linked`)",
+        "}",
+        # A sentence-ending period is punctuation, not part of the name.
+        "assert.match(render('see plan.md.', files), /plan.md<\\/a>\\./)",
+        # Several names in one sentence, and the compact parse.
+        "const both = render('plan.md then ' + checklist.name, files)",
+        "assert.equal((both.match(/<a /g) || []).length, 2, both)",
+        "assert.match(markdown.renderInline('plan.md',",
+        "  { runFiles: fileLookup(files) }), /<a /)",
+        # The daemon's URL goes through the same allowlist every other link does.
+        "const unsafe = [{ name: 'evil.md', url: 'javascript:alert(1)' }]",
+        "assert.equal(fileLookup(unsafe).size, 0)",
+        "assert.ok(!render('evil.md', unsafe).includes('<a'), 'a bad url linked')",
+    ])
+    _probe(body)
+
+
+def test_two_runs_sharing_a_filename_do_not_share_their_links():
+    """Issue #616: the render cache is module-level, so it outlives the component.
+
+    ``RunDetail`` is keyed per run in ``App.vue``, but this module is not, and the
+    cache key was the file *names*. Two runs that both write ``plan.md`` (or
+    ``spec.md``, ``goals.md``, ``retro.md``, ``state.yaml`` — any name a taskdef
+    reuses) and whose text matches are the same key, so the second run renders the
+    first run's ``href``. Nothing on screen says so; the link just opens another
+    run's file.
+
+    A DOM makes DOMPurify supported, so this is the real cached path rather than
+    the escape-everything fallback a Node-only probe takes — the fallback has no
+    ``href`` in it at all, which is why the bug survived the memo test.
+    """
+    body = "\n".join([
+        "assert.equal(DOMPurify.isSupported, true,",
+        "  'no DOM: this probe did not exercise the cached render path')",
+        "const runA = [{ name: 'plan.md',",
+        "  url: 'https://forge.example/w/-/blob/main/runs/A/plan.md' }]",
+        "const runB = [{ name: 'plan.md',",
+        "  url: 'https://forge.example/w/-/blob/main/runs/B/plan.md' }]",
+        "const text = 'plan approved: plan.md'",
+        # Both shapes cache, and they cache separately.
+        "for (const [shape, render] of [['block', renderMarkdown],",
+        "                               ['inline', renderMarkdownInline]]) {",
+        "  const a = render(text, runA)",
+        "  const b = render(text, runB)",
+        "  assert.match(a, /runs\\/A\\/plan\\.md/, `${shape}: ${a}`)",
+        "  assert.match(b, /runs\\/B\\/plan\\.md/, `${shape}: ${b}`)",
+        "  assert.ok(!b.includes('runs/A/plan.md'),",
+        "    `${shape}: run B served run A's href: ${b}`)",
+        "  assert.ok(!a.includes('runs/B/plan.md'),",
+        "    `${shape}: run A served run B's href: ${a}`)",
+        # Distinguishing the runs must not cost the memo: the same run and text
+        # again is still a hit, which is the whole reason the cache exists.
+        "  assert.equal(render(text, runA), a, `${shape}: a repeat re-rendered`)",
+        "}",
+    ])
+    _probe(body, dom=True)
 
 
 def test_an_external_link_cannot_reach_back_into_this_page():
@@ -841,7 +996,7 @@ def test_the_rendered_html_is_allowlisted_before_it_reaches_v_html():
     """
     text = _read(MARKDOWN)
     path = _render_path()
-    assert "DOMPurify.sanitize(markdown.render(text), SANITIZE)" in path, (
+    assert "DOMPurify.sanitize(markdown.render(text, { runFiles: lookup }), SANITIZE)" in path, (
         "the sanitiser does not wrap the parser's output"
     )
     for key in ("ALLOWED_TAGS", "ALLOWED_ATTR", "ALLOWED_URI_REGEXP"):
@@ -872,13 +1027,14 @@ def test_the_rendered_html_is_allowlisted_before_it_reaches_v_html():
     # its allowlist covers) are in tests/test_platform_web_markdown_surfaces.py.
     assert re.search(
         r"const rendered = computed\(\(\) => \(props\.inline\s*"
-        r"\?\s*renderMarkdownInline\(props\.text\)\s*"
-        r":\s*renderMarkdown\(props\.text\)\)\)",
+        r"\?\s*renderMarkdownInline\(props\.text, props\.files\)\s*"
+        r":\s*renderMarkdown\(props\.text, props\.files\)\)\)",
         text,
     ), "what v-html renders is not the output of one of the two render functions"
-    assert "DOMPurify.sanitize(markdown.renderInline(text), SANITIZE_INLINE)" in path, (
-        "the inline shape does not sanitise what its parse produced"
-    )
+    assert (
+        "DOMPurify.sanitize(markdown.renderInline(text, { runFiles: lookup }), "
+        "SANITIZE_INLINE)"
+    ) in path, "the inline shape does not sanitise what its parse produced"
 
 
 def test_the_fallback_when_there_is_no_dom_is_not_the_raw_text():
@@ -1003,15 +1159,24 @@ def test_rendering_is_memoised_because_the_parent_redraws_every_second():
         "the render runs on every re-render of the parent, not on a change of text"
     )
     render = _render_path()
-    assert "renderCache.get(text)" in render, "the cache is written but never read"
+    assert "renderCache.get(key)" in render, "the cache is written but never read"
     assert "renderCache.clear()" in render, (
         "an unbounded cache of message bodies is a leak in a view that is open "
         "for hours"
     )
     # The compact shape has a cache of its own, because the same string renders to
     # different markup in the two of them — and a row is redrawn by the same tick.
-    assert "inlineCache.get(text)" in render, "the inline shape re-parses every tick"
+    assert "inlineCache.get(key)" in render, "the inline shape re-parses every tick"
     assert "inlineCache.clear()" in render, "the inline cache is unbounded"
+    # Keyed on the run's file *pairs* as well as the text (#616): the same
+    # sentence renders differently once the list arrives, and a hit on the text
+    # alone would keep showing the unlinked copy. That the pairs — not just the
+    # names — are in the key is what
+    # test_two_runs_sharing_a_filename_do_not_share_their_links executes; this
+    # assertion only pins that the key exists.
+    assert "filesKey(lookup)" in render and r"\u0000${text}" in render, (
+        "the cache key ignores the run's files"
+    )
     # The reason, taken from the component that supplies it rather than restated.
     tick = re.search(
         r"setInterval\(.{0,80}?now\.value = Date\.now\(\).{0,40}?,\s*(\d+)\)",

@@ -46,6 +46,8 @@ const props = defineProps({
   sessionId: { type: String, required: true },
   // One entry from the ask channel: { id, text, options, at, answered, answer }.
   question: { type: Object, required: true },
+  // The run's own files, so a filename the question names opens it (issue 616).
+  files: { type: Array, default: () => [] },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -124,7 +126,7 @@ function submit() {
                wrote are line breaks in the markup now, and pre-wrap on top of it
                would show the ones *between* block tags as blank lines. The
                renderer also owns wrapping long paths, so nothing is restated. -->
-          <Markdown :text="question.text" class="text-body-medium" />
+          <Markdown :text="question.text" :files="files" class="text-body-medium" />
         </div>
       </div>
 

@@ -13,6 +13,9 @@ const props = defineProps({
   // Whether the session is still running, which here decides one thing only:
   // whether the record can still grow. Nothing on this view is answerable.
   live: { type: Boolean, default: false },
+  // The run's own files, so the record's question text links a filename to the
+  // file it names (issue 616), exactly as the dock does.
+  files: { type: Array, default: () => [] },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -91,6 +94,7 @@ watch(() => props.live, start)
           :key="entry.id"
           :entry="entry"
           :live="live"
+          :files="files"
           :now="now"
           question-icon
           show-options

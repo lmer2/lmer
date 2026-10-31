@@ -83,6 +83,8 @@ const props = defineProps({
   // screen before the first fetch returns. Replaced by the full feed a moment
   // later — a phone opening a waiting run should not watch a spinner first.
   initial: { type: Array, default: () => [] },
+  // The run's own files, for the question and note text this dock draws (issue 616).
+  files: { type: Array, default: () => [] },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -229,6 +231,7 @@ watch(() => props.live, start)
       :session-id="sessionId"
       :workspace-id="workspaceId"
       :question="question"
+      :files="files"
       :now="now"
       @answered="answered"
     />
@@ -260,6 +263,7 @@ watch(() => props.live, start)
           :key="entry.id"
           :entry="entry"
           :live="live"
+          :files="files"
           :now="now"
           unreachable
         />
