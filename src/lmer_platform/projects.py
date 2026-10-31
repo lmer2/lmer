@@ -30,7 +30,14 @@ COLORS = (
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
     "Pink", "Rose", "Brown", "Slate", "Gray",
 )
+#: How long :meth:`Supervisor.stop` waits for a reconcile pass, which may be
+#: launching an assistant, before the daemon exits without it.
+SUPERVISOR_STOP_SECONDS = 120.0
 _HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+#: Lock order (issue #566): this lock, through :func:`operation`, is always
+#: taken before ``assistant._LOCK``, never while holding it. Every assistant
+#: entry point that can reach :func:`operation` is ``@serialized`` so it takes
+#: this one first; ``with operation(), assistant._LOCK:`` is the only nesting.
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
 _ADMISSION = ContextVar("assistant_admission", default=None)
@@ -961,4 +968,12 @@ class Supervisor:
     def stop(self):
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
-            self._thread.join()
+            # Waits out an admitted launch so it publishes before shutdown, but
+            # a launch wedged past this bound must not hang the daemon's exit.
+            self._thread.join(SUPERVISOR_STOP_SECONDS)
+            if self._thread.is_alive():
+                logger.error(
+                    "project_assistants_stop_timed_out seconds=%s — a reconcile pass "
+                    "is still running; the daemon exits without waiting for it",
+                    SUPERVISOR_STOP_SECONDS,
+                )

@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-import uuid
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -62,7 +62,7 @@ logger = logging.getLogger("lmer_platform.registry")
 
 __all__ = [
     "RegistryError", "SESSION_KINDS", "WORKER_KIND", "ASSISTANT_KIND",
-    "new_session_id", "session_path",
+    "new_session_id", "SESSION_ID_SUFFIX_BYTES", "session_path",
     "token_path", "register", "update", "read_session", "list_sessions",
     "remove", "prune_dead", "is_live",
 ]
@@ -87,20 +87,28 @@ SESSION_KINDS = (WORKER_KIND, ASSISTANT_KIND)
 #: silently mangling one could map two distinct sessions onto a single file.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+#: Random bytes in a minted id's suffix (twice as many hex digits). At most 12
+#: digits so a container name, which borrows the trailing hex, never truncates it
+#: (``lmer_cli.runtime.NAME_SESSION_HEX_MAX``).
+SESSION_ID_SUFFIX_BYTES = 6
+
 
 class RegistryError(RuntimeError):
     """Raised on a malformed registration — a caller bug, not a runtime state."""
 
 
 def new_session_id() -> str:
-    """A fresh session id: sortable timestamp plus a short random suffix.
+    """A fresh session id: sortable timestamp plus a random suffix.
 
     The timestamp makes a directory listing chronological, which matters when
     reading these files by hand during a post-mortem; the suffix keeps two
-    sessions started in the same second distinct.
+    sessions started in the same second distinct. 48 bits, because the four hex
+    digits this used to draw collided inside one same-second burst (#519). A
+    candidate is still only a candidate: the spawn reserves it exclusively and
+    draws again on a clash (``spawn._reserve_session_identity``).
     """
     stamp = utc_now_iso().replace("-", "").replace(":", "").replace("Z", "")
-    return f"s-{stamp}-{uuid.uuid4().hex[:4]}"
+    return f"s-{stamp}-{secrets.token_hex(SESSION_ID_SUFFIX_BYTES)}"
 
 
 def _validate_session_id(session_id: str) -> str:

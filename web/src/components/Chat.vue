@@ -95,12 +95,14 @@ import CopyButton from './CopyButton.vue'
 import {
   computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue'
+import { useTheme } from 'vuetify'
 import {
   mdiAlertCircleOutline,
   mdiClose,
   mdiCogOutline,
   mdiDraw,
   mdiFileDocumentOutline,
+  mdiLockOutline,
   mdiPaperclip,
   mdiRefresh,
   mdiSend,
@@ -112,10 +114,14 @@ import {
 import { ago } from '../format.js'
 import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
-import { readDraft, storeDraft } from '../projects.js'
+import { operatorGround, readDraft, storeDraft } from '../projects.js'
+import { chatTintOperator } from '../operatorChat.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
 import { assistantName } from '../ratchet.js'
+// Send Privately (issue 510). Static: too small to earn a chunk of its own, and
+// mounted only while open, so its text exists only then.
+import PrivateSend from './PrivateSend.vue'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -138,6 +144,8 @@ const Markdown = defineAsyncComponent(async () => {
 
 const props = defineProps({
   workspaceId: { type: String, default: undefined },
+  // The color of the project `workspaceId` names, for the operator's ground (issue 646).
+  projectColor: { type: String, default: undefined },
   conversationKey: { type: String, default: null },
   // The id, not the session object: the fleet poll replaces that object every ten
   // seconds and a watcher on it would restart a working view for no reason. Same
@@ -524,9 +532,11 @@ const presented = computed(() => {
   const rows = props.assistantHistory ? historyWithoutOutboundCopies(shown) : withoutOutboundCopies(shown)
   return rows.map((message) => ({
     ...message,
+    // A private send is drawn from `private`: its text is instructions for the agent.
+    ...(message.private ? { text: '' } : {}),
     // Only what you sent: these lines are put in a message by this pane, and an
     // agent quoting one back is quoting, not attaching.
-    uploads: message.role === 'user' ? uploadsIn(message.text) : [],
+    uploads: message.role === 'user' && !message.private ? uploadsIn(message.text) : [],
   }))
 })
 
@@ -590,6 +600,29 @@ function ground(message) {
   if (message.kind !== 'said') return 'action'
   if (message.role === 'user') return 'operator'
   return message.role === 'assistant' ? 'agent' : 'action'
+}
+
+// The operator's ground in this project's hue (issue 646), checked against the ink
+// this theme actually draws on it: full-emphasis body text and the dimmer header.
+const theme = useTheme()
+const operatorStyle = computed(() => {
+  if (!chatTintOperator.value || !props.projectColor || !props.workspaceId || props.workspaceId === 'general') {
+    return undefined
+  }
+  const current = theme.current.value
+  const tinted = operatorGround(props.projectColor, {
+    dark: current.dark,
+    ink: current.colors['on-surface'],
+    emphasis: [current.variables['high-emphasis-opacity'], current.variables['medium-emphasis-opacity']]
+      .map(Number).filter((alpha) => alpha > 0 && alpha <= 1),
+  })
+  return { '--chat-operator-ground': tinted }
+})
+
+// A private file goes when its session does, so an entry from a session that has
+// ended names that; nothing records the deletion itself.
+function privateRemoved(message) {
+  return !live.value || (!!message.session && message.session !== props.sessionId)
 }
 
 // What the conversation view is not drawing, so a header counting more turns
@@ -1100,6 +1133,23 @@ async function loadEarlier() {
   }
 }
 
+const privateOpen = ref(false)
+const privateButton = ref(null)
+const privateNotice = ref(null)
+
+// The dialog has no activator, so focus goes back to the button by hand.
+function privateClosed(reason) {
+  privateOpen.value = false
+  if (reason) privateNotice.value = reason
+  nextTick(() => privateButton.value?.$el?.focus())
+}
+
+function privateSent() {
+  following.value = true
+  nextTick(stickToBottom)
+  poll()
+}
+
 async function send() {
   if (props.readOnly || props.sendPaused) return
   const typed = draft.value.trim()
@@ -1340,7 +1390,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
 </script>
 
 <template>
-  <v-card :class="fill ? 'chat-fill' : 'mb-3'">
+  <v-card :class="fill ? 'chat-fill' : 'mb-3'" :style="operatorStyle">
     <v-card-text>
       <div v-if="headerRow" class="d-flex flex-wrap align-center ga-2 mb-3">
         <span v-if="phase === 'loading'" class="text-body-small text-medium-emphasis">
@@ -1371,6 +1421,17 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
         >{{ showInjected ? 'hide' : 'show' }} {{ hiddenCount }} internal</v-btn>
       </div>
 
+      <!-- Send Privately's outcome stays until dismissed: polling clears
+           `problem`, and one of these asks the operator to act. -->
+      <v-alert
+        v-if="privateNotice"
+        type="warning"
+        density="compact"
+        class="mb-3 private-notice"
+        role="status"
+        closable
+        @click:close="privateNotice = null"
+      >{{ privateNotice }}</v-alert>
       <v-alert v-if="problem" type="error" density="compact" class="mb-3">
         {{ problem }}
         <v-btn
@@ -1417,7 +1478,19 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
           class="turn"
           :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation', 'turn-digest': !!message.digest }]"
         >
-          <div class="d-flex align-center ga-2 text-body-small text-medium-emphasis">
+          <!-- A Send Privately reference (issue 646): the line the agent was given
+               is instructions for it, so the operator sees that one was sent. -->
+          <div v-if="message.private" class="d-flex align-center flex-wrap ga-2 text-body-small private-entry">
+            <span class="text-body-medium"><v-icon :icon="mdiLockOutline" size="small" class="me-1" aria-hidden="true" />Private message sent<template v-if="message.private.purpose">: {{ message.private.purpose }}</template></span>
+            <span class="text-medium-emphasis">· delivered</span>
+            <span
+              v-if="privateRemoved(message)"
+              class="text-medium-emphasis inferred"
+              title="inferred: the session has ended, and the platform deletes private files when a session ends"
+            >· removed with the session (inferred)</span>
+            <span class="text-medium-emphasis" :title="message.at || ''">{{ ago(message.at, now) }}</span>
+          </div>
+          <div v-else class="d-flex align-center ga-2 text-body-small text-medium-emphasis">
             <span>{{ speaker(message) }}</span>
             <span v-if="assistantHistory && message.generation != null">· generation {{ message.generation }}</span>
             <span v-if="message.kind !== 'said'">· internal</span>
@@ -1486,7 +1559,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
                what it wants. Trimming the tail instead left the preamble and cut
                the conclusion, which made a shortened report a useless one. -->
           <p
-            v-if="message.truncated"
+            v-if="message.truncated && !message.private"
             class="text-body-small text-medium-emphasis mb-1"
           >
             … earlier part of this message trimmed — the terminal has all of it
@@ -1768,6 +1841,14 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
                in that row is what an operator can tap, and a hidden element in
                it is indistinguishable from a control that disappears at some
                width (tests/test_platform_web_composer.py). -->
+          <PrivateSend
+            v-if="privateOpen"
+            :session-id="sessionId"
+            :workspace-id="workspaceId"
+            :send-paused="sendPaused"
+            @close="privateClosed"
+            @sent="privateSent"
+          />
           <!-- Only while something is being marked up: the component is a
                separate chunk, and mounting it unconditionally would fetch a
                canvas editor for every conversation anybody opens. -->
@@ -1798,6 +1879,23 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
               aria-label="attach a file to this message"
               @click="picker?.click()"
             >attach</v-btn>
+            <!-- The label goes below the composer's narrow width (`.composer` is the
+                 container), leaving the lock and its tooltip. -->
+            <v-tooltip text="Send privately" location="top" open-on-focus>
+              <template #activator="{ props: tooltip }">
+                <v-btn
+                  v-bind="tooltip"
+                  ref="privateButton"
+                  :prepend-icon="mdiLockOutline"
+                  :disabled="sending || sendPaused"
+                  class="private-button"
+                  variant="tonal"
+                  size="large"
+                  aria-label="Send privately"
+                  @click="privateOpen = true"
+                ><span class="private-label">private</span></v-btn>
+              </template>
+            </v-tooltip>
             <v-spacer />
             <v-btn
               :prepend-icon="mdiSend"
@@ -1888,6 +1986,11 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
   min-height: 8rem;
   max-height: none;
 }
+/* Vuetify's v-alert is `flex: 1 1`: in this column a failed poll's alert took a
+   share of the pane's height equal to the conversation's (issue 646). */
+.chat-fill :deep(.v-alert) {
+  flex: none;
+}
 
 /* The wrap is declared here, on the bubble, rather than on each kind of content
    inside it: a long path or URL is routine in every one of them, and the message
@@ -1930,7 +2033,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
 }
 
 .ground-operator {
-  background: rgb(var(--v-theme-chat-operator));
+  background: var(--chat-operator-ground, rgb(var(--v-theme-chat-operator)));
 }
 
 .ground-action {
@@ -2024,10 +2127,20 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
    would be chrome on the one control this pane is mostly used for, and the app's
    own tone tokens are used so it reads the same in both themes. */
 .composer {
+  container-type: inline-size;
   border-radius: 8px;
   outline: 2px dashed transparent;
   outline-offset: 4px;
   transition: outline-color 120ms linear;
+}
+
+@container (max-width: 420px) {
+  .private-label {
+    display: none;
+  }
+  .private-button :deep(.v-btn__prepend) {
+    margin-inline: 0;
+  }
 }
 
 .composer-drop {

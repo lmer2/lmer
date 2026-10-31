@@ -10,11 +10,13 @@ flags or thread relations, because a fake with opinions is a second
 implementation of the thing under test.
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from matrix_bridge.client import Homeserver
+from matrix_bridge.client import CryptoUnavailable, Homeserver, SessionMissing, Undecryptable
 
 
 @dataclass
@@ -49,6 +51,8 @@ class FakeHomeserver(Homeserver):
     open_store_error: Optional[Exception] = None
     #: Set to raise from :meth:`has_backup`, for "the homeserver cannot say".
     backup_error: Optional[Exception] = None
+    #: Set to raise from :meth:`back_up_store`, for "the export upload failed".
+    back_up_store_error: Optional[Exception] = None
     #: What the store exports. ``b""`` is the "the store gave us nothing" case
     #: the real transport refuses to write over a backup with.
     export: Optional[bytes] = None
@@ -83,6 +87,13 @@ class FakeHomeserver(Homeserver):
     #: Refuse every homeserver call until :meth:`listen` has run, the way
     #: ``mautrix``' ``AppService.intent`` does. See :meth:`_require_listener`.
     requires_listener: bool = False
+    #: The crypto lent through ``matrix_bridge.crypto_api``. Fake Megolm: the
+    #: "ciphertext" is the JSON of the plaintext, readable only while its
+    #: session id is in :attr:`room_keys`. Literal, like the rest of the fake.
+    crypto_open: bool = True
+    device_id: str = "BRIDGEDEV"
+    room_keys: set = field(default_factory=set)
+    encrypted_for: list = field(default_factory=list)
     _event_serial: int = 0
 
     # --- the store ------------------------------------------------------------
@@ -108,6 +119,8 @@ class FakeHomeserver(Homeserver):
         non-empty export, and an **empty** export never replaces one that is
         already there.
         """
+        if self.back_up_store_error is not None:
+            raise self.back_up_store_error
         if self.export == b"":
             return
         self.backups_written += 1
@@ -163,6 +176,46 @@ class FakeHomeserver(Homeserver):
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         self.callback = callback
+
+    # --- crypto lent to other processes ----------------------------------------
+
+    def _require_crypto(self) -> None:
+        if not self.crypto_open:
+            raise CryptoUnavailable("the bridge's crypto store is not open yet (fake)")
+
+    async def crypto_identity(self) -> dict:
+        self._require_crypto()
+        return {"user_id": self.whoami_as, "device_id": self.device_id}
+
+    async def encrypt_content(self, room_id: str, event_type: str, content: dict) -> dict:
+        self._require_crypto()
+        self.encrypted_for.append((room_id, event_type))
+        sealed = {"algorithm": "m.megolm.v1.aes-sha2", "session_id": "fake-session",
+                  "ciphertext": json.dumps({"type": event_type, "content": content})}
+        if "m.relates_to" in content:
+            sealed["m.relates_to"] = content["m.relates_to"]
+        return sealed
+
+    async def decrypt_event(self, event: dict) -> dict:
+        self._require_crypto()
+        content = event.get("content") or {}
+        if content.get("session_id") not in self.room_keys:
+            raise SessionMissing(content.get("session_id"))
+        try:
+            plain = json.loads(content["ciphertext"])
+        except (KeyError, ValueError):
+            raise Undecryptable("not fake ciphertext") from None
+        return {**event, "type": plain["type"], "content": plain["content"]}
+
+    async def encrypt_attachment(self, data: bytes) -> tuple:
+        sealed = bytes(reversed(data))
+        return sealed, {"key": {"k": "fake"}, "iv": "iv", "v": "v2",
+                        "hashes": {"sha256": hashlib.sha256(sealed).hexdigest()}}
+
+    async def decrypt_attachment(self, data: bytes, file: dict) -> bytes:
+        if (file.get("hashes") or {}).get("sha256") != hashlib.sha256(data).hexdigest():
+            raise Undecryptable("Mismatched SHA-256 digest")
+        return bytes(reversed(data))
 
     async def listen(self, host: str, port: int) -> None:
         """Record the bind, the way the real listener does."""

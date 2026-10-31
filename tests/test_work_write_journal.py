@@ -11,6 +11,7 @@ journaling itself as suite-descendant).
 """
 import json
 import os
+import stat
 import subprocess
 import sys
 import textwrap
@@ -37,6 +38,23 @@ def _valid_record(**overrides):
     }
     record.update(overrides)
     return record
+
+
+def _foreign_file(monkeypatch, path):
+    """Make the file at *path* look owned by another uid to ``os.fstat``
+    (keyed by inode: the reads under test fstat their own descriptor)."""
+    inode = path.stat().st_ino
+    real_fstat = os.fstat
+
+    def fstat(descriptor):
+        info = real_fstat(descriptor)
+        if info.st_ino != inode:
+            return info
+        fields = list(info[:10])
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", fstat)
 
 
 class TestParseRecord:
@@ -311,6 +329,85 @@ class TestRecordWriteIntent:
         assert len(lines) == 1
         assert write_journal.parse_record(lines[0])["command"] == "log"
 
+    def test_the_journal_is_owner_only(self, lock_dir, tmp_path):
+        self._marker(lock_dir, os.getppid())
+        write_journal.record_write_intent("log", ["a/b"], work_repo=str(tmp_path))
+        path = lock_dir / write_journal.JOURNAL_NAME
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(lock_dir.stat().st_mode) == 0o700
+
+    def test_a_planted_journal_symlink_is_not_written_through(
+        self, lock_dir, tmp_path
+    ):
+        """The journal excuses drift: a write redirected elsewhere is both a
+        clobbered file and a record the guard never sees (#262)."""
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        (lock_dir / write_journal.JOURNAL_NAME).symlink_to(target)
+        self._marker(lock_dir, os.getppid())
+
+        write_journal.record_write_intent("log", ["a/b"], work_repo=str(tmp_path))
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+
+    def test_a_planted_compaction_tmp_is_not_written_through(
+        self, lock_dir, tmp_path
+    ):
+        """The tmp name is predictable (pid-derived), so it is created
+        exclusively; a leftover is cleared so the next rewrite can run."""
+        stale = _valid_record(ts=time.time() - write_journal.STALE_AFTER_SECONDS - 60)
+        path = lock_dir / write_journal.JOURNAL_NAME
+        line = json.dumps(stale) + "\n"
+        path.write_text(line * (write_journal.COMPACT_AT_BYTES // len(line) + 2))
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        planted = lock_dir / f".{path.name}.{os.getpid()}.tmp"
+        planted.symlink_to(target)
+        self._marker(lock_dir, os.getppid())
+
+        write_journal.record_write_intent("log", ["a/b"], work_repo=str(tmp_path))
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+        assert not planted.is_symlink()
+        # The record still lands, by the plain append the failed rewrite
+        # falls back to.
+        last = path.read_text().splitlines()[-1]
+        assert write_journal.parse_record(last)["command"] == "log"
+
+    def test_a_foreign_lock_dir_is_neither_journaled_nor_consumed(
+        self, lock_dir, tmp_path, monkeypatch
+    ):
+        """Records in a directory someone else controls could be forged
+        excuses: they are not consumed, and none are added (#262)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        path = lock_dir / write_journal.JOURNAL_NAME
+        path.write_text(json.dumps(_valid_record(
+            work_repo=write_journal.resolve_work_repo(str(repo)), ts=time.time()
+        )) + "\n")
+        self._marker(lock_dir, os.getppid())
+        before = path.read_text()
+        other = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other)
+
+        write_journal.record_write_intent("log", ["a/b"], work_repo=str(repo))
+        assert write_journal.consume_records(str(repo), 7) == []
+        assert path.read_text() == before
+
+
+    def test_a_journal_owned_by_another_uid_is_not_consumed(
+        self, lock_dir, tmp_path, monkeypatch
+    ):
+        """A planted journal would be a forged write excuse (#262)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        path = lock_dir / write_journal.JOURNAL_NAME
+        path.write_text(json.dumps(_valid_record(
+            work_repo=write_journal.resolve_work_repo(str(repo)), ts=time.time()
+        )) + "\n")
+        _foreign_file(monkeypatch, path)
+
+        assert write_journal.consume_records(str(repo), 7) == []
 
 class TestConsumeRecords:
     def _write(self, directory, record):

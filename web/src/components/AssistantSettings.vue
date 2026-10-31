@@ -35,6 +35,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { mdiRestart } from '@mdi/js'
 import { fetchAssistantConfig, setAssistantConfig } from '../api.js'
+import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_KEYS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
 import { applyChatSettings } from '../operatorChat.js'
 import { assistantName } from '../ratchet.js'
 
@@ -55,7 +56,7 @@ const open = computed({
   set: (value) => emit('update:modelValue', value),
 })
 
-const SETTING_KEYS = ['model', 'harness', 'preset', 'agents', 'threads']
+const SETTING_KEYS = [...LAUNCH_SETTING_KEYS, 'threads']
 
 // The daemon's own reminder intervals (#244, #317, #446). A different kind of
 // setting from the five above and captioned as one: they are read on the next
@@ -115,20 +116,8 @@ const TICK_SOURCES = {
   ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.api, [spec.group, spec.key]])),
   rotation_context_threshold: ['rotation', 'context_threshold'],
 }
-const SETTING_LABELS = {
-  model: 'Model',
-  harness: 'Harness',
-  preset: 'Preset',
-  agents: 'Fan-out presets',
-  threads: 'Chat threads',
-}
-const SETTING_HINTS = {
-  model: 'The model the session runs, handed to the harness verbatim.',
-  harness: 'Agent harness, for example claude, codex or pi.',
-  preset: 'A named startup preset from the host’s presets file.',
-  agents: 'Comma-separated preset names the session may fan out to.',
-  threads: 'Slack or matrix thread permalinks, one per line.',
-}
+const SETTING_LABELS = { ...LAUNCH_SETTING_LABELS, threads: 'Chat threads' }
+const SETTING_HINTS = { ...LAUNCH_SETTING_HINTS, threads: 'Slack or matrix thread permalinks, one per line.' }
 
 const reply = ref(null)
 const problem = ref(null)
@@ -151,8 +140,9 @@ const savedTickShadowed = ref(false)
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
 const fields = reactive({
-  model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0',
+  model: '', harness: '', preset: '', agents: '', effort: '', threads: '',
   showTranscript: false,
+  tintOperator: true,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
 })
@@ -201,11 +191,11 @@ async function load() {
 }
 
 function prefill(config) {
-  fields.chatKeepLast = String(config.chat?.keep_last?.stored ?? 0)
   // The effective value is the stored layer's own reading here: the chat group
   // has no environment layer to shadow it, so nothing an export set can be
   // baked into the file by saving this.
   fields.showTranscript = config.chat?.show_transcript?.value === true
+  fields.tintOperator = config.chat?.tint_operator?.value !== false
   applyChatSettings(config)
   for (const spec of TICK_FIELDS) {
     const stored = config[spec.group]?.[spec.key]?.stored
@@ -239,14 +229,11 @@ function changes() {
     const edited = (fields[key] || '').trim()
     if (edited !== stored) named[key] = edited || null
   }
-  const keepLast = Number(fields.chatKeepLast)
-  if (!Number.isSafeInteger(keepLast) || keepLast < 0) {
-    problem.value = 'Keep last must be a whole number of 0 or more.'
-    return null
-  }
-  if (keepLast !== (reply.value?.chat?.keep_last?.stored ?? 0)) named.chat_keep_last = keepLast
   if (fields.showTranscript !== (reply.value?.chat?.show_transcript?.value === true)) {
     named.chat_show_transcript = fields.showTranscript
+  }
+  if (fields.tintOperator !== (reply.value?.chat?.tint_operator?.value !== false)) {
+    named.chat_tint_operator = fields.tintOperator
   }
   for (const spec of TICK_FIELDS) {
     const stored = reply.value?.[spec.group]?.[spec.key]?.stored ?? null
@@ -294,7 +281,7 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = changed.includes('chat_keep_last') || changed.includes('chat_show_transcript')
+    savedDisplay.value = changed.includes('chat_show_transcript') || changed.includes('chat_tint_operator')
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -436,21 +423,6 @@ onBeforeUnmount(() => {
             <p class="text-body-small text-medium-emphasis mb-3">
               Applies now, to this pane; other open browsers follow within a poll.
             </p>
-            <div class="settings-field">
-              <v-text-field
-                v-model="fields.chatKeepLast"
-                label="Keep last (entries)"
-                type="number"
-                min="0"
-                step="1"
-                hint="Keep the newest N entries in the operator chat. 0 turns auto-clear off. History is kept."
-                persistent-hint
-                density="compact"
-                variant="outlined"
-                :disabled="saving"
-              />
-            </div>
-
             <!-- The uber lmer pane's one view switch (issue 488). Platform state,
                  not this browser's: the operator debugging a stuck session from a
                  phone should find it where they left it on the desktop. -->
@@ -467,6 +439,21 @@ onBeforeUnmount(() => {
                 Off, the chat is the conversation only: your messages, and what {{ assistantName }}
                 posted, asked and answered. On, its tool calls, watch events, hook
                 re-prompts and unposted working notes appear muted beside them.
+              </p>
+            </div>
+            <div class="settings-field">
+              <v-switch
+                v-model="fields.tintOperator"
+                class="tint-operator"
+                color="primary"
+                density="compact"
+                hide-details
+                :disabled="saving"
+                label="Tint my messages with the project color"
+              />
+              <p class="text-body-small text-medium-emphasis setting-source">
+                On, your messages in each chat take that project's hue, kept readable in
+                both color schemes. Off, they use one color everywhere.
               </p>
             </div>
           </section>
@@ -574,7 +561,7 @@ onBeforeUnmount(() => {
             Saved to config.json, but every launch value you changed is still pinned by
             an exported environment variable — a restart would run the export,
             not what you saved. Remove the export first.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported
@@ -584,7 +571,7 @@ onBeforeUnmount(() => {
           </v-alert>
           <v-alert v-else-if="saved && !savedLaunch" type="success" density="compact">
             Saved. No session restart is needed.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported
@@ -595,7 +582,7 @@ onBeforeUnmount(() => {
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh {{ assistantName }} starts — restart to apply it
             from the project chat, or let the change wait for the next incarnation.
-            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedDisplay">Chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
               ⚠️ a reminder setting you changed is still pinned by an exported
@@ -627,18 +614,3 @@ onBeforeUnmount(() => {
     </v-card>
   </v-dialog>
 </template>
-
-<style scoped>
-.settings-group + .settings-group {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-}
-.settings-field {
-  margin-bottom: 12px;
-}
-.setting-source {
-  margin: 4px 0 0;
-  overflow-wrap: anywhere;
-}
-</style>

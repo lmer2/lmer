@@ -6,7 +6,7 @@ import PlatformSettings from '../src/components/PlatformSettings.vue'
 import Chat from '../src/components/Chat.vue'
 import RunDetail from '../src/components/RunDetail.vue'
 import RunNav from '../src/components/RunNav.vue'
-import { contrastRatio, projectColor, projectColors, projectTextColor, storedProjectColor } from '../src/projects.js'
+import { blend, contrastRatio, operatorGround, projectColor, projectColors, projectTextColor, storedProjectColor } from '../src/projects.js'
 import RunCard from '../src/components/RunCard.vue'
 import ProjectNav from '../src/components/ProjectNav.vue'
 import ProjectSettings from '../src/components/ProjectSettings.vue'
@@ -342,6 +342,66 @@ it('saves a custom hex from the picker and keeps a preset stored by name', async
   await wrapper.findAll('button').find(button => button.text() === 'Save project').trigger('click')
   await flushPromises()
   expect(api.updateProject.mock.calls.at(-1)[1].color).toBe('Teal')
+})
+
+// Issue 646 item 9. The ink and emphasis values are what this Vuetify draws: on-surface
+// is black on the light scheme's white surface and white on the dark one, the header
+// is medium emphasis and the body high emphasis.
+const THEMES = {
+  light: { dark: false, ink: '#000', emphasis: [0.87, 0.6] },
+  dark: { dark: true, ink: '#FFF', emphasis: [1, 0.7] },
+}
+const CUSTOM = ['#ffffff', '#f0f8ff', '#ffff00', '#00ff00', '#ff00ff', '#0000ff', '#1a1a40', '#000000']
+
+it.each(Object.keys(THEMES))('tints the operator ground in each project hue and keeps %s ink at AA', (scheme) => {
+  const theme = THEMES[scheme]
+  for (const color of [...Object.keys(projectColors), ...CUSTOM]) {
+    const ground = operatorGround(color, theme)
+    expect(ground, color).toMatch(/^#[0-9a-f]{6}$/)
+    for (const alpha of theme.emphasis) {
+      expect(contrastRatio(blend(theme.ink, alpha, ground), ground), `${color} at ${alpha}`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+  // A tint, not the search's last resort, and different projects get different ones.
+  for (const color of Object.keys(projectColors)) expect(operatorGround(color, theme), color).not.toMatch(/^#(000000|ffffff)$/)
+  expect(operatorGround('Red', theme)).not.toBe(operatorGround('Teal', theme))
+})
+
+it('blends ink at an opacity onto its ground', () => {
+  expect(blend('#000000', 0.6, '#ffffff')).toBe('#666666')
+  expect(blend('#ffffff', 1, '#123456')).toBe('#ffffff')
+  expect(blend('#FFF', 0.5, '#000000')).toBe(blend('#ffffff', 0.5, '#000000'))
+  // No emphasis given checks full-strength ink rather than nothing.
+  for (const scheme of [{ dark: false, ink: '#ffffff' }, { dark: true, ink: '#000' }]) {
+    expect(operatorGround('#ffff00', { ...scheme, emphasis: [] })).toBe(operatorGround('#ffff00', { ...scheme, emphasis: [1] }))
+  }
+})
+
+it('keeps the color swatches first and the canvas behind Custom…, opening it for a custom hex', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[1], color: 'Blue', repositories: [], settings: {} } })
+  await flushPromises()
+  const picker = wrapper.getComponent({ name: 'VColorPicker' })
+  expect([picker.props('hideCanvas'), picker.props('hideSliders'), picker.props('hideInputs')]).toEqual([true, true, true])
+  const toggle = wrapper.get('.custom-color')
+  expect(toggle.attributes('aria-expanded')).toBe('false')
+  await toggle.trigger('click')
+  expect(picker.props('hideCanvas')).toBe(false)
+  expect(toggle.attributes('aria-expanded')).toBe('true')
+  const custom = mountPane(ProjectSettings, { project: { ...projects[1], color: '#ff69b4', repositories: [], settings: {} } })
+  await flushPromises()
+  expect(custom.getComponent({ name: 'VColorPicker' }).props('hideCanvas')).toBe(false)
+  for (const mounted of [wrapper, custom]) mounted.unmount()
+})
+
+it('lays the short execution fields out in a grid in reading order, effort included', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const execution = wrapper.findAll('section.settings-group')[2]
+  const grid = execution.get('.settings-grid')
+  expect(grid.findAll('.v-field-label, label.v-label').map(node => node.text()).filter((t, i, all) => all.indexOf(t) === i))
+    .toEqual(['Model', 'Harness', 'Preset', 'Fan-out presets', 'Reasoning effort'])
+  expect(grid.text()).not.toContain('Project thread connections')
+  wrapper.unmount()
 })
 
 it.each(['toolbar', 'attention card', 'calm card'])('binds a closed drawer to the selected project when reopening from %s', async shortcut => {
@@ -1172,5 +1232,307 @@ it('labels project execution overrides readably and says what an empty one inher
   const labels = wrapper.findAll('.v-field-label, label.v-label').map(node => node.text())
   for (const label of ['Model', 'Harness', 'Preset', 'Fan-out presets']) expect(labels).toContain(label)
   for (const raw of ['model', 'harness', 'preset', 'agents']) expect(labels).not.toContain(raw)
-  expect(wrapper.text()).toContain('Empty inherits the platform default.')
+  expect(wrapper.text()).toContain('Empty fields inherit the platform defaults.')
+})
+
+it('groups project settings into titled sections, each saying what it applies to', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const sections = wrapper.findAll('section.settings-group')
+  expect(sections.map(section => section.get('h3').text()))
+    .toEqual(['Identity', 'This browser', 'Execution', 'Assistant', 'Chat channels', 'Archive'])
+  for (const section of sections) {
+    expect(section.get('h3').attributes('id')).toBe(section.attributes('aria-labelledby'))
+    expect(section.get('p').text().length).toBeGreaterThan(20)
+  }
+  const topActions = wrapper.get('.project-actions').findAll('button').map(button => button.text())
+  expect(topActions).toEqual(['Save project', 'Close'])
+  expect(sections.at(-1).findAll('button').map(button => button.text())).toEqual(['Archive project'])
+})
+
+it('remembers which projects were collapsed across a reload, keyed by project id', async () => {
+  const first = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  const toggle = (wrapper, index) => wrapper.findAllComponents(ProjectNav)[index].get('.project-toggle')
+  await toggle(first, 0).trigger('click')
+  expect(toggle(first, 0).attributes('aria-expanded')).toBe('false')
+  expect(JSON.parse(window.localStorage.getItem('lmer.projects.collapsed'))).toEqual(['alpha'])
+  first.unmount()
+
+  const second = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(toggle(second, 0).attributes('aria-expanded')).toBe('false')
+  expect(toggle(second, 1).attributes('aria-expanded')).toBe('true')
+  await toggle(second, 0).trigger('click')
+  expect(JSON.parse(window.localStorage.getItem('lmer.projects.collapsed'))).toEqual([])
+})
+
+it('renders every project expanded when the stored collapse list is unusable or storage throws', async () => {
+  window.localStorage.setItem('lmer.projects.collapsed', '{"alpha":true}')
+  const garbled = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(garbled.findAllComponents(ProjectNav).map(nav => nav.get('.project-toggle').attributes('aria-expanded')))
+    .toEqual(['true', 'true'])
+  garbled.unmount()
+
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const failures = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+    await flushPromises()
+    const navs = wrapper.findAllComponents(ProjectNav)
+    expect(navs).toHaveLength(2)
+    await navs[0].get('.project-toggle').trigger('click')
+    expect(navs[0].get('.project-toggle').attributes('aria-expanded')).toBe('false')
+    expect(failures).not.toHaveBeenCalled()
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+    failures.mockRestore()
+  }
+})
+
+const switcherLabel = wrapper => wrapper.get('.project-switcher').text()
+
+it('reopens the project last viewed, and writes it only when the operator moves', async () => {
+  const first = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(first)).toBe('All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBeNull()
+  await chooseProject(first, 'Beta')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  first.unmount()
+
+  const second = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(second)).toBe('Beta')
+  expect(window.location.search).toBe('?workspace=beta')
+  await chooseProject(second, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  second.unmount()
+
+  const third = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(third)).toBe('All projects')
+})
+
+it('skips a remembered project that is gone or archived, and keeps it stored for when it returns', async () => {
+  window.localStorage.setItem('lmer.project.last', 'gone')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('All projects')
+  expect(window.location.search).toBe('')
+  expect(wrapper.find('.v-alert').exists()).toBe(false)
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('gone')
+  wrapper.unmount()
+
+  api.fetchProjects.mockResolvedValue({ projects: [...projects, { id: 'old', name: 'Old', archived: true }] })
+  window.localStorage.setItem('lmer.project.default', 'old')
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const fallback = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(fallback)).toBe('Beta')
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('old')
+})
+
+it('does not call a remembered project unavailable when the project list cannot be fetched', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  api.fetchProjects.mockRejectedValue(new Error('daemon down'))
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(wrapper.text()).not.toContain('This project link is unavailable or archived.')
+})
+
+it('records a project opened from a link as the last viewed one, once it is confirmed live', async () => {
+  window.localStorage.setItem('lmer.project.last', 'alpha')
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  wrapper.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=gone')
+  const dead = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  dead.unmount()
+})
+
+it('lets a link win over the remembered project and shows its own notice for a dead link', async () => {
+  window.localStorage.setItem('lmer.project.default', 'alpha')
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+  wrapper.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=gone')
+  const dead = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(dead)).toBe('Unavailable project')
+  expect(dead.text()).toContain('This project link is unavailable or archived.')
+})
+
+it('opens the default project on every load, over the last viewed, until it is cleared', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+  await chooseProject(wrapper, 'Project settings for Beta')
+  const flag = () => wrapper.getComponent(ProjectSettings).get('.project-default input')
+  expect(flag().element.checked).toBe(false)
+  await chooseProject(wrapper, 'Alpha research and development')
+  await chooseProject(wrapper, 'Project settings for Alpha research and development')
+  await flag().setValue(true)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('alpha')
+  expect(flag().element.checked).toBe(true)
+  await chooseProject(wrapper, 'Beta')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  wrapper.unmount()
+
+  const reloaded = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  await chooseProject(reloaded, 'Project settings for Alpha research and development')
+  await reloaded.getComponent(ProjectSettings).get('.project-default input').setValue(false)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('')
+  reloaded.unmount()
+
+  const cleared = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(cleared)).toBe('Beta')
+})
+
+// A remembered All projects is stored as '' and is a choice: clearing the default
+// must bring it back, not the tab's own URL, which still names the old default.
+it('brings back All projects as the last viewed once the default is cleared', async () => {
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  await chooseProject(wrapper, 'Alpha research and development')
+  await chooseProject(wrapper, 'Project settings for Alpha research and development')
+  await wrapper.getComponent(ProjectSettings).get('.project-default input').setValue(true)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('alpha')
+  await chooseProject(wrapper, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  wrapper.unmount()
+
+  const reloaded = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.location.search).toBe('?workspace=alpha')
+  await chooseProject(reloaded, 'Project settings for Alpha research and development')
+  await reloaded.getComponent(ProjectSettings).get('.project-default input').setValue(false)
+  expect(window.localStorage.getItem('lmer.project.default')).toBe('')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  reloaded.unmount()
+
+  const cleared = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  expect(switcherLabel(cleared)).toBe('All projects')
+})
+
+it('renders and switches projects when storage refuses every read and write', async () => {
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const failures = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+    await flushPromises()
+    expect(switcherLabel(wrapper)).toBe('All projects')
+    await chooseProject(wrapper, 'Beta')
+    expect(switcherLabel(wrapper)).toBe('Beta')
+    await chooseProject(wrapper, 'Project settings for Beta')
+    await wrapper.getComponent(ProjectSettings).get('.project-default input').setValue(true)
+    expect(wrapper.getComponent(ProjectSettings).get('.project-default input').element.checked).toBe(true)
+    expect(failures).not.toHaveBeenCalled()
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+    failures.mockRestore()
+  }
+})
+
+const mountApp = async () => {
+  const wrapper = mountPane(App, {}, { global: { stubs: { AssistantChat: true } } })
+  await flushPromises()
+  return wrapper
+}
+
+it('treats the URL the app wrote itself as its own on a reload, but a link someone followed as a link', async () => {
+  window.localStorage.setItem('lmer.project.default', 'alpha')
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const first = await mountApp()
+  expect(switcherLabel(first)).toBe('Alpha research and development')
+  expect(window.location.search).toBe('?workspace=alpha')
+  first.unmount()
+
+  const reloaded = await mountApp()
+  expect(switcherLabel(reloaded)).toBe('Alpha research and development')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('beta')
+  reloaded.unmount()
+
+  window.history.replaceState({}, '', '/?workspace=beta')
+  const linked = await mountApp()
+  expect(switcherLabel(linked)).toBe('Beta')
+  linked.unmount()
+  const relinked = await mountApp()
+  expect(switcherLabel(relinked)).toBe('Beta')
+})
+
+it('keeps the current project across a reload through the URL when storage refuses everything', async () => {
+  const refuse = () => { throw new DOMException('denied', 'SecurityError') }
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse)
+  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse)
+  try {
+    const first = await mountApp()
+    await chooseProject(first, 'Beta')
+    first.unmount()
+    const reloaded = await mountApp()
+    expect(switcherLabel(reloaded)).toBe('Beta')
+  } finally {
+    read.mockRestore()
+    write.mockRestore()
+  }
+})
+
+it('does not write a remembered project into the URL before the project list confirms it', async () => {
+  window.localStorage.setItem('lmer.project.last', 'gone')
+  api.fetchProjects.mockRejectedValue(new Error('daemon down'))
+  const failed = await mountApp()
+  expect(window.location.search).toBe('')
+  failed.unmount()
+
+  api.fetchProjects.mockResolvedValue({ projects })
+  const reloaded = await mountApp()
+  expect(switcherLabel(reloaded)).toBe('All projects')
+  expect(reloaded.text()).not.toContain('This project link is unavailable or archived.')
+})
+
+it('labels a remembered project neutrally until the first project list arrives', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  const pending = deferred()
+  api.fetchProjects.mockReturnValue(pending.promise)
+  const wrapper = await mountApp()
+  expect(switcherLabel(wrapper)).toBe('Loading project…')
+  pending.resolve({ projects })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('Beta')
+})
+
+it('does not record a followed link as last viewed once the operator has moved away', async () => {
+  window.localStorage.setItem('lmer.project.last', 'beta')
+  window.history.replaceState({}, '', '/?workspace=alpha')
+  const pending = deferred()
+  api.fetchProjects.mockReturnValue(pending.promise)
+  const wrapper = await mountApp()
+  await chooseProject(wrapper, 'All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
+  pending.resolve({ projects })
+  await flushPromises()
+  expect(switcherLabel(wrapper)).toBe('All projects')
+  expect(window.localStorage.getItem('lmer.project.last')).toBe('')
 })

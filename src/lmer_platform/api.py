@@ -59,6 +59,7 @@ import json
 import logging
 import os
 import secrets as secrets_mod
+import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -115,6 +116,7 @@ from .ingress import Ingress
 from . import references
 from . import reattach
 from . import relations
+from . import rotate_requests
 from . import run_transition
 from . import schema_report
 from . import session_io
@@ -137,6 +139,7 @@ from .config import (
     assistant_resource_settings,
     assistant_settings,
     chat_settings,
+    dock_settings,
     list_connectors,
     checkin_settings,
     _slots_value,
@@ -235,6 +238,21 @@ CALLER_CONNECTOR = "connector"
 #: handshake refused before ``accept`` reaches it as a bare connection failure.
 #: Hence the client contract — mint a fresh ticket and retry once.
 WS_POLICY_VIOLATION = 1008
+
+#: What a 503 for transient state contention tells a client to wait (seconds,
+#: as the ``Retry-After`` header carries it).
+RETRY_AFTER_SECONDS = "1"
+
+
+def _busy_detail(reason: str, *, retryable: bool, advice: str) -> dict:
+    """The body of a 503 for state contention: the cause, then what to do.
+
+    ``retryable`` is true only where a retry is known to be safe — nothing was
+    applied, or the request is idempotent. Otherwise the request may have
+    partly applied, and only the client knows whether repeating it is safe.
+    """
+    return {"code": "state_busy", "message": f"{reason} {advice}", "retryable": retryable}
+
 
 #: RFC 6455 caps a close reason at 123 bytes; the reasons here are explanations,
 #: so they are truncated rather than assumed short.
@@ -799,8 +817,8 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin, nudge and "
     "rotation groups on its next tick, so a change there takes effect without a "
     "rotation. "
-    "chat_keep_last and chat_show_transcript are browser display settings "
-    "applied on config refresh; neither requires an assistant rotation. The "
+    "chat_show_transcript, chat_tint_operator and dock_keep_last_notes are browser "
+    "display settings applied on config refresh; none requires an assistant rotation. The "
     "resources group is "
     "read-only and environment-only, and like the launch settings it applies "
     "to the next incarnation: changing it does not resize a running container."
@@ -828,6 +846,13 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "chat": {
             key: setting.to_dict()
             for key, setting in chat_settings().items()
+        },
+        # Every run's operator channel dock (issue #465): a display preference
+        # edited from the platform settings page, served here too because the
+        # run view reads its display settings from this reply.
+        "dock": {
+            key: setting.to_dict()
+            for key, setting in dock_settings().items()
         },
         "checkin": {
             key: setting.to_dict()
@@ -2400,7 +2425,7 @@ def create_app(
     """
     # deferred: import cost — fastapi adds ~320 ms; anyio, starlette.requests and GZipMiddleware ~58 ms together
     import anyio
-    from fastapi import Depends, FastAPI, Header, HTTPException, Query
+    from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
         FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
     )
@@ -2421,6 +2446,35 @@ def create_app(
     @app.exception_handler(projects.ProjectError)
     async def project_error(_request, exc):
         return JSONResponse(status_code=exc.status, content={"detail": {"code": exc.code, "message": str(exc)}})
+
+    @app.exception_handler(sqlite3.OperationalError)
+    async def project_store_busy(request, exc):
+        # A writer holding projects.sqlite3 past the busy timeout is contention,
+        # not a fault: say so rather than answer an opaque 500. Any other
+        # OperationalError stays a 500 with its traceback. Only a failure inside
+        # the request binding (require_secret, before the handler ran) is known
+        # to have applied nothing; past it, a spawn or a create may have.
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise exc
+        state = request.state
+        unapplied = getattr(state, "binding_entered", False) and not getattr(
+            state, "binding_done", False)
+        logger.warning("platform_state_busy unapplied=%s error=%s", unapplied, exc)
+        reason = f"The project database is busy ({exc})."
+        if unapplied:
+            detail = _busy_detail(reason, retryable=True, advice=(
+                "It happened before the request was handled, so nothing was "
+                "applied; retry the request."))
+        else:
+            detail = _busy_detail(reason, retryable=False, advice=(
+                "The request may have partly applied: retry it only if it is "
+                "idempotent, otherwise check its effect first."))
+        return JSONResponse(
+            status_code=503,
+            content={"detail": detail},
+            headers={"Retry-After": RETRY_AFTER_SECONDS},
+        )
     mention_settings = ingress.settings if ingress else MentionSettings.from_env()
     ingress_status = ingress or Ingress(mention_settings)
 
@@ -2520,7 +2574,11 @@ def create_app(
                 body = value if isinstance(value, dict) else {}
             except ValueError:
                 pass
+        # Read by project_store_busy: a failure between these two marks is in
+        # the binding, before the handler, so it applied nothing.
+        request.state.binding_entered = True
         with project_api.bind(request, caller, body):
+            request.state.binding_done = True
             yield caller
 
     require_secret.__annotations__["request"] = Request
@@ -2718,7 +2776,10 @@ def create_app(
             "  POST /api/sessions/{id}/uploads      store one {name,data:base64};\n"
             "                                       the reply's `reference` is the\n"
             "                                       line to put in the message\n"
-            "  GET  /api/sessions/{id}/uploads/{name}  read one back\n\n"
+            "  GET  /api/sessions/{id}/uploads/{name}  read one back\n"
+            "  POST /api/sessions/{id}/private      Send Privately {text}; 0400\n"
+            "                                       file, reply's `reference` only\n"
+            "  DELETE /api/sessions/{id}/private/{name}  withdraw an undelivered one\n\n"
             "Stored host-side and bind-mounted into the container, because the\n"
             "input route types bytes at a PTY and has nowhere for a file. A\n"
             "session started before this existed has no store and is told so.\n\n"
@@ -2748,9 +2809,9 @@ def create_app(
             "                               pending count here is the only\n"
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"
-            "  POST /api/assistant/start    start it {handoff?, model?, harness?,\n"
-            "                               preset?, agents?, threads?} — 409 when one is\n"
-            "                               already up, which is how the incumbent\n"
+            "  POST /api/assistant/start    start it {handoff?, model?, effort?,\n"
+            "                               harness?, preset?, agents?, threads?} — 409\n"
+            "                               when one is already up, which is how the incumbent\n"
             "                               keeps its context window. 200, not 202:\n"
             "                               the session is up when this returns\n"
             "  POST /api/assistant/stop     stop it {reason?,handoff?}. NEVER\n"
@@ -2765,6 +2826,11 @@ def create_app(
             "                               assistant may call it for itself; the\n"
             "                               call does not return, because its own\n"
             "                               container is what this ends\n"
+            "  GET  /api/assistant/rotate-all  the assistants a rotate-all would reach\n"
+            "  POST /api/assistant/rotate-all  ask every running assistant to rotate\n"
+            "                               itself at its next breakpoint {reason?}:\n"
+            "                               a bus record each, never a stop.\n"
+            "                               Operator only\n"
             "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
             "                               model/harness/preset/agents/threads, with\n"
             "                               the layer that decided it (env /\n"
@@ -3040,10 +3106,11 @@ def create_app(
                 agents=body.get("agents"),
                 harness=body.get("harness"),
                 model=body.get("model"),
+                effort=body.get("effort"),
                 session_metadata=body.get("session_metadata"),
                 source_session_id=body.get("source_session_id"),
                 allow_unsigned_source=body.get("allow_unsigned_source"),
-                # Not a launch flag like the four above it: the slot resolves
+                # Not a launch flag like the ones above it: the slot resolves
                 # against ``config.slots`` and supplies the preset, which is why
                 # naming both is refused rather than ordered (issue #245).
                 slot=body.get("slot"),
@@ -4116,6 +4183,68 @@ def create_app(
             },
         )
 
+    # Send Privately (issue #510): the operator's text becomes a 0400 file in the
+    # session's own store and the reply carries only a reference line, which the
+    # client sends like an attachment's. ``body`` is typed ``object`` so a
+    # malformed body is refused here, in words that never repeat it, rather than
+    # by a validation error that echoes the input back.
+
+    def _private_caller(caller: Caller) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(
+                status_code=403,
+                detail="Send Privately is for the operator; this credential cannot use it",
+            )
+
+    @app.post(
+        "/api/sessions/{session_id}/private", dependencies=guard, status_code=201
+    )
+    def session_private(
+        session_id: str,
+        body: object = Body(default=None),
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Store private text for a live session and say how to refer to it."""
+        _private_caller(caller)
+        try:
+            entry = session_io.require_session(session_id)
+            live = session_io.session_is_live(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        if not live:
+            raise HTTPException(
+                status_code=410,
+                detail="this session has exited, so nothing was sent to it",
+            )
+        try:
+            stored = uploads.store_private(
+                session_id,
+                entry,
+                body.get("text") if isinstance(body, dict) else None,
+                max_bytes=upload_settings()["max_bytes"].value,
+                purpose=body.get("purpose") if isinstance(body, dict) else None,
+            )
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return stored.to_dict()
+
+    @app.delete(
+        "/api/sessions/{session_id}/private/{name}", dependencies=guard
+    )
+    def session_private_withdraw(
+        session_id: str, name: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Delete a private file whose reference never reached the session."""
+        _private_caller(caller)
+        try:
+            entry = session_io.require_session(session_id)
+            withdrawn = uploads.withdraw_private(session_id, entry, name)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"session": session_id, "name": name, "withdrawn": withdrawn}
+
     # --- ending one session (spec §7.5 / D22, T27) ---------------------------
     #
     # Two routes because they are two verbs, and the difference between them is the
@@ -4604,6 +4733,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except mute.MuteError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _mute_unwritten(exc) from exc
         return _mute_reply({"muted": muted, "changed": outcome["changed"], "run": outcome["key"]})
 
     def _set_session_mute(session_id: str, muted: bool, caller: Caller) -> dict:
@@ -4611,7 +4742,22 @@ def create_app(
             outcome = mute.set_session(session_id, muted=muted, by=_mute_caller(caller))
         except mute.MuteError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _mute_unwritten(exc) from exc
         return _mute_reply(outcome)
+
+    def _mute_unwritten(exc: StoreError) -> HTTPException:
+        """A mute write that failed may have landed in part; both verbs are
+        idempotent, so the answer is a retry, not an opaque 500."""
+        logger.warning("platform_mute_unwritten error=%s", exc)
+        return HTTPException(
+            status_code=503,
+            detail=_busy_detail(
+                f"The mute state could not be written ({exc}).", retryable=True,
+                advice="It may have partly applied; mute and unmute are idempotent, "
+                "so retry the request."),
+            headers={"Retry-After": RETRY_AFTER_SECONDS},
+        )
 
     @app.post("/api/runs/mute", dependencies=guard)
     def mute_run(body: dict, caller: Caller = Depends(require_secret)) -> dict:
@@ -5178,6 +5324,31 @@ def create_app(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return rotated.to_dict()
 
+    def _operator_only(caller: Caller, action: str) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail=f"{action} is for the operator; this credential cannot use it")
+
+    @app.get("/api/assistant/rotate-all", dependencies=guard)
+    def assistant_rotate_all_targets(caller: Caller = Depends(require_secret)) -> dict:
+        """The assistants a rotate-all would address, so the modal can list them first."""
+        _operator_only(caller, "Rotating every assistant")
+        return {"targets": rotate_requests.targets(), "reason_limit": rotate_requests.MAX_REASON_CHARS}
+
+    @app.post("/api/assistant/rotate-all", dependencies=guard)
+    def assistant_rotate_all(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Ask every running assistant to rotate itself (issue #646).
+
+        A request, not a rotation: each one is told on its bus and rotates through
+        ``lmer-ctl rotate`` with a handover when it reaches a breakpoint. The
+        reply's ``generation`` per target is the one asked; a higher one later is
+        the receipt.
+        """
+        _operator_only(caller, "Rotating every assistant")
+        try:
+            return rotate_requests.request_all((body or {}).get("reason"))
+        except rotate_requests.RotateRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/assistant/handoff", dependencies=guard)
     def assistant_handoff() -> dict:
         """The note the previous incarnation left for this one (§8.3).
@@ -5349,9 +5520,10 @@ def create_app(
         (:func:`lmer_platform.config.update_stored`).
 
         Keys are the launch-setting names (including ``threads``) plus the integer settings
-        (pane-only ``chat_keep_last``, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
+        (display-only ``dock_keep_last_notes`` from #465, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
-        #446) and the boolean ``chat_show_transcript`` (#488), which are spelled as their config
+        #446) and the booleans ``chat_show_transcript`` (#488) and ``chat_tint_operator`` (#646),
+        which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. A boolean takes ``true``/``false`` (the JSON
         values, or the two words as strings) and nothing looser. Omitted keys

@@ -19,8 +19,10 @@ from lmer_cli.connector_recovery import Recovery
 from lmer_cli.thread_access import (
     MAX_FILE_BYTES, UploadStore, outbound_file, post_thread, slack_upload_refusal,
 )
+from matrix_chat.connector import render_outbound as matrix_render_outbound
 from slack_chat.client import SlackClient, SlackError
 from slack_chat.connector import _share_refused
+from tests.test_lmer_thread_access import MATRIX_LINK, FakeMatrix
 from tests.test_slack_connector import (  # noqa: F401 — autouse fixtures
     _SHAPED, FakeSlack, Rig, _clean_lmer_env, registry_dir,
 )
@@ -88,7 +90,7 @@ class TestConnector:
         (store / "data.csv").write_bytes(b"a,b\n1,2\n")
         rig.agent("message", "results", attachments=[_item("data.csv")])
         rig.connector._outbound_once()
-        assert _texts(rig) == ["results\n📎 data.csv"]
+        assert _texts(rig) == ["results\n📎 `data.csv`"]
         assert rig.slack.uploads == [("F0001", "data.csv", b"a,b\n1,2\n")]
         assert rig.slack.shared == [("F0001", "C1", THREAD, "data.csv")]
 
@@ -130,8 +132,8 @@ class TestConnector:
         rig.slack.complete_upload = refuse
         rig.connector._outbound_once()
         assert _texts(rig) == [
-            "results\n📎 data.csv",
-            "📎 data.csv withheld: Slack refused the upload (restricted_action)",
+            "results\n📎 `data.csv`",
+            "📎 `data.csv` withheld: Slack refused the upload (restricted_action)",
         ]
         assert rig.connector._state.data["pending"] is None, "the record finished"
 
@@ -145,8 +147,8 @@ class TestConnector:
         rig.slack.complete_upload = refuse
         rig.connector._outbound_once()
         assert _texts(rig) == [
-            "results\n📎 data.csv",
-            "📎 data.csv withheld: Slack refused the upload (file_not_found)",
+            "results\n📎 `data.csv`",
+            "📎 `data.csv` withheld: Slack refused the upload (file_not_found)",
         ]
         assert not rig.connector._state.blocked and rig.connector._state.data["pending"] is None
 
@@ -162,7 +164,7 @@ class TestConnector:
         rig.slack.complete_upload = fail
         with pytest.raises(RecoveryRequired):
             rig.connector._outbound_once()
-        assert _texts(rig) == ["results\n📎 data.csv"], "no note for a file that may be shared"
+        assert _texts(rig) == ["results\n📎 `data.csv`"], "no note for a file that may be shared"
         assert rig.connector._state.blocked
 
     def test_a_credential_shaped_name_is_scrubbed_everywhere(self, rig, store):
@@ -201,7 +203,7 @@ class TestConnector:
             rig.slack.upload_error = SlackError("Slack API error", code="invalid_arguments")
         rig.agent("message", "see", attachments=[_item(name, "image/png")])
         rig.connector._outbound_once()
-        assert _texts(rig) == ["see\n📎 shot.png", f"📎 shot.png withheld: {reason}"]
+        assert _texts(rig) == ["see\n📎 `shot.png`", f"📎 `shot.png` withheld: {reason}"]
         assert rig.slack.shared == []
 
     def test_a_transient_failure_retries_the_file_and_not_the_text(self, rig, store):
@@ -210,10 +212,10 @@ class TestConnector:
         rig.slack.upload_error = SlackError("Request failed: ConnectionError")
         with pytest.raises(SlackError):
             rig.connector._outbound_once()
-        assert _texts(rig) == ["results\n📎 data.csv"] and rig.slack.shared == []
+        assert _texts(rig) == ["results\n📎 `data.csv`"] and rig.slack.shared == []
         rig.slack.upload_error = None
         rig.connector._outbound_once()
-        assert _texts(rig) == ["results\n📎 data.csv"], "the text is not posted twice"
+        assert _texts(rig) == ["results\n📎 `data.csv`"], "the text is not posted twice"
         assert [shared[0] for shared in rig.slack.shared] == ["F0001"]
 
     def test_an_uploaded_file_is_shared_once_after_a_failed_share(self, rig, store):
@@ -247,8 +249,8 @@ class TestSpeakerTag:
     def test_a_file_withheld_before_upload_is_tagged(self, rig, store, speaker):
         rig.agent("message", "see", attachments=[_item("shot.png", "image/png")])
         rig.connector._outbound_once()
-        assert _texts(rig) == ["[run-a] see\n📎 shot.png",
-                               f"[run-a] 📎 shot.png withheld: {thread_access.WITHHELD_UNREADABLE}"]
+        assert _texts(rig) == ["[run-a] see\n📎 `shot.png`",
+                               f"[run-a] 📎 `shot.png` withheld: {thread_access.WITHHELD_UNREADABLE}"]
 
     def test_a_refused_share_keeps_the_tag_it_committed_to_across_a_retry(self, rig, store, speaker, monkeypatch):
         """Delivery refuses changed content on a retry, so a run titled between a
@@ -269,8 +271,8 @@ class TestSpeakerTag:
         note_fails["value"] = rig.slack.fail_post = False
         rig.connector._outbound_once()
         assert _texts(rig) == [
-            "[run-a] results\n📎 data.csv",
-            "[run-a] 📎 data.csv withheld: Slack refused the upload (restricted_action)",
+            "[run-a] results\n📎 `data.csv`",
+            "[run-a] 📎 `data.csv` withheld: Slack refused the upload (restricted_action)",
         ]
         assert rig.connector._state.data["pending"] is None, "the record finished"
 
@@ -305,8 +307,8 @@ class TestPostThread:
         self._post(slack, store, [_item("a.png", "image/png"), _item("b.csv")], poster=poster)
         texts = [text for _c, _t, text in slack.posted]
         assert texts[1] == (
-            f"[run] 📎 a.png withheld: {thread_access.WITHHELD_CREDENTIAL}\n"
-            "📎 b.csv withheld: the Slack app lacks the files:write scope"
+            f"[run] 📎 `a.png` withheld: {thread_access.WITHHELD_CREDENTIAL}\n"
+            "📎 `b.csv` withheld: the Slack app lacks the files:write scope"
         )
         note_ts = f"{1700000000 + 1}.000100"
         assert thread_posts.lookup("C0123ABCDEF", note_ts) == poster
@@ -327,6 +329,68 @@ class TestPostThread:
         self._post(slack, store, [_item("data.csv")], poster=poster)
         share = {"ts": "1712345680.000100", "user": "UBOT", "files": [{"id": "F0001"}]}
         assert thread_posts.poster_from_slack("C0123ABCDEF", share) == poster
+
+
+class TestMrkdwnSafeNames:
+    """A file name is shown, never rendered: Slack gets it entity-escaped in a
+    code span, so ``*``/``_`` cannot format and ``<``/``&`` cannot ping or
+    link. Matrix posts plain text and the caller gets the raw name."""
+
+    NAME = "my_draft*v2<!channel>&co`x.txt"
+    SHOWN = "`my_draft*v2&lt;!channel&gt;&amp;coˋx.txt`"
+
+    def test_the_connector_line_and_the_note_for_a_file_withheld_before_upload(self, rig, store):
+        rig.agent("message", "see", attachments=[_item(self.NAME, stored="absent.csv")])
+        rig.connector._outbound_once()
+        assert _texts(rig) == [
+            f"see\n📎 {self.SHOWN}",
+            f"📎 {self.SHOWN} withheld: {thread_access.WITHHELD_UNREADABLE}",
+        ]
+
+    def test_the_connector_note_for_a_refused_share(self, rig, store):
+        (store / "data.csv").write_bytes(b"a,b\n")
+        rig.agent("message", "results", attachments=[_item(self.NAME, stored="data.csv")])
+
+        def refuse(*args, **kwargs):
+            raise SlackError("Slack API error: restricted_action", code="restricted_action")
+
+        rig.slack.complete_upload = refuse
+        rig.connector._outbound_once()
+        assert _texts(rig)[1] == f"📎 {self.SHOWN} withheld: Slack refused the upload (restricted_action)"
+        assert rig.slack.uploads[0][1] == self.NAME, "the file itself keeps its name"
+
+    def test_post_thread_line_and_note_with_the_raw_name_for_the_caller(self, store):
+        slack = UploadingSlack()
+        slack.bot_token = "xoxb-test"
+        result = post_thread(
+            TestPostThread.LINK, "have a look", label="run",
+            attachments=[_item(self.NAME, stored="absent.csv")],
+            store=UploadStore(str(store), CONTAINER), client=slack,
+            ref=thread_access.parse_thread(TestPostThread.LINK),
+        )
+        texts = [text for _c, _t, text in slack.posted]
+        assert texts == [
+            f"[run] have a look\n📎 {self.SHOWN}",
+            f"[run] 📎 {self.SHOWN} withheld: {thread_access.WITHHELD_UNREADABLE}",
+        ]
+        assert result["posted"]["withheld"] == [
+            {"name": self.NAME, "reason": thread_access.WITHHELD_UNREADABLE},
+        ]
+
+    def test_matrix_shows_the_name_as_is(self, store):
+        record = {"kind": "message", "text": "see", "source": {"channel": "agent"},
+                  "attachments": [{"name": self.NAME}]}
+        assert matrix_render_outbound(record) == f"see\n📎 {self.NAME}"
+
+        matrix = FakeMatrix()
+        post_thread(
+            MATRIX_LINK, "have a look", label="run", env={},
+            attachments=[_item(self.NAME, stored="absent.csv")],
+            store=UploadStore(str(store), CONTAINER), client=matrix,
+            ref=thread_access.parse_thread(MATRIX_LINK),
+        )
+        notes = [text for text, msgtype in matrix.sent if msgtype == "m.notice"]
+        assert len(notes) == 1 and notes[0].startswith(f"[run] 📎 {self.NAME} withheld: ")
 
 
 class TestSharedRules:

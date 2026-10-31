@@ -21,6 +21,7 @@ from tests.test_assistant_mentions import (
     body, isolated, matrix_event, remember, slack_event, transports,
 )
 from lmer_platform import daemon, project_requests
+from tests.timing_budgets import JOIN
 
 
 def manager(monkeypatch, *, matrix=False):
@@ -37,7 +38,8 @@ async def until(predicate):
     async def wait():
         while not predicate():
             await asyncio.sleep(0.005)
-    await asyncio.wait_for(wait(), timeout=5)
+    # JOIN, not 5 s: a loaded gate missed a 5 s wait here (#636).
+    await asyncio.wait_for(wait(), timeout=JOIN)
 
 
 def test_configuration_is_visible_without_network():
@@ -267,7 +269,7 @@ async def test_shutdown_cancels_sdk_reconnect_dispatch(monkeypatch):
         async with component.lifespan(None):
             await until(lambda: component.snapshot()["slack"]["up"])
             task = asyncio.create_task(sockets[0].run_message_listeners({"type": "disconnect"}, ""))
-            await asyncio.wait_for(reconnecting.wait(), 5)
+            await asyncio.wait_for(reconnecting.wait(), JOIN)
         assert task.done(), "SDK reconnect dispatch survived daemon shutdown"
     finally:
         if task is not None:
@@ -291,7 +293,7 @@ async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, o
     def receive(*args, **kwargs):
         owners.append(replayer.get())
         entered.set()
-        assert release.wait(5), "test did not release admission"
+        assert release.wait(JOIN), "test did not release admission"
         try:
             return original(*args, **kwargs)
         finally:
@@ -331,7 +333,7 @@ async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, o
         await until(lambda: fake_socket[0][0].closed)
         assert not stopping.done()
         release.set()
-        await asyncio.wait_for(stopping, 5)
+        await asyncio.wait_for(stopping, JOIN)
         await event
         assert owners == [owner], "the pin did not decide which replay admitted"
         assert finished_after_admission == [True]
@@ -343,9 +345,9 @@ async def test_shutdown_waits_for_inflight_admission(monkeypatch, fake_socket, o
         if stopping is None:
             await lifetime.__aexit__(None, None, None)
         else:
-            await asyncio.wait_for(asyncio.gather(stopping, return_exceptions=True), 5)
+            await asyncio.wait_for(asyncio.gather(stopping, return_exceptions=True), JOIN)
         if event is not None:
-            await asyncio.wait_for(asyncio.gather(event, return_exceptions=True), 5)
+            await asyncio.wait_for(asyncio.gather(event, return_exceptions=True), JOIN)
 
 
 @pytest.mark.asyncio

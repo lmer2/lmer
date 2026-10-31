@@ -17,7 +17,8 @@ version (reslug_run: `release-<repo>` → `release-<repo>-v0.6.0`), which is
 what frees the bare address for the NEXT release. Because dirs can be
 renamed, a directory name is never a valid address: every lookup goes
 through find_run_dir(), which matches on state.yaml content (slug, then
-name), with find_successor_run_dir() covering the re-slug case.
+name), with find_successor_run_dir() covering the re-slug case: the live
+run that moved, or a finished one this launch wrote (issue #172).
 
 The run area is form-routed (issue #353 D20): `{work}/{host}/{project}/runs/`
 in a legacy tree, `<project>/_runs/` under the registry-resolved project dir
@@ -171,6 +172,9 @@ SESSION_DIR_RE = re.compile(rf"{SESSION_ID_RE.pattern}(?:--.+)?")
 # (D22 resume). Optional and additive: a record without it is a record from
 # before the field, or a legacy run dir, which never grows one.
 SESSIONS_FIELD = "sessions"
+# The label current_session_id stamps when there is no launch id — an
+# unknown writer, never an identity anything can be matched by.
+UNKNOWN_SESSION_ID = "unknown"
 # A session id names one directory inside a group, so: the segments
 # `lmer_platform.answer._reject_traversal` refuses, and the characters
 # `Path.glob` would expand rather than compare (see _usable_session_id).
@@ -246,7 +250,7 @@ def utc_now_iso() -> str:
 
 
 def current_session_id() -> str:
-    return os.environ.get("LMER_SESSION_ID", "unknown")
+    return os.environ.get("LMER_SESSION_ID", UNKNOWN_SESSION_ID)
 
 
 def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> str:
@@ -829,8 +833,11 @@ def slug_available(
         return False
 
 
-def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Optional[Path]:
-    """The LIVE run carrying this slug's identity after a re-slug.
+def find_successor_run_dir(
+    identifier: str, base: Optional[Path] = None, session: Optional[str] = None
+) -> Optional[Path]:
+    """The run carrying this slug's identity after a re-slug: a LIVE one, or
+    a finished one THIS launch wrote.
 
     A release run re-slugs itself the moment leg 1 records the version
     (`release-<repo>` → `release-<repo>-v0.6.0`, reslug_run), so the address
@@ -846,34 +853,97 @@ def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Opti
     derive_slug's own contract rules out. Runs that never re-slugged carry
     no `reslugged_from` and are excluded by construction.
 
-    Only IN-PROGRESS runs qualify, and that is the whole point of the
-    version-bearing slug: a terminal run has given its address up, so the
-    next release seeds fresh at the bare address instead of resolving a
-    finished run and being refused forever. (It is also what keeps a
-    declined release and its successor apart — both vacated the same seed
-    address, but only one of them is live.)
+    For every OTHER launch only IN-PROGRESS runs qualify, and that is the
+    whole point of the version-bearing slug: a terminal run has given its
+    address up, so the next release seeds fresh at the bare address instead
+    of resolving a finished run and being refused forever. (It is also what
+    keeps a declined release and its successor apart — both vacated the same
+    seed address, but only one of them is live.) The launch that wrote the
+    terminal run is the exception (issue #172, :func:`_written_by_launch`;
+    `session` is a resume naming the launch this one continues): its `work
+    commit` must still stage the completion write, and its next `work log`
+    must land there rather than seed a phantom live run at the vacated
+    address.
 
-    Ties are not expected (single-flight allows one live release per repo)
-    but resolve deterministically: newest `created`, then dir name.
+    A run this launch wrote wins over one it did not; ties are not expected
+    (single-flight allows one live release per repo) but resolve
+    deterministically: newest `created`, then dir name.
     """
     if base is None:
         base = runs_base()
     if base is None:
         return None
-    matches: list[tuple[str, str, Path]] = []
+    matches: list[tuple[bool, str, str, Path]] = []
     for child in iter_record_dirs(base):
         try:
             state = _read_sibling_state(child)
         except OSError:
             continue
-        if not isinstance(state, dict) or state.get("status") != "in-progress":
+        if not isinstance(state, dict) or not has_vacated(state, identifier):
             continue
-        if not has_vacated(state, identifier):
+        mine = _written_by_launch(child, state, session)
+        if state.get("status") != "in-progress" and not mine:
             continue
-        matches.append((str(state.get("created") or ""), _area_rel_name(base, child), child))
+        matches.append(
+            (mine, str(state.get("created") or ""), _area_rel_name(base, child), child)
+        )
     if not matches:
         return None
-    return max(matches)[2]
+    return max(matches)[3]
+
+
+def _written_by_launch(
+    rdir: Path, state: dict, session: Optional[str] = None
+) -> bool:
+    """Whether this launch has written in *rdir*: as `LMER_SESSION_ID`, or as
+    the *session* a resume names — the launch it continues, whose lineage
+    :func:`attach_session` is about to extend. That id may be spelled as the
+    frozen `<sid>--<name>` dir name, as :func:`_named_session` accepts it.
+
+    Asked of facts this kernel records itself: a session dir's own id, its
+    `sessions:` lineage, and the `session` every :func:`append_event` stamps —
+    the last being the only one a legacy run dir has. An invocation with
+    neither id has written nowhere. :data:`UNKNOWN_SESSION_ID` is never a
+    launch id: every contextless invocation stamps its events with it, so a
+    `--session unknown` would claim any finished run one of those wrote.
+    """
+    launch_ids = {
+        sid for sid in (session and session_id_of(session), launch_session_id())
+        if sid and sid != UNKNOWN_SESSION_ID
+    }
+    if not launch_ids:
+        return False
+    if (session_id_of(rdir.name) in launch_ids
+            or launch_ids.intersection(session_lineage(state))):
+        return True
+    try:
+        events = read_events(rdir, last_n=0)
+    except OSError:
+        return False
+    # read_events keeps any JSON object, so the stamp may not be hashable.
+    return any(
+        isinstance(stamp := event.get("session"), str) and stamp in launch_ids
+        for event in events
+    )
+
+
+def finished_run_vacating(slug: str, base: Optional[Path] = None) -> Optional[Path]:
+    """A terminal run that records having vacated *slug*, or None. A seed at
+    that address by an invocation that cannot say whether the run is its own
+    would be a phantom of it (issue #172)."""
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return None
+    for child in iter_record_dirs(base):
+        state = _read_sibling_state(child)
+        if (
+            isinstance(state, dict)
+            and state.get("status") != "in-progress"
+            and has_vacated(state, slug)
+        ):
+            return child
+    return None
 
 
 def vacated_slugs(state: dict) -> tuple[str, ...]:
@@ -896,13 +966,16 @@ def has_vacated(state: dict, slug: str) -> bool:
     return isinstance(slug, str) and slug in vacated_slugs(state)
 
 
-def resolve_run_dir(slug: str, base: Optional[Path] = None) -> Optional[Path]:
-    """The run dir addressed by `slug`: the run recording it, else the live
-    run that re-slugged away from it. None when neither exists."""
+def resolve_run_dir(
+    slug: str, base: Optional[Path] = None, session: Optional[str] = None
+) -> Optional[Path]:
+    """The run dir addressed by `slug`: the run recording it, else the run
+    that re-slugged away from it (:func:`find_successor_run_dir`). None when
+    neither exists."""
     found = find_run_dir(slug, base)
     if found is not None:
         return found
-    return find_successor_run_dir(slug, base)
+    return find_successor_run_dir(slug, base, session)
 
 
 def _unreadable_state_candidate(base: Path, slug: str) -> Optional[Path]:
@@ -1065,7 +1138,7 @@ def _record_address(
                 raise RunStateError(f"session UID {uid} has more than one record")
             if matches:
                 return matches[0]
-    found = resolve_run_dir(slug, base) or _unreadable_state_candidate(base, slug)
+    found = resolve_run_dir(slug, base, session) or _unreadable_state_candidate(base, slug)
     if found is None:
         return _creation_address(base, slug, session)
     if not is_session_form() or found.parent == base:
@@ -1698,9 +1771,39 @@ def ensure_run(
             write_state(rdir, state)
             append_event(rdir, "run_seeded")
         else:
+            refuse_contextless_phantom(slug)
             rdir, state = seed_run_dir(slug, taskdef, target, session=session)
     attach_session(rdir, state)
     return rdir, state
+
+
+def refuse_contextless_phantom(slug: str) -> None:
+    """Refuse to seed at an address a finished run vacated when this
+    invocation has no `LMER_SESSION_ID` (issue #172).
+
+    A launched session finds its own finished run through
+    :func:`find_successor_run_dir`, and a different launch seeding here is the
+    next release doing exactly what the re-slug freed the address for. With
+    no `LMER_SESSION_ID` neither can be told apart, and guessing "new run"
+    leaves a live phantom where the next release's claim resolves. A
+    `--session` is no exemption. A resume of the finished run's launch has
+    usually resolved it by then, but not always: :func:`_written_by_launch`
+    finds the run by the session dir's id, its lineage or its events, while
+    :func:`_session_dir` picks the dir inside it by name only, so a
+    lineage-only id or a mistyped `--<name>` half reaches this seed too.
+    """
+    if launch_session_id() is not None:
+        return
+    finished = finished_run_vacating(slug)
+    if finished is None:
+        return
+    raise RunStateError(
+        f"refusing to start a new run at '{slug}': the finished run at "
+        f"{run_area_rel_name(finished) or finished} moved away from that address, "
+        "and without LMER_SESSION_ID this invocation cannot tell whether that "
+        "run is its own. Run this from the launched session, or start the next "
+        "run with an lmer launch."
+    )
 
 
 def list_sessions(
@@ -2174,7 +2277,9 @@ def read_events(rdir: Path, last_n: int = 5) -> list[dict]:
     if not path.exists():
         return []
     events = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # Notes are written with ensure_ascii=False, so a torn append can end
+    # mid-character; that line is then skipped like any other torn line.
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue

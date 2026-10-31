@@ -14,8 +14,12 @@ import pytest
 
 from lmer_cli import container_follow, runtime
 from lmer_cli.container import clone_and_exec
+from tests.timing_budgets import CLI, JOIN, SETTLE, stretch, wait_until
 
 FAKE = Path(__file__).with_name("fake_container_runtime.py")
+#: Outlasts the longest container these tests run (``sleep 30``), so only a
+#: hang in the fake reaches it.
+RUNTIME_DEADLINE = stretch(60.0)
 
 
 @pytest.fixture
@@ -31,6 +35,7 @@ def fake_runtime(tmp_path, monkeypatch):
         shim.chmod(0o755)
     state = tmp_path / "containers"
     monkeypatch.setenv("FAKE_RUNTIME_STATE", str(state))
+    monkeypatch.setenv("FAKE_RUNTIME_DEADLINE", str(RUNTIME_DEADLINE))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     # Cached per runtime name; each test's PATH may answer differently.
     container_follow._supports_sig_proxy.cache_clear()
@@ -53,6 +58,27 @@ def both(capfd):
     not a terminal here)."""
     captured = capfd.readouterr()
     return captured.out + captured.err
+
+
+def remove_once_running(state, cid):
+    """``docker rm --force`` *cid* once its process is up, from a thread.
+    Returns a join that says whether it was up: a fixed delay raced the start
+    under load (#636). The removal runs either way, so a follower never hangs
+    on a container that never came up."""
+    up = []
+
+    def remove():
+        up.append(wait_until(lambda: (state / cid / "pid").exists(), budget=SETTLE))
+        subprocess.run(["docker", "rm", "--force", cid], check=False)
+
+    thread = threading.Thread(target=remove, daemon=True)
+    thread.start()
+
+    def removed_while_running():
+        thread.join(JOIN)
+        return up == [True]
+
+    return removed_while_running
 
 
 def follow(cid, **kwargs):
@@ -138,8 +164,9 @@ def test_an_exit_file_for_another_container_is_ignored(
     monkeypatch.setenv(container_follow.EXIT_FILE_ENV, str(exit_file))
     cid = fake_runtime("sleep 30")
     exit_file.write_text(json.dumps({"exit_code": 9, "container": "someone-else"}))
-    threading.Timer(0.5, subprocess.run, (["docker", "rm", "--force", cid],)).start()
+    removed_while_running = remove_once_running(fake_runtime.state, cid)
     assert follow(cid) != 9
+    assert removed_while_running()
 
 
 def test_a_replay_starts_where_the_follower_says(fake_runtime, capfd):
@@ -177,9 +204,38 @@ def test_sigterm_stops_the_container_and_still_records_its_exit(fake_runtime, ca
 
 def test_a_container_that_vanished_is_not_reported_as_a_clean_exit(fake_runtime, capfd):
     cid = fake_runtime("sleep 30")
-    threading.Timer(0.5, subprocess.run, (["docker", "rm", "--force", cid],)).start()
+    removed_while_running = remove_once_running(fake_runtime.state, cid)
     assert follow(cid) != 0
     assert "exited with code unknown" in both(capfd)
+    assert removed_while_running()
+
+
+def test_the_fake_start_of_a_removed_container_fails_rather_than_hangs(fake_runtime):
+    """The fake's start used to wait forever for a pid that a container removed
+    before it ran never publishes (#636)."""
+    cid = fake_runtime("sleep 30")
+    subprocess.run(["docker", "rm", "--force", cid], check=True)
+    result = subprocess.run(
+        ["docker", "start", "--attach", cid],
+        capture_output=True, text=True, timeout=CLI, check=False,
+    )
+    assert result.returncode == 1
+    assert f"no such container: {cid}" in result.stderr
+
+
+def test_a_fake_wait_past_its_deadline_exits_124(fake_runtime):
+    """A hang in the fake fails its test rather than stalling the gate (#636)."""
+    cid = fake_runtime("sleep 30")
+    subprocess.run(["docker", "start", cid], check=True)
+    try:
+        result = subprocess.run(
+            ["docker", "wait", cid], capture_output=True, text=True, timeout=CLI,
+            env={**os.environ, "FAKE_RUNTIME_DEADLINE": "0.5"}, check=False,
+        )
+    finally:
+        container_follow.remove("docker", cid)
+    assert result.returncode == 124
+    assert "FAKE_RUNTIME_DEADLINE" in result.stderr
 
 
 def test_console_commands_carry_the_detach_keys(fake_runtime):

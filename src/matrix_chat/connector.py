@@ -33,6 +33,7 @@ from slack_chat.connector import (
 )
 
 from .client import MatrixAccount, MatrixClient, MatrixError
+from .crypto import BRIDGE_URL_ENV, NO_SESSION, CryptoError, encrypted_room_refusal
 from .permalink import matrix_to_link, parse_matrix_permalink
 from lmer_cli.assistant_mentions import route_connected_mention
 
@@ -50,9 +51,23 @@ HOMESERVER_ENV = "LMER_MATRIX_HOMESERVER"
 USER_ID_ENV = "LMER_MATRIX_USER_ID"
 ACCESS_TOKEN_ENV = "LMER_MATRIX_ACCESS_TOKEN"
 AUTHENTICATED_MEDIA_ENV = "LMER_MATRIX_AUTHENTICATED_MEDIA"
+#: MXIDs whose replies may answer an operator-only question (#599). Unset or
+#: empty means none may: there is no way to tell another bot account in the
+#: room from a human, so that question is answered on Slack or the platform.
+OPERATOR_USERS_ENV = "LMER_MATRIX_OPERATOR_USERS"
 
 BUS_POLL_SECONDS = 25.0
 SYNC_TIMEOUT_MS = 25000
+
+#: How long an encrypted event waits for its room key to reach the bridge. A
+#: key normally lands within a sync or two; one that has not arrived in ten
+#: minutes was never sent to the bridge's device. Replies held because the
+#: bridge was unreachable when the room turned encrypted wait for it unbounded,
+#: capped only by :data:`MAX_UNDECRYPTED`.
+UNDECRYPTED_GIVE_UP_SECONDS = 600.0
+#: Held events are re-sent to the bridge on every sync; anyone in the room can
+#: post events with session ids that will never resolve.
+MAX_UNDECRYPTED = 200
 
 #: Matrix bodies are not size-capped by the spec in practice, but a thread is
 #: read on a phone; the bridge's cap.
@@ -90,6 +105,10 @@ class ConnectorConfig:
     connect_budget: float = bus.DEFAULT_CONNECT_BUDGET
     #: See :data:`lmer_cli.connector_lifecycle.PLATFORM_SESSION_ENV`.
     platform_session: Optional[str] = None
+    #: See :data:`matrix_chat.crypto.BRIDGE_URL_ENV`.
+    bridge_url: Optional[str] = None
+    #: See :data:`OPERATOR_USERS_ENV`.
+    operator_users: frozenset = frozenset()
 
     @classmethod
     def from_env(
@@ -146,11 +165,17 @@ class ConnectorConfig:
             uploads_dir=uploads_dir, container_uploads_dir=container_uploads_dir,
             connect_budget=bus.connect_budget(environ),
             platform_session=(environ.get(PLATFORM_SESSION_ENV) or "").strip() or None,
+            bridge_url=(environ.get(BRIDGE_URL_ENV) or "").strip() or None,
+            # Comma-separated, as LMER_MATRIX_ALLOWED_USERS is (matrix_chat.listener).
+            operator_users=frozenset(
+                item.strip() for item in (environ.get(OPERATOR_USERS_ENV) or "").split(",") if item.strip()
+            ),
         )
 
     @property
     def account(self) -> MatrixAccount:
-        return MatrixAccount(homeserver=self.homeserver, user_id=self.user_id, access_token=self.access_token)
+        return MatrixAccount(homeserver=self.homeserver, user_id=self.user_id, access_token=self.access_token,
+                             bridge_url=self.bridge_url)
 
 
 def render_outbound(
@@ -196,7 +221,7 @@ def resolve_thread_root(event: dict) -> str:
 
 
 class MatrixConnector(ConnectorLifecycle):
-    _transport_fields = ("_seen", "_next_batch", "_last_event_id", "_question_events")
+    _transport_fields = ("_seen", "_next_batch", "_last_event_id", "_question_events", "_undecrypted")
     _bus_poll_seconds = BUS_POLL_SECONDS
 
     def __init__(
@@ -227,10 +252,18 @@ class MatrixConnector(ConnectorLifecycle):
         self._names: dict = {}
         #: question id → the event this connector posted for it, for `_replies_to`
         self._question_events: dict = {}
+        #: event id → ``{"event", "since"}``: thread events whose room key has
+        #: not reached the bridge yet. Wall-clock, since it outlives a restart.
+        self._undecrypted: dict = {}
+        self._wall_clock = time.time
+        self.encrypted = False
         #: questions whose one free-text chance has been used
         self._answered_freely: set = set()
         #: Whether the thread has been told this connector is listening.
         self._announced = False
+        #: Whether the thread has been told why no reply here answers an
+        #: operator-only question (OPERATOR_USERS_ENV unset).
+        self._operator_list_noted = False
         #: Who wrote the events this bot account sent (#427).
         self._posters = thread_posts.Attribution(
             poster_of=lambda event: thread_posts.poster_from_matrix(event.get("content")),
@@ -269,7 +302,8 @@ class MatrixConnector(ConnectorLifecycle):
             except MatrixError as exc:
                 logger.info("matrix_connector_join_skipped room=%s error=%s", room_id, exc)
             if self.matrix.room_is_encrypted(room_id):
-                raise MatrixError(f"room {room_id} is end-to-end encrypted; this connector requires a plaintext room")
+                self._require_crypto(room_id)
+                self.encrypted = True
         except BaseException:
             self._lease.close()
             self._lease = self._state = None
@@ -277,6 +311,24 @@ class MatrixConnector(ConnectorLifecycle):
         self.room_id = room_id
         return room_id
 
+
+    def _require_crypto(self, room_id: str) -> None:
+        """Refuse an encrypted room unless the bridge lends this token its device."""
+        crypto = self.matrix.crypto if self.matrix.can_encrypt else None
+        if crypto is None:
+            raise MatrixError(encrypted_room_refusal(room_id))
+        try:
+            identity = crypto.whoami()
+        except CryptoError as exc:
+            raise MatrixError(f"room {room_id} is end-to-end encrypted, and {exc}",
+                              status=exc.status, transient=exc.transient) from exc
+        if identity.get("user_id") != self.config.user_id:
+            raise MatrixError(
+                f"room {room_id} is end-to-end encrypted, and lmer-matrix-bridge's device belongs to "
+                f"{identity.get('user_id')}, not {self.config.user_id} — set {USER_ID_ENV} to the "
+                "bridge's appservice user"
+            )
+        logger.info("matrix_connector_encrypted room=%s device=%s", room_id, identity.get("device_id"))
 
     def _warn(self, message: str) -> None:
         """Loud on both sides: the host `lmer` process configures no logging."""
@@ -365,17 +417,25 @@ class MatrixConnector(ConnectorLifecycle):
                         if upload and upload["identity"] != identity:
                             raise RecoveryRequired("pending attachment bytes changed")
                     if upload is None:
-                        mxc = self.matrix.upload(clean, content_type=media_type, filename=name)
-                        upload = {"identity": identity, "mxc": mxc}
+                        if self.matrix.encrypts(self.room_id):
+                            upload = {"identity": identity, "file": self.matrix.upload_encrypted(clean)}
+                        else:
+                            mxc = self.matrix.upload(clean, content_type=media_type, filename=name)
+                            upload = {"identity": identity, "mxc": mxc}
                         with self._state.lock:
                             pending["uploads"][part] = upload
                             self._state.save()
-                    payload = {**identity, "mxc": upload["mxc"]}
+                    payload = {**identity, **{key: upload[key] for key in ("mxc", "file") if key in upload}}
             def send():
                 if "text" in payload:
                     return self.matrix.send_thread_text(
                         self.room_id, self.config.thread_event, payload["text"],
                         last_event_id=self._last_event_id, msgtype="m.notice")
+                if "file" in payload:
+                    return self.matrix.send_thread_file(
+                        self.room_id, self.config.thread_event, file=payload["file"], name=payload["name"],
+                        media_type=payload["media_type"], size=payload["size"],
+                        last_event_id=self._last_event_id, extra=self._mirror_content())
                 return self.matrix.send_thread_file(
                     self.room_id, self.config.thread_event, mxc=payload["mxc"], name=payload["name"],
                     media_type=payload["media_type"], size=payload["size"], last_event_id=self._last_event_id,
@@ -394,8 +454,8 @@ class MatrixConnector(ConnectorLifecycle):
         return {
             "room": {
                 "rooms": [self.room_id],
-                "timeline": {"limit": 50, "types": ["m.room.message", "m.room.encrypted"]},
-                "state": {"lazy_load_members": True, "types": []},
+                "timeline": {"limit": 50, "types": ["m.room.message", "m.room.encrypted", "m.room.encryption"]},
+                "state": {"lazy_load_members": True, "types": ["m.room.encryption"]},
                 "ephemeral": {"types": []},
                 "account_data": {"types": []},
             },
@@ -423,11 +483,16 @@ class MatrixConnector(ConnectorLifecycle):
         initial = self.matrix.sync(filter_body=self._room_filter(), timeout_ms=0)
         rooms = ((initial.get("rooms") or {}).get("join") or {})
         room = rooms.get(self.room_id) or {}
+        self._watch_encryption(room)
         timeline = ((room.get("timeline") or {}).get("events") or [])
         events.extend(
             event for event in timeline
             if isinstance(event, dict) and resolve_thread_root(event) == self.config.thread_event
         )
+        if self.encrypted:
+            # History that will not decrypt now is neither counted nor waited for.
+            events = [plain or event for event, (plain, _problem)
+                      in zip(events, self.matrix.decrypt_events(self.room_id, events))]
         snapshot = {
             event["event_id"]: event for event in events
             if isinstance(event, dict) and isinstance(event.get("event_id"), str)
@@ -450,19 +515,21 @@ class MatrixConnector(ConnectorLifecycle):
         resumed = self._resume_pending_inbound()
         body = self.matrix.sync(since=self._next_batch, filter_body=self._room_filter(), timeout_ms=SYNC_TIMEOUT_MS)
         rooms = ((body.get("rooms") or {}).get("join") or {})
-        events = (((rooms.get(self.room_id) or {}).get("timeline") or {}).get("events") or [])
+        room = rooms.get(self.room_id) or {}
+        self._watch_encryption(room)
+        events = ((room.get("timeline") or {}).get("events") or [])
+        thread = [event for event in events
+                  if isinstance(event, dict) and resolve_thread_root(event) == self.config.thread_event]
+        thread = self._readable(thread)
         try:
             with self._state.lock:
                 inbound = []
-                for event in events:
-                    if event.get("type") == "m.room.encrypted":
-                        logger.warning("matrix_connector_encrypted_event room=%s", self.room_id)
-                        continue
-                    if resolve_thread_root(event) != self.config.thread_event:
-                        continue
+                for event in thread:
                     relay, poster = self._inbound(event)
                     if relay:
                         inbound.append((event, poster))
+                    else:
+                        self._undecrypted.pop(event.get("event_id"), None)
                 ready = self._posters.due() + inbound
                 self._state.save()
             posted = resumed
@@ -471,6 +538,9 @@ class MatrixConnector(ConnectorLifecycle):
                     posted += 1
                 with self._state.lock:
                     self._posters.ack(event)
+                    # Only now: a held event is in no later sync batch, so
+                    # releasing it before it is handled would lose it.
+                    self._undecrypted.pop(event.get("event_id"), None)
                     self._state.save()
             with self._state.lock:
                 self._next_batch = body.get("next_batch") or self._next_batch
@@ -478,6 +548,98 @@ class MatrixConnector(ConnectorLifecycle):
             return posted
         finally:
             self._posters.release()
+
+    def _readable(self, thread: list) -> list:
+        """*thread* with encrypted events decrypted, plus held ones whose key
+        has now arrived; what still cannot be read is held or dropped."""
+        with self._state.lock:
+            held = [entry["event"] for entry in self._undecrypted.values()]
+            candidates = held + [event for event in thread if event.get("event_id") not in self._undecrypted]
+        sealed = [event for event in candidates if event.get("type") == "m.room.encrypted"]
+        if not sealed:
+            return candidates
+        if not self.encrypted:
+            clear = [event for event in candidates if event.get("type") != "m.room.encrypted"]
+            try:
+                # Anyone can send m.room.encrypted; only the room's state says
+                # whether it is encrypted.
+                turned = (self.matrix.can_encrypt and self.matrix.room_is_encrypted(self.room_id)
+                          and self._turn_encrypted())
+            except MatrixError as exc:
+                if not exc.transient:
+                    raise
+                logger.warning("matrix_connector_encryption_unconfirmed room=%s error=%s", self.room_id, exc)
+                self._hold([(event, NO_SESSION) for event in sealed], bridge_down=True)
+                return clear
+            if not turned:
+                with self._state.lock:
+                    for event in sealed:
+                        self._undecrypted.pop(event.get("event_id"), None)
+                logger.warning("matrix_connector_encrypted_event room=%s events=%d",
+                               self.room_id, len(sealed))
+                return clear
+        results = self.matrix.decrypt_events(self.room_id, candidates)
+        readable = [plain for plain, _problem in results if plain is not None]
+        self._hold([(event, problem) for event, (plain, problem) in zip(candidates, results) if plain is None])
+        return readable
+
+    def _hold(self, failed, *, bridge_down=False) -> None:
+        """Keep events whose key may still arrive; drop the rest, the overdue
+        and the oldest past :data:`MAX_UNDECRYPTED`. While *bridge_down* the
+        key-arrival clock does not run: it starts once the bridge answers."""
+        now = self._wall_clock()
+        with self._state.lock:
+            for event, problem in failed:
+                event_id = event.get("event_id")
+                entry = self._undecrypted.setdefault(event_id, {"event": event, "since": now})
+                if bridge_down:
+                    entry["bridge_down"] = True
+                    continue
+                if entry.pop("bridge_down", False):
+                    entry["since"] = now
+                if problem != NO_SESSION or now - entry["since"] > UNDECRYPTED_GIVE_UP_SECONDS:
+                    self._drop_undecrypted(event_id, problem)
+            while len(self._undecrypted) > MAX_UNDECRYPTED:
+                oldest = min(self._undecrypted, key=lambda key: self._undecrypted[key]["since"])
+                self._drop_undecrypted(oldest, "too many held")
+
+    def _drop_undecrypted(self, event_id, reason) -> None:
+        entry = self._undecrypted.pop(event_id, None) or {}
+        logger.warning(
+            "matrix_connector_undecryptable_dropped room=%s event=%s sender=%s reason=%s",
+            self.room_id, event_id, (entry.get("event") or {}).get("sender"), reason,
+        )
+
+    def _watch_encryption(self, room: dict) -> None:
+        """Switch over when a sync batch carries the room's m.room.encryption."""
+        if self.encrypted:
+            return
+        events = (((room.get("state") or {}).get("events") or [])
+                  + ((room.get("timeline") or {}).get("events") or []))
+        if not any(isinstance(event, dict) and event.get("type") == "m.room.encryption"
+                   and event.get("state_key") == "" for event in events):
+            return
+        try:
+            self._turn_encrypted()
+        except MatrixError as exc:
+            # Sends are sealed already; its encrypted replies are held until
+            # the bridge answers.
+            logger.warning("matrix_connector_encryption_unconfirmed room=%s error=%s", self.room_id, exc)
+
+    def _turn_encrypted(self) -> bool:
+        """The room turned encryption on after connect: borrow the bridge from
+        now on, or say why not. Either way nothing more goes out in the clear.
+        A transient bridge failure raises."""
+        self.matrix.note_encrypted(self.room_id)
+        try:
+            self._require_crypto(self.room_id)
+        except MatrixError as exc:
+            if exc.transient:
+                raise
+            logger.warning("matrix_connector_encrypted_event room=%s error=%s", self.room_id, exc)
+            return False
+        self.encrypted = True
+        return True
 
     def _relayable(self, event: dict) -> bool:
         """Whether this is a message event this connector has not already had.
@@ -540,14 +702,21 @@ class MatrixConnector(ConnectorLifecycle):
         sender = event.get("sender")
         return sender if isinstance(sender, str) else None
 
+    def _is_operator(self, event: dict) -> bool:
+        sender = event.get("sender")
+        return bool(sender and sender != self.config.user_id and sender in self.config.operator_users)
+
     def _post_inbound(self, event, poster=None):
         event_id = event.get("event_id")
-        if poster is None and event.get("sender") != self.config.user_id:
+        human = poster is None and event.get("sender") != self.config.user_id
+        if human:
             if route_connected_mention(CHANNEL, self.room_id, event, bot_id=self.config.user_id):
                 with self._state.lock:
                     self._accept_inbound(event_id)
                     self._state.save()
                 return True
+        refused = []
+
         def prepare():
             content = event.get("content") if isinstance(event.get("content"), dict) else {}
             body, attachments = self._inbound_body(event)
@@ -565,16 +734,48 @@ class MatrixConnector(ConnectorLifecycle):
                          key=lambda question: question["seq"], default=None)
             question = related or oldest
             if question is not None:
-                bound = answer_binding(text, question, replies_to_question=related is not None,
-                                       first_since_question=self._first_since(question),
-                                       refuse_operator_only=poster is not None or event.get("sender") == self.config.user_id)
+                relation = {"replies_to_question": related is not None,
+                            "first_since_question": self._first_since(question)}
+                bound = answer_binding(text, question, **relation,
+                                       refuse_operator_only=poster is not None or not self._is_operator(event))
                 if bound is not None:
                     kind, in_reply_to, text = "answer", question["id"], bound
+                elif human and answer_binding(text, question, **relation) is not None:
+                    refused.append(question["id"])
             return {"question": question["id"] if question else None,
-                    "human_receipt": poster is None and event.get("sender") != self.config.user_id,
+                    "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
-        return bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
+        posted = bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
+        if refused:
+            self._operator_only_refused(event, refused[0])
+        return posted
+
+    def _operator_only_refused(self, event: dict, question_id: str) -> None:
+        """Say why a human's reply went in as a message, not the answer.
+
+        An unset list refuses every reply, so the thread is told once; a
+        sender missing from a set list is only logged, for a mistyped MXID.
+        """
+        if self.config.operator_users:
+            logger.info("matrix_connector_operator_only_refused question=%s sender=%s not in %s",
+                        question_id, event.get("sender"), OPERATOR_USERS_ENV)
+            return
+        if self._operator_list_noted:
+            return
+        self._operator_list_noted = True
+        logger.warning("matrix_connector_operator_only_refused question=%s reason=%s unset",
+                       question_id, OPERATOR_USERS_ENV)
+        try:
+            receipt = self._send_notice(self._tagged_notice(
+                f"Replies here can't answer an operator-only question: {OPERATOR_USERS_ENV} is not "
+                "set where this connector runs. Answer it on Slack or the platform."
+            ))
+            with self._state.lock:
+                self._remember_notice(receipt)
+                self._state.save()
+        except Exception as error:
+            logger.warning("matrix_connector_operator_notice_failed error=%s", error)
 
     def _accept_inbound(self, ref):
         self._seen.add(ref)
@@ -612,11 +813,12 @@ class MatrixConnector(ConnectorLifecycle):
         neither guard.
         """
         store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
-        mxc = content.get("url")
+        encrypted = isinstance(content.get("file"), dict)
+        mxc = content["file"].get("url") if encrypted else content.get("url")
         if store is None or not isinstance(mxc, str):
             return None
-        if isinstance(content.get("file"), dict):
-            return None  # an encrypted attachment: nothing here can decrypt it
+        if encrypted and not self.matrix.can_encrypt:
+            return None
         name = str(content.get("filename") or content.get("body") or "file")
         info = content.get("info") if isinstance(content.get("info"), dict) else {}
         declared = info.get("size")
@@ -625,7 +827,10 @@ class MatrixConnector(ConnectorLifecycle):
             logger.info("matrix_connector_file_too_large name=%s bytes=%s", name, declared)
             return None
         try:
-            data, media_type = self.matrix.download(mxc, max_bytes=thread_access.MAX_FILE_BYTES)
+            if encrypted:
+                data, media_type = self.matrix.download_content(content, max_bytes=thread_access.MAX_FILE_BYTES)
+            else:
+                data, media_type = self.matrix.download(mxc, max_bytes=thread_access.MAX_FILE_BYTES)
         except MatrixError as exc:
             logger.warning("matrix_connector_download_failed mxc=%s error=%s", mxc, exc)
             return None
@@ -680,7 +885,8 @@ def main(argv: Optional[list] = None) -> int:
             "Mirror one matrix thread onto one session's bus. Reads LMER_SUPERVISOR_URL "
             "(or LMER_FASTAPI_PORT), LMER_FASTAPI_TOKEN, LMER_MATRIX_HOMESERVER, "
             "LMER_MATRIX_USER_ID, LMER_MATRIX_ACCESS_TOKEN and the thread from "
-            "LMER_MATRIX_ROOM_ID/LMER_MATRIX_THREAD_EVENT or --permalink."
+            "LMER_MATRIX_ROOM_ID/LMER_MATRIX_THREAD_EVENT or --permalink. An "
+            "encrypted room also needs LMER_MATRIX_BRIDGE_URL."
         ),
     )
     parser.add_argument("--permalink", help="matrix.to or client permalink to the thread; overrides the env pair.")

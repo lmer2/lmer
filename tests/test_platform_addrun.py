@@ -326,6 +326,70 @@ def test_a_mount_dir_is_not_refused_by_the_model_reservation(config):
     assert "/tmp:/data:ro" in command
 
 
+# --- the reasoning effort ----------------------------------------------------
+# The model's rules, plus a closed vocabulary: the spawn refuses an unknown level
+# itself rather than leaving the child to exit 2 on it.
+
+def test_the_effort_field_reaches_the_child_as_lmer_parses_it(config):
+    namespace = as_lmer_reads_it(
+        spawn.spawn_session(config, request_for(effort=" XHigh ")).command
+    )
+
+    assert namespace.effort == "xhigh"
+
+
+def test_no_effort_flag_is_spelled_when_none_was_asked_for(config):
+    command = spawn.spawn_session(config, request_for()).command
+
+    assert "--effort" not in command
+    assert as_lmer_reads_it(command).effort is None
+
+
+def test_the_effort_lands_ahead_of_extra_args_and_its_container_command(config):
+    command = spawn.spawn_session(
+        config, request_for(effort="low", extra_args=("--", "echo", "hi")),
+    ).command
+
+    assert command.index("--effort") < command.index("--")
+
+
+def test_the_entry_records_the_effort_the_child_was_given(config, monkeypatch):
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for(effort="max"))
+    try:
+        assert registry.read_session(result.session_id)["task"]["effort"] == "max"
+    finally:
+        os.kill(result.pid, 9)
+
+
+@pytest.mark.parametrize("bad", ["turbo", "", "   ", 7, "-high"])
+def test_an_unknown_effort_is_refused_before_anything_spawns(config, bad):
+    with pytest.raises(spawn.SpawnError, match="effort must be one of"):
+        spawn.spawn_session(config, request_for(effort=bad))
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_session_metadata_reports_the_requested_effort_over_the_daemon_s(
+    monkeypatch
+):
+    monkeypatch.setenv("LMER_REASONING_EFFORT", "low")
+
+    assert spawn._session_metadata(request_for(effort="high"))["effort"] == "high"
+    assert spawn._session_metadata(request_for())["effort"] == "low"
+
+
+@pytest.mark.parametrize("smuggled", ["--effort", "--effort=high", "--eff", "--ef=high"])
+def test_an_effort_in_extra_args_is_refused(config, smuggled):
+    with pytest.raises(spawn.SpawnError, match="not allowed in extra_args"):
+        spawn.spawn_session(config, request_for(extra_args=(smuggled, "high")))
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_effort_abbreviations_the_guard_refuses_are_ones_lmer_honours():
+    assert parse_args(["develop", TARGET, "--eff", "high"])[0].effort == "high"
+    assert parse_args(["develop", TARGET, "--ef", "high"])[0].effort == "high"
+
+
 # --- why both are reserved in extra_args ------------------------------------
 
 def test_the_smuggle_the_reservation_closes_is_real():
@@ -776,6 +840,26 @@ def test_the_route_refuses_a_model_smuggled_through_extra_args(client):
     )
     assert response.status_code == 400
     assert "not allowed in extra_args" in response.json()["detail"]
+
+
+def test_the_route_passes_the_effort_as_a_typed_field(client, captured_spawn):
+    response = client.post(
+        "/api/sessions", headers=bearer(),
+        json={"taskdef": "develop", "target": TARGET, "effort": "High"},
+    )
+
+    assert response.status_code == 201
+    assert captured_spawn["request"].effort == "high"
+    assert captured_spawn["request"].extra_args == ()
+
+
+def test_the_route_refuses_an_unknown_effort_with_the_reason(client):
+    response = client.post(
+        "/api/sessions", headers=bearer(),
+        json={"taskdef": "develop", "target": TARGET, "effort": "turbo"},
+    )
+    assert response.status_code == 400
+    assert "effort must be one of" in response.json()["detail"]
 
 
 def test_the_route_passes_the_title_and_description_as_typed_fields(

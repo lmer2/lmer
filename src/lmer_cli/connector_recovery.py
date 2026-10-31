@@ -200,6 +200,10 @@ class Recovery:
                 raise RecoveryRequired("Slack reference does not match this operation's thread, sender and content")
             return
         event = remote.get_event(self.key.conversation, reference)
+        if event.get("type") == "m.room.encrypted":
+            ((event, problem),) = remote.decrypt_events(self.key.conversation, [event])
+            if event is None:
+                raise RecoveryRequired(f"Matrix reference is encrypted and lmer-matrix-bridge cannot read it ({problem})")
         content = event.get("content") or {}
         relation = content.get("m.relates_to") or {}
         if (event.get("event_id") != reference or event.get("sender") != sender
@@ -211,7 +215,10 @@ class Recovery:
             return
         if content.get("filename", content.get("body")) != payload["name"]:
             raise RecoveryRequired("Matrix attachment name does not match the selected index")
-        data, _ = remote.download(content.get("url"), max_bytes=payload["size"])
+        if isinstance(content.get("file"), dict):
+            data, _ = remote.download_content(content, max_bytes=payload["size"])
+        else:
+            data, _ = remote.download(content.get("url"), max_bytes=payload["size"])
         if data is None or len(data) != payload["size"] or hashlib.sha256(data).hexdigest() != payload["sha256"]:
             raise RecoveryRequired("Matrix attachment bytes do not match the selected index")
 

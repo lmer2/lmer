@@ -390,8 +390,11 @@ def test_the_real_transport_never_sends_cleartext():
     unencrypted send (!243 review)."""
     import inspect
 
-    source = inspect.getsource(mxclient.MautrixHomeserver._send_encrypted)
-    assert "raise MatrixClientError" in source
+    sending = inspect.getsource(mxclient.MautrixHomeserver._send_encrypted)
+    assert "self._encrypt(" in sending.split("send_message_event(")[0]
+    # `_encrypt` is shared with the crypto API lent to the connector (#478).
+    source = inspect.getsource(mxclient.MautrixHomeserver._encrypt)
+    assert "raise MatrixClientError" in source and "raise CryptoUnavailable" in source
     unencrypted_branch = source.split("if self._crypto is None")[1].split("try:")[0]
     assert "send_message(" not in unencrypted_branch
 

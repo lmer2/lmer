@@ -7,6 +7,10 @@ fails create as both runtimes do (exit 125), in the wording of
 State lives in ``$FAKE_RUNTIME_STATE``. A "container" is a detached process
 whose output goes to a file, so it outlives any client exactly as a real
 detached container does. Set ``FAKE_RUNTIME_NO_LOGS=1`` to make ``logs`` fail.
+
+``FAKE_RUNTIME_DEADLINE`` (seconds) bounds every wait a verb makes: past it the
+verb exits 124, so a container that never runs fails its test instead of
+stalling the gate (#636).
 """
 
 import json
@@ -31,6 +35,16 @@ VALUED = {
 HELP = {"start": "--attach --interactive --detach-keys", "attach": "--no-stdin --sig-proxy --detach-keys"}
 if os.environ.get("FAKE_RUNTIME_FLAVOR") == "podman":
     HELP["start"] += " --sig-proxy"
+DEADLINE = time.monotonic() + float(os.environ.get("FAKE_RUNTIME_DEADLINE") or "inf")
+
+
+def pause(seconds, what):
+    """Sleep between polls, or exit 124 once the deadline has passed."""
+    if time.monotonic() >= DEADLINE:
+        print(f"fake runtime: still waiting for {what} at FAKE_RUNTIME_DEADLINE",
+              file=sys.stderr)
+        sys.exit(124)
+    time.sleep(seconds)
 
 
 def box(ref):
@@ -94,9 +108,13 @@ def stream(cid, offset):
     out = box(cid) / "out.log"
     while True:
         done = (box(cid) / "exit").exists()
-        with out.open("rb") as handle:
-            handle.seek(offset)
-            chunk = handle.read()
+        try:
+            with out.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+        except FileNotFoundError:
+            print(f"Error: container {cid} was removed", file=sys.stderr)
+            return 1
         if chunk:
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
@@ -104,7 +122,7 @@ def stream(cid, offset):
         elif done:
             return int((box(cid) / "exit").read_text())
         else:
-            time.sleep(0.05)
+            pause(0.05, f"output of {cid}")
 
 
 def create(args):
@@ -142,13 +160,19 @@ def start(args):
         # As a runtime refusing a device or a port: nothing runs.
         print("Error: error gathering device information", file=sys.stderr)
         return 125
-    subprocess.Popen(
+    runner = subprocess.Popen(
         [sys.executable, __file__, "_run", cid],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     while not (box(cid) / "pid").exists():
-        time.sleep(0.01)
+        given_up = runner.poll() is not None or not box(cid).exists()
+        # Rechecked: a runner may publish the pid and exit between the two looks.
+        if given_up and not (box(cid) / "pid").exists():
+            # Removed before its process came up; no pid will ever appear.
+            print(f"Error: no such container: {cid}", file=sys.stderr)
+            return 1
+        pause(0.01, f"{cid} to start")
     return stream(cid, 0) if "--attach" in args else 0
 
 
@@ -162,7 +186,12 @@ def run_container(cid):
     config = json.loads((box(cid) / "config.json").read_text())
     with (box(cid) / "out.log").open("ab", buffering=0) as out:
         process = subprocess.Popen(config["command"], stdout=out, stderr=out)
-        publish(box(cid) / "pid", str(process.pid))
+        try:
+            publish(box(cid) / "pid", str(process.pid))
+        except OSError:
+            # Removed meanwhile, before `rm` could know whom to kill.
+            process.kill()
+            raise
         code = process.wait()
     code = 128 - code if code < 0 else code
     publish(box(cid) / "finished", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
@@ -176,7 +205,11 @@ def wait(args):
         print(f"Error: no such container: {cid}", file=sys.stderr)
         return 1
     while not (box(cid) / "exit").exists():
-        time.sleep(0.05)
+        if not box(cid).exists():
+            # Removed while waited on: `rm` leaves no exit code behind.
+            print(f"Error: no such container: {cid}", file=sys.stderr)
+            return 1
+        pause(0.05, f"{cid} to exit")
     print(int((box(cid) / "exit").read_text()))
     return 0
 
@@ -258,12 +291,12 @@ def stop(args):
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + json.loads((box(cid) / "config.json").read_text())["stop_timeout"]
     while running(cid) and time.monotonic() < deadline:
-        time.sleep(0.05)
+        pause(0.05, f"{cid} to stop")
     if running(cid):
         os.kill(pid, signal.SIGKILL)
     # A follower may record the exit and remove the container first.
     while box(cid).exists() and not (box(cid) / "exit").exists():
-        time.sleep(0.05)
+        pause(0.05, f"{cid} to record its exit")
     return 0
 
 

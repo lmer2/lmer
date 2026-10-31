@@ -111,6 +111,51 @@ class TestSessionId:
         assert run_state.current_session_id() == "unknown"
 
 
+class TestWrittenByLaunch:
+    """Which finished run a launch wrote, asked of the ids the kernel
+    records (issue #172)."""
+
+    @staticmethod
+    def _finished_reslugged_run(base, monkeypatch, writer):
+        """A complete release that vacated `release`, whose only record of its
+        writer is the `session` stamp on its events."""
+        if writer is None:
+            monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+        else:
+            monkeypatch.setenv("LMER_SESSION_ID", writer)
+        rdir = base / "release-v0.6.0"
+        rdir.mkdir(parents=True)
+        state = run_state.seed_state("release-v0.6.0", "release", "")
+        state["status"] = "complete"
+        state["reslugged_from"] = ["release"]
+        run_state.write_state(rdir, state)
+        run_state.append_event(rdir, "run_seeded")
+        monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+        return rdir, state
+
+    def test_a_contextless_writer_is_nobodys_launch(self, run_env, monkeypatch):
+        """Every contextless invocation stamps `unknown`, so a `--session
+        unknown` must not claim the run one of them finished."""
+        rdir, state = self._finished_reslugged_run(run_env, monkeypatch, None)
+        assert {e["session"] for e in run_state.read_events(rdir, last_n=0)} == {
+            run_state.UNKNOWN_SESSION_ID}
+
+        assert run_state._written_by_launch(rdir, state, "unknown") is False
+        assert run_state.find_successor_run_dir("release", session="unknown") is None
+
+    def test_an_unknown_launch_id_matches_nothing_either(self, run_env, monkeypatch):
+        rdir, state = self._finished_reslugged_run(run_env, monkeypatch, None)
+        monkeypatch.setenv("LMER_SESSION_ID", "unknown")
+
+        assert run_state._written_by_launch(rdir, state) is False
+
+    def test_a_named_writer_still_matches_by_its_events(self, run_env, monkeypatch):
+        rdir, state = self._finished_reslugged_run(run_env, monkeypatch, "s-rel-1")
+
+        assert run_state._written_by_launch(rdir, state, "s-rel-1") is True
+        assert run_state.find_successor_run_dir("release", session="s-rel-1") == rdir
+
+
 class TestStateIO:
     def test_seed_shape(self, run_env):
         state = run_state.seed_state("develop-issue-123", "develop", "https://x/-/issues/123")

@@ -100,6 +100,13 @@ class TestPackagedTemplate:
     def test_it_names_the_env_var_it_is_gated_on(self):
         assert uploads.UPLOADS_DIR_ENV in TEMPLATE.read_text(encoding="utf-8")
 
+    def test_it_tells_the_agent_how_to_handle_a_private_file(self):
+        """#510: the platform cannot keep a printed secret out of the transcript."""
+        rendered = render_fragment()
+        assert uploads.PRIVATE_PREFIX in rendered and f"{uploads.PRIVATE_DIRNAME}/" in rendered
+        assert "never print" in rendered and "chmod 000" in rendered
+        assert "deleted when this session ends" in rendered
+
 
 @skip_if_npm_claude_present
 class TestClaudeRunner:

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .private_tmp import open_no_follow, owned_dir
+
 DEFAULT_CACHE_DIR = "/tmp/lmer-precommit-cache"
 CACHE_DIR_ENV = "LMER_PRECOMMIT_CACHE_DIR"
 CACHE_FORMAT_VERSION = 2
@@ -277,32 +279,14 @@ def cache_dir() -> Path:
 
 def safe_cache_dir(create: bool = False) -> Optional[Path]:
     """Return an owner-only cache directory, or ``None`` (a cache miss)."""
-    directory = cache_dir()
-    try:
-        if directory.is_symlink():
-            return None
-        if not directory.is_dir():
-            if not create:
-                return None
-            directory.mkdir(mode=CACHE_DIR_MODE, parents=True, exist_ok=True)
-            directory.chmod(CACHE_DIR_MODE)
-            return directory
-        info = directory.stat()
-        if info.st_uid != os.geteuid():
-            return None
-        if stat.S_IMODE(info.st_mode) & ~CACHE_DIR_MODE:
-            directory.chmod(CACHE_DIR_MODE)
-        return directory
-    except OSError:
-        return None
+    return owned_dir(cache_dir(), create=create, mode=CACHE_DIR_MODE)
 
 
 def _entry_path(fingerprint: Fingerprint, directory: Path) -> Path:
     return directory / f"{fingerprint.key}{ENTRY_SUFFIX}"
 
 
-def _open_no_follow(path: str, flags: int) -> int:
-    return os.open(path, flags | os.O_NOFOLLOW)
+_open_no_follow = open_no_follow
 
 
 def read_pass(

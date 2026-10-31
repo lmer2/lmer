@@ -26,7 +26,7 @@ import pytest
 from lmer_cli import harness
 from lmer_cli.harness import HARNESSES, MemoryIndexLimit
 from lmer_cli.memory_areas import is_area_slug
-from lmer_schema.checks.agents import parse_index_entries
+from lmer_schema.checks.agents import is_forget_tombstone, parse_index_entries
 from lmer_schema.checks.runner import validate
 from tests.conftest import strip_lmer_env
 from tests.plexus_fixtures import (
@@ -1413,6 +1413,8 @@ class TestForgetTombstonesStayVerbatim:
         _add_memory(agent_dir, "project_unrelated.md", area="dev", into="areas/dev.md")
         assert _persist()[0] == 0
         assert tombstone in dev.read_text().splitlines()
+        # Kept verbatim, its dead `See also` is no validator finding (#601).
+        assert _index_findings(tree) == []
 
         memory.revive_memory(key)
         text = dev.read_text()
@@ -1577,3 +1579,248 @@ class TestLegacyLiftReadsFlatAreaLinks:
         )
         assert [write.note for write in lift.writes][-1] == "new instance index: 1 entry"
         assert not [note for note in notes if "no MEMORY.md line" in note]
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 follow-ups (#601): ownership evidence, archive-linked hooks
+# and areas this persist generates
+# ---------------------------------------------------------------------------
+
+
+class TestMapLineOwnershipEvidence:
+    """Only a memory the session holds says where a map line belongs (#601)."""
+
+    def test_an_edited_instance_map_line_leading_with_a_document_stays_put(
+        self, schema_tree
+    ):
+        tree, agent_dir = schema_tree
+        _split(tree.instance_memory_dir, {"user": [USER_MEMORY_FILE]})
+        (tree.instance_memory_dir.parent / "notes.md").write_text("# notes\n")
+        assert memory.restore_memory() == 0
+        local = agent_dir / memory.MEMORY_INDEX
+        edited = "- [Notes](../notes.md) first, then [user](areas/user.md) — read when user\n"
+        local.write_text(local.read_text().replace(
+            "- [user](areas/user.md) — read when user\n", edited
+        ))
+        assert _persist()[0] == 0
+        assert edited in (tree.instance_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert "notes.md" not in (tree.project_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert _index_findings(tree) == []
+
+
+class TestArchiveLinkedMapHooks:
+    """A hook's archive link spares itself, not the line's dead area (#601)."""
+
+    def _retire_dev(self, scope):
+        dev, ops = scope / "areas" / "dev.md", scope / "areas" / "ops.md"
+        ops.write_text(ops.read_text() + "".join(
+            line + "\n" for line in _entry_lines(dev.read_text())
+        ))
+        dev.unlink()
+
+    def test_a_dead_own_area_is_tombstoned_beside_a_hooks_archive_link(self, legacy_tree):
+        tree, agent_dir = legacy_tree
+        scope = tree.project_memory_dir
+        _split(scope, {"dev": [PROJECT_MEMORY_FILE], "ops": [USER_MEMORY_FILE]})
+        index = scope / memory.MEMORY_INDEX
+        hook = "— read when dev; history in [old dev](_archive/dev-old.md)\n"
+        index.write_text(index.read_text().replace(
+            "- [dev](areas/dev.md) — read when dev\n", f"- [dev](areas/dev.md) {hook}"
+        ))
+        self._retire_dev(scope)
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        lines = index.read_text().splitlines(keepends=True)
+        assert f"- archived {memory._tombstone_date()} {hook}" in lines
+        assert _index_findings(tree) == []
+        after = _tree_bytes(scope)
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        assert _tree_bytes(scope) == after
+
+    def test_a_forget_tombstone_on_the_map_is_still_kept_verbatim(self, legacy_tree):
+        # Its first link is the archive mirror: `revive` finds it by its text.
+        tree, agent_dir = legacy_tree
+        scope = tree.project_memory_dir
+        _split(scope, {"dev": [PROJECT_MEMORY_FILE], "ops": [USER_MEMORY_FILE]})
+        index = scope / memory.MEMORY_INDEX
+        tombstone = "- [Old fact](_archive/old_fact.md) — see [dev](areas/dev.md)\n"
+        index.write_text(index.read_text() + tombstone)
+        self._retire_dev(scope)
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        assert tombstone in index.read_text().splitlines(keepends=True)
+
+
+class TestAreasThisPersistGenerates:
+    """A cross-reference to an area the reconcile creates is live (#601)."""
+
+    def test_a_link_to_an_area_a_later_scope_generates_is_kept(self, schema_tree):
+        tree, agent_dir = schema_tree
+        _split(tree.instance_memory_dir, {"user": [USER_MEMORY_FILE]})
+        _split(tree.project_memory_dir, {"dev": [PROJECT_MEMORY_FILE]})
+        assert memory.restore_memory() == 0
+        # No index line: the instance scope's reconcile files it, creating the
+        # area — after the project scope has settled.
+        (agent_dir / "user_new.md").write_text(_memory_file("user-new", "user", "prefs"))
+        local = agent_dir / "areas" / "dev.md"
+        local.write_text(local.read_text() + "See also [prefs](prefs.md).\n")
+        assert _persist()[0] == 0
+        assert "](../user_new.md)" in (
+            tree.instance_memory_dir / "areas" / "prefs.md"
+        ).read_text()
+        assert "See also [prefs](prefs.md)." in (
+            tree.project_memory_dir / "areas" / "dev.md"
+        ).read_text()
+        assert _index_findings(tree) == []
+
+    def test_a_link_to_an_area_the_same_scope_generates_is_kept(self, legacy_tree):
+        tree, agent_dir = legacy_tree
+        scope = tree.project_memory_dir
+        _split(scope, {"dev": [PROJECT_MEMORY_FILE, USER_MEMORY_FILE]})
+        assert memory.restore_memory() == 0
+        (agent_dir / "project_new.md").write_text(_memory_file("project-new", area="prefs"))
+        local = agent_dir / "areas" / "dev.md"
+        local.write_text(local.read_text() + "See also [prefs](prefs.md).\n")
+        assert _persist()[0] == 0
+        assert "](../project_new.md)" in (scope / "areas" / "prefs.md").read_text()
+        assert "See also [prefs](prefs.md)." in (scope / "areas" / "dev.md").read_text()
+        assert _index_findings(tree) == []
+
+
+class TestOneForgetTombstonePredicate:
+    """Writers and the validator read a ``forget`` tombstone alike (#601)."""
+
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            ("- [Fact](../_archive/x/fact.md) — see also [ops](ops.md)", True),
+            ("- [Fact](_archive/x/fact.md) — a fact", True),
+            ("- [Fact](https://example.invalid/a.md) then [Old](_archive/old.md)", True),
+            ("- [dev](areas/dev.md) — history in [old](_archive/dev-old.md)", False),
+            ("See also [ops](ops.md); history in [old](../_archive/old.md).", False),
+            ("- [Fact](fact.md) — a fact", False),
+            ("- archived 2026-10-29 — a fact", False),
+        ],
+    )
+    def test_the_writer_and_the_validator_agree(self, line, expected):
+        assert memory._is_forget_tombstone is is_forget_tombstone
+        assert is_forget_tombstone(line) is expected
+        if expected:
+            assert memory._entry_targets(line, split=False) == []
+            assert parse_index_entries(line) == []
+
+    def test_a_tombstones_later_live_link_is_no_entry_for_persist_either(self, legacy_tree):
+        # Its "see also" names a live memory with no other entry and a dead
+        # one. Persist must file the live one and leave the line verbatim.
+        tree, agent_dir = legacy_tree
+        scope = tree.project_memory_dir
+        tombstone = (
+            "- [Old](_archive/old.md) — see also [Fresh](project_fresh.md) "
+            "and [Gone](project_gone.md)\n"
+        )
+        index = scope / memory.MEMORY_INDEX
+        index.write_text(index.read_text() + tombstone)
+        (scope / "project_fresh.md").write_text(_memory_file("fresh"))
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        lines = index.read_text().splitlines(keepends=True)
+        assert tombstone in lines
+        assert any("](project_fresh.md)" in line for line in lines if line != tombstone)
+        assert _index_findings(tree) == []
+
+    def test_a_tombstone_naming_an_instance_memory_stays_in_its_scope(self, schema_tree):
+        tree, agent_dir = schema_tree
+        tombstone = f"- [Old](_archive/old.md) — see also [Terse]({USER_MEMORY_FILE})\n"
+        index = tree.project_memory_dir / memory.MEMORY_INDEX
+        index.write_text(index.read_text() + tombstone)
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        assert tombstone in index.read_text().splitlines(keepends=True)
+        instance = (tree.instance_memory_dir / memory.MEMORY_INDEX).read_text()
+        assert tombstone not in instance.splitlines(keepends=True)
+        assert _index_findings(tree) == []
+
+    def test_an_area_line_that_also_links_the_archive_still_loses_its_dead_area(
+        self, legacy_tree
+    ):
+        tree, agent_dir = legacy_tree
+        scope = tree.project_memory_dir
+        _split(scope, {"dev": [PROJECT_MEMORY_FILE], "ops": [USER_MEMORY_FILE]})
+        assert memory.restore_memory() == 0
+        local = agent_dir / "areas" / "dev.md"
+        local.write_text(
+            local.read_text() + "See also [ops](ops.md); history in [old](../_archive/old.md).\n"
+        )
+        assert _persist()[0] == 0
+        # Another session retires the ops area, filing its entry into dev.
+        ops, dev = scope / "areas" / "ops.md", scope / "areas" / "dev.md"
+        dev.write_text(dev.read_text() + "".join(
+            line + "\n" for line in _entry_lines(ops.read_text())
+        ))
+        ops.unlink()
+        index = scope / memory.MEMORY_INDEX
+        index.write_text(index.read_text().replace("- [ops](areas/ops.md) — read when ops\n", ""))
+        assert memory.restore_memory() == 0
+        assert _persist()[0] == 0
+        assert (
+            f"See also archived {memory._tombstone_date()}; "
+            "history in [old](../_archive/old.md).\n"
+        ) in dev.read_text().splitlines(keepends=True)
+        assert _index_findings(tree) == []
+
+
+class TestLegacyLiftReadsSplitAreas:
+    """A split legacy dir's hand-written area lines survive the lift (#601)."""
+
+    HAND = f"- [Terse](../{USER_MEMORY_FILE}) — HAND HOOK\n"
+
+    def _split_legacy(self, tmp_path):
+        memory_dir = tmp_path / "memory"
+        (memory_dir / "areas").mkdir(parents=True)
+        (memory_dir / USER_MEMORY_FILE).write_text(_memory_file("terse", "user"))
+        (memory_dir / PROJECT_MEMORY_FILE).write_text(_memory_file("gotcha"))
+        (memory_dir / memory.MEMORY_INDEX).write_text(
+            "# Memory map\n\n- [general](areas/general.md) — read when anything\n"
+        )
+        (memory_dir / "areas" / "general.md").write_text(
+            f"# general\n\n{self.HAND}- [Gotcha](../{PROJECT_MEMORY_FILE}) — project hook\n"
+        )
+        return memory_dir
+
+    def _lift(self, memory_dir, instance_dir, notes):
+        return migrate._plan_memory_lift(
+            memory_dir, migrate._memory_routes(memory_dir), instance_dir, "../_agents/memory",
+            notes,
+        )
+
+    def test_an_instance_memorys_area_line_lifts_with_its_links_rebased(self, tmp_path):
+        memory_dir = self._split_legacy(tmp_path)
+        notes = []
+        lift = self._lift(memory_dir, tmp_path / "instance", notes)
+        writes = {write.path: write for write in lift.writes}
+        instance = writes["../_agents/memory/MEMORY.md"].text
+        assert f"- [Terse]({USER_MEMORY_FILE}) — HAND HOOK\n" in instance
+        area = writes["_agents/memory/areas/general.md"]
+        assert self.HAND not in area.text
+        assert f"](../{PROJECT_MEMORY_FILE}) — project hook\n" in area.text
+        assert area.source == "memory/areas/general.md"
+        # An area index is no memory: it is neither routed nor remarked on.
+        assert [rel for rel, _scope, _remark in lift.files] == sorted(
+            [PROJECT_MEMORY_FILE, USER_MEMORY_FILE]
+        )
+        assert not [note for note in notes if "metadata.type" in note]
+        assert not [note for note in notes if "no MEMORY.md line" in note]
+
+    def test_an_already_split_instance_keeps_the_line_in_the_project_and_says_so(
+        self, tmp_path
+    ):
+        memory_dir = self._split_legacy(tmp_path)
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "areas").mkdir(parents=True)
+        (instance_dir / "areas" / "user.md").write_text("# user\n")
+        notes = []
+        lift = self._lift(memory_dir, instance_dir, notes)
+        assert all("HAND HOOK" not in write.text for write in lift.writes)
+        assert not [write for write in lift.writes if "areas/" in write.path]
+        assert [note for note in notes if "already split" in note and "1 line" in note]

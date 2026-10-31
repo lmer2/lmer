@@ -253,9 +253,9 @@ Guard rails (these apply to every CLI selector — `--preset`,
 - Preset `args` must be known lmer flags — a bare positional, a literal `--`,
   or an unrecognized token fails fast (exit 2) rather than silently rebinding
   your command line.
-- A preset-supplied `--env-file` never loads: it is ignored (with a warning
-  when it isn't already overridden by your own `--env-file`) — pass it on the
-  command line instead.
+- A preset-supplied `--env-file` or `--env-only` never applies: it is ignored
+  (with a warning when it isn't already overridden by your own flag) — pass
+  it on the command line instead.
 
 CLI quick reference: [Startup presets in docs/LMER-CLI.md](./LMER-CLI.md#startup-presets---preset--lmer_preset).
 
@@ -428,8 +428,9 @@ A preset replaces every default-tier key it supplies, including values the
 platform already loaded from its host `.env`. It does not replace a real export:
 `export LMER_REASONING_EFFORT=low` still wins over a preset's `xhigh`, and
 `export LMER_LLM_NAME=sonnet` still wins over a preset's `opus`. Explicit flags,
-such as `--model`, remain highest priority. The platform currently has no
-per-spawn effort field (#354); this change adds no effort levels or defaults.
+such as `--model` and `--effort`, remain highest priority. On the platform, a
+spawn's `effort` field and the assistant's `effort` setting are emitted as
+`--effort`, so they beat both a preset's `env` and the daemon's exports.
 
 The daemon records which values its file loader supplied in internal
 `LMER_PLATFORM_ENV_DEFAULTS` metadata and carries it to the child launcher.

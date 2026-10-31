@@ -48,11 +48,14 @@ The user-facing guide — file format, trust model, and the per-consumer merge
 semantics — is ``docs/PRESETS.md``.
 """
 
+import copy
 import json
 import logging
 import os
 import re
 import shlex
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -122,6 +125,16 @@ _VALID_NAME_RE = re.compile(_NAME_PATTERN)
 
 # Keys a preset entry may define. Anything else is an (logged) typo signal.
 _KNOWN_KEYS = frozenset({"checkout", "service", "service_group", "env", "args"})
+
+# The daemon reads the presets file on nearly every request (state, spawn
+# options, settings polls), so the parsed result is cached per path and keyed
+# on the file's stat signature (issue #600). File timestamps are only as fine
+# as the kernel's clock tick, so a same-size rewrite inside one tick keeps the
+# signature: a file modified within _RACY_WINDOW_NS of the read that filled
+# the cache is re-read and compared by content (git's racy-clean rule).
+_RACY_WINDOW_NS = 2_000_000_000
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict[str, "_CachedPresets"] = {}
 
 
 @dataclass
@@ -302,6 +315,28 @@ def select_preset_name(
     return None, None
 
 
+@dataclass
+class _CachedPresets:
+    """One load of a presets file: its presets, or the error it was refused with.
+
+    A refused file is cached too, so an invalid ``presets.json`` is reported
+    once per change rather than on every request. ``content`` is ``None`` when
+    the file could not be read at all.
+    """
+
+    signature: tuple[int, int, int]
+    read_at_ns: int
+    content: bytes | None
+    presets: dict[str, Preset] | None
+    error: tuple = ()
+
+
+def clear_presets_cache() -> None:
+    """Forget every cached presets file, so the next load re-reads and re-announces."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
 def load_presets(path: str | None = None) -> dict[str, Preset]:
     """Load and validate presets from a JSON file.
 
@@ -313,37 +348,79 @@ def load_presets(path: str | None = None) -> dict[str, Preset]:
     Returns:
         Mapping of preset name to :class:`Preset`. Empty when the feature is
         off or the file could not be loaded. Individual invalid entries are
-        logged and skipped rather than aborting the whole load.
+        logged and skipped rather than aborting the whole load. The file is
+        re-parsed only when it changed since the last load, and its outcome
+        (``presets_loaded`` at INFO, or why it was refused at ERROR) is logged
+        once per change, at DEBUG otherwise. Every call returns fresh copies.
     """
     raw_path = path if path is not None else os.getenv(PRESETS_FILE_ENV, "")
     if not raw_path or not raw_path.strip():
         return {}
 
     file_path = Path(raw_path).expanduser()
+    key = str(file_path)
     if not file_path.is_file():
+        with _CACHE_LOCK:
+            _CACHE.pop(key, None)
         logger.error("presets_file_not_found path=%s", file_path)
         return {}
 
+    with _CACHE_LOCK:
+        presets = _load_presets_cached(key, file_path)
+        # Preset carries a dict and a list: callers get their own copies so
+        # none of them can edit what the next caller is handed.
+        return copy.deepcopy(presets) if presets is not None else {}
+
+
+def _load_presets_cached(key: str, file_path: Path) -> dict[str, Preset] | None:
+    """The parsed presets for ``file_path``, re-parsing only when it changed.
+
+    Called with ``_CACHE_LOCK`` held. ``None`` when the file can't be loaded.
+    A load's outcome is logged at INFO (or ERROR) when the file changed and at
+    DEBUG when the cache answered.
+    """
+    cached = _CACHE.get(key)
+    read_at_ns = time.time_ns()
     try:
-        data = json.loads(file_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        info = file_path.stat()
+    except OSError as exc:
+        _CACHE.pop(key, None)
         logger.error("presets_file_unreadable path=%s error=%s", file_path, exc)
-        return {}
+        return None
+    signature = (info.st_mtime_ns, info.st_size, info.st_ino)
+    if (
+        cached is not None
+        and cached.signature == signature
+        and info.st_mtime_ns < cached.read_at_ns - _RACY_WINDOW_NS
+    ):
+        return _replayed(cached, file_path)
 
-    if not isinstance(data, dict):
-        logger.error(
-            "presets_file_not_object path=%s type=%s",
-            file_path,
-            type(data).__name__,
-        )
-        return {}
+    try:
+        content: bytes | None = file_path.read_bytes()
+    except OSError as exc:
+        content, presets = None, None
+        error: tuple = ("presets_file_unreadable path=%s error=%s", file_path, exc)
+    else:
+        if cached is not None and cached.content == content:
+            cached.signature, cached.read_at_ns = signature, read_at_ns
+            return _replayed(cached, file_path)
+        presets, error = _parse_presets(content, file_path)
 
-    presets: dict[str, Preset] = {}
-    for name, spec in data.items():
-        preset = _build_preset(str(name), spec)
-        if preset is not None:
-            presets[preset.name] = preset
+    # A file that still can't be read has no content to compare: the same
+    # error again is the same outcome.
+    if (
+        content is None
+        and cached is not None
+        and cached.content is None
+        and str(cached.error) == str(error)
+    ):
+        cached.signature, cached.read_at_ns = signature, read_at_ns
+        return _replayed(cached, file_path)
 
+    _CACHE[key] = _CachedPresets(signature, read_at_ns, content, presets, error)
+    if presets is None:
+        logger.error(*error)
+        return None
     logger.info(
         "presets_loaded path=%s count=%s names=%s",
         file_path,
@@ -351,6 +428,39 @@ def load_presets(path: str | None = None) -> dict[str, Preset]:
         ",".join(sorted(presets)) or "(none)",
     )
     return presets
+
+
+def _replayed(cached: _CachedPresets, file_path: Path) -> dict[str, Preset] | None:
+    """A cache hit: the stored outcome, its log line demoted to DEBUG."""
+    if cached.presets is None:
+        logger.debug(*cached.error)
+        return None
+    logger.debug("presets_cached path=%s count=%s", file_path, len(cached.presets))
+    return cached.presets
+
+
+def _parse_presets(
+    content: bytes, file_path: Path
+) -> tuple[dict[str, Preset] | None, tuple]:
+    """``(presets, ())``, or ``(None, error)`` with *error* the log call's args."""
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except ValueError as exc:
+        return None, ("presets_file_unreadable path=%s error=%s", file_path, exc)
+
+    if not isinstance(data, dict):
+        return None, (
+            "presets_file_not_object path=%s type=%s",
+            file_path,
+            type(data).__name__,
+        )
+
+    presets: dict[str, Preset] = {}
+    for name, spec in data.items():
+        preset = _build_preset(str(name), spec)
+        if preset is not None:
+            presets[preset.name] = preset
+    return presets, ()
 
 
 def _extract_arg_flag(args: list[str], flag: str) -> tuple[str | None, list[str]]:

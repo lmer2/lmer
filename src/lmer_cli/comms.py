@@ -446,6 +446,30 @@ def holds_typed_controls(value: str) -> bool:
     return bool(_TYPED_CONTROLS_RE.search(value))
 
 
+def one_line_label(value: object, limit: int, what: str) -> Optional[str]:
+    """*value* as one printable line, ``None`` when it is absent or blank.
+
+    For a short label a human gives and an agent reads, such as a private send's
+    purpose or a rotation reason. Whitespace runs collapse to one space, because a
+    newline submits where the label is relayed into a terminal. Anything else
+    that does not print is refused: a control can erase the relay tag, a bidi
+    override makes the label read differently from the stored one, and a lone
+    surrogate cannot be encoded to reach the agent at all.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CommsError(f"{what} must be text")
+    collapsed = " ".join(value.split())
+    if not collapsed:
+        return None
+    if not collapsed.isprintable():
+        raise CommsError(f"{what} may hold no control, format or other non-printing characters")
+    if len(collapsed) > limit:
+        raise CommsError(f"{what} is {len(collapsed)} characters; the limit is {limit}")
+    return collapsed
+
+
 def _refuse_typed_controls(value: str, label: str, *, one_line: bool = False) -> None:
     if holds_typed_controls(value) or (one_line and _LINE_BREAKS_RE.search(value)):
         allowed = "no control characters or line breaks" if one_line else "no control characters but newline and tab"

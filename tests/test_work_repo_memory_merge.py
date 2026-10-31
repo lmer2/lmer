@@ -40,7 +40,7 @@ scopes, retired)`` positionally (test_work_repo_memory_scopes.py:1708);
 the names test_schema_v2_final_boundaries.py:7-9 imports (``schema_tree``,
 ``schema2_tree``, ``_memory_file``, ``_index_line``, ``_persist``). KEEP
 also, because other areas call them unchanged: ``_entry_targets``,
-``_is_tombstone``, ``_rewrite_index_target``, ``_memory_retirement_lock``
+``_is_forget_tombstone``, ``_rewrite_index_target``, ``_memory_retirement_lock``
 (C.housekeep-index), ``scope_for_memory`` and the ``MEMORY.md`` index-line
 splitter (B.migrate-links); their signatures and semantics do not change
 in D.

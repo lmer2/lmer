@@ -15,13 +15,14 @@ run driving a live release is still found by its own sessions after it has
 moved to its version-bearing address.
 """
 import json
+import subprocess
 from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
 
 from work_repo import cli as work_cli
-from work_repo import release_run, run_state, utils
+from work_repo import git_ops, release_run, run_state, utils
 from work_repo.git_ops import CLAIM_PUSH_WON
 from tests.conftest import strip_lmer_env
 from tests.plexus_fixtures import PRIMARY_REPO, PROJECT, build_schema_plexus
@@ -42,6 +43,9 @@ SCHEMA_BASE = "release-main"
 SID_FIRST = "20260824-101500-1-11111"
 SID_NEXT = "20260825-090000-3-33333"
 SID_OTHER = "20260824-113000-1-22222"
+# The same two launches in a schema-2 tree, where a launch id is a record UID.
+UID_FIRST = "a" * 32
+UID_NEXT = "b" * 32
 
 
 @pytest.fixture(autouse=True)
@@ -112,6 +116,13 @@ def _name_run(rdir, name):
     return rdir.rename(rdir.parent / f"{state['slug']}--{name}")
 
 
+def _next_launch(monkeypatch, n):
+    """The next release is a new launch, and the launcher gives every launch
+    its own `LMER_SESSION_ID`. The launch that finished a release still
+    resolves it (#172), so reusing the id would be that launch claiming again."""
+    monkeypatch.setenv("LMER_SESSION_ID", f"s-rel-{n}")
+
+
 def _close_out(status="complete", stop_reason="complete"):
     rdir = run_state.run_dir()
     state = run_state.load_state(rdir)
@@ -123,7 +134,8 @@ def _close_out(status="complete", stop_reason="complete"):
 
 
 class TestSecondRelease:
-    def test_a_second_release_claims_after_the_first_completed(self, runs, capsys):
+    def test_a_second_release_claims_after_the_first_completed(self, runs, capsys,
+                                                               monkeypatch):
         with ExitStack() as stack:
             assert _claim(stack) == 0
         _ship("0.5.0")
@@ -133,6 +145,7 @@ class TestSecondRelease:
 
         # The next release session — a fresh launch of the same taskdef
         # against the same repository, deriving the same address.
+        _next_launch(monkeypatch, 2)
         with ExitStack() as stack:
             assert _claim(stack) == 0, "a repository can release only once"
         second = run_state.run_dir()
@@ -147,7 +160,8 @@ class TestSecondRelease:
         # ...and the first release's record is untouched where it was left.
         assert release_run.load_release(first)["version"] == "0.5.0"
 
-    def test_a_second_release_claims_after_one_was_aborted(self, runs, capsys):
+    def test_a_second_release_claims_after_one_was_aborted(self, runs, capsys,
+                                                           monkeypatch):
         """The abandoned release (spec §7): bump merged, human declines the
         release MR. The bump stays on prep-release and the next run's ctl
         dry-run skips it — but only if there IS a next run."""
@@ -159,6 +173,7 @@ class TestSecondRelease:
         aborted = _close_out(stop_reason="aborted")
         capsys.readouterr()
 
+        _next_launch(monkeypatch, 2)
         with ExitStack() as stack:
             assert _claim(stack) == 0, "an aborted release wedged the repository"
 
@@ -169,9 +184,10 @@ class TestSecondRelease:
         assert release_run.derive_leg(
             release_run.load_release(aborted))["leg"] == "aborted"
 
-    def test_three_releases_each_get_their_own_run(self, runs, capsys):
+    def test_three_releases_each_get_their_own_run(self, runs, capsys, monkeypatch):
         dirs = []
-        for version in ("0.5.0", "0.6.0", "0.7.0"):
+        for n, version in enumerate(("0.5.0", "0.6.0", "0.7.0"), start=1):
+            _next_launch(monkeypatch, n)
             with ExitStack() as stack:
                 assert _claim(stack) == 0
             _ship(version)
@@ -186,7 +202,8 @@ class TestSecondRelease:
             "0.5.0", "0.6.0", "0.7.0",
         ]
 
-    def test_a_re_used_version_does_not_wedge_the_repository(self, runs, capsys):
+    def test_a_re_used_version_does_not_wedge_the_repository(self, runs, capsys,
+                                                             monkeypatch):
         """An abort at 0.6.0 is followed by a REAL 0.6.0, and then by the
         release after that.
 
@@ -208,6 +225,7 @@ class TestSecondRelease:
         aborted = _close_out(stop_reason="aborted")
         capsys.readouterr()
 
+        _next_launch(monkeypatch, 2)
         with ExitStack() as stack:
             assert _claim(stack) == 0
         _ship("0.6.0")
@@ -228,6 +246,7 @@ class TestSecondRelease:
 
         # The release AFTER the re-used version — one release further than
         # this test used to go, and where the wedge actually bites.
+        _next_launch(monkeypatch, 3)
         with ExitStack() as stack:
             assert _claim(stack) == 0, "a re-used version wedged the repository"
         _ship("0.7.0")
@@ -236,7 +255,7 @@ class TestSecondRelease:
         assert third.name == f"{BASE}-v0.7.0"
         assert len({aborted, shipped, third}) == 3
 
-    def test_named_runs_never_record_one_slug_twice(self, runs, capsys):
+    def test_named_runs_never_record_one_slug_twice(self, runs, capsys, monkeypatch):
         """The same collision from the other side.
 
         A named run lives at `runs/<slug>--<name>`, so its SLUG is occupied
@@ -255,6 +274,7 @@ class TestSecondRelease:
         aborted = _close_out(stop_reason="aborted")
         capsys.readouterr()
 
+        _next_launch(monkeypatch, 2)
         with ExitStack() as stack:
             assert _claim(stack) == 0
         _name_run(run_state.run_dir(), "zz-real-cut")
@@ -286,6 +306,7 @@ class TestSecondRelease:
         assert aborted.name == f"{BASE}-v0.6.0"
         capsys.readouterr()
 
+        _next_launch(monkeypatch, 2)
         with ExitStack() as stack:
             assert _claim(stack) == 0
         with patch.object(run_state.Path, "rename",
@@ -659,3 +680,412 @@ class TestTheRollOverComposesInSchemaForm:
         # The other launch's group is untouched, and one slug names one run.
         assert [d.name for d in (area / taken).iterdir()] == [SID_OTHER]
         assert run_state.find_run_dir(taken) == other
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+@pytest.fixture
+def published_runs(monkeypatch, tmp_path, runs):
+    """`runs`, but the work repo is a real clone of a bare origin, so a test
+    can ask what `work commit` actually PUBLISHED rather than what it meant
+    to stage."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                   check=True, capture_output=True)
+    clone = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)],
+                   check=True, capture_output=True)
+    # `work commit` runs plain git in the clone, and a CI runner has no
+    # global identity to fall back on.
+    _git(clone, "config", "user.name", "test")
+    _git(clone, "config", "user.email", "test@example.com")
+    (clone / "README").write_text("work repo\n")
+    _git(clone, "add", "README")
+    _git(clone, "commit", "-q", "-m", "init")
+    _git(clone, "push", "-q", "origin", "main")
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    return origin, clone
+
+
+def _complete_via_cli():
+    """`work state set --status=complete`, as the release taskdef closes out.
+    Its own push is held back so the assertion is about `work commit`."""
+    with patch("work_repo.cli.commit_work_path", return_value=0):
+        assert _main(["state", "set", "--status=complete",
+                      "--stop-reason=complete"]) == 0
+
+
+def _log(message):
+    with patch("work_repo.cli.commit_work_path", return_value=0):
+        return _main(["log", message])
+
+
+def _session_start(session):
+    with patch("work_repo.cli.commit_work_path", return_value=0):
+        return _main(["session-start", "--session", session])
+
+
+def _finish_a_release():
+    with ExitStack() as stack:
+        assert _claim(stack) == 0
+    assert _record(["version", "0.6.0"]) == 0
+    moved = run_state.run_dir()
+    _complete_via_cli()
+    return moved
+
+
+class TestTheLaunchThatFinishedARelease:
+    """Issue #172. The completing session derives the address its run
+    vacated, and a terminal run used to stop resolving from it: `work commit`
+    staged a path that no longer existed, and the next `work` verb seeded a
+    phantom live run where the next release's claim looks."""
+
+    def test_work_commit_publishes_the_completion_write(self, published_runs,
+                                                         capsys):
+        origin, clone = published_runs
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        assert git_ops.commit_work_changes("live release") == 0
+        moved = f"git.example.com/org/repo/runs/{BASE}-v0.6.0"
+        assert "status: in-progress" in _git(origin, "show", f"main:{moved}/state.yaml")
+
+        _complete_via_cli()
+        assert git_ops.commit_work_changes("complete") == 0
+
+        published = _git(origin, "show", f"main:{moved}/state.yaml")
+        assert "status: complete" in published, (
+            "the completion write was left behind in the clone")
+        events = _git(origin, "show", f"main:{moved}/events.jsonl")
+        assert '"type": "state_changed"' in events.splitlines()[-1]
+        assert _git(clone, "status", "--short") == ""
+
+    def test_work_log_after_completion_seeds_no_run(self, runs, capsys):
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        _complete_via_cli()
+
+        assert _log("closing note written after the release completed") == 0
+
+        moved = runs / f"{BASE}-v0.6.0"
+        assert [d.name for d in runs.iterdir()] == [moved.name], (
+            "a work verb seeded a phantom run at the vacated address")
+        assert run_state.run_dir() == moved
+        assert "closing note written after" in (moved / "log.yaml").read_text()
+        assert run_state.load_state(moved)["status"] == "complete"
+
+    def test_the_finished_run_reads_back(self, runs, capsys):
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        _ship("0.6.0")
+        _complete_via_cli()
+        capsys.readouterr()
+
+        assert _main(["release", "status"]) == 0
+        out = capsys.readouterr().out
+        assert "No release recorded" not in out
+        assert "0.6.0" in out
+
+    def test_the_next_launch_still_seeds_fresh_at_the_bare_address(
+            self, runs, capsys, monkeypatch):
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        _ship("0.6.0")
+        _complete_via_cli()
+        assert _log("closing note written after the release completed") == 0
+        finished = runs / f"{BASE}-v0.6.0"
+        capsys.readouterr()
+
+        _next_launch(monkeypatch, 2)
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+
+        fresh = run_state.run_dir()
+        assert fresh == runs / BASE
+        assert run_state.load_state(fresh)["status"] == "in-progress"
+        assert release_run.load_release(fresh) is None
+        assert run_state.load_state(finished)["status"] == "complete"
+        # A seed, not an adopted phantom: nothing of the first launch's is in it.
+        assert {e["session"] for e in run_state.read_events(fresh, last_n=0)} == {
+            "s-rel-2"}
+        assert not (fresh / "log.yaml").exists()
+        assert "closing note written after" in (finished / "log.yaml").read_text()
+
+    def test_a_contextless_session_start_skips_instead_of_seeding(
+            self, runs, capsys, monkeypatch):
+        """The hook-facing seed site: same refusal, reported and exit 0."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        _complete_via_cli()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["session-start"]) == 0
+
+        assert "run-state session-start skipped: refusing to start a new run" in \
+            capsys.readouterr().out
+        assert [d.name for d in runs.iterdir()] == [f"{BASE}-v0.6.0"]
+
+    def test_a_claim_from_the_same_launch_refuses_loudly(self, runs, capsys):
+        """The schema-2 refusal, word for word. Rolling the finished run
+        aside would re-slug an address it already left."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        _ship("0.6.0")
+        _complete_via_cli()
+        capsys.readouterr()
+
+        with ExitStack() as stack:
+            assert _claim(stack) == 1
+        assert "this execution has finished; start a fresh session" in \
+            capsys.readouterr().err
+        assert [d.name for d in runs.iterdir()] == [f"{BASE}-v0.6.0"]
+
+    def test_a_contextless_verb_refuses_instead_of_seeding(self, runs, capsys,
+                                                          monkeypatch):
+        """With no `LMER_SESSION_ID` nothing can say whether the finished run
+        is this invocation's, and a phantom is the one wrong answer."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        _complete_via_cli()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        assert _log("an operator shell logging after the release") == 1
+
+        err = capsys.readouterr().err
+        assert "refusing to start a new run at 'release'" in err
+        assert f"{BASE}-v0.6.0" in err
+        assert [d.name for d in runs.iterdir()] == [f"{BASE}-v0.6.0"]
+
+    def test_a_contextless_resume_of_the_finished_launch_seeds_no_run(
+            self, runs, capsys, monkeypatch):
+        """`--session` names the launch: its events are on the finished run.
+        No seed happens either way, so the proof it RESOLVED is that the
+        session start landed there rather than skipping."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        _complete_via_cli()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        assert _session_start("s-rel-1") == 0
+
+        assert "session-start skipped" not in capsys.readouterr().out
+        moved = runs / f"{BASE}-v0.6.0"
+        assert [d.name for d in runs.iterdir()] == [moved.name]
+        assert run_state.load_state(moved)["status"] == "complete"
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] == "session_start"
+
+    def test_a_resume_naming_unknown_claims_no_contextless_writers_run(
+            self, runs, capsys, monkeypatch):
+        """`unknown` is the label every contextless write is stamped with,
+        not a launch: naming it must not make the finished run anyone's."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        monkeypatch.delenv("LMER_SESSION_ID")
+        _complete_via_cli()
+        moved = runs / f"{BASE}-v0.6.0"
+        assert run_state.load_state(moved)["status"] == "complete"
+        assert run_state.read_events(moved, last_n=0)[-1]["session"] == \
+            run_state.UNKNOWN_SESSION_ID
+        capsys.readouterr()
+
+        assert _session_start("unknown") == 0
+
+        assert "run-state session-start skipped: refusing to start a new run" in \
+            capsys.readouterr().out
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] != "session_start"
+        assert [d.name for d in runs.iterdir()] == [moved.name]
+
+    def test_a_contextless_resume_of_a_launch_that_wrote_nothing_skips(
+            self, runs, capsys, monkeypatch):
+        """An id with no record proves nothing, so it is no launch id."""
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        _complete_via_cli()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        assert _session_start("s-nobody") == 0
+
+        assert "run-state session-start skipped: refusing to start a new run" in \
+            capsys.readouterr().out
+        assert [d.name for d in runs.iterdir()] == [f"{BASE}-v0.6.0"]
+
+
+class TestTheLaunchThatFinishedAReleaseInSchemaForm:
+    """The same two halves in a session-dir tree, where the phantom is a
+    second session dir under the group the run left — named for the very
+    launch that moved away from it."""
+
+    def test_the_completion_is_staged_and_no_session_is_seeded(
+            self, schema_runs, capsys):
+        area = run_state.runs_base()
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        assert _record(["version", "0.6.0"]) == 0
+        moved = run_state.run_dir()
+        assert moved.parent.name == f"{SCHEMA_BASE}-v0.6.0"
+        _complete_via_cli()
+
+        assert f"{PROJECT}/_runs/{moved.parent.name}/{SID_FIRST}" in \
+            run_state.run_rel_path_candidates()
+        assert _log("closing note written after the release completed") == 0
+        assert not (area / SCHEMA_BASE).exists(), (
+            "a work verb seeded a phantom session at the vacated address")
+        assert run_state.run_dir() == moved
+
+    def test_the_next_launch_still_seeds_fresh_at_the_bare_address(
+            self, schema_runs, capsys, monkeypatch):
+        area = run_state.runs_base()
+        moved = _finish_a_release()
+        monkeypatch.setenv("LMER_SESSION_ID", SID_NEXT)
+
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+
+        fresh = run_state.run_dir()
+        assert fresh == area / SCHEMA_BASE / SID_NEXT
+        assert run_state.load_state(fresh)["status"] == "in-progress"
+        assert {e["session"] for e in run_state.read_events(fresh, last_n=0)} == {
+            SID_NEXT}
+        assert run_state.load_state(moved)["status"] == "complete"
+
+    def test_a_contextless_verb_refuses_instead_of_seeding(
+            self, schema_runs, capsys, monkeypatch):
+        area = run_state.runs_base()
+        moved = _finish_a_release()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        assert _log("an operator shell logging after the release") == 1
+
+        err = capsys.readouterr().err
+        assert f"refusing to start a new run at '{SCHEMA_BASE}'" in err
+        assert f"{moved.parent.name}/{SID_FIRST}" in err
+        assert not (area / SCHEMA_BASE).exists()
+
+    def test_a_contextless_session_start_skips_instead_of_seeding(
+            self, schema_runs, capsys, monkeypatch):
+        area = run_state.runs_base()
+        _finish_a_release()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["session-start"]) == 0
+
+        assert "run-state session-start skipped: refusing to start a new run" in \
+            capsys.readouterr().out
+        assert not (area / SCHEMA_BASE).exists()
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("launch", [None, SID_NEXT])
+    def test_a_resume_of_the_finished_launch_seeds_no_session(
+            self, schema_runs, capsys, monkeypatch, launch, frozen):
+        """The phantom would be named for the very session the resume names,
+        under the group that session's run left. A fleet row shows the frozen
+        `<sid>--<name>` spelling, which names the same session."""
+        area = run_state.runs_base()
+        moved = _finish_a_release()
+        named = SID_FIRST
+        if frozen:
+            named = f"{SID_FIRST}--ship"
+            moved = moved.rename(moved.parent / named)
+        if launch is None:
+            monkeypatch.delenv("LMER_SESSION_ID")
+        else:
+            monkeypatch.setenv("LMER_SESSION_ID", launch)
+        capsys.readouterr()
+
+        assert _session_start(named) == 0
+
+        # A contextless start that failed to resolve would skip rather than
+        # seed, leaving the same tree — only landing here proves it resolved.
+        assert "session-start skipped" not in capsys.readouterr().out
+        assert run_state.read_events(moved, last_n=0)[-1]["type"] == "session_start"
+        assert not (area / SCHEMA_BASE).exists()
+        if launch is not None:
+            assert run_state.has_session(run_state.load_state(moved), launch)
+            assert run_state.run_dir() == moved
+            capsys.readouterr()
+            with ExitStack() as stack:
+                assert _claim(stack) == 1
+            assert "this execution has finished; start a fresh session" in \
+                capsys.readouterr().err
+
+    @pytest.mark.parametrize("route", ["ensure_run", "session-start"])
+    def test_a_contextless_resume_of_a_launch_that_wrote_nothing_refuses(
+            self, schema_runs, capsys, monkeypatch, route):
+        area = run_state.runs_base()
+        _finish_a_release()
+        capsys.readouterr()
+        monkeypatch.delenv("LMER_SESSION_ID")
+
+        if route == "ensure_run":
+            with pytest.raises(run_state.RunStateError,
+                               match="refusing to start a new run"):
+                run_state.ensure_run(session=SID_NEXT)
+        else:
+            assert _session_start(SID_NEXT) == 0
+            assert "session-start skipped: refusing to start a new run" in \
+                capsys.readouterr().out
+        assert not (area / SCHEMA_BASE).exists()
+
+
+
+@pytest.fixture
+def process_runs(monkeypatch, tmp_path):
+    """A schema-2 tree: every record is one launch's, addressed by its UID."""
+    root = tmp_path / "plexus"
+    root.mkdir()
+    (root / "_lmer.yaml").write_text(
+        "schema: 2\nname: example\nprojects:\n  widgets:\n"
+        "    repo: git.example.test/acme/widgets\n")
+    for key, value in {
+        "LMER_WORK_REPO_PATH": str(root),
+        "LMER_REPO_HOST": "git.example.test",
+        "LMER_REPO_PROJECT": "acme/widgets",
+        "LMER_REPO_URL": "https://git.example.test/acme/widgets",
+        "LMER_TASK": "release",
+        "LMER_TASK_TARGET": "main",
+        "LMER_SESSION_ID": UID_FIRST,
+        "LMER_SESSION_METADATA": json.dumps({"operator": "op", "hostname": "h"}),
+    }.items():
+        monkeypatch.setenv(key, value)
+    utils._ANNOUNCED_MANIFEST_PROBLEMS.clear()
+    return root
+
+
+class TestTheLaunchThatFinishedAReleaseInSchema2:
+    """Schema 2 never seeded the phantom — a record is found by its UID —
+    but `work commit` staged only the vacated group, so the completion write
+    was stranded there too."""
+
+    def test_the_completion_is_staged_and_another_launch_does_not_resolve_it(
+            self, process_runs, capsys, monkeypatch):
+        rdir, state = run_state.ensure_run()
+        slug = state["slug"]
+        moved, state, _ = run_state.reslug_run(rdir, state, f"{slug}-v0.6.0")
+        _complete_via_cli()
+
+        rel = f"widgets/_runs/{slug}-v0.6.0/{UID_FIRST}"
+        assert rel in run_state.run_rel_path_candidates(), (
+            "the completion write is not staged by work commit")
+        assert run_state.load_state(moved)["status"] == "complete"
+
+        monkeypatch.setenv("LMER_SESSION_ID", UID_NEXT)
+        assert run_state.resolve_run_dir(slug) is None

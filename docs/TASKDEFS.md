@@ -293,6 +293,18 @@ fires, the template is rendered with:
   github.com and GitHub Enterprise hosts set `is_github`,
   any other non-empty host sets `is_gitlab`, and both are `False` when no host
   can be determined.
+- `{{ available_taskdefs }}` — the taskdefs a run can draw on, as a list of
+  `{name, purpose, path}` mappings. It holds the built-in purpose table's
+  names first (develop, review, spec, masterplan, modernize, followup,
+  release, chat, orchestrate), then every other directory carrying an
+  `instructions.txt` in the start hook's search tiers, sorted by name.
+  `path` is the `instructions.txt` that wins the same first-match walk
+  `/start` uses to resolve a taskdef. It is `None` for a built-in name that
+  no tier carries, so a template can say the file is missing instead of
+  pointing at it. A name outside the purpose table gets a generic purpose.
+  `chat` renders this list in its "Pivoting to development work" section,
+  so a chat run knows which taskdef to read when the conversation turns
+  into develop or review work.
 
 To emit a literal `{{ VAR }}` in the rendered output (e.g. when documenting
 the template format itself), wrap it in a Jinja string: `{{ '{{ VAR }}' }}`.

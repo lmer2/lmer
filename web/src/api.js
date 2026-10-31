@@ -508,7 +508,7 @@ export function fetchAssistantHistory(sessionId, { since = -40, before, limit = 
 // anyone else should see and keeps the raw `/input` route. `sanitize` is
 // accepted for the callers that still pass it; the bus defuses by construction.
 export function sendSessionInput(
-  sessionId, data, { appendNewline = true, sanitize = false, workspaceId } = {},
+  sessionId, data, { appendNewline = true, sanitize = false, workspaceId, meta } = {},
 ) {
   if (!appendNewline) {
     const body = { data, append_newline: false, workspace_id: workspaceId }
@@ -522,7 +522,7 @@ export function sendSessionInput(
   return request(`api/sessions/${encodeURIComponent(sessionId)}/comms`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ kind: 'message', text: data, workspace_id: workspaceId }),
+    body: JSON.stringify({ kind: 'message', text: data, workspace_id: workspaceId, ...(meta ? { meta } : {}) }),
   })
 }
 
@@ -555,6 +555,25 @@ export function uploadSessionFile(sessionId, { name, data, workspaceId }) {
     headers: jsonHeaders,
     body: JSON.stringify({ name, data, workspace_id: workspaceId }),
   })
+}
+
+// Send Privately (issue 510). The text becomes a 0400 file in the session's store;
+// the reply's `reference` is the only thing that goes into the chat.
+export function sendPrivately(sessionId, { text, purpose, workspaceId }) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/private`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ text, purpose: purpose || null, workspace_id: workspaceId }),
+  })
+}
+
+// Deletes a private file whose reference never reached the session.
+export function withdrawPrivate(sessionId, name, workspaceId) {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''
+  return request(
+    `api/sessions/${encodeURIComponent(sessionId)}/private/${encodeURIComponent(name)}${query}`,
+    { method: 'DELETE' },
+  )
 }
 
 // Where the browser reads one back — an `<img>` src, so it is a URL rather than a
@@ -695,6 +714,19 @@ export function stopAssistant(workspaceId) {
 // consumes them and every incarnation reads them at startup.
 export function rotateAssistant(workspaceId) {
   return request(workspacePath('api/assistant/rotate', workspaceId), { method: 'POST' })
+}
+
+// Every project's assistant at once (issue 646): who a request would reach, and
+// the request itself. A request is a bus record asking each to rotate itself; the
+// receipt is a later generation in the listing.
+export function fetchRotateAll() {
+  return request('api/assistant/rotate-all')
+}
+
+export function requestRotateAll(reason) {
+  return request('api/assistant/rotate-all', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ reason: reason || null }),
+  })
 }
 
 export function fetchAssistantInstructions(workspaceId) {

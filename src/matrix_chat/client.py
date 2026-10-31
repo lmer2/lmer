@@ -2,9 +2,9 @@
 
 Exactly what the chat connector and listener need — whoami, alias
 resolution, joining, sync with a filter, thread relations, sending into a
-thread, media up and down — as a logged-in **user account** (access token),
-not an appservice. Encrypted rooms are detected and refused; they are the
-follow-up this module's docstring in :mod:`matrix_chat` names.
+thread, media up and down — over an access token. In an encrypted room every
+send is encrypted by ``lmer-matrix-bridge``'s device (:mod:`matrix_chat.crypto`)
+or refused; there is no plaintext fallback.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from urllib.parse import quote
 
 import requests
 
+from .crypto import UNDECRYPTABLE, BridgeCrypto, CryptoError
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["MatrixError", "MatrixAccount", "MatrixClient", "DEFAULT_SYNC_TIMEOUT_MS"]
@@ -28,10 +30,13 @@ _REQUEST_TIMEOUT = 30.0
 
 class MatrixError(RuntimeError):
     def __init__(self, message: str, status: Optional[int] = None, errcode: Optional[str] = None,
-                 *, transient: bool = False, retry_after: Optional[float] = None) -> None:
+                 *, transient: bool = False, retry_after: Optional[float] = None,
+                 not_sent: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.errcode = errcode
+        #: Failed before the send request: the event certainly does not exist.
+        self.not_sent = not_sent
         #: No answer, a 429 or a 5xx: worth retrying later. Set where the
         #: transport failed, since a definite answer can lack a status too.
         self.transient = transient
@@ -44,6 +49,9 @@ class MatrixAccount:
     homeserver: str
     user_id: str
     access_token: str = field(repr=False)
+    #: ``LMER_MATRIX_BRIDGE_URL``: where the bridge lends its device, for
+    #: encrypted rooms. Here so every path that builds a client gets it.
+    bridge_url: Optional[str] = None
 
     @property
     def base(self) -> str:
@@ -55,10 +63,29 @@ def _q(value: str) -> str:
 
 
 class MatrixClient:
-    def __init__(self, account: MatrixAccount, session=None, *, timeout: float = _REQUEST_TIMEOUT) -> None:
+    def __init__(self, account: MatrixAccount, session=None, *, timeout: float = _REQUEST_TIMEOUT,
+                 crypto: Optional[BridgeCrypto] = None) -> None:
         self.account = account
         self._session = session if session is not None else requests.Session()
         self._timeout = timeout
+        if crypto is None and account.bridge_url:
+            crypto = BridgeCrypto(account.bridge_url, account.access_token)
+        self.crypto = crypto
+        #: room id → whether its ``m.room.encryption`` state was last seen set.
+        self._encrypted: dict = {}
+
+    @property
+    def can_encrypt(self) -> bool:
+        return self.crypto is not None
+
+    def _crypto(self, room_id: str, call):
+        if self.crypto is None:
+            raise MatrixError(f"refusing to send into {room_id} unencrypted: "
+                              "no lmer-matrix-bridge to encrypt with", not_sent=True)
+        try:
+            return call()
+        except CryptoError as exc:
+            raise MatrixError(str(exc), status=exc.status, transient=exc.transient, not_sent=True) from exc
 
     # -- transport -------------------------------------------------------------
 
@@ -136,9 +163,31 @@ class MatrixClient:
             self._call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.encryption")
         except MatrixError as exc:
             if exc.status == 404:
+                self._encrypted[room_id] = False
                 return False
             raise
+        self._encrypted[room_id] = True
         return True
+
+    def note_encrypted(self, room_id: str) -> None:
+        """The room's ``m.room.encryption`` state arrived: it is encrypted now."""
+        self._encrypted[room_id] = True
+
+    def encrypts(self, room_id: str) -> bool:
+        """Whether what goes into *room_id* must be encrypted.
+
+        Without a bridge nothing extra is asked: only a room already known to
+        be encrypted counts, and the callers that can meet one probe first.
+        With one, an unknown room is probed once; later changes reach a
+        long-lived client through :meth:`note_encrypted`."""
+        known = self._encrypted.get(room_id)
+        if known is not None or self.crypto is None:
+            return known is True
+        try:
+            return self.room_is_encrypted(room_id)
+        except MatrixError as exc:
+            exc.not_sent = True
+            raise
 
     def direct_room(self, user_id: str) -> Optional[str]:
         """The room this account already uses to talk to *user_id*, or ``None``.
@@ -323,26 +372,32 @@ class MatrixClient:
 
     # -- writing ---------------------------------------------------------------
 
-    def send_reaction(self, room_id: str, event_id: str, key: str, *, transaction: str) -> str:
-        """Annotate a message using a stable transaction ID for retries."""
+    def send_event(self, room_id: str, event_type: str, content: dict, *,
+                   transaction: Optional[str] = None) -> str:
+        """Send one room event, encrypted when :meth:`encrypts` says so."""
+        if self.encrypts(room_id):
+            content = self._crypto(room_id, lambda: self.crypto.encrypt(room_id, event_type, content))
+            event_type = "m.room.encrypted"
+        txn = transaction or f"lmer-{uuid.uuid4().hex}"
         body = self._call(
-            "PUT", f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.reaction/{_q(transaction)}",
-            json_body={"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": key}},
-        )
-        reaction = body.get("event_id")
-        if not isinstance(reaction, str):
-            raise MatrixError("reaction returned no event_id")
-        return reaction
-
-    def send_message(self, room_id: str, content: dict) -> str:
-        txn = f"lmer-{uuid.uuid4().hex}"
-        body = self._call(
-            "PUT", f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.room.message/{txn}", json_body=content,
+            "PUT", f"/_matrix/client/v3/rooms/{_q(room_id)}/send/{_q(event_type)}/{_q(txn)}",
+            json_body=content,
         )
         event_id = body.get("event_id")
         if not isinstance(event_id, str):
             raise MatrixError("send returned no event_id")
         return event_id
+
+    def send_reaction(self, room_id: str, event_id: str, key: str, *, transaction: str) -> str:
+        """Annotate a message using a stable transaction ID for retries."""
+        return self.send_event(
+            room_id, "m.reaction",
+            {"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": key}},
+            transaction=transaction,
+        )
+
+    def send_message(self, room_id: str, content: dict) -> str:
+        return self.send_event(room_id, "m.room.message", content)
 
     def send_thread_text(self, room_id: str, root_event_id: str, text: str, *,
                          last_event_id: Optional[str] = None, msgtype: str = "m.text",
@@ -362,19 +417,22 @@ class MatrixClient:
         }
         return self.send_message(room_id, content)
 
-    def send_thread_file(self, room_id: str, root_event_id: str, *, mxc: str, name: str,
-                         media_type: str, size: int, last_event_id: Optional[str] = None,
-                         extra: Optional[dict] = None) -> str:
+    def send_thread_file(self, room_id: str, root_event_id: str, *, mxc: Optional[str] = None,
+                         name: str, media_type: str, size: int, last_event_id: Optional[str] = None,
+                         extra: Optional[dict] = None, file: Optional[dict] = None) -> str:
         """*extra* as in :meth:`send_thread_text`: a file event needs the same
         stamp, or the receiving run is told about a post whose file it never
-        sees (review of !300)."""
+        sees (review of !300). *file* replaces *mxc* for an encrypted upload
+        (:meth:`upload_encrypted`)."""
+        if (mxc is None) == (file is None):
+            raise ValueError("send_thread_file needs exactly one of mxc and file")
         msgtype = "m.image" if media_type.startswith("image/") else "m.file"
         content = {
             **(extra or {}),
             "msgtype": msgtype,
             "body": name,
             "filename": name,
-            "url": mxc,
+            **({"file": file} if file is not None else {"url": mxc}),
             "info": {"mimetype": media_type, "size": size},
             "m.relates_to": {
                 "rel_type": "m.thread",
@@ -387,15 +445,63 @@ class MatrixClient:
 
     # -- media -----------------------------------------------------------------
 
-    def upload(self, data: bytes, *, content_type: str, filename: str) -> str:
+    def upload(self, data: bytes, *, content_type: str, filename: Optional[str]) -> str:
         body = self._call(
-            "POST", "/_matrix/media/v3/upload", params={"filename": filename},
+            "POST", "/_matrix/media/v3/upload", params={"filename": filename} if filename else None,
             data=data, headers={"Content-Type": content_type},
         )
         mxc = body.get("content_uri")
         if not isinstance(mxc, str):
             raise MatrixError("upload returned no content_uri")
         return mxc
+
+    def upload_encrypted(self, data: bytes) -> dict:
+        """Upload *data* as ciphertext; the event's ``file`` object, ``url`` set.
+
+        No filename: the media repository keeps it in the clear."""
+        ciphertext, file = self._crypto("an encrypted room", lambda: self.crypto.encrypt_attachment(data))
+        file["url"] = self.upload(ciphertext, content_type="application/octet-stream", filename=None)
+        return file
+
+    def download_content(self, content: dict, *, max_bytes: Optional[int] = None) -> tuple:
+        """A media event's bytes — decrypted when it carries a ``file`` — and type.
+
+        ``(None, type)`` past *max_bytes*, as :meth:`download`.
+        """
+        file = content.get("file")
+        info = content.get("info") if isinstance(content.get("info"), dict) else {}
+        if not isinstance(file, dict):
+            return self.download(str(content.get("url") or ""), max_bytes=max_bytes)
+        if self.crypto is None:
+            raise MatrixError("an encrypted file, and no lmer-matrix-bridge to decrypt it with")
+        data, _ = self.download(str(file.get("url") or ""), max_bytes=max_bytes)
+        media_type = str(info.get("mimetype") or "application/octet-stream")
+        if data is None:
+            return None, media_type
+        return self._crypto("an encrypted room", lambda: self.crypto.decrypt_attachment(data, file)), media_type
+
+    def decrypt_events(self, room_id: str, events: list) -> list:
+        """``(event, problem)`` per event, in order.
+
+        A plaintext event comes back as itself. An encrypted one comes back
+        decrypted, or as ``(None, problem)``: :data:`~matrix_chat.crypto.NO_SESSION`
+        while its room key has not reached the bridge yet, ``undecryptable``
+        for good, ``no_crypto`` without a bridge.
+        """
+        out: list = [(event, None) for event in events]
+        encrypted = [index for index, event in enumerate(events)
+                     if isinstance(event, dict) and event.get("type") == "m.room.encrypted"]
+        if not encrypted:
+            return out
+        if self.crypto is None:
+            for index in encrypted:
+                out[index] = (None, "no_crypto")
+            return out
+        results = self._crypto(room_id, lambda: self.crypto.decrypt(room_id, [events[index] for index in encrypted]))
+        for index, result in zip(encrypted, results):
+            event = result.get("event")
+            out[index] = (event, None) if isinstance(event, dict) else (None, result.get("errcode") or UNDECRYPTABLE)
+        return out
 
     def download(self, mxc: str, *, max_bytes: Optional[int] = None) -> tuple:
         """``(bytes, content_type)`` for an ``mxc://server/media`` URI.

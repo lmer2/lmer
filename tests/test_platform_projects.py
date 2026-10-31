@@ -13,6 +13,7 @@ from lmer_platform import assistant, assistant_history, config, memory, projects
 from lmer_platform import project_api, project_events
 from lmer_platform import project_context as scope, registry, runs, spawn, store, uploads
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import SETTLE, outlast
 
 
 @pytest.fixture
@@ -21,7 +22,9 @@ def fleet(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
     monkeypatch.setenv(config.ENV_CONTAINER_URL, "http://platform.test:8600")
     executable = tmp_path / "lmer"
-    executable.write_text("#!/bin/sh\nexec sleep 120\n")
+    # Must outlive the test, which the teardown below ends with a killpg: a
+    # 120 s session exited under a loaded gate and an upload to it got 410 (#636).
+    executable.write_text(f"#!/bin/sh\nexec sleep {outlast(SETTLE)}\n")
     executable.chmod(0o755)
     settings = config.load({"lmer_bin": str(executable), "max_concurrent_sessions": 1})
     config.ensure_secret(settings)

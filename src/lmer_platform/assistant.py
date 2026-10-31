@@ -500,6 +500,14 @@ _STOP_POLL_SECONDS = 0.05
 #: re-read every session's registry file for the life of the daemon.
 SUPERVISE_POLL_SECONDS = 30.0
 
+#: How long :meth:`Supervisor.stop` waits for a pass that is mid-start to
+#: finish, so nothing it launches lands after the stop returned unannounced.
+SUPERVISE_STOP_SECONDS = 120.0
+
+#: The slice :meth:`Supervisor._wait_for_exit` waits in, so a stop is seen
+#: within this rather than after the whole :data:`SUPERVISE_POLL_SECONDS`.
+SUPERVISE_STOP_CHECK_SECONDS = 0.5
+
 #: The first wait before a respawn, and the ceiling the doubling stops at. Five
 #: seconds because a container that failed to start once usually failed for a
 #: reason that is still true a second later; five minutes because a host whose
@@ -523,6 +531,12 @@ SETTLED_SECONDS = 120.0
 #: the writers here are genuinely concurrent: the API handlers run in Starlette's
 #: threadpool and the daemon's watcher calls :func:`notify` from its own thread.
 #: Reentrant because :func:`rotate` is a stop and a start.
+#:
+#: Lock order (issue #566): ``projects.operation()`` before this lock, never the
+#: reverse. Anything that takes this lock and can reach ``projects.operation()``
+#: (a :func:`start`, :func:`stop`, a project update) is ``@serialized`` so it
+#: holds the projects lock first; ``projects.move`` and the project request and
+#: event paths nest them the same way.
 _LOCK = threading.RLock()
 
 #: Serializes only the registry/state publication boundary shared with
@@ -816,7 +830,7 @@ class AssistantStatus:
     #: answer an assistant can fetch.
     nudged_at: Optional[str] = None
     log_path: Optional[str] = None
-    #: What the *running* incarnation was actually launched with — the four
+    #: What the *running* incarnation was actually launched with — the
     #: launch settings (issue #234), read off its registry entry, where the
     #: spawn recorded what it emitted. ``None`` when nothing is running, and
     #: distinct on purpose from what :func:`lmer_platform.config.assistant_settings`
@@ -1529,7 +1543,7 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
 
     Two validation postures over ONE rule set
     (:func:`lmer_platform.config._unusable_reason` — shape rules mirroring what
-    ``spawn.SpawnRequest.validate`` enforces for these four fields), matching
+    ``spawn.SpawnRequest.validate`` enforces for these fields), matching
     who is asking. A value that arrived through the standing layers has already
     fallen back with a warning when unusable (inside
     :func:`lmer_platform.config.assistant_settings`) — a typo in a file must
@@ -1844,7 +1858,7 @@ def start(
             target=TARGET,
             targets=launch["threads"],
             no_repo=True,
-            # The four launch settings travel as the typed fields the platform
+            # The launch settings travel as the typed fields the platform
             # already emits as its own flags for workers — never appended to
             # extra_args, where a later spelling would win over the recorded
             # one (spawn._RESERVED_ARGS refuses exactly that).
@@ -1852,6 +1866,7 @@ def start(
             agents=launch["agents"],
             harness=launch["harness"],
             model=launch["model"],
+            effort=launch["effort"],
             extra_args=("--env-file", str(env_file)) if env_file else (),
         )
         # The backstop for rule drift, not the validation path: the values
@@ -2079,6 +2094,7 @@ def rotate(
         return start(config, settings=settings, refuse_held_threads=False)
 
 
+@serialized
 def ensure_running(config: PlatformConfig) -> AssistantStatus:
     """Start the assistant unless one is already up. Idempotent.
 
@@ -2229,9 +2245,22 @@ class Supervisor:
         """Ask the loop to finish, and cut short a backoff it is sitting in.
 
         Called when the server stops serving: a supervisor still in its backoff
-        would otherwise start a container that nothing is left to serve.
+        would otherwise start a container that nothing is left to serve. Joins
+        the loop, because a pass already past its stop check would otherwise
+        start one after this returned (#566).
         """
-        self._stop.set()
+        with self._resume_lock:
+            self._stop.set()
+            thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(SUPERVISE_STOP_SECONDS)
+        if thread.is_alive():
+            logger.error(
+                "platform_assistant_supervision_stop_timed_out seconds=%s — a "
+                "start is still running and may leave an assistant up",
+                SUPERVISE_STOP_SECONDS,
+            )
 
     @property
     def stopped(self) -> bool:
@@ -2373,7 +2402,12 @@ class Supervisor:
             # ``status`` will keep reporting it. Fall back to the interval.
             self._sleep(self.poll)
             return
-        self._await_exit(session_id, self.poll)
+        remaining = self.poll
+        while remaining > 0 and not self._stop.is_set():
+            step = min(remaining, SUPERVISE_STOP_CHECK_SECONDS)
+            if self._await_exit(session_id, step):
+                return
+            remaining -= step
 
     def _attempt(self) -> SupervisionReport:
         """Start the assistant once, absorbing anything that goes wrong.

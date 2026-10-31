@@ -16,6 +16,7 @@ from dataclasses import replace
 import pytest
 
 from lmer_cli import tokens
+from lmer_cli.harness import EFFORT_LEVELS
 from lmer_platform import config as cfg
 from lmer_platform import store
 from tests.conftest import strip_lmer_env
@@ -776,6 +777,7 @@ def test_assistant_settings_default_to_todays_behaviour(platform_root):
     """Unset everywhere reads as None/default for every key — no new behaviour."""
     config = cfg.load()
     assert config.assistant_model is None
+    assert config.assistant_effort is None
     assert config.assistant_harness is None
     assert config.assistant_preset is None
     assert config.assistant_agents is None
@@ -890,7 +892,7 @@ def test_update_stored_preserves_unknown_keys(platform_root):
 
 def test_update_stored_refuses_unknown_fields(platform_root):
     with pytest.raises(cfg.ConfigError, match="unknown config field"):
-        cfg.update_stored({"assistant_effort": "high"})
+        cfg.update_stored({"assistant_verbosity": "high"})
     assert not cfg.config_path().exists()
 
 
@@ -958,6 +960,9 @@ def test_an_unusable_env_value_falls_through_to_the_file(
     ("model", "-x"),
     ("agents", ","),
     ("agents", " , ,"),
+    ("effort", "turbo"),
+    ("effort", "-high"),
+    ("effort", 7),
 ])
 def test_validate_assistant_override_refuses_and_names_the_key(
     platform_root, key, value
@@ -971,6 +976,33 @@ def test_validate_assistant_override_strips_a_usable_value(
 ):
     assert cfg.validate_assistant_override("model", "  sonnet-5 ") == "sonnet-5"
     assert cfg.validate_assistant_override("agents", "dev,review") == "dev,review"
+
+
+@pytest.mark.parametrize("level", EFFORT_LEVELS)
+def test_validate_assistant_override_takes_every_effort_level_in_any_case(
+    platform_root, level
+):
+    assert cfg.validate_assistant_override("effort", f" {level.upper()} ") == level
+
+
+def test_the_assistant_effort_resolves_env_over_file_and_skips_junk(
+    platform_root, monkeypatch, caplog
+):
+    store.write_json(cfg.config_path(), {"assistant_effort": "High"})
+    assert cfg.load().assistant_effort == "high"
+    assert cfg.assistant_settings()["effort"].value == "high"
+
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_EFFORT, "MAX")
+    assert cfg.load().assistant_effort == "max"
+    assert cfg.assistant_settings()["effort"].source == "env"
+
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_EFFORT, "turbo")
+    setting = cfg.assistant_settings()["effort"]
+    assert (setting.value, setting.source) == ("high", "config.json")
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
 
 
 # --- the name rules: values the host would refuse at exit 2 -------------------
@@ -1337,8 +1369,8 @@ def test_mutate_stored_serialises_two_writers(platform_root):
 
 
 def test_mutate_stored_refuses_an_unknown_field(platform_root):
-    with pytest.raises(cfg.ConfigError, match="assistant_effort"):
-        cfg.mutate_stored(lambda _current: {"assistant_effort": "high"})
+    with pytest.raises(cfg.ConfigError, match="assistant_verbosity"):
+        cfg.mutate_stored(lambda _current: {"assistant_verbosity": "high"})
 
 
 def test_no_environment_variable_declares_slots(platform_root, monkeypatch):
@@ -1583,7 +1615,7 @@ def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     assert len(keys) == len(cfg.INT_SETTINGS)
     assert set(cfg.INT_SETTINGS) == {
         "max_live_assistants", "max_concurrent_sessions",
-        "chat_keep_last", "checkin_window_seconds", "nudge_after_seconds",
+        "dock_keep_last_notes", "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
         "terminal_confirm_seconds",
         # The chat upload cap (issue 246) resolves through the same warn-

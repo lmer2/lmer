@@ -411,6 +411,33 @@ class TestLeg2ConsumptionContracts:
             "provisioning" in squashed
         )
 
+    def test_every_step5_gh_command_gets_gh_token_and_gh_repo_in_its_own_subshell(self):
+        """`gh` reads the PAT from GH_TOKEN, which a fresh shell lacks
+        (#382): each `gh` line exports it in a subshell holding that one
+        command, and no receipt or push shares the subshell. GH_REPO names
+        the mirror from `release.github_target`, so `gh` never picks a
+        repository from the checkout's remotes, where `origin` is GitLab."""
+        leg2 = _leg2()
+        step5 = leg2[leg2.index(STEP_HEADINGS[4]):leg2.index(STEP_HEADINGS[5])]
+        subshell = re.compile(
+            r'\( export GH_TOKEN="\$\{LMER_RELEASE_GITHUB_TOKEN\}"; '
+            r'export GH_REPO="<release\.github_target>"; '
+            r"export GH_PROMPT_DISABLED=1; (?P<command>[^()]*?) \)"
+        )
+        commands = []
+        for line in step5.splitlines():
+            wrapped = [match.span() for match in subshell.finditer(line)]
+            for gh in re.finditer(r"(?<![\w/-])gh run\b", line):
+                assert any(start < gh.start() < end for start, end in wrapped), (
+                    f"`gh` outside a GH_TOKEN + GH_REPO subshell: {line.strip()!r}"
+                )
+            commands += [match["command"] for match in subshell.finditer(line)]
+        assert len(commands) >= 4, "list, watch, view and rerun"
+        for command in commands:
+            assert command.startswith("gh run ")
+            assert not re.search(r"[;&|]", command), command
+            assert "bin/gate-push" not in command and "work " not in command
+
     def test_status_verb_drives_reentry(self):
         squashed = _squash(_leg2())
         assert "run `work release status` first" in squashed
