@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,7 +37,6 @@ def _clean_lmer_env(monkeypatch):
 @pytest.fixture(autouse=True)
 def disconnect_notices(monkeypatch):
     from lmer_platform import comms
-    from types import SimpleNamespace
 
     posted = []
     hub = SimpleNamespace(post=lambda session, **message: posted.append((session, message)))
@@ -1147,7 +1147,6 @@ class TestVerifiedLaunchThreadIdentity:
 def test_the_connector_environment_carries_the_resolved_assistant_name(platform_root):
     """A connector renders the assistant's records, so it needs the same name the
     daemon resolved — including one set only in config.json (review of !403)."""
-    from types import SimpleNamespace
 
     from lmer_platform import config as platform_config
 
@@ -1161,3 +1160,15 @@ def test_the_connector_environment_carries_the_resolved_assistant_name(platform_
     )
     env = threads._environment(SimpleNamespace(host="127.0.0.1", port=1234, token="tok"), "s-1", {})
     assert env["LMER_PLATFORM_ASSISTANT_NAME"] == "Sprocket"
+
+
+def test_the_connector_environment_carries_the_matrix_operator_list(platform_root):
+    """The matrix connector reads its operator-only answerers from the daemon's
+    own environment (#599)."""
+
+    threads = connectors.ThreadConnectors(
+        runner=Runner(), environ={"LMER_MATRIX_OPERATOR_USERS": "@operator:example.org"},
+        matrix_client=lambda account: FakeMatrix(), slack_client=lambda token: FakeSlack(),
+    )
+    env = threads._environment(SimpleNamespace(host="127.0.0.1", port=1234, token="tok"), "s-1", {})
+    assert env["LMER_MATRIX_OPERATOR_USERS"] == "@operator:example.org"

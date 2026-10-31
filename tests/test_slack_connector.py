@@ -250,7 +250,7 @@ class TestRendering:
 
     def test_attachments_are_named(self):
         text = connector.render_outbound(self._record("message", "see", attachments=[{"name": "shot.png"}]))
-        assert text == "see\n📎 shot.png"
+        assert text == "see\n📎 `shot.png`"
 
     @pytest.mark.parametrize("reply, expected", [
         ("2", "prep"), ("2.", "prep"), (" 1 ", "main"), ("PREP", "prep"), ("main", "main"),

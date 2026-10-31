@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import shutil
+import stat
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
@@ -24,6 +25,7 @@ from lmer_cli.gates import (
     CheckStatus,
     CheckResult,
     Colors,
+    GATE_CHECK_LOG_PATH,
     SUITE_IGNORE_ARGS,
     TEST_MODE_LABEL_MAX,
     TEST_MODE_MARKER,
@@ -1503,6 +1505,68 @@ class TestWriteLogFile:
         bad_path = tmp_path / "nope" / "gate-check.log"
         result = self.gate.write_log_file(path=bad_path)
         assert result is None
+
+    def test_the_default_log_is_per_user(self):
+        """One shared /tmp name let users overwrite and read each other's
+        Security Check findings (#262)."""
+        assert GATE_CHECK_LOG_PATH != Path("/tmp/gate-check.log")
+        assert GATE_CHECK_LOG_PATH.parent.name.endswith(f"-{os.geteuid()}")
+
+    def test_the_log_is_owner_only_in_a_private_dir(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "private" / "gate-check.log"
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", log_path)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file() == log_path
+
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o700
+
+    def test_an_existing_log_with_loose_bits_is_tightened(self, tmp_path):
+        log_path = tmp_path / "gate-check.log"
+        log_path.write_text("old\n")
+        log_path.chmod(0o644)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        self.gate.write_log_file(path=log_path)
+
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert "old" not in log_path.read_text()
+
+    def test_a_planted_log_symlink_is_not_written_through(self, tmp_path, capsys):
+        target = tmp_path / "victim.txt"
+        target.write_text("untouched\n", encoding="utf-8")
+        log_path = tmp_path / "gate-check.log"
+        log_path.symlink_to(target)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file(path=log_path) is None
+
+        assert target.read_text(encoding="utf-8") == "untouched\n"
+        assert self.gate.log_path_written is None
+        assert "Could not write gate-check log" in capsys.readouterr().out
+
+    def test_a_default_dir_owned_by_another_uid_is_not_written(
+        self, tmp_path, monkeypatch
+    ):
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH",
+                            private / "gate-check.log")
+        other = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other)
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+
+        assert self.gate.write_log_file() is None
+        assert list(private.iterdir()) == []
 
     def test_run_commit_gate_writes_log_and_prints_path(self, tmp_path, capsys, monkeypatch):
         """run_commit_gate persists the log and announces its path."""
@@ -4484,6 +4548,406 @@ class TestPushGateTransparency:
         assert out.count("<-- not allowed") == 2
         assert ("Example entry that would allow this push: "
                 "gitlab.example.com/x/y") in out
+
+
+class TestCappedDetailsSayWhatTheyDropped:
+    """A `details` list that was capped states its dropped count (#597)."""
+
+    LEAK_CANARY = "leakcanary-9f3a7c1e"
+
+    @pytest.fixture(autouse=True)
+    def setup_method(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path / "work"))
+        self.gate = GateSystem(verbose=True)
+
+    @staticmethod
+    def _git(root, *args):
+        subprocess.run(["git", *args], cwd=root, check=True,
+                       capture_output=True, text=True)
+
+    def _secret_repo(self, root, count, body="API_KEY = '{canary}'\n"):
+        self._git(root, "init")
+        names = [f"cfg_{i:02d}.py" for i in range(count)]
+        for name in names:
+            (root / name).write_text(body.format(canary=self.LEAK_CANARY))
+        if names:
+            self._git(root, "add", *names)
+        self.gate.project_root = root
+        return names
+
+    def test_a_list_within_the_limit_is_untouched(self):
+        result = CheckResult(name="X", status=CheckStatus.FAILED,
+                             details=["a", "b"], details_limit=2)
+        assert result.details == ["a", "b"]
+        assert result.dropped == 0
+        assert result.full_details is None
+        assert result.dropped_note(Path("/x/log")) is None
+
+    def test_a_head_cap_keeps_the_head_and_the_complete_list(self):
+        items = [str(i) for i in range(8)]
+        result = CheckResult(name="X", status=CheckStatus.FAILED,
+                             details=items, details_limit=5)
+        assert result.details == ["0", "1", "2", "3", "4"]
+        assert result.full_details == items
+        assert result.dropped == 3
+        assert not result.dropped_earlier
+
+    def test_a_tail_cap_keeps_the_end(self):
+        result = CheckResult(name="X", status=CheckStatus.FAILED,
+                             details=[str(i) for i in range(8)],
+                             details_limit=5, details_keep_tail=True,
+                             full_output="all of it")
+        assert result.details == ["3", "4", "5", "6", "7"]
+        assert result.dropped == 3
+        assert result.dropped_earlier
+
+    def test_the_note_points_at_the_log_only_when_one_was_written(self):
+        head = CheckResult(name="X", status=CheckStatus.FAILED,
+                           details=list("abcdefgh"), details_limit=5)
+        tail = CheckResult(name="X", status=CheckStatus.FAILED,
+                           details=list("abcdefgh"), details_limit=5,
+                           details_keep_tail=True, full_output="all of it")
+        log = Path("/x/gate-check.log")
+
+        assert head.dropped_note(log) == "… and 3 more (the rest are in /x/gate-check.log)"
+        assert tail.dropped_note(log) == (
+            "… 3 earlier line(s) not shown (full output in /x/gate-check.log)")
+        for result in (head, tail):
+            note = result.dropped_note(None)
+            assert "/x/gate-check.log" not in note
+            assert "no gate-check log was written" in note
+        assert head.dropped_note(log, in_log=True) is None
+        assert "full output below" in tail.dropped_note(log, in_log=True)
+
+    def test_print_results_names_the_log_after_it_was_written(self, tmp_path, capsys):
+        self.gate.results = [CheckResult(
+            name="Security Check", status=CheckStatus.FAILED,
+            details=[f"f{i}.py: rule" for i in range(8)], details_limit=5)]
+        log_path = tmp_path / "gate-check.log"
+
+        self.gate.write_log_file(path=log_path)
+        self.gate.print_results()
+
+        out = capsys.readouterr().out
+        assert f"… and 3 more (the rest are in {log_path})" in out
+
+    def test_print_results_does_not_name_a_log_that_was_not_written(
+        self, tmp_path, capsys
+    ):
+        self.gate.results = [CheckResult(
+            name="Security Check", status=CheckStatus.FAILED,
+            details=[f"f{i}.py: rule" for i in range(8)], details_limit=5)]
+        unwritable = tmp_path / "missing-dir" / "gate-check.log"
+
+        assert self.gate.write_log_file(path=unwritable) is None
+        self.gate.print_results()
+
+        out = capsys.readouterr().out
+        note = [line for line in out.splitlines() if "… and 3 more" in line]
+        assert len(note) == 1
+        assert "no gate-check log was written" in note[0]
+        assert str(unwritable) not in note[0]
+
+    def test_a_commit_gate_run_points_at_the_log_it_wrote(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        log_path = tmp_path / "gate-check.log"
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", log_path)
+        for name in ("check_git_status", "check_staged_files", "check_branch",
+                     "check_secrets", "check_permissions",
+                     "check_deliverable_formats", "check_changelog",
+                     "check_documentation", "check_code_quality",
+                     "check_precommit", "check_tests"):
+            monkeypatch.setattr(self.gate, name, MagicMock(
+                __name__=name,
+                return_value=CheckResult(name=name, status=CheckStatus.PASSED)))
+        self.gate.check_secrets = MagicMock(__name__="check_secrets", return_value=CheckResult(
+            name="Security Check", status=CheckStatus.FAILED,
+            details=[f"f{i}.py: rule" for i in range(8)], details_limit=5))
+
+        assert self.gate.run_commit_gate() is False
+
+        out = capsys.readouterr().out
+        assert f"… and 3 more (the rest are in {log_path})" in out
+        assert "f7.py: rule" in log_path.read_text()
+
+    def test_a_file_name_that_is_not_utf8_does_not_hide_the_results(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # rglob hands back an undecodable name surrogate-escaped; the log write
+        # used to raise on it, and now runs before the results print. Not
+        # verbose: print_results still cannot print such a detail itself.
+        self.gate.verbose = False
+        bad = os.fsencode(tmp_path) + b"/bad\xff.sh"
+        with open(bad, "w"):
+            pass
+        os.chmod(bad, 0o666)
+        log_path = tmp_path / "gate-check.log"
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", log_path)
+        self.gate.project_root = tmp_path
+        for name in ("check_git_status", "check_staged_files", "check_branch",
+                     "check_secrets", "check_deliverable_formats",
+                     "check_changelog", "check_documentation",
+                     "check_code_quality", "check_precommit", "check_tests"):
+            monkeypatch.setattr(self.gate, name, MagicMock(
+                __name__=name,
+                return_value=CheckResult(name=name, status=CheckStatus.PASSED)))
+
+        assert self.gate.run_commit_gate() is False
+
+        out = capsys.readouterr().out
+        assert "File Permissions" in out
+        assert "Permission issues found (1)" in out
+        assert "SUMMARY" in out
+        assert "world-writable" in log_path.read_text(encoding="utf-8")
+
+    def test_security_check_message_carries_the_total_and_details_the_dropped(
+        self, tmp_path
+    ):
+        self._secret_repo(tmp_path, 13)
+
+        result = self.gate.check_secrets()
+
+        assert result.status == CheckStatus.FAILED
+        assert result.is_critical
+        assert "13 findings" in result.message
+        assert len(result.details) == 5
+        assert result.dropped == 8
+        assert len(result.full_details) == 13
+
+    def test_security_check_full_list_reaches_the_log(self, tmp_path):
+        names = self._secret_repo(tmp_path, 13)
+        result = self.gate.check_secrets()
+        self.gate.results = [result]
+        log_path = tmp_path / "out" / "gate-check.log"
+        log_path.parent.mkdir()
+
+        self.gate.write_log_file(path=log_path)
+
+        content = log_path.read_text()
+        assert all(f"{name}: Potential hardcoded secret" in content
+                   for name in names)
+
+    @pytest.mark.parametrize("count", [0, 1, 5, 6, 13])
+    def test_the_display_cap_never_changes_which_findings_fail_the_gate(
+        self, tmp_path, count
+    ):
+        names = self._secret_repo(tmp_path, count)
+        (tmp_path / "clean.py").write_text("x = 1\n")
+        self._git(tmp_path, "add", "clean.py")
+
+        result = self.gate.check_secrets()
+
+        if count == 0:
+            assert result.status == CheckStatus.PASSED
+            assert result.details is None
+            return
+        assert result.status == CheckStatus.FAILED
+        listed = result.full_details or result.details
+        assert sorted(f.split(":")[0] for f in listed) == names
+        assert len(result.details) == min(count, 5)
+        assert result.dropped == max(0, count - 5)
+
+    def test_full_findings_never_carry_the_matched_text(self, tmp_path):
+        self._secret_repo(tmp_path, 7)
+        (tmp_path / "key.py").write_text(
+            f"# BEGIN PRIVATE KEY {self.LEAK_CANARY}\nAKIAABCDEFGHIJKLMNOP\n")
+        self._git(tmp_path, "add", "key.py")
+        result = self.gate.check_secrets()
+        self.gate.results = [result]
+        log_path = tmp_path / "gate-check.log"
+
+        self.gate.write_log_file(path=log_path)
+
+        everything = "\n".join(
+            [result.message, *result.details, *result.full_details,
+             log_path.read_text()])
+        assert "Private Key" in everything
+        assert "AWS Access Key" in everything
+        assert self.LEAK_CANARY not in everything
+        assert "AKIAABCDEFGHIJKLMNOP" not in everything
+
+    def test_git_status_states_the_total_and_dropped(self, tmp_path):
+        self._git(tmp_path, "init")
+        for i in range(12):
+            (tmp_path / f"f{i}.txt").write_text("x")
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_git_status()
+
+        assert result.status == CheckStatus.FAILED
+        assert "12 paths" in result.message
+        assert result.dropped == 2
+        assert len(result.full_details) == 12
+
+    @patch('subprocess.run')
+    def test_suspicious_staged_files_state_the_total_and_dropped(self, mock_run):
+        files = "\n".join(f"node_modules/p{i}/index.js" for i in range(11))
+        mock_run.return_value = MagicMock(returncode=0, stdout=files, stderr="")
+
+        result = self.gate.check_staged_files()
+
+        assert result.status == CheckStatus.FAILED
+        assert "(11;" in result.message
+        assert result.dropped == 1
+
+    @patch('subprocess.run')
+    def test_a_file_matching_two_suspicious_patterns_counts_once(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=".venv/__pycache__/x.pyc", stderr="")
+
+        result = self.gate.check_staged_files()
+
+        assert result.status == CheckStatus.FAILED
+        assert result.details == [".venv/__pycache__/x.pyc"]
+        assert result.dropped == 0
+
+    @patch('subprocess.run')
+    def test_a_large_staged_set_states_the_dropped_count(self, mock_run):
+        files = "\n".join(f"src/m{i}.py" for i in range(25))
+        mock_run.return_value = MagicMock(returncode=0, stdout=files, stderr="")
+
+        result = self.gate.check_staged_files()
+
+        assert result.status == CheckStatus.WARNING
+        assert result.dropped == 15
+
+    def test_permission_issues_state_the_total_and_dropped(self, tmp_path):
+        for i in range(7):
+            path = tmp_path / f"w{i}.txt"
+            path.write_text("x")
+            path.chmod(0o666)
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_permissions()
+
+        assert result.status == CheckStatus.FAILED
+        assert "(7)" in result.message
+        assert result.dropped == 2
+
+    def test_code_quality_states_the_dropped_count(self, tmp_path):
+        (tmp_path / "mod.py").write_text("print('x')\n" * 8)
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_code_quality()
+
+        assert result.status == CheckStatus.WARNING
+        assert result.dropped == 3
+
+    @patch('subprocess.run')
+    def test_deliverable_formats_state_the_dropped_count(self, mock_run):
+        files = "\n".join(f"docs/spec{i}.docx" for i in range(7))
+        mock_run.return_value = MagicMock(returncode=0, stdout=files, stderr="")
+
+        result = self.gate.check_deliverable_formats()
+
+        assert result.status == CheckStatus.WARNING
+        assert result.dropped == 2
+        assert len(result.full_details) == 7
+
+    @patch('subprocess.run')
+    def test_precommit_tail_states_the_dropped_count(self, mock_run):
+        out = "\n".join(f"hook line {i}" for i in range(20))
+        mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr="")
+
+        result = self.gate.check_precommit()
+
+        assert result.dropped == 5 and result.dropped_earlier
+        assert "(20 output lines, last 15 shown)" in result.message
+        assert len(result.details) == 15
+        assert result.details[-1] == "hook line 19"
+        assert "hook line 0" in result.full_output
+
+    def test_custom_runner_tail_states_the_dropped_count(self, tmp_path,
+                                                         monkeypatch):
+        monkeypatch.setenv("LMER_REPO_HOST", "gitlab.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "group/example")
+        monkeypatch.setenv("LMER_TASK", "develop")
+        script = (tmp_path / "work" / "gitlab.example.com" / "group/example"
+                  / "info" / "gate-check-run-tests.sh")
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8; do echo l$i; done\nexit 1\n")
+        script.chmod(0o755)
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.FAILED
+        assert result.dropped == 3 and result.dropped_earlier
+        assert result.details == ["l4", "l5", "l6", "l7", "l8"]
+
+    def test_python_test_failures_state_the_dropped_count(self, tmp_path):
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_many.py").write_text(
+            "def test_fails():\n"
+            "    for n in range(8):\n"
+            "        print(f'ERROR line {n}')\n"
+            "    assert False\n")
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.FAILED
+        # 11 lines match: the 8 printed lines, the `assert False` echo, its `E`
+        # line and the FAILED summary line.
+        assert result.dropped == 6
+        assert result.message.startswith("Tests failed: 1 failed")
+        assert result.full_details is None
+        assert "ERROR line 0" in result.full_output
+        assert "more not shown here (full output below)" in result.dropped_note(
+            Path("/x/log"), in_log=True)
+
+
+    def test_a_passing_custom_runner_tail_states_the_dropped_count(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_REPO_HOST", "gitlab.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "group/example")
+        monkeypatch.setenv("LMER_TASK", "develop")
+        script = (tmp_path / "work" / "gitlab.example.com" / "group/example"
+                  / "info" / "gate-check-run-tests.sh")
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nfor i in 1 2 3 4 5 6; do echo l$i; done\n")
+        script.chmod(0o755)
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert result.dropped == 1 and result.dropped_earlier
+        assert result.details == ["l2", "l3", "l4", "l5", "l6"]
+
+    def test_a_list_exactly_at_its_limit_drops_nothing(self, tmp_path):
+        self._secret_repo(tmp_path, 5)
+
+        result = self.gate.check_secrets()
+
+        assert result.dropped == 0
+        assert len(result.details) == 5
+        assert result.dropped_note(Path("/x/log")) is None
+
+    def test_a_tail_cap_without_output_to_hold_the_rest_is_refused(self):
+        with pytest.raises(ValueError, match="needs full_output"):
+            CheckResult(name="X", status=CheckStatus.FAILED,
+                        details=list("abcdefgh"), details_limit=5,
+                        details_keep_tail=True)
+
+    @patch('subprocess.run')
+    def test_every_capped_result_has_its_rest_behind_it(self, mock_run, tmp_path):
+        """A capped list must leave the rest in the log, never nowhere (#597)."""
+        many = "\n".join(f"item{i}" for i in range(30))
+        mock_run.return_value = MagicMock(returncode=0, stdout=many, stderr="")
+        results = [self.gate.check_git_status(), self.gate.check_staged_files(),
+                   self.gate.check_deliverable_formats()]
+        mock_run.return_value = MagicMock(returncode=1, stdout=many, stderr="")
+        results.append(self.gate.check_precommit())
+        self._secret_repo(tmp_path, 9)
+        results.append(self.gate.check_secrets())
+        capped = [r for r in results if r.dropped]
+        assert len(capped) >= 3
+        for result in capped:
+            assert result.full_details is not None or result.full_output is not None, result.name
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Optional
 
 from lmer_cli import gate_lock
+from lmer_cli.private_tmp import open_private, read_no_follow, write_private
 
 #: Journal filename, beside the gate markers in :func:`gate_lock.lock_dir`.
 JOURNAL_NAME = "work-writes.jsonl"
@@ -159,9 +160,10 @@ def guard_verdict(record: dict, guard_pid: int) -> Optional[bool]:
     """The record's ancestry verdict for *guard_pid*'s marker (None=unknown).
 
     Duplicate entries for the same pid resolve worst-verdict-wins
-    (True > None > False): the journal sits in a world-readable tmp dir, and a
-    crafted record carrying a False beside a True must not flip the guard from
-    fail to pass — the excuse is only as strong as the weakest claim in it.
+    (True > None > False): the journal is a plain file in tmp that any process
+    of this uid can append to, and a crafted record carrying a False beside a
+    True must not flip the guard from fail to pass — the excuse is only as
+    strong as the weakest claim in it.
     """
     verdicts = [
         entry.get("ancestor")
@@ -182,9 +184,17 @@ def guard_verdict(record: dict, guard_pid: int) -> Optional[bool]:
 # ---------------------------------------------------------------------------
 
 
-def journal_path(directory: Optional[Path] = None) -> Path:
-    """The journal file, beside the markers (honoring the lock-dir env)."""
-    return (directory or gate_lock.lock_dir()) / JOURNAL_NAME
+def journal_path(
+    directory: Optional[Path] = None, create: bool = False
+) -> Optional[Path]:
+    """The journal file, beside the markers (honoring the lock-dir env).
+
+    None when that directory is not one this uid can trust
+    (:func:`gate_lock.safe_lock_dir`): a journal someone else can write is an
+    excuse someone else can forge.
+    """
+    trusted = gate_lock.safe_lock_dir(create=create, directory=directory)
+    return None if trusted is None else trusted / JOURNAL_NAME
 
 
 def resolve_work_repo(path: Optional[str] = None) -> str:
@@ -273,8 +283,9 @@ def record_write_intent(
             "rel_paths": list(rel_paths),
             "markers": marker_verdicts([m["pid"] for m in markers], chain, complete),
         }
-        path = journal_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = journal_path(create=True)
+        if path is None:
+            return
         _append_record(path, record)
     except Exception:
         pass
@@ -293,11 +304,11 @@ def _append_record(path: Path, record: dict) -> None:
     """
     line = json.dumps(record, ensure_ascii=False) + "\n"
     try:
-        if path.exists() and path.stat().st_size > COMPACT_AT_BYTES:
+        if path.exists() and path.lstat().st_size > COMPACT_AT_BYTES:
             now = time.time()
             kept = [
                 text
-                for text in path.read_text(encoding="utf-8").splitlines()
+                for text in read_no_follow(path).splitlines()
                 if text.strip()
                 and (parsed := parse_record(text)) is not None
                 and not (
@@ -310,8 +321,7 @@ def _append_record(path: Path, record: dict) -> None:
             return
     except (OSError, UnicodeDecodeError):
         pass
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
+    write_private(path, line, append=True)
 
 
 def _replace_journal(path: Path, lines: list[str]) -> None:
@@ -323,9 +333,21 @@ def _replace_journal(path: Path, lines: list[str]) -> None:
     symptom this module removes.
     """
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    content = "\n".join(lines) + ("\n" if lines else "")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    content = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+    try:
+        # O_EXCL: the tmp name is predictable, and must be this write's own.
+        descriptor = open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+        os.replace(tmp, path)
+    except OSError:
+        # Including a tmp left by a crashed write of this same pid: removing
+        # it is what keeps the O_EXCL from blocking every later rewrite.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def consume_records(
@@ -348,12 +370,12 @@ def consume_records(
     did before attribution existed.
     """
     path = journal_path(directory)
+    if path is None:
+        return []
     resolved = resolve_work_repo(work_repo)
     now = time.time()
     try:
-        if not path.exists():
-            return []
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = read_no_follow(path).splitlines()
     except (OSError, UnicodeDecodeError):
         return []
     mine: list[dict] = []

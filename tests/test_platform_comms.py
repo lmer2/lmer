@@ -25,6 +25,7 @@ from lmer_cli import supervisor
 from lmer_platform import api, comms, registry, spawn, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import JOIN, wait_until
 
 SECRET = "test-secret-value"
 BUS_TOKEN = "bus-control-plane-token"
@@ -624,15 +625,25 @@ class TestHub:
         spooled = []
         monkeypatch.setattr(assistant, "notify", lambda note, kind="event", data=None: spooled.append((kind, note, data)) or True)
         hub = comms.CommsHub()
-        hub.add_consumer(daemon._assistant_consumer(hub))
+        assistant_consumer = daemon._assistant_consumer(hub)
+        handled = []
+
+        def consumer(event):
+            # _ingest journals before it dispatches, so the journal cursor can
+            # run ahead of this consumer (#463). Held here so it does on every
+            # run: the wait below must be on what was handled.
+            time.sleep(0.25)
+            assistant_consumer(event)
+            handled.append(event)
+
+        hub.add_consumer(consumer)
         hub.subscribe(session)
         agent_posts(plane, "milestone", "pushed MR !300")
         plane.log.append(kind="message", text="hi there", source=bus.Source("slack", author="tester", ref="t1"))
         agent_posts(plane, "note", "working on it")
-        deadline = time.monotonic() + 5
-        while hub.journal.cursor < 3 and time.monotonic() < deadline:
-            time.sleep(0.05)
+        handled_all = wait_until(lambda: len(handled) == 3, budget=JOIN)
         hub.stop()
+        assert handled_all, f"the consumer handled {len(handled)} of 3 records"
         assert [item[0] for item in spooled] == ["session_signal"]
         assert "signalled: pushed MR !300" in spooled[0][1]
         assert hub.flush_digests() == 1
@@ -826,6 +837,10 @@ class TestOldPathCompatibility:
         hub.subscribe(session)
         _until(lambda: hub.question_for_ask_entry(
             session, f"{question.seq:06d}", mirrored=True))
+        # The route asks /healthz whether the session has a bus, on a 1 s budget,
+        # and caches only a yes. One slow probe under load sent it down the file
+        # path, so the bus is confirmed here first.
+        _until(lambda: hub.supports(session))
 
         reply = client.post(
             f"/api/sessions/{session}/ask/{question.seq:06d}/answer",
@@ -1132,7 +1147,7 @@ def test_assistant_milestone_is_recorded_and_marked_from_the_real_bus(
         assert message.source.channel == "uber-lmer"
         assert bool(message.meta.get("session_origin")) == bool(meta)
         _until(lambda: hub.journal.read_since(0)[0])
-        _until(lambda: detect._signal_marks().get(session) == 1, timeout=2)
+        _until(lambda: detect._signal_marks().get(session) == 1, timeout=JOIN)
         events = [event for event in store.read_events() if event["type"] == detect.SESSION_SIGNALLED]
         assert len(events) == 1
         assert hub.flush_digests() == 0

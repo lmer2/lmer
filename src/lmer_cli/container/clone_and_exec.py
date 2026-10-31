@@ -1417,6 +1417,115 @@ def ensure_clone(
     return credential
 
 
+_WORK_REPO_REF_ENV = "LMER_WORK_REPO_REF"
+
+
+def _checkout_work_repo_branch(
+    workspace: Path,
+    branch: str,
+    *,
+    remote: str = "origin",
+    credential: "_SessionGitCredential | None" = None,
+) -> int:
+    """Check the work-repo clone out at *branch*, tracking its remote branch.
+
+    Branch-only by design (issue #613): ``work commit`` publishes to the
+    current branch's upstream, and a tag or commit SHA would leave a detached
+    HEAD with none, so the first write would fail closed. A ref that is not a
+    branch on the remote is refused here — at startup, before the manifest is
+    read — rather than at the first write.
+
+    Applies to an existing clone as well as a fresh one: a service-mode
+    re-entry must not silently stay on the default branch, and must read the
+    branch's *current* manifest. An existing local branch of that name is
+    fast-forwarded to the fetched tip (a non-fast-forward is refused rather
+    than reset, so local commits are never discarded) and its upstream is
+    repointed to ``{remote}/{branch}`` if it points anywhere else — otherwise
+    ``work commit`` would publish somewhere other than the branch.
+
+    Returns 0 on success, 2 for the not-a-branch refusal, else the git exit
+    code.
+    """
+
+    def git(*args: str) -> list[str]:
+        return _lfs_safe_git(
+            *_credential_git_args(credential), "-C", str(workspace), *args
+        )
+
+    def quiet(*args: str) -> int:
+        """Run git with stdout discarded, keeping stderr for real failures."""
+        return subprocess.run(
+            git(*args), stdout=subprocess.DEVNULL
+        ).returncode
+
+    rc = run(git("fetch", remote))
+    if rc != 0:
+        print(
+            f"❌ {_WORK_REPO_REF_ENV}: failed to fetch the work repo "
+            f"(git exit {rc})",
+            file=sys.stderr,
+        )
+        return rc
+    remote_branch = f"refs/remotes/{remote}/{branch}"
+    if quiet("rev-parse", "--verify", "--quiet", remote_branch) != 0:
+        print(
+            f"❌ {_WORK_REPO_REF_ENV}={branch!r} is not a branch on the work "
+            "repo.\n"
+            "   A tag or commit SHA cannot be used: work commit publishes to a "
+            "branch's upstream, and a detached checkout has none.",
+            file=sys.stderr,
+        )
+        return 2
+
+    local_branch_exists = quiet(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"
+    ) == 0
+    if local_branch_exists:
+        rc = quiet("switch", branch)
+    else:
+        rc = quiet("switch", "--track", "-c", branch, f"{remote}/{branch}")
+    if rc != 0:
+        print(
+            f"❌ {_WORK_REPO_REF_ENV}: failed to check out branch {branch!r} "
+            f"in {workspace} (git exit {rc})",
+            file=sys.stderr,
+        )
+        return rc
+
+    upstream = subprocess.run(
+        git("rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"),
+        capture_output=True,
+        text=True,
+    )
+    if upstream.returncode != 0 or upstream.stdout.strip() != f"{remote}/{branch}":
+        rc = quiet("branch", f"--set-upstream-to={remote}/{branch}", branch)
+        if rc != 0:
+            print(
+                f"❌ {_WORK_REPO_REF_ENV}: branch {branch!r} has no upstream "
+                f"{remote}/{branch}; work commit cannot publish",
+                file=sys.stderr,
+            )
+            return rc
+
+    if local_branch_exists:
+        # The re-entry case: the local branch can be behind the fetched tip.
+        # Fast-forward only, so the branch's current manifest is what startup
+        # reads, and a diverged branch is refused instead of reset.
+        rc = quiet("merge", "--ff-only", f"{remote}/{branch}")
+        if rc != 0:
+            print(
+                f"❌ {_WORK_REPO_REF_ENV}: local branch {branch!r} cannot be "
+                f"fast-forwarded to {remote}/{branch} (it has diverged); "
+                "refusing to reset it. Resolve the branch in the work repo "
+                "checkout and retry.",
+                file=sys.stderr,
+            )
+            return rc
+
+    print(f"✅ Work repo checked out at branch {branch!r}", file=sys.stderr)
+    return 0
+
+
 def clone_aux_repos(
     napkin_repo_url: "str | None",
     taskdef_repo_url: "str | None",
@@ -2571,9 +2680,9 @@ def _ensure_session_dir(
     creating the bare address unconditionally then leaves an empty
     ``<session-id>/`` beside the very record the launch is about to write in.
     Nothing mis-routes — both resolvers count only children carrying a state
-    file — but it is litter at the one level D22 keeps clean, the validator
-    warns on it, and an operator reading the group finds two directories for
-    one launch and no way to tell which is the run.
+    file — but it is litter at the one level D22 keeps clean, and an operator
+    reading the group finds two directories for one launch and no way to tell
+    which is the run.
 
     Two refusals. With no base there is nothing to create and the reason is
     printed (a present manifest this build cannot read). With no usable
@@ -3534,6 +3643,18 @@ def main(argv: list[str] | None = None) -> int:
         # bin/doctor uses this non-secret path to authenticate declared-source
         # probes without reconstructing a credential-bearing URL.
         os.environ["LMER_WORK_REPO_CREDENTIAL_FILE"] = str(work_credential.path)
+
+    # Point the clone at an operator-named branch BEFORE the manifest is read.
+    # The manifest decides the writer contract (including whether a schema-2
+    # uid is minted), so it has to come from the tree the session will write
+    # (issue #613).
+    work_repo_ref = (os.environ.get(_WORK_REPO_REF_ENV) or "").strip()
+    if work_repo_ref:
+        rc = _checkout_work_repo_branch(
+            work_repo_path, work_repo_ref, credential=work_credential
+        )
+        if rc:
+            return rc
 
     # The freshly cloned manifest owns the writer contract. A schema-2
     # process never inherits the UID of a preceding execution.

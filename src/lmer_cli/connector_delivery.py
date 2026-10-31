@@ -55,6 +55,8 @@ def verified_rejection(exc: Exception) -> bool:
     from slack_chat.client import SlackError
 
     if isinstance(exc, MatrixError):
+        if getattr(exc, "not_sent", False):
+            return True
         return getattr(exc, "status", None) in (400, 401, 403, 404, 405, 413, 429)
     if isinstance(exc, SlackError):
         return getattr(exc, "code", None) in {
@@ -101,7 +103,7 @@ class DeliveryState:
                 if (saved.get("version") != 1 or saved.get("session") != session
                         or saved.get("thread") != self.key.parts
                         or not isinstance(saved.get("transport"), dict)
-                        or not (set(self.snapshot()) - {"_receipt_pending", "_delivery_health"}).issubset(saved["transport"])
+                        or not (set(self.snapshot()) - {"_receipt_pending", "_delivery_health", "_undecrypted"}).issubset(saved["transport"])
                         or type(saved["transport"].get("_bus_cursor")) is not int
                         or saved["transport"]["_bus_cursor"] < 0):
                     raise RecoveryRequired("incompatible connector checkpoint; state preserved")

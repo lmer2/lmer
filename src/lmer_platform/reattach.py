@@ -713,13 +713,19 @@ def reattach_session(
                 ),
             )
         else:
+            # Read the drain's position once and use it for both the entry and the
+            # report. Reading it again after the lock is a race the CI suite hit
+            # (#500): the drain assigns its cursor on every poll, so an advance
+            # landing between the two reads leaves the persisted entry behind the
+            # offset the report returns.
+            drain_cursor = drain.cursor
             marked = mark_detached(
                 session_id,
                 output=OUTPUT_CONTROL_PLANE,
                 detail=already_detail,
                 # The drain's own position rather than a probe's: it is where this
                 # session's output is being read from.
-                cursor=drain.cursor,
+                cursor=drain_cursor,
             )
     if marked is None:
         return ReattachReport(
@@ -738,7 +744,7 @@ def reattach_session(
             session_id=session_id,
             detached=True,
             draining=True,
-            cursor=drain.cursor,
+            cursor=drain_cursor,
             detail=already_detail,
             output=OUTPUT_CONTROL_PLANE,
         )

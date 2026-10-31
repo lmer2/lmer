@@ -166,6 +166,7 @@ import yaml
 from lmer_cli import gate_lock
 from lmer_cli.harness import MemoryIndexLimit, memory_index_budget
 from lmer_cli.memory_areas import AREAS_DIR, UNSORTED_AREA, is_area_slug
+from lmer_cli.memory_areas import is_forget_tombstone as _is_forget_tombstone
 from lmer_cli.util import get_bool_env
 
 from .git_ops import check_commit_ready, commit_work_path, fast_forward_upstream
@@ -232,6 +233,22 @@ RESTORE_MANIFEST_NAME = ".lmer-memory-restore.json"
 #: (#369 gap (a)): a manifest recorded under another launch is not this
 #: session's baseline.
 RESTORE_MANIFEST_VERSION = 2
+
+#: A memory scope's store-format marker (#598): one integer, the newest
+#: layout the scope's writer used — :data:`MEMORY_FORMAT_FLAT` or
+#: :data:`MEMORY_FORMAT_SPLIT`. A missing marker is the flat format. It only
+#: GUARDS: the shape (:func:`_is_split`) still decides how a scope is read,
+#: and persist never writes the marker. A dotfile, so ``lmer-schema
+#: validate`` skips it like every dot name, and :func:`_files_under` — the one
+#: place it is excluded — keeps it out of restore, routing, every deletion
+#: path and the memory count.
+MEMORY_FORMAT_FILE = ".lmer-memory-format"
+MEMORY_FORMAT_FLAT = 1
+MEMORY_FORMAT_SPLIT = 2
+
+#: The newest store format this lmer reads and writes. A scope whose marker
+#: names a newer one is refused by every writer and warned about on restore.
+MEMORY_FORMAT_MAX = MEMORY_FORMAT_SPLIT
 
 #: Schema-2's durable, machine-readable retirement state at the plexus root.
 RETIREMENT_STATE_NAME = "_memory_retirements.json"
@@ -566,6 +583,13 @@ def memory_retirement_paths(scoped_path: str, *, root: Optional[Path] = None) ->
     return [path.as_posix() for path in paths] + [RETIREMENT_STATE_NAME]
 
 
+def _refuse_newer_store_format(scope_dir: Path) -> None:
+    """Raise :class:`MemoryRetirementError` for a scope no writer may touch (#598)."""
+    problem = check_store_format(scope_dir)
+    if problem is not None:
+        raise MemoryRetirementError(problem)
+
+
 def _rewrite_index_target(line: str, old: str, new: str) -> str:
     """Rewrite relative markdown link targets equal to *old* on one line."""
     pieces = []
@@ -613,6 +637,7 @@ def _forget_memory_locked(
     if key in state["retired"]:
         raise MemoryRetirementError(f"memory is already retired: {key}")
     source_rel, archive_rel, index_rel = _retirement_paths(key, manifest)
+    _refuse_newer_store_format(root / Path(index_rel.parent))
     index_rel = _retirement_index_rel(root, source_rel, index_rel)
     source = root / Path(source_rel)
     archive = root / Path(archive_rel)
@@ -702,6 +727,7 @@ def _revive_memory_locked(scoped_path: str, root: Path) -> List[str]:
     if entry is None:
         raise MemoryRetirementError(f"memory is not retired: {key}")
     source_rel, archive_rel, index_rel = _retirement_paths(key, manifest)
+    _refuse_newer_store_format(root / Path(index_rel.parent))
     index_rel = _retirement_index_rel(root, source_rel, index_rel, entry.get("index"))
     source = root / Path(source_rel)
     archive = root / Path(archive_rel)
@@ -1128,7 +1154,9 @@ def _entry_targets(line: str, index_rel: Optional[str] = None, *, split: bool) -
     still part of the map line, and must not be filed or dropped as an entry
     for ``alpha.md``. Inside an area index a cross-reference to another area
     is skipped, and the line's memory links still count (a dead one is
-    tombstoned by :func:`_tombstone_dead_area_links`).
+    tombstoned by :func:`_tombstone_dead_area_links`). A ``forget`` tombstone
+    (:func:`_is_forget_tombstone`) carries none at all, whatever it links
+    later: the validator reads it the same way (#601).
 
     Links resolve against *index_rel* — the index file's path inside its
     scope, ``MEMORY.md`` when omitted — so an area index's ``../fact.md`` and
@@ -1141,6 +1169,8 @@ def _entry_targets(line: str, index_rel: Optional[str] = None, *, split: bool) -
     the scope the line is read in (:func:`_is_split`), and every caller —
     housekeep and migrate included — must say which shape it is reading.
     """
+    if _is_forget_tombstone(line):
+        return []
     base = posixpath.dirname(index_rel) if index_rel else ""
     targets = []
     for target in _LINK_RE.findall(line):
@@ -1486,16 +1516,6 @@ def _removed_areas(source: Path, manifest: Dict[str, dict], scopes) -> Set[Path]
     return {rel for rel in restored if not (source / rel).exists()}
 
 
-def _is_tombstone(line: str) -> bool:
-    """Whether *line* is an entry ``forget`` re-pointed at the archive mirror."""
-    for target in _LINK_RE.findall(line):
-        if not target.lower().endswith(".md") or _NOT_RELATIVE_RE.match(target):
-            continue
-        if any(part in _ARCHIVE_MARKERS for part in posixpath.normpath(target).split("/")):
-            return True
-    return False
-
-
 def _split_index(
     text: str,
     scope_of: Dict[str, str],
@@ -1547,7 +1567,7 @@ def _split_index(
             owners = [
                 scope for scope in per_scope
                 if line.strip() in (restored or {}).get(scope, ())
-            ] if (mapped or _is_tombstone(line)) else []
+            ] if (mapped or _is_forget_tombstone(line)) else []
             if len(owners) != 1 and mapped:
                 owners = _map_line_owners(
                     line, index_rel, scope_of, area_scopes or {}, flat_scopes
@@ -1572,27 +1592,22 @@ def _map_line_owners(
 
     See :func:`_split_index`: a flat scope's entry follows its memory, and a
     map line follows its own area. ``[]`` leaves it to the caller's default.
+
+    Only a memory this session holds (one in *scope_of*) is a memory link
+    here. A link to any other document — ``../notes.md`` — routes nothing:
+    read as a memory, it would file an edited map line under the default
+    scope, where a flat index tombstones its area link (#601).
     """
     own = _own_area(line)
     held = sorted(area_scopes.get(own[1], ())) if own is not None else []
-    memories = [
+    targets = [
         target
         for target in _entry_targets(line, index_rel, split=False)
-        if not _is_area_index(target)
+        if _is_area_index(target) or target in scope_of
     ]
-    if not memories:
+    if not targets or _is_area_index(targets[0]):
         return held
-    home = scope_of.get(memories[0], DEFAULT_SCOPE)
-    first = next(
-        (
-            posixpath.normpath(target)
-            for target in _LINK_RE.findall(line)
-            if target.lower().endswith(".md") and not _NOT_RELATIVE_RE.match(target)
-        ),
-        None,
-    )
-    if first is None or _is_area_index(first):
-        return held
+    home = scope_of[targets[0]]
     if not held or home in flat_scopes:
         return [home]
     return held
@@ -1707,14 +1722,64 @@ def _merged_index_text(
 
 def _has_files(directory: Path) -> bool:
     """Return True if ``directory`` exists and contains at least one file."""
-    return directory.is_dir() and any(p.is_file() for p in directory.rglob("*"))
+    return bool(_files_under(directory))
 
 
 def _files_under(directory: Path) -> Dict[Path, Path]:
-    """Every file under *directory*, keyed by its relative path."""
+    """Every file under *directory*, keyed by its relative path.
+
+    The scope's store-format marker (:data:`MEMORY_FORMAT_FILE`) is no file
+    of the memory set: it is never restored, routed, persisted or deleted.
+    """
     if not directory.is_dir():
         return {}
-    return {p.relative_to(directory): p for p in directory.rglob("*") if p.is_file()}
+    return {
+        p.relative_to(directory): p
+        for p in directory.rglob("*")
+        if p.is_file() and p.relative_to(directory) != Path(MEMORY_FORMAT_FILE)
+    }
+
+
+def check_store_format(scope_dir: Path) -> Optional[str]:
+    """Why this lmer must not write *scope_dir*, or ``None`` when it may.
+
+    Reads the scope's store-format marker (:data:`MEMORY_FORMAT_FILE`, #598).
+    No marker is the flat format. A marker naming a format newer than
+    :data:`MEMORY_FORMAT_MAX` — written for a layout this lmer does not know —
+    is a refusal, and so is one that is not a positive integer: neither says
+    what the scope holds.
+    """
+    path = scope_dir / MEMORY_FORMAT_FILE
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        return f"{path}: store format marker could not be read ({e}); fix or remove it"
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < MEMORY_FORMAT_FLAT:
+        return (
+            f"{path}: store format marker {text[:40]!r} is not a positive integer; "
+            f"fix or remove it"
+        )
+    if value > MEMORY_FORMAT_MAX:
+        return (
+            f"{path}: store format {value} is newer than this lmer understands "
+            f"(max {MEMORY_FORMAT_MAX}); update the image"
+        )
+    return None
+
+
+def _store_format_problems(directories) -> List[str]:
+    """:func:`check_store_format` for each of *directories*, problems only."""
+    return [
+        problem
+        for problem in (check_store_format(Path(directory)) for directory in directories)
+        if problem is not None
+    ]
 
 
 def _mirror_files(files: Dict[Path, Path], dst: Path, keep: Set[Path]) -> int:
@@ -1920,6 +1985,13 @@ def restore_memory() -> int:
         _report_manifest_problem()
         return 0
     retired = _retired_by_scope(scopes, retired_keys, root)
+    for problem in _store_format_problems(scopes.values()):
+        # Restore only reads, so it hands the agent its memory and says so;
+        # every writer refuses the scope until the image is updated (#598).
+        print(
+            f"⚠️  {problem} — restoring anyway; persisting will be refused",
+            file=sys.stderr,
+        )
 
     if work_repo_layout().form == "legacy":
         # One scope: the whole directory, index bytes and all. This is the
@@ -2581,6 +2653,13 @@ def persist_memory(
             # current side of the three-way merge is what upstream holds
             # (#369 gap (b)).
             _pull_before_merge(root)
+            # A scope a newer lmer wrote (#598) is refused before anything is
+            # read for writing: no manifest, no snapshot, no write.
+            problems = _store_format_problems(scopes.values())
+            if problems:
+                for problem in problems:
+                    print(f"❌ Refusing to persist agent memory: {problem}", file=sys.stderr)
+                return 1
             # The pull may have brought in another session's forget.
             retired = _retired_by_scope(scopes, _schema2_retired_keys(root), root)
             scope_rels = [
@@ -2766,7 +2845,10 @@ def _persist_scopes(
             allow_unbaselined_delete=allow_unbaselined_delete,
             removed_areas=removed,
         )
-        _settle_scope(dest, retired.get(PROJECT_SCOPE, set()), source=source)
+        retired_here = retired.get(PROJECT_SCOPE, set())
+        _settle_scope(
+            dest, retired_here, source=source, planned=_planned_areas(dest, retired_here)
+        )
         write_restore_manifest(manifest)
         rel = _rel_to_root(dest, work_repo_root())
         return copied, ([rel] if rel is not None else []), deleted, declined
@@ -2879,9 +2961,15 @@ def _persist_scopes(
         if rel is not None:
             rel_paths.append(rel)
     # Only now is every scope this persist writes in its end state, which is
-    # what a link in any of them is judged against (#435).
+    # what a link in any of them is judged against (#435) — and that end
+    # state includes the areas each scope's reconcile is about to generate.
+    planned: Set[str] = set()
+    for _scope, dest, retired_here in written:
+        planned |= _planned_areas(dest, retired_here)
     for scope, dest, retired_here in written:
-        _settle_scope(dest, retired_here, _memory_peers(scope, scopes, root), source)
+        _settle_scope(
+            dest, retired_here, _memory_peers(scope, scopes, root), source, planned
+        )
     write_restore_manifest(manifest)
     return copied, rel_paths, deletions, declined
 
@@ -3057,6 +3145,7 @@ def _settle_scope(
     retired: Set[Path],
     peers: tuple = (),
     source: Optional[Path] = None,
+    planned: Set[str] = frozenset(),
 ) -> None:
     """Check and reconcile one scope's indexes against what the persist leaves.
 
@@ -3064,7 +3153,9 @@ def _settle_scope(
     view (:func:`_memory_view` over *dest* and its *peers*) is the end state:
     a memory this persist deletes from a scope written later is already gone,
     and an area the merge declined to recreate is not counted because the
-    agent's dir (*source*) still holds a copy of it.
+    agent's dir (*source*) still holds a copy of it. *planned* adds the areas
+    this persist's reconciles will generate, this scope's own included
+    (:func:`_planned_areas`).
 
     A split scope is first judged against its migration contract, before the
     reconcile tombstones what a bad migration broke (#435). A flat scope
@@ -3080,6 +3171,7 @@ def _settle_scope(
     tells its own removals from another writer's edits.
     """
     memories, areas = _memory_view(dest, peers)
+    areas |= planned
     if _is_split(dest):
         problems = _area_problems(dest, memories, areas)
         held = [p for p in problems if source is None or _holds_problem(source, p)]
@@ -3380,6 +3472,8 @@ def _reconcile_scope_indexes(
     area and a map hook's link are judged against the agent's merged view,
     *memories* and *areas* (:func:`_memory_view`, this scope alone when
     omitted): they are tombstoned only when what they name exists nowhere.
+    An area this reconcile generates is in *areas* only when the caller put
+    it there (:func:`_planned_areas`).
     """
     index_path = dest / MEMORY_INDEX
     current = _read_text(index_path) if index_path.is_file() else ""
@@ -3392,9 +3486,7 @@ def _reconcile_scope_indexes(
                 index_path.write_text(reconciled, encoding="utf-8")
         return
 
-    texts: Dict[Path, str] = {Path(MEMORY_INDEX): current}
-    texts.update({rel: _read_text(path) for rel, path in _area_indexes(dest).items()})
-    indexed: Set[str] = set()
+    texts = _split_index_texts(dest, current)
     out: Dict[Path, str] = {}
     if memories is None or areas is None:
         memories, areas = _memory_view(dest)
@@ -3404,20 +3496,8 @@ def _reconcile_scope_indexes(
         )
         if rel != Path(MEMORY_INDEX):
             out[rel] = _tombstone_dead_area_links(out[rel], rel.as_posix(), areas)
-        indexed |= _indexed_in(out[rel], rel.as_posix(), split=True)
-
-    root = work_repo_root()
-    for name in sorted(_live_memory_rels(dest) - indexed):
-        path = Path(name)
-        if path in retired or any(
-            _has_exact_archive_tombstone(root, text, dest, path, rel.as_posix())
-            for rel, text in texts.items()
-        ):
-            continue
-        area = _area_rel(_memory_area(dest / path))
-        entry = _generated_entry(dest, path, area.as_posix())
-        if entry is not None:
-            out[area] = _append_lines(out.get(area, ""), [entry])
+    for area, entries in _generated_area_entries(dest, retired, texts).items():
+        out[area] = _append_lines(out.get(area, ""), entries)
 
     for rel, text in out.items():
         if rel != Path(MEMORY_INDEX) and text != texts.get(rel):
@@ -3430,6 +3510,60 @@ def _reconcile_scope_indexes(
         index_path.write_text(top, encoding="utf-8")
 
 
+def _split_index_texts(dest: Path, current: Optional[str] = None) -> Dict[Path, str]:
+    """A split scope's index files' text: the map (*current*, when read) and areas."""
+    if current is None:
+        index_path = dest / MEMORY_INDEX
+        current = _read_text(index_path) if index_path.is_file() else ""
+    texts: Dict[Path, str] = {Path(MEMORY_INDEX): current}
+    texts.update({rel: _read_text(path) for rel, path in _area_indexes(dest).items()})
+    return texts
+
+
+def _generated_area_entries(
+    dest: Path, retired: Set[Path], texts: Dict[Path, str]
+) -> Dict[Path, List[str]]:
+    """The entries a split scope's reconcile generates, per area index.
+
+    One for each live memory none of *texts* carries, unless its retirement
+    state accounts for it (:func:`_reconcile_index`), filed in the area its
+    ``metadata.area`` names. Tombstoning changes no live entry, so what
+    *texts* carry before the reconcile is what it carries after.
+    """
+    indexed: Set[str] = set()
+    for rel, text in texts.items():
+        indexed |= _indexed_in(text, rel.as_posix(), split=True)
+    root = work_repo_root()
+    generated: Dict[Path, List[str]] = {}
+    for name in sorted(_live_memory_rels(dest) - indexed):
+        path = Path(name)
+        if path in retired or any(
+            _has_exact_archive_tombstone(root, text, dest, path, rel.as_posix())
+            for rel, text in texts.items()
+        ):
+            continue
+        area = _area_rel(_memory_area(dest / path))
+        entry = _generated_entry(dest, path, area.as_posix())
+        if entry is not None:
+            generated.setdefault(area, []).append(entry)
+    return generated
+
+
+def _planned_areas(dest: Path, retired: Set[Path]) -> Set[str]:
+    """The area indexes *dest*'s reconcile will write a generated entry into.
+
+    A cross-reference is judged before the reconcile that creates such an area
+    runs — that of the same scope, which tombstones before it generates, or
+    of a scope settled later — so the persist counts them live up front (#601).
+    """
+    if not _is_split(dest):
+        return set()
+    return {
+        rel.as_posix()
+        for rel in _generated_area_entries(dest, retired, _split_index_texts(dest))
+    }
+
+
 def _tombstone_dead_area_links(text: str, index_rel: str, areas: Set[str]) -> str:
     """Tombstone an area index's cross-references to areas that exist nowhere.
 
@@ -3438,8 +3572,9 @@ def _tombstone_dead_area_links(text: str, index_rel: str, areas: Set[str]) -> st
     place, so ``lmer-schema validate`` and persist agree on it (#435). *areas*
     is the agent's merged view, so an area in the other scope is live.
 
-    A ``forget`` tombstone (:func:`_is_tombstone`) is kept verbatim, as every
-    index pass keeps it: ``revive`` finds it again by its exact text.
+    A ``forget`` tombstone (:func:`_is_forget_tombstone`) is kept verbatim, as
+    every index pass keeps it: ``revive`` finds it again by its exact text. On
+    any other line an archive link is left alone and the rest is judged.
     """
     base = posixpath.dirname(index_rel)
     when = None
@@ -3456,7 +3591,7 @@ def _tombstone_dead_area_links(text: str, index_rel: str, areas: Set[str]) -> st
         return f"archived {when}"
 
     return "".join(
-        line if _is_tombstone(line) else _LINK_RE.sub(replace, line)
+        line if _is_forget_tombstone(line) else _LINK_RE.sub(replace, line)
         for line in text.splitlines(keepends=True)
     )
 
@@ -3503,7 +3638,8 @@ def _tombstone_dead_map_lines(
     When the line's own area is dead, the hook's live links are unlinked to
     their label text. The line is a tombstone now, and a tombstone links
     nothing: left linked, the next persist would read it as an entry and drop,
-    move or route it. A ``forget`` tombstone is kept verbatim.
+    move or route it. A ``forget`` tombstone (:func:`_is_forget_tombstone`)
+    is kept verbatim; on any other line an archive link alone is left alone.
     """
     live = _live_memory_rels(dest) if memories is None else memories
     live_areas = (
@@ -3513,7 +3649,7 @@ def _tombstone_dead_map_lines(
     out = []
     for line in text.splitlines(keepends=True):
         own = _own_area(line)
-        if own is None or _is_tombstone(line):
+        if own is None or _is_forget_tombstone(line):
             out.append(line)
             continue
         own_start, own_rel = own

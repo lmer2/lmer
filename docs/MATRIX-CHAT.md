@@ -520,6 +520,8 @@ logged in.
 ```bash
 lmer-matrix-bridge check      # reports every precondition, changes nothing
 lmer-matrix-bridge run
+# or, when the store-export refresh cannot succeed (#634):
+lmer-matrix-bridge run --no-backup
 ```
 
 `check` is the verb to reach for when the room has gone quiet. It reports the
@@ -635,6 +637,13 @@ start refreshes the export (after folding in the store's write-ahead log, so it
 is never short the rows written moments before), so the backup keeps up with
 the keys the bridge accumulates.
 
+That refresh is **part of starting, not an optional extra**: if the export
+cannot be uploaded, the bridge does not start. A bridge that ran on a backup it
+could no longer refresh would look healthy while the thing it restores from
+went stale, and the only trace would be one journal line. When the upload
+cannot be fixed, `run --no-backup` is the deliberate way past it — see the
+`--no-backup` section below.
+
 What happens on a restart:
 
 | what is on disk | what the bridge does |
@@ -646,13 +655,167 @@ What happens on a restart:
 | a store it cannot read, and no backup | **refuses to start**, naming the variable and the path |
 | the export is empty | keeps the existing backup rather than replacing it — an empty export means the store is wrong, not that the backup should go |
 | it cannot tell whether a backup exists | **refuses to start** — "cannot tell" must not become "mint a new device and overwrite the export" |
+| the export fails to upload | **refuses to start** — the store opened fine, but the export it restores from would go stale silently, on every plan including a first start (which has no earlier export to fall back on) |
+| `--no-backup` was passed | opens the store and the room as usual, skips the export refresh entirely, and logs `matrix_backup_disabled` at WARNING |
 
-That last row is the one to know. The bridge will not quietly mint a fresh
+The "cannot tell whether a backup exists" row is the one to know. The bridge will not quietly mint a fresh
 device to get past a broken store, because a bridge that did would run, look
 healthy, encrypt to keys nobody in the room holds, and leave you with a room
 that has simply gone quiet. Losing both the store *and* the recovery key means
 old history is unreadable to the bridge — new messages are unaffected, and
 slice 1 only ever needs new messages.
+
+### `--no-backup` — running without a fresh export
+
+`lmer-matrix-bridge run --no-backup` opens the store and the room exactly as a
+normal start does, and skips the export refresh. It is the one deliberate
+degradation the bridge offers, and it is opt-in: without the flag a failed
+refresh stops the start.
+
+Use it when the refresh **cannot** succeed and you want the service up
+anyway. Today that is #634: a 33 MB crypto store's export is refused by the
+homeserver's edge with a Cloudflare 502 on every start, so the bridge would
+otherwise refuse to run at all. With the flag it runs, and the start logs:
+
+```
+WARNING  matrix_backup_disabled — --no-backup: this start does not refresh the
+store export at …/matrix/crypto/store.db, so the backup on the homeserver stays
+as it was. A host lost from here restores only as far as that backup.
+```
+
+What you give up is stated in that line: the export on the homeserver stays as
+it was, so a host lost from here restores only as far as the last successful
+refresh. When there is no backup on the homeserver (a first start, or any
+start since one made under `--no-backup`) there is no export at all, and the
+line says so instead: there is no backup on the homeserver, so a host lost
+from here cannot be restored and would mint another device. **Remove the
+flag** (and restart) once the upload works again — that is what puts the
+backup back in step with the keys the bridge accumulates.
+
+In a container deployment the flag goes on the container's command:
+
+```ini
+[Container]
+# … the Image=, EnvironmentFile= and Volume= lines from §5 …
+# Quadlet's Exec= replaces the image's CMD (`run`), so a flag goes here.
+# If your quadlet does not support Exec=, append `--no-backup` to a
+# `podman run` invocation instead.
+Exec=run --no-backup
+```
+
+On the host (§5b), it goes on the unit's `ExecStart=`:
+
+```ini
+ExecStart=%h/.local/bin/lmer-matrix-bridge run --no-backup
+```
+
+---
+
+## Encrypted threads
+
+The thread connector (`lmer chat <permalink>`, `lmer-ctl threads connect`) and
+the host's thread verbs (`lmer-signal read`, `post --thread`, `thread open`,
+`dm`) work in an end-to-end encrypted room **by borrowing this bridge's
+device**. They never hold keys of their own.
+
+### Why the bridge, and only the bridge
+
+A device belongs to one user, and one process has to own it. mautrix keeps the
+Olm account and Olm sessions in process memory. A second process writing the
+same store would desynchronise the ratchets and lose one-time keys, and room
+keys would then stop arriving with no error anywhere. Room keys for the bridge's
+device also arrive only on the homeserver's pushes to the appservice, not on
+`/sync`. So the bridge does the crypto and the others ask it, over
+`/_lmer/crypto/v1/` on the bridge's own listener: encrypt, decrypt, and the
+attachment ciphers. The device, store and recovery-key export are the ones in
+the section above. There is no second key set.
+
+### Setting it up
+
+The connector and the thread verbs must act **as the bridge's appservice user**.
+In the daemon's (or host `lmer`'s) environment, usually `~/.lmer/.env`:
+
+```bash
+LMER_MATRIX_HOMESERVER=https://matrix.example.org
+LMER_MATRIX_USER_ID=@lmer-<name>:<server_name>   # the bridge's sender, from `name`
+LMER_MATRIX_ACCESS_TOKEN=<the bridge's as_token>  # LMER_MATRIX_AS_TOKEN's value
+LMER_MATRIX_BRIDGE_URL=http://127.0.0.1:29331     # where *this host* reaches the bridge
+```
+
+`LMER_MATRIX_BRIDGE_URL` is the bridge's listener as seen from the host: the
+`PublishPort=` address of the container deployment (§5), or `bind_address` and
+`bind_port` for a host-run bridge. It is host-only and never enters a session
+container. The bridge must be running. Without it, an encrypted thread fails to
+connect or retries, and a plaintext room is unaffected.
+
+The bearer for the crypto API is the `as_token`, so any other token is answered
+`401`, and the connector reports that by name. Whoever holds the `as_token` could
+already act as this user. What the API adds is this device's **room keys**,
+meaning it can decrypt what the bridge can. The homeserver holds the `as_token`
+in the bridge's registration and knows the listener's URL, so whoever
+administers the homeserver can read these rooms too; that matters little when
+you run the homeserver yourself. If `url` puts the listener behind a
+reverse proxy, you may also deny `/_lmer/` there; the host reaches the bridge
+directly.
+
+### The first time, in Element
+
+1. Invite the bridge's user (`@lmer-<name>:<server_name>`) to the room. lmer
+   joins nothing by itself.
+2. Leave its session **unverified**. The bridge accepts unverified devices and
+   shares keys with them, the same rule as the allowlist ("trust is the
+   allowlist's job"). Element sends room keys to unverified sessions unless
+   *Never send encrypted messages to unverified sessions* is on, either in
+   Security & Privacy or in the room's settings. Turn that off for this room,
+   or verify the session. The bridge's device is not cross-signed, so the same
+   applies to any client that sends keys only to verified or cross-signed
+   devices.
+3. Messages from before the bot joined stay unreadable to it. Megolm shares
+   forward only (#395).
+
+### What the connector does with what it cannot read
+
+- **A live reply whose key has not arrived yet is held, not dropped.** It is
+  retried on every sync, survives a connector restart, and is relayed once the
+  key lands. After 10 minutes it is given up and logged as
+  `matrix_connector_undecryptable_dropped` with the sender, so it is not posted
+  to the thread. Ask the person to send it again. At most 200 replies are held
+  at once, and past that the oldest is given up first.
+- **Replies that arrive while the bridge is unreachable at the moment a room
+  turns encryption on** are held until it answers, however long that takes.
+  The 10 minutes start only then. The 200 cap still applies. Sends into the
+  room are retried until it answers too, so nothing goes out in the clear.
+- **History** that will not decrypt when the connector attaches is left out of
+  the attach notice's count and not waited for, whether its key never reached
+  the bridge or is merely late.
+  A thread **read** shows it as `[an encrypted message lmer cannot decrypt]`.
+- **Files** go up as ciphertext with the key in the event, and inbound
+  encrypted files are decrypted into the session's upload store.
+  `LMER_MATRIX_AUTHENTICATED_MEDIA` still gates the agent's outbound files.
+- Nothing is sent in the clear into a room lmer knows is encrypted. With no
+  bridge, with a bridge that cannot encrypt, or with a bridge owned by another
+  user, the send or the connection is refused. A send the bridge could not
+  encrypt never reached the homeserver, so the connector retries it rather than
+  asking for manual recovery.
+- An encrypted upload carries no filename to the media repository. The name is
+  only inside the encrypted event.
+
+### Limits
+
+- The platform's mention ingress (`LMER_MATRIX_ROOMS`, docs/ASSISTANT-MENTIONS.md)
+  does not decrypt. Mentions in encrypted rooms are not seen.
+- The bridge's group session goes to the members joined or invited when it is
+  created, and is not re-shared or rotated when membership changes (#395).
+  Someone who joins later cannot read the bot's messages until the session
+  rotates, and a member who leaves can still read them until then.
+- A room that turns on encryption *after* a connector has connected is noticed
+  when the room's `m.room.encryption` state arrives in the connector's sync.
+  From then on the connector borrows the bridge, or refuses its sends and logs
+  `matrix_connector_encrypted_event`. An `m.room.encrypted` event in a room
+  whose state says plaintext is skipped and logged; it does not switch the
+  room. The thread verbs ask the room's state each time they run.
+- Posts come from `@lmer-<name>`. That is the account the room sees for every
+  lmer session, as it already was for the bot account the connector used before.
 
 ---
 

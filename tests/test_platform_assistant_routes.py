@@ -59,6 +59,8 @@ ASSISTANT_ROUTES = (
     ("POST", "/api/assistant/start"),
     ("POST", "/api/assistant/stop"),
     ("POST", "/api/assistant/rotate"),
+    ("GET", "/api/assistant/rotate-all"),
+    ("POST", "/api/assistant/rotate-all"),
     ("GET", "/api/assistant/handoff"),
     ("POST", "/api/assistant/handoff"),
     ("GET", "/api/assistant/instructions"),
@@ -1101,6 +1103,15 @@ def test_config_write_is_a_patch_of_the_keys_named(
     assert settings["preset"]["value"] == "new"
 
 
+def test_config_write_persists_the_effort_lowercased(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"effort": "XHigh"},
+    )
+    assert reply.status_code == 200
+    assert reply.json()["settings"]["effort"]["value"] == "xhigh"
+    assert store.read_json(cfg.config_path())["assistant_effort"] == "xhigh"
+
+
 @pytest.mark.parametrize("cleared", [None, "", "   "])
 def test_config_write_null_or_blank_clears_the_key(
     client, platform_root, cleared
@@ -1136,7 +1147,8 @@ def test_a_shadowed_write_lands_in_the_file_and_says_it_is_shadowed(
 
 @pytest.mark.parametrize("body, named", [
     ({}, "at least one setting"),
-    ({"effort": "high"}, "effort"),
+    ({"verbosity": "high"}, "verbosity"),
+    ({"effort": "turbo"}, "effort"),
     ({"model": 7}, "model"),
     ({"model": "-x"}, "model"),
 ])
@@ -1666,112 +1678,163 @@ def test_session_api_threads_reach_the_launch(client, monkeypatch):
     assert bad.status_code == 400, bad.text
 
 
-def test_chat_retention_defaults_off_and_round_trips_through_config(client, platform_root):
+# The operator channel dock's retention (issue #465): one global display
+# preference, edited from Platform settings through ``/api/settings``. Unset keeps
+# every note, 0 keeps none — open questions are the dock's to show either way.
+
+
+def test_dock_retention_defaults_unset_and_round_trips_through_platform_settings(client, platform_root):
     headers = bearer_header()
-    initial = client.get("/api/assistant/config", headers=headers)
+    initial = client.get("/api/settings", headers=headers)
     assert initial.status_code == 200
-    assert initial.json()["chat"]["keep_last"] == {
-        "value": 0, "source": "default", "stored": None,
+    assert initial.json()["dock"]["keep_last_notes"] == {
+        "value": None, "source": "default", "stored": None,
     }
+    assert cfg.load().dock_keep_last_notes is None
     cfg.update_stored({"assistant_model": "kept"})
-    for value in (25, 0, None):
+    for value in (3, 0, None):
         reply = client.post(
-            "/api/assistant/config", headers=headers, json={"chat_keep_last": value},
-        )
-        assert reply.status_code == 200
-        expected = {
-            "value": value or 0,
-            "source": "default" if value is None else "config.json",
-            "stored": value,
-        }
-        assert reply.json()["changed"] == ["chat_keep_last"]
-        assert reply.json()["chat"]["keep_last"] == expected
-        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["keep_last"] == expected
-        assert cfg.load().chat_keep_last == (value or 0)
-        stored = store.read_json(cfg.config_path())
-        assert stored["assistant_model"] == "kept"
-        if value is None:
-            assert "chat_keep_last" not in stored
-        else:
-            assert stored["chat_keep_last"] == value
-
-
-@pytest.mark.parametrize("bad", [-1, True, 1.5, "many", [], {}])
-def test_chat_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
-    reply = client.post(
-        "/api/assistant/config", headers=bearer_header(), json={"chat_keep_last": bad},
-    )
-    assert reply.status_code == 400
-    assert "chat_keep_last" in reply.json()["detail"]
-    assert not cfg.config_path().exists()
-
-
-# The uber lmer pane's transcript toggle (issue #488): a boolean beside
-# ``keep_last`` in the ``chat`` group, stored platform-side so it survives
-# browsers, applied on the pane's next config refresh rather than at a rotate.
-
-
-def test_chat_transcript_toggle_defaults_off_and_round_trips_through_config(client, platform_root):
-    headers = bearer_header()
-    initial = client.get("/api/assistant/config", headers=headers)
-    assert initial.status_code == 200
-    assert initial.json()["chat"]["show_transcript"] == {
-        "value": False, "source": "default", "stored": None,
-    }
-    cfg.update_stored({"assistant_model": "kept"})
-    for value in (True, False, None):
-        reply = client.post(
-            "/api/assistant/config", headers=headers, json={"chat_show_transcript": value},
+            "/api/settings", headers=headers, json={"dock_keep_last_notes": value},
         )
         assert reply.status_code == 200, reply.text
         expected = {
-            "value": bool(value),
+            "value": value,
             "source": "default" if value is None else "config.json",
             "stored": value,
         }
-        assert reply.json()["changed"] == ["chat_show_transcript"]
-        assert reply.json()["chat"]["show_transcript"] == expected
-        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["show_transcript"] == expected
-        assert cfg.load().chat_show_transcript is bool(value)
+        assert reply.json()["dock"]["keep_last_notes"] == expected
+        assert client.get("/api/settings", headers=headers).json()["dock"]["keep_last_notes"] == expected
+        # The run view reads its display settings from the assistant config reply.
+        assert client.get("/api/assistant/config", headers=headers).json()["dock"]["keep_last_notes"] == expected
+        assert cfg.load().dock_keep_last_notes == value
         stored = store.read_json(cfg.config_path())
         assert stored["assistant_model"] == "kept"
         if value is None:
-            assert "chat_show_transcript" not in stored
+            assert "dock_keep_last_notes" not in stored
         else:
-            assert stored["chat_show_transcript"] is value
-    # The pane's own note about scope names it beside keep_last.
-    assert "chat_show_transcript" in reply.json()["note"]
+            assert stored["dock_keep_last_notes"] == value
 
 
-@pytest.mark.parametrize("bad", [1, 0, "yes", "on", 1.5, [], {}])
-def test_chat_transcript_toggle_refuses_non_booleans_without_writing(client, platform_root, bad):
+@pytest.mark.parametrize("bad", [-1, True, 1.5, "many", [], {}])
+def test_dock_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
     reply = client.post(
-        "/api/assistant/config", headers=bearer_header(), json={"chat_show_transcript": bad},
+        "/api/settings", headers=bearer_header(), json={"dock_keep_last_notes": bad},
     )
     assert reply.status_code == 400, reply.text
-    assert "chat_show_transcript" in reply.json()["detail"]
+    assert "dock_keep_last_notes" in reply.json()["detail"]
     assert not cfg.config_path().exists()
 
 
-def test_a_hand_written_true_in_the_file_reads_as_on_and_junk_reads_as_off(client, platform_root):
+def test_the_retired_chat_keep_last_is_refused_and_a_stored_one_is_ignored(client, platform_root, caplog):
+    """Not migrated: its 0 meant "keep everything", the dock's 0 means "no notes".
+
+    An old ``config.json`` that still carries it must load, keep the key on the
+    next write (unknown keys survive, :func:`cfg.mutate_stored`), and leave the
+    dock at its own default.
+    """
+    headers = bearer_header()
+    store.write_json(cfg.config_path(), {"chat_keep_last": 4, "assistant_model": "kept"})
+    assert cfg.load().dock_keep_last_notes is None
+    reply = client.get("/api/settings", headers=headers)
+    assert reply.status_code == 200
+    assert reply.json()["dock"]["keep_last_notes"]["value"] is None
+    assert "keep_last" not in reply.json()["chat"]
+    refused = client.post("/api/settings", headers=headers, json={"chat_keep_last": 2})
+    assert refused.status_code == 400, refused.text
+    assert "chat_keep_last" in refused.json()["detail"]
+    client.post("/api/settings", headers=headers, json={"dock_keep_last_notes": 1})
+    stored = store.read_json(cfg.config_path())
+    assert stored["chat_keep_last"] == 4
+    assert stored["dock_keep_last_notes"] == 1
+    assert "platform_dock_keep_last_notes_invalid" not in caplog.text
+
+
+def test_an_unusable_stored_dock_retention_reads_as_unset(platform_root, caplog):
+    store.write_json(cfg.config_path(), {"dock_keep_last_notes": -2})
+    assert cfg.load().dock_keep_last_notes is None
+    assert cfg.dock_settings()["keep_last_notes"].value is None
+    assert "platform_dock_keep_last_notes_invalid" in caplog.text
+
+
+# The pane's display toggles: the transcript toggle (issue #488) and the
+# operator bubble tint (issue #646). Booleans in the ``chat`` group, stored
+# platform-side so they survive browsers, applied on the pane's next config
+# refresh rather than at a rotate.
+
+CHAT_TOGGLES = pytest.mark.parametrize("key, field, default", [
+    ("chat_show_transcript", "show_transcript", False),
+    ("chat_tint_operator", "tint_operator", True),
+])
+
+
+@CHAT_TOGGLES
+def test_chat_toggle_defaults_and_round_trips_through_config(client, platform_root, key, field, default):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"][field] == {
+        "value": default, "source": "default", "stored": None,
+    }
+    assert getattr(cfg.load(), key) is default
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (not default, default, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={key: value},
+        )
+        assert reply.status_code == 200, reply.text
+        expected = {
+            "value": default if value is None else value,
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == [key]
+        assert reply.json()["chat"][field] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"][field] == expected
+        assert getattr(cfg.load(), key) is expected["value"]
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert key not in stored
+        else:
+            assert stored[key] is value
+    # The pane's own note about scope names it among the display settings.
+    assert key in reply.json()["note"]
+
+
+@CHAT_TOGGLES
+@pytest.mark.parametrize("bad", [1, 0, "yes", "on", 1.5, [], {}])
+def test_chat_toggle_refuses_non_booleans_without_writing(client, platform_root, bad, key, field, default):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={key: bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert key in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+
+
+@CHAT_TOGGLES
+def test_a_hand_written_boolean_in_the_file_is_read_and_junk_reads_as_the_default(
+    client, platform_root, key, field, default,
+):
     """The file layer is lenient the way the integer settings' is: a spelled-out
-    ``"true"`` is honoured, anything else costs that layer with a warning rather
-    than a daemon that will not load its config."""
+    ``"true"`` or ``"false"`` is honoured, anything else costs that layer with a
+    warning rather than a daemon that will not load its config."""
     cfg.update_stored({"assistant_model": "kept"})
     path = cfg.config_path()
     written = store.read_json(path)
-    written["chat_show_transcript"] = "TRUE"
+    spelled = "FALSE" if default else "TRUE"
+    written[key] = spelled
     store.write_json(path, written)
-    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
-        "value": True, "source": "config.json", "stored": "TRUE",
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"][field] == {
+        "value": not default, "source": "config.json", "stored": spelled,
     }
-    assert cfg.load().chat_show_transcript is True
-    written["chat_show_transcript"] = "sometimes"
+    assert getattr(cfg.load(), key) is (not default)
+    written[key] = "sometimes"
     store.write_json(path, written)
-    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
-        "value": False, "source": "default", "stored": "sometimes",
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"][field] == {
+        "value": default, "source": "default", "stored": "sometimes",
     }
-    assert cfg.load().chat_show_transcript is False
+    assert getattr(cfg.load(), key) is default
 
 
 # The assistant's own container allocation (issue #453). Read-only and

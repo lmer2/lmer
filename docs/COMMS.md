@@ -725,10 +725,13 @@ else is stored as sent.
 refuses an `answer` or `close` to it from `uber-lmer` or `peer-ul` with a 400,
 whatever authority the record carries. The Slack connector never binds a
 thread post that no human typed (the platform's, a session's, any bot's) as its
-answer, and the matrix connector never binds one lmer made or its own account
-posted: each arrives as a plain message instead. The matrix connector cannot
-tell another bot account from a human, so such an account can still bind one.
-This is how a worker keeps a gate such as spec approval or a merge with the
+answer. The matrix connector cannot tell another bot account from a human, so
+it binds only a reply from an MXID listed in `LMER_MATRIX_OPERATOR_USERS`
+(host-side, comma-separated), and never one lmer made or its own account
+posted, even if listed. Every refused post arrives as a plain message instead.
+The list fails closed: unset or empty, no matrix reply answers an operator-only
+question, the connector says so once in the thread and logs it, and the
+question is answered on Slack or the platform. This is how a worker keeps a gate such as spec approval or a merge with the
 operator (issues #594 and #518). `lmer-signal list` marks such a question
 `(operator-only)`.
 
@@ -1112,16 +1115,19 @@ Routine retry/recovery notes retain `connector_health` metadata and do not wake
 project assistants (#512).
 
 **Limits stated plainly.** The matrix connector speaks the client-server API
-as a bot account and handles plaintext rooms; an end-to-end encrypted room is
-refused at connect time with its own name, and an encrypted event in a plain
-room is logged and skipped. Encryption for this connector is a follow-up.
+as a bot account. It handles an end-to-end encrypted room only when it acts as
+`lmer-matrix-bridge`'s appservice user and `LMER_MATRIX_BRIDGE_URL` reaches that
+bridge, which does the crypto with its own device (docs/MATRIX-CHAT.md,
+"Encrypted threads"). Otherwise an encrypted room is refused at connect time with
+its own name and that pointer, and an encrypted event in a plain room is logged
+and skipped.
 In the default mode, both listeners spawn subprocesses; spawning through a
 platform daemon is not wired.
 
 The matrix chat connector is not the fleet bridge (`lmer-matrix-bridge`,
 `docs/MATRIX-CHAT.md`), which announces runs wanting a human into one room per
 orchestrator as an appservice. The two coexist; the connector reuses the
-bridge's scrub and nothing else.
+bridge's scrub and, in an encrypted room, the bridge's device.
 
 ### Posts from other runs, and from the platform
 
@@ -1305,8 +1311,8 @@ A connection is refused, with nothing written or started, when:
   credentials, or is over the length bound;
 - the transport's credentials are missing from the **daemon's** environment —
   the refusal names `SLACK_BOT_TOKEN`, or the `LMER_MATRIX_*` variables;
-- the matrix room is end-to-end encrypted (named), which the connector refuses
-  too;
+- the matrix room is end-to-end encrypted (named) and the daemon has no
+  `LMER_MATRIX_BRIDGE_URL`, which the connector refuses too;
 - this run already holds that thread;
 - **Slack says the conversation is not this token's**: the resolution's own
   `conversations.replies` answers `no_permission` or `access_denied` — what that
@@ -1654,6 +1660,7 @@ ask-directory readers and the steering form of `POST /api/sessions/{id}/input`.
 | `SLACK_BOT_TOKEN` | host (the `lmer` process, the listener) | the Slack bot; required for a Slack thread target, never forwarded into the container |
 | `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval (default 3) |
 | `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID`, `LMER_MATRIX_ACCESS_TOKEN` | host | the bot account the matrix connector and listener act as; required for a matrix thread target, never forwarded |
+| `LMER_MATRIX_BRIDGE_URL` | host | where `lmer-matrix-bridge`'s listener is reached from this host; lets the connector and thread verbs work in encrypted rooms through the bridge's device, acting as its appservice user; never forwarded |
 | `LMER_MATRIX_AUTHENTICATED_MEDIA` | host, bool | the operator's assertion that the homeserver requires authentication for media; the agent's attachments are withheld until set |
 | `LMER_MATRIX_ALLOWED_USERS` | host | comma-separated MXIDs allowed to mention the bot and receive `lmer-signal dm` messages; exact match, unset or empty means nobody |
 | `LMER_SLACK_DM_ALLOWED_USERS` | host | comma-separated Slack user IDs or handles allowed to DM the listener and receive `lmer-signal dm` messages; entries matching `^[UW][A-Z0-9]{8,}$` are exact, case-sensitive IDs, while all others are case-insensitive, confirmed handles with a leading `@` ignored; unset or empty means nobody |
@@ -1933,7 +1940,8 @@ comes from the **caller's credential** the way `source.channel` does: `Ratchet` 
 - Credentials missing from the **host's** environment — the refusal names
   `SLACK_BOT_TOKEN`, or the `LMER_MATRIX_*` variables, and says whose
   environment it means.
-- An end-to-end encrypted matrix room, by name, as the connector refuses one.
+- An end-to-end encrypted matrix room, by name, when the host has no
+  `LMER_MATRIX_BRIDGE_URL` — as the connector refuses one.
 - A channel the host's bot token cannot see: the Slack error code with what to
   do about it (`channel_not_found` → invite the bot).
 - No servicer attached (above).

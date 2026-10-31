@@ -20,6 +20,7 @@ from lmer_platform import projects, registry, runs, spawn, store
 from lmer_platform import project_context as scope
 from tests.test_platform_projects import fleet  # noqa: F401
 from tests.test_platform_checkin import iso, row, stamp
+from tests.timing_budgets import CLI, JOIN
 
 
 def test_supervisor_shutdown_waits_for_an_admitted_launch_to_publish(fleet, monkeypatch):
@@ -55,6 +56,91 @@ def test_supervisor_shutdown_waits_for_an_admitted_launch_to_publish(fleet, monk
     assert not supervisor._thread.is_alive()
     state = projects.status(project["id"])
     assert state["running"] and state["generation"] == 1
+
+
+def test_supervisor_shutdown_gives_up_on_a_wedged_launch_loudly(fleet, monkeypatch, caplog):
+    projects.migrate()
+    projects.create("Wedged")
+    entered, release = threading.Event(), threading.Event()
+
+    def wedged_start(*args, **kwargs):
+        entered.set()
+        release.wait(JOIN)
+        raise assistant.AssistantError("released by the test")
+
+    monkeypatch.setattr(assistant, "start", wedged_start)
+    monkeypatch.setattr(projects, "SUPERVISOR_STOP_SECONDS", 0.2)
+    supervisor = projects.Supervisor(fleet)
+    supervisor.start()
+    try:
+        assert entered.wait(JOIN)
+        supervisor.stop()
+        assert supervisor._thread.is_alive(), "stop must not wait past its bound"
+        assert "project_assistants_stop_timed_out" in caplog.text
+    finally:
+        release.set()
+        supervisor._thread.join(JOIN)
+    assert not supervisor._thread.is_alive()
+
+
+class _ContendedRLock:
+    """``projects._LOCK`` that says when a second thread has to wait for it."""
+
+    def __init__(self, contended):
+        self._lock, self._contended = threading.RLock(), contended
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self._contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+def test_ensure_running_and_a_project_operation_cannot_deadlock(fleet, monkeypatch):
+    """#566: both orders of ``projects.operation()`` and ``assistant._LOCK`` at once.
+
+    The project side holds the operation and then wants the assistant lock, as
+    ``projects.move`` and the project request paths do. The assistant side is
+    the legacy supervisor's ``ensure_running``, whose ``start`` is ``@serialized``.
+    The project side reaches for the assistant lock only once the other thread
+    either holds it (the old order: deadlock) or is queued on the operation.
+    """
+    projects.migrate()
+    arrived, holding = threading.Event(), threading.Event()
+    monkeypatch.setattr(projects, "_LOCK", _ContendedRLock(arrived))
+
+    def not_running():
+        arrived.set()  # reached only with assistant._LOCK held
+        return SimpleNamespace(running=False)
+
+    started = SimpleNamespace(running=True)
+    monkeypatch.setattr(assistant, "status", not_running)
+    monkeypatch.setattr(assistant, "start", projects.serialized(lambda config: started))
+    results = {}
+
+    def project_side():
+        with projects.operation():
+            holding.set()
+            assert arrived.wait(JOIN)
+            with assistant._LOCK:
+                results["project"] = True
+
+    def assistant_side():
+        assert holding.wait(JOIN)
+        results["assistant"] = assistant.ensure_running(fleet)
+
+    threads = [threading.Thread(target=target, daemon=True) for target in (project_side, assistant_side)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(JOIN)
+    assert not any(thread.is_alive() for thread in threads), (
+        "assistant._LOCK and projects.operation() deadlocked (ABBA)"
+    )
+    assert results == {"project": True, "assistant": started}
 
 
 def test_crash_recovery_is_bounded_and_does_not_drain_another_project(fleet):
@@ -347,7 +433,7 @@ registry.register = crash
 projects.reconcile(settings)
 '''
     pid_file = tmp_path / "launch-pid"
-    result = subprocess.run([sys.executable, "-c", code, str(root), str(executable), str(pid_file)], timeout=20)
+    result = subprocess.run([sys.executable, "-c", code, str(root), str(executable), str(pid_file)], timeout=CLI)
     assert result.returncode == 77
     pid = int(pid_file.read_text())
     _assert_child_exited_without_execution(pid, marker)

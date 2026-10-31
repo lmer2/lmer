@@ -72,6 +72,12 @@ all `lmer.`-prefixed so they can never collide with a harness's own vocabulary
 Anything else on the line — an unknown field, an unknown `lmer.*` type, a record
 of the harness's own — is ignored, per record, never fatally.
 
+One field is the platform's own and is not part of this format: `lmer_private`,
+which the platform adds to a user turn when it scrubs a finished session's file
+and that turn was a private reference line (`[lmer private] …`). A writer should
+not emit it; the reader honours it only on a turn that still has that line's
+prefix and private path.
+
 ### `lmer.meta` — file header
 
 ```json

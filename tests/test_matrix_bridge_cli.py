@@ -710,6 +710,39 @@ async def _until_running(task, homeserver):
         )
 
 
+# --- --no-backup threads from the parser to the store ----------------------
+
+def test_run_takes_no_backup_and_defaults_to_refreshing():
+    """The flag is opt-out: a bare ``run`` refreshes the export as it always
+    did, and only ``--no-backup`` skips it."""
+    parser = mxcli.create_parser()
+    assert parser.parse_args(["run"]).no_backup is False
+    assert parser.parse_args(["run", "--no-backup"]).no_backup is True
+
+
+async def test_no_backup_reaches_the_store_through_serve(
+    configured, secrets, monkeypatch, caplog,
+):
+    """Threaded through ``serve`` the way the operator actually runs it — the
+    flag on ``run``, not a parameter a test invents. The bridge starts, no
+    upload is attempted, and the start warns that backups are disabled."""
+    import asyncio
+
+    homeserver = _bridge(configured, monkeypatch)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.serve(configured, secrets, stop=stop, back_up=False),
+    )
+    await _until_running(task, homeserver)
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert homeserver.joined == [STORED["room_id"]], "the bridge ran"
+    assert homeserver.backups_written == 0, "no backup was attempted"
+    assert "matrix_backup_disabled" in caplog.text
+
+
 async def test_a_stop_request_drains_and_serve_returns(
     configured, secrets, monkeypatch,
 ):
@@ -754,7 +787,7 @@ async def test_a_stop_during_startup_aborts_it(
     homeserver = _bridge(configured, monkeypatch)
     release = asyncio.Event()
 
-    async def unanswering_start(self):
+    async def unanswering_start(self, *, back_up=True):
         # A homeserver that accepts the connection and never answers.
         await release.wait()
 

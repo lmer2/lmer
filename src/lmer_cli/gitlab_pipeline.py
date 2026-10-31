@@ -109,7 +109,9 @@ class GitLabPipelineClient:
         """Make API request and return status code and response body."""
         url = f"{self.base_url}{endpoint}"
         req = urllib.request.Request(url)
-        req.add_header("PRIVATE-TOKEN", self.token)
+        # Unredirected: urllib copies ordinary headers onto every redirect
+        # hop, whatever host it points at (#593).
+        req.add_unredirected_header("PRIVATE-TOKEN", self.token)
         req.add_header("Accept", accept)
 
         try:

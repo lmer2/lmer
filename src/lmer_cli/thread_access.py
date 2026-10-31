@@ -36,12 +36,13 @@ import requests
 
 from ask_channel import bus
 from matrix_chat.client import MatrixAccount, MatrixClient
+from matrix_chat.crypto import BRIDGE_URL_ENV, CryptoError, encrypted_room_refusal
 from matrix_chat.permalink import matrix_to_link
 from slack_chat.client import SlackClient
 from slack_chat.permalink import slack_thread_link
 
 from . import dm_access, dm_parents
-from .thread_posts import Poster, tagged
+from .thread_posts import Poster, slack_file_name, tagged
 from .threads import (
     CHANNEL_MATRIX, CHANNEL_SLACK, ChannelRef, ThreadError, ThreadRef,
     parse_channel, parse_thread,
@@ -147,6 +148,10 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 #: Why a file read from a thread was described rather than copied in.
 NO_STORE = "this session has no upload store"
 
+#: A message in an encrypted thread whose room key lmer-matrix-bridge's device
+#: never received: there, but not readable to lmer.
+UNDECRYPTABLE_TEXT = "[an encrypted message lmer cannot decrypt]"
+
 # Why an agent's attachment was withheld, as posted into a thread. Fixed phrases:
 # an exception's own text carries host paths and server URLs into a room the run
 # may not own; the detail goes to the log.
@@ -216,6 +221,7 @@ def matrix_account(env: Optional[dict] = None, *, where: str = DAEMON_ENVIRONMEN
         homeserver=values[HOMESERVER_ENV],
         user_id=values[USER_ID_ENV],
         access_token=values[ACCESS_TOKEN_ENV],
+        bridge_url=(environ.get(BRIDGE_URL_ENV) or "").strip() or None,
     )
 
 
@@ -301,16 +307,16 @@ def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False,
 
 def _refuse_encrypted(room_id: str) -> None:
     """One phrasing for the one room lmer cannot work in, wherever it is met."""
-    raise ThreadError(
-        f"room {room_id} is end-to-end encrypted, and lmer reads and writes "
-        "plaintext events only — use an unencrypted room (encryption is a "
-        "follow-up)",
-        status=400,
-    )
+    raise ThreadError(encrypted_room_refusal(room_id), status=400)
+
+
+def _can_encrypt(client) -> bool:
+    return bool(getattr(client, "can_encrypt", False))
 
 
 def matrix_resolved(ref: ThreadRef, client, *, refuse_encrypted: bool = True) -> ThreadRef:
-    """*ref* keyed by the room id, refusing an encrypted room by name."""
+    """*ref* keyed by the room id, refusing an encrypted room by name unless
+    the client borrows lmer-matrix-bridge's device for it."""
     room = ref.key["room"]
     try:
         room_id = client.resolve_room(room)
@@ -319,7 +325,7 @@ def matrix_resolved(ref: ThreadRef, client, *, refuse_encrypted: bool = True) ->
         raise
     except Exception as exc:
         raise ThreadError(f"the homeserver could not be asked about {room}: {exc}", status=400) from None
-    if encrypted:
+    if encrypted and not _can_encrypt(client):
         _refuse_encrypted(room_id)
     return ref.rekeyed({"room": room_id, "event": ref.key["event"]})
 
@@ -479,9 +485,10 @@ def read_from_store(
         raise ThreadError(f"not readable in this session's upload store ({exc.strerror})", status=400) from None
 
 
-def withheld_note(name: str, reason: str) -> str:
+def withheld_note(name: str, reason: str, *, slack_markup: bool = False) -> str:
     """The line a thread gets in place of a file it was not sent."""
-    return f"📎 {name} withheld: {reason}"
+    shown = slack_file_name(name) if slack_markup else name
+    return f"📎 {shown} withheld: {reason}"
 
 
 @dataclass(frozen=True)
@@ -767,6 +774,9 @@ def _read_matrix(
     room, event = ref.key["room"], ref.key["event"]
     try:
         events = [client.get_event(room, event)] + list(client.thread_events(room, event, limit=limit))
+        if any(isinstance(item, dict) and item.get("type") == "m.room.encrypted" for item in events):
+            events = [plain or {**item, "content": {"body": UNDECRYPTABLE_TEXT}}
+                      for item, (plain, _problem) in zip(events, client.decrypt_events(room, events))]
     except Exception as exc:
         raise _matrix_failure(exc, room) from None
     names: dict = {}
@@ -796,7 +806,8 @@ def _stage_matrix_file(
     client, content: dict, store: Optional[UploadStore], budget: list, *, unstored: str = NO_STORE,
 ) -> list:
     """The message's file, described, and copied in when there is room for it."""
-    mxc = content.get("url")
+    encrypted = isinstance(content.get("file"), dict)
+    mxc = content["file"].get("url") if encrypted else content.get("url")
     if not isinstance(mxc, str) or not mxc.startswith("mxc://"):
         return []
     info = content.get("info") if isinstance(content.get("info"), dict) else {}
@@ -815,8 +826,12 @@ def _stage_matrix_file(
         # What the event claims, before asking for the bytes: a homeserver's
         # download has no bound of its own to fall back on.
         return [{**described, "reason": "it is over the size this copies in"}]
+    bound = min(MAX_FILE_BYTES, budget[0])
     try:
-        data, media_type = client.download(mxc, max_bytes=min(MAX_FILE_BYTES, budget[0]))
+        if encrypted:
+            data, media_type = client.download_content(content, max_bytes=bound)
+        else:
+            data, media_type = client.download(mxc, max_bytes=bound)
     except Exception as exc:
         logger.warning("thread_read_file_failed mxc=%s error=%s", mxc, exc)
         return [{**described, "reason": "it could not be fetched"}]
@@ -890,7 +905,7 @@ def _post_slack(
     for item in attachments:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
-            text += f"\n📎 {name}"
+            text += f"\n📎 {slack_file_name(name)}"
     body, clipped = _clip(scrub_text(text))
     channel, thread_ts = ref.key["channel"], ref.key["thread_ts"]
     try:
@@ -925,7 +940,10 @@ def _post_slack(
                 channel, thread_ts,
                 tagged(
                     label,
-                    "\n".join(withheld_note(item["name"], item["reason"]) for item in withheld),
+                    "\n".join(
+                        withheld_note(item["name"], item["reason"], slack_markup=True)
+                        for item in withheld
+                    ),
                     slack_markup=True,
                 ),
             )
@@ -1007,11 +1025,15 @@ def _matrix_attachment(
     if prepared.withheld is not None:
         return prepared.withheld
     try:
-        mxc = client.upload(prepared.data, content_type=prepared.media_type, filename=prepared.name)
+        if client.encrypts(ref.key["room"]):
+            uploaded = {"file": client.upload_encrypted(prepared.data)}
+        else:
+            uploaded = {"mxc": client.upload(prepared.data, content_type=prepared.media_type,
+                                             filename=prepared.name)}
         client.send_thread_file(
-            ref.key["room"], ref.key["event"], mxc=mxc, name=prepared.name,
+            ref.key["room"], ref.key["event"], name=prepared.name,
             media_type=prepared.media_type, size=len(prepared.data), last_event_id=last_event_id,
-            extra=stamp,
+            extra=stamp, **uploaded,
         )
     except Exception as exc:
         logger.warning("thread_attachment_upload_failed name=%s error=%s", prepared.name, exc)
@@ -1232,11 +1254,13 @@ def _dm_matrix(
         encrypted = client.room_is_encrypted(room)
     except Exception as exc:
         raise _matrix_failure(exc, recipient) from None
-    if encrypted:
+    if encrypted and not _can_encrypt(client):
         raise ThreadError(
             f"the direct room with {recipient} ({room}) is encrypted, and this "
             "host's bot account holds no keys for it — the message would arrive "
-            "unreadable. Nothing was sent",
+            f"unreadable. Nothing was sent. Set {BRIDGE_URL_ENV} to have "
+            "lmer-matrix-bridge's device encrypt it (docs/MATRIX-CHAT.md, "
+            '"Encrypted threads")',
             status=409,
         )
     body, clipped = _clip(scrub_text(text))
@@ -1348,7 +1372,7 @@ def _open_matrix(
         encrypted = client.room_is_encrypted(room_id)
     except Exception as exc:
         raise _matrix_failure(exc, room_id) from None
-    if encrypted:
+    if encrypted and not _can_encrypt(client):
         _refuse_encrypted(room_id)
     body, clipped = _clip(scrub_text(text))
     content = {
@@ -1388,6 +1412,11 @@ def _slack_failure(exc: Exception, channel: str) -> ThreadError:
 
 def _matrix_failure(exc: Exception, room: str) -> ThreadError:
     status = getattr(exc, "status", None)
+    if isinstance(exc.__cause__, CryptoError):
+        return ThreadError(
+            f"{room} is end-to-end encrypted and {exc}",
+            status=403 if status == 401 else 502, **retry_hint(exc),
+        )
     if status in (401, 403):
         return ThreadError(
             f"the homeserver refused {room}: {exc} — the host's bot account may "

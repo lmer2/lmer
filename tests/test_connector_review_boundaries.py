@@ -174,10 +174,11 @@ sys.addaudithook(audit)
 @pytest.mark.parametrize("stage", ["checkpoint", "final-ack", "lease", "lease-close"])
 def test_finalization_is_inside_total_reload_deadline(child, stage):
     # Wider than CHILD_DRAIN_EXPIRED: under load, joining the workers and the
-    # steps before *stage* can spend a 5 s drain, and stop() then skips the stage
+    # steps before *stage* can spend the drain, and stop() then skips the stage
     # instead of reaching it — a loaded host, not a finalization outside the
-    # deadline.
-    drain = stretch(15.0)
+    # deadline. Those steps took up to 5.6 s on a busy host, and a 15 s drain
+    # still failed [matrix-lease-close] beside two other pytest runs (#636).
+    drain = stretch(30.0)
     child.bounds["CONNECTOR_FIXTURE_DRAIN"] = str(drain)
     instrument(child, '''
 from ask_channel import bus
@@ -241,7 +242,7 @@ connector_lifecycle.ConnectorLifecycle.stop = stop
             owned.popen.terminate()
         else:
             (child.root / "watched.py").write_text("# finalize under total deadline\n")
-        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, SHUTDOWN + drain)
+        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, SETTLE + drain)
         result = json.loads((child.root / "stop-result").read_text())
         assert not result["ok"], result
         assert result["elapsed"] < outlast(drain), result
@@ -254,7 +255,7 @@ connector_lifecycle.ConnectorLifecycle.stop = stop
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
         (child.root / "exit").touch()
-        wait_for(lambda: owned.popen.poll() is not None, child, SHUTDOWN)
+        wait_for(lambda: owned.popen.poll() is not None, child, SETTLE)
         assert owned.collect() == 3
         assert not child.key.busy()
     finally:
@@ -282,8 +283,12 @@ connector_delivery.sync_directory = synced
 ''')
     source, _ = child.supervisor.log.append(kind="milestone", text="publication boundary", source=comms.Source("agent"))
     owned = child.spawn()
-    wait_for(lambda: owned.popen.poll() is not None, child)
-    assert owned.collect() == 71
+    try:
+        # [matrix-published] missed SETTLE in a loaded full gate (#636).
+        wait_for(lambda: owned.popen.poll() is not None, child, outlast(SETTLE))
+        assert owned.collect() == 71
+    finally:
+        owned.stop(timeout=STOP)
     assert child.events() == []
     path = marker_path(child.key)
     if path.exists():
@@ -295,7 +300,7 @@ connector_delivery.sync_directory = synced
     (child.root / "bootstrap.py").write_text(CHILD_SOURCE)
     resumed = child.spawn()
     try:
-        wait_for(lambda: len(child.events()) == 1 and read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child)
+        wait_for(lambda: len(child.events()) == 1 and read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child, outlast(SETTLE))
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
         resumed.stop(timeout=STOP)
@@ -351,8 +356,12 @@ def test_completed_receipt_identity_outlives_echo_eviction(child):
     (child.root / "mode").write_text("unknown")
     source, _ = child.supervisor.log.append(kind="milestone", text="identical content", source=comms.Source("agent"))
     second = child.spawn()
-    wait_for(lambda: second.popen.poll() is not None, child)
-    assert second.collect() == 4
+    try:
+        # Its 257-record replay ahead of the exit missed SETTLE in a loaded full gate (#636).
+        wait_for(lambda: second.popen.poll() is not None, child, outlast(SETTLE))
+        assert second.collect() == 4
+    finally:
+        second.stop(timeout=STOP)
     op = json.loads(child.cli("inspect").stdout)["operation"]
     before = checkpoint_path(child.key, child.supervisor.log.session).read_bytes()
     result = child.cli("receipt", "--operation", op, "--remote-ref", old)
@@ -364,7 +373,7 @@ def test_completed_receipt_identity_outlives_echo_eviction(child):
     (child.root / "mode").write_text("healthy")
     resumed = child.spawn()
     try:
-        wait_for(lambda: read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child)
+        wait_for(lambda: read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child, outlast(SETTLE))
         assert len(child.events()) == 258
         assert any(item.id == source.id for item in child.supervisor.log.read_since(0)[0])
     finally:

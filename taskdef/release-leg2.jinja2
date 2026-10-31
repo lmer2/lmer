@@ -199,15 +199,25 @@ never re-tagging.
 
 ### Step 5 — `leg2-poll-actions` — the GitHub Actions release run
 
-Find the `release.yml` run for the recorded merge SHA on the mirror
-(`gh run list` filtered by workflow and head SHA — the recorded SHA, never
-"the latest run").
+`gh` takes the same PAT from `GH_TOKEN`, supplied PER COMMAND like ASKPASS:
+every `gh` command below runs in its own subshell that exports the token, so
+it reaches that one command and never its command line. The `work` receipts
+and `bin/gate-push` stay OUTSIDE these subshells — neither needs `GH_TOKEN`.
+The same subshell sets `GH_REPO` to `release.github_target`, the URL exactly
+as resolved in Phase 0.5: `gh` reads the owner and repository from that URL,
+so it never guesses the mirror from this checkout's git remotes.
+
+Find the `release.yml` run for the recorded merge SHA on the mirror, filtered
+by workflow and head SHA — the recorded SHA, never "the latest run":
+`( export GH_TOKEN="${LMER_RELEASE_GITHUB_TOKEN}"; export GH_REPO="<release.github_target>"; export GH_PROMPT_DISABLED=1; gh run list --workflow release.yml --commit <merge-sha> )`
 
 - [ ] Already green for that SHA → skip the poll; make sure the receipts
       below exist (their URLs must name the run that actually uploaded) and
       move on.
-- [ ] Otherwise poll the run to completion (`gh run watch <run-id>`, or a
-      loop on `gh run view <run-id>`).
+- [ ] Otherwise poll the run to completion:
+      `( export GH_TOKEN="${LMER_RELEASE_GITHUB_TOKEN}"; export GH_REPO="<release.github_target>"; export GH_PROMPT_DISABLED=1; gh run watch <run-id> )`,
+      or a loop on
+      `( export GH_TOKEN="${LMER_RELEASE_GITHUB_TOKEN}"; export GH_REPO="<release.github_target>"; export GH_PROMPT_DISABLED=1; gh run view <run-id> )`.
 - [ ] Green → PyPI has the version (with attestations) and the GitHub
       Release exists. Record which run actually published:
       `work release record receipt actions-run --url <Actions run URL>`
@@ -217,7 +227,8 @@ Find the `release.yml` run for the recorded merge SHA on the mirror
       leaves `publish-pypi` untouched, so a later green run may have
       uploaded nothing.
 - [ ] Red, with refs current → re-dispatch the FAILED JOBS ONLY via the
-      API, keyed on the recorded SHA: `gh run rerun <run-id> --failed`.
+      API, keyed on the recorded SHA:
+      `( export GH_TOKEN="${LMER_RELEASE_GITHUB_TOKEN}"; export GH_REPO="<release.github_target>"; export GH_PROMPT_DISABLED=1; gh run rerun <run-id> --failed )`.
       The `--failed` is not optional. `release.yml` sets no
       `skip-existing`, so re-running a `publish-pypi` that already
       succeeded attempts an upload PyPI already holds; PyPI refuses it,

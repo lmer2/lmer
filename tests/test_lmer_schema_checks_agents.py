@@ -666,6 +666,35 @@ class TestSplitMemoryIndex:
         finding = _only(_run(schema_plexus), ag.MEMORY_ENTRY_WITHOUT_FILE)
         assert finding.path == "_agents/memory/MEMORY.md"
 
+    def test_the_store_format_marker_is_never_a_finding(self, schema_plexus):
+        # #598: `.lmer-memory-format` beside a flat and a split index.
+        self._split(schema_plexus.instance_memory_dir)
+        for scope in (schema_plexus.instance_memory_dir, schema_plexus.project_memory_dir):
+            _write(scope / ".lmer-memory-format", "2\n")
+        assert _run(schema_plexus).findings == ()
+
+    def test_a_forget_tombstones_dead_cross_reference_is_no_finding(self, schema_plexus):
+        # Writers keep a forget tombstone verbatim until a revive (#601).
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        with (scope / ag.AREAS_DIR / "dev.md").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "- [old](../../../_archive/_agents/memory/user_old.md) — old. "
+                "See also [ops](ops.md).\n"
+            )
+        assert _run(schema_plexus).findings == ()
+
+    def test_a_later_archive_link_does_not_hide_a_lines_dead_entry(self, schema_plexus):
+        scope = schema_plexus.instance_memory_dir
+        self._split(scope)
+        with (scope / ag.AREAS_DIR / "dev.md").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "- [gone](../user_gone.md) — was "
+                "[old](../../../_archive/_agents/memory/user_old.md).\n"
+            )
+        finding = _only(_run(schema_plexus), ag.MEMORY_ENTRY_WITHOUT_FILE)
+        assert finding.detail == "../user_gone.md"
+
     @pytest.mark.parametrize("name", ["Notes.md", "notes.txt", "nested"])
     def test_anything_but_a_slug_index_in_areas_is_unknown(self, schema_plexus, name):
         scope = schema_plexus.instance_memory_dir

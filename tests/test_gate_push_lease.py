@@ -20,6 +20,7 @@ from lmer_cli.push_lease import LeaseError, PushLease
 from tests.conftest import strip_lmer_env
 from tests.test_gate_push_tag_ref import _load_gate_push_module
 from tests.test_gate_push_scrub import CRED_URL, CRED_VALUE
+from tests.timing_budgets import CLI, SHUTDOWN
 
 
 @pytest.fixture(autouse=True)
@@ -33,8 +34,9 @@ def clean_env(monkeypatch):
 
 
 def git(repo, *args, check=True):
+    # CLI, not 30 s: a loaded gate timed out this fixture's `git commit` (#636).
     return subprocess.run(["git", "-C", str(repo), *args], text=True,
-                          capture_output=True, check=check, timeout=30)
+                          capture_output=True, check=check, timeout=CLI)
 
 
 def commit(repo, name):
@@ -94,11 +96,11 @@ def runner(repo, monkeypatch):
 
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             pushes.append(command)
             push_configs.append(real_run(
                 ["git", "config", "--null", "--list", "--includes"],
-                env=kwargs.get("env"), capture_output=True, text=True, timeout=30,
+                env=kwargs.get("env"), capture_output=True, text=True, timeout=CLI,
                 check=True).stdout)
         return real_run(command, **kwargs)
 
@@ -260,7 +262,7 @@ def test_source_locks_cover_gate_push_and_receipt(repo, runner, monkeypatch):
 
     def run(command, **kw):
         if is_gate_push(command):
-            kw.setdefault("timeout", 30)
+            kw.setdefault("timeout", CLI)
             try_move("push")
         return runner.real_run(command, **kw)
 
@@ -306,7 +308,7 @@ def test_lost_source_lock_is_refused(repo, runner, monkeypatch):
         with original(lease, remote) as source:
             def lose_lock():
                 source.process.terminate()
-                source.process.wait(timeout=5)
+                source.process.wait(timeout=SHUTDOWN)
                 return True
             runner.checks.side_effect = lose_lock
             yield source
@@ -441,7 +443,7 @@ def test_named_remote_cannot_redirect_after_authorization(repo, runner):
 def test_last_boundary_remote_and_mirror_changes_cannot_expand_push(repo, runner, monkeypatch):
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             git(repo.source, "remote", "set-url", "--push", "origin",
                 "https://denied.example.com/group/project.git")
             git(repo.source, "config", "remote.origin.mirror", "true")
@@ -466,7 +468,7 @@ def test_push_failure_preserves_raw_credentials_and_records_failure(repo, runner
             inspections.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             pushes.append(command)
             return subprocess.CompletedProcess(command, 19)
         return runner.real_run(command, **kwargs)
@@ -572,7 +574,7 @@ def test_last_boundary_rewrite_cannot_redirect_to_denied_remote(repo, runner, mo
 
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             key = f"url.{denied_url}.insteadOf"
             if layer == "command":
                 monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
@@ -696,7 +698,7 @@ def test_last_boundary_service_selectors_cannot_redirect(repo, runner, monkeypat
 
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             git(repo.source, "config", "remote.origin.receivepack", str(wrapper))
             git(repo.source, "config", "remote.origin.vcs", "/no-such-service")
             monkeypatch.setenv("GIT_OVERRIDE_VIRTUAL_HOST", "denied.example.com")
@@ -804,7 +806,7 @@ def test_inspection_cli_omits_url_secrets_and_captured_errors(repo, runner, fail
     env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ["PATH"])
     result = subprocess.run(
         [sys.executable, runner.module.__file__, "--inspect-lease", "refs/heads/feature"],
-        env=env, capture_output=True, text=True, check=False, timeout=30)
+        env=env, capture_output=True, text=True, check=False, timeout=CLI)
     assert marker.exists()
     assert result.returncode == (1 if failure else 0)
     for secret in secrets:
@@ -855,7 +857,7 @@ def traced_inspection(repo, request):
                 config.write_text(f"[include]\npath = {included}\n")
             env["GIT_CONFIG_GLOBAL"] = str(config)
     control = subprocess.run(["git", "check-ref-format", "refs/heads/feature"],
-                             env=env, capture_output=True, text=True, timeout=30, check=True)
+                             env=env, capture_output=True, text=True, timeout=CLI, check=True)
     assert control.stdout == ""
     traces = "".join(p.read_text() for p in sinks.rglob("*") if p.is_file())
     assert all(secret in traces for secret in secrets)
@@ -877,7 +879,7 @@ def test_inspection_cli_disables_git_trace_sinks(repo, traced_inspection, stage)
     command = Path(__file__).resolve().parents[1] / "bin" / "gate-push"
     result = subprocess.run([sys.executable, str(command), "--inspect-lease", destination,
                              "--remote", remote], env=trace.env, capture_output=True,
-                            text=True, check=False, timeout=30)
+                            text=True, check=False, timeout=CLI)
     assert result.returncode == (0 if stage == "success" else 1)
     if stage == "success":
         assert result.stdout == f"Push endpoint: file://localhost\n{repo.old} {destination}\n"
@@ -1013,7 +1015,7 @@ def test_snapshot_keeps_credentials_proxy_precedence_and_cleans_up(repo, runner,
 
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             env = kwargs["env"]
             captured.append(Path(env["GIT_DIR"]))
             included.write_text('[credential]\n helper = denied\n')
@@ -1042,12 +1044,12 @@ def test_credential_helper_is_used_from_the_snapshot(repo, runner, monkeypatch, 
 
     def run(command, **kwargs):
         if is_gate_push(command):
-            kwargs.setdefault("timeout", 30)
+            kwargs.setdefault("timeout", CLI)
             git(repo.source, "config", "credential.helper", "/no-such-helper")
             result = runner.real_run(
                 ["git", "credential", "fill"], env=kwargs["env"],
                 input="protocol=https\nhost=git.example.com\n\n", capture_output=True,
-                text=True, timeout=30, check=True)
+                text=True, timeout=CLI, check=True)
             assert "username=fake-user\npassword=fake-pass" in result.stdout
             checked.append(True)
         return runner.real_run(command, **kwargs)

@@ -47,6 +47,12 @@ def test_new_session_id_is_sortable_and_unique():
     assert a.startswith("s-")
     assert a != b
     assert registry._SESSION_ID_RE.match(a)
+    # 48 random bits (#519): four hex digits collided inside one same-second
+    # burst. At most 12, which is all a container name borrows.
+    stamp, suffix = a[2:].split("-")
+    assert len(stamp) == len("20260924T105841") and stamp[8] == "T"
+    assert len(suffix) == 2 * registry.SESSION_ID_SUFFIX_BYTES == 12
+    assert set(suffix) <= set("0123456789abcdef")
 
 
 @pytest.mark.parametrize("bad", ["", "../escape", "a/b", "with space", ".hidden", None])

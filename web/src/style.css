@@ -63,6 +63,8 @@
    agree on, and `size="large"` is Vuetify's own name for it. */
 .send-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-end;
   margin-top: 10px;
 }
@@ -138,3 +140,12 @@ dl.kv dd {
 
 .tone-edge-attention { border-inline-start-color: rgb(var(--v-theme-warning)); }
 .tone-edge-bad { border-inline-start-color: rgb(var(--v-theme-error)); }
+
+/* The grouped layout of the project and assistant settings pages. */
+.settings-group + .settings-group {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.settings-field { margin-bottom: 12px; }
+.setting-source { margin: 4px 0 0; overflow-wrap: anywhere; }

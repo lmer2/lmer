@@ -286,7 +286,7 @@ def render_outbound(
     for item in record.get("attachments") or []:
         name = item.get("name") if isinstance(item, dict) else None
         if name:
-            body += f"\n📎 {name}"
+            body += f"\n📎 {thread_posts.slack_file_name(name) if slack_markup else name}"
     # Before the clip: a token cut in half no longer matches its shape.
     body = scrub_text(body)
     if len(body) > MAX_SLACK_CHARS:
@@ -755,7 +755,11 @@ class SlackConnector(ConnectorLifecycle):
                     if upload is not None:
                         payload = {**identity, "file_id": upload["file_id"]}
                 if payload is None:
-                    note = thread_posts.tagged(self._speaker_label(), prepared.note, slack_markup=True)
+                    note = thread_posts.tagged(
+                        self._speaker_label(),
+                        withheld_note(prepared.name, prepared.withheld, slack_markup=True),
+                        slack_markup=True,
+                    )
                     payload = {"text": scrub_text(note), "index": index}
             if "file_id" in payload:
                 self._uploaded.add(payload["file_id"])
@@ -782,7 +786,7 @@ class SlackConnector(ConnectorLifecycle):
                     raise
                 committed = pending["parts"].get(part + ":note")
                 note = committed["payload"]["text"] if committed else scrub_text(thread_posts.tagged(
-                    self._speaker_label(), withheld_note(payload["name"], reason), slack_markup=True,
+                    self._speaker_label(), withheld_note(payload["name"], reason, slack_markup=True), slack_markup=True,
                 ))
                 self._deliver_part(
                     record, part + ":note", {"text": note, "index": index},

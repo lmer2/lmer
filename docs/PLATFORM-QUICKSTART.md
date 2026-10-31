@@ -270,6 +270,11 @@ consult relevant prior exchanges when context is missing.
   them. Platform state (`chat_show_transcript` in `config.json`): the browser
   that saved it switches at once, and every other open drawer follows on its
   next status poll. `docs/COMMS.md` §4 has the table of what each view draws.
+  Beside it, **Tint my messages with the project color** (on by default,
+  `chat_tint_operator`) paints your bubbles in each chat with that project's
+  hue, at a lightness where the message text and its header both clear WCAG AA
+  in either color scheme; off, they use the theme's one operator color. The
+  General project and a chat with no project always use that one color.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
@@ -702,6 +707,18 @@ exit tab has the same toggle beside forget, and the fleet row shows a `muted`
 chip and carries `muted: true` (so `lmer-ctl status` shows it too). Each change
 is a `run_muted` or `run_unmuted` platform event that names who made it.
 
+If the platform's state is briefly busy (the project database is locked by
+another writer, or the mute state could not be written), a mute route answers
+`503` with `Retry-After` and a `detail` of `{code: "state_busy", message,
+retryable: true}`. Both verbs are idempotent, so retry.
+
+Any other route that finds the project database locked also answers `503`
+`state_busy` with `Retry-After`, and `retryable` says whether a retry is known
+to be safe. It is `true` only when the lock was hit while the request was being
+bound to its project, before anything ran. Otherwise it is `false`: the
+request may have partly applied, so retry it only if it is idempotent (a spawn
+or a project create is not), and check its effect first.
+
 While a run is muted:
 
 - Routine records are not spooled to the assistant: messages, replies and notes
@@ -954,6 +971,28 @@ what the operator's shared secret opens, and an unauthenticated rotate is still 
 401. The operator-initiated rotate — the chat drawer's restart, or the route by
 hand — is untouched.
 
+### Asking every Ratchet to rotate
+
+The app bar's rotate button (issue #646) asks **every** running project
+assistant to rotate itself, with an optional reason. A phone's app bar has no
+room for it, so there it is **Ask every Ratchet to rotate** under Platform
+settings, which has the same button at every width. It lists the instances it
+will reach (project and generation) before you confirm, then shows each one as
+requested, then rotated once its project reports a later generation.
+
+It asks; it does not rotate. `POST /api/assistant/rotate-all {reason?}` posts
+one record on each running assistant's bus (`channel=platform`,
+`author=operator`, `ref=rotate-request:<id>`) asking it to write a handover that
+names the request and its reason, then run `lmer-ctl rotate` at its next
+breakpoint. Nothing is stopped, so an assistant mid-task finishes its step
+first. `GET` on the same path lists who a request would reach. Both are
+operator-only: an assistant or connector credential gets a 403. A stopped or
+waiting assistant is listed and not asked, and one whose session has no message
+bus (an image older than the unified channel) is reported as not reached. The
+reason is one line of at most 500 characters, and a reason holding a character
+that does not print (a control, a format character such as a bidi override, a
+lone surrogate) is refused, the same rule as a private send's purpose.
+
 ### Configuration
 
 | variable | default | what it sets |
@@ -1109,6 +1148,84 @@ the message, and the message names the path the agent will find it at.
   So opening the run later, on another device or after a resume, still shows the
   screenshot rather than a path. A file the store no longer holds — one a run
   copied out and deleted — leaves the path line and drops the thumbnail.
+
+### Send Privately
+
+**Private** (a lock), beside **attach** in both chats, is for a secret or other
+private text (issue #510). In a narrow composer it is the lock alone, labelled
+"Send privately". It opens an editor; what you type there never goes into the
+chat.
+
+- **How it travels.** `POST /api/sessions/{id}/private` with `{text}` writes the
+  text to `<store>/.lmer-private/<session-id>/<stamp>-private.txt`, mode **0400**,
+  in the same upload store and mount as attachments. The reply carries only a
+  `reference`, and the composer sends that line as the message:
+  `[lmer private] /home/developer/.lmer-uploads/.lmer-private/<session-id>/<name> — …`.
+  The line has no content and no size. The route is operator-only, and its
+  refusals never repeat the text.
+- **Purpose (optional).** A short, non-secret label such as "GitLab deploy
+  token" (`{text, purpose}`; one line, at most 80 characters, nothing that
+  does not print: no control or format character, no lone surrogate). It goes into the line the session receives (`— private text for:
+  <purpose> (this session only).`), so a session given several can tell them
+  apart, and into the file name as a slug (`<stamp>-private-gitlab-deploy-token.txt`).
+  The editor says it is not secret, because it is shown in the chat.
+- **In the chat history** a send is one compact entry: a lock, "Private message
+  sent: <purpose>", the time and "delivered". Once its session has ended it adds
+  "removed with the session", which is inferred from the session being over
+  (the platform deletes the directory then) rather than read from a record.
+  The composer marks the record with `meta.private`; older sends are recognised
+  by their exact reference-line shape. So is the harness's own copy of the line
+  when the bus record is not in the read (a worker past the bus read window, a
+  hub that could not be read, a session with no bus): untagged or behind
+  `[platform · operator]`, it shows as the same entry. The match is made on the
+  raw line before the credential scrub, which can rewrite the line, its purpose
+  and its file name. Where only scrubbed text is kept, the verdict is kept
+  beside it: the assistant archive stores the record with `meta.private`, and
+  the transcript file scrubbed at a session's end keeps an `lmer_private` key on
+  that turn, honoured only on a turn that still starts with the reference
+  line's prefix and private path. Archive records written by an earlier version
+  hold no raw line to match. However it is found, a purpose is shown as one line
+  of at most 80 characters, cut when longer. The session still receives the full line.
+- **Where it does not appear:** chat and comms records, the container bus, the
+  fleet journal, assistant history and digest, Slack and Matrix, reference lines,
+  filenames, previews, error messages and the daemon's logs. The attachment
+  read-back route does not serve it, and `lmer-signal --attach` refuses a path
+  inside `.lmer-private/` (a copy made elsewhere is not caught; see the next
+  point).
+- **What it does not cover.** Once the agent reads the file, the platform cannot
+  keep its contents out of the harness transcript, terminal scrollback or
+  captured tool output. The reference line and the uploads prompt fragment ask
+  the agent to use the file in place (a `--password-file` style flag, or
+  `"$(< FILE)"` inside the one command that needs it), never to print it, and to
+  `chmod 000` the file once used. That is an instruction, not a guarantee, and code in
+  the container runs as the same user as the file's reader.
+- **Lifetime.** A session's private directory is deleted when its exit is
+  recorded, clean or crashed, and the detector sweeps every 30 seconds for any
+  session that is no longer live (an exit no daemon watched, a rotated assistant
+  generation). Owner bits a run took away (`chmod 000` on the file, its
+  directory or `.lmer-private/` itself) are restored before removal, on Linux
+  and macOS daemons alike. Cleanup only ever acts inside `.lmer-private/`, and
+  only on one the platform created (it carries a `.lmer-owned` marker), so an
+  ordinary upload, or a folder the assistant named `private/`, is never touched.
+  If the marker is deleted, a `.lmer-private/` holding nothing but session
+  directories of `<stamp>-private.txt` files is re-marked and cleaned as usual;
+  anything else in it keeps it foreign, and sends to that store are refused
+  until it is moved aside.
+  A failed delivery withdraws the file it had stored
+  (`DELETE /api/sessions/{id}/private/{name}`).
+- **In the editor.** The text lives only in the open dialog: never in the
+  composer draft or browser storage, and cleared on send or cancel. A failed send
+  keeps it for retry. The dialog belongs to the session it was opened for:
+  - **Switching runs** unmounts the chat and the dialog with it, so nothing is
+    shown. A store still in flight is withdrawn; a reference already in flight is
+    delivered to the run the dialog was opened for, never the new one.
+  - **A rotation of Ratchet starting**, or the session changing in place, closes
+    an idle dialog with nothing sent. While it is sending, the dialog stays until
+    the outcome is known and then says which it was: withdrawn before delivery
+    (nothing sent), or delivered to the session it was opened for. That notice
+    stays until dismissed, because the rotation one asks you to send again.
+- **Same limits as attach:** the per-file cap applies, and a session started
+  before uploads existed has no store and is refused.
 
 ## Where things live
 

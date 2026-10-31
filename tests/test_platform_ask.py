@@ -1491,9 +1491,14 @@ def test_the_channel_view_shows_a_closed_question_as_unanswerable():
     )
     # Everything that is not waiting on an answer falls through to the dock's
     # record, so a closed question keeps its text and its timestamp rather than
-    # vanishing off the page — and the history below has it either way.
-    assert "const recent = computed(() => entries.value.filter(" in source, (
+    # vanishing off the page — and the history below has it either way. Only the
+    # operator's dock retention (#465) thins it, and then as one of the notes:
+    # unset, the retained list is the whole channel.
+    assert "const recent = computed(() => retained.value.filter(" in source, (
         "the dock no longer shows anything except what is waiting"
+    )
+    assert "if (limit === null) return entries.value" in source, (
+        "the dock thins its record even when no retention is set"
     )
     # The sentence belongs to the dock and is written in the shared entry
     # component, which draws it only for the view that asks (#274). The record does

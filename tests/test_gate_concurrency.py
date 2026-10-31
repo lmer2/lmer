@@ -506,3 +506,21 @@ def test_description_process_errors_remain_visible(gate, monkeypatch, error):
     assert result.full_output
     assert failed.call_count == 1
     assert instance._passing_suite is None
+
+
+def test_a_long_descriptor_failure_states_how_many_earlier_lines_it_dropped(
+    gate, monkeypatch
+):
+    instance, task, _ = gate
+    configure(task, {**POLICY, "protocol": "argv-v1"})
+    monkeypatch.setattr(instance, "_interpreter_can_import", lambda _: True)
+    monkeypatch.setattr(instance, "_text_diff_fast_path", lambda: None)
+    monkeypatch.setattr(gates.gate_descriptor, "describe", Mock(
+        side_effect=ValueError("\n".join(f"line {i}" for i in range(8)))))
+
+    result = instance.check_tests()
+
+    assert result.message == "Parallel test command description failed"
+    assert result.details == [f"line {i}" for i in range(3, 8)]
+    assert result.dropped == 3 and result.dropped_earlier
+    assert "line 0" in result.full_output

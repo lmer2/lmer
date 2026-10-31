@@ -38,7 +38,7 @@ to leg 2.
   the lmer credential-provisioning source (`LMER_RELEASE_SIGNING_KEY`);
   public-key fingerprint recorded here: `<fingerprint>` — date/actor:
 - [ ] **(5) Production fine-grained PAT issued** — `contents:write` +
-  `workflows:write` on the mirror repo only; expiry noted: `<date>`;
+  `workflows:write` + `actions:write` on the mirror repo only; expiry noted: `<date>`;
   rotation owner: the repository owner; provisioned via lmer credential
   provisioning (`LMER_RELEASE_GITHUB_TOKEN`, release-taskdef sessions only)
   — date/actor:

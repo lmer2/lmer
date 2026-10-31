@@ -475,6 +475,7 @@ async def serve(
     config: mxcfg.MatrixConfig, secrets: mxcfg.Secrets, *,
     stop: Optional[asyncio.Event] = None,
     hurry: Optional[asyncio.Event] = None,
+    back_up: bool = True,
 ) -> None:
     """Spec §5's startup sequence, then the two halves, running together.
 
@@ -491,6 +492,10 @@ async def serve(
     may touch asyncio state — and this process is PID 1 in its container,
     where an uninstalled SIGTERM is not defaulted but *dropped*: without a
     handler every ``podman stop`` was the 10-second grace and then SIGKILL.
+
+    ``back_up`` is ``run``'s ``--no-backup`` inverted, threaded to
+    :meth:`MatrixClient.start`; it skips the store-export refresh and nothing
+    else.
     """
     stop = stop if stop is not None else asyncio.Event()
     hurry = hurry if hurry is not None else asyncio.Event()
@@ -522,7 +527,9 @@ async def serve(
         # request hostage past podman's grace — the SIGKILL again, moved to
         # the exact window where a bad deployment has the operator stopping
         # the unit. A stop here aborts the startup and exits 0.
-        startup = asyncio.ensure_future(_start_bridge(config, client))
+        startup = asyncio.ensure_future(
+            _start_bridge(config, client, back_up=back_up)
+        )
         stopping = asyncio.ensure_future(stop.wait())
         try:
             await asyncio.wait(
@@ -577,7 +584,9 @@ async def serve(
             logger.info("matrix_bridge_stopped")
 
 
-async def _start_bridge(config: mxcfg.MatrixConfig, client) -> "mxout.Outbound":
+async def _start_bridge(
+    config: mxcfg.MatrixConfig, client, *, back_up: bool = True,
+) -> "mxout.Outbound":
     """Spec §5's startup sequence: listener, store, room, wiring, baseline.
 
     Both halves of the listener ordering finding (!245 review, two
@@ -593,7 +602,7 @@ async def _start_bridge(config: mxcfg.MatrixConfig, client) -> "mxout.Outbound":
     and cancel it wholesale (!247 review).
     """
     await client.listen(config.bind_address, config.bind_port)
-    await client.start()
+    await client.start(back_up=back_up)
 
     threads = ThreadMap.load(config.state_dir / "threads.json")
     endpoint = mxout.platform_endpoint()
@@ -696,8 +705,18 @@ def create_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="verb")
 
-    sub.add_parser(
+    run = sub.add_parser(
         "run", help="Open the store and the room, then poll and answer.",
+    )
+    run.add_argument(
+        "--no-backup", action="store_true",
+        help=(
+            "Do not refresh the crypto-store export on this start. For a "
+            "deployment whose export cannot be uploaded (a large store's "
+            "export can be refused by the homeserver's edge — see issue "
+            "#634): the bridge starts without a fresh backup and logs a "
+            "WARNING saying so. A failed refresh is fatal without this flag."
+        ),
     )
     emit = sub.add_parser(
         "register",
@@ -787,7 +806,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # No KeyboardInterrupt catch: `serve` handles SIGINT itself, so an
         # interactive Ctrl-C and a `systemctl stop` take the same drain path
         # and both exit 0 (issue #349).
-        asyncio.run(serve(config, secrets))
+        asyncio.run(serve(config, secrets, back_up=not args.no_backup))
     except (mxclient.MatrixClientError, PlatformError) as exc:
         print(f"lmer-matrix-bridge: {exc}", file=sys.stderr)
         return EXIT_FAILURE

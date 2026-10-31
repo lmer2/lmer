@@ -260,7 +260,8 @@ selects its scope:
   hook saying when to read it. The entry lines live in the area indexes,
   with links relative to the area file (`../<name>.md`). The memory files
   themselves stay flat in the scope directory. A scope is split exactly when
-  `areas/` holds an area index; there is no other marker. A memory MAY name
+  `areas/` holds an area index: the shape is the switch, and the store-format
+  marker below never changes how a scope is read. A memory MAY name
   its area in `metadata.area`. A writer filing an entry that is in no area
   index (one added to the map, or one generated for an unindexed file) MUST
   put it in that area, or in `areas/unsorted.md` when the memory names none,
@@ -278,8 +279,11 @@ selects its scope:
   where the session's copy still holds it. A dead one — a map line's area, a
   hook link, a cross-reference to an area no merged scope has — is
   tombstoned like any other link, and a map line whose area is gone keeps
-  its hook with its links reduced to their text. A `forget` tombstone is
-  kept verbatim by every pass. Every merge, tombstone and reconcile rule
+  its hook with its links reduced to their text. A `forget` tombstone — a
+  line whose first relative `.md` link names the `_archive/` mirror — is
+  kept verbatim by every pass, a dead link later on it included, until
+  `revive`; an `_archive/` link later on any other line spares only itself.
+  Every merge, tombstone and reconcile rule
   above applies to each area index as it does to `MEMORY.md`, including
   the deletion rule: an area index another session deleted or emptied is
   not recreated from what a session was given, only from what it added. (A
@@ -300,10 +304,31 @@ selects its scope:
   session's to make, so the persist warns and goes on, and the dead link is
   tombstoned. A flat scope ignores `areas/`: a line there that links one is
   an ordinary entry, and its dead area link is tombstoned like any other —
-  by persist, by `work housekeep` and by `work migrate`'s lift alike, and in
-  mixed form too, where a flat scope's edited entry leading with its memory
-  link stays that scope's entry. `work housekeep` plans a split scope's
-  dangling entries in its area indexes, where they are.
+  by persist and by `work housekeep` alike, and in mixed form too, where a
+  flat scope's edited entry leading with its memory link stays that scope's
+  entry. `work migrate`'s lift reads such a link as an entry link too, but
+  only routes it, unchanged, to a scope; a later persist that writes that
+  scope, or `work housekeep`, tombstones it there. `work housekeep` plans a
+  split scope's dangling entries in its area indexes, where they are. A
+  split legacy `memory/` lifts its area lines too: a line whose entries are
+  all instance memories moves, links rebased, into a flat instance
+  `MEMORY.md`, and the project area index keeps the rest. An instance scope
+  that is already split takes no such line yet (#637) — the plan says so,
+  and the line stays in the project's area index for the next persist to
+  tombstone.
+- **Store-format marker.** A scope MAY hold `.lmer-memory-format`: one
+  integer naming the newest layout a writer of that scope used — `1` flat,
+  `2` split; no marker is `1`. It is a guard only. A writer that does not
+  know the format a marker names (a newer one, or a marker that is not a
+  positive integer) MUST NOT write the scope: `work memory persist`,
+  `forget` and `revive`, `work housekeep`'s index tombstones and `work
+  migrate`'s memory lift all refuse, persist with "store format N is newer
+  than this lmer understands (max M); update the image" and nothing written
+  — not the scope, not the restore manifest. Restore only reads, so it warns
+  and goes on. The marker belongs to its scope alone: it is never restored
+  into the agent's dir, never persisted into the other scope, never deleted
+  by persist, and never a memory; `lmer-schema validate` skips it like every
+  dot name. This lmer never writes it.
 - **Load budget.** `work memory persist` reports the size of the index a
   session will load (the scope's `MEMORY.md`, or both scopes' merged) against
   the strictest limit a built-in harness declares, every time it runs. A flat
@@ -621,7 +646,10 @@ self-contained; nothing about it is shared with any other launch.
   the timestamp and pid in a directory name are always the launch that opened
   it — which is what keeps that listing in start order however often a record
   is resumed. A session dir SHOULD carry a `state.yaml`; a session-id not
-  matching this pattern is a warning.
+  matching this pattern is a warning. An EMPTY session directory is passed
+  over: a launch pre-creates it as an address before `work session-start`
+  writes the state file, and git cannot track an empty directory, so it can
+  never be part of a committed record.
 - **`--<name>`** is appended to the directory name when the session is named
   at its pre-execution freeze; the rename happens at most once. Index symlinks
   are re-pointed by the tool that renames.
@@ -826,7 +854,7 @@ Every file below keeps exactly the shape and the single writer documented in
 
 | path pattern | writer | shape | optional | tier |
 |---|---|---|---|---|
-| `<session-dir>/` | session (`work` CLI creates and, at most once, renames it) | directory named `<session-id>[--<name>]`, session-id `YYYYMMDD-HHMMSS-<pid>-<random>`; a name not in this form is a warning | optional | machine |
+| `<session-dir>/` | session (`work` CLI creates and, at most once, renames it) | directory named `<session-id>[--<name>]`, session-id `YYYYMMDD-HHMMSS-<pid>-<random>`; a name not in this form is a warning; an EMPTY session directory is passed over (git cannot track an empty directory, so it can never be part of a committed record) | optional | machine |
 | `<session-dir>/state.yaml` | `work state` (single writer) | RUN-STATE.md §2, plus the `sessions:` lineage chain; unparseable, wrong integer or enum is an error in every form | expected | machine |
 | `<session-dir>/events.jsonl` | `work event` (append-only) | one JSON object per line, RUN-STATE.md §2; a line that does not parse is an error | optional | machine |
 | `<session-dir>/ledger.yaml` | `work ledger set` | RUN-STATE.md `ledger.yaml` | optional | machine |
@@ -866,7 +894,9 @@ than a memory: the area index must exist, and the line is otherwise not an
 entry. **Tombstoning** a line
 means replacing its link with the word `archived` or `forgotten` and the date,
 or re-pointing the link at the `_archive/` mirror; either way the line stays
-and the file's disappearance is not a dangling entry.
+and the file's disappearance is not a dangling entry. A memory index line
+whose first relative `.md` link is re-pointed at the mirror — what `forget`
+leaves — carries no entry at all, so a dead link later on it is no finding.
 
 ### Outside the schema
 
@@ -976,7 +1006,7 @@ tier: a corrupt state file is broken in every form.
 | `record.release-claim` | ERROR | | machine | a schema-2 shared release claim cannot be safely interpreted; arbitration must refuse |
 | `record.events-line-unparseable` | ERROR | | machine | an `events.jsonl` line that is not one JSON object |
 | `record.grouping-level-entry` | WARN | | machine | a file or a non-session directory at a `_runs/<slug>/` grouping level, where nothing is written |
-| `record.session-dir-without-state` | WARN | | machine | a session directory with no `state.yaml`: a session SHOULD carry one |
+| `record.session-dir-without-state` | WARN | | machine | a NON-EMPTY session directory with no `state.yaml`: a session SHOULD carry one. An empty one is a prepared address and is passed over |
 | `record.session-id-malformed` | WARN | | machine | a session directory whose name is not `<session-id>[--<name>]` in the `LMER_SESSION_ID` form |
 | `record.seed-dir-leftover` | WARN | | machine | a `.new-<session-id>-*` seed directory left behind by a crash — transient state the cleaner sweeps |
 | `record.session-stale` | INFO | | machine | an `in-progress` session untouched for longer than the staleness window: possibly orphaned, resumable, never auto-ended |

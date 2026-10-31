@@ -3,7 +3,10 @@
 The gate and CI run pytest only, so a ``web/tests/*.test.js`` file runs there
 only through a wrapper like this one (issue #507: its regressions for the chat
 cursor, digest rows, the question badge, the status strip and the settings
-dialog live in these files).
+dialog live in these files; issue #617 added the answer box and the per-launch
+resume rows, whose disabled-send reasons are only observable here; issue #510
+the Send Privately editor; issue #465 the operator channel dock's retention;
+issue #646 the rotate-every-assistant modal).
 """
 import os
 from pathlib import Path
@@ -17,14 +20,19 @@ from tests.conftest import node_binary, require_node_toolchain
 WEB = Path(__file__).resolve().parents[1] / "web"
 
 SUITES = [
+    "tests/AnswerBox.test.js",
+    "tests/AskChannel.test.js",
     "tests/AssistantHistory.test.js",
     "tests/AssistantSettings.test.js",
     "tests/Chat.test.js",
     "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",
+    "tests/PrivateSend.test.js",
     "tests/Projects.test.js",
     "tests/Ratchet.test.js",
     "tests/RequestRecovery.test.js",
+    "tests/RotateAll.test.js",
+    "tests/SessionsPerTarget.test.js",
     "tests/StatusStrip.test.js",
     "tests/UnassignedRuns.test.js",
 ]

@@ -73,9 +73,14 @@ class Action:
 
 @dataclass
 class Plan:
-    """The action table later planners append to."""
+    """The action table later planners append to.
+
+    ``refusals`` names what a planner would not plan at all — a memory scope
+    a newer lmer wrote (#598) — so the run says so and exits non-zero.
+    """
 
     actions: list[Action] = field(default_factory=list)
+    refusals: list[str] = field(default_factory=list)
 
     def add(self, action: Action) -> None:
         self.actions.append(action)
@@ -676,6 +681,10 @@ def _plan_memory_index(plan, root, scope_dir, manifest, date):
     index = scope_dir / "MEMORY.md"
     if not index.is_file():
         return
+    problem = memory.check_store_format(scope_dir)
+    if problem is not None:
+        plan.refusals.append(f"index: not tombstoning — {problem}")
+        return
     split = memory._is_split(scope_dir)
     indexes = [(index, memory.MEMORY_INDEX)]
     if split:
@@ -691,8 +700,6 @@ def _plan_memory_index(plan, root, scope_dir, manifest, date):
         base = posixpath.dirname(index_rel) or "."
         src = path.relative_to(root).as_posix()
         for line in text.splitlines():
-            if memory._is_tombstone(line):
-                continue
             for target in memory._entry_targets(line, index_rel, split=split):
                 if (scope_dir / target).exists():
                     continue  # the file is present: not dangling
@@ -765,6 +772,8 @@ def build_plan(root: Path, projects, policy: Policy, areas: Sequence[str],
 
 def _print_plan(plan: Plan, *, apply: bool) -> None:
     header = "Applying" if apply else "Planned"
+    for refusal in plan.refusals:
+        print(f"❌ {refusal}", file=sys.stderr)
     if not plan.actions:
         print("Nothing to do.")
         return
@@ -1004,6 +1013,8 @@ def cmd_housekeep(args) -> int:
     plan = build_plan(root, projects, policy, areas,
                       archive_stale=getattr(args, "archive_stale", False))
     _print_plan(plan, apply=args.apply)
+    # A refused memory scope refuses only itself, as an invalid area policy does.
+    refused_selected = refused_selected or plan.refusals
     if not args.apply or not plan.changes:
         return 2 if refused_selected else 0
 

@@ -132,6 +132,7 @@ from typing import Any, Optional, Sequence
 
 from lmer_cli import routing_receipts, runref
 from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS, assistant_display_name
+from lmer_cli.harness import EFFORT_LEVELS
 
 from lmer_platform.client import (
     Call,
@@ -370,7 +371,7 @@ def _call_spawn_options(args) -> Call:
 def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
-        "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
+        "repo_url", "preset", "agents", "harness", "model", "effort", "ports", "slot",
         "title", "description", "targets", "supervisor_authority",
     )))
     if args.references:
@@ -878,6 +879,9 @@ def create_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--agents", help="Fan-out spec for --agents.")
     spawn.add_argument("--harness", help="claude, codex, pi — whatever the host has.")
     spawn.add_argument("--model", help="Model override.")
+    spawn.add_argument(
+        "--effort", type=str.lower, choices=EFFORT_LEVELS, help="Reasoning effort override.",
+    )
     spawn.add_argument("--ports", type=int, help="How many ports to publish.")
     spawn.add_argument(
         "--slot",

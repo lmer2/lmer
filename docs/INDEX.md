@@ -40,7 +40,7 @@ assistant) on a host:
 Platform web guides:
 
 - [Copy messages and code](../web/docs/CLIPBOARD.md)
-- [Operator chat retention, count, and unread indicator](../web/docs/OPERATOR-CHAT.md)
+- [Operator channel dock retention, operator chat count and unread indicator](../web/docs/OPERATOR-CHAT.md)
 - [Fleet state in the browser tab title](../web/docs/FLEET-TITLE.md)
 - [Forget all completed runs](../web/docs/FORGET-COMPLETED.md)
 

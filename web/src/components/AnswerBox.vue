@@ -28,7 +28,7 @@
 // list of alternatives should arrive as a list. What you type in reply is never
 // rendered anywhere, for the reason Markdown.vue's header gives.
 
-import { computed, defineAsyncComponent, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import { mdiCommentQuestionOutline, mdiReplyOutline } from '@mdi/js'
 import { answerRun } from '../api.js'
 
@@ -51,6 +51,12 @@ const NO_QUESTION_NOTE = 'question text was not recorded — open the run to see
 
 const draft = ref('')
 const projectConfirmed = ref(false)
+// The reason a blocked send attempt was refused, held only so the chord says
+// something: it is what the live region announces and what marks the reason on
+// screen. Cleared by `watch(disabledReason)` below — the reason changing is the
+// state changing — so neither the highlight nor the announcement can outlive
+// the condition that produced it (review of MR !431).
+const pressedReason = ref(null)
 const selectedSlot = ref(null)
 const busy = ref(false)
 const error = ref(null)
@@ -79,10 +85,30 @@ const questionRecorded = computed(
 // within seconds and the box goes away with it, and a second answer in the gap
 // would only earn the daemon's "already has a live session" refusal.
 const handedOff = computed(() => !!startedSession.value)
-const canSend = computed(
-  () => !handedOff.value && !!draft.value.trim() && !busy.value
-    && (!props.run.confirm_project || projectConfirmed.value),
-)
+
+const projectName = computed(() => props.run.workspace_name || 'this project')
+
+// Why the answer cannot be sent, in the operator's words, or null when it can.
+// The control is unsendable four different ways and a greyed-out button says
+// none of them: the report behind issue 617 was a moved run whose required
+// confirmation sat above an unrelated field, so the operator read a working
+// gate as a broken button.
+const disabledReason = computed(() => {
+  if (handedOff.value) {
+    return `This answer already started ${startedSession.value} — wait for it to pick the run up.`
+  }
+  if (busy.value) return 'Sending — a new session is starting for this run.'
+  if (!draft.value.trim()) return 'Type an answer to send.'
+  if (props.run.confirm_project && !projectConfirmed.value) {
+    return `Tick "Authorize this answer in ${projectName.value}" above to send.`
+  }
+  return null
+})
+const canSend = computed(() => !disabledReason.value)
+
+watch(disabledReason, () => {
+  pressedReason.value = null
+})
 
 async function submitWithDecision() {
   if (!canSend.value) return
@@ -130,7 +156,18 @@ function retryWithRepoUrl() {
   return submitWithDecision()
 }
 
-function submit() {
+async function submit() {
+  if (!canSend.value) {
+    // Nothing happens silently, for anyone. The reason is already on screen, so
+    // a colour change is all a re-render would give a sighted operator and
+    // nothing at all to a screen reader — it is cleared and set again instead,
+    // which is a content change the live region announces, and which makes a
+    // second identical attempt audible too.
+    pressedReason.value = null
+    await nextTick()
+    pressedReason.value = disabledReason.value
+    return undefined
+  }
   return submitWithDecision()
 }
 
@@ -259,11 +296,37 @@ function cancelUnsignedSource() {
         @keydown.ctrl.enter.prevent="submit"
         @keydown.meta.enter.prevent="submit"
       />
-      <v-checkbox v-if="run.confirm_project" v-model="projectConfirmed" :label="`Authorize this answer in ${run.workspace_name} with its current project settings`" />
       <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
           item-title="name" item-value="name" label="Service slot" clearable
           hint="Leave empty to reuse this run's remembered slot. Choose an applicable slot if its assignment changed." persistent-hint />
+      <!-- Directly above the control it gates, and saying that it gates it: this
+           is a required step, which a label reading like an acknowledgement does
+           not convey (issue 617 — it used to sit above the unrelated Service
+           slot and the answer button went grey with no explanation). The
+           second sentence is the reason it exists: `confirm_project` is set by
+           the platform only when the run was moved, and sending is what clears
+           it. -->
+      <v-checkbox
+        v-if="run.confirm_project"
+        v-model="projectConfirmed"
+        :label="`Authorize this answer in ${projectName} — required to send`"
+        :hint="`This run was moved to ${projectName}, so sending it needs a confirmation that it runs with that project's current settings.`"
+        persistent-hint
+        class="mt-1"
+      />
       <div class="send-row">
+        <p
+          v-if="disabledReason"
+          id="answer-send-reason"
+          class="send-reason text-body-small text-medium-emphasis"
+          :class="{ 'send-reason--pressed': pressedReason }"
+          role="status"
+        >{{ disabledReason }}</p>
+        <!-- Announced, not only coloured: a blocked Ctrl/Cmd+Enter produces no
+             visible change at all (the reason already reads this), so this is
+             what a screen reader gets. Empty until a chord is refused, and
+             emptied again by the watcher as soon as the reason changes. -->
+        <span class="send-announcer" aria-live="polite" aria-atomic="true">{{ pressedReason || '' }}</span>
         <v-btn
           :prepend-icon="mdiReplyOutline"
           :loading="busy"
@@ -272,6 +335,7 @@ function cancelUnsignedSource() {
           variant="tonal"
           size="large"
           aria-label="answer and start a session"
+          :aria-describedby="disabledReason ? 'answer-send-reason' : undefined"
           @click="submit"
         >answer</v-btn>
       </div>
@@ -289,6 +353,42 @@ function cancelUnsignedSource() {
    only this view uses. */
 .question-body {
   min-width: 0;
+}
+
+/* The reason sits on the control's own row — beside it where there is width for
+   both, above it on a phone — because a hint anywhere else on the card is
+   exactly what the operator failed to connect to the greyed-out button. */
+.send-row {
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.send-reason {
+  flex: 1 1 14rem;
+  margin: 0;
+}
+
+/* A blocked Ctrl/Cmd+Enter is the same reason, said louder: the chord would
+   otherwise look like it did nothing at all. */
+.send-reason--pressed {
+  color: rgb(var(--v-theme-warning));
+  opacity: 1;
+}
+
+/* The live region that announces a blocked chord. Visually hidden (the standard
+   clip recipe): the sentence is already on screen beside the control, and
+   showing it twice would be the duplication this rule exists to avoid. */
+.send-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* The rendered question keeps the spacing the plain paragraph had. Nothing about

@@ -186,8 +186,8 @@ class TestAResumeLandsInTheRecordItResumed:
         """Not "no new record" — no new CHILD. An empty `<sid>/` beside the
         `<sid>--<name>/` it belongs to routes nothing wrong (a child with no
         state file is not a record to any resolver) but it is litter at the
-        one level D22 keeps clean: the validator warns on it and an operator
-        reading the group sees two directories for one launch."""
+        one level D22 keeps clean, and an operator reading the group sees two
+        directories for one launch."""
         assert _dirs_in(resumed.runs_dir / SLUG) == sorted(SESSION_DIR_NAMES)
 
     def test_the_launch_writes_in_the_record_that_was_there(self, resumed):

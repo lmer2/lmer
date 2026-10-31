@@ -344,8 +344,9 @@ issue #518 drew).
 - **Operator-only questions.** `lmer-signal ask --operator-only` marks a gate
   question. The bus refuses an answer or a close to it from `uber-lmer` or
   `peer-ul` at any level. Neither connector binds the assistant's own thread
-  posts as its answer; Slack also refuses any other bot's, while matrix knows
-  only lmer's own account. On a session with a bus, the ask-directory answer
+  posts as its answer. Slack refuses any bot's post; matrix binds only a reply
+  from an MXID in `LMER_MATRIX_OPERATOR_USERS`, and with that unset or empty
+  binds none, so the question is answered on Slack or the platform. On a session with a bus, the ask-directory answer
   route refuses the assistant (409) until the question reaches the bus, where
   the same refusal applies ([COMMS.md](./COMMS.md) §6). A question the session
   has closed unanswered is answered by file for every caller, which returns the

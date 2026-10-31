@@ -2,19 +2,19 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AssistantSettings from '../src/components/AssistantSettings.vue'
 import { fetchAssistantConfig, setAssistantConfig } from '../src/api.js'
-import { chatKeepLast, chatShowTranscript, applyChatSettings } from '../src/operatorChat.js'
+import { chatShowTranscript, chatTintOperator, applyChatSettings } from '../src/operatorChat.js'
 import { mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ fetchAssistantConfig: vi.fn(), setAssistantConfig: vi.fn() }))
-const config = (value = 0, changed = [], shown = false) => ({
-  settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'threads'].map((key) => [
+const config = (changed = [], shown = false, tint = undefined) => ({
+  settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'effort', 'threads'].map((key) => [
     key, { value: null, stored: null, source: 'default' },
   ])),
   chat: {
-    keep_last: { value, stored: value, source: 'config.json' },
     show_transcript: {
       value: shown, stored: shown ? true : null, source: shown ? 'config.json' : 'default',
     },
+    ...(tint === undefined ? {} : { tint_operator: { value: tint, stored: tint, source: 'config.json' } }),
   },
   changed,
 })
@@ -30,14 +30,14 @@ const transcriptSwitch = () => {
 beforeEach(() => {
   vi.clearAllMocks()
   applyChatSettings(config())
-  fetchAssistantConfig.mockResolvedValue(config(25))
+  fetchAssistantConfig.mockResolvedValue(config())
   setAssistantConfig.mockImplementation(async (named) => config(
-    named.chat_keep_last ?? 25, Object.keys(named), named.chat_show_transcript ?? false,
+    Object.keys(named), named.chat_show_transcript ?? false, named.chat_tint_operator,
   ))
 })
 
-// The uber lmer pane's transcript switch (issue #488): stored through the same
-// config route as retention, applied to the drawer the moment the save lands.
+// The uber lmer pane's transcript switch (issue #488): stored through the
+// config route, applied to the drawer the moment the save lands.
 it('turns the working transcript on through the config route and applies it at once', async () => {
   await open()
   expect(chatShowTranscript.value).toBe(false)
@@ -54,7 +54,7 @@ it('turns the working transcript on through the config route and applies it at o
 })
 
 it('prefills the switch from the stored setting and sends nothing when it is unchanged', async () => {
-  fetchAssistantConfig.mockResolvedValue(config(25, [], true))
+  fetchAssistantConfig.mockResolvedValue(config([], true))
   await open()
   expect(transcriptSwitch().checked).toBe(true)
   expect(chatShowTranscript.value).toBe(true)
@@ -64,7 +64,7 @@ it('prefills the switch from the stored setting and sends nothing when it is unc
 })
 
 it('turns the working transcript off again with an explicit false', async () => {
-  fetchAssistantConfig.mockResolvedValue(config(25, [], true))
+  fetchAssistantConfig.mockResolvedValue(config([], true))
   await open()
   transcriptSwitch().click()
   await flushPromises()
@@ -81,73 +81,38 @@ async function open() {
   return wrapper
 }
 
-async function edit(value) {
-  const field = document.querySelector('.v-dialog input[type="number"]')
-  expect(field).not.toBeNull()
-  field.value = value
-  field.dispatchEvent(new Event('input', { bubbles: true }))
-  await flushPromises()
-}
-
-it('loads the stored retention, persists only that key, and applies it without restart', async () => {
+// The dock's retention moved to Platform settings (issue 465): this dialog is the
+// assistant's, and the setting governs every run's dock.
+it('offers no retention field and never writes the retired chat_keep_last', async () => {
   await open()
-  expect(document.querySelector('input[type="number"]').value).toBe('25')
-  await edit('10')
+  const dialog = document.querySelector('.v-dialog')
+  expect(dialog.textContent).not.toMatch(/keep last/i)
+  transcriptSwitch().click()
+  await flushPromises()
   button('save').click()
   await flushPromises()
-  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_keep_last: 10 })
-  expect(chatKeepLast.value).toBe(10)
-  expect(document.body.textContent).toContain('Operator chat display applies now')
-  expect(button('restart')).toBeUndefined()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_show_transcript: true })
 })
 
-it('saves zero to turn automatic clearing off', async () => {
-  await open()
-  await edit('0')
-  button('save').click()
-  await flushPromises()
-  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_keep_last: 0 })
-  expect(chatKeepLast.value).toBe(0)
-})
-
-it('keeps the entered value and reports a refused save', async () => {
-  setAssistantConfig.mockRejectedValueOnce(new Error('Configuration is read-only'))
-  await open()
-  await edit('10')
-  button('save').click()
-  await flushPromises()
-  expect(document.body.textContent).toContain('Configuration is read-only')
-  expect(document.querySelector('input[type="number"]').value).toBe('10')
-  expect(chatKeepLast.value).toBe(25)
-})
-
-it.each(['-1', '1.5'])('refuses invalid retention %s before saving', async (value) => {
-  await open()
-  await edit(value)
-  button('save').click()
-  await flushPromises()
-  expect(setAssistantConfig).not.toHaveBeenCalled()
-  expect(document.body.textContent).toContain('whole number')
-})
-
-it('does not offer a restart when retention changes beside an environment-pinned launch setting', async () => {
-  const before = config(25)
+it('does not offer a restart when a display change lands beside an environment-pinned launch setting', async () => {
+  const before = config()
   before.settings.model = { value: 'pinned', stored: 'old', source: 'env' }
   fetchAssistantConfig.mockResolvedValue(before)
-  const after = config(10, ['model', 'chat_keep_last'])
+  const after = config(['chat_show_transcript', 'model'], true)
   after.settings.model = { value: 'pinned', stored: 'edited', source: 'env' }
   setAssistantConfig.mockResolvedValue(after)
   await open()
   const model = document.querySelector('.v-dialog input')
   model.value = 'edited'
   model.dispatchEvent(new Event('input', { bubbles: true }))
-  await edit('10')
+  transcriptSwitch().click()
+  await flushPromises()
   button('save').click()
   await flushPromises()
-  expect(setAssistantConfig).toHaveBeenCalledWith({ model: 'edited', chat_keep_last: 10 })
-  expect(chatKeepLast.value).toBe(10)
+  expect(setAssistantConfig).toHaveBeenCalledWith({ model: 'edited', chat_show_transcript: true })
+  expect(chatShowTranscript.value).toBe(true)
   expect(button('restart')).toBeUndefined()
-  expect(document.body.textContent).toContain('Operator chat display applies now')
+  expect(document.body.textContent).toContain('Chat display applies now')
 })
 
 it('groups the fields under labelled headings with readable persistent labels and hints', async () => {
@@ -159,7 +124,7 @@ it('groups the fields under labelled headings with readable persistent labels an
     expect(section.getAttribute('aria-labelledby')).toBe(section.querySelector('h3').id)
   }
   const labels = [...dialog.querySelectorAll('.v-field-label, label.v-label')].map((node) => node.textContent.trim())
-  for (const label of ['Model', 'Harness', 'Preset', 'Fan-out presets', 'Chat threads', 'Keep last (entries)']) {
+  for (const label of ['Model', 'Harness', 'Preset', 'Fan-out presets', 'Chat threads']) {
     expect(labels).toContain(label)
   }
   for (const raw of ['model', 'harness', 'preset', 'agents', 'threads']) expect(labels).not.toContain(raw)
@@ -175,7 +140,7 @@ it('groups the fields under labelled headings with readable persistent labels an
 })
 
 it('says off, not zero seconds, for a reminder whose 0 is its off switch', async () => {
-  fetchAssistantConfig.mockResolvedValue({ ...config(25),
+  fetchAssistantConfig.mockResolvedValue({ ...config(),
     checkin: { window_seconds: { value: 0, stored: 0, source: 'config.json' } },
     nudge: { after_seconds: { value: 1, stored: 1, source: 'config.json' },
       pending_threshold: { value: 1, stored: null, source: 'default' } },
@@ -186,4 +151,27 @@ it('says off, not zero seconds, for a reminder whose 0 is its off switch', async
   expect(lines).toContain('In effect now: 1 second (from config.json)')
   expect(lines).toContain('In effect now: 1 digest (from default)')
   expect(lines.some((line) => line.includes('0 seconds'))).toBe(false)
+})
+
+// Issue 646 item 9: the project tint is on unless the platform stores false.
+const tintSwitch = () => [...document.querySelectorAll('.v-dialog .tint-operator')][0]?.querySelector('input')
+
+it('tints by default and turning it off stores an explicit false that applies at once', async () => {
+  await open()
+  expect(chatTintOperator.value).toBe(true)
+  const input = tintSwitch()
+  expect(input.checked).toBe(true)
+  input.click()
+  await flushPromises()
+  button('save').click()
+  await flushPromises()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_tint_operator: false })
+  expect(chatTintOperator.value).toBe(false)
+  expect(document.body.textContent).toContain('applies now')
+})
+
+it('offers the launch effort beside the other launch settings', async () => {
+  await open()
+  const labels = [...document.querySelectorAll('.v-dialog .v-text-field label')].map((node) => node.textContent.trim())
+  expect(labels).toContain('Reasoning effort')
 })

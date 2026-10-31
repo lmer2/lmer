@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,10 @@ import requests
 from ask_channel import bus
 from lmer_cli import comms, supervisor, targets, thread_posts
 from matrix_chat import connector, listener, permalink
-from matrix_chat.client import MatrixError
+from lmer_cli.connector_delivery import verified_rejection
+from lmer_cli.connector_process import child_environment
+from matrix_chat.client import MatrixClient, MatrixError
+from matrix_chat.crypto import CryptoError
 from slack_chat import registry
 from tests.conftest import drain_connectors, strip_lmer_env
 from tests.timing_budgets import DRAIN, JOIN
@@ -137,9 +141,30 @@ class TestRules:
 # ---------------------------------------------------------------------------
 
 
+class FakeBridgeCrypto:
+    """What :class:`matrix_chat.crypto.BridgeCrypto` answers, minus the HTTP."""
+
+    def __init__(self, user_id=BOT):
+        self.user_id = user_id
+        self.refusal = None
+
+    def whoami(self):
+        if self.refusal is not None:
+            raise self.refusal
+        return {"user_id": self.user_id, "device_id": "BRIDGEDEV"}
+
+
 class FakeMatrix:
-    def __init__(self, *, encrypted=False):
+    def __init__(self, *, encrypted=False, crypto=None):
+        #: The room's m.room.encryption state, and what the client believes of it.
         self.encrypted = encrypted
+        self.known = None
+        self.state_reads = 0
+        self.crypto = crypto
+        self.state_events: list = []
+        #: Megolm session ids whose room key has "reached the bridge".
+        self.room_keys: set = set()
+        self.decrypt_calls = 0
         self.sent: list = []
         self.stamps: list = []
         self.thread: list = []
@@ -165,6 +190,8 @@ class FakeMatrix:
         return ROOM
 
     def room_is_encrypted(self, room_id):
+        self.state_reads += 1
+        self.known = self.encrypted
         return self.encrypted
 
     def get_event(self, room_id, event_id):
@@ -174,9 +201,19 @@ class FakeMatrix:
         return list(self.thread)
 
     def sync(self, *, since=None, filter_body=None, timeout_ms=0):
+        """As a homeserver does, only the event types the filter admits."""
         self.next_batch += 1
         events, self.pending = self.pending, []
-        return {"next_batch": f"s{self.next_batch}", "rooms": {"join": {ROOM: {"timeline": {"events": events}}}}}
+        state, self.state_events = self.state_events, []
+        room_filter = (filter_body or {}).get("room") or {}
+
+        def admitted(section, batch):
+            types = (room_filter.get(section) or {}).get("types")
+            return batch if types is None else [event for event in batch if event.get("type") in types]
+
+        events, state = admitted("timeline", events), admitted("state", state)
+        return {"next_batch": f"s{self.next_batch}",
+                "rooms": {"join": {ROOM: {"state": {"events": state}, "timeline": {"events": events}}}}}
 
     def send_thread_text(self, room_id, root, text, *, last_event_id=None, msgtype="m.text",
                          extra=None):
@@ -185,12 +222,56 @@ class FakeMatrix:
         self.stamps.append(extra or {})
         return event_id
 
-    def send_thread_file(self, room_id, root, *, mxc, name, media_type, size,
-                         last_event_id=None, extra=None):
+    def send_thread_file(self, room_id, root, *, mxc=None, name, media_type, size,
+                         last_event_id=None, extra=None, file=None):
         event_id = f"$file{len(self.sent)}"
-        self.sent.append((room_id, root, f"FILE {name} {mxc}", "m.file"))
+        where = mxc if file is None else f"encrypted {file['url']}"
+        self.sent.append((room_id, root, f"FILE {name} {where}", "m.file"))
         self.stamps.append(extra or {})
         return event_id
+
+    @property
+    def can_encrypt(self):
+        return self.crypto is not None
+
+    def encrypts(self, room_id):
+        if self.known is None and self.crypto is not None:
+            return self.room_is_encrypted(room_id)
+        return self.known is True
+
+    def note_encrypted(self, room_id):
+        self.known = True
+
+    def turn_encryption_on(self, *, gap=False):
+        """Set m.room.encryption; sync carries it in the timeline, or after a
+        gap only in the state section."""
+        self.encrypted = True
+        event = {"type": "m.room.encryption", "state_key": "", "event_id": "$enc",
+                 "sender": "@tester:example.org", "content": {"algorithm": "m.megolm.v1.aes-sha2"}}
+        (self.state_events if gap else self.pending).append(event)
+
+    def upload_encrypted(self, data):
+        mxc = self.upload(bytes(reversed(data)), content_type="application/octet-stream", filename=None)
+        return {"url": mxc, "key": {"k": "fake"}, "iv": "iv", "hashes": {"sha256": "h"}, "v": "v2"}
+
+    def download_content(self, content, *, max_bytes=None):
+        data, _ = self.download(content["file"]["url"], max_bytes=max_bytes)
+        mimetype = (content.get("info") or {}).get("mimetype") or "application/octet-stream"
+        return (None if data is None else bytes(reversed(data))), mimetype
+
+    def decrypt_events(self, room_id, events):
+        """Fake Megolm: the ciphertext is the JSON of the plaintext content."""
+        self.decrypt_calls += 1
+        out = []
+        for event in events:
+            if event.get("type") != "m.room.encrypted":
+                out.append((event, None))
+            elif event["content"]["session_id"] in self.room_keys:
+                plain = json.loads(event["content"]["ciphertext"])
+                out.append(({**event, "type": "m.room.message", "content": plain}, None))
+            else:
+                out.append((None, "no_session"))
+        return out
 
     def upload(self, data, *, content_type, filename):
         self.uploads.append((filename, content_type, data))
@@ -221,10 +302,25 @@ class FakeMatrix:
         (self.pending if live else self.thread).append(event)
         return event
 
+    def human_says_encrypted(self, text, *, session="megolm-1", live=True, **content):
+        """An ``m.room.encrypted`` thread reply; the relation stays in the clear."""
+        relates = {"rel_type": "m.thread", "event_id": ROOT}
+        self.counter += 1
+        event = {
+            "event_id": f"$e{self.counter}", "sender": "@tester:example.org", "type": "m.room.encrypted",
+            "origin_server_ts": 10 + self.counter,
+            "content": {"algorithm": "m.megolm.v1.aes-sha2", "session_id": session,
+                        "ciphertext": json.dumps({"msgtype": "m.text", "body": text,
+                                                  "m.relates_to": relates, **content}),
+                        "m.relates_to": relates},
+        }
+        (self.pending if live else self.thread).append(event)
+        return event
+
 
 class Rig:
     def __init__(self, tmp_path, *, uploads=None, encrypted=False, authenticated_media=False,
-                 launch_settings=None):
+                 launch_settings=None, crypto=None):
         from fastapi.testclient import TestClient
 
         self.log = comms.MessageLog("sess-1", str(tmp_path / "messages.jsonl"))
@@ -240,7 +336,7 @@ class Rig:
         )
         client = bus.BusClient(bus.Endpoint(url="http://testserver", token="tok"), session=_Session(TestClient(app)))
         self.bus = client
-        self.matrix = FakeMatrix(encrypted=encrypted)
+        self.matrix = FakeMatrix(encrypted=encrypted, crypto=crypto)
         self.config = connector.ConnectorConfig(
             supervisor_url="http://testserver", supervisor_token="tok",
             homeserver="https://hs.example.org", user_id=BOT, access_token="syt_secret",
@@ -322,8 +418,9 @@ class TestConnector:
 
     def test_an_encrypted_room_is_refused_by_name(self, tmp_path):
         rig = Rig(tmp_path, encrypted=True)
-        with pytest.raises(MatrixError, match="end-to-end encrypted"):
+        with pytest.raises(MatrixError, match="end-to-end encrypted") as caught:
             rig.connector.connect()
+        assert "LMER_MATRIX_BRIDGE_URL" in str(caught.value)
 
     def test_attach_counts_both_sides_without_replaying_them(self, rig):
         rig.matrix.human_says("earlier reply", live=False)
@@ -580,6 +677,92 @@ class TestConnector:
         assert [sent[3] for sent in rig.matrix.sent] == ["m.text"]
 
 
+OPERATOR = "@operator:example.org"
+CI_BOT = "@ci:example.org"
+
+
+class TestOperatorOnly:
+    """Only a listed operator account answers an operator-only question (#599):
+    any account in the room can post, and a bridge or CI bot looks like a human."""
+
+    def _connect(self, rig, operators):
+        rig.connector = connector.MatrixConnector(
+            replace(rig.config, operator_users=frozenset(operators)), matrix=rig.matrix, bus_client=rig.bus,
+        )
+        rig.connector.replay()
+
+    def _gate(self, rig):
+        return rig.agent("question", "merge?", options=["approved", "rejected"],
+                         meta={comms.META_OPERATOR_ONLY: True})
+
+    def _notices(self, rig):
+        return [sent[2] for sent in rig.matrix.sent if sent[3] == "m.notice"]
+
+    def test_another_bot_account_is_refused_and_the_operator_binds(self, rig):
+        self._connect(rig, {OPERATOR})
+        question = self._gate(rig)
+        rig.matrix.human_says("approved", sender=CI_BOT)
+        assert rig.connector.sync_once() == 1
+        refused = rig.log.read_since(question.seq)[0][-1]
+        assert (refused.kind, refused.in_reply_to, refused.source.author) == ("message", None, CI_BOT)
+        assert rig.log.question(str(question.seq)).open
+        rig.matrix.human_says("approved", sender=OPERATOR)
+        assert rig.connector.sync_once() == 1
+        answer = rig.log.read_since(question.seq)[0][-1]
+        assert (answer.kind, answer.text, answer.in_reply_to, answer.source.author) == (
+            "answer", "approved", question.id, OPERATOR,
+        )
+        assert self._notices(rig) == []
+
+    def test_a_reply_to_the_question_event_from_another_bot_is_refused_too(self, rig):
+        self._connect(rig, {OPERATOR})
+        question = self._gate(rig)
+        rig.connector._post_outbound(
+            {"kind": "question", "id": question.id, "text": "merge?", "seq": question.seq,
+             "options": ["approved", "rejected"], "source": {"channel": "agent"},
+             "meta": {comms.META_OPERATOR_ONLY: True}}, {},
+        )
+        posted = rig.connector._question_events[question.id]
+        rig.matrix.human_says("ship it", sender=CI_BOT, **{"m.relates_to": {
+            "rel_type": "m.thread", "event_id": ROOT,
+            "m.in_reply_to": {"event_id": posted}, "is_falling_back": False,
+        }})
+        assert rig.connector.sync_once() == 1
+        assert rig.log.read_since(question.seq)[0][-1].kind == "message"
+        assert rig.log.question(str(question.seq)).open
+
+    def test_listing_lmers_own_account_does_not_let_its_posts_answer(self, rig):
+        self._connect(rig, {BOT, OPERATOR})
+        question = self._gate(rig)
+        rig.matrix.app_says("approved", poster=thread_posts.Poster.for_platform("Ratchet"))
+        assert rig.connector.sync_once() == 1
+        assert rig.log.read_since(question.seq)[0][-1].kind == "message"
+        assert rig.log.question(str(question.seq)).open
+
+    def test_with_no_operator_list_nothing_answers_it_and_the_thread_is_told_once(self, rig, caplog):
+        self._connect(rig, ())
+        question = self._gate(rig)
+        with caplog.at_level("WARNING", logger="matrix_chat.connector"):
+            for _ in range(2):
+                rig.matrix.human_says("approved", sender=OPERATOR)
+                assert rig.connector.sync_once() == 1
+        assert [record.kind for record in rig.log.read_since(question.seq)[0]] == ["message", "message"]
+        assert rig.log.question(str(question.seq)).open
+        (notice,) = self._notices(rig)
+        assert "LMER_MATRIX_OPERATOR_USERS" in notice and "Slack or the platform" in notice
+        assert "LMER_MATRIX_OPERATOR_USERS" in caplog.text
+
+    @pytest.mark.parametrize("operators", [(), (OPERATOR,)])
+    def test_an_ordinary_question_still_binds_from_any_matrix_user(self, rig, operators):
+        self._connect(rig, operators)
+        question = rig.agent("question", "branch?", options=["main", "prep-release"])
+        rig.matrix.human_says("2", sender=CI_BOT)
+        assert rig.connector.sync_once() == 1
+        answer = rig.log.read_since(question.seq)[0][-1]
+        assert (answer.kind, answer.text, answer.in_reply_to) == ("answer", "prep-release", question.id)
+        assert self._notices(rig) == []
+
+
 # ---------------------------------------------------------------------------
 # configuration, the target handler, the listener
 # ---------------------------------------------------------------------------
@@ -600,6 +783,21 @@ class TestConfigAndTargets:
             "LMER_MATRIX_ACCESS_TOKEN": "syt", "LMER_MATRIX_AUTHENTICATED_MEDIA": "1",
         })
         assert config.authenticated_media is True and "syt" not in repr(config)
+        assert config.operator_users == frozenset()
+
+    def test_the_operator_list_is_parsed_like_the_listeners_allow_list(self):
+        config = connector.ConnectorConfig.from_env({
+            "LMER_FASTAPI_PORT": "1", "LMER_FASTAPI_TOKEN": "t",
+            "LMER_MATRIX_ROOM_ID": ROOM, "LMER_MATRIX_THREAD_EVENT": ROOT,
+            "LMER_MATRIX_HOMESERVER": "https://hs", "LMER_MATRIX_USER_ID": BOT,
+            "LMER_MATRIX_ACCESS_TOKEN": "syt",
+            "LMER_MATRIX_OPERATOR_USERS": f" {OPERATOR} , ,@second:example.org,",
+        })
+        assert config.operator_users == {OPERATOR, "@second:example.org"}
+
+    def test_the_cli_run_connector_inherits_the_operator_list(self, monkeypatch):
+        monkeypatch.setenv("LMER_MATRIX_OPERATOR_USERS", OPERATOR)
+        assert child_environment()["LMER_MATRIX_OPERATOR_USERS"] == OPERATOR
 
     def test_the_target_handler_claims_matrix_links_and_keeps_the_token_out(self, monkeypatch):
         link = permalink.matrix_to_link(ROOM, ROOT)
@@ -616,6 +814,7 @@ class TestConfigAndTargets:
         assert handler.validate_environment() is None
         env = targets.special_target_env(handlers)
         assert env["LMER_MATRIX_ACCESS_TOKEN"] is None and env["LMER_CHAT_CHANNEL"] == "matrix"
+        assert env["LMER_MATRIX_BRIDGE_URL"] is None  # host-only, like the account
         assert env["LMER_MATRIX_ROOM_ID"] == ROOM and env["SLACK_BOT_TOKEN"] is None
         assert handler.supports_repoless_session("chat")
 
@@ -1100,3 +1299,341 @@ def test_matrix_attachment_notice_waits_for_supervisor_identity(tmp_path, monkey
         rig.connector.stop(timeout=DRAIN)
         rig.bus._session._http.close()
         rig.log.close()
+
+
+# ---------------------------------------------------------------------------
+# encrypted threads (#478): the bridge's device does the crypto
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def secret_rig(tmp_path):
+    store = tmp_path / "uploads"
+    store.mkdir()
+    rig = Rig(tmp_path, uploads=str(store), encrypted=True, authenticated_media=True,
+              crypto=FakeBridgeCrypto())
+    rig.store = store
+    yield rig
+    rig.connector.stop()
+    rig.bus._session._http.close()
+    rig.log.close()
+
+
+def _attachment_record():
+    return {"kind": "message", "text": "see", "source": {"channel": "agent"}, "meta": {},
+            "attachments": [{"name": "report.txt", "media_type": "text/plain", "bytes": 9,
+                             "path": "/home/developer/.lmer-uploads/report.txt"}]}
+
+
+class TestEncryptedThread:
+    def test_a_bridge_lending_its_device_to_this_user_admits_the_room(self, secret_rig):
+        assert secret_rig.connector.connect() == ROOM
+        assert secret_rig.connector.encrypted is True
+
+    def test_a_bridge_owned_by_another_user_is_refused_naming_both(self, tmp_path):
+        rig = Rig(tmp_path, encrypted=True, crypto=FakeBridgeCrypto(user_id="@lmer-xo:example.org"))
+        with pytest.raises(MatrixError) as caught:
+            rig.connector.connect()
+        message = str(caught.value)
+        assert "@lmer-xo:example.org" in message and BOT in message and "LMER_MATRIX_USER_ID" in message
+        assert rig.connector._lease is None
+
+    def test_a_bridge_that_refuses_the_token_is_refused_by_its_own_words(self, tmp_path):
+        crypto = FakeBridgeCrypto()
+        crypto.refusal = CryptoError("lmer-matrix-bridge refused /whoami: 401 its own token only", status=401)
+        rig = Rig(tmp_path, encrypted=True, crypto=crypto)
+        with pytest.raises(MatrixError, match="401 its own token only"):
+            rig.connector.connect()
+
+    def test_an_encrypted_reply_reaches_the_bus_decrypted(self, secret_rig):
+        secret_rig.matrix.room_keys.add("megolm-1")
+        secret_rig.connector.replay()
+        secret_rig.matrix.human_says_encrypted("ship it")
+        assert secret_rig.connector.sync_once() == 1
+        record = secret_rig.log.read_since(0)[0][-1]
+        assert (record.text, record.source.ref) == ("ship it", "$e1")
+
+    def test_a_reply_whose_key_arrives_later_is_held_then_relayed(self, secret_rig):
+        secret_rig.connector.replay()
+        secret_rig.matrix.human_says_encrypted("ship it", session="late")
+        assert secret_rig.connector.sync_once() == 0
+        assert "$e1" in secret_rig.connector._snapshot()["_undecrypted"]
+        secret_rig.matrix.room_keys.add("late")
+        assert secret_rig.connector.sync_once() == 1
+        assert secret_rig.log.read_since(0)[0][-1].text == "ship it"
+        assert secret_rig.connector._undecrypted == {}
+
+    def test_a_key_that_never_arrives_is_given_up_on_loudly(self, secret_rig, monkeypatch, caplog):
+        now = [1000.0]
+        secret_rig.connector._wall_clock = lambda: now[0]
+        secret_rig.connector.replay()
+        secret_rig.matrix.human_says_encrypted("lost", session="never")
+        assert secret_rig.connector.sync_once() == 0
+        now[0] += connector.UNDECRYPTED_GIVE_UP_SECONDS + 1
+        with caplog.at_level("WARNING", logger="matrix_chat.connector"):
+            assert secret_rig.connector.sync_once() == 0
+        assert secret_rig.connector._undecrypted == {}
+        assert "matrix_connector_undecryptable_dropped" in caplog.text and "$e1" in caplog.text
+
+    def test_history_counts_what_decrypts_and_skips_what_does_not(self, secret_rig):
+        secret_rig.matrix.room_keys.add("old")
+        secret_rig.matrix.human_says_encrypted("readable", session="old", live=False)
+        secret_rig.matrix.human_says_encrypted("before the bridge joined", session="gone", live=False)
+        assert secret_rig.connector.replay() == 1
+        (notice,) = secret_rig.log.read_since(0)[0]
+        assert "has 2 earlier messages" in notice.text  # the root and the readable one
+        assert secret_rig.connector.sync_once() == 0
+
+    def test_an_inbound_encrypted_file_is_decrypted_into_the_store(self, secret_rig):
+        secret_rig.matrix.room_keys.add("megolm-1")
+        secret_rig.matrix.media["mxc://example.org/sealed"] = (bytes(reversed(b"\x89PNG")), "application/octet-stream")
+        secret_rig.connector.replay()
+        secret_rig.matrix.human_says_encrypted(
+            "shot.png", msgtype="m.image", info={"mimetype": "image/png"},
+            file={"url": "mxc://example.org/sealed", "key": {"k": "fake"}, "iv": "iv", "hashes": {"sha256": "h"}},
+        )
+        assert secret_rig.connector.sync_once() == 1
+        (attachment,) = secret_rig.log.read_since(0)[0][-1].attachments
+        assert attachment["media_type"] == "image/png"
+        (written,) = secret_rig.store.iterdir()
+        assert written.read_bytes() == b"\x89PNG"
+
+    def test_an_outbound_attachment_goes_up_as_ciphertext(self, secret_rig):
+        (secret_rig.store / "report.txt").write_text("all green", encoding="utf-8")
+        secret_rig.connector.connect()
+        record = {"kind": "message", "text": "see", "source": {"channel": "agent"}, "meta": {},
+                  "attachments": [{"name": "report.txt", "media_type": "text/plain", "bytes": 9,
+                                   "path": "/home/developer/.lmer-uploads/report.txt"}]}
+        secret_rig.connector._post_outbound(record, {})
+        assert secret_rig.matrix.uploads == [(None, "application/octet-stream", b"neerg lla")]
+        assert any(s[3] == "m.file" and "encrypted mxc://" in s[2] for s in secret_rig.matrix.sent)
+
+    def test_a_held_reply_survives_a_failed_post(self, secret_rig, monkeypatch):
+        """The event came in an earlier sync batch, so no later sync brings it
+        back: it stays held until it has been handled (review of #478)."""
+        secret_rig.connector.replay()
+        secret_rig.matrix.human_says_encrypted("ship it", session="late")
+        assert secret_rig.connector.sync_once() == 0
+        secret_rig.matrix.room_keys.add("late")
+        real, calls = secret_rig.connector.bus.questions, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise bus.BusError("temporary")
+            return real()
+
+        monkeypatch.setattr(secret_rig.connector.bus, "questions", flaky)
+        with pytest.raises(bus.BusError):
+            secret_rig.connector.sync_once()
+        assert "$e1" in secret_rig.connector._snapshot()["_undecrypted"]
+        assert secret_rig.connector.sync_once() == 1
+        assert secret_rig.log.read_since(0)[0][-1].text == "ship it"
+        assert secret_rig.connector._undecrypted == {}
+
+    def test_held_replies_are_capped(self, secret_rig, monkeypatch, caplog):
+        cap = 2  # a count, not a wall-clock bound
+        monkeypatch.setattr(connector, "MAX_UNDECRYPTED", cap)
+        clock = iter(range(100))
+        secret_rig.connector._wall_clock = lambda: float(next(clock))
+        secret_rig.connector.replay()
+        for n in range(cap + 1):
+            secret_rig.matrix.human_says_encrypted(f"m{n}", session=f"never-{n}")
+            secret_rig.connector.sync_once()
+        assert sorted(secret_rig.connector._undecrypted) == ["$e2", "$e3"]
+        assert "too many held" in caplog.text
+
+    def test_a_bridge_failure_on_send_is_not_an_uncertain_outcome(self, secret_rig, monkeypatch):
+        """Encryption happens before the request: a bridge that cannot encrypt
+        means the event does not exist, so the delivery is retried rather than
+        frozen for manual recovery (review of #478)."""
+        refused = MatrixError("lmer-matrix-bridge refused /encrypt: 503", status=503, transient=True, not_sent=True)
+        assert verified_rejection(refused)
+        secret_rig.connector.connect()
+
+        def refuse(*_args, **_kwargs):
+            raise refused
+
+        monkeypatch.setattr(secret_rig.matrix, "send_thread_text", refuse)
+        record = {"kind": "message", "text": "hi", "source": {"channel": "agent"}, "meta": {}, "seq": 1}
+        with pytest.raises(MatrixError):
+            secret_rig.connector._post_outbound(record, {})
+        assert secret_rig.connector._state.frozen is False
+
+    @pytest.mark.parametrize("gap", [False, True], ids=["timeline", "state-after-gap"])
+    def test_a_room_that_turns_encrypted_borrows_the_bridge(self, tmp_path, gap):
+        rig = Rig(tmp_path, crypto=FakeBridgeCrypto())
+        try:
+            rig.connector.replay()
+            assert rig.connector.encrypted is False
+            rig.matrix.room_keys.add("megolm-1")
+            rig.matrix.turn_encryption_on(gap=gap)
+            rig.matrix.human_says_encrypted("now secret")
+            assert rig.connector.sync_once() == 1
+            assert rig.connector.encrypted is True and rig.matrix.encrypts(ROOM) is True
+            assert rig.log.read_since(0)[0][-1].text == "now secret"
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    @pytest.mark.parametrize("gap", [False, True], ids=["timeline", "state-after-gap"])
+    def test_the_state_event_seals_sends_before_any_encrypted_reply(self, tmp_path, gap):
+        """Review of #478: the switch is read from m.room.encryption, not
+        waited for behind a cached plaintext answer. No encrypted reply, so
+        nothing but the state event can turn the room."""
+        rig = Rig(tmp_path, crypto=FakeBridgeCrypto())
+        try:
+            rig.connector.replay()
+            reads = rig.matrix.state_reads
+            rig.matrix.turn_encryption_on(gap=gap)
+            assert rig.connector.sync_once() == 0
+            assert rig.matrix.known is True and rig.connector.encrypted is True
+            assert rig.matrix.state_reads == reads
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    def test_a_room_that_turns_encrypted_without_a_bridge_stops_plaintext(self, rig, caplog):
+        rig.connector.replay()
+        rig.matrix.turn_encryption_on()
+        rig.matrix.human_says_encrypted("now secret")
+        assert rig.connector.sync_once() == 0
+        assert rig.matrix.encrypts(ROOM) is True  # the client now encrypts or refuses
+        assert "LMER_MATRIX_BRIDGE_URL" in caplog.text
+
+    @pytest.mark.parametrize("bridge", [False, True], ids=["no-bridge", "bridge"])
+    def test_a_stray_encrypted_event_does_not_seal_a_plaintext_room(self, tmp_path, bridge, caplog):
+        """Review of #478: anyone can send m.room.encrypted into a plaintext
+        room; it is skipped, and sends stay plaintext."""
+        rig = Rig(tmp_path, crypto=FakeBridgeCrypto() if bridge else None)
+        try:
+            rig.connector.replay()
+            reads = rig.matrix.state_reads
+            rig.matrix.human_says_encrypted("not really")
+            rig.matrix.human_says("plain")
+            assert rig.connector.sync_once() == 1
+            assert rig.matrix.encrypts(ROOM) is False and rig.connector.encrypted is False
+            assert rig.connector._undecrypted == {}
+            assert "matrix_connector_encrypted_event" in caplog.text
+            # Without a bridge nothing new is asked, as before #478.
+            assert rig.matrix.state_reads - reads == (1 if bridge else 0)
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    def test_a_bridge_blip_at_the_switch_holds_replies(self, tmp_path):
+        """Review of #478: a transient bridge failure when the room turns
+        encrypted holds the replies until it answers, instead of dropping them."""
+        bridge = FakeBridgeCrypto()
+        rig = Rig(tmp_path, crypto=bridge)
+        try:
+            rig.connector.replay()
+            rig.matrix.room_keys.add("megolm-1")
+            bridge.refusal = CryptoError("lmer-matrix-bridge is unreachable", status=None, transient=True)
+            rig.matrix.turn_encryption_on()
+            rig.matrix.human_says_encrypted("during the blip")
+            assert rig.connector.sync_once() == 0
+            assert rig.connector.encrypted is False
+            assert rig.matrix.encrypts(ROOM) is True  # sends are sealed meanwhile
+            assert "$e1" in rig.connector._undecrypted
+            bridge.refusal = None
+            assert rig.connector.sync_once() == 1
+            assert rig.log.read_since(0)[0][-1].text == "during the blip"
+            assert rig.connector._undecrypted == {}
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    def test_an_outage_at_the_switch_outlasts_the_key_give_up(self, tmp_path, caplog):
+        """Review of #478: replies held while the bridge cannot be asked are
+        not on the key-arrival clock; it starts once the bridge answers."""
+        bridge = FakeBridgeCrypto()
+        rig = Rig(tmp_path, crypto=bridge)
+        now = [1000.0]
+        rig.connector._wall_clock = lambda: now[0]
+        try:
+            rig.connector.replay()
+            bridge.refusal = CryptoError("lmer-matrix-bridge is unreachable", status=None, transient=True)
+            rig.matrix.turn_encryption_on()
+            rig.matrix.human_says_encrypted("during the outage", session="late")
+            for _ in range(3):
+                assert rig.connector.sync_once() == 0
+                now[0] += connector.UNDECRYPTED_GIVE_UP_SECONDS + 1
+            assert "$e1" in rig.connector._undecrypted
+            bridge.refusal = None
+            assert rig.connector.sync_once() == 0  # answered, but the key is still on its way
+            assert rig.connector.encrypted is True and "$e1" in rig.connector._undecrypted
+            rig.matrix.room_keys.add("late")
+            assert rig.connector.sync_once() == 1
+            assert rig.log.read_since(0)[0][-1].text == "during the outage"
+            assert "matrix_connector_undecryptable_dropped" not in caplog.text
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    @pytest.mark.parametrize("bridge", [False, True], ids=["no-bridge", "bridge"])
+    def test_an_attachment_in_a_plaintext_room_goes_up_named(self, tmp_path, bridge):
+        """Review of #478: the upload choice is the client's predicate. Without
+        a bridge it asks the homeserver nothing new."""
+        store = tmp_path / "uploads"
+        store.mkdir()
+        (store / "report.txt").write_text("all green", encoding="utf-8")
+        rig = Rig(tmp_path, uploads=str(store), authenticated_media=True,
+                  crypto=FakeBridgeCrypto() if bridge else None)
+        try:
+            rig.connector.replay()
+            reads = rig.matrix.state_reads
+            rig.connector._post_outbound(_attachment_record(), {})
+            assert rig.matrix.uploads == [("report.txt", "text/plain", b"all green")]
+            assert any(s[3] == "m.file" and "mxc://" in s[2] and "encrypted" not in s[2] for s in rig.matrix.sent)
+            assert rig.matrix.state_reads == reads
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    def test_an_attachment_after_the_switch_goes_up_as_ciphertext(self, tmp_path):
+        store = tmp_path / "uploads"
+        store.mkdir()
+        (store / "report.txt").write_text("all green", encoding="utf-8")
+        rig = Rig(tmp_path, uploads=str(store), authenticated_media=True, crypto=FakeBridgeCrypto())
+        try:
+            rig.connector.replay()
+            rig.matrix.turn_encryption_on()
+            rig.connector.sync_once()
+            rig.connector._post_outbound(_attachment_record(), {})
+            assert rig.matrix.uploads == [(None, "application/octet-stream", b"neerg lla")]
+            assert any(s[3] == "m.file" and "encrypted mxc://" in s[2] for s in rig.matrix.sent)
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+    def test_a_plaintext_room_never_asks_the_bridge(self, tmp_path):
+        rig = Rig(tmp_path, crypto=FakeBridgeCrypto())
+        try:
+            rig.connector.replay()
+            rig.matrix.human_says("plain")
+            assert rig.connector.sync_once() == 1
+            assert rig.matrix.decrypt_calls == 0 and rig.connector.encrypted is False
+        finally:
+            rig.connector.stop()
+            rig.bus._session._http.close()
+            rig.log.close()
+
+
+def test_the_bridge_url_reaches_the_account(monkeypatch):
+    environ = {"LMER_SUPERVISOR_URL": "http://127.0.0.1:1", "LMER_FASTAPI_TOKEN": "tok",
+               "LMER_MATRIX_ROOM_ID": ROOM, "LMER_MATRIX_THREAD_EVENT": ROOT,
+               "LMER_MATRIX_HOMESERVER": "https://hs", "LMER_MATRIX_USER_ID": BOT,
+               "LMER_MATRIX_ACCESS_TOKEN": "as-token", "LMER_MATRIX_BRIDGE_URL": " http://127.0.0.1:29331/ "}
+    config = connector.ConnectorConfig.from_env(environ)
+    assert config.account.bridge_url == "http://127.0.0.1:29331/"
+    assert MatrixClient(config.account).crypto.url == "http://127.0.0.1:29331"
+    assert MatrixClient(connector.ConnectorConfig.from_env(
+        {**environ, "LMER_MATRIX_BRIDGE_URL": ""}).account).crypto is None
