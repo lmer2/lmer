@@ -1,2 +1,0 @@
-fixed:
-- "gate-check capped finding lists now state how many were dropped, and the full Security Check list is written to /tmp/lmer-gate-check-<euid>/gate-check.log."

@@ -1,2 +1,0 @@
-fixed:
-- "Fixed a session re-attach race where the persisted control-plane cursor could differ from the offset reported for the same drain."
