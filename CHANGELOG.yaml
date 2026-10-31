@@ -5,6 +5,99 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.13.0:
+  added:
+  - --env-only and LMER_ENV_ISOLATED let a launch load only its --env-file, so a second
+    identity no longer inherits ~/.lmer/.env keys.
+  - '`LMER_WORK_REPO_REF` checks a session''s work-repo clone out at a branch before
+    the manifest is read, so manifest and layout changes can be live-tested before
+    merging.'
+  - Matrix thread connector and lmer-signal thread verbs now work in encrypted rooms
+    through lmer-matrix-bridge's device, set with LMER_MATRIX_BRIDGE_URL
+  - The control UI remembers collapsed projects and the last viewed project per browser,
+    and project settings can make a project open on every page load.
+  - Both chats have a **send privately** button beside attach. The operator can paste
+    a secret or other private text, and the run receives it as a read-only file deleted
+    when the session ends; the chat shows only the file's path. Once the agent reads
+    the file, its contents can still reach the harness transcript.
+  - Memory scopes may carry a `.lmer-memory-format` marker; every memory writer refuses
+    a store written in a newer format and asks you to update the image.
+  - Chat sessions list the available taskdefs and read the matching one's instructions
+    when a conversation turns into develop or review work.
+  - A header button (under Platform settings on a phone) asks every running Ratchet,
+    with an optional reason, to hand over and rotate itself, and shows each one's
+    progress.
+  - '`lmer --effort LEVEL` sets reasoning effort above presets and exports; projects,
+    Ratchet settings and `lmer-ctl spawn` take an effort setting too.'
+  - Send Privately takes an optional, non-secret purpose that labels the agent's prompt,
+    the file name and the chat entry.
+  - Your chat bubbles take the project's color, kept readable in both color schemes;
+    a Ratchet setting turns it off.
+  fixed:
+  - Fixed a session re-attach race where the persisted control-plane cursor could
+    differ from the offset reported for the same drain.
+  - '`work commit` now pushes a re-slugged release run''s completion write, and later
+    `work` verbs no longer seed a phantom run at its old address.'
+  - '`lmer-schema validate` no longer warns about an empty session directory, such
+    as the one a launch pre-creates before writing its state file'
+  - A cwd .env now overrides ~/.lmer/.env in the container, matching host precedence.
+  - The answer box and continue controls now say why sending is disabled, and the
+    moved-run authorization checkbox is labelled as required
+  - gate-check capped finding lists now state how many were dropped, and the full
+    Security Check list is written to /tmp/lmer-gate-check-<euid>/gate-check.log.
+  - Release leg 2 gives each `gh` command the GitHub PAT and mirror repository; the
+    release PAT now needs Actions read/write.
+  - presets.json is re-read only when it changes; `presets_loaded` is logged at INFO,
+    and an invalid-file error once, per change.
+  - Platform launches in the same second no longer fail on a session ID clash; IDs
+    are reserved before anything else is created.
+  - A project assistant's launch guard waits for its publication however long that
+    takes, and a guard that died fails the launch cleanly, not with a broken pipe.
+  - Fixed a possible deadlock between assistant and project locks; stopping assistant
+    supervision now waits for an in-flight start.
+  - A locked project database now answers 503 saying whether a retry is safe, and
+    a failed mute write answers a retryable 503, not a 500.
+  - Slack thread posts show attached file names literally, so names containing `*`,
+    `_`, `<` or `&` no longer format, link or ping.
+  - Memory persist, housekeep, the validator and `work migrate` handle six split-index
+    edge cases without losing lines or reporting stale links.
+  - '`work session-start --session unknown` no longer claims a finished release run
+    that a session without `LMER_SESSION_ID` wrote.'
+  - Clearing the default project now reopens All projects when that was last viewed,
+    instead of the old default.
+  - 'matrix bridge: crypto-store backups larger than 25 MB upload correctly instead
+    of failing with `memoryview: a bytes-like object is required, not ''str''`'
+  - A failed chat poll in the Ratchet panel shows a one-line error instead of a card
+    filling the panel.
+  - A relayed message whose text holds something credential-shaped no longer shows
+    twice in a session's chat.
+  changed:
+  - A non-isolated --env-file now warns when repo-routing or token keys come from
+    another .env file.
+  - Project settings are grouped into titled sections, and Archive project moves to
+    its own section at the bottom.
+  - Platform settings set how many notes every run's operator channel dock keeps (0
+    = open questions only); the operator chat tab shows full history.
+  - 'matrix bridge: a crypto-store export that fails to upload now refuses the start
+    with a clean error naming `--no-backup`, instead of an uncaught traceback. `lmer-matrix-bridge
+    run --no-backup` starts without the refresh for a deployment whose export cannot
+    be uploaded (#634) and logs a warning that backups are disabled'
+  - A private send shows in chat history as one compact entry instead of the agent-facing
+    prompt text.
+  - "Project settings use two columns on wide screens, with a compact, centered color\
+    \ picker that keeps custom colors behind Custom\u2026."
+  - The composer's Send Privately button is now a lock labelled Private, icon-only
+    in narrow chats; chat copy buttons are smaller.
+  removed:
+  - The `chat_keep_last` setting is retired and its stored value ignored; set `dock_keep_last_notes`
+    in Platform settings instead.
+  security:
+  - Gate lock dir, deferral queue, write journal and gate-check log refuse foreign
+    or symlinked paths and are owner-only; the log moved to `/tmp/lmer-gate-check-<euid>/`.
+  - GitLab API tokens are no longer sent on to a different host when a GitLab request
+    is redirected.
+  - Matrix replies answer an operator-only question only from MXIDs in the new `LMER_MATRIX_OPERATOR_USERS`;
+    when it is unset, none do.
 0.12.0:
   added:
   - "`docs/SCHEMA-GUIDE.md`: a plain-language guide to the lmer schema for operators\

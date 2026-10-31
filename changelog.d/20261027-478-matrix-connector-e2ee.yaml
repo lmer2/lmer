@@ -1,2 +1,0 @@
-added:
-- "Matrix thread connector and lmer-signal thread verbs now work in encrypted rooms through lmer-matrix-bridge's device, set with LMER_MATRIX_BRIDGE_URL"

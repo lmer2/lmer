@@ -1,2 +1,0 @@
-fixed:
-- "`lmer-schema validate` no longer warns about an empty session directory, such as the one a launch pre-creates before writing its state file"

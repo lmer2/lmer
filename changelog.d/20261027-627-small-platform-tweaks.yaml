@@ -1,4 +1,0 @@
-added:
-- "The control UI remembers collapsed projects and the last viewed project per browser, and project settings can make a project open on every page load."
-changed:
-- "Project settings are grouped into titled sections, and Archive project moves to its own section at the bottom."
