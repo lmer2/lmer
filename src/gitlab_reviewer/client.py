@@ -11,6 +11,8 @@ from dataclasses import dataclass
 # PYTHONPATH, so the import costs nothing and always resolves.
 from lmer_cli.tokens import _get_gitlab_token, _sanitize_hostname
 
+from . import review_notes
+
 
 DEFAULT_PAGE_SIZE = 20
 DEFAULT_MAX_PAGES = 25
@@ -290,7 +292,9 @@ class GitLabClient:
         """
         project_encoded = project.replace('/', '%2F')
         data = {"body": body}
-        return self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}/notes", json=data)
+        created = self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}/notes", json=data)
+        review_notes.record(self.host, project, mr_id, created)
+        return created
 
     def resolve_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
         """Resolve a merge request discussion thread.
@@ -601,13 +605,17 @@ class GitLabClient:
             }
         }
 
-        return self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions", json=data)
+        created = self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions", json=data)
+        review_notes.record(self.host, project, mr_id, created)
+        return created
 
     def add_general_comment(self, project: str, mr_id: int, comment: str) -> Dict[str, Any]:
         """Add general comment to MR (not tied to specific line)."""
         project_encoded = project.replace('/', '%2F')
         data = {"body": comment}
-        return self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/notes", json=data)
+        created = self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/notes", json=data)
+        review_notes.record(self.host, project, mr_id, created)
+        return created
 
     def get_issue_discussions(
         self,

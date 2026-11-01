@@ -1,0 +1,2 @@
+fixed:
+- "Stop stale-run check-in digests naming a dormant review run whose MR has not moved since its review was posted; the run is named again once someone pushes or comments after the review (the reviewer's own replies, which gitlab-review now records on the run as review_note events in review sessions, its resolves, and system notes such as cross-references, do not count), a review on a merged or closed MR is left out, and a failed MR read leaves the run named. MRs are read in parallel, and a merged MR is not read again (#401)"

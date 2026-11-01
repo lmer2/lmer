@@ -567,6 +567,16 @@ Two things worth knowing about how it behaves:
   route around by taking the spool and ignoring it; if a run should stop being
   mentioned, it should be finished, or the operator should be asked whether to
   forget it. Never wind one down to quieten the digest.
+- **A posted review waits on its MR, not on you.** A dormant review run that
+  recorded `review_posted`, with no open question and no attention card, is left
+  out of the digest while its MR has not moved since that review. Moving means a
+  new push after the review, or a new comment after it that the review session
+  did not write itself. The reviewer's own replies (recorded as `review_note`
+  events), thread resolves, and GitLab system notes such as a cross-reference
+  ("mentioned in ..."), do not count. When it is named again,
+  someone has pushed or commented, and that is the turn to take (`/followup`). A
+  review on a merged or closed MR is left out too. If the MR cannot be read, the
+  run is named as usual. The run's phase plays no part in this.
 
 ### Rotating yourself
 
