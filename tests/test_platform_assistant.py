@@ -2567,6 +2567,15 @@ def test_the_taskdef_says_what_a_check_in_is(platform_root):
     assert "Never wind one down to quieten the digest" in text, (
         "the one dangerous way to make a reminder stop is not ruled out"
     )
+    assert "review_posted" in text and "MR has not moved" in text, (
+        "a review run that drops out while its author is idle, and comes back "
+        "when the MR moves, reads as a bug unless it is stated as the design (#401)"
+    )
+    assert "new push" in text and "cross-reference" in text, (
+        "the orchestrator acts on a named review with /followup, so it has to know "
+        "that only the author's push or comment names it, not the reviewer's own "
+        "cleanup or GitLab's system notes (#401 F1)"
+    )
 
 
 # ── The shared memory store in status (#325) ─────────────────────────────────

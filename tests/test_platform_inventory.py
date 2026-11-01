@@ -326,6 +326,92 @@ def test_events_can_be_disabled(tmp_path):
     assert inventory.build_inventory([ref], [], event_count=0).runs[0].events == []
 
 
+def test_the_latest_review_posted_is_on_the_row_beyond_the_recent_events(tmp_path):
+    """The check-in digest keys on it (#401), so it cannot depend on the last N."""
+    lines = [
+        '{"ts": "2026-07-26T10:00:00Z", "type": "review_posted", "note": "MR 7: iteration 1"}',
+        '{"ts": "2026-07-26T11:00:00Z", "type": "review_posted", "note": "MR 7: iteration 2"}',
+    ] + [
+        f'{{"ts": "2026-07-26T12:0{i}:00Z", "type": "tick"}}' for i in range(5)
+    ]
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"),
+                    events="\n".join(lines) + "\n")
+    run = inventory.build_inventory([ref], [], event_count=2).runs[0]
+    assert run.review_posted_at == "2026-07-26T11:00:00Z"
+    assert run.to_dict()["review_posted_at"] == "2026-07-26T11:00:00Z"
+    assert [e["type"] for e in run.events] == ["tick", "tick"]
+
+
+def test_the_notes_the_review_wrote_are_on_the_row(tmp_path):
+    """`gitlab-review` records each MR note a review session writes (#401 F3);
+    the digest excludes exactly those, whenever the session ended."""
+    lines = [
+        '{"ts": "2026-09-25T04:50:05Z", "session": "s2", "type": "review_note",'
+        ' "data": {"mr": "gitlab.example.com/acme/widgets!7", "note_id": 9100}}',
+        '{"ts": "2026-09-25T04:50:11Z", "session": "s2", "type": "review_posted"}',
+        '{"ts": "2026-09-25T04:50:35Z", "session": "s2", "type": "review_note",'
+        ' "data": {"mr": "gitlab.example.com/acme/widgets!7", "note_id": 9101}}',
+        '{"ts": "2026-09-25T04:50:36Z", "session": "s2", "type": "review_note",'
+        ' "data": {"note_id": "not an id"}}',
+        '{"ts": "2026-09-25T04:54:24Z", "session": "s2", "type": "session_end"}',
+    ]
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"),
+                    events="\n".join(lines) + "\n")
+    run = inventory.build_inventory([ref], [], event_count=0).runs[0]
+    assert run.review_posted_at == "2026-09-25T04:50:11Z"
+    assert run.review_note_ids == [9100, 9101]
+    assert run.to_dict()["review_note_ids"] == [9100, 9101]
+
+
+def test_the_149_shape_end_to_end(tmp_path, monkeypatch):
+    """F3's regression case from the run's own events to the digest's answer.
+
+    review-mr-149: review posted 09-13 01:23:15, one recorded reviewer reply two
+    minutes later, and the session's only later event its teardown on 09-17
+    04:36:43. The author replied 09-14 09:00 without pushing. That reply is a
+    turn owed, so the run must stay in the digest.
+    """
+    from lmer_platform import checkin, mr_activity, store
+
+    monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
+    target = "https://gitlab.example.com/acme/widgets/-/merge_requests/149"
+    lines = [
+        '{"ts": "2026-09-13T01:23:15Z", "session": "s1", "type": "review_posted"}',
+        '{"ts": "2026-09-13T01:25:03Z", "session": "s1", "type": "review_note",'
+        ' "data": {"note_id": 4150}}',
+        '{"ts": "2026-09-17T04:36:43Z", "session": "s1", "type": "session_end"}',
+    ]
+    ref = plant_run(tmp_path, "review-mr-149",
+                    state_yaml=state_yaml(status="in-progress", target=target),
+                    events="\n".join(lines) + "\n")
+    row = inventory.build_inventory([ref], [], event_count=0).runs[0].to_dict()
+    assert row["state"] == "dormant"
+
+    def fetch(ref):
+        return {
+            "state": "opened", "head_sha": "abc", "pushed_at": "2026-09-12T22:10:00Z",
+            "comments": [[4200, "2026-09-14T09:00:00Z"], [4150, "2026-09-13T01:25:02Z"]],
+            "page_floor": None,
+            # The shape this module answered before F3, so the case fails on its
+            # meaning rather than on a missing field when run against it.
+            "commented_at": "2026-09-14T09:00:00Z",
+        }
+
+    cache = mr_activity.refresh([("k", target)], window=3600, fetch=fetch)
+    assert checkin.is_eligible(row, cache, window=3600) is True, (
+        "an author reply between review_posted and a late session_end was dropped"
+    )
+
+
+def test_a_run_that_never_posted_a_review_has_none(tmp_path):
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"),
+                    events='{"ts": "2026-07-26T10:00:00Z", "type": "tick"}\n')
+    run = inventory.build_inventory([ref], [], event_count=0).runs[0]
+    assert run.review_posted_at is None
+    assert run.review_note_ids == []
+    assert run.to_dict()["review_posted_at"] is None
+
+
 # --- sessions without run dirs ----------------------------------------------
 
 def test_session_without_run_dir_still_appears(tmp_path):

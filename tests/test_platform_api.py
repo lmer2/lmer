@@ -1506,6 +1506,45 @@ def test_a_fleet_poll_records_no_check_in(platform_root):
     assert checkin.read_marks() == {}, "build_state wrote check-in state"
 
 
+def test_the_badge_reads_the_mr_activity_the_digest_used(platform_root):
+    """A review whose MR is quiet is not marked stale on the row (#401).
+
+    The fold only *reads* the cache the detector refreshed: a fleet poll from a
+    phone must never become a GitLab request per row.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from lmer_platform import checkin, mr_activity
+
+    def iso(**delta):
+        when = datetime.now(timezone.utc) - timedelta(**delta)
+        return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    target = "https://gitlab.example.com/acme/widgets/-/merge_requests/7"
+    review = {
+        "host": "gitlab.example.com", "project": "acme/widgets",
+        "slug": "review-mr-7", "state": "dormant", "orchestrator": False,
+        "target": target, "review_posted_at": iso(hours=6),
+    }
+    payload = {"runs": [review], "attention": []}
+    checkin.observe(payload)
+    store.write_json(checkin.marks_path(), {"runs": {
+        "gitlab.example.com/acme/widgets/review-mr-7": {"first_seen": iso(hours=48)},
+    }})
+
+    api._fold_checkins(payload)
+    assert review["checkin"]["stale"] is True, "no cache: named, fail open"
+
+    mr_activity.refresh(
+        [("gitlab.example.com/acme/widgets/review-mr-7", target)],
+        window=3600,
+        fetch=lambda ref: {"head_sha": "a", "pushed_at": iso(hours=7),
+                           "comments": [], "page_floor": None, "state": "opened"},
+    )
+    api._fold_checkins(payload)
+    assert review["checkin"]["stale"] is False
+
+
 # --- the work repo's taskdef tiers, in both tree shapes (issue #353) ---------
 #
 # The daemon reads the operator's own taskdefs off its mirror (T73) by resolving

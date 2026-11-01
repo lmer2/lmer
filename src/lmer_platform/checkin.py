@@ -23,6 +23,12 @@ must act, this means the orchestrator has a next step
 (:data:`lmer_platform.detect.SIGNAL_DIGEST_KIND` stands beside it for the same
 reason).
 
+**A posted review is not an unread run while its MR is quiet** (#401). Nothing in
+a wound-down review run can say whether its author has moved, so the MR is asked
+(:mod:`lmer_platform.mr_activity`): only for runs about to be named, once a window,
+and failing open. An open question, an attention card or a live session always
+wins over what the MR says.
+
 Reads never raise; writes do, because a stale run has no second copy the way a
 signal has ``events.jsonl``. The retry belongs to the *window*, not the tick — at
 30s a tick, an unwritable marks file evicted every other digest class from a
@@ -40,6 +46,7 @@ from typing import Optional
 
 from lmer_cli import runref
 
+from . import mr_activity
 from .assistant import MAX_NOTE_CHARS
 from .runs import (
     holds_conflict, key_parts, key_parts_lenient, merge_values, run_key,
@@ -62,7 +69,7 @@ __all__ = [
     "MAX_LABEL_CHARS", "MAX_DATA_LABEL_CHARS", "FUTURE_GRACE_SECONDS", "StaleRun",
     "marks_path", "read_marks", "record_check", "observe", "stale_runs",
     "record_announced", "digest", "checkin_of", "is_eligible", "row_checkin",
-    "rekey",
+    "review_candidates", "rekey",
 ]
 
 #: ``{"runs": {"<host>/<project>/<key segment>": {"checked_at", "announced_at",
@@ -96,6 +103,7 @@ FUTURE_GRACE_SECONDS = 60
 #: States nobody owes a turn on (an ``archived`` run is not in the view at all).
 #: Names from :data:`lmer_platform.inventory.RUN_STATES`.
 SETTLED_STATES = ("complete",)
+
 
 @dataclass(frozen=True)
 class StaleRun:
@@ -255,15 +263,87 @@ def _identity(row: dict) -> Optional[tuple]:
     return key_parts_lenient(row)
 
 
-def is_eligible(row: dict) -> bool:
+def _awaiting_author(row: dict) -> bool:
+    """Whether this row is a posted review whose only open turn may be its author's.
+
+    True only when every one of these holds, because each is a way the run can
+    still owe a turn of its own — and each outranks anything the MR says:
+
+    - the run is ``dormant`` — no session is live, so its silence is not the stall
+      detector's to read;
+    - nothing is outstanding: no open question and no attention card. A yielded
+      run keeps its phase-boundary card and must still be named;
+    - it has recorded :data:`lmer_platform.mr_activity.REVIEW_POSTED_EVENT` and
+      names a target.
+
+    Whether the author has in fact moved is then the MR's to say
+    (:func:`lmer_platform.mr_activity.quiet_since_review`). The run's ``phase`` is
+    deliberately not consulted: ``cleanup`` records that the reviewer's turn is
+    over, never that nobody owes one (#244).
+    """
+    if row.get("state") != "dormant" or row.get("live"):
+        return False
+    if row.get("stop_reason") == "question":
+        return False
+    attention = row.get("attention")
+    if isinstance(attention, dict) and attention.get("reason"):
+        return False
+    return bool(row.get("review_posted_at")) and bool(row.get("target"))
+
+
+def _quiet_review(row: dict, activity: Optional[dict], window: int) -> bool:
+    """Whether *row* is a posted review whose MR has not moved since (#401).
+
+    An answer up to two windows old is believed: the detector refreshes it once a
+    window, and the fleet badge reads between refreshes.
+    """
+    if not activity or not window or not _awaiting_author(row):
+        return False
+    return mr_activity.quiet_since_review(
+        activity, row.get("target"), row.get("review_posted_at"),
+        own_note_ids=row.get("review_note_ids") or (), max_age=2 * window,
+    )
+
+
+def is_eligible(row: dict, activity: Optional[dict] = None, *, window: int = 0) -> bool:
     """Whether a check-in is owed on this row. See the module docstring.
 
     Public because the fleet view asks it too: a second reading of it is how a
     badge starts marking a run no digest will ever name.
+
+    *activity* is :func:`lmer_platform.mr_activity.read_cache`'s answer; without
+    it (or with *window* 0) no review run is excluded — the fail-open default.
     """
     if row.get("orchestrator") or row.get("muted") is True:
         return False
-    return row.get("state") not in SETTLED_STATES
+    if row.get("state") in SETTLED_STATES:
+        return False
+    if _quiet_review(row, activity, window):
+        return False
+    return True
+
+
+def review_candidates(
+    payload: object, *, window: int, marks: Optional[dict] = None
+) -> list:
+    """``(run key, target)`` for each review run the MR decides.
+
+    Only runs that would be named right now: the API is asked about a run when,
+    and only when, its answer changes a digest.
+    """
+    if not window:
+        return []
+    marks = read_marks() if marks is None else marks
+    now = datetime.now(timezone.utc)
+    found = []
+    for row in _rows(payload):
+        identity = _identity(row)
+        if identity is None or not is_eligible(row) or not _awaiting_author(row):
+            continue
+        key = _run_key(*identity)
+        if checkin_of(marks.get(key), window=window, now=now)["stale"]:
+            found.append((key, row["target"]))
+    return found
 
 
 def observe(payload: object) -> dict:
@@ -347,7 +427,9 @@ def checkin_of(mark: Optional[dict], *, window: int, now=None) -> dict:
     }
 
 
-def row_checkin(row: dict, marks: dict, *, window: int, now=None) -> dict:
+def row_checkin(
+    row: dict, marks: dict, *, window: int, now=None, activity: Optional[dict] = None
+) -> dict:
     """One fleet row's check-in block: what the operator sees on the run.
 
     Through the same two functions the digest uses, because a badge and a digest
@@ -359,16 +441,23 @@ def row_checkin(row: dict, marks: dict, *, window: int, now=None) -> dict:
     identity = _identity(row)
     mark = marks.get(_run_key(*identity)) if identity else None
     facts = checkin_of(mark, window=window, now=now)
-    if not is_eligible(row):
+    if not is_eligible(row, activity, window=window):
         facts["stale"] = False
     return facts
 
 
-def stale_runs(payload: object, *, window: int, marks: Optional[dict] = None) -> list:
+def stale_runs(
+    payload: object,
+    *,
+    window: int,
+    marks: Optional[dict] = None,
+    activity: Optional[dict] = None,
+) -> list:
     """Runs past the window, oldest first. Empty when *window* is 0 (disabled).
 
     A pure read, so a caller that dies before :func:`record_announced` finds the
-    same runs next tick instead of losing them (deliver-then-mark).
+    same runs next tick instead of losing them (deliver-then-mark). *activity* is
+    the MR-activity cache (:func:`review_candidates`, :mod:`lmer_platform.mr_activity`).
     """
     if not window:
         return []
@@ -377,7 +466,7 @@ def stale_runs(payload: object, *, window: int, marks: Optional[dict] = None) ->
     found = []
     for row in _rows(payload):
         identity = _identity(row)
-        if identity is None or not is_eligible(row):
+        if identity is None or not is_eligible(row, activity, window=window):
             continue
         facts = checkin_of(marks.get(_run_key(*identity)), window=window, now=now)
         if not facts["stale"]:

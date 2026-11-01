@@ -111,6 +111,7 @@ from lmer_cli.threads import ThreadError
 
 from . import meta
 from . import mention_routing
+from . import mr_activity
 from . import mute
 from .ingress import Ingress
 from . import references
@@ -1173,12 +1174,19 @@ def _fold_checkins(payload: dict) -> None:
     caller check closes, arriving through the other door.
 
     Both lists get it: ``attention`` holds separate copies of the same rows.
+
+    The MR-activity cache is *read*, never refreshed, for the same reason: a poll
+    must not become a GitLab request per row. The detector keeps it current, so a
+    review whose MR has not moved reads the same here as in the digest (#401).
     """
     window = checkin_settings()["window_seconds"].value
     marks = checkin.read_marks()
+    activity = mr_activity.read_cache()
     for row in (payload.get("runs") or []) + (payload.get("attention") or []):
         if isinstance(row, dict):
-            row["checkin"] = checkin.row_checkin(row, marks, window=window)
+            row["checkin"] = checkin.row_checkin(
+                row, marks, window=window, activity=activity
+            )
 
 
 def _fold_mute(payload: dict, sessions: list) -> None:

@@ -319,8 +319,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, comms, nudge, registry, rotation, runs, stall, statusline,
-    teardown, transcripts, uploads,
+    ask, assistant, checkin, comms, mr_activity, nudge, registry, rotation, runs,
+    stall, statusline, teardown, transcripts, uploads,
 )
 from .api import build_state
 from . import config as config_module
@@ -1291,9 +1291,13 @@ class Detector:
         notifier=None,
         sender=None,
         sleep=None,
+        mr_fetch=None,
     ) -> None:
         self.config = config
         self.interval = interval
+        #: How a review run's MR is read for the check-in pass (#401). ``None`` is
+        #: the GitLab API; tests hand in a fake (:mod:`lmer_platform.mr_activity`).
+        self._mr_fetch = mr_fetch
         #: Absorbed failures since this detector was created. A health counter,
         #: not a budget: there is no give-up (module docstring).
         self.failures = 0
@@ -2211,7 +2215,16 @@ class Detector:
         if not window:
             return []
         marks = self._with_pending_announcements(marks)
-        stale = checkin.stale_runs(payload, window=window, marks=marks)
+        # Only runs about to be named are asked about, once per MR per window, and
+        # an MR that cannot be read leaves its run named (#401).
+        activity = mr_activity.refresh(
+            checkin.review_candidates(payload, window=window, marks=marks),
+            window=window,
+            fetch=self._mr_fetch,
+        )
+        stale = checkin.stale_runs(
+            payload, window=window, marks=marks, activity=activity
+        )
         if not stale:
             return []
         groups = {}

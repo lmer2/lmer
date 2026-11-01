@@ -49,6 +49,19 @@ a bare 404 that reads like a token-scope failure). Resolution follows GitLab's
 advertise no resolved state are refused before any write. Replying works on any
 thread type.
 
+### Review sessions record the notes they write
+
+In a review session (`LMER_TASK=review`), every MR note `gitlab-review` creates
+(a thread reply, an inline comment, a general comment, including those posted
+from a review file) is recorded on the run as a `review_note` event carrying the
+note id (`work event review_note --data '{"mr": ..., "note_id": ...}'`). The
+platform's check-in digest uses these ids to tell the reviewer's own
+post-review replies ("verified in <sha>") from its author's, even when both
+come from one bot account (#401). This needs no action. Recording never fails
+the write: if the `work` CLI is missing or refuses, the note is still posted and
+a warning is printed, and the digest then treats that note as the author's
+comment. Other sessions (followup, develop) record nothing.
+
 ### Post Review Comments
 
 Post reviews to merge requests using a JSON file containing all review data:
