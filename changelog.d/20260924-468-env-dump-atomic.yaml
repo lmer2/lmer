@@ -1,0 +1,2 @@
+fixed:
+- "Fixed flaky platform spawn tests that could read a partially written child environment dump and lose the variable under test."

@@ -34,6 +34,7 @@ import pytest
 from lmer_platform import answer as answer_mod
 from lmer_platform import config as cfg
 from lmer_platform import inventory, mute, registry, resume as resume_mod, runs, spawn, store
+from tests._child_dump import json_dump_python
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 
@@ -91,7 +92,7 @@ def answer_recording_lmer(tmp_path):
         "           'launch_uid': getattr(ns, 'launch_uid', None),\n"
         "           'source_session': os.environ.get('LMER_SOURCE_SESSION_ID'),\n"
         "           'allow_unsigned': os.environ.get('LMER_ALLOW_UNSIGNED_SOURCE')}\n"
-        f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
+        f"{json_dump_python(dump)}"
         # Staying alive is how a test keeps the session's registry entry around; a
         # clean exit reaps it, which would race any assertion about a live one.
         "time.sleep(float(os.environ.get('FAKE_LMER_SLEEP') or 0))\n",

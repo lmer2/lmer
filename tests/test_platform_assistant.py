@@ -44,6 +44,7 @@ from lmer_platform import config as cfg
 from lmer_platform import connectors, memory, registry, runs, spawn, store
 from matrix_chat.client import MatrixError
 from slack_chat.client import SlackError
+from tests._child_dump import env_dump_shell
 from tests.conftest import strip_lmer_env
 from tests.timing_budgets import SETTLE, outlast
 
@@ -91,7 +92,7 @@ def fake_lmer(tmp_path):
     script.write_text(
         "#!/bin/sh\n"
         'echo "fake lmer started: $*"\n'
-        f'env > "{tmp_path / "child-env.txt"}"\n'
+        f'{env_dump_shell(tmp_path / "child-env.txt")}\n'
         'if [ -n "$FAKE_LMER_SLEEP" ]; then sleep "$FAKE_LMER_SLEEP"; fi\n'
         'exit "${FAKE_LMER_EXIT:-0}"\n',
         encoding="utf-8",
