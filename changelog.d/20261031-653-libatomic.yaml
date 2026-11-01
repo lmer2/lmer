@@ -1,0 +1,2 @@
+fixed:
+- "The lmer container image builds again now that Node LTS is 26, which needs libatomic; the image now installs it."
