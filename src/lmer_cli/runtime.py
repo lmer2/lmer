@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
@@ -406,6 +407,33 @@ def apply_env_file_defaults(
                 os.environ[key] = value
                 sources[key] = f".env ({location})"
     return sources
+
+
+def env_file_disagreements(
+    candidates: "list[tuple[str, Path]]", names: "Iterable[str]"
+) -> "list[tuple[str, Path]]":
+    """Exported *names* that the ``.env`` files would set to another value.
+
+    Call it before :func:`apply_env_file_defaults` seeds ``os.environ``, so
+    every *name* still present there is an export. Compares against the value
+    first-wins would pick from *candidates* and returns ``(name, file)`` for
+    each disagreement — never a value, since the callers' names are secrets.
+    """
+    disagreements: "list[tuple[str, Path]]" = []
+    for name in names:
+        exported = os.environ.get(name)
+        if exported is None:
+            continue
+        for _location, env_file in candidates:
+            if not env_file.exists():
+                continue
+            in_file = dotenv_values(dotenv_path=str(env_file)).get(name)
+            if in_file is None:
+                continue
+            if in_file.strip() != exported.strip():
+                disagreements.append((name, env_file))
+            break
+    return disagreements
 
 
 def default_env_file_candidates(

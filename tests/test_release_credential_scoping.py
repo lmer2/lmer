@@ -358,3 +358,250 @@ class TestReleaseSessionProvisioning:
         assert captured.get(RELEASE_GITHUB_TOKEN_ENV) is None
         assert captured.get(RELEASE_SIGNING_KEY_ENV) is None
         assert "-v" not in cmd
+
+
+class TestReleaseCredentialsReloadedFromEnvFile:
+    """A release credential the daemon baked from ``.env`` at startup must be
+    re-read from the file at spawn (#467).
+
+    ``lmer platform`` seeds its own environment from ``~/.lmer/.env`` once at
+    startup and records which keys that supplied; a child inherits the snapshot
+    and its first-wins ``.env`` seeding then keeps the launch-time value, so a
+    rotated token had no effect until the daemon restarted. The child must drop
+    the file-supplied defaults before its own early ``.env`` load so the file as
+    it is now decides.
+    """
+
+    @staticmethod
+    def _carrier(stale: dict) -> dict:
+        """The provenance carrier the daemon's loader would have written."""
+        from lmer_cli.env_sources import DEFAULT_SOURCES_ENV, remember_env_defaults
+
+        with patch.dict(os.environ, stale, clear=True):
+            remember_env_defaults(
+                {name: ".env (lmer state dir)" for name in stale}
+            )
+            return {DEFAULT_SOURCES_ENV: os.environ[DEFAULT_SOURCES_ENV]}
+
+    def test_release_session_uses_the_current_env_file(self, fake_home):
+        state_dir = fake_home / ".lmer"
+        state_dir.mkdir()
+        fresh_pat = "github_pat_rotated_in_env_file"
+        fresh_key = _key_path(fake_home)
+        (state_dir / ".env").write_text(
+            f"{RELEASE_GITHUB_TOKEN_ENV}={fresh_pat}\n"
+            f"{RELEASE_SIGNING_KEY_ENV}={fresh_key}\n"
+        )
+        stale = {
+            RELEASE_GITHUB_TOKEN_ENV: "github_pat_stale_daemon_snapshot",
+            RELEASE_SIGNING_KEY_ENV: "/host/stale-signing-key",
+        }
+        captured: dict = {}
+        cmd: list = []
+        rc = _run_main(
+            [RELEASE_TASK_ID, REPO_URL],
+            env_in={**stale, **self._carrier(stale)},
+            captured_env=captured,
+            captured_cmd=cmd,
+            home=fake_home,
+        )
+        assert rc == 0, f"release session must launch; rc={rc}"
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) == fresh_pat, (
+            "the file as it is now must decide, not the daemon's snapshot"
+        )
+        assert (
+            captured.get(RELEASE_SIGNING_KEY_ENV)
+            == CONTAINER_RELEASE_SIGNING_KEY_PATH
+        )
+        assert f"{fresh_key}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro" in cmd, (
+            "the mount must name the current file's key, not the stale snapshot"
+        )
+
+    def test_a_genuinely_exported_release_credential_still_wins(self, fake_home):
+        """The fix is scoped to file-supplied defaults: an export was never
+        recorded, so it keeps its documented precedence over the file."""
+        state_dir = fake_home / ".lmer"
+        state_dir.mkdir()
+        (state_dir / ".env").write_text(
+            f"{RELEASE_GITHUB_TOKEN_ENV}=github_pat_from_file\n"
+        )
+        exported = "github_pat_exported_in_daemon_shell"
+        captured: dict = {}
+        cmd: list = []
+        rc = _run_main(
+            [RELEASE_TASK_ID, REPO_URL],
+            env_in={RELEASE_GITHUB_TOKEN_ENV: exported},
+            captured_env=captured,
+            captured_cmd=cmd,
+            home=fake_home,
+        )
+        assert rc == 0
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) == exported
+
+    def test_a_key_deleted_from_the_env_file_stops_being_forwarded(self, fake_home):
+        """Removal is the other half of "the file as it is now decides": a key
+        the daemon baked from ``.env`` and the operator has since deleted from
+        the file must not keep reaching release sessions until a restart."""
+        state_dir = fake_home / ".lmer"
+        state_dir.mkdir()
+        (state_dir / ".env").write_text("LMER_UNRELATED=1\n")
+        # A stale key that still passes the mount guard, so a mount in the
+        # command could only come from the daemon's snapshot.
+        stale = {
+            RELEASE_GITHUB_TOKEN_ENV: "github_pat_deleted_from_env_file",
+            RELEASE_SIGNING_KEY_ENV: _key_path(fake_home),
+        }
+        captured: dict = {}
+        cmd: list = []
+        rc = _run_main(
+            [RELEASE_TASK_ID, REPO_URL],
+            env_in={**stale, **self._carrier(stale)},
+            captured_env=captured,
+            captured_cmd=cmd,
+            home=fake_home,
+        )
+        assert rc == 0, f"release session must launch; rc={rc}"
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) is None, (
+            "a PAT deleted from the file must stop being forwarded"
+        )
+        assert captured.get(RELEASE_SIGNING_KEY_ENV) is None
+        assert not any(CONTAINER_RELEASE_SIGNING_KEY_PATH in arg for arg in cmd), (
+            "a signing key deleted from the file must not be mounted"
+        )
+
+
+class TestReleaseCredentialDisagreementWarning:
+    """An exported release credential that disagrees with ``.env`` is announced
+    (#467, option 3; operator decision on the review of the fix).
+
+    An export keeps its precedence over the file, so a daemon started from a
+    shell that exports the PAT still hands every release session that value
+    after the operator rotates it in ``~/.lmer/.env``. That precedence is
+    documented, but silent: the launch must say which variable disagrees, with
+    which file, and that the export won — without printing either value.
+    """
+
+    _MARKER = "the exported value wins"
+
+    def _launch(self, fake_home, capsys, *, exported, env_file, task=RELEASE_TASK_ID):
+        state_dir = fake_home / ".lmer"
+        state_dir.mkdir()
+        (state_dir / ".env").write_text(
+            "".join(f"{name}={value}\n" for name, value in env_file.items())
+        )
+        captured: dict = {}
+        cmd: list = []
+        rc = _run_main(
+            [task, REPO_URL],
+            env_in=exported,
+            captured_env=captured,
+            captured_cmd=cmd,
+            home=fake_home,
+        )
+        return rc, captured, capsys.readouterr().out, state_dir / ".env"
+
+    def test_an_exported_pat_that_disagrees_with_the_env_file_warns(
+        self, fake_home, capsys
+    ):
+        exported = "github_pat_exported_in_daemon_shell"
+        in_file = "github_pat_rotated_in_env_file"
+        rc, captured, out, env_file = self._launch(
+            fake_home,
+            capsys,
+            exported={RELEASE_GITHUB_TOKEN_ENV: exported},
+            env_file={RELEASE_GITHUB_TOKEN_ENV: in_file},
+        )
+        assert rc == 0
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) == exported, (
+            "the export keeps its precedence; the warning changes nothing else"
+        )
+        warnings = [line for line in out.splitlines() if self._MARKER in line]
+        assert len(warnings) == 1, out
+        assert RELEASE_GITHUB_TOKEN_ENV in warnings[0]
+        assert str(env_file) in warnings[0], "the warning must name the file"
+        assert exported not in out and in_file not in out, (
+            "the warning must never print a credential value"
+        )
+
+    def test_an_exported_signing_key_that_disagrees_with_the_env_file_warns(
+        self, fake_home, capsys
+    ):
+        exported_key = _key_path(fake_home)
+        rc, captured, out, env_file = self._launch(
+            fake_home,
+            capsys,
+            exported={RELEASE_SIGNING_KEY_ENV: exported_key},
+            env_file={RELEASE_SIGNING_KEY_ENV: str(fake_home / "rotated_key")},
+        )
+        assert rc == 0
+        assert captured.get(RELEASE_SIGNING_KEY_ENV) == CONTAINER_RELEASE_SIGNING_KEY_PATH
+        warnings = [line for line in out.splitlines() if self._MARKER in line]
+        assert len(warnings) == 1, out
+        assert RELEASE_SIGNING_KEY_ENV in warnings[0]
+        assert str(env_file) in warnings[0]
+
+    def test_the_warning_precedes_the_abort_on_an_exported_deleted_key(
+        self, fake_home, capsys
+    ):
+        """The usual rotation deletes the old key: an export still naming it
+        aborts the launch, and the abort alone does not say the path came from
+        an export while ``.env`` names the new key — the warning must be
+        printed before the launch gives up."""
+        deleted_key = fake_home / ".ssh" / "old_key_deleted"
+        rc, captured, out, env_file = self._launch(
+            fake_home,
+            capsys,
+            exported={RELEASE_SIGNING_KEY_ENV: str(deleted_key)},
+            env_file={RELEASE_SIGNING_KEY_ENV: _key_path(fake_home)},
+        )
+        assert rc == 1, "the export still wins, and its key is missing"
+        assert captured == {}, "the aborted launch must not start a container"
+        warnings = [line for line in out.splitlines() if self._MARKER in line]
+        assert len(warnings) == 1, out
+        assert RELEASE_SIGNING_KEY_ENV in warnings[0]
+        assert str(env_file) in warnings[0]
+        assert _key_path(fake_home) not in warnings[0], (
+            "the warning names the file, never the value it holds"
+        )
+
+    def test_no_warning_when_the_export_and_the_file_agree(self, fake_home, capsys):
+        same = "github_pat_same_in_both"
+        rc, _, out, _ = self._launch(
+            fake_home,
+            capsys,
+            exported={RELEASE_GITHUB_TOKEN_ENV: same},
+            env_file={RELEASE_GITHUB_TOKEN_ENV: same},
+        )
+        assert rc == 0
+        assert self._MARKER not in out
+
+    def test_no_warning_for_a_daemon_file_default(self, fake_home, capsys):
+        """A value the daemon took from the file is re-read, not exported: the
+        rotation case #467 fixed must not be reported as a disagreement."""
+        stale = {RELEASE_GITHUB_TOKEN_ENV: "github_pat_stale_daemon_snapshot"}
+        rc, captured, out, _ = self._launch(
+            fake_home,
+            capsys,
+            exported={
+                **stale,
+                **TestReleaseCredentialsReloadedFromEnvFile._carrier(stale),
+            },
+            env_file={RELEASE_GITHUB_TOKEN_ENV: "github_pat_rotated_in_env_file"},
+        )
+        assert rc == 0
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) == "github_pat_rotated_in_env_file"
+        assert self._MARKER not in out
+
+    def test_no_warning_for_a_non_release_session(self, fake_home, capsys):
+        """A non-release session never forwards the credential, so which value
+        would have won is moot there."""
+        rc, captured, out, _ = self._launch(
+            fake_home,
+            capsys,
+            exported={RELEASE_GITHUB_TOKEN_ENV: "github_pat_exported"},
+            env_file={RELEASE_GITHUB_TOKEN_ENV: "github_pat_in_file"},
+            task="review",
+        )
+        assert rc == 0
+        assert captured.get(RELEASE_GITHUB_TOKEN_ENV) is None
+        assert self._MARKER not in out

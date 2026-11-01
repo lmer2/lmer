@@ -42,7 +42,11 @@ from .clone_cache import (
 )
 from .container import sources as container_sources
 from .container_home import ensure_container_home
-from .env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
+from .env_sources import (
+    DEFAULT_SOURCES_ENV,
+    consume_env_defaults,
+    drop_env_file_defaults,
+)
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
@@ -148,6 +152,7 @@ from .runtime import (
     default_env_file_candidates,
     env_files_isolated,
     detect_runtime,
+    env_file_disagreements,
     gpu_grant_plan,
     gpu_remediation,
     engine_is_rootless,
@@ -235,6 +240,13 @@ RELEASE_TASK_ID = "release"
 #   location never leaks into the container env).
 RELEASE_GITHUB_TOKEN_ENV = "LMER_RELEASE_GITHUB_TOKEN"
 RELEASE_SIGNING_KEY_ENV = "LMER_RELEASE_SIGNING_KEY"
+
+#: The release-credential allowlist: the variables whose value must come from
+#: the current ``.env`` files at spawn rather than from the daemon's launch-time
+#: snapshot (#467). ``lmer platform`` seeds its own environment from
+#: ``~/.lmer/.env`` once at startup and every child inherits it, so without this
+#: list a rotated token stayed frozen for the daemon's whole life.
+RELEASE_CREDENTIAL_ENV_VARS = (RELEASE_GITHUB_TOKEN_ENV, RELEASE_SIGNING_KEY_ENV)
 
 
 # --- gpg-agent forwarding (issue #355) -------------------------------------
@@ -2614,6 +2626,11 @@ def main(argv: list[str] | None = None) -> int:
     if ns.verbose or ns.debug:
         os.environ["LMER_VERBOSE"] = "1"
         inherited_env_sources.pop("LMER_VERBOSE", None)
+    # Release credentials the daemon supplied from a .env file at startup are
+    # re-read from the file at every spawn (#467): the daemon's snapshot would
+    # otherwise pin a rotated token until restart. Genuine exports were never
+    # recorded as file defaults, so they keep their precedence.
+    drop_env_file_defaults(inherited_env_sources, RELEASE_CREDENTIAL_ENV_VARS)
 
     # Resolve isolation once, before anything reads the environment: the same
     # value must drive the early load, the host-side seeding and the container
@@ -2669,6 +2686,12 @@ def main(argv: list[str] | None = None) -> int:
         env_file_candidates += default_env_file_candidates(
             state_dir=state_dir, cwd=cwd_env_file.parent
         )
+    # Before the load below seeds os.environ, a release credential still in it
+    # is an export; one the .env files set differently is announced at the
+    # release gate (#467), since the export keeps winning.
+    release_credential_disagreements = env_file_disagreements(
+        env_file_candidates, RELEASE_CREDENTIAL_ENV_VARS
+    )
     early_env_file_sources = {
         **inherited_env_sources,
         **apply_env_file_defaults(env_file_candidates),
@@ -3282,6 +3305,15 @@ def main(argv: list[str] | None = None) -> int:
     release_env_entries, release_key_mount, release_fatal = _release_credential_env(
         runtime, task_id
     )
+    # Before the fatal return: an exported signing-key path whose file a
+    # rotation deleted aborts below, and only this says the export won.
+    if task_id == RELEASE_TASK_ID:
+        for name, env_file in release_credential_disagreements:
+            warning(
+                f"⚠️  {name} is exported and set differently in {env_file}; "
+                "the exported value wins. Unset the export (for `lmer platform`, "
+                "restart it from a shell without it) to use the file's value."
+            )
     if release_fatal:
         error(f"❌ {release_fatal}")
         return 1
