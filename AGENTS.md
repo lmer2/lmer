@@ -327,11 +327,11 @@ the project scope taking precedence on a name collision. In a legacy work repo
   hand, but the shared index is budgeted for the strictest reader). Once the index is split (an
   `areas/` directory beside `MEMORY.md`), `MEMORY.md` is a map of areas:
   **open the area index whose "read when" hook matches your task before you
-  start work**, and file new pointers in `areas/<slug>.md` (link
-  `../<file>.md`) or set `metadata.area: <slug>` in the memory's
+  start work**, and file new pointers in `areas/{slug}.md` (link
+  `../{file}.md`) or set `metadata.area: {slug}` in the memory's
   frontmatter. Persist reports the index size against the limit every time,
   moves a new pointer left in a split `MEMORY.md` into its area (or
-  `areas/unsorted.md`) — a pointer whose memory is already filed in an area
+  the `unsorted` area) — a pointer whose memory is already filed in an area
   is dropped, so edit hooks in the area index — and refuses a persist that
   grows an over-budget map or finds the split index badly migrated. Never
   create the first `areas/` index yourself: splitting an index is a

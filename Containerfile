@@ -10,6 +10,7 @@ LABEL org.opencontainers.image.description="LLM Environment Runtime — FIPS-com
 
 # Install base dependencies
 # Using Python 3.12 to satisfy pyproject.toml requires-python >= 3.12
+# libatomic: Node >= 26 (mise `node = "lts"`) needs it at runtime (#653)
 RUN microdnf -y install \
         python3.12 \
         python3.12-pip \
@@ -21,6 +22,7 @@ RUN microdnf -y install \
         openssl \
         openssl-devel \
         which \
+        libatomic \
         sudo \
         shadow-utils && \
     microdnf clean all && \
