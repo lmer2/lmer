@@ -915,8 +915,35 @@ def _alive(pid):
     try:
         with open(f"/proc/{pid}/stat") as stat:
             return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # ESRCH is the same answer as ENOENT: the process was reaped between
+        # open() and read() (#654), so it is gone, not an error.
         return False
+
+
+class TestAlive:
+    def test_reaped_between_open_and_read_is_not_alive(self, monkeypatch):
+        """#654: reading /proc/<pid>/stat of a just-reaped process raises
+        ProcessLookupError, which means dead — not a test failure."""
+        class Vanishing:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        monkeypatch.setattr("builtins.open", lambda *a, **k: Vanishing())
+        assert _alive(4242) is False
+
+    def test_missing_proc_entry_is_not_alive(self, monkeypatch):
+        def missing(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr("builtins.open", missing)
+        assert _alive(4242) is False
 
 
 class TestSmokeProcessGroup:
