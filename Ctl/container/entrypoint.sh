@@ -44,6 +44,19 @@ openssl version -a | grep -i fips || echo "⚠️  OpenSSL FIPS information not 
 # Add Claude, uv, and global bin to PATH
 export PATH="/Agents/global/bin:/home/developer/.npm-global/bin:/home/developer/.local/bin:/home/developer/.local/share/mise/shims:${PATH}"
 
+# ── mise node pin migration ──
+# The persistent ~/.config/mise/config.toml is mounted over the image's copy
+# and only seeded when missing, so container-homes seeded before node was
+# pinned still say node = "lts" — which a current mise resolves to node 26,
+# not installable on this image. Rewrite exactly that line, leave every other
+# line (an operator's own `mise use -g` entries) alone. Idempotent, a no-op
+# without the file or the line, and never fatal under `set -e`.
+mise_global_config="${HOME:-/home/developer}/.config/mise/config.toml"
+if [ -f "$mise_global_config" ] && grep -qx 'node = "lts"' "$mise_global_config"; then
+    sed -i 's/^node = "lts"$/node = "24"/' "$mise_global_config" || true
+fi
+# ── end mise node pin migration ──
+
 # Ensure mise tools are available (bind mounts override build-time installs)
 if [ -f /Agents/global/.mise.toml ] && command -v mise >/dev/null 2>&1; then
     mkdir -p /home/developer/.config/mise
