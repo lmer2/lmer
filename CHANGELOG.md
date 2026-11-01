@@ -37,6 +37,8 @@
 - matrix bridge: crypto-store backups larger than 25 MB upload correctly instead of failing with `memoryview: a bytes-like object is required, not 'str'`
 - A failed chat poll in the Ratchet panel shows a one-line error instead of a card filling the panel.
 - A relayed message whose text holds something credential-shaped no longer shows twice in a session's chat.
+- Fixed the container image build failing at `mise install` since node 26 became LTS: node is now pinned to the 24 line, because node 26 needs libatomic, which the base image does not ship.
+- Existing container-homes are migrated on the next launch: the entrypoint rewrites the exact line `node = "lts"` in the persistent `~/.config/mise/config.toml` to `node = "24"`, leaving every other entry alone.
 ### Changed
 - A non-isolated --env-file now warns when repo-routing or token keys come from another .env file.
 - Project settings are grouped into titled sections, and Archive project moves to its own section at the bottom.
