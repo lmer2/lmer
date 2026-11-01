@@ -5,9 +5,33 @@ from lmer_cli import thread_posts
 from lmer_platform import store
 from slack_chat import registry
 from tests.conftest import strip_lmer_env
-from tests.timing_budgets import CLI, JOIN, LINK, STOP, child_bounds
+from tests.timing_budgets import CLI, DRAIN, JOIN, LINK, STOP, child_bounds
 from tests.test_matrix_chat import Rig as MatrixRig, ROOM
 from tests.test_slack_connector import Rig as SlackRig
+
+
+def drain_connector(connector, *, attempts=1, timeout=DRAIN):
+    """Stop a connector and assert its lease is released before returning.
+
+    A drain-timeout ``stop`` deliberately retains the lease until the process
+    exits (docs/CONNECTOR-RECOVERY.md): a timed-out stop leaves ``Lease.close``
+    unrun, and when finalize expires mid-flight the retained ``_drain_fd`` keeps
+    the flock. A same-thread reconstruction must therefore confirm the drain
+    before building a successor. Retrying waits up to ``attempts * timeout`` for
+    the drain to finish; it is not a process exit, which would close the lease
+    descriptor even with a stuck worker. Either way the silent ``OwnershipBusy``
+    race becomes a failure here instead.
+    """
+    lease = connector._lease
+    assert lease is not None, "connector never acquired a lease"
+    for _ in range(attempts):
+        if connector.stop(timeout=timeout, announce=False):
+            break
+    else:
+        raise AssertionError(
+            f"connector did not drain after {attempts} stop(s); lease still held"
+        )
+    assert not lease.key.busy(), "drained connector still holds the lease"
 
 
 @pytest.fixture(autouse=True)

@@ -5,7 +5,7 @@ import time
 import pytest
 
 from lmer_cli import thread_posts
-from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
+from tests.connector_fakes import MatrixRig, ROOM, SlackRig, drain_connector, isolated_connectors
 from tests.timing_budgets import DRAIN, JOIN
 
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
@@ -123,7 +123,7 @@ def test_confirmed_receipt_filesystem_failure_blocks_reconstructed_connector(cha
             with pytest.raises(RecoveryRequired, match="receipt"):
                 conn._outbound_once()
         assert reached and len(sent) == 1
-        conn.stop(timeout=DRAIN, announce=False)
+        drain_connector(conn)
         assert marker_path(conn._lease.key).exists()
         kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
         fresh = type(conn)(conn.config, bus_client=rig.bus, **kwargs)
@@ -133,9 +133,9 @@ def test_confirmed_receipt_filesystem_failure_blocks_reconstructed_connector(cha
             assert len(sent) == 1
             assert any(item.id == record.id for item in rig.log.read_since(0)[0])
         finally:
-            fresh.stop(timeout=DRAIN, announce=False)
+            drain_connector(fresh)
     finally:
-        conn.stop(timeout=DRAIN, announce=False)
+        drain_connector(conn)
         rig.bus._session._http.close()
         rig.log.close()
 

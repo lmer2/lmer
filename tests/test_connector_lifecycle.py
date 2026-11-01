@@ -5,7 +5,7 @@ import time
 import pytest
 
 from lmer_cli import thread_posts
-from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
+from tests.connector_fakes import MatrixRig, ROOM, SlackRig, drain_connector, isolated_connectors
 from tests.timing_budgets import DRAIN, JOIN
 
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
@@ -59,7 +59,7 @@ def test_real_startup_validates_identity_before_restoring_cursor(channel, deferr
     old._bus_cursor = 42
     old._state.save()
     path = checkpoint_path(old._lease.key, old._state.session)
-    old.stop(timeout=DRAIN, announce=False)
+    drain_connector(old)
     cls = type(old)
     remote_kw = {"slack": rig.slack} if channel == "slack" else {"matrix": rig.matrix}
     fresh = cls(old.config, bus_client=rig.bus, **remote_kw)
@@ -92,7 +92,7 @@ def test_real_startup_validates_identity_before_restoring_cursor(channel, deferr
         assert fresh._state.session == rig.log.session
     finally:
         allow.set()
-        assert fresh.stop(timeout=DRAIN, announce=False)
+        drain_connector(fresh)
         rig.bus._session._http.close()
         rig.log.close()
 
