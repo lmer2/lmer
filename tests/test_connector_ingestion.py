@@ -5,8 +5,8 @@ import time
 import pytest
 
 from lmer_cli import comms, thread_posts
-from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
-from tests.timing_budgets import DRAIN, JOIN, SCRIPT, XDIST_GROUP
+from tests.connector_fakes import MatrixRig, ROOM, SlackRig, drain_connector, isolated_connectors
+from tests.timing_budgets import DRAIN, FINALIZE_EXPIRED, JOIN, SCRIPT, XDIST_GROUP
 
 pytestmark = pytest.mark.xdist_group(XDIST_GROUP)
 
@@ -82,7 +82,7 @@ def test_pending_answer_and_known_attribution_survive_reconstruction(channel, tm
         assert original._pending_inbound
         bound = next(iter(original._pending_inbound.values()))
         assert bound["question"] == question.id
-        original.stop(timeout=DRAIN, announce=False)
+        drain_connector(original)
         # The original question is now closed; a freshly computed answer would bind the new one.
         rig.bus.post("answer", "already decided", in_reply_to=question.id, source={"channel": "terminal"})
         newer = rig.agent("question", "new question")
@@ -100,9 +100,85 @@ def test_pending_answer_and_known_attribution_survive_reconstruction(channel, tm
             assert not fresh._pending_inbound
             assert not fresh._posters._held
         finally:
-            fresh.stop(timeout=DRAIN, announce=False)
+            drain_connector(fresh)
     finally:
-        original.stop(timeout=DRAIN, announce=False)
+        drain_connector(original)
+        rig.bus._session._http.close()
+        rig.log.close()
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+def test_reconstruction_drains_an_original_whose_stop_timed_out(channel, tmp_path, monkeypatch):
+    """Regression for #469: a stop that expires retains the lease until exit.
+
+    A reconstruction must drain the original before building a successor, or
+    the fresh connector's lease acquisition races the original's release and
+    raises OwnershipBusy.
+    """
+    factory = SlackRig if channel == "slack" else MatrixRig
+    rig = factory(tmp_path)
+    original = rig.connector
+    remote = rig.slack if channel == "slack" else rig.matrix
+    original._inbound_once()
+    kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
+    fresh = None
+    try:
+        assert original.stop(timeout=0.0, announce=False) is False
+        assert original._lease.key.busy(), "the original should still own the thread"
+        drain_connector(original)
+        fresh = type(original)(original.config, bus_client=rig.bus, **kwargs)
+        monkeypatch.setattr(fresh._posters, "_poster_of", lambda message: None)
+        fresh._ensure_ready()
+    finally:
+        if fresh is not None and fresh._lease is not None:
+            drain_connector(fresh)
+        if original._lease is not None:
+            drain_connector(original)
+        rig.bus._session._http.close()
+        rig.log.close()
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+def test_reconstruction_drains_an_original_whose_finalize_timed_out(channel, tmp_path, monkeypatch):
+    """Regression for #469: a stop that expires inside finalize retains _drain_fd.
+
+    Finalize enters ``_announce_detached`` — its first step, with no deadline
+    check before it — so the barrier is reached regardless of when the thread
+    is scheduled. The deadline then expires while the barrier holds, so finalize
+    returns without closing the lease and the dup'd ``_drain_fd`` keeps the
+    flock. The reconstruction must drain that retained descriptor before
+    building a successor.
+    """
+    factory = SlackRig if channel == "slack" else MatrixRig
+    rig = factory(tmp_path)
+    original = rig.connector
+    remote = rig.slack if channel == "slack" else rig.matrix
+    original._inbound_once()
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_announce():
+        entered.set()
+        release.wait(JOIN)
+
+    monkeypatch.setattr(original, "_announce_detached", blocked_announce)
+    kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
+    fresh = None
+    try:
+        assert original.stop(timeout=FINALIZE_EXPIRED, announce=True) is False
+        assert entered.wait(JOIN), "finalize never entered the announce barrier"
+        assert original._drain_fd is not None, "finalize-timeout path retains the lease descriptor"
+        assert original._lease.key.busy()
+        release.set()
+        drain_connector(original)
+        fresh = type(original)(original.config, bus_client=rig.bus, **kwargs)
+        monkeypatch.setattr(fresh._posters, "_poster_of", lambda message: None)
+        fresh._ensure_ready()
+    finally:
+        release.set()
+        if fresh is not None and fresh._lease is not None:
+            drain_connector(fresh)
+        if original._lease is not None:
+            drain_connector(original)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -261,7 +337,7 @@ def test_attributed_batch_exceeding_hold_limit_drains(channel, reconstruct, tmp_
                 with pytest.raises(RuntimeError, match="known backlog"):
                     poll()
             assert len(connector._posters._held) == len(source)
-            connector.stop(timeout=DRAIN, announce=False)
+            drain_connector(connector)
             kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
             connector = type(connector)(connector.config, bus_client=rig.bus, **kwargs)
             monkeypatch.setattr(connector._posters, "_poster_of", lambda message: None)
@@ -271,7 +347,7 @@ def test_attributed_batch_exceeding_hold_limit_drains(channel, reconstruct, tmp_
         assert actual == source
         assert not connector._posters._held
     finally:
-        connector.stop(timeout=DRAIN, announce=False)
+        drain_connector(connector)
         rig.bus._session._http.close()
         rig.log.close()
 

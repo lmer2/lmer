@@ -1,0 +1,2 @@
+fixed:
+  - "Stabilized the connector reconstruction test so it drains the previous thread owner before asserting, removing an OwnershipBusy race on loaded runners (#469)."
