@@ -1,0 +1,4 @@
+fixed:
+- "Release credentials edited into ~/.lmer/.env now take effect on the next session, without a platform restart; a credential deleted from the file stops being forwarded"
+added:
+- "A release session warns when a release credential exported in the environment (e.g. the platform daemon's shell) differs from its .env value; the export still wins, and the warning names the variable and file, never the value — and is printed even when the exported signing key is missing and the launch aborts"

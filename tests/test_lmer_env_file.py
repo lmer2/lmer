@@ -254,6 +254,29 @@ class TestInFileReferenceResolution:
         assert os.environ["LMER_ENVREF_DERIVED2"] == "solo/x"
 
 
+class TestEnvFileDisagreements:
+    """``env_file_disagreements`` compares an export with the value first-wins
+    would have taken from the ``.env`` files (#467)."""
+
+    def test_compares_against_the_highest_priority_file_only(self, tmp_path, monkeypatch):
+        from lmer_cli.runtime import env_file_disagreements
+
+        high, low = tmp_path / "high.env", tmp_path / "low.env"
+        high.write_text("LMER_DISAGREE_A=exported\n")
+        low.write_text("LMER_DISAGREE_A=other\nLMER_DISAGREE_B=other\n")
+        monkeypatch.setenv("LMER_DISAGREE_A", "exported")
+        monkeypatch.setenv("LMER_DISAGREE_B", "exported")
+
+        found = env_file_disagreements(
+            [("high", high), ("missing", tmp_path / "absent.env"), ("low", low)],
+            ["LMER_DISAGREE_A", "LMER_DISAGREE_B", "LMER_DISAGREE_UNSET"],
+        )
+
+        # A agrees with the file that would win; B is only in the lower file,
+        # which is then the one that would have supplied it.
+        assert found == [("LMER_DISAGREE_B", low)]
+
+
 class TestEnvIsolation:
     """``--env-only`` / ``LMER_ENV_ISOLATED`` (issue #609).
 

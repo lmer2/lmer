@@ -6,7 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from lmer_cli.env_sources import (
-    DEFAULT_SOURCES_ENV, consume_env_defaults, env_with_overrides, remember_env_defaults,
+    DEFAULT_SOURCES_ENV, consume_env_defaults, drop_env_file_defaults,
+    env_with_overrides, remember_env_defaults,
 )
 
 
@@ -51,3 +52,27 @@ def test_provenance_carrier_cannot_be_forwarded_from_launch_config(tmp_path, mon
     captured = {}
     assert _run_main(args, env_in=env, captured_env=captured, home=tmp_path) == 0
     assert captured[DEFAULT_SOURCES_ENV] is None
+
+
+def test_drop_env_file_defaults_forgets_only_recorded_defaults():
+    env = {"LMER_RELEASE_GITHUB_TOKEN": "from-file", "OTHER": "exported"}
+    sources = {"LMER_RELEASE_GITHUB_TOKEN": ".env (host)"}
+
+    drop_env_file_defaults(sources, ["LMER_RELEASE_GITHUB_TOKEN", "OTHER"], env=env)
+
+    assert "LMER_RELEASE_GITHUB_TOKEN" not in env, (
+        "a recorded file default must be dropped so a fresh .env load can decide"
+    )
+    assert sources == {}, "and its source label must go with it"
+    assert env["OTHER"] == "exported", (
+        "a genuine export was never recorded and keeps its precedence"
+    )
+
+
+def test_drop_env_file_defaults_defaults_to_os_environ():
+    with patch.dict(os.environ, {"LMER_RELEASE_GITHUB_TOKEN": "from-file"}, clear=True):
+        drop_env_file_defaults(
+            {"LMER_RELEASE_GITHUB_TOKEN": ".env (host)"},
+            ["LMER_RELEASE_GITHUB_TOKEN"],
+        )
+        assert "LMER_RELEASE_GITHUB_TOKEN" not in os.environ
