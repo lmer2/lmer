@@ -37,6 +37,7 @@ from lmer_platform import (
     ask, memory, registry, runs, session_io, spawn, statusline, store,
     transcripts, uploads, workrepo,
 )
+from tests._child_dump import json_dump_python
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 from work_repo.utils import repository_of
@@ -1944,7 +1945,7 @@ def resolving_lmer(tmp_path):
         # "LMER_FASTAPI_TOKEN": ns.fastapi_token or os.environ.get(...)
         "    'token': None or os.environ.get('LMER_FASTAPI_TOKEN'),\n"
         "}\n"
-        f"open({str(dump)!r}, 'w').write(json.dumps(resolved))\n"
+        f"{json_dump_python(dump, 'resolved')}"
         "import time; time.sleep(30)\n",
         encoding="utf-8",
     )
