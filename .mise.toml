@@ -3,7 +3,9 @@
 
 [tools]
 # Default tools (installed at container build time)
-node = "lts"
+# Not "lts": node 26+ needs libatomic.so.1, absent from oraclelinux:9-slim-fips.
+# Unpin only once the Containerfile installs libatomic.
+node = "24"
 gh = "latest"
 glab = "latest"
 claude-powerline = "latest"
