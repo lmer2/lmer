@@ -24,6 +24,22 @@ directory (`~/.lmer/platform/`), so `lmer platform run` afterwards works from
 any directory. Re-run it after every update — `npm run build` alone does not
 refresh what the daemon serves.
 
+**Restart the daemon after an update, too.** The daemon reads the UI bundle from
+disk on every page load, but its routes are fixed when it starts. A daemon left
+running across an update serves the new page without that page's newer routes,
+so new controls fail with "Not Found". `GET /api/health` reports this as
+`ui.stale: true` (the bundle on disk differs, by content, from the one there at
+startup). The page then shows a banner asking for a restart, and shows the same
+banner for a daemon too old to report `ui` at all. A daemon started before any
+bundle existed has nothing to compare against and never reports stale. If the
+bundle is there but cannot be read at startup (for example, `setup-ui` is
+swapping it in at that moment), the daemon logs
+`platform_ui_fingerprint_unavailable` and uses the first bundle a health check
+reads as its baseline. `ui.stale: false` only means the bundle has not changed
+since the daemon took its baseline (at startup, or at the first readable health
+check). It does not prove that the page and the daemon come from the same
+version.
+
 By default the daemon binds loopback (`127.0.0.1:8600`). Open the printed URL
 in a browser; it prompts for credentials — any username, and the shared secret
 as the password:
@@ -1226,6 +1242,9 @@ chat.
     stays until dismissed, because the rotation one asks you to send again.
 - **Same limits as attach:** the per-file cap applies, and a session started
   before uploads existed has no store and is refused.
+- **A daemon older than the page** has no `/private` route, so the send fails
+  with a 404 before anything is stored. The editor then says the daemon needs a
+  restart rather than "Not Found" (see [Install and first run](#install-and-first-run)).
 
 ## Where things live
 

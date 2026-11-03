@@ -34,6 +34,7 @@ import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
+import StaleDaemon from './components/StaleDaemon.vue'
 import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason, offReason } from './ratchet.js'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
@@ -1123,6 +1124,7 @@ onUnmounted(() => {
 
     <v-main>
       <v-container max-width="900" class="pa-3">
+        <StaleDaemon />
         <v-alert v-if="!loading && activeProject && activeProject !== unconfirmedProject && (!workspace || workspace.archived)"
           type="warning" class="mb-3">
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.

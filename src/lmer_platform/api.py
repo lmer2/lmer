@@ -204,7 +204,7 @@ from .spawn import (
     spawn_session,
 )
 from .store import StoreError, utc_now_iso
-from .ui_build import dist_dir
+from .ui_build import bundle_fingerprint, dist_dir, is_built
 from .workrepo import (
     fold_registry,
     folded_identity,
@@ -2447,6 +2447,16 @@ def create_app(
         raise ValueError("refusing to serve without a shared secret")
 
     builder = state_builder or build_state
+    # This process's routes are the code it started with, while `/` and `/assets`
+    # read the bundle from disk per request: a bundle replaced after this point is
+    # UI this process may not have the routes for (#650). Started without a
+    # bundle, there is nothing to compare, so it never reads as stale.
+    started_ui = bundle_fingerprint()
+    # A bundle that could not be read now must not leave the check off for the
+    # life of the process: the first reading a poll gets becomes the baseline.
+    adopt_ui = started_ui is None and is_built()
+    if adopt_ui:
+        logger.warning("platform_ui_fingerprint_unavailable dir=%s; the first readable bundle becomes the baseline", dist_dir())
     app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
                   lifespan=ingress.lifespan if ingress else None)
     app.router.route_class = project_api.WorkspaceRoute
@@ -2639,7 +2649,9 @@ def create_app(
         """Plain-text route list — useful from a terminal, and stable for scripts."""
         return (
             "lmer platform\n\n"
-            "  GET  /api/health            liveness and mirror presence (cheap)\n"
+            "  GET  /api/health            liveness, mirror presence, and\n"
+            "                              ui.stale: the bundle on disk changed\n"
+            "                              since this process started (cheap)\n"
             "  GET  /api/state             fleet view: runs THIS orchestrator\n"
             "                              tracks. A run's session block is\n"
             "                              narrowed to the fields a client reads,\n"
@@ -3023,13 +3035,18 @@ def create_app(
         Health checks run often; making one depend on a network fetch would turn
         a slow remote into a false "unhealthy".
         """
+        nonlocal started_ui
         status = mirror_status(config)
+        serving_ui = bundle_fingerprint()
+        if adopt_ui and started_ui is None:
+            started_ui = serving_ui
         return {
             "ok": True,
             "schema": SCHEMA_VERSION,
             "at": utc_now_iso(),
             "bind": config.base_url,
             "ingress": ingress_status.snapshot(),
+            "ui": {"stale": bool(started_ui and serving_ui and serving_ui != started_ui)},
             "mirror": {
                 "present": status.present,
                 "healthy": status.healthy,

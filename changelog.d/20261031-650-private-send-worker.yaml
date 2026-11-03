@@ -1,0 +1,4 @@
+fixed:
+- "The platform UI now warns when its daemon is older than the page, and Send Privately asks for a restart instead of failing with \"Not Found\""
+added:
+- "`GET /api/health` reports `ui.stale` when the UI bundle changed on disk after the platform daemon started"

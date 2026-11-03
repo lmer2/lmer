@@ -6,7 +6,8 @@ cursor, digest rows, the question badge, the status strip and the settings
 dialog live in these files; issue #617 added the answer box and the per-launch
 resume rows, whose disabled-send reasons are only observable here; issue #510
 the Send Privately editor; issue #465 the operator channel dock's retention;
-issue #646 the rotate-every-assistant modal).
+issue #646 the rotate-every-assistant modal; issue #650 the outdated-daemon
+banner).
 """
 import os
 from pathlib import Path
@@ -33,6 +34,7 @@ SUITES = [
     "tests/RequestRecovery.test.js",
     "tests/RotateAll.test.js",
     "tests/SessionsPerTarget.test.js",
+    "tests/StaleDaemon.test.js",
     "tests/StatusStrip.test.js",
     "tests/UnassignedRuns.test.js",
 ]
