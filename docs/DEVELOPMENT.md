@@ -238,6 +238,41 @@ attribute, hoist the module (`from lmer_cli import runtime`) and call
 **Enforced by** `tests/test_import_placement.py`, which names each import
 that lacks a valid comment.
 
+## Paths built from caller input: pass the name through `store.path_component`
+
+**Decision (2026-11-01, #659):** a session id, upload name or other
+caller-supplied name that becomes a path component is validated against its
+own pattern, as before, and the value the path is built from is the return
+value of `lmer_platform.store.path_component(name)`.
+
+The reason is CodeQL. Its `py/path-injection` query (CodeQL 2.27, checked
+against the library source) accepts only three kinds of sanitizer:
+
+- a comparison with a constant;
+- a models-as-data barrier;
+- a path normalised with `os.path.normpath`/`abspath`/`realpath`, then
+  checked with `.startswith`.
+
+A regex `fullmatch`, which is how `registry._validate_session_id`,
+`uploads._PRIVATE_NAME` and `stored_name` validate, is not one of them. So
+every sink downstream was reported even though nothing tainted reached it.
+
+A model pack under `.github/codeql/extensions` does not help here. Its
+API-graph paths only match calls made through an import, and these validators
+are mostly called from inside their own module.
+
+`path_component` is that normalise-and-prefix check, applied to a name joined
+under a placeholder root. It raises `ValueError` unless the name is exactly
+one entry of its directory. Its callers have already passed a stricter
+pattern, so for them it never raises and returns the same string. For any
+input that already reached those call sites, behaviour does not change. What
+changes is that CodeQL sees the sink use a checked value. One related
+hardening landed in the same change: `uploads._private_dir` now validates the
+session id itself instead of relying on the route having done it.
+
+Use the return value, not the argument: `name = path_component(name)`. A bare
+call whose result is dropped is invisible to the analysis.
+
 ## Gate checks: a capped `details` list says what it dropped
 
 **Decision (#597):** a gate check never shortens a `CheckResult.details`

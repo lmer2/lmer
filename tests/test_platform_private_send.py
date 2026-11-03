@@ -138,6 +138,19 @@ def test_a_session_without_a_store_is_refused(platform_root):
         uploads.store_private(WORKER, {"id": WORKER, "kind": registry.WORKER_KIND}, "x")
 
 
+def test_a_session_id_that_is_not_one_name_never_reaches_the_shared_store(platform_root):
+    """The routes refuse such an id first; the store no longer relies on that.
+    The assistant's store is the one whose path does not pass through the id."""
+    entry = entry_for(ASSISTANT, registry.ASSISTANT_KIND)
+    for call in (
+        lambda: uploads.store_private("../x", entry, "x"),
+        lambda: uploads.withdraw_private("../x", entry, "20261028-120000-private.txt"),
+    ):
+        with pytest.raises(uploads.UploadNotFound):
+            call()
+    assert not (uploads.assistant_upload_dir() / "x").exists()
+
+
 @pytest.mark.parametrize("planted", ["root", "session"])
 def test_a_symlink_planted_in_the_store_is_never_written_through(platform_root, tmp_path, planted):
     """The container has ``rw`` on the store, so it can plant a link at any level."""
