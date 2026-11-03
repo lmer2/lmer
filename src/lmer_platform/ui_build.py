@@ -83,9 +83,11 @@ import logging
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -103,7 +105,7 @@ __all__ = [
     "UIBuildError", "NODE_VERSION", "NODE_CHECKSUMS", "NodeToolchain", "ENV_WEB_DIR",
     "ENV_UI_DIST", "node_dir", "dist_dir", "web_source_dir", "platform_key",
     "archive_name", "download_url", "ensure_node", "build_ui", "setup_ui",
-    "is_built", "installed_ui_dir", "install_ui",
+    "is_built", "installed_ui_dir", "install_ui", "bundle_fingerprint",
 ]
 
 #: Pinned Node LTS. Bumping this requires updating NODE_CHECKSUMS in the same
@@ -122,6 +124,12 @@ NODE_BASE_URL = "https://nodejs.org/dist"
 DOWNLOAD_TIMEOUT_SECONDS = 300
 BUILD_TIMEOUT_SECONDS = 900
 _CHUNK = 256 * 1024
+
+#: Per bundle directory, the stat signature last hashed and its digest.
+_fingerprints: dict[Path, tuple[tuple, str]] = {}
+#: Reads of a bundle that install_ui's swap may cut across, and the pause between them.
+FINGERPRINT_ATTEMPTS = 3
+FINGERPRINT_RETRY_SECONDS = 0.05
 
 
 class UIBuildError(RuntimeError):
@@ -364,6 +372,81 @@ def install_ui(dist: Path) -> Path:
 def is_built() -> bool:
     dist = dist_dir()
     return bool(dist and (dist / "index.html").is_file())
+
+
+def bundle_fingerprint(dist: Optional[Path] = None) -> Optional[str]:
+    """A hash over the served bundle's file names and contents, or ``None`` without one.
+
+    Contents rather than mtimes: :func:`install_ui` swaps in a freshly copied tree,
+    so a re-install of identical files must not read as a change. The stat
+    signature only decides whether to hash again, which keeps a health poll cheap.
+
+    A read counts only if the directory is the same one, untouched, before and
+    after it. :func:`install_ui` renames the live tree away and another into its
+    place, and a walk the swap cuts across skips what it had not reached instead
+    of raising. Such a read is tried again, briefly, and is ``None`` if the tree
+    never holds still.
+    """
+    dist = dist_dir() if dist is None else dist
+    if dist is None:
+        return None
+    for attempt in range(FINGERPRINT_ATTEMPTS):
+        if attempt:
+            time.sleep(FINGERPRINT_RETRY_SECONDS)
+        try:
+            before = _identity(dist)
+        except OSError:
+            if attempt:
+                # Between install_ui's two renames.
+                continue
+            return None
+        try:
+            read = _hash_tree(dist)
+        except OSError:
+            read = None
+        try:
+            settled = _identity(dist) == before
+        except OSError:
+            settled = False
+        if settled:
+            if read is None:
+                return None
+            _fingerprints[dist] = read
+            return read[1]
+    return None
+
+
+def _identity(dist: Path) -> tuple:
+    # A rename sets the ctime, so a tree renamed away and back (install_ui's
+    # recovery) differs from the one that was never moved.
+    info = os.stat(dist)
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def _hash_tree(dist: Path) -> Optional[tuple[tuple, str]]:
+    if not (dist / "index.html").is_file():
+        return None
+    files = []
+    for path in dist.rglob("*"):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            if path.is_symlink():
+                # Dangling: nothing a request could be served from.
+                continue
+            raise
+        if stat.S_ISREG(info.st_mode):
+            files.append((str(path.relative_to(dist)), path, info))
+    files.sort(key=lambda entry: entry[0])
+    signature = tuple((name, info.st_size, info.st_mtime_ns, info.st_ino) for name, _, info in files)
+    cached = _fingerprints.get(dist)
+    if cached and cached[0] == signature:
+        return cached
+    digest = hashlib.sha256()
+    for name, path, _ in files:
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(_sha256(path).encode("ascii"))
+    return signature, digest.hexdigest()
 
 
 def _sha256(path: Path) -> str:

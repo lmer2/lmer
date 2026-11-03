@@ -3,7 +3,8 @@
 // and nowhere else — not the composer's draft, not browser storage — and it goes
 // when the dialog does. Mounted only while open, so a closed dialog holds nothing.
 import { onBeforeUnmount, ref, watch } from 'vue'
-import { sendPrivately, sendSessionInput, withdrawPrivate } from '../api.js'
+import { fetchHealth, sendPrivately, sendSessionInput, withdrawPrivate } from '../api.js'
+import { daemonOutdated } from '../daemon.js'
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -44,6 +45,22 @@ function close(reason = null) {
 function withdrawn() {
   const why = switched() ? 'the conversation changed' : 'the assistant began rotating'
   return `Send Privately closed because ${why} — nothing was sent.`
+}
+
+// A daemon older than this page answers the store with the router's bare
+// "Not Found" (#650): no handler words a refusal that way, and its health says
+// whether it is outdated. A 404 after a store is a refusal from a route that exists.
+async function refusal(exc, stored) {
+  if (!stored && exc.status === 404 && exc.message === 'Not Found') {
+    try {
+      if (daemonOutdated(await fetchHealth())) {
+        return "this platform's daemon is older than this page and has no Send Privately. Restart the daemon, then send again"
+      }
+    } catch {
+      // Unknown, so the refusal is shown as it came.
+    }
+  }
+  return exc.message
 }
 
 function delivered() {
@@ -89,8 +106,13 @@ async function submit() {
       if (!closed) close(withdrawn())
       return
     }
+    const reason = await refusal(exc, stored)
+    if (moved()) {
+      if (!closed) close(withdrawn())
+      return
+    }
     // The server's refusals never quote the text, and neither does this.
-    problem.value = `not sent — ${exc.message}`
+    problem.value = `not sent — ${reason}`
   } finally {
     busy.value = false
   }

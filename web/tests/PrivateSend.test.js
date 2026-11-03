@@ -5,15 +5,19 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import Chat from '../src/components/Chat.vue'
 import {
-  fetchSessionMessages, sendPrivately, sendSessionInput, withdrawPrivate,
+  fetchHealth, fetchSessionMessages, sendPrivately, sendSessionInput, withdrawPrivate,
 } from '../src/api.js'
 import { deferred, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
-  fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(),
+  fetchHealth: vi.fn(), fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(),
   sessionUploadUrl: vi.fn(), uploadSessionFile: vi.fn(),
   sendPrivately: vi.fn(), withdrawPrivate: vi.fn(),
 }))
+
+function notFound(message) {
+  return Object.assign(new Error(message), { status: 404 })
+}
 
 const MARKER = 'PRIVMARK-web-5f1c9a'
 const REFERENCE = '[lmer private] /home/developer/.lmer-uploads/.lmer-private/s-1/20261028-120000-private.txt — private text'
@@ -138,6 +142,73 @@ it('a failed store keeps the text for retry, says so without quoting it, and ret
   expect(sendPrivately).toHaveBeenCalledTimes(2)
   expect(sendSessionInput).toHaveBeenCalledTimes(1)
   expect(editor()).toBeNull()
+})
+
+it('a daemon older than the page says to restart it, not "Not Found" (#650)', async () => {
+  await mountChat()
+  sendPrivately.mockRejectedValueOnce(notFound('Not Found'))
+  fetchHealth.mockResolvedValueOnce({ ok: true, schema: 1 })
+  await openAndType(MARKER)
+  button('send privately').click()
+  await settle()
+  const alert = document.querySelector('.private-send .v-alert[role="alert"]').textContent
+  expect(alert).toContain('not sent')
+  expect(alert).toContain('Restart the daemon')
+  expect(alert).not.toContain('Not Found')
+  expect(alert).not.toContain(MARKER)
+  expect(editor().value).toBe(MARKER)
+  expect(withdrawPrivate).not.toHaveBeenCalled()
+})
+
+it("a daemon's own worded 404 is shown as it came, without asking its health", async () => {
+  await mountChat()
+  sendPrivately.mockRejectedValueOnce(notFound("no such session 's-1'"))
+  await openAndType(MARKER)
+  button('send privately').click()
+  await settle()
+  const alert = document.querySelector('.private-send .v-alert[role="alert"]').textContent
+  expect(alert).toContain("not sent — no such session 's-1'")
+  expect(fetchHealth).not.toHaveBeenCalled()
+})
+
+it('a 404 on delivery is the refusal as it came, and the file is withdrawn', async () => {
+  await mountChat()
+  sendSessionInput.mockRejectedValueOnce(notFound('Not Found'))
+  await openAndType(MARKER)
+  button('send privately').click()
+  await settle()
+  const alert = document.querySelector('.private-send .v-alert[role="alert"]').textContent
+  expect(alert).toContain('not sent — Not Found')
+  expect(fetchHealth).not.toHaveBeenCalled()
+  expect(withdrawPrivate).toHaveBeenCalledTimes(1)
+})
+
+it('an unreadable health check leaves the refusal as it came', async () => {
+  await mountChat()
+  sendPrivately.mockRejectedValueOnce(notFound('Not Found'))
+  fetchHealth.mockRejectedValueOnce(new Error('offline'))
+  await openAndType(MARKER)
+  button('send privately').click()
+  await settle()
+  const alert = document.querySelector('.private-send .v-alert[role="alert"]').textContent
+  expect(alert).toContain('not sent — Not Found')
+  expect(editor().value).toBe(MARKER)
+})
+
+it('a switch while the daemon is being asked closes the editor and says nothing was sent', async () => {
+  await mountChat()
+  const health = deferred()
+  sendPrivately.mockRejectedValueOnce(notFound('Not Found'))
+  fetchHealth.mockReturnValueOnce(health.promise)
+  await openAndType(MARKER)
+  button('send privately').click()
+  await flushPromises()
+  await wrapper.setProps({ sessionId: 's-2' })
+  health.resolve({ ok: true, schema: 1 })
+  await settle()
+  expect(editor()).toBeNull()
+  expect(wrapper.text()).toContain('nothing was sent')
+  expect(sendSessionInput).not.toHaveBeenCalled()
 })
 
 it('a failed delivery withdraws the stored file and keeps the text', async () => {
