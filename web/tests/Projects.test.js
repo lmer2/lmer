@@ -218,6 +218,7 @@ it('names and colors the selected project in the bar and switches projects from 
   expect(wrapper.get('.project-switcher').attributes('aria-label')).toBe('project: Beta — switch project')
   expect(bar().element.style.backgroundColor).toBe('rgb(34, 94, 201)')
   expect(bar().element.style.color).toBe('rgb(255, 255, 255)')
+  expect(bar().element.style.getPropertyValue('--focus-ring')).toBe('#ffffff')
   await wrapper.get('.project-switcher').trigger('click')
   await flushPromises()
   const entries = [...document.querySelectorAll('.project-switcher-list .v-list-item-title')].map(title => title.textContent.trim())
@@ -229,6 +230,7 @@ it('names and colors the selected project in the bar and switches projects from 
   expect(wrapper.get('.project-switcher').text()).toBe('Hot pink')
   expect(bar().element.style.backgroundColor).toBe('rgb(255, 105, 180)')
   expect(bar().element.style.color).toBe('rgb(0, 0, 0)')
+  expect(bar().element.style.getPropertyValue('--focus-ring')).toBe('#000000')
   expect(wrapper.findAllComponents(ProjectNav).find(nav => nav.props('project').id === 'pink').element.style.borderInlineStartColor)
     .toBe('#ff69b4')
   await chooseProject(wrapper, 'Project settings for Hot pink')
@@ -238,6 +240,7 @@ it('names and colors the selected project in the bar and switches projects from 
   expect(wrapper.get('.project-switcher').text()).toBe('All projects')
   expect(bar().element.style.backgroundColor).toBe('')
   expect(bar().element.style.color).toBe('')
+  expect(bar().element.style.getPropertyValue('--focus-ring')).toBe('')
   await chooseProject(wrapper, 'New project')
   expect(document.querySelector('.v-dialog input')).not.toBeNull()
 })
@@ -311,8 +314,10 @@ it('reads preset names and hex values, and picks the more contrasting text color
   for (const [name, hex] of Object.entries(projectColors)) {
     const text = projectTextColor(name)
     expect(contrastRatio(hex, text), name).toBeGreaterThanOrEqual(contrastRatio(hex, text === '#000000' ? '#ffffff' : '#000000'))
+    // Also the focus ring of the bar's buttons (style.css), which needs only 3:1 on the bar.
     expect(contrastRatio(hex, text), name).toBeGreaterThanOrEqual(4.5)
   }
+  expect(Object.keys(projectColors)).toHaveLength(20)
   expect(projectTextColor('#ffffff')).toBe('#000000')
   expect(projectTextColor('#ffff00')).toBe('#000000')
   expect(projectTextColor('#ff69b4')).toBe('#000000')
@@ -377,7 +382,7 @@ it('blends ink at an opacity onto its ground', () => {
   }
 })
 
-it('keeps the color swatches first and the canvas behind Custom…, opening it for a custom hex', async () => {
+it('keeps the color swatches first and the canvas behind Custom…, a custom hex included', async () => {
   const wrapper = mountPane(ProjectSettings, { project: { ...projects[1], color: 'Blue', repositories: [], settings: {} } })
   await flushPromises()
   const picker = wrapper.getComponent({ name: 'VColorPicker' })
@@ -389,7 +394,8 @@ it('keeps the color swatches first and the canvas behind Custom…, opening it f
   expect(toggle.attributes('aria-expanded')).toBe('true')
   const custom = mountPane(ProjectSettings, { project: { ...projects[1], color: '#ff69b4', repositories: [], settings: {} } })
   await flushPromises()
-  expect(custom.getComponent({ name: 'VColorPicker' }).props('hideCanvas')).toBe(false)
+  expect(custom.getComponent({ name: 'VColorPicker' }).props('hideCanvas')).toBe(true)
+  expect(custom.get('.project-color legend').text()).toContain('#ff69b4')
   for (const mounted of [wrapper, custom]) mounted.unmount()
 })
 
@@ -745,7 +751,7 @@ it('does not write hidden instructions before loading, and ignores a previous pr
   expect(wrapper.get('.project-orders textarea').element.value).toBe('Beta orders')
 })
 
-it('keeps numeric capacity values and restores the intended colored archived project', async () => {
+it('keeps numeric capacity values and restores the archived project named in its color', async () => {
   const archived = { id: 'archived', name: 'Example Archive', color: 'Purple', archived: true }
   const wrapper = mountPane(PlatformSettings, { projects: [...projects, archived] }, {
     global: { stubs: { AssistantSettings: true, IngressStatus: true, SlotEditor: true } },
@@ -761,17 +767,108 @@ it('keeps numeric capacity values and restores the intended colored archived pro
   }
   await fields[0].setValue('12')
   await fields[1].setValue('5')
-  await wrapper.findAll('button').find(button => button.text() === 'Save limit').trigger('click')
+  await wrapper.findAll('button').find(button => button.text() === 'Save capacity').trigger('click')
   await flushPromises()
   expect(api.setPlatformSettings).toHaveBeenCalledWith({ max_concurrent_sessions: 12, max_live_assistants: 5 })
   const row = wrapper.get('.archived-project')
   expect(row.attributes('style')).toContain(projectColor('Purple'))
   expect(row.getComponent({ name: 'VChip' }).props('color')).toBe(projectColor('Purple'))
-  expect(row.getComponent({ name: 'VBtn' }).props('color')).toBe(projectColor('Purple'))
   expect(row.getComponent({ name: 'VChip' }).element.style.color).toBe('rgb(255, 255, 255)')
-  expect(row.getComponent({ name: 'VBtn' }).element.style.color).toBe('rgb(255, 255, 255)')
+  expect(row.getComponent({ name: 'VBtn' }).props('variant')).toBe('tonal')
   await row.get('button').trigger('click')
   expect(api.archiveProject).toHaveBeenCalledWith('archived', true)
+})
+
+// Issue 652: leaving Platform settings with an unsaved card asks first.
+it('asks before the shell leaves Platform settings with unsaved edits', async () => {
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('header button[aria-label="Platform settings"]').trigger('click')
+  await flushPromises()
+  await wrapper.get('#worker-capacity').setValue('12')
+  const back = () => wrapper.get('header button[aria-label="back to the fleet"]')
+  const dialogButton = label => [...document.querySelectorAll('.settings-leave button')].find(node => node.textContent.trim() === label)
+  await back().trigger('click')
+  await flushPromises()
+  expect(document.querySelector('.settings-leave').textContent).toContain('Fleet has unsaved changes.')
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(true)
+  dialogButton('Keep editing').click()
+  await flushPromises()
+  expect(wrapper.get('#worker-capacity').element.value).toBe('12')
+  await back().trigger('click')
+  await flushPromises()
+  dialogButton('Discard').click()
+  await flushPromises()
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(false)
+  await wrapper.get('header button[aria-label="Platform settings"]').trigger('click')
+  await flushPromises()
+  await back().trigger('click')
+  await flushPromises()
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(false)
+  expect(api.setPlatformSettings).not.toHaveBeenCalled()
+  wrapper.unmount()
+})
+
+// An answered Discard is final: a card that still reads unsaved must not ask again.
+it('leaves Platform settings on Discard even if a card still reads as unsaved', async () => {
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('header button[aria-label="Platform settings"]').trigger('click')
+  await flushPromises()
+  await wrapper.get('#worker-capacity').setValue('12')
+  wrapper.findComponent(PlatformSettings).vm.$.exposed.hasUnsavedChanges = () => true
+  await wrapper.get('header button[aria-label="back to the fleet"]').trigger('click')
+  await flushPromises()
+  const discard = [...document.querySelectorAll('.settings-leave button')].find(node => node.textContent.trim() === 'Discard')
+  discard.click()
+  await flushPromises()
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(false)
+  expect(document.querySelector('.settings-leave')?.checkVisibility?.() ?? false).toBe(false)
+  wrapper.unmount()
+})
+
+it('puts the chosen project back too when the operator keeps editing', async () => {
+  const wrapper = mountPane(App)
+  await flushPromises()
+  await wrapper.get('header button[aria-label="Platform settings"]').trigger('click')
+  await flushPromises()
+  const before = wrapper.get('.project-switcher').text()
+  await wrapper.get('#worker-capacity').setValue('12')
+  const dialogButton = label => [...document.querySelectorAll('.settings-leave button')].find(node => node.textContent.trim() === label)
+  await chooseProject(wrapper, 'Beta')
+  expect(document.querySelector('.settings-leave').textContent).toContain('Fleet has unsaved changes.')
+  dialogButton('Keep editing').click()
+  await flushPromises()
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(true)
+  expect(wrapper.get('.project-switcher').text()).toBe(before)
+  await chooseProject(wrapper, 'Beta')
+  dialogButton('Discard').click()
+  await flushPromises()
+  expect(wrapper.findComponent(PlatformSettings).exists()).toBe(false)
+  expect(wrapper.get('.project-switcher').text()).toContain('Beta')
+  wrapper.unmount()
+})
+
+it('archives a project only after the confirm step', async () => {
+  const wrapper = mountPane(ProjectSettings, { project: { ...projects[0], repositories: [], settings: {} } })
+  await flushPromises()
+  const trigger = wrapper.findAllComponents({ name: 'VBtn' }).find(node => node.text() === 'Archive project')
+  expect([trigger.props('color'), trigger.props('variant')]).toEqual(['error', 'tonal'])
+  await trigger.trigger('click')
+  await flushPromises()
+  const confirm = () => [...document.querySelectorAll('.archive-confirm button')]
+  expect(document.querySelector('.archive-confirm').textContent).toContain(`Archive ${projects[0].name}?`)
+  expect(api.archiveProject).not.toHaveBeenCalled()
+  confirm().find(node => node.textContent.trim() === 'Cancel').click()
+  await flushPromises()
+  expect(api.archiveProject).not.toHaveBeenCalled()
+  await trigger.trigger('click')
+  await flushPromises()
+  confirm().find(node => node.textContent.trim() === 'Archive project').click()
+  await flushPromises()
+  expect(api.archiveProject).toHaveBeenCalledWith(projects[0].id)
+  expect(wrapper.emitted('close')).toHaveLength(1)
+  wrapper.unmount()
 })
 
 it('gives every rendered global-header action an accessible tooltip association', async () => {

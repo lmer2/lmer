@@ -550,7 +550,7 @@ prose blocks in the file, 132 served, and a time-ordered replay of the pane's
 polling delivered all 491 served turns once each.
 
 The Ratchet pane has two views, chosen by the **Show Ratchet's working
-transcript** switch in its settings dialog — `chat_show_transcript` on
+transcript** switch under Platform settings → Chat and display — `chat_show_transcript` on
 `GET`/`POST /api/assistant/config`, stored in `config.json`, applied on the pane's
 next config refresh in every browser. The run chat keeps its older rendering
 (spoken turns, the harness's internals behind a button) and is not in this table.

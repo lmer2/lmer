@@ -245,6 +245,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             bars[width] = bar
             await browser.shot(output, f"fleet-bar-phone-{width}")
         await browser.click("Platform settings")
+        await browser.settings_section("Assistants")
         await browser.click("Ask every Ratchet to rotate")
         await browser.wait("document.querySelector('.rotate-all-dialog')?.textContent.includes('Beta · generation')")
         assert not await browser.evaluate("document.documentElement.scrollWidth > innerWidth")
@@ -255,8 +256,8 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
 
         # Item 2: the header button lists both assistants, asks, and reports each one.
         await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
-        await browser.call("Page.reload")
-        await browser.wait("document.querySelector('header .rotate-all')")
+        await browser.reload()
+        await browser.wait(browser.labelled("Ask every Ratchet to rotate"))
         await browser.click("Ask every Ratchet to rotate")
         await browser.wait("document.querySelector('.rotate-all-dialog')?.textContent.includes('Beta · generation')")
         listed = await browser.evaluate("document.querySelector('.rotate-all-dialog').textContent")

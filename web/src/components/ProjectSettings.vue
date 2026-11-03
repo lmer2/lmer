@@ -38,8 +38,10 @@ const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
   rows.at(-1).push(hex)
   return rows
 }, [])
-// The canvas, sliders and HEX field: open for a color no swatch holds.
+// The canvas, sliders and HEX field, behind "Custom…" even for a color no swatch
+// holds (issue 652): the chip beside the legend names the current one.
 const customColor = ref(false)
+const archiving = ref(false)
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
 const authorityLevels = [
   { value: 'none', title: 'None: its messages carry no approval' },
@@ -71,7 +73,8 @@ watch(() => props.project.id, (id) => {
   ordersError.value = null
   form.value = { name: props.project.name, color: props.project.color,
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
-  customColor.value = !Object.hasOwn(projectColors, props.project.color || 'Gray')
+  customColor.value = false
+  archiving.value = false
   readForNonce = props.focus?.nonce
   readOrders(id)
   readChannels(id)
@@ -143,7 +146,7 @@ async function save() {
 async function archive() {
   busy.value = true
   error.value = null
-  try { await archiveProject(props.project.id); emit('changed'); emit('close') }
+  try { await archiveProject(props.project.id); archiving.value = false; emit('changed'); emit('close') }
   catch (exc) { error.value = exc.message } finally { busy.value = false }
 }
 </script>
@@ -151,8 +154,8 @@ async function archive() {
 <template>
   <v-card title="Project settings" :subtitle="project.name" class="project-settings">
     <v-card-actions class="project-actions">
-      <v-btn :loading="busy" color="primary" variant="tonal" @click="save">Save project</v-btn>
-      <v-spacer /><v-btn :disabled="busy" @click="emit('close')">Close</v-btn>
+      <v-btn :loading="busy" color="primary" variant="flat" @click="save">Save project</v-btn>
+      <v-spacer /><v-btn variant="tonal" :disabled="busy" @click="emit('close')">Close</v-btn>
     </v-card-actions>
     <v-card-text class="settings-body">
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
@@ -175,7 +178,7 @@ async function archive() {
           <v-color-picker v-model="pickedColor" mode="hex" :modes="['hex']" show-swatches :swatches="swatches"
             swatches-max-height="none" :hide-canvas="!customColor" :hide-sliders="!customColor" :hide-inputs="!customColor"
             canvas-height="120" :disabled="busy" elevation="0" width="100%" max-width="360" class="project-color-picker" />
-          <v-btn variant="text" size="small" class="custom-color" :aria-expanded="customColor" :disabled="busy"
+          <v-btn variant="tonal" size="small" class="custom-color" :aria-expanded="customColor" :disabled="busy"
             @click="customColor = !customColor">{{ customColor ? 'Swatches only' : 'Custom…' }}</v-btn>
         </fieldset>
         <div class="settings-field">
@@ -265,7 +268,22 @@ async function archive() {
         <p class="text-body-small text-medium-emphasis mb-3">
           Takes the project out of the switcher and the sidebar. It can be restored from Platform settings.
         </p>
-        <v-btn color="warning" :disabled="busy" @click="archive">Archive project</v-btn>
+        <v-btn color="error" variant="tonal" :disabled="busy">Archive project
+          <v-dialog v-model="archiving" activator="parent" max-width="480" :persistent="busy">
+            <v-card class="archive-confirm" :title="`Archive ${project.name}?`">
+              <v-card-text>
+                <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+                Its assistant is stopped and the project leaves the switcher and the sidebar.
+                Restore it from Platform settings to bring it back.
+              </v-card-text>
+              <v-card-actions>
+                <v-spacer />
+                <v-btn variant="tonal" :disabled="busy" @click="archiving = false">Cancel</v-btn>
+                <v-btn color="error" variant="flat" :loading="busy" @click="archive">Archive project</v-btn>
+              </v-card-actions>
+            </v-card>
+          </v-dialog>
+        </v-btn>
       </section>
     </v-card-text>
   </v-card>
@@ -282,6 +300,7 @@ async function archive() {
 }
 .project-color { border: 0; padding: 0; min-width: 0; text-align: center; }
 .project-color-picker { margin-inline: auto; }
-.project-color legend { display: flex; align-items: center; flex-wrap: wrap; padding: 0; }
+.project-color legend { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; width: 100%; padding: 0; }
 .project-actions { position: sticky; top: var(--v-layout-top, 64px); z-index: 1; flex-wrap: wrap; background: rgb(var(--v-theme-surface)); }
+.archive-confirm :deep(.v-card-title) { white-space: normal; overflow-wrap: anywhere; }
 </style>

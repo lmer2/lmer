@@ -253,18 +253,17 @@ consult relevant prior exchanges when context is missing.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
 - **Ratchet settings** — how its session is *run* (model, harness, preset,
-  agents fan-out, Slack/matrix threads), per platform instance: **Execution and chat
-  defaults** in Platform settings, or `GET`/`POST /api/assistant/config`. The dialog groups its
-  fields as **Session launch**, **Conversation** and **Reminders**, each with a line
-  saying when its changes apply. Each value shows which
-  layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
-  dialog persists to `config.json`, and the dialog says so). Changes apply to
-  the **next** incarnation — the running one keeps its context window until
-  you restart it, and the dialog offers the restart. Standing orders are the
-  chat's to edit and are deliberately not in this dialog. Thread permalinks go
-  one per line; save and rotate to connect. The saved list survives rotations.
-  The dialog also holds the chat pane's **Show Ratchet's working transcript**
-  switch: off (the default) the pane draws the conversation only — your
+  agents fan-out, Slack/matrix threads), per platform instance: Platform settings
+  → **Assistants** (cards **Launch defaults** and **Reminders**), or
+  `GET`/`POST /api/assistant/config`. Each card says when its changes apply. Each
+  value shows which layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats
+  what the card persists to `config.json`, and the card says so). Launch changes
+  apply to the **next** incarnation — the running one keeps its context window
+  until you restart it from the project chat. Standing orders are the chat's to
+  edit and are deliberately not here. Thread permalinks go one per line; save and
+  rotate to connect. The saved list survives rotations.
+  Platform settings → **Chat and display** holds the chat pane's **Show
+  Ratchet's working transcript** switch: off (the default) the pane draws the conversation only — your
   messages, and what Ratchet posted, asked and answered; on, its tool calls,
   watch events, hook re-prompts and unposted working notes appear muted beside
   them. Platform state (`chat_show_transcript` in `config.json`): the browser

@@ -13,7 +13,7 @@
 // keeps slice 1 unchanged.
 //
 // It is an ordinary centered dialog, the shape every other dialog in this app
-// has (AssistantSettings, the three confirm dialogs) — not the full-screen one
+// has (the rotate-all and confirm dialogs) — not the full-screen one
 // it shipped as first. Marking up a screenshot is work done *about* a
 // conversation, and a full-screen surface paints over the conversation being
 // reported, so the operator loses sight of what the mark is for (!273 followup).
