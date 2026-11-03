@@ -192,7 +192,7 @@ from lmer_cli.codex_delivery import MAX_RPC_TIMEOUT, input_budget
 
 from . import assistant_history, registry
 from .spawn import container_log_path_for, log_path_for, read_control_token
-from .store import append_event
+from .store import append_event, path_component
 
 logger = logging.getLogger("lmer_platform.session_io")
 
@@ -481,7 +481,7 @@ def _validated(session_id: str) -> str:
         registry.session_path(session_id)
     except registry.RegistryError as exc:
         raise SessionNotFound(str(exc)) from exc
-    return session_id
+    return path_component(session_id)
 
 
 def session_log_path(session_id: str) -> Path:

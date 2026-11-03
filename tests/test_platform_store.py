@@ -53,6 +53,27 @@ def test_platform_dir_defaults_under_state_dir(monkeypatch):
     assert store.platform_dir() == Path("/fake/state/platform")
 
 
+# --- path_component ---------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "20260826-120000-1-4242", "a", "a.b", "a..b", "x.", "-x", "_", "20261101-120000-private.txt",
+    # ``$`` in the session-id pattern admits a trailing newline.
+    "abc\n", "a.\n",
+])
+def test_a_single_name_comes_back_unchanged(name):
+    """Callers pass names a stricter pattern already admitted; for every one of
+    those this must be the identity, or the CodeQL barrier changes behaviour."""
+    assert store.path_component(name) == name
+
+
+@pytest.mark.parametrize("name", [
+    "", ".", "..", "a/b", "/etc", "../x", "a/..", "a/", "./a", "a//b",
+])
+def test_anything_but_one_entry_of_its_directory_is_refused(name):
+    with pytest.raises(ValueError):
+        store.path_component(name)
+
+
 # --- write_json -------------------------------------------------------------
 
 def test_write_json_roundtrip_stamps_schema_and_updated(platform_root):

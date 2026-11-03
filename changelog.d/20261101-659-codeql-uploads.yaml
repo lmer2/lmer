@@ -1,0 +1,2 @@
+security:
+- "Fixed a platform daemon freeze: an upload whose filename held a long run of dashes could stall every session's API for seconds to minutes."

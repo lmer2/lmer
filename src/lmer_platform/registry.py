@@ -55,7 +55,7 @@ from typing import Optional
 
 from . import SCHEMA_VERSION
 from .store import (
-    StoreError, mutating, read_json, sessions_dir, utc_now_iso, write_json,
+    StoreError, mutating, path_component, read_json, sessions_dir, utc_now_iso, write_json,
 )
 
 logger = logging.getLogger("lmer_platform.registry")
@@ -119,7 +119,7 @@ def _validate_session_id(session_id: str) -> str:
         )
     if os.sep in session_id or "/" in session_id:  # pragma: no cover - regex covers
         raise RegistryError(f"invalid session id {session_id!r}: path separator")
-    return session_id
+    return path_component(session_id)
 
 
 def session_path(session_id: str) -> Path:

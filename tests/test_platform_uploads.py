@@ -12,14 +12,18 @@ a refused type stays refused however it is spelled.
 """
 
 import base64
+import itertools
 import logging
 import os
+import re
 import stat
+import time
 
 import pytest
 
 from lmer_platform import config as cfg
 from lmer_platform import registry, store, uploads
+from tests import timing_budgets as timing
 from tests.conftest import strip_lmer_env
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -320,6 +324,30 @@ def test_a_stored_name_stays_short_enough_to_read(platform_root):
     stored = uploads.store_upload(entry['id'], entry, "x" * 400 + ".png", encoded(PNG))
     assert len(stored.name) <= uploads.MAX_NAME_CHARS
     assert stored.name.endswith(".png")
+
+
+def test_dashes_beside_a_dot_go_exactly_as_the_regex_they_replace_dropped_them():
+    """Every string over the only characters the collapse treats differently:
+    after the unsafe-character pass, anything else behaves like ``a``."""
+    for length in range(9):
+        for chars in itertools.product("-.a", repeat=length):
+            text = "".join(chars)
+            assert uploads._join_dots_tightly(text) == re.sub(r"-*\.-*", ".", text), text
+
+
+@pytest.mark.parametrize("name", [
+    "-" * 1_000_000,
+    "a" + "-" * 1_000_000 + "b.png",
+], ids=["dashes", "dashes-inside-a-name"])
+def test_a_long_dash_run_cannot_stall_the_daemon(name):
+    """CodeQL #68: the regex this replaced backtracked quadratically over a dash
+    run (over 10 s for 100k dashes, holding the GIL, so the whole daemon
+    stopped). At a million the old code needs far longer than the bound at
+    any wait scale, and the linear one stays well inside it."""
+    started = time.monotonic()
+    stored = uploads.stored_name(name, uploads.KNOWN_TYPES["png"])
+    assert time.monotonic() - started < timing.stretch(2.0)
+    assert len(stored) <= uploads.MAX_NAME_CHARS
 
 
 # --- reading one back --------------------------------------------------------
