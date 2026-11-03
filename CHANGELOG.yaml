@@ -71,6 +71,12 @@ unreleased:
     filling the panel.
   - A relayed message whose text holds something credential-shaped no longer shows
     twice in a session's chat.
+  - 'Fixed the container image build failing at `mise install` since node 26 became
+    LTS: node is now pinned to the 24 line, because node 26 needs libatomic, which
+    the base image does not ship.'
+  - 'Existing container-homes are migrated on the next launch: the entrypoint rewrites
+    the exact line `node = "lts"` in the persistent `~/.config/mise/config.toml` to
+    `node = "24"`, leaving every other entry alone.'
   changed:
   - A non-isolated --env-file now warns when repo-routing or token keys come from
     another .env file.
