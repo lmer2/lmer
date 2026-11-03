@@ -292,7 +292,7 @@ ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
 #: The assistant's display name (issue #581). Not in :data:`ASSISTANT_SETTING_KEYS`:
-#: it is not a launch flag and not written by the settings dialog — config.json or
+#: it is not a launch flag and not written by Platform settings — config.json or
 #: the env, read-only through the API.
 ENV_ASSISTANT_NAME = ASSISTANT_NAME_ENV
 

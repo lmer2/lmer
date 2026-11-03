@@ -143,11 +143,17 @@ const dark = {
     surface: '#252423',
     // Deep, not bright. A lighter orange (#ff7043 and friends) turns every
     // filled button into a salmon slab that shouts louder than the accent is
-    // meant to; the darker tone reads as the brand and lets white sit on it.
+    // meant to; the darker tone reads as the brand.
     primary: '#e64a19',
     success: '#3fb950',
     warning: '#ffd23f',
-    error: '#f43f5e',
+    // Rose-400: the deeper #f43f5e read 4.2:1 as ink on `surface` and 3.7:1
+    // under white on a filled button. This one clears AA for both uses.
+    error: '#fb7185',
+    // White on the primary and error fills measured 3.9:1 and 3.7:1 (issue 652).
+    // Near-black clears AA on both: 4.9:1 on primary, 7.2:1 on error.
+    'on-primary': '#0f0e0e',
+    'on-error': '#0f0e0e',
     'tone-idle': '#9a9793',
     'tone-done': '#a371f7',
     terminal: '#141312',

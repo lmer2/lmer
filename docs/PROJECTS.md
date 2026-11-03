@@ -50,11 +50,25 @@ its name, so the chip shows it.
 
 The **Platform settings** cog in the global app header is available on desktop
 and phone views, separately from the selected project's **Project settings**.
-Platform settings contains shared worker capacity, assistant capacity, execution
-and display defaults, transport infrastructure, slot administration and archived
-projects. Defaults affect subsequent assistant launches; project execution
-settings override them. Thread addresses, instructions, history and memory are
-never inherited from another project.
+Platform settings shows one section at a time, picked from a side nav on desktop
+or a **Section** select on a phone:
+
+| Section | Cards |
+|---|---|
+| Fleet | Capacity: shared worker and assistant limits |
+| Assistants | Launch defaults, Reminders, Rotate all |
+| Chat and display | Chat display (working transcript, tint my messages), Operator channel dock |
+| Graph | Graph groups |
+| Service slots | Slot administration |
+| Projects | Archived projects, with Restore |
+| Inbound chat | Message ingress status, conversation requests needing attention |
+
+Each editable card has its own Save, enabled only while the card holds unsaved edits; an
+edited card shows **Unsaved** and its section is marked in the nav. Switching
+section, leaving Platform settings or closing the tab with unsaved edits asks
+first. Defaults affect subsequent assistant launches; project execution settings
+override them. Thread addresses, instructions, history and memory are never
+inherited from another project.
 
 ## Admission and recovery
 

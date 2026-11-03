@@ -48,6 +48,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         await browser.wait("document.querySelectorAll('.fleet-map__core').length === 2")
         assert not await browser.evaluate("document.querySelector('.fleet-map__group-ring') !== null")
         await browser.click("Platform settings")
+        await browser.settings_section("Graph")
         await browser.wait("document.querySelector('.fleet-groups')?.textContent.includes('No graph groups')")
         await browser.click("Add group")
         await browser.click("Save groups")
@@ -86,6 +87,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
         for width in (390, 320):
             await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=844, deviceScaleFactor=1, mobile=True)
             await browser.click("Platform settings")
+            await browser.settings_section("Graph")
             await browser.wait("document.querySelector('.fleet-group-row input')?.value === 'Renamed'")
             await browser.evaluate("document.querySelector('.fleet-groups').scrollIntoView({block:'start'})")
             await asyncio.sleep(.3)
@@ -96,6 +98,7 @@ async def probe(chrome, output, url, secret, alpha, beta, settings):
             await browser.wait("document.querySelector('.fleet-map__group')?.textContent === 'Renamed'")
 
         await browser.click("Platform settings")
+        await browser.settings_section("Graph")
         await browser.wait("document.querySelector('.fleet-group-row input')?.value === 'Renamed'")
         await input_text(browser, "document.querySelector('.fleet-group-row input')", "Team")
         await browser.click("Remove group 2")

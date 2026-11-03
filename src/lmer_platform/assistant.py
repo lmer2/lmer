@@ -1067,7 +1067,7 @@ def refuse_unusable_thread_list(session_id: object, permalink: object) -> None:
 
     ``MAX_PER_SESSION`` bounds the *connections of one session*;
     ``assistant_threads`` is a different list — the launch list, editable straight
-    from the settings dialog — so the two diverge, and appending to the second
+    from Platform settings — so the two diverge, and appending to the second
     with only the first checked is how it goes over.
 
     Over is worse than it sounds: :func:`config.update_stored` validates by

@@ -133,17 +133,19 @@ async def settings_screens(browser, output, before, width, project_id):
         assert all(row["width"] >= 60 for row in fields), fields
         await input_text(browser, "document.querySelector('#worker-capacity')", "10")
         await input_text(browser, "document.querySelector('#assistant-capacity')", "3")
-        await browser.click("Save limit")
+        await browser.click("Save capacity")
         await browser.wait("!document.querySelector('.v-btn--loading')")
         assert config.load().max_concurrent_sessions == 10 and config.load().max_live_assistants == 3
     await browser.evaluate("window.scrollTo(0, 0)")
     await asyncio.sleep(.2)
     await browser.shot(output, f"platform-capacity-{width}")
+    await browser.settings_section("Projects")
     archive = "[...document.querySelectorAll('.v-list-item')].find(e => e.textContent.includes('Example Archive'))"
     await browser.evaluate(archive + ".scrollIntoView({block:'center'})")
     await asyncio.sleep(.3)
     if not before:
-        assert await browser.evaluate("(() => { const row = " + archive + "; return getComputedStyle(row.querySelector('.v-chip')).backgroundColor === getComputedStyle(row.querySelector('button')).backgroundColor && getComputedStyle(row).borderInlineStartColor === getComputedStyle(row.querySelector('button')).backgroundColor; })()")
+        # The chip and the edge carry the project's color; Restore is a secondary (tonal) button (issue 652).
+        assert await browser.evaluate("(() => { const row = " + archive + "; return getComputedStyle(row.querySelector('.v-chip')).backgroundColor === getComputedStyle(row).borderInlineStartColor && row.querySelector('button').classList.contains('v-btn--variant-tonal'); })()")
     await browser.shot(output, f"archived-project-{width}")
     assert not await browser.evaluate("document.documentElement.scrollWidth > innerWidth"), width
     await browser.click("back to the fleet")

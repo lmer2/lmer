@@ -679,9 +679,12 @@ def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
     assert "api/assistant/instructions" not in text, (
         "the settings dialog touches the standing orders, which are the chat's"
     )
-    # The naming rule is the drawer's, and it travels with the feature: the
-    # dialog is about the same recipient.
-    assert "{{ assistantName }} settings" in text, "the dialog never says whose settings these are"
+    # The naming rule is the drawer's, and it travels with the feature. Since
+    # #652 the form sits in Platform settings cards, which say whose it is.
+    host = _read(WEB / 'src/components/PlatformSettings.vue')
+    assert "How every project's ${assistantName} session starts" in host, (
+        "the launch card never says whose settings these are"
+    )
     assert "assistant" not in words.lower(), (
         f"the dialog calls the supervisor an assistant to the operator: {words!r}"
     )
@@ -846,6 +849,7 @@ const source = compiled.content
   .replace(/from ['"]\.\.\/operatorChat.js['"]/g, `from '${import.meta.resolve('./src/operatorChat.js')}'`)
   .replace(/from ['"]\.\.\/ratchet.js['"]/g, `from '${import.meta.resolve('./src/ratchet.js')}'`)
   .replace(/from ['"]\.\.\/launchSettings.js['"]/g, `from '${import.meta.resolve('./src/launchSettings.js')}'`)
+  .replace(/from ['"]\.\.\/numberField.js['"]/g, `from '${import.meta.resolve('./src/numberField.js')}'`)
   .replace(/import .* from ['"]\.\.\/api.js['"]/, `
     const fetchAssistantConfig = async () => ({ settings: {} });
     const setAssistantConfig = async (body) => {
@@ -982,7 +986,7 @@ globalThis.fetch = async (url, options = {}) => {
 const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
-  .replace(/from ['"]\\.\\.\\/(api|format|launchSettings|operatorChat|ratchet)\\.js['"]/g,
+  .replace(/from ['"]\\.\\.\\/(api|format|launchSettings|numberField|operatorChat|ratchet)\\.js['"]/g,
     (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
 const component = (await import(
   `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`

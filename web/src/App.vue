@@ -174,6 +174,34 @@ const linkedProject = ownUrl ? '' : urlProject
 // nothing: the URL may still name the default the operator has since cleared.
 if (ownUrl && urlProject && lastProject !== '') restoreCandidates.push(urlProject)
 const activeProject = ref(linkedProject || restoreCandidates[0] || '')
+// Leaving Platform settings with unsaved edits asks first (issue 652). The view is
+// put back at once, so the page keeps its edits while the question is open, and
+// so is the project or run the same tap chose just before it changed the view.
+const platformSettings = ref(null)
+let leaveFrom = null
+watch([activeProject, selectedKey], (_, [project, key]) => {
+  if (view.value !== 'platform-settings' || leaveFrom) return
+  leaveFrom = { project, key }
+  queueMicrotask(() => { leaveFrom = null })
+}, { flush: 'sync' })
+// Set while carrying out an answered Discard: the operator has decided, so a card
+// that still reads as unsaved afterwards must not ask again.
+let discarded = false
+watch(view, (next, previous) => {
+  if (discarded || previous !== 'platform-settings' || !platformSettings.value?.hasUnsavedChanges()) return
+  const target = { project: activeProject.value, key: selectedKey.value }
+  if (leaveFrom) { activeProject.value = leaveFrom.project; selectedKey.value = leaveFrom.key }
+  view.value = previous
+  platformSettings.value.confirmLeave().then((leave) => {
+    if (!leave) return
+    discarded = true
+    try {
+      activeProject.value = target.project
+      selectedKey.value = target.key
+      view.value = next
+    } finally { discarded = false }
+  })
+}, { flush: 'sync' })
 // What storage chose; a link is never second-guessed, it gets the unavailable notice.
 const restoredProject = linkedProject ? '' : activeProject.value
 // No "unavailable" notice for a restored id until the first list: a failed fetch is not a dead project.
@@ -194,7 +222,12 @@ const chatWorkspace = computed(() => projects.value.find(project => project.id =
 // is gone) leaves the theme's own bar.
 const barProject = computed(() => (workspace.value && !workspace.value.archived ? workspace.value : null))
 const barColor = computed(() => (barProject.value ? projectColor(barProject.value.color) : undefined))
-const barStyle = computed(() => (barProject.value ? { color: projectTextColor(barProject.value.color) } : undefined))
+// The bar's ink is also its buttons' focus ring: the page's primary ring can match the project colour.
+const barStyle = computed(() => {
+  if (!barProject.value) return undefined
+  const ink = projectTextColor(barProject.value.color)
+  return { color: ink, '--focus-ring': ink }
+})
 const switcherEvents = {
   choose: chooseProject,
   settings: () => { projectSettingsFocus.value = null; view.value = 'project-settings' },
@@ -1133,7 +1166,7 @@ onUnmounted(() => {
           :project="workspace" :focus="projectSettingsFocus" :now="now" :is-default="defaultProject === workspace.id"
           @changed="load" @close="view = 'fleet'" @focused="projectSettingsFocus = null"
           @default="setDefaultProject" />
-        <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
+        <PlatformSettings ref="platformSettings" :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail
              view over instead of reusing one that still holds the last run's

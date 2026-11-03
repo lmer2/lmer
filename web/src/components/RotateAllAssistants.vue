@@ -111,7 +111,7 @@ onBeforeUnmount(() => {
 <template>
   <v-tooltip :text="label" location="bottom" open-on-focus>
     <template #activator="{ props: tooltip }">
-      <v-btn v-if="block" v-bind="tooltip" :prepend-icon="mdiAutorenew" variant="text" class="rotate-all"
+      <v-btn v-if="block" v-bind="tooltip" :prepend-icon="mdiAutorenew" variant="tonal" class="rotate-all"
         @click="open = true">{{ label }}</v-btn>
       <v-btn v-else v-bind="tooltip" :icon="mdiAutorenew" variant="text" :aria-label="label" class="rotate-all"
         @click="open = true" />
@@ -161,8 +161,8 @@ onBeforeUnmount(() => {
       </v-card-text>
       <v-card-actions>
         <v-spacer />
-        <v-btn variant="text" @click="open = false">{{ sent ? 'close' : 'cancel' }}</v-btn>
-        <v-btn v-if="!sent" color="primary" variant="tonal" :loading="sending" :disabled="!running.length || loading"
+        <v-btn variant="tonal" @click="open = false">{{ sent ? 'close' : 'cancel' }}</v-btn>
+        <v-btn v-if="!sent" color="primary" variant="flat" :loading="sending" :disabled="!running.length || loading"
           @click="send">ask {{ running.length }} to rotate</v-btn>
       </v-card-actions>
     </v-card>

@@ -277,7 +277,7 @@ const presetHint = computed(() => {
 
 <template>
   <v-dialog v-model="open" max-width="560">
-    <v-card>
+    <v-card class="slot-editor">
       <v-card-title class="text-title-medium">
         {{ editing ? `service slot ${opened.name}` : 'declare a service slot' }}
       </v-card-title>
@@ -386,16 +386,16 @@ const presetHint = computed(() => {
           :disabled="saving"
           :prepend-icon="mdiDelete"
           color="error"
-          variant="text"
+          :variant="confirmingRemoval ? 'flat' : 'tonal'"
           @click="remove"
         >{{ confirmingRemoval ? 'remove anyway' : 'remove' }}</v-btn>
         <v-spacer />
-        <v-btn :disabled="saving" variant="text" @click="open = false">cancel</v-btn>
+        <v-btn :disabled="saving" variant="tonal" @click="open = false">cancel</v-btn>
         <v-btn
           :disabled="saving || !name || !preset"
           :loading="saving"
           color="primary"
-          variant="tonal"
+          variant="flat"
           @click="save"
         >{{ confirmingRebind ? 'save anyway' : 'save' }}</v-btn>
       </v-card-actions>
