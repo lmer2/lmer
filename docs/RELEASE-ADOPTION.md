@@ -19,9 +19,10 @@ credential-provisioning entries only.**
 
 ## 1. Parameterization surface
 
-The release taskdef takes four required per-repo parameters and one
-optional one (taskdef config / work-repo project info). If an adoption needs
-anything beyond these, stop — that is a design change, not an adoption.
+The release taskdef takes four required per-repo parameters, the
+`leak_scan` block, and one optional parameter (taskdef config / work-repo
+project info). If an adoption needs anything beyond these, stop — that is a
+design change, not an adoption.
 
 - [ ] **GitHub target URL** — the mirror repo the release pushes `main` +
       the signed tag to (e.g. `github.com/lmer2/lmer`).
@@ -38,6 +39,16 @@ anything beyond these, stop — that is a design change, not an adoption.
       `make dep-up`). Omit it and the flow runs no refresh — an explicit
       opt-out, recorded as a receipt. Declaring it empty is a hard stop,
       not an opt-out.
+- [ ] **Leak-scan block** (`leak_scan`) — what the leak scan and the
+      pre-push guard need to know about this project
+      ([RELEASE-GUARD.md](./RELEASE-GUARD.md) has the full contract).
+      Everything project-private goes here and never into the lmer
+      repository: `public_mirror` (`true`, or `false` to opt out of the scan
+      and the guard when the mirror is not public), and optionally the
+      `exceptions` file in the project's work-repo `info/` directory, the
+      `ancestry_denylist` of commits that must never be published,
+      `patterns` for private names and hosts, and `guard_strings` that fail
+      the guard outright. A manifest without the block is a hard stop.
 
 ## 2. Prerequisites — all of them, none optional
 
@@ -69,8 +80,20 @@ None of them are free; each one closes a specific hole.
       the tag-pattern policy above, these three settings carry the
       authorization the workflow used to enforce itself; all three live in
       repository settings, where a tag-borne workflow cannot reach them.
-- [ ] PR/issue policy set: mirror repos accept **no PRs**. Disable issues
-      unless the repo deliberately hosts them.
+- [ ] PR/issue policy set: mirror repos accept **no outside PRs** — the
+      only PR is the release run's own draft `release-candidate/vX.Y.Z` PR,
+      which exists for CI and is never merged. Disable issues unless the
+      repo deliberately hosts them.
+- [ ] Code scanning, if enabled, is readable by the release PAT
+      (`code_scanning_alerts:read`): the release run triages the
+      candidate's alerts before the tag, and a 403 stops it.
+- [ ] The project info (`work read-project-info`) documents the
+      deployment's trust boundaries: who can reach it, and what each
+      caller can send. The release run judges an alert's reachability
+      against that description; without one, every caller counts as a
+      non-operator, so any new alert stops the release. If tests live
+      outside `tests/`, the project info also names those test roots: the
+      red-CI rule's test-only fix is a fact about paths under them.
 
 ### PyPI
 
@@ -85,20 +108,25 @@ None of them are free; each one closes a specific hole.
 - [ ] **Protected tags** `v*` on the canonical repo, configured to permit
       the release credential to push.
 - [ ] Note and verify at first release: GitLab currently carries **zero
-      tags**, so these rules are unexercised — **leg-2 step 5** (the tag
-      push to GitLab origin, after GitHub is green) is where a
+      tags**, so these rules are unexercised — **the leg-2 GitLab tag
+      push** (after GitHub is green) is where a
       misconfiguration surfaces. Watch that step on the first run.
 
 ### Credentials
 
 - [ ] Per-repo **fine-grained PAT** issued with `contents:write` +
-      `workflows:write` + `actions:write` (Actions read and write) on the
+      `workflows:write` + `actions:write` (Actions read and write) +
+      `pull_requests:write` (the draft CI-candidate PR) +
+      `code_scanning_alerts:read` (when code scanning is enabled) on the
       single mirror repo (`workflows:write` is required: mirrored `main`
       routinely carries `.github/workflows/*` changes, and GitHub rejects
       workflow-touching pushes from a PAT without it).
 - [ ] PAT provisioned via lmer credential provisioning to **release-taskdef
       sessions only**, with `push_allow` entries for the mirror repo and
-      for tag pushes to GitLab origin (`refs/tags/*`).
+      for tag pushes to GitLab origin (`refs/tags/*`). The CI candidate
+      push needs `<mirror>|refs/heads/release-candidate/*` too. Without a
+      standing entry the run asks the operator for a one-command grant,
+      and the changed grant makes the gate re-run its full suite.
 - [ ] Release SSH signing key provisioned via lmer credential provisioning
       to **release-taskdef sessions only**; public half registered on the
       bot GitHub account.
@@ -126,8 +154,9 @@ sessions receive them.
 Fine-grained PATs **expire** (≤ 1 year). Before expiry:
 
 - [ ] Issue a new fine-grained PAT with the same scopes
-      (`contents:write` + `workflows:write` + `actions:write`, single
-      mirror repo).
+      (`contents:write` + `workflows:write` + `actions:write` +
+      `pull_requests:write` + `code_scanning_alerts:read`, single mirror
+      repo).
 - [ ] Update the lmer credential-provisioning entry (reference the entry
       name — never record the token value anywhere).
 - [ ] Confirm the next release-taskdef session receives the new PAT and

@@ -230,7 +230,7 @@ class TestReleaseParameterization:
         assert "do not infer the changelog mechanism" in out
         # Env vars and project-info prose do not substitute for the manifest.
         assert "Environment variables do not override the manifest" in out
-        assert "does NOT substitute for the four release parameters" in out
+        assert "does NOT substitute for the release parameters" in out
 
     def test_signing_key_is_a_reference_never_material(self):
         out = _render()
@@ -339,12 +339,13 @@ class TestCrossCuttingRecordSeam:
 
     def test_leg2_step_names_are_kernel_steps_or_the_documented_bridge(self):
         """Every `leg2-*` name the document cites is either a frozen
-        derived step or one of the two bridge phase names, and the bridge
-        is declared: neither ever appears as a derived next step."""
+        derived step or one of the four bridge phase names, and the bridge
+        is declared: none ever appears as a derived next step."""
         out = _render()
         cited = set(re.findall(r"`(leg2-[a-z-]+)`", out))
         kernel = {s for s in release_run.STEPS if s.startswith("leg2")}
-        bridge = {"leg2-record-merge", "leg2-preconditions"}
+        bridge = {"leg2-record-merge", "leg2-preconditions",
+                  "leg2-leak-scan", "leg2-ci-candidate"}
         assert kernel <= cited
         assert cited - kernel == bridge
         squashed = _squash(out)

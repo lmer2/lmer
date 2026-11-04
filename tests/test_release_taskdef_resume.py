@@ -256,8 +256,9 @@ class TestResumeDecisionTable:
         documents sharing this partial must not contradict each other."""
         section = _squash(_resume_section(_render(INSTRUCTIONS)))
         assert (
-            "still open → in a full release session re-arm the watch and "
-            "idle with pushed state; in a follow-up session exit "
+            "still open → in a full release session run the gate's early "
+            "leak scan, re-arm the watch and idle with pushed state; in a "
+            "follow-up session exit "
             "immediately — the scheduled relaunch IS the re-arm" in section
         )
         assert (

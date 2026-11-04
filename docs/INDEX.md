@@ -422,11 +422,23 @@ Canonical explanation of how a public release ships, as a tracked lmer run with 
 
 ---
 
+### [RELEASE-GUARD.md](./RELEASE-GUARD.md)
+**Release Guard — Leak Scan and Pre-Push Guard**
+
+Reference for `lmer-release-guard`, the tool the release run uses before anything reaches the public mirror:
+- `scan` / `scan-text`: what is scanned, the generic detectors, masking, exit codes
+- `prepush`: the ref allow list, the ancestry denylist, guard strings and live secrets
+- The project tier's `release.leak_scan` block and its validation (`check-config`)
+
+**Best for**: Onboarding a project's leak-scan configuration and reading a release run's `leak-scan.md`.
+
+---
+
 ### [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md)
 **Release Flow — Per-Repo Adoption Checklist & Runbooks**
 
 How a repository adopts the release flow (configuration plus prerequisites, never design changes):
-- The four-parameter surface (GitHub target URL, tag prefix, signing-key reference, changelog mechanism)
+- The parameter surface (GitHub target URL, tag prefix, signing-key reference, changelog mechanism, the `leak_scan` block, optional dependency refresh)
 - Prerequisite checklists: GitHub mirror controls, PyPI trusted publisher, GitLab protected tags, credentials
 - Rotation runbook for the fine-grained PAT and the release SSH signing key
 - Burned-version and GitHub `main` divergence remediation runbooks

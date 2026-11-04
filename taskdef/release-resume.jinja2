@@ -29,8 +29,8 @@ top wins:
 | --- | --- | --- |
 | No release version recorded | leg1 | `leg1-bump` — run leg 1 from the top; the ctl dry-run detects an already-bumped branch and skips the bump (this is the abandoned-release re-entry), and an existing remote `prep-<X.Y.Z>` branch or open bump MR matching the dry-run's target version is ADOPTED per leg 1's step-6 rule — never re-created, never force-pushed. |
 | Version recorded, no bump-MR merge SHA (bump not merged) | leg1 | `leg1-record-bump-merge` — the bump MR is open or landed unrecorded (adopt an existing branch/MR, per leg 1's step-6 rule): merged → record its merge SHA; still open → in a full release session wait for the merge; in a follow-up session exit immediately — the scheduled relaunch picks the merge up. |
-| Bump merged, no release-MR merge SHA (release MR not merged, or merged while nothing watched) | gate | `gate-await-release-merge` — check the release MR NOW: merged → record the merge SHA (verifying the version at that SHA) and continue; still open → in a full release session re-arm the watch and idle with pushed state; in a follow-up session exit immediately — the scheduled relaunch IS the re-arm. |
-| Release MR merged (merge SHA recorded), no tag | leg2 | `leg2-create-tag` — verify preconditions, create the SSH-signed tag at exactly the recorded merge SHA. |
+| Bump merged, no release-MR merge SHA (release MR not merged, or merged while nothing watched) | gate | `gate-await-release-merge` — check the release MR NOW: merged → record the merge SHA (verifying the version at that SHA) and continue; still open → in a full release session run the gate's early leak scan, re-arm the watch and idle with pushed state; in a follow-up session exit immediately — the scheduled relaunch IS the re-arm. |
+| Release MR merged (merge SHA recorded), no tag | leg2 | `leg2-create-tag` — verify preconditions, rescan for leaks at the merge SHA, prove GitHub CI green on exactly that SHA (the release-candidate branch, with its code-scanning check), then create the SSH-signed tag at exactly the recorded merge SHA. A red candidate with a `ci-candidate-fix` event recorded (check this first): fix MR merged → abort as superseded; open → nothing to advance. |
 | Tag created, no `github-main-push` receipt | leg2 | `leg2-push-github-main` — push GitHub `main` (never force). |
 | GitHub `main` pushed, no `github-tag-push` receipt | leg2 | `leg2-push-github-tag` — push the tag to GitHub (this triggers the Actions release workflow). |
 | Tag pushed to GitHub, Actions not green (`actions-run` receipt missing) | leg2 | `leg2-poll-actions` — poll the Actions run; already green for the tag → record which run actually uploaded; red with refs current → re-dispatch keyed on the recorded SHA. |
@@ -39,11 +39,13 @@ top wins:
 | GitLab tag pushed, no `dep-refresh` receipt | leg2 | `leg2-dep-refresh` — open the next cycle's dependency-refresh MR against `prep-release`; an existing open one is adopted, never duplicated. A repository declaring no `dep_refresh` parameter records the receipt with a note and advances — the ladder walks receipts, not parameters. |
 | All receipts recorded | complete | `complete` — close out the run (retro, completion state, `work commit`). |
 
-The table names derived steps only. Leg 2's `leg2-record-merge` and
-`leg2-preconditions` phase names never appear as a derived next step — the
-derivation folds them into the rows above: the merge SHA is recorded on the
-gate row's merged → continue path (and idempotently re-recorded on every
-leg-2 entry), and the preconditions run inside `leg2-create-tag`.
+The table names derived steps only. Leg 2's `leg2-record-merge`,
+`leg2-preconditions`, `leg2-leak-scan` and `leg2-ci-candidate` phase names
+never appear as a derived next step — the derivation folds them into the
+rows above: the merge SHA is recorded on the gate row's merged → continue
+path (and idempotently re-recorded on every leg-2 entry), and the
+preconditions, the leak scan and the CI candidate run inside
+`leg2-create-tag`.
 
 Re-entry stays idempotent because every step re-checks against the recorded
 merge SHA and version before acting: a tag that already exists must point at
