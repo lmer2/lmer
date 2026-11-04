@@ -86,6 +86,7 @@ tests:
     - tests/test_platform_web_markdown.py
     - tests/test_platform_web_markdown_surfaces.py
     - tests/test_platform_web_theme.py
+    - tests/test_release_guard.py
     - tests/test_release_taskdef.py
     - tests/test_rules_structure.py
     - tests/test_service_checkout_guidance.py

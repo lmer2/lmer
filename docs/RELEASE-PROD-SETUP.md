@@ -25,7 +25,7 @@ release run's records in the work repo, not here.
 >
 > Receipts are self-attestation unless an item cites externally verifiable
 > evidence — a missed or misconfigured setting surfaces in the follow-on
-> release run (leg-2 step 5 is where canonical-forge-side misconfiguration
+> release run (the leg-2 GitLab tag push is where canonical-forge-side misconfiguration
 > surfaces). Tick an item only after performing it, with the date and your
 > name.
 
@@ -38,12 +38,16 @@ to leg 2.
   the lmer credential-provisioning source (`LMER_RELEASE_SIGNING_KEY`);
   public-key fingerprint recorded here: `<fingerprint>` — date/actor:
 - [ ] **(5) Production fine-grained PAT issued** — `contents:write` +
-  `workflows:write` + `actions:write` on the mirror repo only; expiry noted: `<date>`;
+  `workflows:write` + `actions:write` + `pull_requests:write` (the draft
+  CI-candidate PR) + `code_scanning_alerts:read` on the mirror repo only;
+  expiry noted: `<date>`;
   rotation owner: the repository owner; provisioned via lmer credential
   provisioning (`LMER_RELEASE_GITHUB_TOKEN`, release-taskdef sessions only)
   — date/actor:
-- [ ] **(5a) Push-allow entries provisioned** — mirror `refs/heads/main` and
-  `refs/tags/*`, canonical origin `refs/tags/*`. Mirror entries must be
+- [ ] **(5a) Push-allow entries provisioned** — mirror `refs/heads/main`,
+  `refs/tags/*` and `refs/heads/release-candidate/*` (the CI candidate; without
+  a standing entry each release asks for a one-command grant), canonical
+  origin `refs/tags/*`. Mirror entries must be
   written `host/path|refpattern` — host-anchored and ref-scoped. Leg 2 adds
   the mirror as a NAMED remote and pushes through it, and the named-remote
   half of the grammar accepts a host-less `group/project` entry, which
@@ -107,9 +111,10 @@ carry the authorization the workflow used to enforce itself, and they gate.
 - [ ] **(8) Canonical repo protected tags `v*`** — configured to permit the
   release credential. Unexercised until the first release, since the
   canonical repo currently carries zero tags. A misconfiguration surfaces
-  at **leg-2 step 5**, which runs *after* the public publish is green, so
+  at **the leg-2 GitLab tag push**, which runs *after* the public publish is green, so
   it cannot burn a version — date/actor:
 - [ ] **(9) PR/issue policy + minimal collaborators on the mirror** —
-  mirror accepts no PRs; collaborators = bot + owner only. Note that the
+  mirror accepts no contributed PRs (the release run opens and never merges
+  its own draft CI-candidate PR); collaborators = bot + owner only. Note that the
   project's issue tracker may deliberately live on the mirror; decide
   rather than default — date/actor:

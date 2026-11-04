@@ -67,7 +67,9 @@ _SECRET_NAME_PATTERNS = re.compile(
 # stamps the configured hostname out of every matching URL and emits a false
 # leak warning. Known token shapes and URL userinfo remain independently
 # redacted from text regardless of the variable that carried them.
-_SECRET_VALUE_LOCATOR_NAMES = frozenset({"LMER_GITLAB_TOKEN_HOST"})
+# LMER_RELEASE_SIGNING_KEY holds the key's public container path, which the
+# docs name; read as a held secret it stops every release's leak scan.
+_SECRET_VALUE_LOCATOR_NAMES = frozenset({"LMER_GITLAB_TOKEN_HOST", "LMER_RELEASE_SIGNING_KEY"})
 
 # Known token value prefixes — match directly in text regardless of env var name.
 # Each pattern captures the full token (prefix + sufficient trailing characters).
