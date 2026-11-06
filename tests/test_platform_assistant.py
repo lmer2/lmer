@@ -312,6 +312,135 @@ def test_an_untracked_live_assistant_is_reported_as_such(platform_root):
     assert status.age_seconds is not None
 
 
+def _detach(session_id):
+    registry.update(session_id, detached={"reason": "daemon_restart", "output": "none"})
+
+
+def _multiple_logs(caplog):
+    return [r for r in caplog.records if "platform_multiple_assistants" in r.getMessage()]
+
+
+def test_a_detached_old_assistant_is_no_incumbent_and_not_reported(
+    platform_root, caplog, monkeypatch
+):
+    """#538: after a restart the previous assistant's entry stays detached, and
+    its reused pid still reads live; it must not compete with the new one."""
+    monkeypatch.setattr(assistant, "_reported_multiple", {}, raising=False)
+    registry.register("s-old", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T09:00:00Z")
+    _detach("s-old")
+    registry.register("s-new", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T10:00:00Z")
+    store.write_json(assistant.state_path(), {"session_id": "s-new"})
+
+    for _ in range(3):
+        assert assistant.status().session_id == "s-new"
+    assert _multiple_logs(caplog) == []
+
+
+def test_with_no_pointer_a_detached_old_assistant_does_not_outrank_a_new_one(
+    platform_root, caplog, monkeypatch
+):
+    """The case the candidate filter changes: nothing recorded, so the oldest
+    live entry would win, and that is the previous daemon's detached one."""
+    monkeypatch.setattr(assistant, "_reported_multiple", {}, raising=False)
+    registry.register("s-old", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T09:00:00Z")
+    _detach("s-old")
+    registry.register("s-new", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T10:00:00Z")
+
+    status = assistant.status()
+    assert status.session_id == "s-new"
+    assert status.tracked is False
+    assert _multiple_logs(caplog) == []
+
+
+def test_a_detached_assistant_that_is_the_recorded_one_stays_incumbent(platform_root):
+    """A healthy assistant that survived the restart is detached too."""
+    registry.register("s-survivor", kind=assistant.KIND, pid=os.getpid())
+    _detach("s-survivor")
+    store.write_json(assistant.state_path(), {"session_id": "s-survivor"})
+    status = assistant.status()
+    assert status.running is True
+    assert status.session_id == "s-survivor"
+    assert status.tracked is True
+
+
+def test_a_lone_untracked_detached_assistant_is_still_found(platform_root):
+    registry.register("s-orphan", kind=assistant.KIND, pid=os.getpid())
+    _detach("s-orphan")
+    assert assistant.status().session_id == "s-orphan"
+
+
+def test_two_live_assistants_are_reported_once_per_change(
+    platform_root, caplog, monkeypatch
+):
+    monkeypatch.setattr(assistant, "_reported_multiple", {}, raising=False)
+    registry.register("s-first", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T09:00:00Z")
+    registry.register("s-second", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T10:00:00Z")
+    store.write_json(assistant.state_path(), {"session_id": "s-second"})
+
+    for _ in range(3):
+        assistant.status()
+    logged = _multiple_logs(caplog)
+    assert len(logged) == 1
+    message = logged[0].getMessage()
+    assert "recorded" in message and "oldest is treated" not in message
+    assert "incumbent=s-second" in message
+
+    registry.register("s-third", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T11:00:00Z")
+    assistant.status()
+    assert len(_multiple_logs(caplog)) == 2
+
+
+def test_a_moved_pointer_is_reported_with_its_new_incumbent(
+    platform_root, caplog, monkeypatch
+):
+    """The same two assistants, but the recorded one changed: the last report
+    must not keep naming the old incumbent."""
+    monkeypatch.setattr(assistant, "_reported_multiple", {}, raising=False)
+    registry.register("s-a", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T09:00:00Z")
+    registry.register("s-b", kind=assistant.KIND, pid=os.getpid(),
+                      started_at="2026-07-27T10:00:00Z")
+    store.write_json(assistant.state_path(), {"session_id": "s-a"})
+    assistant.status()
+    store.write_json(assistant.state_path(), {"session_id": "s-b"})
+    assistant.status()
+    assistant.status()
+
+    messages = [record.getMessage() for record in _multiple_logs(caplog)]
+    assert len(messages) == 2
+    assert "incumbent=s-a" in messages[0]
+    assert "incumbent=s-b" in messages[1]
+
+
+def test_each_workspace_keeps_its_own_once_per_change_memory(
+    platform_root, caplog, monkeypatch
+):
+    """Reconcile asks once per workspace each pass; a workspace with one
+    assistant must not reset another's report and make it repeat."""
+    monkeypatch.setattr(assistant, "_reported_multiple", {}, raising=False)
+    homes = {"s-a1": "ws-a", "s-a2": "ws-a", "s-b1": "ws-b"}
+    current = {"workspace": "ws-a"}
+    monkeypatch.setattr(assistant.projects, "enabled", lambda: True)
+    monkeypatch.setattr(assistant.projects, "session_home", homes.get)
+    monkeypatch.setattr(assistant.project_context, "current", lambda: current["workspace"])
+    monkeypatch.setattr(assistant, "read_state", assistant.AssistantState)
+    for session_id in homes:
+        registry.register(session_id, kind=assistant.KIND, pid=os.getpid())
+
+    for _ in range(3):
+        for workspace in ("ws-a", "ws-b"):
+            current["workspace"] = workspace
+            assistant._live_assistant()
+    assert len(_multiple_logs(caplog)) == 1
+
+
 def test_an_unreaped_session_is_not_waited_on(platform_root):
     """The daemon is every session's parent, so its dead children are zombies.
 

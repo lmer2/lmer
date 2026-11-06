@@ -41,6 +41,8 @@ tests:
     - tests/test_consistency.py
     - tests/test_containerfile.py
     - tests/test_doctor_sources.py
+    # Runs each Stop hook named in agent-files/claude/settings.json from hooks/.
+    - tests/test_fanout_child_stop_hooks.py
     - tests/test_gate_cache.py
     - tests/test_gate_concurrency.py
     - tests/test_gate_inflight_hold.py

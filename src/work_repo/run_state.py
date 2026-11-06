@@ -1044,6 +1044,29 @@ def _lineage_session(group: Path, session: str) -> Optional[Path]:
     return _newest_record(matches)
 
 
+def unresolved_session_reason(rdir: Path, session: str) -> Optional[str]:
+    """Why an explicit *session* names no session dir, or None.
+
+    *rdir* is what :func:`run_dir` answered for it. An explicit id resumes a
+    launch (#639), so a missing directory is refused, never seeded. Found by
+    its session-id half, a directory needs a state file present; found by
+    exact name, it is resumed whatever its state.
+    """
+    if not _is_session_record(rdir) or rdir.is_dir():
+        return None
+    holder = _lineage_session(rdir.parent, session)
+    if holder is not None:
+        return (
+            f"no session dir is named {session!r}; it is a writer recorded "
+            f"in {holder.name!r} — resume that with --session "
+            f"{session_id_of(holder.name)}"
+        )
+    return (
+        f"no session dir of run {rdir.parent.name!r} is named {session!r} "
+        "(`work sessions` lists them)"
+    )
+
+
 def _session_dir(group: Path, session: Optional[str] = None) -> Path:
     """Which session dir of *group* this call writes in (D22).
 

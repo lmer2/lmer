@@ -180,6 +180,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -207,7 +208,7 @@ __all__ = [
     "read_log_at", "follow_log", "control_endpoint", "send_input", "apply_resize",
     "probe_health", "read_control_output", "session_activity",
     "session_output_state",
-    "control_plane_answers", "ACTIVITY_TIMEOUT_SECONDS",
+    "control_plane_answers", "control_plane_refused", "ACTIVITY_TIMEOUT_SECONDS",
 ]
 
 #: ``LogChunk.source``: the session wrote this log itself, from inside its
@@ -1269,6 +1270,27 @@ def control_plane_answers(session_id: str) -> bool:
     proved" rather than as "the container is gone".
     """
     return quiet_health(session_id) is not None
+
+
+def control_plane_refused(session_id: str) -> bool:
+    """Whether a TCP connect to *session_id*'s recorded control port is refused.
+
+    A raw socket, because ``requests`` honours ``HTTP_PROXY`` and would report
+    a dead proxy's refusal as this port's. Any other failure is not proof.
+    """
+    try:
+        endpoint = control_endpoint(session_id)
+    except SessionIOError:
+        return False
+    try:
+        with socket.create_connection(
+            (endpoint.host, endpoint.port), timeout=ACTIVITY_TIMEOUT_SECONDS
+        ):
+            return False
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
 
 
 def session_activity(session_id: str) -> Optional[dict]:

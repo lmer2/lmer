@@ -51,7 +51,7 @@ import os
 import re
 import secrets
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import SCHEMA_VERSION
 from .store import (
@@ -444,7 +444,7 @@ def remove(session_id: str, *, force: bool = False) -> bool:
     return True
 
 
-def prune_dead() -> list[str]:
+def prune_dead(gone: Optional[Callable[[dict], bool]] = None) -> list[str]:
     """Remove entries whose session process is gone. Returns the ids removed.
 
     The explicit reclaim path (see the module docstring): unique session ids mean
@@ -457,13 +457,18 @@ def prune_dead() -> list[str]:
     exactly that), so discarding it is an acknowledgement the operator makes, not
     housekeeping that quietly erases a crash nobody saw.
 
-    ``force=True`` because the sessions being pruned are dead by definition, and
+    ``force=True`` because the sessions being pruned are dead (or, through
+    *gone*, have lost their control plane), and
     their entries are frequently owned by a *previous* daemon process; refusing
     to clean those up is exactly the litter this exists to remove.
+
+    *gone* also condemns an entry whose pid still reads live, for the caller
+    that can ask more than the pid (the control-plane probe this module cannot
+    import, #538).
     """
     removed: list[str] = []
     for entry in list_sessions(live_only=False):
-        if entry.get("live"):
+        if entry.get("live") and not (gone and gone(entry)):
             continue
         session_id = entry.get("id")
         if not isinstance(session_id, str):

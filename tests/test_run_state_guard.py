@@ -513,6 +513,9 @@ GUARD_ENV_VARS = (
     "LMER_REPO_PROJECT",
     "LMER_SESSION_ID",
     "LMER_WORK_REPO_PATH",
+    # A headless session running the suite exports it, and the hook skips.
+    "LMER_NONINTERACTIVE",
+    "LMER_FANOUT_CHILD",
 )
 
 

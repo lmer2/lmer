@@ -78,6 +78,11 @@ CODEX_SEED_ERROR_ENV = "LMER_CODEX_CONFIG_SEED_ERROR"
 #: readers, matching every other boolean ``LMER_*`` variable.
 NONINTERACTIVE_ENV = "LMER_NONINTERACTIVE"
 
+#: Set only on ``spawn-harness`` children, whose captured output is their last
+#: turn, so lmer's Stop hooks can stand down for them without also standing
+#: down for a headless top-level session (#323).
+FANOUT_CHILD_ENV = "LMER_FANOUT_CHILD"
+
 #: Word-bounded, case-insensitive model-name words that imply a harness, in
 #: match order. Used only when neither ``--harness`` nor ``LMER_HARNESS`` is
 #: set: a model family name is usually enough to pick the right CLI

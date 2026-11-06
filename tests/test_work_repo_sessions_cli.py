@@ -675,8 +675,48 @@ class TestASessionIsContinuedByName:
         """The CLI keeps no grammar of its own: the `--<name>` half of a
         session dir is unconstrained and a launcher's out-of-form id is used
         verbatim, so a second rule here would refuse ids that are on disk."""
+        _write_record(group / SLUG / "s-cli-1")
         assert _main(["session-start", "--session", "s-cli-1"]) == 0
-        assert (group / SLUG / "s-cli-1" / run_state.STATE_FILE).exists()
+        assert "session_start" in _event_types(group / SLUG / "s-cli-1")
+
+    def test_a_session_dir_with_unreadable_state_is_still_resumed(self, group):
+        """The dir is that launch's even when its state was set aside as
+        corrupt; session start reseeds it in place rather than refusing."""
+        named = group / SLUG / SESSION_IDS[0]
+        (named / run_state.STATE_FILE).rename(named / "state.yaml.bad-1")
+        assert _main(["session-start", "--session", SESSION_IDS[0]]) == 0
+        assert "session_start" in _event_types(named)
+        assert _dirs_in(group / SLUG) == sorted(SESSION_IDS)
+
+    @pytest.mark.parametrize(
+        "case", ["lineage-only id", "mistyped name half"]
+    )
+    def test_an_id_naming_no_session_dir_is_refused_and_seeds_nothing(
+        self, group, capsys, case
+    ):
+        """#639: an explicit `--session` that resolves to no session dir is
+        refused, never seeded as a fresh record at the address it names."""
+        named = group / SLUG / SESSION_IDS[0]
+        if case == "lineage-only id":
+            _write_record(named, **{run_state.SESSIONS_FIELD: ["s-lineage-1"]})
+            asked = "s-lineage-1"
+        else:
+            named = named.rename(group / SLUG / f"{SESSION_IDS[0]}--the-name")
+            asked = f"{SESSION_IDS[0]}--the-nmae"
+        before = {
+            child.name: _state_of(child) for child in (group / SLUG).iterdir()
+        }
+
+        assert _main(["session-start", "--session", asked]) != 0
+
+        err = capsys.readouterr().err
+        assert asked in err and "no session dir" in err
+        if case == "lineage-only id":
+            assert named.name in err
+        assert {
+            child.name: _state_of(child) for child in (group / SLUG).iterdir()
+        } == before
+        assert not (run_state.runs_base() / SLUG / SID_RESUMED).exists()
 
     @pytest.mark.parametrize("bad", [".", "..", "", "a/b", "2026*", "sid?"])
     def test_an_unusable_id_is_a_clean_refusal(self, group, capsys, bad):

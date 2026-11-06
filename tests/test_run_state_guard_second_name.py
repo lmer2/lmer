@@ -317,6 +317,9 @@ class TestNoProjectImports:
 # ---- end to end: main() finds the schema-form run dir -----------------------------
 
 GUARD_ENV_VARS = (
+    # A headless session running the suite exports them, and the hook skips.
+    "LMER_NONINTERACTIVE",
+    "LMER_FANOUT_CHILD",
     "LMER_RUN_STATE_GUARD",
     "LMER_REPO_HOST",
     "LMER_REPO_PROJECT",
