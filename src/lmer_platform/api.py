@@ -5897,7 +5897,7 @@ def create_app(
         stays visible, so discarding it is an acknowledgement the operator makes
         explicitly rather than a side effect of refreshing the view.
         """
-        removed = prune_dead()
+        removed = prune_dead(gone=reattach.gone_since_restart)
         return {"removed": removed, "count": len(removed)}
 
     return app

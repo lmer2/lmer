@@ -462,8 +462,20 @@ stops to ask still ends its turn normally and reports success. Reading a
 half-finished answer as half-finished is a judgment about content — a job for a
 model, not a heuristic. Issue #153 tracks what the harnesses *can* report
 structurally (turn-limit truncation, in-band errors); issue #138 covers the
-hook-side session signal for sessions that fire hooks, which `spawn-harness`
-children do not.
+hook-side session signal for sessions that fire hooks.
+
+A claude `spawn-harness` child does fire hooks: it shares the parent's
+settings, so it runs the same Stop hooks, and a hook that blocks its stop
+replaces the child's captured last turn with its answer to the hook (#323).
+So every lmer Stop hook stands down in a child. `run_state_guard` and
+`slack_reply_guard` key on `LMER_FANOUT_CHILD`, which only `spawn-harness`
+sets, so a headless top-level session keeps their nudges. `signal_guard` and
+the Codex `codex_ask_guard` key on `LMER_NONINTERACTIVE`.
+`tests/test_fanout_child_stop_hooks.py` runs every Stop hook listed in
+`agent-files/claude/settings.json` in a child's environment, and fails when
+one is added there without a skip. `codex_ask_guard`'s skip is covered by its
+own tests. The child's output is still only its last turn: a hook from outside
+lmer that blocks the stop can still replace it.
 
 Without `--output` the same check still applies (issue #152). The child's
 stdout is *teed* rather than inherited: every byte is forwarded to

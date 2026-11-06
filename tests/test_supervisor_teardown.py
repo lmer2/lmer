@@ -497,3 +497,41 @@ def test_blocked_quit_write_cannot_hold_escalation(monkeypatch):
         assert not worker.is_alive()
     assert escalated_while_blocked
     assert killed == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_an_xoff_typed_through_the_input_route_does_not_stall_output(supervised, tmp_path):
+    """#549: a stray Ctrl-S (XOFF) from the browser terminal reaches the session
+    PTY through ``/input``; with software flow control on, it stopped all output
+    until an XON arrived. Run under ``manual_start`` so nothing else touches the
+    PTY's termios first."""
+    gate = tmp_path / "xoff-sent"
+    child = (
+        "import os, time\n"
+        "os.write(1, b'ready\\n')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(.005)\n"
+        "os.write(1, b'after-xoff\\n')\n"
+    )
+
+    def output(observed):
+        return observed["output"].read_since(0, timeout=0)[0]
+
+    def type_xoff(_stdin, observed):
+        with TestClient(observed["app"]) as client:
+            headers = {"Authorization": "Bearer teardown-control-test-key"}
+            deadline = time.monotonic() + JOIN
+            while b"ready" not in output(observed):
+                assert time.monotonic() < deadline, observed["evidence"]()
+                time.sleep(.005)
+            assert client.post("/input", json={"data": "\x13"},
+                               headers=headers).status_code == 200
+            gate.touch()
+            deadline = time.monotonic() + JOIN
+            while b"after-xoff" not in output(observed):
+                if time.monotonic() >= deadline:
+                    client.post("/input", json={"data": "\x11"}, headers=headers)
+                    raise AssertionError("output stalled after XOFF: " + observed["evidence"]())
+                time.sleep(.005)
+
+    result, _ = supervised(child, driver=type_xoff)
+    assert result["exit_code"] == 0

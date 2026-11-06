@@ -473,6 +473,16 @@ own `/healthz` probe over the pid check — the session control plane answers
 it for as long as it is up, and it is namespace-independent. Nothing in
 this doc should be read as claiming that already works.
 
+What does work since #538: an entry re-attach marked `detached` is treated
+as one inherited from a previous daemon, whatever its pid says. `POST
+/api/prune` removes such an entry when a plain TCP connect to its recorded
+control port is refused. It is not an HTTP call, so a configured proxy
+cannot answer for the port. A timeout, any other socket error, or a missing
+port or token keeps the entry. The assistant lookup lets a detached
+assistant win only when it is the recorded one or nothing else is live.
+`platform_multiple_assistants` is logged once per change of the competing
+set or of the incumbent, not on every poll.
+
 ## Spike runbook
 
 The point of the walk is to confirm or refute seven predictions with

@@ -343,7 +343,7 @@ from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 from lmer_cli.comms import assistant_display_name
 
-from . import ask, assistant_history, containers, memory, registry, spawn, statusline
+from . import ask, assistant_history, containers, memory, reattach, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -549,6 +549,11 @@ _PUBLICATION_LOCK = threading.RLock()
 #: Each load replaces its spool's entry with the notes it just read, so a taken
 #: note leaves the memo; a change in the credentials masked by value empties it.
 _SCRUBBED_NOTES: dict = {}
+
+#: Per workspace, the competing ids and the incumbent last reported as more than
+#: one assistant, so a poll logs the condition once per change rather than on
+#: every call (#538).
+_reported_multiple: dict[str, tuple[tuple[str, ...], str]] = {}
 
 
 
@@ -1221,6 +1226,10 @@ def _live_assistant() -> Optional[dict]:
     :func:`status` start reporting a different session id from one call to the
     next; otherwise the oldest live one is the incumbent. More than one is
     logged, because it means something upstream let two starts through.
+
+    A detached entry (inherited from a previous daemon) competes only when it is
+    the recorded one or nothing else is live: its pid may have been reused, so
+    it must not crowd out the assistant this daemon started (#538).
     """
     workspace_id = project_context.current() or projects.GENERAL
     live = [
@@ -1229,18 +1238,31 @@ def _live_assistant() -> Optional[dict]:
         and (not projects.enabled() or projects.session_home(entry["id"]) == workspace_id)
     ]
     if not live:
+        _reported_multiple.pop(workspace_id, None)
         return None
-    if len(live) > 1:
-        logger.error(
-            "platform_multiple_assistants ids=%s — one assistant at a time (D11); "
-            "the oldest is treated as the incumbent",
-            ",".join(str(entry.get("id")) for entry in live),
-        )
     recorded = read_state().session_id
-    for entry in live:
-        if recorded and entry.get("id") == recorded:
-            return entry
-    return live[0]
+    candidates = [
+        entry for entry in live
+        if (recorded and entry.get("id") == recorded)
+        or reattach.detached_record(entry) is None
+    ] or live
+    incumbent = next(
+        (entry for entry in candidates if recorded and entry.get("id") == recorded),
+        candidates[0],
+    )
+    ids = tuple(str(entry.get("id")) for entry in candidates)
+    reported = (ids, str(incumbent.get("id")))
+    if len(ids) > 1 and reported != _reported_multiple.get(workspace_id):
+        logger.error(
+            "platform_multiple_assistants ids=%s incumbent=%s — one assistant at a "
+            "time (D11); the recorded assistant is the incumbent, else the oldest",
+            ",".join(ids), incumbent.get("id"),
+        )
+    if len(ids) > 1:
+        _reported_multiple[workspace_id] = reported
+    else:
+        _reported_multiple.pop(workspace_id, None)
+    return incumbent
 
 
 def status() -> AssistantStatus:

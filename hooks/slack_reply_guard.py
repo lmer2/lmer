@@ -12,6 +12,7 @@ import os
 import sys
 
 from lmer_cli.routing_receipts import delivered, prepare_bash
+from lmer_cli.util import get_bool_env
 
 # Ignore short working acknowledgments.
 MIN_SUBSTANTIVE_CHARS = 40
@@ -169,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
         if prepared:
             json.dump(prepared, sys.stdout)
             sys.stdout.write("\n")
+        return 0
+
+    # A spawn-harness child reports to its parent, not the chat, and its
+    # captured output is only its last turn: a block replaces it (#323).
+    if get_bool_env("LMER_FANOUT_CHILD"):
         return 0
 
     transcript_path = payload.get("transcript_path")

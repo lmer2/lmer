@@ -73,6 +73,7 @@ from typing import Dict, Optional
 from lmer_cli.harness import (
     HARNESS_ENV,
     LLM_NAME_ENV,
+    FANOUT_CHILD_ENV,
     NONINTERACTIVE_ENV,
     Harness,
     build_exec_argv,
@@ -223,6 +224,9 @@ def build_child_env(
     its turn on ``Shall I proceed? (yes/no)`` exits 0 with a near-empty output
     file, so the orchestrator consolidates from N-1 agents with nothing to
     show it lost one.
+
+    ``LMER_FANOUT_CHILD`` is set last for the same reason. It stands down the
+    Stop hooks that would replace the child's captured last turn (#323).
     """
     # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
     from work_repo import session_record
@@ -252,6 +256,7 @@ def build_child_env(
     ):
         child.pop(key, None)
     child[NONINTERACTIVE_ENV] = "1"
+    child[FANOUT_CHILD_ENV] = "1"
     _expand_spawn_time_model(child, extra_env)
     return child
 

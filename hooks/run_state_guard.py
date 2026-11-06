@@ -802,6 +802,11 @@ def main(argv: list[str] | None = None) -> int:
     if not env_flag(os.environ.get("LMER_RUN_STATE_GUARD")):
         return 0
 
+    # A spawn-harness child's captured output is only its last turn: a block
+    # here replaces the findings its parent is waiting for (#323).
+    if env_flag(os.environ.get("LMER_FANOUT_CHILD"), default=False):
+        return 0
+
     # Gate: run context plus the work CLI. Without either there is no run
     # state to check and no safe way to check it.
     host = os.environ.get("LMER_REPO_HOST", "").strip()

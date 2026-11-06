@@ -1,0 +1,5 @@
+fixed:
+- "`work session-start --session <id>` now refuses an id that names no session instead of seeding a phantom run."
+- "A stray Ctrl-S in a platform terminal no longer freezes the session's output."
+- "After a daemon restart, `prune` removes a stale session whose control port refuses connections, and duplicate-assistant errors stop repeating every poll."
+- "Fan-out children are no longer prompted by lmer's Stop hooks, so their findings are not replaced by a reply to the hook."

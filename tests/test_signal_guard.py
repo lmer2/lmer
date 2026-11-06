@@ -837,6 +837,8 @@ GUARD_ENV_VARS = (
     # file (#407), so a stray one from anywhere in the suite decides these
     # tests' outcome instead of the fixture.
     "LMER_COMMS_LOG",
+    # A headless session running the suite exports it, and the hook skips.
+    "LMER_NONINTERACTIVE",
 )
 
 

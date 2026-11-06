@@ -219,6 +219,7 @@ from .session_io import (
     SessionIOError,
     apply_resize,
     canonical_log,
+    control_plane_refused,
     probe_health,
     read_control_output,
 )
@@ -236,8 +237,8 @@ __all__ = [
     "OUTPUT_POLL_SECONDS", "FAILURE_BACKOFF_SECONDS", "MAX_CONSECUTIVE_FAILURES",
     "REATTACH_ROWS", "REATTACH_COLS",
     "ReattachReport", "ControlDrain",
-    "detached_record", "mark_detached", "seam_marker", "dropped_marker",
-    "reattach_session", "reattach_all", "active_drains", "startup_notice",
+    "detached_record", "gone_since_restart", "mark_detached", "seam_marker",
+    "dropped_marker", "reattach_session", "reattach_all", "active_drains", "startup_notice",
 ]
 
 #: Why a session detached. One value today; named rather than inlined because the
@@ -345,6 +346,19 @@ def detached_record(entry: Optional[dict]) -> Optional[dict]:
         return None
     record = entry.get("detached")
     return record if isinstance(record, dict) else None
+
+
+def gone_since_restart(entry: Optional[dict]) -> bool:
+    """Whether *entry* is a detached session whose control plane is gone.
+
+    A detached entry's pid comes from a previous daemon and may be reused or
+    another user's, so only a refused control port is evidence (#538). A
+    container whose host ``lmer`` is still tearing down also reads as gone.
+    """
+    if detached_record(entry) is None:
+        return False
+    session_id = entry.get("id")
+    return isinstance(session_id, str) and control_plane_refused(session_id)
 
 
 def mark_detached(

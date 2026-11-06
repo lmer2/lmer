@@ -153,7 +153,9 @@ nudges:
   forever.
 
 Kill switch: `LMER_RUN_STATE_GUARD` with `get_bool_env` semantics — unset or
-truthy enables the guard; `LMER_RUN_STATE_GUARD=0` disables it.
+truthy enables the guard; `LMER_RUN_STATE_GUARD=0` disables it. Fan-out
+children (`LMER_FANOUT_CHILD`, set by `spawn-harness`) are skipped. Their
+captured output is their last turn, so a block would replace it (#323).
 
 The hook fails open: unreadable payload, git errors, `work` failures, or
 sentinel/counter I/O errors all result in exit 0 with no output. It only

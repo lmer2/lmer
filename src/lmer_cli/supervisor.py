@@ -735,6 +735,17 @@ def _preconfigure_pty_for_injection(fd: int) -> None:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
+def _disable_flow_control(fd: int) -> None:
+    """Clear ``IXON``/``IXOFF``/``IXANY`` on the PTY at creation, so a Ctrl-S
+    typed in the browser is not an XOFF that stops all output (#549). A harness
+    restoring the PTY's original modes then restores them off.
+    """
+    with contextlib.suppress(termios.error, OSError):
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
     """Return ``(rows, cols)`` for ``fd`` or ``None`` if unavailable."""
     try:
@@ -2894,6 +2905,8 @@ def _run_supervisor(
         slave_path: Optional[str] = os.ttyname(slave_fd)
     except OSError:
         slave_path = None
+
+    _disable_flow_control(slave_fd)
 
     # Pre-clear ICRNL/ECHO/ICANON before fork so the auto-/start injection that
     # fires shortly after spawn isn't mangled by the PTY's default cooked-mode

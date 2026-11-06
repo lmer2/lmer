@@ -4316,7 +4316,9 @@ def _source_slug_warning(context: dict, slug: str | None) -> str | None:
 @work_transaction
 def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
-    ALWAYS exits 0 — a broken state layer must never break session start.
+    exits 0 — a broken state layer must never break session start. A refusal
+    exits 2: a schema-2 start refused by the state layer, or an explicit
+    `--session` naming no session dir (#639), which the hook never passes.
 
     `--session` is the D22 resume handshake, and it happens exactly once per
     launch: the named record is the one this session continues, and
@@ -4333,6 +4335,7 @@ def cmd_session_start(session: str | None = None) -> int:
     except SchemaContextError as exc:
         print(f"No run context: {exc} — run state skipped")
         return 0
+    explicit = session
     try:
         session = _launch_session(session)
         rdir = run_state.run_dir(session=session)
@@ -4341,6 +4344,13 @@ def cmd_session_start(session: str | None = None) -> int:
         # consequence is. Hook-facing: reported, never raised, still 0.
         print(f"⚠️  run-state session-start skipped: {exc}")
         return 0
+    if explicit and rdir is not None:
+        # Only an operator passes --session (the hook never does), so this
+        # refusal can be loud without breaking session start.
+        reason = run_state.unresolved_session_reason(rdir, explicit)
+        if reason:
+            print(f"Session start refused: {reason}", file=sys.stderr)
+            return 2
     if rdir is None:
         # The cause, not a guess at it. `hooks/start.py` runs this verb with
         # `capture_output=True` and injects its STDOUT into the agent's
