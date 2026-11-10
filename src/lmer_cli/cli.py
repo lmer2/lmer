@@ -3696,6 +3696,10 @@ def main(argv: list[str] | None = None) -> int:
         # runs in the container, so a host-side value that stopped at the
         # boundary would leave the operator unable to turn the nudge off.
         "LMER_SIGNAL_GUARD": os.environ.get("LMER_SIGNAL_GUARD"),
+        # Configure the run's own usage record, written in the container (#647).
+        "LMER_USAGE": os.environ.get("LMER_USAGE"),
+        "LMER_USAGE_CHECKPOINT_SECONDS": os.environ.get("LMER_USAGE_CHECKPOINT_SECONDS"),
+        "LMER_USAGE_IDLE_SECONDS": os.environ.get("LMER_USAGE_IDLE_SECONDS"),
         # Gate-in-flight coordination (issue #201): the kill switch for the
         # work-repo commit deferral and the Stop hook's matching nudge
         # suppression, and the marker directory both sides read. Both must

@@ -45,6 +45,7 @@ try:
     from work_repo import write_journal
 except ImportError as exc:  # pragma: no cover — needs a pre-#233 install
     raise ImportError(_OUTDATED_TREE_MSG) from exc
+from work_repo import usage as work_usage
 
 if "journal_only" not in inspect.signature(gate_lock.hold_gate_lock).parameters:
     # Same skew, other module: write_journal may exist while gate_lock is
@@ -833,6 +834,38 @@ def isolate_runtime_state(tmp_path_factory):
         yield
     finally:
         runtime._LMER_STATE_DIR = original
+
+
+#: Read at import, before any test moves LMER_WORK_REPO_PATH.
+OPERATIONAL_WORK_REPO = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work")).resolve()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_usage_transcripts():
+    """Keep the container's own harness transcripts out of every usage write.
+
+    ``work commit`` and ``work session-end`` summarise the session's
+    transcripts into its usage record (#647). Under test that would read the
+    real session's transcripts into tmp run dirs; tests that want usage stub
+    ``work_repo.usage.session_dirs`` themselves.
+
+    A test calling those in-process with the session's own env would also
+    write a zero record over the running session's real one, so a run dir
+    inside the operational work repo has no usage context at all.
+    """
+    operational = OPERATIONAL_WORK_REPO
+    original_dirs, original_context = work_usage.session_dirs, work_usage._context
+
+    def context():
+        found = original_context()
+        if found is not None and Path(found[0]).resolve().is_relative_to(operational):
+            return None
+        return found
+
+    work_usage.session_dirs = lambda: []
+    work_usage._context = context
+    yield
+    work_usage.session_dirs, work_usage._context = original_dirs, original_context
 
 
 @pytest.fixture(autouse=True, scope="session")

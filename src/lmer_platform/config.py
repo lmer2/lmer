@@ -274,6 +274,16 @@ ENV_STALL_IDLE_SECONDS = "LMER_PLATFORM_STALL_IDLE_SECONDS"
 ENV_STALL_BACKSTOP_SECONDS = "LMER_PLATFORM_STALL_BACKSTOP_SECONDS"
 ENV_STUCK_TEARDOWN_SECONDS = "LMER_PLATFORM_STUCK_TEARDOWN_SECONDS"
 
+#: The live usage view (#315; docs/USAGE-TRACKING.md): whether the collector
+#: runs, how often it reads transcripts, the window the headroom projection
+#: fits over, and the operator's price table (no defaults ship).
+ENV_USAGE = "LMER_PLATFORM_USAGE"
+ENV_USAGE_INTERVAL = "LMER_PLATFORM_USAGE_INTERVAL"
+ENV_USAGE_PROJECTION_MINUTES = "LMER_PLATFORM_USAGE_PROJECTION_MINUTES"
+ENV_USAGE_PRICES = "LMER_PLATFORM_USAGE_PRICES"
+DEFAULT_USAGE_INTERVAL_SECONDS = 30
+DEFAULT_USAGE_PROJECTION_MINUTES = 30
+
 #: How the orchestrating assistant's session is *run*, per platform instance
 #: (issue #234): the model, reasoning effort, harness, preset and agents fan-out
 #: its ``lmer`` invocation is given. Exactly the launch facts a worker spawn
@@ -629,6 +639,11 @@ class PlatformConfig:
     stall_idle_seconds: int = DEFAULT_STALL_IDLE_SECONDS
     stall_backstop_seconds: int = DEFAULT_STALL_BACKSTOP_SECONDS
     stuck_teardown_seconds: int = DEFAULT_STUCK_TEARDOWN_SECONDS
+    #: The live usage view (#315); see :data:`ENV_USAGE` and its neighbours.
+    usage_enabled: bool = True
+    usage_interval_seconds: int = DEFAULT_USAGE_INTERVAL_SECONDS
+    usage_projection_minutes: int = DEFAULT_USAGE_PROJECTION_MINUTES
+    usage_prices_path: Optional[str] = None
     autonomous_default: bool = False
     park_idle_side: bool = False
     #: How the orchestrating assistant's session is run (issue #234) — see
@@ -787,6 +802,8 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         "max_live_assistants",
         "max_followup_rounds",
         "stuck_teardown_seconds",
+        "usage_interval_seconds",
+        "usage_projection_minutes",
     ):
         value = getattr(config, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -1395,6 +1412,9 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "stall_idle_seconds": _env_int(ENV_STALL_IDLE_SECONDS),
         "stall_backstop_seconds": _env_int(ENV_STALL_BACKSTOP_SECONDS),
         "stuck_teardown_seconds": _env_int(ENV_STUCK_TEARDOWN_SECONDS),
+        "usage_interval_seconds": _env_int(ENV_USAGE_INTERVAL),
+        "usage_projection_minutes": _env_int(ENV_USAGE_PROJECTION_MINUTES),
+        "usage_prices_path": _env_str(ENV_USAGE_PRICES),
         # Not `_env_int`: it raises, which is right for a bind port and wrong
         # for a reminder interval. Cleaned here rather than in ``_validate`` so
         # an unusable export costs its own layer and lets ``config.json`` show
@@ -1432,6 +1452,8 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
 
     if os.environ.get(ENV_AUTONOMOUS, "").strip():
         values["autonomous_default"] = get_bool_env(ENV_AUTONOMOUS)
+    if os.environ.get(ENV_USAGE, "").strip():
+        values["usage_enabled"] = get_bool_env(ENV_USAGE, True)
 
     if overrides:
         unknown = set(overrides) - known

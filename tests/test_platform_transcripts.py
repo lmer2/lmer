@@ -4266,3 +4266,102 @@ def test_codex_wrapper_meaningful_results_and_errors_stay_visible(output, status
     assert call.status == status and call.detail
     assert call.raw_output == output
     assert bool(call.error) == (status == 'failed')
+
+
+# Fan-out children (#647 Q6) keep their transcripts in a reserved
+# subtree of the parent's transcript dir; they are never the parent's chat.
+
+CHILD = "0123456789abcdef0123456789abcdef"
+CHILD_UUID = "01234567-89ab-cdef-0123-456789abcdef"
+
+
+def plant_child(session_id, *, harness_dir="claude", in_flight=False):
+    """A child conversation in *session_id*'s dir: inside ``.lmer-children``,
+    or (``in_flight``) a claude child still at its original place."""
+    base = transcripts.session_transcript_dir(session_id) / harness_dir
+    child_dir = base / ".lmer-children" / CHILD
+    child_dir.mkdir(parents=True, exist_ok=True)
+    if in_flight:
+        target = base / "-workspace" / f"{CHILD_UUID}.jsonl"
+        sub = base / "-workspace" / CHILD_UUID / "subagents" / "agent-a1.jsonl"
+    else:
+        target = child_dir / "-workspace" / f"{CHILD_UUID}.jsonl"
+        sub = child_dir / "-workspace" / CHILD_UUID / "subagents" / "agent-a1.jsonl"
+    for path in (target, sub):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join([
+            turn_line("user", "child prompt: review the diff", at="2026-08-11T10:09:00.000Z"),
+            turn_line("assistant", "child answer: no findings", at="2026-08-11T10:09:30.000Z"),
+        ]) + "\n", encoding="utf-8")
+    return target, sub
+
+
+def plant_parent(session_id):
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir(session_id) / "claude" / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "fedcba98-7654-3210-fedc-ba9876543210.jsonl"
+    target.write_text("\n".join([
+        turn_line("user", "parent prompt", at="2026-08-11T10:00:00.000Z"),
+        turn_line("assistant", "parent answer", at="2026-08-11T10:00:05.000Z"),
+    ]) + "\n", encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize("in_flight", [False, True], ids=["moved", "in-flight"])
+def test_a_child_transcript_is_not_a_source_of_its_parent(platform_root, in_flight):
+    parent = plant_parent("s-kids1")
+    child, sub = plant_child("s-kids1", in_flight=in_flight)
+    located = [s.path for s in transcripts.locate_sources("s-kids1")]
+    assert located == [parent]
+    directory = transcripts.session_transcript_dir("s-kids1")
+    assert transcripts.is_child_transcript(child, directory)
+    assert transcripts.is_child_transcript(sub, directory)
+    assert not transcripts.is_child_transcript(parent, directory)
+
+
+@pytest.mark.parametrize("in_flight", [False, True], ids=["moved", "in-flight"])
+def test_the_parents_chat_and_tail_never_show_a_child(platform_root, in_flight):
+    plant_parent("s-kids2")
+    child, _ = plant_child("s-kids2", in_flight=in_flight)
+    # The child is newer: a newest-file pick would otherwise land on it.
+    os.utime(child, (time.time() + 60, time.time() + 60))
+    page = transcripts.read_messages("s-kids2", limit=100)
+    texts = [m["text"] if isinstance(m, dict) else m.text for m in page.to_dict()["messages"]]
+    assert "parent answer" in texts
+    assert not any("child" in (text or "") for text in texts)
+    turn = transcripts.last_turn("s-kids2")
+    assert turn is not None and turn.text == "parent answer"
+
+
+def test_a_pi_child_under_its_harness_dir_is_excluded_too(platform_root):
+    parent = plant_parent("s-kids3")
+    child_dir = transcripts.session_transcript_dir("s-kids3") / "pi" / ".lmer-children" / CHILD
+    child_dir.mkdir(parents=True)
+    (child_dir / "2026-08-11_x.jsonl").write_text(turn_line("user", "child"), encoding="utf-8")
+    assert [s.path for s in transcripts.locate_sources("s-kids3")] == [parent]
+
+
+def test_a_childs_transcript_is_still_scrubbed(platform_root):
+    plant_parent("s-kids4")
+    child, _ = plant_child("s-kids4")
+    child.write_text(LEAKY_TRANSCRIPT, encoding="utf-8")
+    transcripts.scrub_session_transcripts("s-kids4")
+    for leaked in LEAKED:
+        assert leaked not in child.read_text(encoding="utf-8")
+
+
+def test_a_child_dir_hides_nothing_outside_its_own_session(platform_root):
+    plant_child("s-kids5", in_flight=True)
+    other = transcripts.session_transcript_dir("s-kids6") / "claude" / "-workspace"
+    other.mkdir(parents=True)
+    same_name = other / f"{CHILD_UUID}.jsonl"
+    same_name.write_text(turn_line("user", "another session"), encoding="utf-8")
+    registry.register("s-kids6", pid=DEAD_PID, run=dict(RUN))
+    assert [s.path for s in transcripts.locate_sources("s-kids6")] == [same_name]
+
+
+def test_a_uuid_named_file_without_a_child_dir_is_the_parents(platform_root):
+    parent = plant_parent("s-kids7")
+    (transcripts.session_transcript_dir("s-kids7") / "claude" / ".lmer-children").mkdir()
+    assert [s.path for s in transcripts.locate_sources("s-kids7")] == [parent]

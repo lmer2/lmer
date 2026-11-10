@@ -785,6 +785,11 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     None of them is the drawer either: they choose which project the page lands
     on, and the landing screen is still the fleet with the drawer closed.
 
+    ``lmer.fleet.order`` (#315) is whether the run list is shown as listed or
+    ranked "most expensive now". A reading preference like the fleet view: it
+    reorders rows the screen already has, fetches nothing, and defaults to as
+    listed.
+
     What stays true is the actual rule: nothing writes the drawer's own open
     state, so closing it is still forgotten by the next load.
     """
@@ -796,7 +801,7 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     assert set(keys) == {
         "THEME_STORAGE_KEY", "NARROW_STORAGE_KEY", "FLEET_VIEW_STORAGE_KEY",
         "COLLAPSED_PROJECTS_STORAGE_KEY", "LAST_PROJECT_STORAGE_KEY",
-        "DEFAULT_PROJECT_STORAGE_KEY",
+        "DEFAULT_PROJECT_STORAGE_KEY", "LIST_ORDER_STORAGE_KEY",
     }, (
         f"the shell now stores {sorted(set(keys))}; the drawer's open state is "
         "deliberately not remembered, and a further key here is a decision"

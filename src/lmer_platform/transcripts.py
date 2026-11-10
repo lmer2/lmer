@@ -278,6 +278,7 @@ from typing import Iterable, Iterator, Optional
 from ask_channel.protocol import KIND_QUESTION, AskError
 from lmer_cli import comms as bus
 from lmer_cli.threads import ThreadError, parse_thread
+from lmer_usage import children, shape
 
 from . import ask, assistant_history, registry, runs, uploads
 from .config import active_assistant_credential, active_secret
@@ -297,7 +298,7 @@ __all__ = [
     "MAX_MESSAGES_PER_SOURCE", "MAX_SOURCES", "TOOL_STATUSES", "MESSAGE_KINDS",
     "ASK_CHANNEL_VIA", "COMMS_VIA", "MONITOR_VIA", "MONITOR_ROLE", "PLATFORM_ROLE",
     "ToolCall", "Message", "Source", "MessagePage",
-    "transcript_root", "session_transcript_dir", "locate_sources",
+    "transcript_root", "session_transcript_dir", "locate_sources", "is_child_transcript",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
     "scrub_transcript", "scrub_session_transcripts", "scrub_credentials",
     "LAST_TURN_TAIL_BYTES", "last_turn",
@@ -444,32 +445,18 @@ MONITOR_ROLE = "monitor"
 #: attribution; ordinary occurrences later in a message remain operator text.
 PLATFORM_ROLE = "platform"
 
-#: Record ``type`` values each harness writes. Disjoint, which is what makes the
-#: dispatch per record (:func:`_harness_of_record`) rather than per file. Each
-#: set names the harness's *bookkeeping* types as well as its conversation ones,
-#: so a session that has so far written only its header is still labelled by what
-#: wrote it — and so a type this build has never seen stays unrecognised instead
-#: of being handed to whichever adapter guessed first.
-#: ``attachment`` is a turn when it delivers a queued command (see
-#: :data:`_QUEUED_COMMAND_ATTACHMENT`); ``queue-operation`` never is, but it is
-#: still claude's bookkeeping and belongs to claude's vocabulary — leaving it
-#: out would let a queue-heavy transcript open with rows no format claims.
-_CLAUDE_RECORD_TYPES = frozenset({
-    "user", "assistant", "system", "attachment", "queue-operation",
-})
-_PI_RECORD_TYPES = frozenset({
-    "session", "model_change", "thinking_level_change", "message",
-})
-_CODEX_RECORD_TYPES = frozenset({
-    "session_meta", "response_item", "event_msg", "turn_context", "world_state",
-})
+#: Record ``type`` values each harness writes, shared with the usage adapters so
+#: both read one dispatch rule (:mod:`lmer_usage.shape`).
+_CLAUDE_RECORD_TYPES = shape.CLAUDE_RECORD_TYPES
+_PI_RECORD_TYPES = shape.PI_RECORD_TYPES
+_CODEX_RECORD_TYPES = shape.CODEX_RECORD_TYPES
 
 #: The canonical vocabulary — "lmer transcript format", version 1 (#296). Not a
 #: harness's dialect but this platform's own, written by a drop-in's in-container
 #: converter and the one format here that is a public contract
 #: (``docs/TRANSCRIPT-FORMAT.md``). Namespaced so it can never collide with a
 #: harness's own types, which claim bare words.
-_LMER_RECORD_TYPES = frozenset({"lmer.meta", "lmer.message", "lmer.tool_update"})
+_LMER_RECORD_TYPES = shape.LMER_RECORD_TYPES
 
 #: The canonical-format version this build speaks. A file's ``lmer.meta`` states
 #: its own (``format``), and a *higher* number is the one thing that cannot be
@@ -489,12 +476,12 @@ _LMER_FORMAT = 1
 #: falling through to "nobody recognises this" would make a version-2 file read as
 #: a format this build cannot open at all — the one wrong answer, since every
 #: record it *does* understand is still readable.
-_LMER_TYPE_PREFIX = "lmer."
+_LMER_TYPE_PREFIX = shape.LMER_TYPE_PREFIX
 
 #: What labels a canonical file that declares no usable ``lmer.meta``: the
 #: format's name, since the one thing known about such a writer is which format
 #: it chose. A valid meta record replaces it with the drop-in's own harness name.
-_LMER_HARNESS = "lmer"
+_LMER_HARNESS = shape.LMER_HARNESS
 
 #: The roles a canonical record may claim — the ones the view knows how to title.
 #: ``monitor`` is included because a converter may have the provenance to say a
@@ -1078,6 +1065,28 @@ def _jsonl_files(directory: Path) -> list:
     return kept
 
 
+def is_child_transcript(path: Path, directory: Path) -> bool:
+    """Whether *path*, found in *directory*, is a fan-out child's transcript.
+
+    Children live in a reserved subtree of their parent's transcript dir
+    (:data:`lmer_usage.children.CHILDREN_DIRNAME`), named rather than recorded,
+    so the rule needs no state the container wrote; a claude child still at its
+    original place is recognised by the id its child directory carries. Only
+    names inside *directory* count, so a session can only ever exclude its own
+    files. The one predicate for every reader of a session's own conversation.
+    """
+    return children.is_child_path(path, directory)
+
+
+def _conversation_files(directory: Path) -> list:
+    """The session's own transcripts in *directory*: children's are excluded.
+
+    The scrub still walks every file (:func:`scrub_session_transcripts`): a
+    child's transcript is the session's to scrub even though it is not its chat.
+    """
+    return [p for p in _jsonl_files(directory) if not is_child_transcript(p, directory)]
+
+
 def _pointer_sources(session_id: str, pointer: dict, roots: list) -> list:
     """Resolve a session entry's recorded ``transcript`` pointer.
 
@@ -1111,7 +1120,7 @@ def _pointer_sources(session_id: str, pointer: dict, roots: list) -> list:
             return []
         return [
             Source(path=path, session=session_id, harness=harness)
-            for path in _jsonl_files(candidate)
+            for path in _conversation_files(candidate)
         ]
     return []
 
@@ -1137,7 +1146,7 @@ def locate_sources(session_id: str) -> list:
         if located:
             return located
 
-    return [Source(path=path, session=session_id) for path in _jsonl_files(own_dir)]
+    return [Source(path=path, session=session_id) for path in _conversation_files(own_dir)]
 
 
 def _run_key_of(entry: Optional[dict]) -> Optional[tuple]:
@@ -2215,22 +2224,7 @@ def _lmer_message(record: dict, pending: dict, *, presentation: bool = True) -> 
     return None if result.empty else result
 
 
-def _harness_of_record(record: dict) -> Optional[str]:
-    """Which harness's format one record is in, or ``None`` for a shape nobody
-    here recognises — a fourth harness, or a file that is not a transcript."""
-    kind = record.get("type")
-    if kind in _CLAUDE_RECORD_TYPES:
-        return "claude"
-    if kind in _PI_RECORD_TYPES:
-        return "pi"
-    if kind in _CODEX_RECORD_TYPES:
-        return "codex"
-    if isinstance(kind, str) and kind.startswith(_LMER_TYPE_PREFIX):
-        # The canonical format, claimed by its namespace rather than by the three
-        # known types: a record from a later version is this format's and skipped
-        # by its adapter, not a format this build cannot read.
-        return _LMER_HARNESS
-    return None
+_harness_of_record = shape.harness_of_record
 
 
 def _message_from_record(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:

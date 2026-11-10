@@ -124,7 +124,7 @@ from . import session_io
 from . import session_threads
 from . import statusline
 from . import transcripts
-from . import uploads
+from . import uploads, usage_api, usage_live, usage_rollup
 from .answer import AnswerError, AnswerRequest, answer_run
 from .ask import AskChannelError
 from .uploads import UploadError
@@ -1423,6 +1423,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     _fold_references(payload)
     _fold_relations(payload)
     _fold_readopt(payload, readopt)
+    usage_api.fold_state(payload, usage_live.current(), table=usage_api.price_table(config)[0])
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -4850,6 +4851,89 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _note_check(caller, run=parts)
         return _run_files_reply(config, run)
+
+    # --- AI usage (#315, #647; docs/USAGE-TRACKING.md) ------------------------
+    #
+    # Read-only. The fleet view is account-wide, so it is unbound like
+    # /api/state; one run's usage is run-keyed and read on open like the file
+    # list above, never on the poll.
+
+    @app.get("/api/usage", dependencies=guard)
+    def usage_fleet(window: str = "1h", caller: Caller = Depends(require_secret)) -> dict:
+        """Fleet usage over *window*, the runs burning most now, and limit headroom.
+
+        Scoped like ``/api/state``: a request bound to a project (an assistant's
+        home, or a workspace the operator names) sees only that project's runs."""
+        table, problem = usage_api.price_table(config)
+        scope = project_scope.current() if projects.enabled() else None
+
+        def in_scope(key) -> bool:
+            return (projects.run_home(run_key(*key)) or {}).get("project_id") == scope
+
+        try:
+            reply = usage_api.fleet(
+                usage_live.current(), window=window, table=table,
+                projection_minutes=config.usage_projection_minutes,
+                include=in_scope if scope else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        reply["enabled"] = config.usage_enabled
+        reply["prices"] = {"configured": table is not None, "problem": problem,
+                           "table_hash": getattr(table, "hash", None)}
+        return reply
+
+    @app.get("/api/usage/rollup", dependencies=guard)
+    def usage_rollup_route(
+        project: str = "", period: str = "day", since: str = Query("", alias="from"),
+        until: str = Query("", alias="to"), caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Usage per period for one repo project (``host/project``), from the
+        run-dir records in the mirror, standalone runs included. Never pulls."""
+        host, _, repo_project = project.partition("/")
+        if not host or not repo_project:
+            raise HTTPException(status_code=400, detail="project must be <host>/<project>")
+        table, problem = usage_api.price_table(config)
+        try:
+            reply = usage_rollup.rollup(
+                run_dirs(config), host=host, project=repo_project, period=period,
+                since=since or None, until=until or None, table=table,
+                live=usage_live.current(), mirror_sha=mirror_status(config).head_sha,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        reply["prices_problem"] = problem
+        return reply
+
+    @app.get("/api/runs/usage", dependencies=guard)
+    def run_usage(
+        host: str = "", project: str = "", slug: str = "", uid: str = "",
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """One run's usage per session: the run-dir record beside the live numbers."""
+        run = _query_run(host, project, slug, uid)
+        try:
+            parts = _run_parts(run)
+            run_key(*parts)
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _note_check(caller, run=parts)
+        ref = resolve_run_dir(config, host, project, slug or None, uid=_bound_uid(run) or None)
+        records = []
+        if ref is not None:
+            base = _web_base_from_remote((config.work_repo_url or "").strip()) or ""
+            branch = checkout_branch(config.mirror_path)
+
+            def url_for(name: str) -> str:
+                return forge_web_url(base, branch, f"{ref.rel_path}/{name}",
+                                     forge=config.work_repo_forge, default_forge=FORGE_GITLAB)
+
+            records = usage_api.read_records(ref.path, url_for)
+        table, problem = usage_api.price_table(config)
+        reply = usage_api.run_detail(usage_live.current(), parts, records, slug=slug, table=table)
+        reply["present"] = ref is not None
+        reply["prices_problem"] = problem
+        return reply
 
     # --- the launches of one target (#374, spec §13.F) ------------------------
     #

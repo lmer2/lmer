@@ -107,7 +107,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterator, Optional
 
 import yaml
@@ -760,6 +760,33 @@ def run_dirs(config: PlatformConfig) -> list[RunDirRef]:
     return sorted(
         iter_run_dirs(config), key=lambda r: (r.host, r.project, r.slug)
     )
+
+
+def every_launch(ref: RunDirRef) -> list[RunDirRef]:
+    """*ref* and every other launch of its ``_runs/<slug>/`` group, oldest first.
+
+    :func:`run_dirs` lists one ref per group, at the newest launch, because it is
+    the adoption picker. A reader that sums records across a run's history, such
+    as the usage rollup, needs every launch: the same group, the same slug
+    claim, one ref per record-holding session dir (:func:`_sessions_in`). A
+    legacy ref, whose record is shared by every launch, is answered as itself.
+    """
+    group = ref.path.parent
+    if group.parent.name != _SCHEMA_RUNS_DIR:
+        return [ref]
+    refs = []
+    for session in _sessions_in(group):
+        if session == ref.path:
+            refs.append(ref)
+            continue
+        uid = run_state.session_id_of(session.name)
+        refs.append(RunDirRef(
+            host=ref.host, project=ref.project, slug=ref.slug, path=session,
+            dir_name=session.name,
+            address=(PurePosixPath(ref.address).parent / session.name).as_posix() if ref.address else None,
+            uid=uid if session_record.UID_RE.fullmatch(uid) else None,
+        ))
+    return refs or [ref]
 
 
 def record_session_id(ref: RunDirRef) -> Optional[str]:

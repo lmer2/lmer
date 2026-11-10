@@ -35,6 +35,8 @@ import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
 import StaleDaemon from './components/StaleDaemon.vue'
+import UsageRollup from './components/UsageRollup.vue'
+import UsageStrip from './components/UsageStrip.vue'
 import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason, offReason } from './ratchet.js'
 import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
@@ -45,6 +47,7 @@ import {
   rememberChoice, rememberFlag, rememberId, rememberIds, storedChoice, storedFlag, storedId, storedIds,
 } from './preferences.js'
 import { onRunRef, runKey } from './runref.js'
+import { burnLabel, usageComparator, usageRanking } from './usage.js'
 
 const POLL_MS = 10000
 
@@ -100,6 +103,21 @@ function rememberFleetView(value) {
   )
 }
 // --- end of fleet view mode --------------------------------------------------
+
+// --- list order --------------------------------------------------------------
+// The order the list was always in, or the most expensive run now (issue 315):
+// remembered for the same reason as the view mode above.
+const LIST_ORDERS = ['listed', 'cost']
+const LIST_ORDER_STORAGE_KEY = 'lmer.fleet.order'
+
+function storedListOrder() {
+  return storedChoice(() => window.localStorage.getItem(LIST_ORDER_STORAGE_KEY), LIST_ORDERS)
+}
+
+function rememberListOrder(value) {
+  rememberChoice((stored) => window.localStorage.setItem(LIST_ORDER_STORAGE_KEY, stored), LIST_ORDERS, value)
+}
+// --- end of list order -------------------------------------------------------
 
 // --- projects this browser comes back to (#627) ------------------------------
 // A page loads on its link's project, else the default, else the last one open
@@ -750,6 +768,9 @@ function haystack(run) {
     // rendered relative and a query never means one — the same reason `updated`
     // is not in here.
     run.checkin?.stale && 'unchecked',
+    // The burn reading, as the row words it: "burn" finds the runs that are
+    // spending at all, and the numbers are what the row shows beside it.
+    burnLabel(run.usage),
     ...(run.ports || []).map((port) => `:${port.host}`),
   ].filter(Boolean).join(' ').toLowerCase()
 }
@@ -771,8 +792,22 @@ function visible(list) {
 // learn the exceptions to; and `nothingMatches` then means the same thing in both
 // views, which is what lets one message serve them.
 const mapRows = computed(() => visible(runs.value))
-const attentionRows = computed(() => visible(attention.value))
-const calmRows = computed(() => visible(calm.value))
+const listOrder = ref(storedListOrder())
+watch(listOrder, rememberListOrder)
+// Offered only once some run has a burn reading: before that every run ties.
+const orderable = computed(() => runs.value.some((run) => run.usage))
+// One comparator for both groups, so both rank by the same measure: cost only
+// when every run is priced. Sorted inside each group, never across them, so a
+// run waiting on somebody still comes first.
+const byCost = computed(() => (
+  listOrder.value === 'cost' && orderable.value ? usageComparator(runs.value) : null
+))
+const ordered = (list) => (byCost.value ? [...list].sort(byCost.value) : list)
+const rankedBy = computed(() => (
+  usageRanking(runs.value) === 'cost' ? 'by cost' : 'by unpriced token weight (cost is not priced for every run)'
+))
+const attentionRows = computed(() => visible(ordered(attention.value)))
+const calmRows = computed(() => visible(ordered(calm.value)))
 // Said out loud, because a tracked fleet with an empty list on screen otherwise
 // reads as the fleet having been lost rather than as the search having matched
 // nothing.
@@ -1158,6 +1193,7 @@ onUnmounted(() => {
     <v-main>
       <v-container max-width="900" class="pa-3">
         <StaleDaemon />
+        <UsageStrip v-if="view === 'fleet'" :now="now" />
         <v-alert v-if="!loading && activeProject && activeProject !== unconfirmedProject && (!workspace || workspace.archived)"
           type="warning" class="mb-3">
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
@@ -1223,6 +1259,7 @@ onUnmounted(() => {
                daemon) is not assumed to be one — so a legacy fleet mounts nothing
                and sends no request. -->
           <WorkRepoSchema v-if="mirror?.form === 'schema'" :head-sha="mirror.head_sha || null" />
+          <UsageRollup :runs="state?.runs || []" />
         </template>
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
@@ -1315,6 +1352,12 @@ onUnmounted(() => {
                  between them are one view, and conditioning them separately is
                  how they drift out of step. -->
             <template v-if="fleetView === 'list'">
+              <div v-if="orderable" class="d-flex justify-end mb-1">
+                <v-btn-toggle v-model="listOrder" density="compact" mandatory variant="text" aria-label="list order">
+                  <v-btn value="listed" size="small">as listed</v-btn>
+                  <v-btn value="cost" size="small" :title="`burn over the last 15 minutes, ${rankedBy}`">most expensive now</v-btn>
+                </v-btn-toggle>
+              </div>
               <!-- Runs needing a human come first, always: it is the one thing this
                    view exists to tell you. The split is inside the search results
                    rather than around them, so filtering never buries a run that is

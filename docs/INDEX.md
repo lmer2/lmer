@@ -182,6 +182,22 @@ adapt for any other agent CLI.
 
 ---
 
+### [USAGE-TRACKING.md](./USAGE-TRACKING.md)
+**AI usage tracking: the per-run record and the live fleet view**
+
+What a session spent, kept in its run directory and shown live:
+- The token buckets per harness, and the deduplication rules (claude
+  `message.id`, codex snapshot deltas, the pi tree)
+- `ai-usage/<session-id>.yaml`: its format, who writes it and when, and what a
+  killed container leaves behind
+- The live view's routes, the burn ranking, limit headroom and its projection
+- Per-project and per-period rollups, and the optional read-time price table
+
+**Best for**: Reading a run's usage record, setting up prices, or interpreting
+the headroom chips.
+
+---
+
 ### [TRANSCRIPT-FORMAT.md](./TRANSCRIPT-FORMAT.md)
 **The lmer transcript format (version 1)**
 

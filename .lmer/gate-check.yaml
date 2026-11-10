@@ -96,6 +96,7 @@ tests:
     - tests/test_security.py
     - tests/test_self_dev_pythonpath.py
     - tests/test_signal_guard.py
+    - tests/test_spawn_harness_usage.py
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
     - tests/test_user_harnesses.py

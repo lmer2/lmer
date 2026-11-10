@@ -57,13 +57,16 @@ class TestSessionIdMinting:
 
         monkeypatch.setattr(clone_and_exec.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
-        monkeypatch.setattr(
-            clone_and_exec, "run_state_session_end",
-            lambda: seen.setdefault("at_backstop", os.environ.get("LMER_SESSION_ID")),
-        )
+
+        def fake_session_end(*a, **kw):
+            seen.setdefault("at_backstop", os.environ.get("LMER_SESSION_ID"))
+            seen["backstop_args"] = a
+
+        monkeypatch.setattr(clone_and_exec, "run_state_session_end", fake_session_end)
         clone_and_exec.dispatch_runner("/bin/runner")
         assert seen["at_spawn"], "id must be minted before the runner spawns"
         assert seen["at_backstop"] == seen["at_spawn"]
+        assert seen["backstop_args"] == (0,), "the runner's exit code reaches the backstop"
 
     def test_dispatch_runner_preserves_host_injected_id(self, monkeypatch):
         import os
@@ -75,7 +78,7 @@ class TestSessionIdMinting:
             lambda cmd: type("P", (), {"wait": lambda self: 0})(),
         )
         monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
-        monkeypatch.setattr(clone_and_exec, "run_state_session_end", lambda: None)
+        monkeypatch.setattr(clone_and_exec, "run_state_session_end", lambda *a, **kw: None)
         clone_and_exec.dispatch_runner("/bin/runner")
         assert os.environ["LMER_SESSION_ID"] == "host-injected-id"
 
@@ -460,12 +463,12 @@ class TestHarnessSessionEndBackstop:
         monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
         monkeypatch.setattr(
             clone_and_exec, "run_state_session_end",
-            lambda: calls.append("session-end"),
+            lambda *a, **kw: calls.append(("session-end", a)),
         )
         rc = clone_and_exec.dispatch_runner("/bin/runner")
         assert rc == 7
         assert ("popen", ("/bin/runner",)) in calls
-        assert calls.index("runner-wait") < calls.index("session-end")
+        assert calls.index("runner-wait") < calls.index(("session-end", (7,)))
 
     def test_backstop_fail_soft(self, monkeypatch):
         from lmer_cli.container import clone_and_exec

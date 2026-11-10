@@ -67,6 +67,10 @@ def bind(request, caller, body):
     # fleet panel that reads it is the operator's all-projects view.
     if caller.kind != "operator" and path == "/api/workrepo/schema":
         raise projects.ProjectError("Only an operator may read the whole work repo's validator report.", status=403)
+    # A rollup sums a repository's records across every project that ran
+    # against it, so it is the operator's all-projects view, like the above.
+    if caller.kind != "operator" and path == "/api/usage/rollup":
+        raise projects.ProjectError("Only an operator may read usage rolled up across projects.", status=403)
     candidates = [value for value in (
         body.get("workspace_id"), query.get("workspace_id"),
         request.headers.get("x-lmer-workspace-id"), request.path_params.get("workspace_id"),
@@ -121,7 +125,7 @@ def bind(request, caller, body):
         "/api/comms/feed", "/api/comms/questions", "/api/comms/connectors", "/api/spawn-options",
         "/api/prune", "/api/runs/forget",
         "/api/assistant/peers", "/api/workrepo/schema", "/api/channel-routes",
-        "/api/assistant/rotate-all",
+        "/api/assistant/rotate-all", "/api/usage", "/api/usage/rollup",
     } or path.startswith(("/assets/", "/api/slots"))
     operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
         f"/api/sessions/{session}/messages", f"/api/sessions/{session}/log", f"/api/sessions/{session}/ask",
