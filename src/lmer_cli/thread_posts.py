@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .comms import META_POSTER, POSTER_BOT, POSTER_HUMAN
 from .runtime import lmer_state_dir
 from .threads import CHANNEL_SLACK
 
@@ -35,7 +36,7 @@ __all__ = [
     "matrix_content", "poster_from_matrix", "poster_from_slack", "record",
     "lookup", "REGISTRY_DIR", "ENTRY_TTL_SECONDS", "MAX_ENTRIES",
     "Attribution", "INGEST", "SKIP", "WAIT", "GRACE_SECONDS", "HELD_LIMIT",
-    "WROTE_LIMIT", "speaker_tag", "tagged",
+    "WROTE_LIMIT", "speaker_tag", "tagged", "relay_meta",
 ]
 
 #: A run said it, through its thread servicer.
@@ -145,6 +146,17 @@ class Poster:
             origin, session=session,
             label=label if isinstance(label, str) and label else None,
         )
+
+
+def relay_meta(poster: Optional[Poster], human: bool) -> dict:
+    """The ``meta`` a connector puts on a record it relays: who posted it.
+
+    The bus record keeps only the display ``author``; this is what a reader
+    may classify on (the session cannot post on a connector's channel).
+    """
+    if poster is not None:
+        return {META_POSTER: poster.origin}
+    return {META_POSTER: POSTER_HUMAN if human else POSTER_BOT}
 
 
 def speaker_tag(label: object, *, slack_markup: bool) -> str:

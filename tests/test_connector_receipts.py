@@ -1,10 +1,9 @@
 """Acceptance reactions use real bus records and transport message identities."""
 import json
-from types import SimpleNamespace
 
 import pytest
 
-from lmer_cli import comms, connector_receipts
+from lmer_cli import comms, connector_receipts, thread_posts
 from ask_channel import bus
 from lmer_cli.connector_delivery import checkpoint_path
 from matrix_chat.permalink import matrix_to_link
@@ -188,7 +187,7 @@ def test_bus_refusal_does_not_schedule_a_receipt(receipts, monkeypatch):
 
 def test_other_session_bot_input_has_no_human_receipt(receipts):
     channel, rig = receipts
-    poster = SimpleNamespace(author="other session")
+    poster = thread_posts.Poster.for_session("s-other", "other session")
     if channel == "slack":
         item = {"ts": "1700001111.123456", "user": "UBOT", "bot_id": "B1", "text": "other agent"}
     else:

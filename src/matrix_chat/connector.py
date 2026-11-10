@@ -745,6 +745,7 @@ class MatrixConnector(ConnectorLifecycle):
             return {"question": question["id"] if question else None,
                     "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "meta": thread_posts.relay_meta(poster, human),
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         posted = bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
         if refused:

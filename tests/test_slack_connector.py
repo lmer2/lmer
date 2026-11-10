@@ -621,6 +621,7 @@ class TestPostsFromOtherRuns:
         assert rig.connector._poll_thread() == 1
         assert rig.log.read_since(1)[0][0].source.author == "platform \u00b7 operator"
         assert b"[slack \xc2\xb7 platform \xc2\xb7 operator]" in b"".join(rig.sink)
+        assert rig.log.read_since(1)[0][0].meta.get("poster") == "platform"
 
     def test_the_assistants_post_cannot_open_a_turn_on_a_drop_in_harness(self, tmp_path, monkeypatch):
         """The assistant's ``POST /api/comms/thread`` into this thread arrives as
@@ -664,6 +665,8 @@ class TestPostsFromOtherRuns:
         authors = [record.source.author for record in rig.log.read_since(1)[0]]
         assert authors == ["lmer chat-mr-288", "tester"]
         assert [record.source.channel for record in rig.log.read_since(1)[0]] == ["slack"] * 2
+        posters = [record.meta.get("poster") for record in rig.log.read_since(1)[0]]
+        assert posters == ["session", "human"], "who posted reaches the bus as data (#674)"
 
     def test_it_is_not_mirrored_straight_back_into_the_thread(self, rig):
         """A live inbound record is never mirrored back to its own channel."""
