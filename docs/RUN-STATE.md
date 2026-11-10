@@ -323,7 +323,9 @@ never left readable-but-stale.
 `session_end`, `phase`, `state_changed` (non-phase mutations to
 status/stop_reason/critical_error; on `status=complete` its data also
 carries the estimate-vs-actual `actuals`), `question_answered` (the recorded open
-question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
+question plus its human answer, both secret-redacted; when written from the
+session bus it also says who answered — see "Decisions" below), `decision`
+(see "Decisions"), `goal_set`, `run_named`,
 `artifact_written`, `gate`, `verify`, `task` (every ledger mutation, §2),
 `run_dir_renamed` (the freeze-gate rename, §1), `goals_frozen`,
 `goal_amended`, `goals_assessed` (the goal-set lifecycle, §2), `claim`
@@ -331,6 +333,70 @@ question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
 `release` (every release.yaml mutation, §7 — prior receipt values live
 here), `run_aborted` (the release-run abort, §7). The type set
 is open-ended — later growth adds types without schema churn.
+
+### Decisions (`work decision`, `work decisions`)
+
+The human review report's Decisions section lists what was decided and who
+decided it, from records rather than from an agent's memory (issue #674).
+Four event types count, because the tooling writes them: `goals_frozen`,
+`goal_amended`, `question_answered` and `decision`. Ad hoc types an agent
+invented with `work event` do not, and `work event` refuses these four: a
+hand-typed one would carry whatever "who" it was given.
+
+Who decided is stamped at write time from the session bus record the
+decision came from, so the agent never types it:
+
+- `lmer-signal ask`, `wait` and `close` record an accepted answer by running
+  `work decision --ref <answer id>` (only in a session with
+  `LMER_WORK_REPO_PATH`; a failure is one stderr line and never changes
+  their exit code).
+- `work decision --ref <id>` names a bus record. An answer, or a question by
+  its own id, becomes `question_answered`; a `message` from a human or an
+  assistant becomes `decision` (which then needs the "what" text). Refused:
+  the agent's own records (including an assistant session's own posts),
+  notes and closes (often the system's own), late answers, and another
+  session's id.
+- `work decision "<what>"` without `--ref` records a decision the agent made
+  on its own.
+
+Fields added to `data`: `by`, `channel`, `author`, `label` (the channel's
+display name, or the assistant's), `ref` (the bus record id), `source_ref`
+(where a connector or the ask directory says the record came from, when it
+says), `message` (the referenced message's text, shown beside the agent's
+summary), `authority`, and for answers `question`, `question_ref`, `answer`,
+`operator_only`.
+
+- `by` is `assistant` on an assistant's channel; `human` on `terminal` and
+  `platform`, and on `slack`/`matrix` only when the connector stamped
+  `meta.poster: human` (COMMS.md §1); `unknown` for any other thread post (another lmer run,
+  the platform's post button, a bot, or a connector too old to say, kept as
+  `poster`), listed as "…, not confirmed as a human"; `agent` without `--ref`.
+- `authority` counts only on the supervising assistant's channel with a level
+  the daemon stamps; anything else, a peer assistant included, is `none`. The
+  reader applies the same rule to what it reads.
+- An event without `by` (every record written before this, `work answer`,
+  `lmer --answer`, `goals_frozen`) is listed as "not recorded"; nothing is
+  inferred from its note.
+
+The listing collapses only exact repeats (same type, `ref` and note). Two
+decisions recorded on one message both list. A `work decision "<summary>"
+--ref <answer id>` after the automatic record replaces it in the listing, with
+the summary beside the answer (`summary` in JSON). A `goal_amended` without a
+note lists its goal changes (`diff` in JSON).
+
+**Strength of the attribution.** Who decided comes from the bus, where the
+session cannot claim a channel, author or authority. The stored event is
+not tamper-evident against the session, though: `events.jsonl` is writable
+from the container, and an older lmer's `work event` still writes these types.
+The listing is a report for a human to read, not a security control.
+
+In schema form `work decisions` without `--target` reads only this
+execution's record, and each row names its execution (`<name>/<session>`);
+use `--target` to include earlier executions of the same work.
+
+An answer that reached the agent only as a relayed message (no `wait` ran)
+is recorded once the agent runs `lmer-signal wait <id>`, as the bus rules
+already require, or `work decision --ref <id>`.
 
 ### Receipt events (`gate`, `verify`)
 
@@ -750,6 +816,8 @@ genuinely new engagement seeds a fresh run.
 | `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>] [--question "<text>"]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
 | `work answer "<text>"` | Record an answer to the run's recorded open question (§2) from inside a session. On a schema-2 tree the verb needs the launch's session UID: a bare shell is refused (exit 2) with a message naming the human's route — the platform's answer card or `POST /api/runs/answer`, which starts a session carrying the answer. It appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
+| `work decision ["<what>"] [--ref <message id>]` | Record a decision (§2 "Decisions"): with `--ref`, who decided and at what authority come from that session-bus record; without it the decision is the agent's own. Exit 1 when the bus cannot be read, or the record is the agent's own (an assistant session's own posts included), a note or close, a late answer, an unanswered question, another session's id, or a message with no "what". |
+| `work decisions [--target <url>] [--json]` | Read-only. Lists the current run's decisions, or with `--target` those of every run whose recorded target is that URL (`/-/work_items/` and `/-/issues/` match; trailing slash and fragment ignored). Oldest first, exact repeats collapsed; agent-only decisions are marked `AGENT-ONLY` (`agent_only` in JSON); no run context exits 0. Never modifies a record, even a corrupt one. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
 | `work resume [--json] [--session <id>]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |

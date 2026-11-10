@@ -594,6 +594,13 @@ def _read_sibling_state(rdir: Path) -> Optional[dict]:
     return None
 
 
+def read_state_best_effort(rdir: Path) -> Optional[dict]:
+    """Read another record's state without side effects: None when it cannot
+    be read. :func:`load_state` backs up a corrupt file, which a reader
+    scanning other runs must never do."""
+    return _read_sibling_state(rdir)
+
+
 def _session_dirs(group: Path) -> list[Path]:
     """The record-holding children of one `_runs/<slug>/` group, oldest first.
 

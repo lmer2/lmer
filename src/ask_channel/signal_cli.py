@@ -45,6 +45,7 @@ import json
 import mimetypes
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -91,6 +92,11 @@ UPLOADS_DIR_ENV = "LMER_UPLOADS_DIR"
 #: How the record's id is printed — the ask channel's width, so a caller that
 #: captured ``000001`` yesterday captures ``000002`` today.
 ID_WIDTH = 6
+
+#: Seconds `work decision --ref` may take to read the bus and append one event;
+#: short, because the caller is an agent waiting on its answer.
+RECORD_DECISION_TIMEOUT = 15.0
+WORK_REPO_PATH_ENV = "LMER_WORK_REPO_PATH"
 
 
 def format_id(record: dict) -> str:
@@ -684,7 +690,38 @@ def _await(client: bus.BusClient, question: dict, args: argparse.Namespace) -> i
         return TIMEOUT_EXIT_CODE
     print(answer["text"])
     print(f"answered from {_who(answer)}", file=sys.stderr)
+    _record_decision(answer)
     return 0
+
+
+def _record_decision(answer: dict) -> None:
+    """Record the accepted answer in the run (#674); best effort, never the exit code.
+
+    Via the `work` CLI, not an import: the only /work writer a running gate
+    can attribute (#233).
+    """
+    work = shutil.which("work")
+    if work is None or not os.environ.get(WORK_REPO_PATH_ENV):
+        return  # no work repo here (a host shell, a test)
+    # The bus already counts the answer delivered; it must survive a kill below.
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(
+            [work, "decision", "--ref", str(answer.get("id"))],
+            capture_output=True, text=True, errors="replace",
+            stdin=subprocess.DEVNULL, timeout=RECORD_DECISION_TIMEOUT,
+        )
+    except Exception as exc:
+        _not_recorded(answer, exc)
+        return
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        _not_recorded(answer, detail[-1] if detail else result.returncode)
+
+
+def _not_recorded(answer: dict, why: object) -> None:
+    print(f"answer not recorded in the run: {why} — record it with "
+          f"`work decision --ref {answer.get('id')}`", file=sys.stderr)
 
 
 def _who(record: dict) -> str:
@@ -750,6 +787,7 @@ def _cmd_close(args: argparse.Namespace, client: bus.BusClient) -> int:
         print(f"question {qid} was answered before it could be closed — the answer is on stdout", file=sys.stderr)
         if answer is not None:
             print(answer["text"])
+            _record_decision(answer)
         return 0
     client.post(KIND_CLOSE, args.reason or "", in_reply_to=question["id"])
     print(f"closed question {qid}; nobody can reply to it now", file=sys.stderr)

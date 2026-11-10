@@ -1129,6 +1129,7 @@ class TestPostsFromOtherRuns:
                             poster=thread_posts.Poster.for_platform("operator"))
         assert rig.connector.sync_once() == 1
         assert rig.log.read_since(1)[0][0].source.author == "platform \u00b7 operator"
+        assert rig.log.read_since(1)[0][0].meta.get("poster") == "platform"
 
     def test_the_assistants_post_cannot_open_a_turn_on_a_drop_in_harness(self, tmp_path, monkeypatch):
         """As on Slack: ``POST /api/comms/thread`` arrives as ``matrix`` (#594)."""
@@ -1168,6 +1169,8 @@ class TestPostsFromOtherRuns:
         assert rig.connector.sync_once() == 2
         authors = [record.source.author for record in rig.log.read_since(1)[0]]
         assert authors == ["lmer chat-mr-288", "@tester:example.org"]
+        posters = [record.meta.get("poster") for record in rig.log.read_since(1)[0]]
+        assert posters == ["session", "human"], "who posted reaches the bus as data (#674)"
 
     def test_it_is_not_mirrored_straight_back_into_the_thread(self, rig):
         """A live inbound record is never mirrored back to its own channel."""

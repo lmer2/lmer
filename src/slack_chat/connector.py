@@ -615,9 +615,11 @@ class SlackConnector(ConnectorLifecycle):
                                        refuse_operator_only=poster is not None or not self._is_human(message))
                 if bound is not None:
                     kind, in_reply_to, text = "answer", oldest.get("id"), bound
+            human = poster is None and self._is_human(message)
             return {"question": oldest.get("id") if oldest else None,
-                    "human_receipt": poster is None and self._is_human(message),
+                    "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "meta": thread_posts.relay_meta(poster, human),
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         return self._post_prepared(ts, prepare, lambda: self._accept_inbound(ts)) or {}
 

@@ -1,0 +1,5 @@
+added:
+- "`work decisions` lists a run's recorded decisions and who made them; `lmer-signal` answers and `work decision` record them with the answer's authority."
+- "Slack and Matrix connectors stamp `meta.poster` (human, bot, or the lmer origin) on what they relay into a session's bus."
+changed:
+- "`work event` refuses `goals_frozen`, `goal_amended`, `question_answered` and `decision`; record decisions with `work decision`."

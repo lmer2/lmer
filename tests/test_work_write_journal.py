@@ -756,6 +756,10 @@ class TestWriteIntentMapCoversTheParser:
         ("name", ["name", "some-name"], True),
         ("verify", ["verify", "tests", "--", "true"], True),
         ("event", ["event", "note"], True),
+        ("decision", ["decision", "kept it read-only"], True),
+        ("decision", ["decision", "--ref", "000004"], True),
+        ("decisions", ["decisions"], False),
+        ("decisions", ["decisions", "--target", "https://x/y/-/issues/1", "--json"], False),
         ("ledger", ["ledger"], False),
         ("ledger", ["ledger", "set", "T1", "--status", "done"], True),
         # `sessions` only READS the run area (run_state.list_sessions);

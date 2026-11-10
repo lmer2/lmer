@@ -164,6 +164,12 @@ ASSISTANT_CHANNELS = frozenset({CHANNEL_UBER, CHANNEL_PEER_UL})
 #: reply to. An open question so flagged still reaches uber lmer as live.
 META_OFF_THREAD = "off_thread"
 
+#: ``meta`` key on a record a Slack or Matrix connector relays: who posted it in
+#: the thread — a human, a bot, or a ``thread_posts`` origin (#674).
+META_POSTER = "poster"
+POSTER_HUMAN = "human"
+POSTER_BOT = "bot"
+
 
 def off_thread(record: Optional[Mapping]) -> bool:
     return bool(record) and (record.get("meta") or {}).get(META_OFF_THREAD) is True

@@ -39,7 +39,7 @@ from .git_ops import (
     web_url_for,
 )
 from . import (
-    git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
+    decisions, git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
     specs_index, usage, write_journal,
 )
 from .memory import (
@@ -409,6 +409,31 @@ Examples:
     event_parser.add_argument("type", help="Event type (e.g. review_posted)")
     event_parser.add_argument("--note", help="Short human-readable note")
     event_parser.add_argument("--data", help="JSON object with extra data")
+
+    # decision / decisions (the human review report's Decisions — issue #674)
+    decision_parser = subparsers.add_parser(
+        "decision",
+        help="Record a decision: who decided comes from the --ref message on the "
+             "session bus; without --ref it is the agent's own",
+    )
+    decision_parser.add_argument(
+        "what", nargs="?",
+        help="What was decided (optional for an answer: the answer is the decision)",
+    )
+    decision_parser.add_argument(
+        "--ref", metavar="<message id>",
+        help="The bus message the decision came from (`lmer-signal list` shows ids)",
+    )
+    decisions_parser = subparsers.add_parser(
+        "decisions",
+        help="List recorded decisions and who made them (read-only)",
+    )
+    decisions_parser.add_argument(
+        "--target", metavar="<url>",
+        help="Every run whose target is this URL (an issue or MR); default: the current run",
+    )
+    decisions_parser.add_argument("--json", action="store_true", dest="as_json",
+                                  help="Emit the decisions as JSON")
 
     # ledger command (per-task execution ledger — issue #89)
     ledger_parser = subparsers.add_parser(
@@ -1695,6 +1720,14 @@ def cmd_event(args) -> int:
         except json.JSONDecodeError as exc:
             print(f"❌ --data is not valid JSON: {exc}", file=sys.stderr)
             return 1
+    if args.type in decisions.DECISION_EVENT_TYPES:
+        # Their writers stamp who decided; a hand-typed one would be believed.
+        print(
+            f"❌ `{args.type}` is written by its own verb (work decision, work goals, "
+            "work answer), not by `work event`",
+            file=sys.stderr,
+        )
+        return 1
     rdir, _state = _require_run()
     if rdir is None:
         return 1
@@ -1706,6 +1739,55 @@ def cmd_event(args) -> int:
         data=_redact_json_values(data),
     )
     print(f"✅ Event appended: {args.type}")
+    return 0
+
+
+def cmd_decision(what: str | None, ref: str | None) -> int:
+    """Record a decision; who made it is read from the bus, never typed (#674).
+
+    The bus is read before the checkout lock is taken, so a slow supervisor
+    never holds up other `work` writers.
+    """
+    if ref is None and not (what or "").strip():
+        print("❌ decision requires what was decided, or --ref <message id>", file=sys.stderr)
+        return 1
+    try:
+        if ref is not None:
+            event_type, note, data = decisions.event_from_bus(ref, what)
+        else:
+            event_type, note, data = decisions.agent_decision(what)
+    except decisions.DecisionError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    return _append_decision(event_type, note, data)
+
+
+@work_transaction
+def _append_decision(event_type: str, note: str | None, data: dict) -> int:
+    rdir, _state = _require_run()
+    if rdir is None:
+        return 1
+    run_state.append_event(rdir, event_type, note=note, data=data)
+    print(f"✅ Decision recorded ({event_type}): {decisions.who_for(data)}")
+    return 0
+
+
+def cmd_decisions(target: str | None, as_json: bool) -> int:
+    """List recorded decisions (read-only; no run context exits 0 like the other readers)."""
+    if target:
+        runs = decisions.runs_for_target(target)
+    else:
+        rdir = run_state.run_dir()
+        state = run_state.read_state_best_effort(rdir) if rdir is not None else None
+        if state is None:
+            print(no_run_context_error() if rdir is None else "No run state recorded yet.")
+            return 0
+        runs = [(rdir, state)]
+    rows = decisions.decision_rows(runs)
+    if as_json:
+        print(json.dumps({"runs": [str(rdir) for rdir, _ in runs], "decisions": rows}, indent=2))
+    else:
+        print(decisions.format_text(rows))
     return 0
 
 
@@ -4719,7 +4801,7 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         return None if args.description is None else run_candidates()
     if command == "name":
         return None if args.value is None else run_candidates()
-    if command in ("event", "verify", "report", "session-start"):
+    if command in ("event", "decision", "verify", "report", "session-start"):
         return run_candidates()
     if command in ("answer", "session-end"):
         return pushing(run_candidates())
@@ -4942,6 +5024,10 @@ def _dispatch(args, parser) -> int:
         return cmd_verify(raw[1], raw[3:])
     elif args.command == "event":
         return cmd_event(args)
+    elif args.command == "decision":
+        return cmd_decision(args.what, args.ref)
+    elif args.command == "decisions":
+        return cmd_decisions(args.target, args.as_json)
     elif args.command == "answer":
         return cmd_answer(args.text)
     elif args.command == "name":

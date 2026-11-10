@@ -104,7 +104,7 @@ line in the log and the same object on the wire.
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
 | `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
-| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, and `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6). |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6), and `poster` on a record a Slack or Matrix connector relayed: `human`, `bot`, or the `thread_posts` origin (`session` for another lmer run, `platform` for the daemon's post button). Only a connector can post on its channel, so `work decisions` reads a thread post as a human's only with `poster: human` (#674). |
 
 ### Kinds
 
@@ -847,6 +847,12 @@ so a shell can capture it; the rest goes to stderr. §9 has what they do and
 what they refuse. A session whose host side is a shell `lmer` process is
 refused by name: that process takes its threads as launch arguments and cannot
 change them while it runs.
+
+An accepted answer that `ask`, `wait` or `close` hands back is also
+recorded in the run, with who answered and at what authority, through
+`work decision --ref` ([RUN-STATE.md](RUN-STATE.md), "Decisions"). Recording
+is best effort: a failure is one line on stderr, and stdout and the exit code
+are unchanged.
 
 Exit codes: `0` posted/answered/closed/listed · `1` a real error · `2`
 waited, no answer yet (the question is open; `lmer-signal wait <id>`
