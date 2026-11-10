@@ -58,6 +58,7 @@ from .comms import CommsHub, register_hub
 from .connectors import ThreadConnectors, register_connectors
 from .ctl import segment_field
 from .thread_service import ThreadServices, register_services
+from .usage_live import UsageLive, register as register_usage
 from .config import (
     connector_path,
     list_connectors,
@@ -451,6 +452,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     hub = _subscribe_to_comms()
     threads = _run_thread_connectors(config)
     services = _serve_thread_requests()
+    usage = _collect_usage(config)
 
     app = create_app(config, secret, ingress=ingress)
     uvicorn.run(
@@ -486,6 +488,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # answering for a daemon that has stopped.
     services.stop()
     register_services(None)
+    usage.stop()
+    register_usage(None)
     return 0
 
 
@@ -516,6 +520,16 @@ def _serve_thread_requests() -> ThreadServices:
     services.start()
     register_services(services)
     return services
+
+
+def _collect_usage(config) -> UsageLive:
+    """Start the live usage collector (issue #315), read-only: published for the
+    usage routes, and a no-op object when ``LMER_PLATFORM_USAGE`` turns it off."""
+    live = UsageLive(config)
+    if config.usage_enabled:
+        live.start()
+        register_usage(live)
+    return live
 
 
 def _subscribe_to_comms() -> CommsHub:

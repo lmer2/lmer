@@ -787,6 +787,9 @@ class TestWriteIntentMapCoversTheParser:
         ("release", ["release", "record", "tag", "v1.2.3", "--sha", "abc123"], True),
         ("session-start", ["session-start"], True),
         ("session-end", ["session-end"], True),
+        ("session-end", ["session-end", "--exit-code", "1"], True),
+        ("usage", ["usage"], False),
+        ("usage", ["usage", "--checkpoint"], True),
     ]
 
     def _subcommands(self):

@@ -247,6 +247,26 @@ export function fetchRunSessions(run) {
   return request(`api/runs/sessions?${query}`)
 }
 
+// --- AI usage (issue 315, docs/USAGE-TRACKING.md) ----------------------------
+//
+// All three are read-only; how often each is read: docs/USAGE-TRACKING.md.
+// The fleet read names no workspace, like `api/state`.
+export function fetchUsage(window = '1h') {
+  return request(`api/usage?${new URLSearchParams({ window })}`)
+}
+
+// One run's usage per session. The run's key only, like the run files' read.
+export function fetchRunUsage(run) {
+  return request(`api/runs/usage?${runQuery(runRef(run))}`)
+}
+
+// Usage per period for one repo project, spelled `<host>/<project>` (not a
+// platform workspace: records are filed under the repository they ran against).
+// `from`/`to` are YYYY-MM-DD and omitted when blank.
+export function fetchUsageRollup({ project, period = 'day', from, to }) {
+  return request(`api/usage/rollup?${runQuery({ project, period, from: from || null, to: to || null })}`)
+}
+
 // Relating is symmetric and the daemon stores it once, so there is one call rather
 // than one per direction: both runs carry it afterwards, either order names the
 // same relation, and doing it twice is a no-op the reply reports (`created`). The

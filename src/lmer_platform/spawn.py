@@ -4053,6 +4053,10 @@ def _spawn_session(
                 # entry is a debugging artifact people paste around.
                 "agents": request.agents,
                 "harness": request.harness,
+                # Host-side provenance for the usage view's headroom groups
+                # (#315): the same value the container gets as
+                # LMER_SESSION_METADATA.operator, kept where it cannot write.
+                "operator": _session_metadata(request).get("operator"),
                 # What the spawn *asked* for, which is ``None`` for the ordinary
                 # request that names no model. The session overwrites it with what
                 # it actually resolved as soon as it reports back (absorb_ports), so

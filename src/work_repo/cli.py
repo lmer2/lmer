@@ -40,7 +40,7 @@ from .git_ops import (
 )
 from . import (
     git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
-    specs_index, write_journal,
+    specs_index, usage, write_journal,
 )
 from .memory import (
     MemoryRetirementError, forget_memory, memory_retirement_paths, memory_write_rel_paths,
@@ -730,9 +730,22 @@ Examples:
              "harness id chains into its lineage and every later `work` "
              "invocation of the launch finds it there",
     )
-    subparsers.add_parser(
+    session_end_parser = subparsers.add_parser(
         "session-end",
         help="Record session end, release the owner claim, push run state (hook-facing)",
+    )
+    session_end_parser.add_argument(
+        "--exit-code", type=int, default=None, metavar="<n>",
+        help="The harness's exit status, from the runner; non-zero marks the usage record crashed",
+    )
+
+    usage_parser = subparsers.add_parser(
+        "usage",
+        help="Show this session's AI usage, or checkpoint it into the run dir (docs/USAGE-TRACKING.md)",
+    )
+    usage_parser.add_argument(
+        "--checkpoint", action="store_true",
+        help="Rewrite ai-usage/<session>.yaml if its counters changed and commit just that file",
     )
 
     return parser
@@ -900,6 +913,9 @@ def cmd_commit(message: str | None) -> int:
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
     _sync_masterplan_links()
+    # Refresh this session's usage record into the commit, at most once per
+    # checkpoint interval (#647). Fail-soft: never changes the commit.
+    usage.checkpoint(respect_interval=True)
     rc = commit_work_changes(message)
     # Napkin capture is best-effort in both modes and must never block the
     # worklog commit: a failure is logged but does not change the exit code.
@@ -4563,10 +4579,41 @@ def _release_claim_at_session_end(rdir) -> None:
           "leaving the claim to the stale threshold")
 
 
+def cmd_usage(checkpoint: bool = False) -> int:
+    """Print this session's usage, or checkpoint it (``--checkpoint``).
+
+    The checkpoint commits only this session's record file. It is driven by the
+    runner's timer and always exits 0: usage never fails a session.
+    """
+    if checkpoint:
+        return _checkpoint_usage()
+    summary = usage.summarise(usage.session_files())
+    print(json.dumps({
+        "totals": summary.totals,
+        "models": summary.row_list(),
+        "not_collected": summary.not_collected,
+        "active_seconds": summary.active_seconds,
+    }, indent=2))
+    return 0
+
+
 @work_transaction(failure_result=0)
-def cmd_session_end() -> int:
+def _checkpoint_usage() -> int:
+    path = usage.checkpoint()
+    if path is None:
+        return 0
+    rel = usage.rel_path(path)
+    if rel and commit_work_path([rel], f"usage: checkpoint {path.stem}") != 0:
+        print("⚠️  usage checkpoint saved locally; push failed (the next commit carries it)")
+    return 0
+
+
+@work_transaction(failure_result=0)
+def cmd_session_end(exit_code: int | None = None) -> int:
     """Record session end, release a claim we hold, and push the run dir.
-    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write."""
+    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write.
+    *exit_code* is the harness's, passed by the runner's backstop; the hook
+    passes none."""
     rdir = run_state.run_dir()
     if rdir is None:
         return 0
@@ -4583,6 +4630,8 @@ def cmd_session_end() -> int:
         if state is None:
             return 0
         run_state.append_event(rdir, "session_end")
+        # The final usage record rides this push (#647); fail-soft by design.
+        usage.finalise(exit_code)
         owner = state.get("owner")
         if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
             state["owner"] = None
@@ -4674,6 +4723,8 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         return run_candidates()
     if command in ("answer", "session-end"):
         return pushing(run_candidates())
+    if command == "usage":
+        return pushing(run_candidates()) if getattr(args, "checkpoint", False) else None
     if command == "release":
         action = getattr(args, "release_action", None)
         if action in ("claim", "unclaim", "abort", "record"):
@@ -4940,7 +4991,9 @@ def _dispatch(args, parser) -> int:
     elif args.command == "session-start":
         return cmd_session_start(args.session)
     elif args.command == "session-end":
-        return cmd_session_end()
+        return cmd_session_end(args.exit_code)
+    elif args.command == "usage":
+        return cmd_usage(args.checkpoint)
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

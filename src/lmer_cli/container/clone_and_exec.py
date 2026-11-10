@@ -69,6 +69,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,6 +106,17 @@ KNOWN_HARNESS_RUNNERS = {
 #: How long the session-end backstop may take (a work-repo push). The container's
 #: stop timeout (lmer_cli.runtime.STOP_TIMEOUT_SECONDS) must exceed it.
 SESSION_END_TIMEOUT_SECONDS = 180
+
+#: The runner's usage-checkpoint timer (#647). Standalone copies of
+#: work_repo.usage.CHECKPOINT_ENV / DEFAULT_CHECKPOINT_SECONDS / ENABLED_ENV.
+USAGE_ENABLED_ENV = "LMER_USAGE"
+USAGE_CHECKPOINT_ENV = "LMER_USAGE_CHECKPOINT_SECONDS"
+USAGE_DEFAULT_CHECKPOINT_SECONDS = 900
+USAGE_CHECKPOINT_TIMEOUT_SECONDS = 120
+#: How long teardown waits for an in-flight checkpoint. Small: the stop timeout
+#: leaves only ~20 s above SESSION_END_TIMEOUT_SECONDS.
+USAGE_CHECKPOINT_JOIN_SECONDS = 10
+USAGE_CHECKPOINT_THREAD_NAME = "lmer-usage-checkpoint"
 
 # The canonical source config (sources.yaml, issue #105) file name at the
 # work-repo root (single source of truth for the refusal check and the
@@ -3380,7 +3392,7 @@ def _forward_signals(proc: subprocess.Popen) -> None:
     signal.signal(signal.SIGINT, _relay)
 
 
-def run_state_session_end() -> None:
+def run_state_session_end(exit_code: int | None = None) -> None:
     """Harness-side run-state release — backstop for the SessionEnd hook.
 
     Claude Code fires SessionEnd hooks without blocking its exit on them, and
@@ -3391,14 +3403,90 @@ def run_state_session_end() -> None:
     short of a hard container kill. Safe when the hook did complete: the
     duplicate session_end event is harmless audit detail and the owner clear
     is a no-op.
+
+    *exit_code* is the runner's: a non-zero one marks the usage record
+    ``crashed`` (#647).
     """
     work = shutil.which("work")
     if not work:
         return
+    cmd = [work, "session-end"]
+    if exit_code is not None:
+        cmd += ["--exit-code", str(exit_code)]
     try:
-        subprocess.call([work, "session-end"], timeout=SESSION_END_TIMEOUT_SECONDS)
+        subprocess.call(cmd, timeout=SESSION_END_TIMEOUT_SECONDS)
     except Exception as e:  # teardown cleanup must never fail the session
         print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
+
+
+def _usage_checkpoint_interval() -> int:
+    """Seconds between checkpoints; mirrors work_repo.usage.checkpoint_seconds."""
+    raw = (os.environ.get(USAGE_CHECKPOINT_ENV) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return USAGE_DEFAULT_CHECKPOINT_SECONDS
+    return value if value > 0 else USAGE_DEFAULT_CHECKPOINT_SECONDS
+
+
+def _usage_checkpoint(work: str, gate_lock) -> None:
+    """One timer tick. ``work usage --checkpoint`` skips a running gate as well;
+    checking here first saves starting a process."""
+    if gate_lock.active_gate() is not None:
+        return
+    subprocess.call([work, "usage", "--checkpoint"], timeout=USAGE_CHECKPOINT_TIMEOUT_SECONDS)
+
+
+def _start_usage_checkpoints():
+    """Start the session's usage-checkpoint timer (#647); return its stopper.
+
+    Harness-agnostic: it runs beside whatever runner ``dispatch_runner``
+    spawned, for the runner's whole life. Not started when ``LMER_USAGE`` is
+    off or there is no ``work`` CLI. Nothing here can fail the session: every
+    error is a warning, and the stopper is always callable.
+    """
+
+    def _noop() -> None:
+        return None
+
+    def _warn(e: Exception) -> None:
+        print(f"⚠️  usage checkpoint failed (continuing): {e}", file=sys.stderr)
+
+    try:
+        # deferred: optional dependency — this standalone entrypoint may lack lmer_cli; only a session with `work`, which ships it, reaches here
+        from lmer_cli import gate_lock
+        # deferred: optional dependency — same as gate_lock above
+        from lmer_cli.util import get_bool_env
+
+        if not get_bool_env(USAGE_ENABLED_ENV, True):
+            return _noop
+        work = shutil.which("work")
+        if not work:
+            return _noop
+        interval = _usage_checkpoint_interval()
+        stop = threading.Event()
+
+        def _loop() -> None:
+            while not stop.wait(interval):
+                try:
+                    _usage_checkpoint(work, gate_lock)
+                except Exception as e:
+                    _warn(e)
+
+        thread = threading.Thread(target=_loop, name=USAGE_CHECKPOINT_THREAD_NAME, daemon=True)
+        thread.start()
+    except Exception as e:
+        _warn(e)
+        return _noop
+
+    def _stop() -> None:
+        stop.set()
+        try:
+            thread.join(USAGE_CHECKPOINT_JOIN_SECONDS)
+        except Exception as e:
+            _warn(e)
+
+    return _stop
 
 
 def mint_session_id(*, fresh: bool = False) -> None:
@@ -3467,12 +3555,15 @@ def dispatch_runner(runner) -> int:
     can run while the container is still alive. Returns the runner's exit code.
     Accepts a command string or an argv list (user runners run via ``bash`` —
     a read-only mount preserves host permissions, so the exec bit may be
-    missing)."""
+    missing). The usage-checkpoint timer runs while the runner does, and the
+    exit code reaches the session-end backstop."""
     mint_session_id()
     proc = subprocess.Popen(runner if isinstance(runner, list) else [runner])
     _forward_signals(proc)
+    stop_checkpoints = _start_usage_checkpoints()
     rc = proc.wait()
-    run_state_session_end()
+    stop_checkpoints()
+    run_state_session_end(rc)
     return rc
 
 

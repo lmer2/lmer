@@ -795,7 +795,7 @@ class TestUserRunnerDispatch:
                 return 0
 
         monkeypatch.setattr(clone_and_exec, "mint_session_id", lambda: None)
-        monkeypatch.setattr(clone_and_exec, "run_state_session_end", lambda: None)
+        monkeypatch.setattr(clone_and_exec, "run_state_session_end", lambda *a, **kw: None)
         monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
         monkeypatch.setattr(
             clone_and_exec.subprocess,

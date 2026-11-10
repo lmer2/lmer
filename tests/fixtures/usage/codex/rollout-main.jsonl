@@ -1,0 +1,11 @@
+{"timestamp": "2026-11-05T09:00:00Z", "type": "session_meta", "payload": {"id": "thread-main", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5-codex", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "user"}}
+{"timestamp": "2026-11-05T09:00:10Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 800, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40, "total_tokens": 1100}}}}
+{"timestamp": "2026-11-05T09:00:11Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 800, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40, "total_tokens": 1100}}}}
+{"timestamp": "2026-11-05T09:00:12Z", "type": "event_msg", "payload": {"type": "token_count", "info": null}}
+{"timestamp": "2026-11-05T09:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3000, "cached_input_tokens": 2500, "cache_write_input_tokens": 100, "output_tokens": 250, "reasoning_output_tokens": 90, "total_tokens": 3250}}}}
+{"timestamp": "2026-11-05T09:02:00Z", "type": "turn_context", "payload": {"model": "gpt-5.5-mini", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:02:30Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3600, "cached_input_tokens": 2900, "cache_write_input_tokens": 100, "output_tokens": 300, "reasoning_output_tokens": 100, "total_tokens": 3900}}}}
+{"timestamp": "2026-11-05T09:03:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 100, "cache_write_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 5, "total_tokens": 220}}}}
+{"timestamp": "2026-11-05T09:03:30Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 500, "cached_input_tokens": 300, "cache_write_input_tokens": 0, "output_tokens": 50, "reasoning_output_tokens": 10, "total_tokens": 550}}}}

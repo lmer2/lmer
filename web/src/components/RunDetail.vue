@@ -18,6 +18,7 @@ import RunMeta from './RunMeta.vue'
 import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
+import UsageTab from './UsageTab.vue'
 import { forgetRun, muteRun, resumeRun, moveRun } from '../api.js'
 import { useOperatorChat } from '../operatorChat.js'
 import {
@@ -1224,6 +1225,11 @@ async function forget() {
             </v-card-text>
           </v-card>
         </template>
+
+        <!-- What each session spent (issue 315), read once when this panel first
+             renders and never on the poll. In the overview and not a fifth tab
+             for the run files' reason below: four tabs on a phone is the ceiling. -->
+        <UsageTab :run="run" :now="now" />
 
         <!-- The run's own record, and last in this panel on purpose. It is the
              reference rather than the news: the facts at the top answer "what is

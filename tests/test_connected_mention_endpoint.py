@@ -30,7 +30,7 @@ def test_cli_endpoint_reaches_connector_forwarding(transport_host, monkeypatch, 
     api_client, transports, _component = transport_host
     runner = Runner()
     noop = SimpleNamespace(stop=lambda: None)
-    for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests"):
+    for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests", "_collect_usage"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
     monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     monkeypatch.setattr(connectors.ThreadConnectors, "start", lambda self: None)

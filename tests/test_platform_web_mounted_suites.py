@@ -7,7 +7,9 @@ dialog live in these files; issue #617 added the answer box and the per-launch
 resume rows, whose disabled-send reasons are only observable here; issue #510
 the Send Privately editor; issue #465 the operator channel dock's retention;
 issue #646 the rotate-every-assistant modal; issue #650 the outdated-daemon
-banner).
+banner; issue #315 the usage strip's headroom chips, the run view's usage
+section, the rollup panel, the fleet card's burn reading and ranking, and the
+list's "most expensive now" order).
 """
 import os
 from pathlib import Path
@@ -26,6 +28,7 @@ SUITES = [
     "tests/AssistantHistory.test.js",
     "tests/AssistantSettings.test.js",
     "tests/Chat.test.js",
+    "tests/FleetOrder.test.js",
     "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",
     "tests/PrivateSend.test.js",
@@ -33,10 +36,14 @@ SUITES = [
     "tests/Ratchet.test.js",
     "tests/RequestRecovery.test.js",
     "tests/RotateAll.test.js",
+    "tests/RunCardUsage.test.js",
     "tests/SessionsPerTarget.test.js",
     "tests/StaleDaemon.test.js",
     "tests/StatusStrip.test.js",
     "tests/UnassignedRuns.test.js",
+    "tests/UsageRollup.test.js",
+    "tests/UsageStrip.test.js",
+    "tests/UsageTab.test.js",
 ]
 
 

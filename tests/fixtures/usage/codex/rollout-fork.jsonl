@@ -1,0 +1,4 @@
+{"timestamp": "2026-11-05T09:10:00Z", "type": "session_meta", "payload": {"id": "thread-fork", "forked_from_id": "thread-main"}}
+{"timestamp": "2026-11-05T09:10:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5-codex", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:10:05Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3600, "cached_input_tokens": 2900, "cache_write_input_tokens": 100, "output_tokens": 300, "reasoning_output_tokens": 100, "total_tokens": 3900}}}}
+{"timestamp": "2026-11-05T09:11:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4000, "cached_input_tokens": 3200, "cache_write_input_tokens": 100, "output_tokens": 340, "reasoning_output_tokens": 110, "total_tokens": 4340}}}}

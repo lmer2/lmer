@@ -636,7 +636,7 @@ def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket,
     noop = SimpleNamespace(stop=lambda: None)
     for name in ("_supervise_assistant", "_watch_for_attention"):
         monkeypatch.setattr(daemon, name, lambda *a: noop)
-    for name in ("_subscribe_to_comms", "_run_thread_connectors", "_serve_thread_requests"):
+    for name in ("_subscribe_to_comms", "_run_thread_connectors", "_serve_thread_requests", "_collect_usage"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
     monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     seen = []
