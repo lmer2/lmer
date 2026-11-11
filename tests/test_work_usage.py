@@ -155,6 +155,16 @@ class TestCheckpoint:
         assert usage.checkpoint() == path
         assert _read(path)["totals"]["requests"] == 7
 
+    def test_the_record_carries_the_platform_session_id(self, monkeypatch, tmp_path, transcripts, no_gate):
+        _legacy(monkeypatch, tmp_path)
+        monkeypatch.setenv("LMER_USAGE_PLATFORM_SESSION", "s-20261111T112144-ed3dbf1e53a2")
+        assert _read(usage.checkpoint())["platform_session"] == "s-20261111T112144-ed3dbf1e53a2"
+
+    def test_a_session_outside_the_platform_records_no_platform_session(
+            self, monkeypatch, tmp_path, transcripts, no_gate):
+        _legacy(monkeypatch, tmp_path)
+        assert _read(usage.checkpoint())["platform_session"] is None
+
     def test_a_running_gate_suppresses_the_checkpoint(self, monkeypatch, tmp_path, transcripts):
         rdir = _legacy(monkeypatch, tmp_path)
         monkeypatch.setattr(usage.gate_lock, "active_gate", lambda *a, **k: {"pid": 1})

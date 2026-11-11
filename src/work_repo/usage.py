@@ -180,7 +180,7 @@ def build(state: dict, summary: Summary, *, status: str, final: bool, partial: b
         harness=metadata.get("harness") or os.environ.get("LMER_HARNESS"),
         model=metadata.get("model"),
         effort=metadata.get("effort"),
-        platform_session=os.environ.get("LMER_PLATFORM_SESSION_ID") or None,
+        platform_session=os.environ.get("LMER_USAGE_PLATFORM_SESSION") or None,
         extra_rows=extra_rows,
         extra_days=extra_days,
     )

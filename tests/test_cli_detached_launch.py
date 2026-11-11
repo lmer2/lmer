@@ -129,6 +129,30 @@ def test_a_platform_launch_reports_its_container_to_the_platform(tmp_path):
     assert seen["followed"][0][1]["name"] == "lmer-chat-mr-389-ff2b"
 
 
+def test_the_platform_session_id_reaches_the_container_under_a_container_only_name():
+    """The host name stays out of the container: a nested `lmer` reads it as
+    "the platform spawned me"."""
+    _, seen = launch(extra_env={"LMER_PLATFORM_SESSION_ID": "s-20261009T152516-ff2b"})
+    assert seen["env"]["LMER_USAGE_PLATFORM_SESSION"] == "s-20261009T152516-ff2b"
+    assert not seen["env"].get("LMER_PLATFORM_SESSION_ID")
+
+
+def test_a_launch_outside_the_platform_forwards_no_session_id():
+    _, seen = launch()
+    assert not seen["env"].get("LMER_USAGE_PLATFORM_SESSION")
+
+
+def test_a_nested_launch_does_not_inherit_the_parents_platform_identity():
+    """What an agent's `lmer` sees inside a platform session's container."""
+    rc, seen = launch(extra_env={"LMER_USAGE_PLATFORM_SESSION": "s-20261009T152516-ff2b"})
+    run = seen["create"]
+    assert "io.lmer.launcher=cli" in run
+    assert not [arg for arg in run if arg.startswith("io.lmer.platform.session=")]
+    assert "ff2b" not in run[run.index("--name") + 1]
+    assert not seen["env"].get("LMER_USAGE_PLATFORM_SESSION")
+    assert not seen["env"].get("LMER_PLATFORM_SESSION_ID")
+
+
 def test_a_failed_create_reports_no_container(tmp_path):
     facts = tmp_path / "facts.json"
     launch(create_rc=125, extra_env={"LMER_PLATFORM_PORTS_FILE": str(facts)})
