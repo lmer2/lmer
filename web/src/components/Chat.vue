@@ -116,6 +116,7 @@ import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
 import { operatorGround, readDraft, storeDraft } from '../projects.js'
 import { chatTintOperator } from '../operatorChat.js'
+import { composerKeydown, enterHint } from '../composerKeys.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
 import { assistantName } from '../ratchet.js'
@@ -1732,8 +1733,8 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
 
         <!-- Send is a labelled control on its own row, and there are two ways to
              reach it. The row is the phone's way and it is the one that has to
-             work: this fleet is driven from a phone, where there is no Ctrl or
-             Cmd key at all, so the chord is a convenience and the button is the
+             work: this fleet is driven from a phone, where Enter has to stay a
+             newline (below), so the key is a convenience and the button is the
              affordance. `.send-row` (style.css, shared by the three composers)
              is what makes it a thumb target rather than a corner icon.
 
@@ -1748,14 +1749,11 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
              send one — "newlines from the app aren't sending" is what an Enter
              that inserts a newline feels like when nothing else leaves.
 
-             The chord: Ctrl+Enter, Cmd+Enter on a Mac, which is the same event
-             with `metaKey` instead. Bare Enter is still deliberately NOT bound —
-             this is a multi-line box (auto-grow, max-rows) an operator writes a
-             paragraph in, and on a phone the return key is the *only* way to type
-             a newline, so binding it to send would make a multi-line message
-             uncomposable on the device this is for. `.prevent` because a browser
-             that would have inserted one on the chord must not leave it behind in
-             a draft that a failed send keeps.
+             Keys (issue 663): composerKeys.js holds the one rule for all three
+             boxes. Enter sends and Shift+Enter is a new line, unless the platform's
+             "Enter sends" setting is off or the device is touch-first. A phone's
+             return key is the only way it can type a newline, so there Enter stays
+             a newline and this button sends. Ctrl/Cmd+Enter sends in every mode.
 
              The hint leads with the tap for the same reason the button exists: the
              way in that always works is the one an operator must not have to
@@ -1823,7 +1821,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
             v-model="draft"
             :disabled="sending"
             :label="composerLabel"
-            hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Attach or paste a file and it goes with the message. Typed into the session, then read back from its transcript — so it appears here with a delay"
+            :hint="`Tap send below — ${enterHint}. Attach or paste a file and it goes with the message. Typed into the session, then read back from its transcript — so it appears here with a delay`"
             persistent-hint
             rows="2"
             auto-grow
@@ -1831,8 +1829,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
             autocapitalize="sentences"
             class="mt-3"
             @paste="onPaste"
-            @keydown.ctrl.enter.prevent="send"
-            @keydown.meta.enter.prevent="send"
+            @keydown.enter="composerKeydown($event, send)"
           >
             <template v-if="$slots['composer-inner']" #append-inner>
               <slot name="composer-inner" />

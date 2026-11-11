@@ -9,7 +9,8 @@ the Send Privately editor; issue #465 the operator channel dock's retention;
 issue #646 the rotate-every-assistant modal; issue #650 the outdated-daemon
 banner; issue #315 the usage strip's headroom chips, the run view's usage
 section, the rollup panel, the fleet card's burn reading and ranking, and the
-list's "most expensive now" order).
+list's "most expensive now" order; issue #663 Enter-to-send in the three
+message boxes).
 """
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ SUITES = [
     "tests/AssistantHistory.test.js",
     "tests/AssistantSettings.test.js",
     "tests/Chat.test.js",
+    "tests/ComposerKeys.test.js",
     "tests/FleetOrder.test.js",
     "tests/ForgetCompleted.test.js",
     "tests/OperatorChat.test.js",

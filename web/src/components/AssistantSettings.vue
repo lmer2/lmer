@@ -143,6 +143,7 @@ const fields = reactive({
   model: '', harness: '', preset: '', agents: '', effort: '', threads: '',
   showTranscript: false,
   tintOperator: true,
+  enterSends: true,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
 })
@@ -159,6 +160,7 @@ function readings() {
   }
   out.showTranscript = fields.showTranscript
   out.tintOperator = fields.tintOperator
+  out.enterSends = fields.enterSends
   for (const spec of TICK_FIELDS) {
     out[spec.field] = numberReading(fields[spec.field])
   }
@@ -170,6 +172,7 @@ const FIELD_GROUP = {
   ...Object.fromEntries(SETTING_KEYS.map((key) => [key, 'launch'])),
   showTranscript: 'conversation',
   tintOperator: 'conversation',
+  enterSends: 'conversation',
   ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.field, 'reminders'])),
   rotationOn: 'reminders',
   rotationPercent: 'reminders',
@@ -230,6 +233,7 @@ function prefill(config, apply = true) {
   // baked into the file by saving this.
   fields.showTranscript = config.chat?.show_transcript?.value === true
   fields.tintOperator = config.chat?.tint_operator?.value !== false
+  fields.enterSends = config.chat?.enter_sends?.value !== false
   if (apply) applyChatSettings(config)
   for (const spec of TICK_FIELDS) {
     const stored = config[spec.group]?.[spec.key]?.stored
@@ -282,6 +286,9 @@ function diff() {
     if (fields.tintOperator !== (reply.value?.chat?.tint_operator?.value !== false)) {
       named.chat_tint_operator = fields.tintOperator
     }
+    if (fields.enterSends !== (reply.value?.chat?.enter_sends?.value !== false)) {
+      named.chat_enter_sends = fields.enterSends
+    }
   }
   if (!show('reminders')) return { named, refused: null }
   for (const spec of TICK_FIELDS) {
@@ -333,7 +340,7 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = changed.includes('chat_show_transcript') || changed.includes('chat_tint_operator')
+    savedDisplay.value = ['chat_show_transcript', 'chat_tint_operator', 'chat_enter_sends'].some((key) => changed.includes(key))
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -502,6 +509,23 @@ defineExpose({ save, reset })
           <p class="text-body-small text-medium-emphasis setting-source">
             On, your messages in each chat take that project's hue, kept readable in
             both color schemes. Off, they use one color everywhere.
+          </p>
+        </div>
+        <!-- Issue 663. composerKeys.js applies it to all three message boxes. -->
+        <div class="settings-field">
+          <v-switch
+            v-model="fields.enterSends"
+            class="enter-sends"
+            color="primary"
+            density="compact"
+            hide-details
+            :disabled="saving"
+            label="Enter sends messages"
+          />
+          <p class="text-body-small text-medium-emphasis setting-source">
+            On, Enter sends and Shift+Enter starts a new line. Off, Enter starts a
+            new line and Ctrl+Enter (Cmd on a Mac) sends. On a phone or other touch
+            device Enter always starts a new line; use the send button.
           </p>
         </div>
       </div>

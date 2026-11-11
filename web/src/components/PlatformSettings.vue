@@ -362,7 +362,7 @@ async function release() {
         </div>
 
         <div v-show="section === 'chat'" class="settings-panel" data-panel="chat">
-          <SettingsSection title="Chat display" description="How the chat panes show your messages and the working transcript."
+          <SettingsSection title="Chat display" description="How the chat panes show your messages and the working transcript, and what Enter does in the message boxes."
             :dirty="displayState.dirty" save-label="Save chat display" :saving="displayState.saving" @save="display?.save()">
             <AssistantSettings ref="display" :groups="['conversation']" :allow-restart="false" @state="displayState = $event" />
           </SettingsSection>

@@ -1764,6 +1764,7 @@ def test_an_unusable_stored_dock_retention_reads_as_unset(platform_root, caplog)
 CHAT_TOGGLES = pytest.mark.parametrize("key, field, default", [
     ("chat_show_transcript", "show_transcript", False),
     ("chat_tint_operator", "tint_operator", True),
+    ("chat_enter_sends", "enter_sends", True),
 ])
 
 
