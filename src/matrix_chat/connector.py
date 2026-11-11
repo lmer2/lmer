@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from ask_channel import bus
 from lmer_cli import thread_access, thread_posts
-from lmer_cli.comms import off_thread
+from lmer_cli.comms import MAX_REF_CHARS, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -34,7 +34,7 @@ from slack_chat.connector import (
 
 from .client import MatrixAccount, MatrixClient, MatrixError
 from .crypto import BRIDGE_URL_ENV, NO_SESSION, CryptoError, encrypted_room_refusal
-from .permalink import matrix_to_link, parse_matrix_permalink
+from .permalink import matrix_to_link, parse_matrix_permalink, thread_ref
 from lmer_cli.assistant_mentions import route_connected_mention
 
 logger = logging.getLogger(__name__)
@@ -663,7 +663,7 @@ class MatrixConnector(ConnectorLifecycle):
         posted = post_replay_notice(
             self.bus, channel=CHANNEL, label=self.thread_label,
             permalink=matrix_to_link(self.room_id, self.config.thread_event),
-            count=len(events), oldest=stamp(events[0]), newest=stamp(events[-1]), ref=newest,
+            count=len(events), oldest=stamp(events[0]), newest=stamp(events[-1]), ref=self._ref(newest),
         )
         if posted:
             with self._state.lock:
@@ -725,7 +725,9 @@ class MatrixConnector(ConnectorLifecycle):
                 return None
             if not event_id:
                 raise ValueError("Matrix input has no event identity")
-            source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": event_id}
+            source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": self._ref(event_id)}
+            if human:
+                source["author_id"] = event.get("sender")
             kind, in_reply_to = "message", None
             states = [state for state in self.bus.questions() if not off_thread(state["question"])]
             related = next((state["question"] for state in states
@@ -777,6 +779,16 @@ class MatrixConnector(ConnectorLifecycle):
                 self._state.save()
         except Exception as error:
             logger.warning("matrix_connector_operator_notice_failed error=%s", error)
+
+    def _ref(self, event_id: str) -> str:
+        """The ``source.ref`` of one of this thread's events. It names the
+        thread, so the platform finds it in every session's bindings; an id
+        too long to carry its tag, or one read before the room resolved, goes
+        bare."""
+        if self.room_id is None:
+            return event_id
+        ref = thread_ref(self.room_id, self.config.thread_event, event_id)
+        return ref if len(ref) <= MAX_REF_CHARS else event_id
 
     def _accept_inbound(self, ref):
         self._seen.add(ref)

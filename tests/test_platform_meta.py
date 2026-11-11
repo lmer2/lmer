@@ -586,6 +586,7 @@ def test_the_reply_carries_the_bounds_the_daemon_will_enforce(client, tracked):
     assert payload["limits"] == {
         "title": meta.MAX_TITLE_CHARS,
         "description": meta.MAX_DESCRIPTION_CHARS,
+        "issues": meta.MAX_ISSUES,
     }
 
 
@@ -805,6 +806,93 @@ def _plant(parts, **entry):
     entries = meta.load_all()
     entries[_key(parts)] = entry
     store.write_json(store.snapshot_path(meta.META_FILE), {"meta": entries})
+
+
+# --- issues (issue #665) -----------------------------------------------------
+
+ISSUE = "https://git.example.com/acme/widgets/-/issues/12"
+MR = "https://git.example.com/acme/widgets/-/merge_requests/7"
+
+
+def test_issues_are_set_read_and_left_alone_by_omission(tracked):
+    stored = meta.write(*RUN, issues=[ISSUE, MR])
+    assert stored.issues == (ISSUE, MR)
+    assert meta.read(*RUN).issues == (ISSUE, MR)
+    meta.write(*RUN, title="auth fix")
+    assert meta.read(*RUN).issues == (ISSUE, MR)
+    assert meta.read(*RUN).title == "auth fix"
+
+
+def test_issues_are_normalised_and_deduplicated_on_write(tracked):
+    stored = meta.write(*RUN, issues=[
+        "HTTPS://Git.Example.com/acme/widgets/-/work_items/12/?x=1", ISSUE, MR + "#note_3"])
+    assert stored.issues == (ISSUE, MR)
+
+
+def test_an_empty_list_clears_the_issues(tracked):
+    meta.write(*RUN, title="t", issues=[ISSUE])
+    assert meta.write(*RUN, issues=[]).issues == ()
+    assert "issues" not in meta.load_all()[runs.run_key(*RUN)]
+
+
+def test_issues_alone_keep_the_entry_and_all_three_empty_remove_it(tracked):
+    stored = meta.write(*RUN, issues=[ISSUE])
+    assert stored.issues == (ISSUE,) and stored.empty
+    assert runs.run_key(*RUN) in meta.load_all()
+    meta.write(*RUN, issues=[])
+    assert runs.run_key(*RUN) not in meta.load_all()
+
+
+@pytest.mark.parametrize("issues, expected", [
+    (["not a url"], "issues[0]: 'not a url' is not an issue URL"),
+    ([ISSUE, "ftp://x.example/1"], "issues[1]:"),
+    ("https://x.example/1", "issues must be a list"),
+    ([f"https://git.example.com/a/b/-/issues/{n}" for n in range(21)], "the limit is 20"),
+])
+def test_bad_issues_are_refused_naming_the_item(tracked, issues, expected):
+    with pytest.raises(meta.MetaError) as caught:
+        meta.write(*RUN, issues=issues)
+    assert expected in str(caught.value)
+    assert meta.read(*RUN).issues == ()
+
+
+def test_twenty_issues_are_accepted(tracked):
+    issues = [f"https://git.example.com/a/b/-/issues/{n}" for n in range(20)]
+    assert meta.write(*RUN, issues=issues).issues == tuple(issues)
+
+
+def test_junk_stored_issues_read_as_none(tracked, platform_root):
+    store.write_json(store.snapshot_path(meta.META_FILE), {"meta": {runs.run_key(*RUN): {
+        "title": "t", "issues": {"old": [ISSUE], "new": [MR]}}}})
+    assert meta.read(*RUN).issues == ()
+    store.write_json(store.snapshot_path(meta.META_FILE), {"meta": {runs.run_key(*RUN): {
+        "title": "t", "issues": [ISSUE, 7, "nope", ISSUE + "/"]}}})
+    assert meta.read(*RUN).issues == (ISSUE,)
+
+
+def test_issues_over_the_api(client, tracked):
+    written = client.post(
+        "/api/runs/meta", headers=bearer_header(), json={**BODY, "issues": [ISSUE]})
+    assert written.status_code == 200, written.text
+    assert written.json()["meta"]["issues"] == [ISSUE]
+    assert written.json()["limits"]["issues"] == meta.MAX_ISSUES
+    read = client.get("/api/runs/meta", headers=bearer_header(), params=BODY).json()
+    assert read["meta"]["issues"] == [ISSUE]
+    refused = client.post(
+        "/api/runs/meta", headers=bearer_header(), json={**BODY, "issues": "x"})
+    assert refused.status_code == 400
+
+
+def test_the_api_index_names_issues(client):
+    body = client.get("/api", headers=bearer_header()).text
+    assert "description?,issues?}" in body
+
+
+def test_rekey_carries_issues(tracked):
+    meta.write(*RUN, issues=[ISSUE])
+    uid = "0" * 32
+    meta.rekey(RUN, (RUN[0], RUN[1], uid))
+    assert meta.read(RUN[0], RUN[1], uid).issues == (ISSUE,)
 
 
 def test_rekey_moves_the_entry(tracked):

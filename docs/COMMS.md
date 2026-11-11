@@ -78,7 +78,7 @@ line in the log and the same object on the wire.
   "seq": 42,
   "session": "20260904-153332-7-21957",
   "at": "2026-09-04T16:02:11.482Z",
-  "source": {"channel": "slack", "author": "tester", "ref": "1725465731.001200"},
+  "source": {"channel": "slack", "author": "tester", "ref": "1725465731.001200", "author_id": "U0123ABCD"},
   "kind": "answer",
   "text": "prep-release",
   "in_reply_to": "20260904-153332-7-21957/000039",
@@ -97,14 +97,15 @@ line in the log and the same object on the wire.
 | `at` | str | UTC ISO-8601 with milliseconds, stamped on acceptance. Order by `seq`, not `at`. |
 | `source.channel` | str | `agent`, `supervisor`, `terminal`, `platform`, `uber-lmer`, `slack`, `matrix`, or a future connector's name (lowercase, letters/digits/dashes). Stamped by the party that vouches for it, never taken from the body alone. |
 | `source.author` | str? | Who spoke, for rendering: a Slack display name, an MXID, an operator identity. Absent for `agent`, `uber-lmer` and an unnamed terminal. |
-| `source.ref` | str? | The origin channel's own id for the message (Slack `channel:thread_ts:message_ts`, matrix `event_id`, a request id). Dedupe key for retries, and how a connector recognises its own message. |
+| `source.ref` | str? | The origin channel's own id for the message (Slack `channel:thread_ts:message_ts`, matrix `<thread tag>:<event_id>`, where the tag is the first 16 hex digits of the SHA-256 of `<room id>\n<thread root>` and an older connector posts the bare `event_id`; a request id). Dedupe key for retries, and how a connector recognises its own message. |
+| `source.author_id` | str? | The channel's stable id for a **human** sender, at most 200 characters: the Slack user id, or the sender's MXID on matrix. Set by the Slack and matrix connectors on a human's post only, never on another run's or the platform's post through the shared bot account, nor on the bot's own. `author` stays the display text. Human time tracking maps a person by it ([TIME-TRACKING.md](./TIME-TRACKING.md#people)). Absent on older records, which parse unchanged. |
 | `kind` | str | `message`, `note`, `milestone`, `question`, `answer`, `close`, `command`. An unknown kind is stored, fanned out and rendered as plain text labelled with the kind. |
 | `text` | str | Body. Caps enforced on post: question 8192, note 4096, milestone 1000, message/answer 16384, close 500, command 4096 characters. |
 | `in_reply_to` | str? | An `id` on the same session. Required on `answer` and `close`; optional on `message`. |
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
 | `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
-| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6), and `poster` on a record a Slack or Matrix connector relayed: `human`, `bot`, or the `thread_posts` origin (`session` for another lmer run, `platform` for the daemon's post button). Only a connector can post on its channel, so `work decisions` reads a thread post as a human's only with `poster: human` (#674). |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. The platform daemon stamps `credential` (`operator` or `connector`) on a record it posts through its API with that credential and drops a caller's own copy; a session's post cannot carry it onto a human channel, because the supervisor refuses a session post on any channel but `agent`. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6), and `poster` on a record a Slack or Matrix connector relayed: `human`, `bot`, or the `thread_posts` origin (`session` for another lmer run, `platform` for the daemon's post button). Only a connector can post on its channel, so `work decisions` reads a thread post as a human's only with `poster: human` (#674). |
 
 ### Kinds
 
@@ -214,7 +215,7 @@ environment is readable from any shell in it (`/proc/1/environ`, same user).
 ### `POST /messages` — post a record
 
 ```
-body: {kind, text?, source: {channel, author?, ref?}, in_reply_to?, option?, options?, attachments?, meta?}
+body: {kind, text?, source: {channel, author?, ref?, author_id?}, in_reply_to?, option?, options?, attachments?, meta?}
 200:  {"message": <record>, "accepted_as": "new" | "duplicate" | "late", "relay": {...} | null}
 400:  {"detail": "<why>"}  — empty text, over a cap, unknown in_reply_to, kind/channel
       mismatch, an out-of-range `option`, `option` on a kind other than `answer`,
@@ -229,8 +230,9 @@ and on a `close`.
 - A post naming no `source.channel` is taken as the agent's own (`agent`).
   The agent may post `message`, `note`, `milestone`, `question`, `close`.
 - **403** when a post made with the session's own token claims any other
-  channel, or an author: the source is stamped by the party that vouches for
-  it, and the session vouches for nobody but itself.
+  channel, an author or an `author_id`: the source is stamped by the party that
+  vouches for it, and the session vouches for nobody but itself. `author_id` is
+  set by the holder of the control token, which is how a connector posts.
 - **`duplicate`**: a record with the same `(source.channel, source.ref)` is
   already stored. The stored record is returned; nothing is appended or
   relayed. This is what makes a connector's retry after a timeout safe.
@@ -342,6 +344,9 @@ traffic. It reads no file a container wrote.
 | the shared secret | `platform` | body `author`, else `operator` |
 | the assistant's minted credential | `uber-lmer` | none |
 | a connector credential | the channel bound to it | body `author` |
+
+No daemon route sets `source.author_id`; only a connector posting to the
+supervisor directly does (§1).
 
 `lmer platform connector add <name> --channel <channel>` mints a connector
 credential (printed once, stored owner-only under `<platform state>/connectors/`);
@@ -939,8 +944,8 @@ The daemon also stamps `LMER_SESSION_KIND` from the session kind it owns.
 For posts authenticated with the session credential, the supervisor uses that
 launch identity to stamp its own outgoing records as `uber-lmer`, rendered
 `[Ratchet]`; workers remain `agent`.
-The session credential still may claim only `agent`, may not name an author,
-may not post commands, and may not ack. The supervisor sets
+The session credential still may claim only `agent`, may not name an author
+or an `author_id`, may not post commands, and may not ack. The supervisor sets
 `meta.session_origin` on its own assistant records, discarding any caller's
 value; this prevents self-relay and keeps the chat pane's reply on the assistant
 side. It also counts those records against the existing agent caps. A human
@@ -995,7 +1000,8 @@ is never blindly replayed. The connector runs until stopped:
   one room. Each new human message — and each post another run or the platform
   made, below — becomes `POST /messages` with `source
   {channel, author, ref}` — the Slack display name (from `users.info`) or the
-  MXID, and the message's own `ts` / `event_id`. While the session has an open
+  MXID, and the message's own `ts` / `event_id` — plus, on a human's message
+  only, `author_id`: the Slack user id or the sender's MXID. While the session has an open
   question the message is an `answer` to the oldest one, and a reply that is
   exactly an option's number or text is that option, and the rest of §6's
   binding rule decides whether anything else does; otherwise it is a

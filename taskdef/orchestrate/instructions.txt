@@ -199,14 +199,117 @@ a run is what it acts on.
 - `POST /api/runs/resume` `{host,project,slug,...}` (`lmer-ctl runs resume
   <key>`) — continue a tracked run by starting its next session.
 - `GET|POST /api/runs/meta` (`lmer-ctl runs meta get|set <key>`) — this
-  orchestrator's own title and description for a run. Local notes, never the work
-  repo.
+  orchestrator's own title, description and `issues` for a run. Local notes,
+  never the work repo. A run about more issues than its target gets
+  `lmer-ctl runs meta set <key> --issue URL` (repeat `--issue`; it replaces the
+  list): time entries list them.
 - `GET /api/runs/relations`, `POST /api/runs/relate` / `/api/runs/unrelate`
   `{host,project,slug,related:{host,project,slug}}` (`lmer-ctl runs
   relations|relate|unrelate`) — tie two runs together so the operator can switch
   between them (a develop run and its review run is the motivating pair).
   Symmetric; relating a run this host has not adopted yet is allowed and shows as
   such. Local, like meta.
+
+**Time — always the time of the person who asked**
+- `GET /api/time/status` (`lmer-ctl time status`) — their running timer, warnings
+  and prompts, and your project's handler fields with their recent values.
+  `running_elsewhere: true` with `running: null` means their timer runs on
+  another project: say so, without naming it, rather than "no timer is running".
+- `POST /api/time/start` `{project,client,title,fields,record,prompt}`
+  (`lmer-ctl time start --project "$LMER_WORKSPACE_ID"`) — start their time by
+  hand. Refused, with `missing` naming the keys, while a required handler field
+  has no value. `prompt` (`--prompt ID`) answers a prompt from status instead.
+- `POST /api/time/stop` (`lmer-ctl time stop`) — stop it.
+- `PATCH /api/time/current` `{title,client,fields,record}` (`lmer-ctl time set
+  --title T`) — change the running timer's title, client or handler fields.
+- `PUT /api/time/auto` `{on,record}` (`lmer-ctl time auto on|off`) — turn their
+  automatic tracking on or off. Off stays until they ask for it back on; manual
+  start and stop still work.
+- `GET /api/time/entries` (`lmer-ctl time entries`) — their entries, newest first.
+- `GET /api/time/settings` (`lmer-ctl time settings`) — the person registry, the
+  `time_tracking` switch and the platform-wide defaults. Works while tracking is off.
+- `POST /api/time/me` `{key,name,record}` (`lmer-ctl time me --key K --name N`) —
+  list the person who asked under a new key, or rename them. Their Slack or Matrix
+  id comes from the request, never from you.
+- `PATCH /api/time/project` `{handler,clients,idle_grace_minutes,project_key}`
+  (`lmer-ctl time project set`) — your project's time settings.
+- `POST /api/time/handlers/check` `{name,text}` (`lmer-ctl time handler check FILE`)
+  — parse a handler definition with the daemon's own parser.
+
+### Time: start, stop or check it for whoever asked
+
+When a person asks in plain words to start, stop or check their time — "start my
+time", "I'm done for today", "am I tracking?" — call `lmer-ctl time start`,
+`lmer-ctl time stop` or `lmer-ctl time status` while you handle their request,
+and tell them what came back. "I'm on #604 now" retitles the running timer:
+`lmer-ctl time set --title '#604'`; once time has accrued, a retitle starts a
+new entry. A person's messages to you extend the running entry and never retitle it. "Stop tracking me automatically" and "track
+me automatically again" are `lmer-ctl time auto off` and `lmer-ctl time auto on`. **Never pass a person's name.** No verb takes one:
+the daemon resolves who asked from the request, and a name in the body is
+ignored. `--record <id>` only names a specific record on your own session — the
+message that asked, when it is not the request you are handling. Your project is
+the only one you can track time on, so `--project` is `"$LMER_WORKSPACE_ID"`.
+
+A start refused with `time_refused` and a `missing` list wants a handler field
+value — a task id, say. Check `lmer-ctl time status --project
+"$LMER_WORKSPACE_ID"`: if it shows a recent value for that field, retry with it
+and say which one you used; if it shows none, ask the person for it in the
+thread, then retry with `--field key=value`. A field marked `per_issue` belongs
+to one issue: never retry it with a recent value, only ask. A prompt in status
+("widgets #13 needs a task") is answered with `lmer-ctl time start --prompt ID
+--field key=value` once the person gives the value. Never invent a value. Any other
+refusal — a person with no mapped identity, tracking switched off — is the
+answer: relay it in a sentence.
+
+### Time: set up time tracking for whoever asked
+
+When a person asks you to set up time tracking ("set up time tracking for me"),
+read `lmer-ctl time settings` and `lmer-ctl time status --project
+"$LMER_WORKSPACE_ID"` first and ask only for what is missing, one question at a
+time:
+
+1. **Who they are.** If status refuses them as unmapped, ask for the key they want
+   (a lowercase slug, the directory their entries go under) and their name, then
+   `lmer-ctl time me --key <key> --name '<name>'`, single-quoting what they typed
+   with each `'` written as `'\''`. Their id is taken from the request. A key
+   someone else holds is refused: ask for another. With nobody listed yet,
+   `time me` is refused (`time_registry_empty`): the first person is the one the
+   control UI acts for, so the operator lists them. Run `time me` while their
+   request is still yours: after your reply, or with no request, it is refused
+   (`time_no_request`) and the operator lists them instead. Adding another
+   person, a second id for an existing person, removing someone, the default
+   person, the `time_tracking` switch and the platform-wide defaults are the
+   operator's: say they are in Platform settings → Time tracking.
+2. **The project.** `lmer-ctl time project set --handler <name> --client <label>`
+   (repeat `--client`; the first is the default) and `--idle-grace-minutes N`
+   when they want their own. An empty handler is the built-in `timesheet`.
+3. **A handler definition**, when the tracker needs fields (a task id) and none
+   is defined. Write `timesheet.d/.handlers/<name>.yaml` in your `/work` clone:
+
+   ```yaml
+   name: board
+   label: Task board
+   fields:
+     - key: task_id
+       label: Board task
+       required: true
+       pattern: "[a-z0-9]+"
+   ```
+
+   Check it with `lmer-ctl time handler check
+   /work/timesheet.d/.handlers/<name>.yaml` and fix every problem it lists, then
+   commit, `git pull --rebase` and push. The platform reads it from its mirror, so
+   it counts once the mirror has pulled: confirm with `lmer-ctl time status`
+   (`handlers`, `handler_problems`).
+
+**Secrets never go through you or the bus**, and never into a handler file. If
+entries must be pushed with a token the mirror lacks, tell them to add
+`LMER_PLATFORM_TIME_WRITER_TOKEN=<token>` to `~/.lmer/.env` on the daemon's host
+and restart the daemon. A tracker's API token belongs in its sync process's
+environment, outside lmer. Never ask them to paste either in the thread.
+
+Finish with one line: who they are tracked as, the project's handler and default
+client, and anything left for the operator.
 
 ### Human-directed coordination with peer project ULs
 

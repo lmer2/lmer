@@ -87,6 +87,26 @@ export function operatorGround(value, { dark, ink, emphasis }) {
   return dark ? '#000000' : '#ffffff'
 }
 
+// WCAG 1.4.11: a control against what surrounds it.
+const NON_TEXT = 3
+
+// The header clock's fill while a timer runs (issue 668): the tint's own hue, its
+// lightness walked away from the tint (up on a dark one, down on a light one) until the
+// fill stands out from the header at 3:1. The walk ends at white or black, which always
+// does. The icon is black or white, whichever reads better on the fill.
+export function runningAccent(value) {
+  const tint = projectColor(value)
+  const [h, s, l] = hsl(tint)
+  const up = projectTextColor(tint) === '#ffffff'
+  for (let step = 1; step <= 50; step += 1) {
+    const lightness = up ? Math.min(1, l + step * 0.02) : Math.max(0, l - step * 0.02)
+    const ground = hexOf(h, s, lightness)
+    if (contrastRatio(ground, tint) >= NON_TEXT) return { ground, ink: projectTextColor(ground) }
+  }
+  const ground = up ? '#ffffff' : '#000000'
+  return { ground, ink: projectTextColor(ground) }
+}
+
 // Text on a surface painted in the project's color. Decided by the color alone:
 // the surface is the same in both themes, so the theme has no say.
 export function projectTextColor(value) {

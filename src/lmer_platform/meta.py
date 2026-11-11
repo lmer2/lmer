@@ -1,7 +1,8 @@
 """What a run is *about*, in this orchestrator's own words (T52).
 
 Two fields — a one-line ``title`` and a markdown ``description`` — attached to a
-run this orchestrator tracks, so a fleet row can be identified at a glance
+run this orchestrator tracks (plus the ``issues`` the run is about beyond its
+target, which time entries list and bill by), so a fleet row can be identified at a glance
 instead of being read off a slug and a taskdef. The orchestrator agent sets them
 when it starts a run; the operator can set or correct them at any time.
 
@@ -78,6 +79,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from lmer_timesheet import normalise_issue_url
+
 from .runs import get_tracked, holds_conflict, merge_values, run_key
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
@@ -86,7 +89,7 @@ from .store import (
 logger = logging.getLogger("lmer_platform.meta")
 
 __all__ = [
-    "META_FILE", "MAX_TITLE_CHARS", "MAX_DESCRIPTION_CHARS", "LOCALITY_NOTE",
+    "META_FILE", "MAX_TITLE_CHARS", "MAX_DESCRIPTION_CHARS", "MAX_ISSUES", "LOCALITY_NOTE",
     "MetaError", "RunNotTracked", "RunMeta",
     "load_all", "read", "write", "drop", "rekey",
 ]
@@ -104,6 +107,10 @@ MAX_TITLE_CHARS = 120
 #: rather than trusted to be reasonable. Two thousand characters is several
 #: paragraphs — enough to say what a run is for and why, which is the use.
 MAX_DESCRIPTION_CHARS = 2000
+
+#: Ceiling on a run's issue list: a run is about a handful of issues, and every
+#: time entry the run's sessions make copies the list.
+MAX_ISSUES = 20
 
 #: Said in every reply that carries metadata, because the surprising half of this
 #: feature is what it is *not*: a property of the run. Prose rather than a flag
@@ -149,7 +156,7 @@ class RunNotTracked(MetaError):
 
 @dataclass(frozen=True)
 class RunMeta:
-    """One run's title and description. Absent metadata is an empty one, not None.
+    """One run's title, description and issues. Absent metadata is an empty one, not None.
 
     An empty instance rather than ``None`` so every caller renders the same shape
     — a run with no metadata is the overwhelmingly common case, and making it the
@@ -159,15 +166,18 @@ class RunMeta:
     title: str = ""
     description: str = ""
     updated_at: Optional[str] = None
+    issues: tuple = ()
 
     @property
     def empty(self) -> bool:
+        """No title and no description: what the fleet shows as "nothing here yet"."""
         return not (self.title or self.description)
 
     def to_dict(self) -> dict:
         return {
             "title": self.title,
             "description": self.description,
+            "issues": list(self.issues),
             "updated_at": self.updated_at,
             # A fact from the daemon rather than a rule the UI restates: "nothing
             # here yet" is a state both ends have to agree on.
@@ -194,7 +204,44 @@ class RunMeta:
             title=title if isinstance(title, str) else "",
             description=description if isinstance(description, str) else "",
             updated_at=updated_at if isinstance(updated_at, str) else None,
+            issues=_read_issues(payload.get("issues")),
         )
+
+
+def _read_issues(raw) -> tuple:
+    """The usable stored issues, normalised and once each; a rekey pair or junk reads as none."""
+    if not isinstance(raw, list):
+        return ()
+    issues = []
+    for item in raw:
+        try:
+            url = normalise_issue_url(item)
+        except ValueError:
+            continue
+        if url not in issues:
+            issues.append(url)
+    return tuple(issues)
+
+
+def _cleaned_issues(value) -> Optional[list]:
+    """Validate a supplied issue list. ``None`` in means ``None`` out; ``[]`` clears."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise MetaError(f"issues must be a list of issue URLs, got {type(value).__name__}")
+    if len(value) > 4 * MAX_ISSUES:
+        raise MetaError(f"{len(value)} issues; the limit is {MAX_ISSUES}")
+    issues: list = []
+    for index, item in enumerate(value):
+        try:
+            url = normalise_issue_url(item)
+        except ValueError as exc:
+            raise MetaError(f"issues[{index}]: {exc}") from None
+        if url not in issues:
+            issues.append(url)
+    if len(issues) > MAX_ISSUES:
+        raise MetaError(f"{len(issues)} issues; the limit is {MAX_ISSUES}")
+    return issues
 
 
 def _meta_path():
@@ -272,8 +319,9 @@ def write(
     *,
     title: Optional[str] = None,
     description: Optional[str] = None,
+    issues: Optional[list] = None,
 ) -> RunMeta:
-    """Set a run's title, description, or both. Returns what was stored.
+    """Set a run's title, description, issues, or any of them. Returns what was stored.
 
     ``None`` leaves a field alone and ``""`` clears it, so a caller that knows
     about one field cannot blank the other by omission — the orchestrator agent
@@ -284,7 +332,11 @@ def write(
     view lists and no ``forget`` can reach, which is a leak rather than a
     feature.
 
-    Both fields ending up empty removes the entry rather than storing a husk, so
+    *issues* replaces the run's issue list: each one normalised
+    (:func:`lmer_timesheet.normalise_issue_url`), once each, at most
+    :data:`MAX_ISSUES`; a bad item refuses the write naming it.
+
+    All three ending up empty removes the entry rather than storing a husk, so
     "cleared" and "never set" are the same state on disk. They read the same way
     out, and leaving a record whose only content is a timestamp would show a run
     as described when it is not.
@@ -299,10 +351,11 @@ def write(
     clean_description = _cleaned(
         description, field="description", limit=MAX_DESCRIPTION_CHARS, one_line=False
     )
-    if clean_title is None and clean_description is None:
+    clean_issues = _cleaned_issues(issues)
+    if clean_title is None and clean_description is None and clean_issues is None:
         raise MetaError(
-            "nothing to set: supply a title, a description, or both. An empty "
-            'string ("") clears a field; omitting it leaves it as it is'
+            "nothing to set: supply a title, a description or issues. An empty "
+            'string ("") or list ([]) clears a field; omitting it leaves it as it is'
         )
     if get_tracked(host, project, slug) is None:
         raise RunNotTracked(
@@ -325,7 +378,10 @@ def write(
             ),
             "updated_at": utc_now_iso(),
         }
-        if not (record["title"] or record["description"]):
+        kept_issues = _kept(raw, "issues", list(current.issues), clean_issues)
+        if kept_issues:
+            record["issues"] = kept_issues
+        if not (record["title"] or record["description"] or kept_issues):
             entries.pop(key, None)
             _save(entries)
             logger.info("platform_run_meta_cleared key=%s", key)
@@ -336,8 +392,9 @@ def write(
     # Lengths, never the text: this is agent-authored content of arbitrary shape
     # and a log line is not where it belongs.
     logger.info(
-        "platform_run_meta_set key=%s title_chars=%d description_chars=%d",
+        "platform_run_meta_set key=%s title_chars=%d description_chars=%d issues=%d",
         key, len(record["title"]), len(record["description"]),
+        len(kept_issues) if isinstance(kept_issues, list) else -1,
     )
     return RunMeta.from_dict(key, record)
 

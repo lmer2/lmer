@@ -61,6 +61,13 @@ def active(workspace_id):
         return row[0] if row else None
 
 
+def bound(workspace_id):
+    """The request the project's credential is bound to, without binding one as :func:`active` does."""
+    with projects.database() as db:
+        row = db.execute("SELECT request_id FROM request_context WHERE project_id=?", (workspace_id,)).fetchone()
+    return row[0] if row else None
+
+
 def _decode(row):
     if row is None:
         return None

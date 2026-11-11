@@ -12,6 +12,7 @@ reply, and the connector resolves the root from it.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -19,11 +20,12 @@ from urllib.parse import quote, unquote, urlparse
 
 __all__ = [
     "MatrixThread", "parse_matrix_permalink", "is_matrix_thread_url",
-    "is_matrix_room", "matrix_to_link",
+    "is_matrix_room", "matrix_to_link", "thread_tag", "thread_ref", "split_thread_ref",
 ]
 
 _ROOM_RE = re.compile(r"^[!#][^/\s]+:[^/\s]+$")
 _EVENT_RE = re.compile(r"^\$[^/\s?#]+$")
+_TAGGED_REF_RE = re.compile(r"^([0-9a-f]{16}):(\$.+)$")
 
 
 @dataclass(frozen=True)
@@ -82,3 +84,21 @@ def is_matrix_room(value: object) -> bool:
 def matrix_to_link(room_id: str, event_id: str) -> str:
     """The canonical permalink for a thread, the shape the listener spawns with."""
     return f"https://matrix.to/#/{quote(room_id, safe='')}/{quote(event_id, safe='')}"
+
+
+def thread_tag(room_id: str, thread_event: str) -> str:
+    """A fixed-length name for one thread, which a ref can carry where the
+    room id and root, colons and all, would not fit or split cleanly."""
+    return hashlib.sha256(f"{room_id}\n{thread_event}".encode("utf-8")).hexdigest()[:16]
+
+
+def thread_ref(room_id: str, thread_event: str, event_id: str) -> str:
+    """A message's ``source.ref``: its thread's tag, then its event id."""
+    return f"{thread_tag(room_id, thread_event)}:{event_id}"
+
+
+def split_thread_ref(ref: str) -> tuple:
+    """``(tag, event_id)`` of a :func:`thread_ref`; ``(None, ref)`` for the
+    bare event id a connector from before the tag posts."""
+    match = _TAGGED_REF_RE.match(ref)
+    return (match.group(1), match.group(2)) if match else (None, ref)

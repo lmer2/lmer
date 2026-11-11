@@ -13,18 +13,28 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 
 from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS
+from lmer_timesheet import is_project_key, is_slug
 
 from . import project_context as scope, registry, store
 from . import assistant_history, runs
 
 logger = logging.getLogger(__name__)
 GENERAL = scope.GENERAL
+#: Per-project time tracking (issue #604): the project's stable key (D15), its
+#: handler (D19), its client labels (D12) and its idle grace (D1).
+PROJECT_TIME_SETTING_KEYS = ("time_project_key", "time_handler", "time_clients", "time_idle_grace_minutes")
 #: Project settings that are not assistant launch settings: they never reach an
-#: assistant start (issue #594, :mod:`lmer_platform.authority`).
-WORKER_SETTING_KEYS = ("supervisor_authority",)
+#: assistant start (issue #594, :mod:`lmer_platform.authority`; issue #604).
+WORKER_SETTING_KEYS = ("supervisor_authority", *PROJECT_TIME_SETTING_KEYS)
+MAX_PROJECT_KEY_CHARS = 64
+MAX_CLIENT_LABEL_CHARS = 32
+MAX_CLIENT_LABELS = 50
+#: What a project whose name has no ASCII letter or digit is keyed as.
+FALLBACK_PROJECT_KEY = "project"
 COLORS = (
     "Red", "Orange", "Amber", "Yellow", "Lime", "Green", "Emerald", "Teal",
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
@@ -366,10 +376,13 @@ def update(workspace_id, values):
     settings = values.get("settings", current["settings"])
     if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS) - set(WORKER_SETTING_KEYS):
         raise ProjectError("Invalid assistant overrides.")
+    settings = dict(settings)
     for key, value in settings.items():
         if value is None:
             continue
-        if key == "supervisor_authority":
+        if key in PROJECT_TIME_SETTING_KEYS:
+            settings[key] = _time_setting(key, value)
+        elif key == "supervisor_authority":
             if value not in SUPERVISOR_AUTHORITY_LEVELS:
                 raise ProjectError(
                     f"supervisor_authority must be one of {', '.join(SUPERVISOR_AUTHORITY_LEVELS)}."
@@ -380,11 +393,157 @@ def update(workspace_id, values):
     if not isinstance(repositories, list) or any(not isinstance(item, str) or not item.strip() for item in repositories):
         raise ProjectError("Repositories must be a list of repository URLs.")
     with operation(), database() as db:
+        _keep_project_key(db, workspace_id, settings)
         try:
             db.execute("UPDATE projects SET name=?,name_key=?,color=?,settings=?,repositories=? WHERE id=?",
                        (name, name.casefold(), color, json.dumps(settings), json.dumps(repositories), workspace_id))
         except sqlite3.IntegrityError as exc:
             raise ProjectError("A project with that name already exists.", code="name_taken", status=409) from exc
+    return get(workspace_id)
+
+
+def _time_setting(key, value):
+    """The stored form of one explicit :data:`PROJECT_TIME_SETTING_KEYS` value, or a refusal."""
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
+    from .config import ConfigError, validate_int_setting
+
+    if key == "time_idle_grace_minutes":
+        try:
+            return validate_int_setting(key, value)
+        except ConfigError as exc:
+            raise ProjectError(str(exc)) from exc
+    if key == "time_clients":
+        if not isinstance(value, list) or len(value) > MAX_CLIENT_LABELS:
+            raise ProjectError(f"time_clients must be a list of at most {MAX_CLIENT_LABELS} client labels.")
+        labels = [_client_label(item) for item in value]
+        if len({label.casefold() for label in labels}) != len(labels):
+            raise ProjectError("time_clients lists the same client label twice.")
+        return labels
+    key_value = value.strip() if isinstance(value, str) else value
+    if key == "time_project_key":
+        if not valid_project_key(key_value):
+            raise ProjectError(
+                f"{key} must be 1–{MAX_PROJECT_KEY_CHARS} characters of lower-case letters, digits, "
+                "'.', '_' or '-', starting with a letter or digit, with no '--'."
+            )
+    elif not is_slug(key_value) or len(key_value) > MAX_PROJECT_KEY_CHARS:
+        raise ProjectError(
+            f"{key} must be 1–{MAX_PROJECT_KEY_CHARS} characters of lower-case letters, digits, "
+            "'.', '_' or '-', starting with a letter or digit."
+        )
+    return key_value
+
+
+def validate_time_settings(changes):
+    """Refuse the first unusable value in *changes* (time setting key -> value, ``None``
+    clears) the way :func:`update` would, before anything is written (issue #668)."""
+    for key, value in changes.items():
+        if key in PROJECT_TIME_SETTING_KEYS and value is not None:
+            _time_setting(key, value)
+
+
+def valid_project_key(value):
+    """*value* can be stored as a ``time_project_key``."""
+    return is_project_key(value) and len(value) <= MAX_PROJECT_KEY_CHARS
+
+
+def _client_label(value):
+    label = value.strip() if isinstance(value, str) else ""
+    if not label or len(label) > MAX_CLIENT_LABEL_CHARS or not label.isprintable():
+        raise ProjectError(f"A client label needs 1–{MAX_CLIENT_LABEL_CHARS} printable characters.")
+    return label
+
+
+def _derived_key(name):
+    """A slug of *name*: ASCII letters and digits, every other run turned into one ``-``."""
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:MAX_PROJECT_KEY_CHARS].rstrip("-")
+    return slug or FALLBACK_PROJECT_KEY
+
+
+def _time_keys(db):
+    """``{workspace id: key}`` for every project: stored, or the one its name would derive."""
+    return {
+        row["id"]: json.loads(row["settings"]).get("time_project_key") or _derived_key(row["name"])
+        for row in db.execute("SELECT id,name,settings FROM projects")
+    }
+
+
+def _taken_keys(db, workspace_id):
+    """Every other project's key: stored, or the one its name would derive."""
+    return {key for other, key in _time_keys(db).items() if other != workspace_id}
+
+
+def time_keys():
+    """``{workspace id: key}`` for every project, archived ones included, as
+    :func:`update` weighs a new key against them. Reads only: a key not yet
+    stored is the one its name would derive, and stays unstored."""
+    with database() as db:
+        return _time_keys(db)
+
+
+def _keep_project_key(db, workspace_id, settings):
+    """Hold *settings*' ``time_project_key`` to the project's stable key.
+
+    A settings write that leaves the key out, or nulls it, keeps the stored one:
+    every settings writer replaces the whole map, and a key that fell out of it
+    would be re-derived from a name that may have changed since. A new explicit
+    key must not be any other project's.
+    """
+    row = db.execute("SELECT settings FROM projects WHERE id=?", (workspace_id,)).fetchone()
+    stored = json.loads(row[0]).get("time_project_key") if row else None
+    wanted = settings.get("time_project_key")
+    if wanted is None:
+        settings.pop("time_project_key", None)
+        if stored:
+            settings["time_project_key"] = stored
+    elif wanted != stored and wanted in _taken_keys(db, workspace_id):
+        raise ProjectError(f"Another project already uses the project key {wanted!r}.",
+                           code="project_key_taken", status=409)
+
+
+def project_key(workspace_id):
+    """The project's stable key (D15), stored the first time it is asked for.
+
+    The first call derives a slug of the name, made unique against every other
+    project with ``-2``, ``-3``…, and stores it, so a later rename keeps the key
+    every entry was written under.
+    """
+    with operation(), database() as db:
+        row = db.execute("SELECT name,settings FROM projects WHERE id=?", (workspace_id,)).fetchone()
+        if row is None:
+            raise ProjectError("This project does not exist.", code="project_not_found", status=404)
+        settings = json.loads(row["settings"])
+        if settings.get("time_project_key"):
+            return settings["time_project_key"]
+        taken = _taken_keys(db, workspace_id)
+        base = key = _derived_key(row["name"])
+        number = 2
+        while key in taken:
+            suffix = f"-{number}"
+            key = base[:MAX_PROJECT_KEY_CHARS - len(suffix)].rstrip("-") + suffix
+            number += 1
+        settings["time_project_key"] = key
+        db.execute("UPDATE projects SET settings=? WHERE id=?", (json.dumps(settings), workspace_id))
+    return key
+
+
+def add_client_label(workspace_id, label):
+    """Append *label* to the project's ``time_clients`` unless it is there already (spec D12)."""
+    label = _client_label(label)
+    with operation(), database() as db:
+        row = db.execute("SELECT settings,archived FROM projects WHERE id=?", (workspace_id,)).fetchone()
+        if row is None:
+            raise ProjectError("This project does not exist.", code="project_not_found", status=404)
+        if row["archived"]:
+            raise ProjectError("This project is archived; restore it first.", code="project_archived", status=409)
+        settings = json.loads(row["settings"])
+        labels = list(settings.get("time_clients") or [])
+        if label.casefold() not in {item.casefold() for item in labels}:
+            if len(labels) >= MAX_CLIENT_LABELS:
+                raise ProjectError(f"A project holds at most {MAX_CLIENT_LABELS} client labels.")
+            settings["time_clients"] = [*labels, label]
+            db.execute("UPDATE projects SET settings=? WHERE id=?", (json.dumps(settings), workspace_id))
     return get(workspace_id)
 
 

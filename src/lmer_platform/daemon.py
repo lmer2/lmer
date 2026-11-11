@@ -75,6 +75,7 @@ from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
 from .store import StoreError, append_event, platform_dir
+from .timetrack_live import TimeTracking, register_tracking
 from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
@@ -449,7 +450,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # about correctness — it is that the assistant's own row is in the fleet view
     # the first tick baselines against, so its start is never itself an event.
     detector = _watch_for_attention(config)
-    hub = _subscribe_to_comms()
+    # Before the hub: its consumer has to be on the hub when the hub starts, or
+    # the first records it journals are nobody's activity.
+    tracking = _track_time(config)
+    hub = _subscribe_to_comms(tracking)
     threads = _run_thread_connectors(config)
     services = _serve_thread_requests()
     usage = _collect_usage(config)
@@ -479,6 +483,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     detector.stop()
     hub.stop()
     register_hub(None)
+    # After the hub, which calls the consumer, and before the connectors, whose
+    # bindings the last decisions read.
+    tracking.stop()
+    register_tracking(None)
     # Last, and after the hub: a connector still running would go on posting
     # into a thread from a daemon that has stopped watching it, and the note it
     # posts on the way out is the only thing that tells the thread so.
@@ -532,17 +540,33 @@ def _collect_usage(config) -> UsageLive:
     return live
 
 
-def _subscribe_to_comms() -> CommsHub:
+def _subscribe_to_comms(*consumers) -> CommsHub:
     """Start the comms hub: one subscriber per session bus, one fleet journal
     (issue #407). Published like the assistant supervisor so the API routes and
     the detector can reach it; milestones it delivers are skipped by the ask-dir
     reader, and everything else it sees is batched into the assistant's spool.
+
+    *consumers* are added before the hub starts, so none misses a record.
     """
     hub = CommsHub()
     hub.add_consumer(_assistant_consumer(hub))
+    for consumer in consumers:
+        hub.add_consumer(consumer)
     hub.start()
     register_hub(hub)
     return hub
+
+
+def _track_time(config) -> TimeTracking:
+    """Start human time tracking (issue #604) and publish it for the settings
+    routes to reconfigure (issue #668).
+
+    Called from :func:`_cmd_run` only, like the detector. Never fatal; see
+    :meth:`lmer_platform.timetrack_live.TimeTracking.start`.
+    """
+    tracking = TimeTracking().start(config)
+    register_tracking(tracking)
+    return tracking
 
 
 def _assistant_consumer(hub: CommsHub):

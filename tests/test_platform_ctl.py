@@ -478,6 +478,53 @@ ROUTE_TABLE = [
      None, None),
     (["runs", "unmute", "--session", "s-chat"], "POST",
      "/api/sessions/s-chat/unmute", None, None),
+    # #604: no verb takes a person — the daemon resolves who asked.
+    (["time", "status"], "GET", "/api/time/status", {}, None),
+    (["time", "status", "--record", "s-a/000004", "--project", "w-1"], "GET",
+     "/api/time/status", {"project": "w-1", "record": "s-a/000004"}, None),
+    (["time", "start", "--project", "w-1"], "POST", "/api/time/start", None,
+     {"project": "w-1"}),
+    (["time", "start", "--project", "w-1", "--client", "acme", "--title", "checkout",
+      "--field", "task_id=abc123", "--field", "note=a=b", "--record", "s-a/000004"],
+     "POST", "/api/time/start", None,
+     {"project": "w-1", "client": "acme", "title": "checkout", "record": "s-a/000004",
+      "fields": {"task_id": "abc123", "note": "a=b"}}),
+    (["time", "stop"], "POST", "/api/time/stop", None, {}),
+    (["time", "stop", "--record", "s-a/000004"], "POST", "/api/time/stop", None,
+     {"record": "s-a/000004"}),
+    (["time", "set", "--title", "#604 now"], "PATCH", "/api/time/current", None,
+     {"title": "#604 now"}),
+    (["time", "set", "--client", "", "--field", "task_id=abc123", "--record", "s-a/000004"],
+     "PATCH", "/api/time/current", None,
+     {"client": "", "record": "s-a/000004", "fields": {"task_id": "abc123"}}),
+    (["time", "auto", "off"], "PUT", "/api/time/auto", None, {"on": False}),
+    (["time", "auto", "on", "--record", "s-a/000004"], "PUT", "/api/time/auto", None,
+     {"on": True, "record": "s-a/000004"}),
+    (["time", "entries"], "GET", "/api/time/entries", {}, None),
+    (["time", "entries", "--from", "2026-10-01", "--to", "2026-10-31", "--project", "webshop",
+      "--client", "acme", "--handler", "tracker-x", "--status", "held"],
+     "GET", "/api/time/entries",
+     {"from": "2026-10-01", "to": "2026-10-31", "project": "webshop", "client": "acme",
+      "handler": "tracker-x", "status": "held"}, None),
+    # #668: the settings a chat-driven setup reaches.
+    (["time", "settings"], "GET", "/api/time/settings", None, None),
+    (["time", "person", "add", "sam", "--name", "Sam", "--slack", "U0SAM", "--matrix", "@sam:example.org"],
+     "POST", "/api/time/people", None,
+     {"key": "sam", "name": "Sam", "slack": ["U0SAM"], "matrix": ["@sam:example.org"]}),
+    (["time", "person", "set", "sam", "--add", "slack:U0NEW", "--clear-matrix"], "PATCH",
+     "/api/time/people/sam", None, {"matrix": [], "add": ["slack:U0NEW"]}),
+    (["time", "person", "remove", "sam"], "DELETE", "/api/time/people/sam", None, None),
+    (["time", "defaults", "set", "--tracking", "off", "--idle-grace-minutes", "20",
+      "--default-person", ""], "PATCH", "/api/time/defaults", None,
+     {"tracking": False, "idle_grace_minutes": "20", "default_person": ""}),
+    (["time", "me", "--key", "sam", "--name", "Sam"], "POST", "/api/time/me", None,
+     {"key": "sam", "name": "Sam"}),
+    (["time", "me"], "POST", "/api/time/me", None, {}),
+    (["time", "project", "set", "--handler", "board", "--client", "acme", "--client", "globex"],
+     "PATCH", "/api/time/project", None, {"handler": "board", "clients": ["acme", "globex"]}),
+    (["time", "project", "set", "--project", "w-1", "--clear-clients", "--idle-grace-minutes", "",
+      "--key", "webshop"], "PATCH", "/api/time/project", None,
+     {"project": "w-1", "clients": "", "idle_grace_minutes": "", "project_key": "webshop"}),
 ]
 
 
@@ -489,6 +536,34 @@ def test_a_verb_is_one_route_and_the_arguments_it_was_given(
     assert (call.method, call.path) == (method, path)
     assert call.params == params
     assert call.body == body
+
+
+def test_time_set_with_nothing_to_change_is_refused_before_the_request(configured, capsys):
+    transport = Recorder()
+    assert ctl.main(["time", "set", "--record", "s-a/000004"], transport=transport) == ctl.EXIT_FAILURE
+    assert transport.calls == []
+    assert "--title, --client or --field" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv, words", [
+    (["time", "person", "set", "sam"], "--name, --slack, --matrix, --add"),
+    (["time", "defaults", "set"], "at least one setting"),
+    (["time", "project", "set", "--project", "w-1"], "--handler, --client"),
+    (["time", "handler", "check", "/nonexistent/board.yaml"], "cannot read"),
+])
+def test_a_time_settings_verb_with_nothing_to_send_is_refused_before_the_request(configured, capsys, argv, words):
+    transport = Recorder()
+    assert ctl.main(argv, transport=transport) == ctl.EXIT_FAILURE
+    assert transport.calls == []
+    assert words in capsys.readouterr().err
+
+
+def test_handler_check_sends_the_file_and_names_it_by_its_stem(tmp_path):
+    definition = tmp_path / "board.yaml"
+    definition.write_text("name: board\nfields: []\n", encoding="utf-8")
+    call = build("time", "handler", "check", str(definition))
+    assert (call.method, call.path) == ("POST", "/api/time/handlers/check")
+    assert call.body == {"name": "board", "text": "name: board\nfields: []\n"}
 
 
 def test_spawn_refuses_an_unknown_effort_before_the_request(configured, capsys):
@@ -520,6 +595,25 @@ def test_every_route_this_cli_names_is_served_by_the_app(client):
         assert any(pattern.match(built) for _served, pattern in patterns), (
             f"{' '.join(argv)} names {built}, which this build does not serve"
         )
+
+
+def test_no_time_verb_takes_a_person():
+    """D9: a name never selects the person, so the CLI offers no way to send one."""
+    for verb in ("status", "start", "stop", "entries"):
+        with pytest.raises(SystemExit):
+            build("time", verb, "--project", "w-1", "--person", "blair")
+
+
+@pytest.mark.parametrize("pair", ["task_id", "=abc123"])
+def test_a_field_that_is_not_key_value_is_refused_before_the_request(pair):
+    with pytest.raises(ctl.CtlError, match="key=value"):
+        build("time", "start", "--project", "w-1", "--field", pair)
+
+
+def test_time_with_tracking_off_passes_the_503_through(configured, client, capsys):
+    failure = refused(["time", "status"], client, capsys)
+    assert failure["status"] == 503
+    assert failure["body"]["detail"]["code"] == "time_tracking_off"
 
 
 def test_an_answer_with_neither_text_nor_an_option_is_refused_before_the_request():
@@ -576,6 +670,39 @@ def test_an_omitted_flag_is_absent_from_the_body_not_null():
     body = build("runs", "meta", "set", RUN_KEY, "--title", "auth fix").body
     assert "description" not in body
     assert body["title"] == "auth fix"
+
+
+ISSUE_A = "https://git.example.com/acme/widgets/-/issues/12"
+ISSUE_B = "https://git.example.com/acme/widgets/-/merge_requests/7"
+
+
+def test_runs_meta_set_issue_builds_the_list_in_order():
+    body = build("runs", "meta", "set", RUN_KEY, "--issue", ISSUE_A, "--issue", ISSUE_B).body
+    assert body["issues"] == [ISSUE_A, ISSUE_B]
+    assert "title" not in body and "description" not in body
+
+
+def test_runs_meta_set_clear_issues_sends_an_empty_list():
+    assert build("runs", "meta", "set", RUN_KEY, "--clear-issues").body["issues"] == []
+
+
+def test_runs_meta_set_refuses_issue_and_clear_issues_together():
+    with pytest.raises(ctl.CtlError, match="--clear-issues"):
+        build("runs", "meta", "set", RUN_KEY, "--issue", ISSUE_A, "--clear-issues")
+
+
+def test_runs_meta_set_without_issue_flags_sends_no_issues_key():
+    assert "issues" not in build("runs", "meta", "set", RUN_KEY, "--title", "x").body
+
+
+def test_time_start_answers_a_prompt_without_a_project():
+    call = build("time", "start", "--prompt", "7", "--field", "task_id=abc123")
+    assert call.body == {"prompt": 7, "fields": {"task_id": "abc123"}}
+
+
+def test_time_start_needs_a_project_or_a_prompt():
+    with pytest.raises(ctl.CtlError, match="--prompt"):
+        build("time", "start", "--title", "x")
 
 
 def test_a_run_key_keeps_a_project_that_contains_a_slash():

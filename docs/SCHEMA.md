@@ -129,6 +129,7 @@ widgets/                  # a project, by short name
 gadgets/                  # another project, same shape
 capacity-planning/        # a project with no repository
 git.example.com/acme/…    # host bucket: an UNNAMED repository's work (not schema form)
+timesheet.d/              # the time log (TIME-TRACKING.md): a known name, never a host bucket
 README.md                 # content namespace (human); MAY carry the generated index block (Inventory)
 ```
 
@@ -823,7 +824,8 @@ memory scope) but never shape findings.
 | `_agents/` | see [Agent surface](#agent-surface-both-scopes) | see Agent surface (`<scope>/` row) | see Agent surface | see Agent surface |
 | `_archive/` | housekeeping tooling; connectors' `archive_plan` and `forget` | mirror: `_archive/<relative path>`. A **`_`-prefixed** first component MUST be an area of this scope — `_agents`, `_knowledge`, `_napkin`, `_taskdef` — and anything else `_`-prefixed is a broken mirror path (an error). A content-namespace first component (`README.md`, a project's short name) is mirrored content and is never a finding; archived contents are not re-validated | optional | machine |
 | `README.md` | humans outside the markers; `lmer-schema index --write` inside them | free-form markdown; MAY carry one generated block rendered from `_lmer.yaml` (project list) plus a fixed legend; a block that differs from a fresh render is a warning; a block of a newer format than the tool is left alone; text outside the markers is never checked | optional | machine (the block only) |
-| any other top-level name | humans | content namespace, never checked; a `_`-prefixed name is a warning; a dotless directory that is project-shaped and unregistered is a warning; a dotted directory is a host bucket | optional | free-form |
+| `timesheet.d/` | the platform's timesheet writer (entries under `<person>/`); the work repo's owner (`.handlers/`); a tracking handler's sync process (`<person>/.sync/<handler>.jsonl`); humans (hand-written entries) | the time log of [TIME-TRACKING.md](./TIME-TRACKING.md): entries, handler definitions and sync ledgers, read by their own parser (`lmer_timesheet`) and not by `lmer-schema`. A known name: never a host bucket despite its dot, and nothing below it is a project, whatever it holds | optional | opaque |
+| any other top-level name | humans | content namespace, never checked; a `_`-prefixed name is a warning; a dotless directory that is project-shaped and unregistered is a warning; a dotted directory other than `timesheet.d/` is a host bucket | optional | free-form |
 
 ### Project tree
 
@@ -1141,7 +1143,8 @@ bucket above INFO. A bucket leaves the tree only by adoption.
 
 - **Where it is.** A bucket starts at a top-level directory whose name
   contains a dot — the **hostname of the normalized remote, without any
-  port** — and follows the remote's path: `git.example.com/acme/widgets/`
+  port**, and never the known name `timesheet.d/` (see the
+  [Inventory](#instance-root)) — and follows the remote's path: `git.example.com/acme/widgets/`
   for the remote `git.example.com/acme/widgets`, and the same directory for
   `ssh://git@git.example.com:2222/acme/widgets`, whose key keeps the port
   (see [The registry](#the-registry)) while its directory does not. The host

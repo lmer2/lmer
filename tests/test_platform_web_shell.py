@@ -233,9 +233,10 @@ def test_the_whole_app_can_be_held_in_a_band_in_the_middle_of_the_screen():
         "app off the screen instead of leaving it alone"
     )
 
-    # The three fixed items, each with the framework's inline value overridden.
+    # The fixed items, each with the framework's inline value overridden.
     for selector, edges in (
         (".app-narrow .v-app-bar", ("left", "right", "width")),
+        (".app-narrow .time-bar-slot", ("left", "right", "width")),
         (".app-narrow .v-navigation-drawer--left", ("left",)),
         (".app-narrow .v-navigation-drawer--right", ("right",)),
     ):

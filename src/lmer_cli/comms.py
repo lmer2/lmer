@@ -296,11 +296,15 @@ def parse_message_ref(ref: object, session: str) -> Optional[int]:
 @dataclass(frozen=True)
 class Source:
     """Who a record came from: a channel and, when known, a person and the
-    channel's own id for the message."""
+    channel's own id for the message.
+
+    ``author`` is display text; ``author_id`` is the channel's stable id for a
+    human sender (a Slack user id, a Matrix MXID), set only on a human's post."""
 
     channel: str
     author: Optional[str] = None
     ref: Optional[str] = None
+    author_id: Optional[str] = None
 
     @property
     def label(self) -> str:
@@ -316,6 +320,8 @@ class Source:
             out["author"] = self.author
         if self.ref:
             out["ref"] = self.ref
+        if self.author_id:
+            out["author_id"] = self.author_id
         return out
 
     @classmethod
@@ -332,7 +338,8 @@ class Source:
             )
         author = _optional_text(raw.get("author"), MAX_AUTHOR_CHARS, "source.author")
         ref = _optional_text(raw.get("ref"), MAX_REF_CHARS, "source.ref")
-        return cls(channel=channel, author=author, ref=ref)
+        author_id = _optional_text(raw.get("author_id"), MAX_AUTHOR_CHARS, "source.author_id")
+        return cls(channel=channel, author=author, ref=ref, author_id=author_id)
 
 
 @dataclass(frozen=True)

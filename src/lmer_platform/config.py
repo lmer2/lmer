@@ -108,6 +108,7 @@ from lmer_cli.user_harnesses import refresh_user_harnesses
 # module only needs to know which names are checkable.
 from .uploads import KNOWN_TYPES
 from .thread_targets import validate_thread_targets
+from .people import parse_registry
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
 # :func:`work_repo.git_ops.forge_web_url` knows how to build paths for, and a
@@ -161,6 +162,12 @@ __all__ = [
     "upload_settings", "upload_types", "chat_settings", "dock_settings",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
+    "TIME_SETTING_KEYS", "TIME_INT_SETTINGS", "TIME_STR_SETTINGS", "time_settings",
+    "ENV_TIME_IDLE_GRACE_MINUTES", "ENV_TIME_MIN_ENTRY_SECONDS",
+    "ENV_TIME_PAUSE_HOURS", "ENV_TIME_TITLE_MAX_AGE_DAYS",
+    "ENV_TIME_SWEEP_SECONDS", "ENV_TIME_WRITER_NAME", "ENV_TIME_WRITER_EMAIL",
+    "ENV_TIME_WRITER_CREDENTIAL", "DEFAULT_TIME_WRITER_NAME",
+    "DEFAULT_TIME_WRITER_EMAIL", "time_writer_token",
 ]
 
 CONFIG_FILENAME = "config.json"
@@ -391,6 +398,43 @@ TERMINAL_SETTING_KEYS = {
     "confirm_seconds": ("terminal_confirm_seconds", TERMINAL_CONFIRM_ENV),
 }
 
+#: Human time tracking's platform-wide settings (issue #604,
+#: docs/TIME-TRACKING.md). The idle grace is also a per-project setting; this
+#: is the default a project without one gets.
+ENV_TIME_IDLE_GRACE_MINUTES = "LMER_PLATFORM_TIME_IDLE_GRACE_MINUTES"
+ENV_TIME_MIN_ENTRY_SECONDS = "LMER_PLATFORM_TIME_MIN_ENTRY_SECONDS"
+ENV_TIME_PAUSE_HOURS = "LMER_PLATFORM_TIME_PAUSE_HOURS"
+ENV_TIME_TITLE_MAX_AGE_DAYS = "LMER_PLATFORM_TIME_TITLE_MAX_AGE_DAYS"
+ENV_TIME_SWEEP_SECONDS = "LMER_PLATFORM_TIME_SWEEP_SECONDS"
+#: The identity the timesheet writer commits as.
+ENV_TIME_WRITER_NAME = "LMER_PLATFORM_TIME_WRITER_NAME"
+ENV_TIME_WRITER_EMAIL = "LMER_PLATFORM_TIME_WRITER_EMAIL"
+DEFAULT_TIME_WRITER_NAME = "lmer timesheet"
+MAX_TIME_WRITER_CHARS = 200
+DEFAULT_TIME_WRITER_EMAIL = "timesheet@lmer.invalid"
+#: The writer's push credential, for when the mirror's may only read.
+#: Environment only, never a :class:`PlatformConfig` field, for the shared
+#: secret's reason: with no field, :func:`save` has no way to write it into
+#: ``config.json``. Read through :func:`time_writer_token`.
+ENV_TIME_WRITER_CREDENTIAL = "LMER_PLATFORM_TIME_WRITER_TOKEN"
+
+#: setting key -> (PlatformConfig field, env var), as above.
+TIME_SETTING_KEYS = {
+    "idle_grace_minutes": ("time_idle_grace_minutes", ENV_TIME_IDLE_GRACE_MINUTES),
+    "min_entry_seconds": ("time_min_entry_seconds", ENV_TIME_MIN_ENTRY_SECONDS),
+    "pause_hours": ("time_pause_hours", ENV_TIME_PAUSE_HOURS),
+    "title_max_age_days": ("time_title_max_age_days", ENV_TIME_TITLE_MAX_AGE_DAYS),
+    "sweep_seconds": ("time_sweep_seconds", ENV_TIME_SWEEP_SECONDS),
+    "writer_name": ("time_writer_name", ENV_TIME_WRITER_NAME),
+    "writer_email": ("time_writer_email", ENV_TIME_WRITER_EMAIL),
+}
+
+#: PlatformConfig field -> default, for the time group's text settings.
+TIME_STR_SETTINGS = {
+    "time_writer_name": DEFAULT_TIME_WRITER_NAME,
+    "time_writer_email": DEFAULT_TIME_WRITER_EMAIL,
+}
+
 
 @dataclass(frozen=True)
 class _IntSettingRule:
@@ -546,6 +590,40 @@ INT_SETTINGS = {
 BOOL_SETTINGS = {
     "chat_show_transcript": False,
     "chat_tint_operator": True,
+}
+
+#: PlatformConfig field -> its rule, for the time group's integers.
+#: Apart from :data:`INT_SETTINGS` because ``POST /api/assistant/config``
+#: accepts every key in that table, and these are set in ``config.json`` or the
+#: environment only. An unusable value in ``config.json`` disables time
+#: tracking rather than defaulting quietly: a timesheet written on a number
+#: the operator did not choose is wrong time on record.
+TIME_INT_SETTINGS = {
+    "time_idle_grace_minutes": _IntSettingRule(
+        default=15, minimum=1,
+        floor_reason="an automatic stop needs at least a minute of grace",
+        log_key="platform_time_idle_grace_invalid", unit="minutes", singular_unit="minute",
+    ),
+    "time_min_entry_seconds": _IntSettingRule(
+        default=60, minimum=0,
+        floor_reason="a length cannot be negative — 0 writes every entry",
+        log_key="platform_time_min_entry_invalid", unit="seconds", singular_unit="second",
+    ),
+    "time_pause_hours": _IntSettingRule(
+        default=0, minimum=0,
+        floor_reason="a pause cannot be negative — 0 turns the pause after a manual stop off",
+        log_key="platform_time_pause_invalid", unit="hours", singular_unit="hour",
+    ),
+    "time_title_max_age_days": _IntSettingRule(
+        default=30, minimum=1,
+        floor_reason="a remembered value has to be kept for at least a day",
+        log_key="platform_time_title_max_age_invalid", unit="days", singular_unit="day",
+    ),
+    "time_sweep_seconds": _IntSettingRule(
+        default=30, minimum=1,
+        floor_reason="the idle sweep needs a positive interval",
+        log_key="platform_time_sweep_invalid", unit="seconds", singular_unit="second",
+    ),
 }
 
 #: setting key -> (PlatformConfig field, optional env var). The one table the loader,
@@ -731,6 +809,39 @@ class PlatformConfig:
     #: it. No environment override, for :attr:`slots`' second reason: a JSON
     #: mapping in an env var is a footgun.
     matrix: Optional[dict] = None
+    #: The person registry and the person the web chat and the web UI act for
+    #: (issue #604) — see :mod:`lmer_platform.people`. No environment override,
+    #: for :attr:`slots`' reason.
+    people: list = field(default_factory=list)
+    default_person: Optional[str] = None
+    #: The platform-wide switch (issue #668): off stops tracking and keeps the
+    #: registry. No environment override, for :attr:`people`' reason.
+    time_tracking: bool = True
+    #: See :data:`TIME_SETTING_KEYS`.
+    time_idle_grace_minutes: int = TIME_INT_SETTINGS["time_idle_grace_minutes"].default
+    time_min_entry_seconds: int = TIME_INT_SETTINGS["time_min_entry_seconds"].default
+    time_pause_hours: int = TIME_INT_SETTINGS["time_pause_hours"].default
+    time_title_max_age_days: int = TIME_INT_SETTINGS["time_title_max_age_days"].default
+    time_sweep_seconds: int = TIME_INT_SETTINGS["time_sweep_seconds"].default
+    time_writer_name: str = DEFAULT_TIME_WRITER_NAME
+    time_writer_email: str = DEFAULT_TIME_WRITER_EMAIL
+    #: Why time tracking is off, one sentence per problem in the registry or
+    #: the time settings. Derived by :func:`_validate` and never read from or
+    #: written to ``config.json`` (:data:`_DERIVED_FIELDS`).
+    time_problems: tuple = ()
+
+    @property
+    def time_tracking_enabled(self) -> bool:
+        """Whether the time configuration is usable. Tracking also needs a
+        person listed in :attr:`people`; see :attr:`time_tracking_runs`."""
+        return not self.time_problems
+
+    @property
+    def time_tracking_runs(self) -> bool:
+        """Whether the daemon starts time tracking: a usable configuration,
+        the ``time_tracking`` switch on, and someone to track. ``people: []``,
+        the default, leaves it off without being a problem."""
+        return self.time_tracking is True and bool(self.people) and self.time_tracking_enabled
 
     @property
     def secret_path(self) -> Path:
@@ -756,7 +867,14 @@ class PlatformConfig:
         return f"http://{host}:{self.bind_port}"
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        for name in _DERIVED_FIELDS:
+            out.pop(name, None)
+        return out
+
+
+#: Fields :func:`_validate` computes; no layer may set them.
+_DERIVED_FIELDS = frozenset({"time_problems"})
 
 
 def config_path() -> Path:
@@ -764,7 +882,7 @@ def config_path() -> Path:
 
 
 def _known_fields() -> set:
-    return {f.name for f in fields(PlatformConfig)}
+    return {f.name for f in fields(PlatformConfig)} - _DERIVED_FIELDS
 
 
 def _env_str(name: str) -> Optional[str]:
@@ -863,6 +981,7 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         usable = _bool_setting_value(getattr(config, field_name), field=field_name)
         if usable is not getattr(config, field_name):
             config = replace(config, **{field_name: usable})
+    config = _validate_time_tracking(config)
     raw_name = config.assistant_name if isinstance(config.assistant_name, str) else ""
     name = raw_name.strip()
     if not name or len(name) > MAX_ASSISTANT_NAME_CHARS:
@@ -875,6 +994,87 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         logger.warning("platform_config_unusable field=fleet_groups error=%s", exc)
         groups = []
     return replace(config, fleet_groups=groups)
+
+
+def _validate_time_tracking(config: PlatformConfig) -> PlatformConfig:
+    """*config* with usable time settings and :attr:`~PlatformConfig.time_problems` set.
+
+    Every problem warns and turns time tracking off, and none of them stops
+    the daemon booting. An unusable setting is replaced by its
+    default so the field keeps its type, but tracking stays off until it is
+    fixed. Values from the environment arrive here already cleaned
+    (:func:`_layer_int`), so what is left to find came from ``config.json``.
+    """
+    problems = []
+    changes = {}
+    if not isinstance(config.time_tracking, bool):
+        logger.warning(
+            "platform_time_tracking_invalid value=%r — it must be true or false; "
+            "time tracking is disabled until it is fixed", config.time_tracking,
+        )
+        problems.append(f"time_tracking is unusable ({config.time_tracking!r}): it must be true or false")
+        changes["time_tracking"] = True
+    for field_name, rule in TIME_INT_SETTINGS.items():
+        value = getattr(config, field_name)
+        reason = _int_setting_reason(_coerced_int(value), field=field_name)
+        if reason is None:
+            if not isinstance(value, int):
+                changes[field_name] = int(_coerced_int(value))
+            continue
+        logger.warning(
+            "%s value=%r — %s; time tracking is disabled until it is fixed",
+            rule.log_key, value, reason,
+        )
+        problems.append(f"{field_name} is unusable ({value!r}): {reason}")
+        changes[field_name] = rule.default
+    for field_name, default in TIME_STR_SETTINGS.items():
+        value = getattr(config, field_name)
+        reason = _time_text_reason(value, field=field_name)
+        if reason is None:
+            if value != value.strip():
+                changes[field_name] = value.strip()
+            continue
+        logger.warning(
+            "platform_%s_invalid value=%r — %s; time tracking is disabled until "
+            "it is fixed", field_name, value, reason,
+        )
+        problems.append(f"{field_name} is unusable ({value!r}): {reason}")
+        changes[field_name] = default
+    _persons, _default, registry_problems = parse_registry(config.people, config.default_person)
+    for problem in registry_problems:
+        logger.warning(
+            "platform_people_invalid problem=%s — time tracking is disabled "
+            "until config.json is fixed", problem,
+        )
+    problems.extend(registry_problems)
+    if isinstance(config.people, tuple):
+        changes["people"] = list(config.people)
+    elif not isinstance(config.people, list):
+        changes["people"] = []
+    default_person = config.default_person
+    if isinstance(default_person, str):
+        default_person = default_person.strip() or None
+    elif default_person is not None:
+        default_person = None
+    if default_person != config.default_person:
+        changes["default_person"] = default_person
+    return replace(config, **changes, time_problems=tuple(problems))
+
+
+def _time_text_reason(value: object, *, field: str) -> Optional[str]:
+    """Why *value* cannot be the time group's text setting *field*, or ``None``."""
+    if not isinstance(value, str) or not value.strip():
+        return "it must be non-empty text"
+    value = value.strip()
+    if len(value) > MAX_TIME_WRITER_CHARS:
+        return f"it is longer than {MAX_TIME_WRITER_CHARS} characters"
+    if any(ord(char) < 32 or ord(char) == 127 or char in "<>" for char in value):
+        return "a git identity cannot hold control characters or angle brackets"
+    if field == "time_writer_email" and (
+        "@" not in value or any(char.isspace() for char in value)
+    ):
+        return "it is not an email address"
+    return None
 
 
 def _slots_value(value: object) -> tuple:
@@ -973,7 +1173,7 @@ def _int_setting_value(value: object, *, field: str) -> Optional[int]:
     is how often a reminder is spooled or a line is typed. An *explicit* write
     gets the opposite treatment (:func:`validate_int_setting`).
     """
-    rule = INT_SETTINGS[field]
+    rule = _int_rule(field)
     if value is None and rule.default is None:
         return None
     coerced = _coerced_int(value)
@@ -991,6 +1191,12 @@ def _int_setting_value(value: object, *, field: str) -> Optional[int]:
         rule.log_key, value, reason, rule.default, unit,
     )
     return rule.default
+
+
+def _int_rule(field: str) -> _IntSettingRule:
+    """*field*'s rule, from :data:`INT_SETTINGS` or :data:`TIME_INT_SETTINGS`."""
+    rule = INT_SETTINGS.get(field)
+    return rule if rule is not None else TIME_INT_SETTINGS[field]
 
 
 def _coerced_int(value: object) -> object:
@@ -1014,7 +1220,7 @@ def _int_setting_reason(value: object, *, field: str) -> Optional[str]:
     One rule set behind both postures, as :func:`_unusable_reason` is for the
     launch settings. Call it on a coerced value.
     """
-    rule = INT_SETTINGS[field]
+    rule = _int_rule(field)
     if isinstance(value, bool) or not isinstance(value, int):
         return f"it is not a whole number ({type(value).__name__})"
     if value < rule.minimum:
@@ -1439,6 +1645,10 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         ),
         # A string here, a JSON list in the file; ``_validate`` normalises both.
         "upload_types": _env_str(ENV_UPLOAD_TYPES),
+        **{
+            field: _time_layer(_env_str(env_var), layer="env", field=field)
+            for field, env_var in TIME_SETTING_KEYS.values()
+        },
     }
     values.update({k: v for k, v in env_values.items() if v is not None})
 
@@ -1721,6 +1931,29 @@ def rotation_settings() -> dict:
     return _int_group_settings(ROTATION_SETTING_KEYS, group="rotation")
 
 
+def time_settings() -> dict:
+    """The time group's effective settings, one per :data:`TIME_SETTING_KEYS`.
+
+    :func:`nudge_settings`' sibling, read **fresh** on the same terms: the
+    tracker and the idle sweep read it as they run, so an edit to
+    ``config.json`` applies without a restart. The writer commits with the
+    identity of the config tracking last applied (at start, or a settings
+    write), and its token is not here; see :func:`time_writer_token`.
+    """
+    numbers = {key: spec for key, spec in TIME_SETTING_KEYS.items() if spec[0] in TIME_INT_SETTINGS}
+    texts = {key: spec for key, spec in TIME_SETTING_KEYS.items() if spec[0] in TIME_STR_SETTINGS}
+    resolved = _int_group_settings(numbers, group="time")
+    resolved.update(_group_settings(
+        texts, group="time", layer=_time_layer, default=TIME_STR_SETTINGS.__getitem__,
+    ))
+    return {key: resolved[key] for key in TIME_SETTING_KEYS}
+
+
+def time_writer_token() -> Optional[str]:
+    """:data:`ENV_TIME_WRITER_CREDENTIAL`, or ``None`` to use the mirror's credential."""
+    return _env_str(ENV_TIME_WRITER_CREDENTIAL)
+
+
 def assistant_resource_settings() -> dict:
     """The assistant's effective container allocation, value and source.
 
@@ -1899,7 +2132,7 @@ def _group_settings(keys: dict, *, group: str, layer: Callable, default: Callabl
 def _int_group_settings(keys: dict, *, group: str) -> dict:
     return _group_settings(
         keys, group=group, layer=_layer_int,
-        default=lambda field: INT_SETTINGS[field].default,
+        default=lambda field: _int_rule(field).default,
     )
 
 
@@ -1929,7 +2162,7 @@ def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
     reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
-    _warn_layer_once(INT_SETTINGS[field].log_key, field=field, layer=layer, raw=raw, reason=reason)
+    _warn_layer_once(_int_rule(field).log_key, field=field, layer=layer, raw=raw, reason=reason)
     return None
 
 
@@ -1941,6 +2174,19 @@ def _layer_bool(raw: object, *, layer: str, field: str) -> Optional[bool]:
     reason = _bool_setting_reason(coerced)
     if reason is None:
         return bool(coerced)
+    _warn_layer_once(f"platform_{field}_invalid", field=field, layer=layer, raw=raw, reason=reason)
+    return None
+
+
+def _time_layer(raw: object, *, layer: str, field: str) -> object:
+    """:func:`_layer_int` for any time setting, text or number."""
+    if field in TIME_INT_SETTINGS:
+        return _layer_int(raw, layer=layer, field=field)
+    if raw is None:
+        return None
+    reason = _time_text_reason(raw, field=field)
+    if reason is None:
+        return raw.strip()
     _warn_layer_once(f"platform_{field}_invalid", field=field, layer=layer, raw=raw, reason=reason)
     return None
 

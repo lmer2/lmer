@@ -455,3 +455,11 @@ export function resetsLabel(iso, now = Date.now()) {
   const span = duration(seconds)
   return span ? `resets in ${span}` : null
 }
+
+// `#12` for an issue or a GitHub pull, `!7` for a merge request, as the daemon labels them.
+export function issueLabel(url) {
+  const path = (url || '').replace(/[?#].*$/, '').replace(/\/+$/, '')
+  const match = path.match(/\/-\/(issues|work_items|merge_requests)\/(\d+)$/) || path.match(/\/(issues|pull)\/(\d+)$/)
+  if (!match) return url
+  return `${match[1] === 'merge_requests' ? '!' : '#'}${match[2]}`
+}
