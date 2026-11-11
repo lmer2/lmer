@@ -199,6 +199,7 @@ models:
 | `LMER_USAGE` | container | on | Writes the run's usage record. `0` turns it off. |
 | `LMER_USAGE_CHECKPOINT_SECONDS` | container | 900 | Checkpoint interval. |
 | `LMER_USAGE_IDLE_SECONDS` | container | 300 | Longest gap that still counts as active. |
+| `LMER_USAGE_PLATFORM_SESSION` | container | unset | The platform session's `s-…` id, set by the launcher (not configuration). Becomes the record's `platform_session`. |
 | `LMER_PLATFORM_USAGE` | daemon | on | Runs the live collector. |
 | `LMER_PLATFORM_USAGE_INTERVAL` | daemon | 30 | Collector tick, in seconds. |
 | `LMER_PLATFORM_USAGE_PROJECTION_MINUTES` | daemon | 30 | Headroom fit window. |

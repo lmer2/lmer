@@ -1,0 +1,2 @@
+fixed:
+- "Fixed usage records from platform-spawned sessions carrying a null platform_session; the session id is now forwarded into the container."

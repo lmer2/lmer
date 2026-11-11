@@ -3895,6 +3895,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": os.environ.get("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"),
         "LMER_PLATFORM_ASSISTANT_NAME": os.environ.get("LMER_PLATFORM_ASSISTANT_NAME"),
+        # Per-session, so no host config can supply it; `work usage` stamps it
+        # on the usage record to join the record to its live session. Not
+        # forwarded under its host name: a nested `lmer` reads that one as "the
+        # platform spawned me" and would take this session's identity.
+        "LMER_USAGE_PLATFORM_SESSION": os.environ.get("LMER_PLATFORM_SESSION_ID"),
         # The worker's launch-time delegation to the assistant (issue #594),
         # read by the orchestrator-ask prompt fragment.
         "LMER_SUPERVISOR_AUTHORITY": os.environ.get("LMER_SUPERVISOR_AUTHORITY"),
