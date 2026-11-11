@@ -82,7 +82,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from lmer_schema.checks.findings import Form
-from lmer_schema.registry import is_host_bucket_name, is_project_shaped
+from lmer_schema.registry import WORK_REPO_DATA_DIRS, is_host_bucket_name, is_project_shaped
 
 __all__ = [
     "BUCKET",
@@ -166,6 +166,8 @@ def project_dirs(
             continue  # already listed by its entry
         if name in RECOGNIZED_LEGACY_NAMES:
             continue  # a bare instance surface, not a project
+        if name in WORK_REPO_DATA_DIRS:
+            continue  # work-repo data with its own contract, not a project
         bucket = is_host_bucket_name(name)
         if is_project_shaped(child):
             # The marker test decides, before the bucket test (decision 2).

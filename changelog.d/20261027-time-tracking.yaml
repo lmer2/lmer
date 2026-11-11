@@ -1,0 +1,10 @@
+added:
+- "Human time tracking on the platform: a person's time starts when they write in a project's thread, stops after an idle grace, and each finished entry is committed to `timesheet.d/` in the work repo. See docs/TIME-TRACKING.md."
+- "A `people` registry and `default_person` in the platform's `config.json` map Slack user ids, Matrix MXIDs and the web chat to a person; only listed people are tracked. With one person listed, `default_person` is implied."
+- "Per-project time settings: a stable project key kept across renames, a tracking handler, client labels and an idle grace override, in Project settings."
+- "Tracking handlers defined in the work repo (`timesheet.d/.handlers/<name>.yaml`) declare required entry fields; a sync process outside lmer reports each entry's status through `timesheet.d/<person>/.sync/<handler>.jsonl`, shown as synced, held or pending."
+- "Manual start and stop from a clock button and a time-tracking panel pinned under the control UI header, a sidebar marker on the tracking project, and a read-only Time entries dialog with filters and per-day totals."
+- "A per-person switch that turns automatic tracking off until it is turned back on, in the time-tracking bar, as `lmer-ctl time auto on|off` and `PUT /api/time/auto`; manual start and stop still work while it is off."
+- "`lmer-ctl time status|start|stop|set|auto|entries` and `/api/time/*`; Ratchet starts, stops, retitles and checks time for whoever asked, turns their automatic tracking on or off, and asks for a missing handler field."
+- "`LMER_PLATFORM_TIME_*` settings for the idle grace, minimum entry length, pause after a manual stop (none by default), how long recent values are kept, the idle sweep interval, and the writer's commit identity and push token."
+- "Bus records keep a human sender's Slack user id or Matrix MXID in `source.author_id`."

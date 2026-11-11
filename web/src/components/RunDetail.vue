@@ -883,6 +883,7 @@ async function forget() {
     <AskChannel
       v-if="terminalSession"
       ref="askDock"
+      class="ask-dock"
       :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
       :live="!!run.live"
@@ -1577,6 +1578,7 @@ async function forget() {
 </template>
 
 <style scoped>
+.ask-dock { scroll-margin-top: calc(var(--v-layout-top, 64px) + 8px); }
 .operator-count {
   position: absolute;
   top: 2px;

@@ -264,7 +264,8 @@ async def test_inbound_routes_on_attention_reason(config, homeserver, threads):
     assert [c["url"] for c in live.writes] == [
         f"{BASE_URL}/api/sessions/s-20260822-aaaa/ask/1/answer",
     ]
-    assert live.writes[0]["json"] == {"answer": "prep-release"}
+    assert live.writes[0]["json"] == {"answer": "prep-release", "author": ALICE}, (
+        "the answer names its sender, so the record maps to that person and never to default_person")
 
     stopped = Platform(row(reason="question"))
     await build(config, homeserver, threads, stopped).handle(event())

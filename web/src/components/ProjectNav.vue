@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { mdiChevronDown, mdiChevronRight, mdiRobot } from '@mdi/js'
+import { mdiChevronDown, mdiChevronRight, mdiRobot, mdiTimerOutline, mdiTimerSyncOutline } from '@mdi/js'
 import { projectColor } from '../projects.js'
 import RunNav from './RunNav.vue'
 
@@ -15,6 +15,8 @@ const props = defineProps({
   // Only where the section starts; the section owns the state after that, and
   // `toggle` reports each change for the parent to remember.
   collapsed: Boolean,
+  // The person's running timer is on this project: 'manual' or 'auto' (spec D3).
+  tracking: { type: String, default: null },
 })
 const emit = defineEmits(['chat', 'open', 'toggle'])
 const expanded = ref(!props.collapsed)
@@ -31,6 +33,8 @@ const statusColor = computed(() => ({
   running: 'success', waiting: 'warning', starting: 'warning', rotating: 'warning',
   stopping: 'warning', failed: 'error',
 })[props.project.assistant?.lifecycle])
+const trackingLabel = computed(() => (props.tracking
+  ? `tracking time here · ${props.tracking === 'manual' ? 'manual' : 'automatic'}` : ''))
 const chatLabel = computed(() => `Chat with ${props.project.name} — assistant ${status.value}`)
 </script>
 
@@ -46,6 +50,10 @@ const chatLabel = computed(() => `Chat with ${props.project.name} — assistant 
         <span class="project-name">{{ project.name }}</span>
         <span v-if="attention.length" class="project-attention" :aria-label="`${attention.length} need you`">{{ attention.length }}</span>
       </button>
+      <span v-if="tracking" class="project-tracking" :class="`project-tracking-${tracking}`" role="img"
+        :aria-label="trackingLabel" :title="trackingLabel">
+        <v-icon :icon="tracking === 'manual' ? mdiTimerOutline : mdiTimerSyncOutline" size="18" />
+      </span>
       <v-btn class="project-assistant" variant="tonal" size="small" :color="statusColor"
         :aria-label="chatLabel" :title="chatLabel" @click="$emit('chat', project)">
         <v-icon :icon="mdiRobot" size="18" />
@@ -108,6 +116,13 @@ const chatLabel = computed(() => `Chat with ${props.project.name} — assistant 
 .project-attention {
   font-size: .75rem;
   font-weight: 600;
+}
+/* 2px down: optical alignment with the name and the assistant button. */
+.project-tracking {
+  display: flex;
+  flex-shrink: 0;
+  color: rgb(var(--v-theme-primary));
+  transform: translateY(2px);
 }
 .project-assistant {
   flex-shrink: 0;

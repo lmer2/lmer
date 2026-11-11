@@ -606,13 +606,16 @@ class SlackConnector(ConnectorLifecycle):
                 return None
             if not ts:
                 raise ValueError("Slack input has no source timestamp")
+            human = poster is None and self._is_human(message)
             source = {"channel": CHANNEL, "author": self._author(message, poster),
                       "ref": f"{self.config.channel}:{self.config.thread_ts}:{ts}"}
+            if human:
+                source["author_id"] = message.get("user")
             kind, in_reply_to = "message", None
             oldest = self._oldest_open_question()
             if oldest is not None:
                 bound = answer_binding(text, oldest, first_since_question=self._first_since(oldest),
-                                       refuse_operator_only=poster is not None or not self._is_human(message))
+                                       refuse_operator_only=not human)
                 if bound is not None:
                     kind, in_reply_to, text = "answer", oldest.get("id"), bound
             human = poster is None and self._is_human(message)

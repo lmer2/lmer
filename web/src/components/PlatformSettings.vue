@@ -7,6 +7,7 @@ import RotateAllAssistants from './RotateAllAssistants.vue'
 import SettingsSection from './SettingsSection.vue'
 import SlotEditor from './SlotEditor.vue'
 import SlotRow from './SlotRow.vue'
+import TimeSettings from './TimeSettings.vue'
 import { projectColor, projectTextColor } from '../projects.js'
 import { applyChatSettings } from '../operatorChat.js'
 import { assistantName } from '../ratchet.js'
@@ -22,6 +23,7 @@ const SECTIONS = [
   { id: 'fleet', title: 'Fleet' },
   { id: 'assistants', title: 'Assistants' },
   { id: 'chat', title: 'Chat and display' },
+  { id: 'time', title: 'Time tracking' },
   { id: 'graph', title: 'Graph' },
   { id: 'slots', title: 'Service slots' },
   { id: 'projects', title: 'Projects' },
@@ -60,6 +62,12 @@ const display = ref(null)
 const launchState = ref({ dirty: false, saving: false })
 const remindersState = ref({ dirty: false, saving: false })
 const displayState = ref({ dirty: false, saving: false })
+const time = ref(null)
+const timeState = ref({ dirty: false, saving: false })
+// Mounted on the first visit, so the other sections cost no time-settings read, and
+// kept, so leaving it never drops an unsaved edit's mark.
+const timeSeen = ref(false)
+watch(section, (id) => { if (id === 'time') timeSeen.value = true }, { immediate: true })
 const slotOpen = ref(false)
 const slotName = ref(null)
 const slot = computed(() => props.slots.find(row => row.name === slotName.value) || null)
@@ -86,6 +94,7 @@ const dirtyBySection = computed(() => ({
   fleet: capacityDirty.value,
   assistants: launchState.value.dirty || remindersState.value.dirty,
   chat: displayState.value.dirty || dockDirty.value,
+  time: timeState.value.dirty,
   graph: groupsDirty.value,
 }))
 const anyDirty = computed(() => Object.values(dirtyBySection.value).some(Boolean))
@@ -93,6 +102,7 @@ const savingBySection = computed(() => ({
   fleet: busy.value,
   assistants: launchState.value.saving || remindersState.value.saving,
   chat: displayState.value.saving || dockBusy.value,
+  time: timeState.value.saving,
   graph: groupsBusy.value,
 }))
 const pickerItems = computed(() => SECTIONS.map(row => ({
@@ -109,6 +119,7 @@ function discard(ids) {
     if (id === 'fleet' && capacitySaved.value) { cap.value = capacitySaved.value.cap; workerCap.value = capacitySaved.value.workers; error.value = null }
     if (id === 'assistants') { launch.value?.reset(); reminders.value?.reset() }
     if (id === 'chat') { display.value?.reset(); dockKeepLast.value = dockBaseline.value; dockError.value = null }
+    if (id === 'time') time.value?.reset()
     if (id === 'graph') readGroups({ fleet_groups: storedGroups, fleet_groups_problem: storedGroupsProblem })
   }
 }
@@ -378,6 +389,9 @@ async function release() {
           </SettingsSection>
         </div>
 
+        <div v-show="section === 'time'" class="settings-panel" data-panel="time">
+          <TimeSettings v-if="timeSeen" ref="time" @state="timeState = $event" />
+        </div>
         <div v-show="section === 'graph'" class="settings-panel" data-panel="graph">
           <SettingsSection title="Graph groups" description="Cluster repositories on the fleet graph by text in their path."
             class="fleet-groups" :dirty="groupsDirty" save-label="Save groups" :saving="groupsBusy"

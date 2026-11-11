@@ -126,7 +126,7 @@ def bind(request, caller, body):
         "/api/prune", "/api/runs/forget",
         "/api/assistant/peers", "/api/workrepo/schema", "/api/channel-routes",
         "/api/assistant/rotate-all", "/api/usage", "/api/usage/rollup",
-    } or path.startswith(("/assets/", "/api/slots"))
+    } or path.startswith(("/assets/", "/api/slots", "/api/time/"))
     operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
         f"/api/sessions/{session}/messages", f"/api/sessions/{session}/log", f"/api/sessions/{session}/ask",
     }

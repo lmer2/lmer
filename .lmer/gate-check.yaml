@@ -62,6 +62,11 @@ tests:
     # ruamel (the manifest writer is the only ruamel importer, #365).
     - tests/test_lmer_schema_manifest_roundtrip.py
     - tests/test_masterplan_provisioning.py
+    # Render taskdef/orchestrate/instructions.txt, which the gate does not
+    # call text (an edit to it runs the full suite anyway). Listed by hand so
+    # the time prose pins (#604, #668) also run on a text-only diff.
+    - tests/test_orchestrate_time_setup.py
+    - tests/test_orchestrate_time_tracking.py
     - tests/test_performance.py
     - tests/test_platform_ask.py
     - tests/test_platform_image.py
@@ -99,6 +104,10 @@ tests:
     - tests/test_spawn_harness_usage.py
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
+    # Reads docs/LMER-CLI.md (every LMER_PLATFORM_TIME_* name) through
+    # `Path(__file__).resolve().parents[1]`, an idiom the scanner does not
+    # model, and scans src/ and web/src/ for a tracker's name (#604).
+    - tests/test_time_tracking_agnostic.py
     - tests/test_user_harnesses.py
     # Reads the golden INDEX.md files under tests/fixtures/knowledge-index/.
     - tests/test_work_repo_knowledge_index.py

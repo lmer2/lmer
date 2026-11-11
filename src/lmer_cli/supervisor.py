@@ -1763,7 +1763,9 @@ def _build_fastapi_app(
         log = _require_comms()
         claimed = (body.source or {}).get("channel") or _comms.CHANNEL_AGENT
         if caller == CALLER_AGENT and (
-            claimed != _comms.CHANNEL_AGENT or (body.source or {}).get("author")
+            claimed != _comms.CHANNEL_AGENT
+            or (body.source or {}).get("author")
+            or (body.source or {}).get("author_id")
         ):
             raise HTTPException(
                 status_code=403,

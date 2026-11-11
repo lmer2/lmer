@@ -51,6 +51,11 @@ def _clean_lmer_env(monkeypatch, tmp_path):
 
 ROOM = "!room:example.org"
 ROOT = "$root_event_id"
+
+
+def tagged(event_id: str) -> str:
+    """The ``source.ref`` the connector posts for one of this thread's events."""
+    return permalink.thread_ref(ROOM, ROOT, event_id)
 BOT = "@lmer:example.org"
 
 
@@ -412,7 +417,7 @@ class TestConnector:
                 rig.wait_until(lambda: current._next_batch is not None)
                 (notice,) = rig.log.read_since(0)[0]
                 assert f"has {3 if with_replies else 1} earlier message" in notice.text
-                assert notice.source.ref == newest
+                assert notice.source.ref == tagged(newest)
             finally:
                 current.stop()
 
@@ -428,7 +433,7 @@ class TestConnector:
         assert rig.connector.replay() == 1
         (record,) = rig.log.read_since(0)[0]
         assert (record.kind, record.in_reply_to) == ("message", None)
-        assert record.source == comms.Source("matrix", ref=newest["event_id"])
+        assert record.source == comms.Source("matrix", ref=tagged(newest["event_id"]))
         assert len(record.text.splitlines()) == 1
         assert "has 3 earlier messages" in record.text
         assert "earlier reply" not in record.text and "bot echo" not in record.text
@@ -958,7 +963,7 @@ def test_initial_sync_does_not_drop_a_reply_after_the_thread_snapshot(rig):
     event = rig.matrix.human_says("arrived during startup")
     assert rig.connector.replay() == 1
     (record,) = rig.log.read_since(0)[0]
-    assert record.source.ref == event["event_id"]
+    assert record.source.ref == tagged(event["event_id"])
     assert "has 2 earlier messages" in record.text
     assert "arrived during startup" not in record.text
     assert rig.connector.sync_once() == 0
@@ -987,7 +992,7 @@ def test_matrix_notice_counts_the_full_thread_and_downloads_nothing(tmp_path, mo
     assert "has 127 earlier messages" in record.text
     assert matrix_to_link(ROOM, ROOT) in record.text and "--limit 127" in record.text
     assert "1970-01-01T00:00:00Z .. 1970-01-01T00:00:00Z" in record.text
-    assert record.source.ref == media["event_id"]
+    assert record.source.ref == tagged(media["event_id"])
     assert not record.attachments and list(store.iterdir()) == []
     assert "stale request" not in record.text and "[lmer upload]" not in record.text
     download.assert_not_called()
@@ -997,10 +1002,33 @@ def test_matrix_notice_counts_the_full_thread_and_downloads_nothing(tmp_path, mo
     rig.connector.stop()
 
 
+def test_a_thread_ref_names_its_thread_and_splits_back():
+    ref = permalink.thread_ref(ROOM, ROOT, "$e1")
+    tag, event = permalink.split_thread_ref(ref)
+    assert (tag, event) == (permalink.thread_tag(ROOM, ROOT), "$e1") and len(tag) == 16
+    assert permalink.thread_tag(ROOM, "$other") != tag
+    assert permalink.split_thread_ref("$e1") == (None, "$e1")
+    assert permalink.split_thread_ref("$old:example.org") == (None, "$old:example.org")
+
+
+def test_a_ref_too_long_to_carry_its_tag_goes_bare(rig):
+    rig.connector.connect()
+    long_id = "$" + "x" * (comms.MAX_REF_CHARS - 1)
+    assert rig.connector._ref("$e1") == tagged("$e1")
+    assert rig.connector._ref(long_id) == long_id
+
+
+def test_a_connector_launched_with_an_alias_tags_the_room_id_it_resolved(rig):
+    rig.connector = connector.MatrixConnector(replace(rig.config, room="#lmer:example.org"),
+                                              matrix=rig.matrix, bus_client=rig.bus)
+    assert rig.connector.connect() == ROOM
+    assert rig.connector._ref("$e1") == permalink.thread_ref(ROOM, ROOT, "$e1")
+
+
 def test_matrix_root_only_and_unchanged_restart(rig):
     assert rig.connector.replay() == 1
     (record,) = rig.log.read_since(0)[0]
-    assert "has 1 earlier message" in record.text and record.source.ref == ROOT
+    assert "has 1 earlier message" in record.text and record.source.ref == tagged(ROOT)
     rig.connector.stop()
     fresh = connector.MatrixConnector(rig.config, matrix=rig.matrix, bus_client=rig.bus)
     rig.connector = fresh
@@ -1012,7 +1040,7 @@ def test_matrix_root_only_and_unchanged_restart(rig):
     rig.connector = again
     assert again.replay() == 1
     (notice,) = rig.log.read_since(record.seq)[0]
-    assert "has 2 earlier messages" in notice.text and notice.source.ref == newest["event_id"]
+    assert "has 2 earlier messages" in notice.text and notice.source.ref == tagged(newest["event_id"])
 
 
 def test_matrix_bot_only_thread_gets_a_notice(rig):
@@ -1118,7 +1146,7 @@ class TestPostsFromOtherRuns:
         assert rig.connector.sync_once() == 1
         record = rig.log.read_since(1)[0][0]
         assert record.source == comms.Source(
-            "matrix", author="lmer chat-mr-288", ref=event["event_id"],
+            "matrix", author="lmer chat-mr-288", ref=tagged(event["event_id"]),
         )
         assert record.text == "[lmer session s-other] have a look at !288"
         assert b"[matrix \xc2\xb7 lmer chat-mr-288]" in b"".join(rig.sink)
@@ -1354,7 +1382,7 @@ class TestEncryptedThread:
         secret_rig.matrix.human_says_encrypted("ship it")
         assert secret_rig.connector.sync_once() == 1
         record = secret_rig.log.read_since(0)[0][-1]
-        assert (record.text, record.source.ref) == ("ship it", "$e1")
+        assert (record.text, record.source.ref) == ("ship it", tagged("$e1"))
 
     def test_a_reply_whose_key_arrives_later_is_held_then_relayed(self, secret_rig):
         secret_rig.connector.replay()

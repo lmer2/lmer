@@ -167,7 +167,7 @@ describe('sections, dirty state and leaving', () => {
   it('reaches every section from the nav in one click and shows only that one', async () => {
     await open()
     expect(nav().map(node => node.text())).toEqual(
-      ['Fleet', 'Assistants', 'Chat and display', 'Graph', 'Service slots', 'Projects', 'Inbound chat'])
+      ['Fleet', 'Assistants', 'Chat and display', 'Time tracking', 'Graph', 'Service slots', 'Projects', 'Inbound chat'])
     expect(wrapper.get('.settings-picker').exists()).toBe(true)
     for (const [title, id] of [['Graph', 'graph'], ['Chat and display', 'chat'], ['Inbound chat', 'inbound'], ['Fleet', 'fleet']]) {
       await navButton(title).trigger('click')

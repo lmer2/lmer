@@ -154,6 +154,8 @@ class ThreadConnectors:
         self._recovery: set = set()
         self._recovering: set = set()
         self._disconnected: set = set()
+        self._room_ids: dict = {}
+        self._room_misses: dict = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._load()
@@ -428,6 +430,62 @@ class ThreadConnectors:
             return self._slack_rooted(ref, refuse_refusals=True)
         client = self._matrix_client(self._require_matrix_credentials())
         return thread_access.matrix_resolved(ref, client)
+
+    def matrix_room_id(self, room: str, *, ask: bool = True) -> Optional[str]:
+        """The room id *room* names, resolving an alias; ``None`` if it names none.
+
+        Adoption keeps a record's ``#alias`` when it cannot be resolved
+        (:meth:`_resolved`), while the record's connector resolves it itself
+        and names the room by its id. A reader matching the two asks here. A
+        resolution is kept for the daemon's life, as the connector keeps its
+        own. ``None`` is a definitive answer: the directory has no such room,
+        or there is no Matrix account to ask as, so no connector could join it
+        either. A failure that could pass (no answer, a 429 or a 5xx) raises a
+        transient :class:`ThreadError`, and so does an alias not yet known
+        while *ask* is off. Either failure is kept for the server's
+        ``retry_after``, at most ``BACKOFF_MAX``, so a burst asks once.
+        """
+        if room.startswith("!"):
+            return room
+        now = self._clock()
+        with self._lock:
+            known = self._room_ids.get(room)
+            miss = self._room_misses.get(room)
+        if known is not None:
+            return known
+        if miss is None or now >= miss[0]:
+            if not ask:
+                raise ThreadError(f"the matrix room {room} is not resolved yet", status=503, transient=True)
+            miss = self._resolve_room(room, now)
+            if isinstance(miss, str):
+                return miss
+        if miss[1]:
+            raise ThreadError(f"cannot resolve the matrix room {room} now", status=503, transient=True)
+        return None
+
+    def _resolve_room(self, room: str, now: float):
+        """The room id, or the ``(until, transient)`` miss now kept for *room*."""
+        retry = None
+        try:
+            room_id = self._matrix_client(self._require_matrix_credentials()).resolve_room(room)
+        except ThreadError as exc:
+            transient, error = False, exc
+        except MatrixError as exc:
+            transient, retry, error = exc.transient, exc.retry_after, exc
+        except Exception as exc:
+            transient, error = True, exc
+        else:
+            if isinstance(room_id, str) and room_id.startswith("!"):
+                with self._lock:
+                    self._room_ids[room] = room_id
+                    self._room_misses.pop(room, None)
+                return room_id
+            transient, error = False, "no room id"
+        logger.warning("platform_thread_alias_unresolved room=%s transient=%s error=%s", room, transient, error)
+        miss = (now + min(BACKOFF_MAX, BACKOFF_MAX if retry is None else retry), transient)
+        with self._lock:
+            self._room_misses[room] = miss
+        return miss
 
     def _resolved(self, ref: ThreadRef, *, require_resolution: bool = False) -> ThreadRef:
         """Resolve transport identity; launch refusals require a verified result.

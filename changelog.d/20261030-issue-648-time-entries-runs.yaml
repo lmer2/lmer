@@ -1,0 +1,4 @@
+added:
+- "Time entries name the runs they covered in an optional `sessions:` list (each item a run key and, for a schema-2 run, its uid): an automatic entry the runs of the sessions its activity came from, an entry an assistant started by hand that assistant's run. A parser that predates the key still reads the entry."
+- "The Time entries page lists an entry's linked runs; each opens that run in the fleet view."
+- "Project settings → Time tracking suggests the work repo registry's short names for the project key, those the project's repositories resolve to first; a key changes only when one is picked."

@@ -1237,6 +1237,23 @@ const settingsWithOrders = async (orders, props = {}) => {
   return wrapper
 }
 
+it('scrolls the standing orders into view clear of the sticky actions row, measured as it scrolls', async () => {
+  const offsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')
+  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true,
+    get() { return this.classList.contains('project-actions') ? 92 : 0 } })
+  const margins = []
+  Element.prototype.scrollIntoView = vi.fn(function () { margins.push(this.style.getPropertyValue('--project-actions-height')) })
+  try {
+    const wrapper = await settingsWithOrders({ instructions: null })
+    expect(Element.prototype.scrollIntoView.mock.contexts).toEqual([wrapper.get('.project-orders').element])
+    expect(margins).toEqual(['92px'])
+    wrapper.unmount()
+  } finally {
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', offsetHeight)
+    delete Element.prototype.scrollIntoView
+  }
+})
+
 it('says when the standing orders are empty, from the stored document rather than the draft', async () => {
   const wrapper = await settingsWithOrders({ instructions: null, instructions_at: null })
   expect(wrapper.get('.orders-empty').text()).toBe('No standing instructions yet.')

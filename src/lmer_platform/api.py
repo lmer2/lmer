@@ -74,6 +74,7 @@ from typing import Callable, Optional
 from lmer_cli.cli import _discover_all_tasks, _discover_tasks, _get_taskdef_paths
 from lmer_cli.presets import load_presets
 from lmer_cli.runtime import repo_root_path
+from lmer_timesheet import DEFAULT_HANDLER, parse_handler
 
 # The forge URL mapping, imported rather than rebuilt (T66). ``web_url_for``
 # cannot be called from here — it resolves paths under the *container's* ``/work``
@@ -144,8 +145,10 @@ from .config import (
     list_connectors,
     checkin_settings,
     _slots_value,
+    config_path,
     configured_repo_url,
     fleet_group_settings,
+    load as load_config,
     mutate_stored,
     nudge_settings,
     rotation_settings,
@@ -203,7 +206,7 @@ from .spawn import (
     schema_two,
     spawn_session,
 )
-from .store import StoreError, utc_now_iso
+from .store import StoreError, read_json, utc_now_iso
 from .ui_build import bundle_fingerprint, dist_dir, is_built
 from .workrepo import (
     fold_registry,
@@ -215,6 +218,10 @@ from .workrepo import (
     run_dirs,
 )
 from . import channel_routes, projects, project_context as project_scope, project_requests, project_threads
+from . import timesheet_handlers, timetrack, timetrack_activity, timetrack_entries, timetrack_live
+from .people import CREDENTIAL_CONNECTOR, CREDENTIAL_OPERATOR, META_CREDENTIAL, Registry
+from .people import identity_of as people_identity
+from . import time_settings
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -673,6 +680,7 @@ def _meta_reply(run: dict, record) -> dict:
         "limits": {
             "title": meta.MAX_TITLE_CHARS,
             "description": meta.MAX_DESCRIPTION_CHARS,
+            "issues": meta.MAX_ISSUES,
         },
         "local": True,
         "note": meta.LOCALITY_NOTE,
@@ -2311,10 +2319,24 @@ def _caller_meta(meta: object, kind: str) -> Optional[dict]:
     """
     if not isinstance(meta, dict):
         return None
-    kept = {key: value for key, value in meta.items() if key != bus_comms.META_AUTHORITY}
+    kept = {key: value for key, value in meta.items()
+            if key not in (bus_comms.META_AUTHORITY, META_CREDENTIAL)}
     if kind != bus_comms.KIND_QUESTION:
         kept.pop(bus_comms.META_OPERATOR_ONLY, None)
     return kept
+
+
+def _credential_meta(caller: "Caller", meta: Optional[dict] = None) -> Optional[dict]:
+    """*meta* stamped with the kind of credential behind the post (#604).
+
+    The person registry reads it: only the operator credential's own post is
+    the web chat, and a connector's author is its caller's text, never a
+    verified identity (:func:`lmer_platform.people._identity`).
+    """
+    if caller.kind not in (CALLER_OPERATOR, CALLER_CONNECTOR):
+        return meta
+    stamp = CREDENTIAL_OPERATOR if caller.kind == CALLER_OPERATOR else CREDENTIAL_CONNECTOR
+    return {**(meta or {}), META_CREDENTIAL: stamp}
 
 
 def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
@@ -2397,6 +2419,206 @@ def _note_check_started(caller: "Caller", result, body: dict) -> None:
             "platform_checkin_skipped error=%s — the session is already "
             "running; only the record of the look is missing", exc,
         )
+
+
+# --- time tracking (issue #604): who a time call is for --------------------------
+
+class TimeRefusal(Exception):
+    """A time route's refusal: the reply is ``{"detail": {"code", "message", ...}}``."""
+
+    def __init__(self, status: int, code: str, message: str, **extra) -> None:
+        super().__init__(message)
+        self.status = status
+        self.detail = {"code": code, "message": message, **extra}
+
+
+#: How :func:`time_actor` found the person, as ``acting.via`` says.
+TIME_VIA_DEFAULT_PERSON = "default_person"
+TIME_VIA_RECORD = "record"
+TIME_VIA_REQUEST = "request"
+TIME_VIA_SESSION = "session"
+
+_HUMAN_KINDS = (bus_comms.KIND_MESSAGE, bus_comms.KIND_ANSWER)
+_JOURNAL_PAGE = 2000
+
+
+def _session_events(hub: "comms.CommsHub", session_id: str):
+    """Every journaled record of *session_id*, oldest first."""
+    cursor = 0
+    while True:
+        events, cursor = hub.feed(cursor, session=session_id, limit=_JOURNAL_PAGE)
+        if not events:
+            return
+        yield from events
+
+
+def _record_person(registry: Registry, message: dict) -> str:
+    """The person *message* speaks for, or the refusal saying why it speaks for nobody."""
+    record = message.get("id")
+    if message.get("kind") not in _HUMAN_KINDS:
+        raise TimeRefusal(422, "time_record_not_human",
+                          f"record {record} is a {message.get('kind')}, not a human's message or answer.")
+    person = registry.person_for(message)
+    if person is not None:
+        return person
+    identity = registry.unmapped(message)
+    if identity is not None:
+        raise TimeRefusal(403, "time_identity_unmapped",
+                          f"record {record} is from {identity}, who is not a listed person; "
+                          "an unmapped identity cannot start or stop time.")
+    raise TimeRefusal(422, "time_record_not_human",
+                      f"record {record} names no human the person registry could map.")
+
+
+def _handling(request_id: str, session_id: str) -> bool:
+    """Whether *session_id* is handling *request_id* now: delivered to it and not yet answered.
+
+    The credential's context row outlives the reply until the next take-pending,
+    and :func:`lmer_platform.project_requests.active` names a queued request
+    nobody has taken; neither says who is asking now.
+    """
+    row = project_requests.get(request_id)
+    return row is not None and row["state"] == "delivered" and row["generation"] == session_id
+
+
+def time_actor(caller: "Caller", registry: Registry, *, hub: "comms.CommsHub",
+               record: Optional[str] = None, request_id: Optional[str] = None) -> dict:
+    """Who a time call acts for: ``{"person", "name", "via", "record", "request_id"}`` (D9).
+
+    Taken only from the credential and the records the platform itself holds,
+    never from a name in the request:
+
+    - the operator credential acts for ``default_person``;
+    - an assistant credential acts for the author of *record*, which must be
+      a human message or answer journaled on the assistant's own session; with
+      no *record*, for the sender of the conversation request it is handling
+      (*request_id*, when that request is delivered to this session and not
+      yet answered); otherwise for the author of the latest human message or
+      answer on its session;
+    - a connector credential acts for nobody.
+
+    An author the registry does not map is refused, not passed over for an
+    earlier one: the latest human is who asked. Raises :class:`TimeRefusal`.
+    """
+    acting = {"person": None, "name": None, "via": None, "record": None, "request_id": None}
+    if caller.kind == CALLER_OPERATOR:
+        if record is not None:
+            raise TimeRefusal(400, "time_record_not_operator",
+                              "record names who asked on an assistant's session; the operator "
+                              "credential always acts for default_person.")
+        if not registry.default_person:
+            raise TimeRefusal(409, "time_no_default_person",
+                              "No default_person is set in the platform config, so the operator "
+                              "credential acts for nobody. Set default_person to a listed person.")
+        acting.update(person=registry.default_person, via=TIME_VIA_DEFAULT_PERSON)
+    elif caller.kind != CALLER_ASSISTANT:
+        raise TimeRefusal(403, "time_caller_refused",
+                          f"A {caller.kind} credential acts for no person and cannot track time.")
+    elif not caller.session_id:
+        raise TimeRefusal(403, "time_no_session",
+                          "This assistant credential names no session, so no record says who asked.")
+    elif record is not None:
+        message = next((event.message for event in _session_events(hub, caller.session_id)
+                        if event.message.get("id") == record), None)
+        if message is None:
+            raise TimeRefusal(403, "time_record_foreign",
+                              f"record {record} is not on this assistant's session.")
+        acting.update(person=_record_person(registry, message), via=TIME_VIA_RECORD, record=record)
+    elif request_id and _handling(request_id, caller.session_id):
+        row = project_requests.get(request_id)
+        person = registry.person_for_sender(row["transport"], row["sender"])
+        if person is None:
+            raise TimeRefusal(403, "time_identity_unmapped",
+                              f"The conversation request's sender {row['transport']}:{row['sender']} "
+                              "is not a listed person; an unmapped identity cannot start or stop time.")
+        acting.update(person=person, via=TIME_VIA_REQUEST, request_id=request_id)
+    else:
+        latest = None
+        for event in _session_events(hub, caller.session_id):
+            message = event.message
+            if message.get("kind") in _HUMAN_KINDS and (
+                    registry.person_for(message) or registry.unmapped(message)):
+                latest = message
+        if latest is None:
+            raise TimeRefusal(422, "time_no_record",
+                              "No human message on this assistant's session says who asked; "
+                              "pass the record that carried the request.")
+        acting.update(person=_record_person(registry, latest), via=TIME_VIA_SESSION,
+                      record=latest.get("id"))
+    known = registry.person(acting["person"])
+    acting["name"] = known.name if known else acting["person"]
+    return acting
+
+
+def time_key_suggestions(registry, repositories, workspace_id: str, keys: dict) -> list:
+    """``[{"key", "matched", "taken"}]``: registry short names a project could take as its key.
+
+    Suggestions only (issue #648): nothing here stores or changes a key, and a
+    fresh key is still derived from the name. ``matched`` marks the names the
+    project's *repositories* resolve to, listed first in repository order;
+    ``taken`` marks a name that is already another project's key (*keys* is
+    :func:`lmer_platform.projects.time_keys`, the set an update is refused
+    against). A short name that cannot be a project key is left out.
+    """
+    if registry is None:
+        return []
+    matched = []
+    for url in repositories or ():
+        try:
+            found = registry.lookup(url)
+        except ValueError:
+            continue
+        if found is not None and found.name not in matched:
+            matched.append(found.name)
+    taken = {key for other, key in keys.items() if other != workspace_id}
+    names = matched + [name for name in registry if name not in matched]
+    return [{"key": name, "matched": name in matched, "taken": name in taken}
+            for name in names if projects.valid_project_key(name)]
+
+
+def _home_time_status(status: dict, home: str) -> dict:
+    """:meth:`Tracker.status` as an assistant on *home* sees it (P14).
+
+    A timer on another project is only ``running_elsewhere``. The writer's
+    refusal is dropped: the oldest queued entry may be anyone's, on any project.
+    """
+    running = status["running"]
+    elsewhere = running is not None and running["workspace_id"] != home
+    return {
+        **status,
+        "running": None if elsewhere else running,
+        "running_elsewhere": elsewhere,
+        "warnings": [] if elsewhere else status["warnings"],
+        "prompts": [prompt for prompt in status["prompts"] if prompt["workspace_id"] == home],
+        "outbox": {**status["outbox"], "last_error": None},
+        "writer_refusal": None,
+    }
+
+
+def _time_handler(handler) -> dict:
+    return {
+        "name": handler.name, "label": handler.label, "sync": handler.sync,
+        "fields": [{"key": item.key, "label": item.label, "required": item.required,
+                    "pattern": item.pattern, "hint": item.hint, "link": item.link,
+                    "per_issue": item.per_issue}
+                   for item in handler.fields],
+    }
+
+
+def _held_warnings(rows: list) -> list:
+    """One ``held`` warning per handler and reason, for the header (D17)."""
+    groups: dict = {}
+    for row in rows:
+        reason = (row["sync"] or {}).get("reason") or "no reason given"
+        group = groups.setdefault((row["handler"], reason), {
+            "kind": "held", "handler": row["handler"],
+            "handler_label": row["handler_label"] or row["handler"], "reason": reason, "count": 0,
+        })
+        group["count"] += 1
+    for group in groups.values():
+        noun = "entry" if group["count"] == 1 else "entries"
+        group["message"] = f"{group['count']} {group['handler_label']} {noun} held: {group['reason']}"
+    return list(groups.values())
 
 
 def _presented_secret(authorization: Optional[str]) -> Optional[str]:
@@ -2494,6 +2716,10 @@ def create_app(
             content={"detail": detail},
             headers={"Retry-After": RETRY_AFTER_SECONDS},
         )
+
+    @app.exception_handler(TimeRefusal)
+    async def time_refusal(_request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
     mention_settings = ingress.settings if ingress else MentionSettings.from_env()
     ingress_status = ingress or Ingress(mention_settings)
 
@@ -2692,12 +2918,12 @@ def create_app(
             "                              above, take uid beside slug (body or\n"
             "                              ?uid=) and address the record by it\n"
             "  GET  /api/runs/meta         what a run is about: this\n"
-            "                              orchestrator's title and description\n"
-            "                              for it ?host=&project=&slug=\n"
+            "                              orchestrator's title, description and\n"
+            "                              issues for it ?host=&project=&slug=\n"
             "  POST /api/runs/meta         set them {host,project,slug,title?,\n"
-            "                              description?} — an omitted field is\n"
-            "                              left alone, \"\" clears it. This is\n"
-            "                              PLATFORM state, never the work repo\n"
+            "                              description?,issues?} — an omitted\n"
+            "                              field is left alone, \"\" or [] clears\n"
+            "                              it. PLATFORM state, never the work repo\n"
             "                              (D3): local to this orchestrator,\n"
             "                              invisible to anyone else's fleet view,\n"
             "                              and dropped when the run is forgotten\n"
@@ -2916,6 +3142,55 @@ def create_app(
             "                               pushed — it waits here; a spool left\n"
             "                               unread past the nudge interval gets\n"
             "                               one reminder typed into the session\n\n"
+            "Time tracking (docs/TIME-TRACKING.md). The operator credential acts\n"
+            "for default_person; an assistant's for the person behind the record\n"
+            "that carried the request — record, else the conversation request it\n"
+            "is handling, else the latest human message on its own session —\n"
+            "and only on its own project. A name in the body never picks the\n"
+            "person. 503 while tracking is off:\n"
+            "  GET  /api/time/status       the person's running timer, warnings,\n"
+            "                              prompts, pause window, automatic on/off,\n"
+            "                              outbox, unmapped\n"
+            "                              identities, and per-project options:\n"
+            "                              handler fields, client labels, recent\n"
+            "                              titles and values ?project=&record=\n"
+            "  POST /api/time/start        start by hand {project,client?,title?,\n"
+            "                              fields?,record?,prompt?}; project is the\n"
+            "                              workspace id; prompt answers a prompt\n"
+            "                              from status. 422 with missing until\n"
+            "                              every required handler field has a\n"
+            "                              value; a new client label joins the\n"
+            "                              project\n"
+            "  POST /api/time/stop         stop by hand {record?,project?}; a\n"
+            "                              pause follows only when\n"
+            "                              time_pause_hours is set\n"
+            "  PATCH /api/time/current     edit the running timer {client?,title?,\n"
+            "                              fields?,record?,base?}; \"\" clears a\n"
+            "                              value; a change after time accrued\n"
+            "                              splits the entry; base is what the\n"
+            "                              form loaded\n"
+            "  PUT  /api/time/auto         turn automatic tracking on or off\n"
+            "                              {on,record?}; off until turned on\n"
+            "  GET  /api/time/entries      the person's entries, newest first, each\n"
+            "                              with its stage and ledger status\n"
+            "                              ?from=&to=&project=&client=&handler=&\n"
+            "                              status=&record=\n"
+            "  GET  /api/time/settings     the registry, the time_tracking switch\n"
+            "                              and the platform-wide time defaults,\n"
+            "                              each with its source\n"
+            "  POST /api/time/people       add a person {key,name?,slack?,matrix?}\n"
+            "                              (operator)\n"
+            "  PATCH /api/time/people/{key} edit one {name?,slack?,matrix?,add?}\n"
+            "                              (operator)\n"
+            "  DELETE /api/time/people/{key} remove one (operator)\n"
+            "  PATCH /api/time/defaults    {tracking?,default_person?,<setting>?};\n"
+            "                              null clears (operator)\n"
+            "  POST /api/time/me           list or rename the person an assistant\n"
+            "                              is talking to {key?,name?,record?}\n"
+            "  PATCH /api/time/project     a project's time settings {project?,\n"
+            "                              handler?,clients?,idle_grace_minutes?,\n"
+            "                              project_key?}\n"
+            "  POST /api/time/handlers/check parse a handler definition {name,text}\n\n"
             "The fleet view is scoped to runs this orchestrator spawned or\n"
             "adopted — never the whole shared work repo.\n"
         )
@@ -3009,6 +3284,502 @@ def create_app(
                              data={"workspace_id": destination["id"], "source_workspace_id": source["id"],
                                    "source_name": source["name"]})
         return {"source_workspace_id": source["id"], "destination_id": destination["id"], "queued": True}
+
+    # --- time tracking (issue #604, docs/TIME-TRACKING.md) -------------------
+    #
+    # The person is the credential's (time_actor), never the body's. An
+    # assistant acts only on its own project. A refusal inside a conversation
+    # request is recorded as one, so the same call may be retried.
+
+    def _time_problems(caller: Caller, problems) -> list:
+        """*problems* for the operator; a count for anyone else, since a registry
+        problem quotes people's ids and keys."""
+        problems = list(problems)
+        if caller.kind == CALLER_OPERATOR or not problems:
+            return problems
+        return [f"config.json has {len(problems)} time-tracking problem(s); the operator sees "
+                "them in Platform settings → Time tracking."]
+
+    def _time_tracker(caller: Caller) -> "timetrack.Tracker":
+        tracker = timetrack.get_tracker()
+        if tracker is None:
+            live = timetrack_live.current_config(config)
+            problems = _time_problems(caller, live.time_problems)
+            if problems:
+                reasons = f": {'; '.join(problems)}"
+            elif not live.time_tracking:
+                reasons = ": it is switched off (time_tracking)"
+            else:
+                reasons = ""
+            raise TimeRefusal(503, "time_tracking_off", f"Time tracking is not running{reasons}.",
+                              problems=problems)
+        return tracker
+
+    def _time_text(values: dict, name: str) -> Optional[str]:
+        value = values.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TimeRefusal(400, "time_invalid", f"{name} must be text.")
+        return value
+
+    def _time_acting(tracker: "timetrack.Tracker", caller: Caller, record: Optional[str]) -> dict:
+        request_id = None
+        if caller.is_assistant and record is None:
+            binding = project_api.capture()
+            request_id = binding.get("request_id")
+            if not request_id and binding.get("workspace_id"):
+                request_id = project_requests.bound(binding["workspace_id"])
+        return time_actor(caller, Registry.from_config(tracker.config), hub=_require_hub(),
+                          record=record, request_id=request_id)
+
+    def _time_scope(caller: Caller, workspace_id: Optional[str]) -> Optional[str]:
+        """*workspace_id*, or for an assistant its own project, refusing any other."""
+        if not caller.is_assistant:
+            return workspace_id
+        home = projects.session_home(caller.session_id)
+        if not home:
+            raise TimeRefusal(403, "time_no_project", "This assistant belongs to no project.")
+        if workspace_id is not None and workspace_id != home:
+            raise TimeRefusal(403, "time_other_project",
+                              "An assistant tracks time only on its own project.")
+        return home
+
+    def _time_result(result, acting: dict, caller: Caller) -> dict:
+        payload = {**result.to_dict(), "acting": acting}
+        if caller.is_assistant:
+            # P14: a timer or finished entry on another project stays out of
+            # what the assistant reads, as in its status, and so does any
+            # reason that would describe it.
+            home = projects.session_home(caller.session_id)
+            if payload["entry"] and payload["entry"]["project"] != projects.project_key(home):
+                payload.update(entry=None, seq=None, kept=None,
+                               reasons=[reason for reason in payload["reasons"] if reason != result.kept])
+            if payload["timer"] and payload["timer"]["workspace_id"] != home:
+                # A success can describe that timer too (a remembered answer).
+                reason = "a timer is running on another project"
+                if result.outcome == timetrack.REMEMBERED:
+                    reason += "; the value is kept for the next time this starts"
+                payload.update(timer=None, warnings=[], reasons=[reason] if payload["reasons"] else [])
+                if not result.ok:
+                    payload.update(missing=[])
+        if not result.ok:
+            project_requests.refused_before_effect()
+            raise TimeRefusal(422, "time_refused", "; ".join(payload["reasons"]) or "refused", **payload)
+        return payload
+
+    def _time_values(body: dict) -> dict:
+        fields = body.get("fields")
+        if fields is not None and not isinstance(fields, dict):
+            raise TimeRefusal(400, "time_invalid", "fields must be an object of handler field values.")
+        return {"client": _time_text(body, "client"), "title": _time_text(body, "title"),
+                "fields": fields}
+
+    def _time_options(tracker: "timetrack.Tracker", person: str, workspace_id: str, *,
+                      registry=None, keys: Optional[dict] = None) -> dict:
+        row = projects.get(workspace_id)
+        settings = row["settings"]
+        handler, warning = timesheet_handlers.resolve(tracker.config, settings.get("time_handler"))
+        return {
+            "workspace_id": workspace_id, "name": row["name"], "archived": row["archived"],
+            "project_key": projects.project_key(workspace_id),
+            "key_suggestions": time_key_suggestions(registry, row["repositories"], workspace_id,
+                                                    keys or {}),
+            "handler": _time_handler(handler), "handler_warning": warning,
+            "clients": list(settings.get("time_clients") or []),
+            "idle_grace_minutes": settings.get("time_idle_grace_minutes"),
+            "recent": tracker.recents(person, workspace_id),
+        }
+
+    @app.get("/api/time/status", dependencies=guard)
+    def time_status(project: Optional[str] = None, record: Optional[str] = None,
+                    caller: Caller = Depends(require_secret)) -> dict:
+        """The acting person's time, and what the app bar offers for each project."""
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, record)
+        person = acting["person"]
+        status = tracker.status(person)
+        own = _time_scope(caller, project)
+        status["running_elsewhere"] = False
+        if caller.is_assistant:
+            status = _home_time_status(status, own)
+            shown = [own]
+        else:
+            shown = [row["id"] for row in projects.listing(archived=False)]
+            for extra in (project, (status["running"] or {}).get("workspace_id")):
+                if extra and extra not in shown:
+                    shown.append(extra)
+        # P14: which keys are taken describes other projects, so an assistant's
+        # reply suggests none.
+        registry = None if caller.is_assistant else fold_registry(tracker.config)
+        # A key is stored on its first ask, so the shown ones are allocated
+        # before reading which are taken.
+        for workspace_id in shown:
+            projects.project_key(workspace_id)
+        keys = projects.time_keys() if registry is not None else {}
+        options = {workspace_id: _time_options(tracker, person, workspace_id,
+                                               registry=registry, keys=keys)
+                   for workspace_id in shown}
+        handlers, handler_problems = timesheet_handlers.available(tracker.config)
+        held = timetrack_entries.held(tracker.config, person)
+        if caller.is_assistant:
+            held = [row for row in held if row["project"] == options[own]["project_key"]]
+        warnings = list(status["warnings"]) + _held_warnings(held)
+        if status["writer_refusal"]:
+            warnings.append({"kind": "writer",
+                             "message": f"Entries are waiting to be written: {status['writer_refusal']}"})
+        activity = timetrack_activity.get_activity()
+        return {
+            **status,
+            "acting": acting,
+            "warnings": warnings,
+            "projects": options,
+            "handlers": [_time_handler(handler) for handler in handlers.values()],
+            "handler_problems": handler_problems,
+            "unmapped": activity.unmapped_identities() if activity is not None else [],
+        }
+
+    @app.post("/api/time/start", dependencies=guard)
+    def time_start(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Start the acting person's time on a project by hand (D4, D19)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        prompt = body.get("prompt")
+        if prompt is not None and (isinstance(prompt, bool) or not isinstance(prompt, int)):
+            raise TimeRefusal(400, "time_invalid", "prompt must be a prompt id from time status.")
+        named = _time_text(body, "project")
+        if prompt is not None:
+            home = tracker.prompt_workspace(acting["person"], prompt)
+            if home is None:
+                raise TimeRefusal(404, "time_prompt_unknown",
+                                  f"No open prompt {prompt} for {acting['person']}.")
+            if named is not None and named != home:
+                raise TimeRefusal(400, "time_prompt_project",
+                                  "That prompt is for another project.")
+            named = home
+        workspace_id = _time_scope(caller, named)
+        if not workspace_id:
+            raise TimeRefusal(400, "time_project_required",
+                              "Name the project to track time on: project is its workspace id.")
+        values = _time_values(body)
+        # The run an assistant starts time from is the one it works in; the
+        # operator credential is no run's, so its entries name none (#648).
+        sessions = timetrack_activity.session_refs((caller.session_id,)) if caller.is_assistant else ()
+        project_requests.effect()
+        if prompt is not None:
+            result = tracker.answer_prompt(acting["person"], prompt, at=tracker.now(),
+                                           sessions=sessions, **values)
+        else:
+            result = tracker.start(acting["person"], workspace_id, at=tracker.now(),
+                                   trigger="manual", sessions=sessions, **values)
+        return _time_result(result, acting, caller)
+
+    @app.post("/api/time/stop", dependencies=guard)
+    def time_stop(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Stop the acting person's time by hand (D4)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        workspace_id = _time_scope(caller, _time_text(body, "project"))
+        project_requests.effect()
+        result = tracker.stop(acting["person"], workspace_id, at=tracker.now(), trigger="manual")
+        return _time_result(result, acting, caller)
+
+    @app.patch("/api/time/current", dependencies=guard)
+    def time_update(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Edit the running timer's client, title or handler fields (D8)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        values = _time_values(body)
+        base = body.get("base")
+        if base is not None:
+            if not isinstance(base, dict) or not isinstance(base.get("fields", {}), dict):
+                raise TimeRefusal(400, "time_invalid",
+                                  "base must be an object of the values the form loaded.")
+            base = {**_time_values(base), "fields": base.get("fields") or {}}
+        if caller.is_assistant:
+            running = tracker.status(acting["person"])["running"]
+            if running is not None:
+                _time_scope(caller, running["workspace_id"])
+        project_requests.effect()
+        result = tracker.update_running(acting["person"], base=base, **values)
+        return _time_result(result, acting, caller)
+
+    @app.put("/api/time/auto", dependencies=guard)
+    def time_auto(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Turn the acting person's automatic tracking on or off, until it is turned back (D4)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        on = body.get("on")
+        if not isinstance(on, bool):
+            raise TimeRefusal(400, "time_invalid", "on must be true or false.")
+        project_requests.effect()
+        result = tracker.set_automatic(acting["person"], on)
+        payload = _time_result(result, acting, caller)
+        payload["automatic"] = tracker.status(acting["person"])["automatic"]
+        return payload
+
+    @app.get("/api/time/entries", dependencies=guard)
+    def time_entries(
+        start: Optional[str] = Query(default=None, alias="from"),
+        end: Optional[str] = Query(default=None, alias="to"),
+        project: Optional[str] = None, client: Optional[str] = None,
+        handler: Optional[str] = None, status: Optional[str] = None,
+        record: Optional[str] = None, caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """The acting person's entries with their stage and ledger status (D18)."""
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, record)
+        try:
+            filters = timetrack_entries.Filters.parse(
+                start=start, end=end, project=project, client=client, handler=handler,
+                status=status)
+        except ValueError as exc:
+            raise TimeRefusal(400, "time_invalid_filter", str(exc)) from exc
+        if caller.is_assistant:
+            home = _time_scope(caller, None)
+            if filters.project not in (None, home, projects.project_key(home)):
+                raise TimeRefusal(403, "time_other_project",
+                                  "An assistant reads time only on its own project.")
+            filters = replace(filters, project=home)
+        return {**timetrack_entries.entries(tracker.config, tracker, acting["person"], filters),
+                "acting": acting}
+
+
+    # --- time-tracking settings (issue #668, docs/TIME-TRACKING.md#settings) ---
+    #
+    # The registry and the platform-wide defaults are the operator's; an
+    # assistant maps only the person who asked (time/me) and sets its own
+    # project. Every write applies to the running tracking at once.
+
+    def _time_operator_only(caller: Caller, what: str) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise TimeRefusal(403, "time_settings_operator_only",
+                              f"{what} is for the operator: Platform settings → Time tracking, or "
+                              "lmer-ctl with the shared secret.")
+
+    def _time_write(compute: Callable[[dict], dict], caller: Caller) -> None:
+        """``mutate_stored``; every refusal it raises means nothing was written."""
+        try:
+            mutate_stored(compute)
+        except time_settings.SettingsRefused as exc:
+            problems = _time_problems(caller, exc.problems)
+            message = "; ".join(problems) if exc.problems else exc.message
+            raise TimeRefusal(exc.status, exc.code, message, problems=problems) from exc
+        except ConfigError as exc:
+            raise TimeRefusal(400, "time_settings_invalid", str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+
+    def _time_store(compute: Callable[[dict], dict], caller: Caller) -> dict:
+        _time_write(compute, caller)
+        return _time_settings_reply(caller, applied=_time_apply())
+
+    def _time_apply() -> str:
+        """Hand the stored change to the running tracking; ``restart`` when this
+        app runs without one (an embedding with no daemon behind it). The file is
+        read under the tracking's lock, so two writes cannot apply out of order."""
+        tracking = timetrack_live.get_tracking()
+        if tracking is None:
+            return "restart"
+        return tracking.reload(load_config)
+
+    def _time_settings_reply(caller: Caller, **extra) -> dict:
+        fresh = load_config()
+        try:
+            stored = read_json(config_path())
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+        stored = stored if isinstance(stored, dict) else {}
+        reply = time_settings.view(fresh, stored)
+        defaults = reply["defaults"]["idle_grace_minutes"]["value"]
+        reply["projects"] = [
+            {"workspace_id": row["id"], "name": row["name"],
+             "idle_grace_minutes": row["settings"].get("time_idle_grace_minutes"),
+             "effective_idle_grace_minutes": row["settings"].get("time_idle_grace_minutes") or defaults}
+            for row in projects.listing(archived=False)
+        ]
+        activity = timetrack_activity.get_activity()
+        reply["unmapped"] = activity.unmapped_identities() if activity is not None else []
+        tracking = timetrack_live.get_tracking()
+        reply["tracking"]["live"] = tracking is not None and tracking.running
+        if caller.kind != CALLER_OPERATOR:
+            # P14: other projects, and other people's ids, are the operator's to read.
+            home = projects.session_home(caller.session_id) if caller.is_assistant else None
+            reply.update(people=[], unmapped=[],
+                         projects=[row for row in reply["projects"] if row["workspace_id"] == home])
+            reply["tracking"]["problems"] = _time_problems(caller, reply["tracking"]["problems"])
+        return {**reply, **extra}
+
+    @app.get("/api/time/settings", dependencies=guard)
+    def time_settings_read(caller: Caller = Depends(require_secret)) -> dict:
+        """The registry, the switch and the platform-wide time defaults, with where each came from."""
+        return _time_settings_reply(caller)
+
+    @app.post("/api/time/people", dependencies=guard)
+    def time_person_add(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Adding a person")
+        return _time_store(lambda current: time_settings.add_person(current, body), caller)
+
+    @app.patch("/api/time/people/{key}", dependencies=guard)
+    def time_person_edit(key: str, body: Optional[dict] = None,
+                         caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Editing a person")
+        return _time_store(lambda current: time_settings.edit_person(current, key, body or {}), caller)
+
+    @app.delete("/api/time/people/{key}", dependencies=guard)
+    def time_person_remove(key: str, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Removing a person")
+        return _time_store(lambda current: time_settings.remove_person(current, key), caller)
+
+    @app.patch("/api/time/defaults", dependencies=guard)
+    def time_defaults(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Changing the platform-wide time settings")
+        return _time_store(lambda current: time_settings.patch_defaults(current, body or {}), caller)
+
+    def _asker_identity(caller: Caller, record: Optional[str], *, writing: bool) -> tuple:
+        """``(transport, raw_id)`` of the human an assistant is acting for, mapped or not.
+
+        A write needs a delivered conversation request: only its sender is known
+        to have asked, and a thread holds other people's records.
+        """
+        if not caller.is_assistant:
+            raise TimeRefusal(403, "time_settings_assistant_only",
+                              "time/me maps the person an assistant is talking to; the operator "
+                              "edits people in Platform settings → Time tracking.")
+        if not caller.session_id:
+            raise TimeRefusal(403, "time_no_session",
+                              "This assistant credential names no session, so no record says who asked.")
+        hub = _require_hub()
+        binding = project_api.capture()
+        request_id = binding.get("request_id")
+        if not request_id and binding.get("workspace_id"):
+            request_id = project_requests.bound(binding["workspace_id"])
+        handled = project_requests.get(request_id) if request_id and _handling(request_id, caller.session_id) else None
+        if writing and handled is None:
+            raise TimeRefusal(403, "time_no_request",
+                              "No conversation request names who asked, so this assistant cannot list "
+                              "or rename anyone; the operator does it in Platform settings → Time tracking.")
+        if record is not None:
+            message = next((event.message for event in _session_events(hub, caller.session_id)
+                            if event.message.get("id") == record), None)
+            if message is None:
+                raise TimeRefusal(403, "time_record_foreign",
+                                  f"record {record} is not on this assistant's session.")
+            if message.get("kind") not in _HUMAN_KINDS:
+                raise TimeRefusal(422, "time_record_not_human",
+                                  f"record {record} is not a human's message or answer.")
+            identity = people_identity(message)
+            if handled is not None and identity != (handled["transport"], handled["sender"]):
+                raise TimeRefusal(403, "time_record_not_asker",
+                                  f"record {record} is not from the person whose request this is.")
+        else:
+            if handled is not None:
+                identity = (handled["transport"], handled["sender"])
+            else:
+                identity = None
+                for event in _session_events(hub, caller.session_id):
+                    if event.message.get("kind") in _HUMAN_KINDS and people_identity(event.message):
+                        identity = people_identity(event.message)
+        if identity is None:
+            raise TimeRefusal(422, "time_no_record",
+                              "No human message on this assistant's session says who asked; "
+                              "pass the record that carried the request.")
+        if identity[0] not in ("slack", "matrix"):
+            raise TimeRefusal(422, "time_settings_web_chat",
+                              "The web chat acts for default_person; set it in Platform settings → "
+                              "Time tracking.")
+        return identity
+
+    @app.post("/api/time/me", dependencies=guard)
+    def time_me(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """List the person an assistant is talking to, or rename them (docs/TIME-TRACKING.md#settings)."""
+        project_requests.preflight()
+        body = body or {}
+        outcome = {}
+
+        def compute(current: dict) -> dict:
+            changes, person, created = time_settings.map_identity(current, identity, key=key, name=name)
+            outcome.update(person=person, created=created)
+            if changes:
+                project_requests.effect()
+            return changes
+
+        try:
+            key, name = _time_text(body, "key"), _time_text(body, "name")
+            identity = _asker_identity(caller, _time_text(body, "record"),
+                                       writing=key is not None or name is not None)
+            _time_write(compute, caller)
+        except TimeRefusal:
+            project_requests.refused_before_effect()
+            raise
+        reply = _time_settings_reply(caller, applied=_time_apply())
+        return {**reply, "person": outcome["person"], "created": outcome["created"],
+                "identity": f"{identity[0]}:{identity[1]}"}
+
+    @app.patch("/api/time/project", dependencies=guard)
+    def time_project(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """A project's time settings: an assistant's own project, any one for the operator."""
+        if caller.kind != CALLER_OPERATOR and not caller.is_assistant:
+            raise TimeRefusal(403, "time_caller_refused",
+                              f"A {caller.kind} credential cannot change a project's time settings.")
+        project_requests.preflight()
+        body = body or {}
+        named = {"handler": "time_handler", "clients": "time_clients",
+                 "idle_grace_minutes": "time_idle_grace_minutes", "project_key": "time_project_key"}
+        unknown = set(body) - set(named) - {"project", "record"}
+        if unknown:
+            raise TimeRefusal(400, "time_invalid",
+                              f"unknown project time setting(s) {', '.join(sorted(unknown))}: "
+                              f"expected {', '.join(named)}")
+        workspace_id = _time_scope(caller, _time_text(body, "project"))
+        if not workspace_id:
+            raise TimeRefusal(400, "time_project_required", "Name the project: project is its workspace id.")
+        changes = {named[key]: (None if value == "" else value)
+                   for key, value in body.items() if key in named}
+        if not changes:
+            raise TimeRefusal(400, "time_invalid", f"name at least one of {', '.join(named)}.")
+        if "time_project_key" in changes and changes["time_project_key"] is None:
+            raise TimeRefusal(400, "time_invalid", "A project key cannot be cleared; name the key to use.")
+        try:
+            # Read and written under the projects lock, so a settings form saving the
+            # whole map at the same time cannot drop this change, or this one its.
+            with projects.operation():
+                current = projects.get(workspace_id, active=True)
+                projects.validate_time_settings(changes)
+                project_requests.effect()
+                row = projects.update(workspace_id, {"settings": {**current["settings"], **changes}})
+        except projects.ProjectError as exc:
+            # Raised inside projects.update's transaction, so nothing was written.
+            project_requests.refused_before_effect()
+            raise TimeRefusal(getattr(exc, "status", 400) or 400,
+                              getattr(exc, "code", None) or "time_invalid", str(exc)) from exc
+        settings = row["settings"]
+        return {"workspace_id": workspace_id, "project_key": projects.project_key(workspace_id),
+                **{key: settings.get(field) for key, field in named.items() if key != "project_key"}}
+
+    @app.post("/api/time/handlers/check", dependencies=guard)
+    def time_handler_check(body: Optional[dict] = None) -> dict:
+        """Parse a handler definition with this daemon's parser, before it is pushed."""
+        project_requests.preflight()
+        body = body or {}
+        name, text = body.get("name"), body.get("text")
+        if not isinstance(text, str) or not isinstance(name, str) or not name.strip():
+            raise TimeRefusal(400, "time_invalid",
+                              "send name (the file name without .yaml) and text (its contents).")
+        if name.strip() == DEFAULT_HANDLER:
+            return {"ok": False, "handler": None,
+                    "problems": ["timesheet is the built-in handler and cannot be defined"]}
+        handler, problems = parse_handler(text, path=f"{name.strip()}.yaml")
+        return {"ok": handler is not None, "handler": _time_handler(handler) if handler else None,
+                "problems": problems}
 
     @app.get("/api/settings", dependencies=guard)
     def platform_settings() -> dict:
@@ -3314,6 +4085,7 @@ def create_app(
                     session_id, kind=kind, text=data.rstrip("\r\n"),
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    meta=_credential_meta(caller),
                     authority=_authority_of(caller, session_id, kind),
                 )
             except SessionIOError as exc:
@@ -3573,6 +4345,7 @@ def create_app(
                     option=option,
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    meta=_credential_meta(caller),
                     authority=_authority_of(caller, session_id, comms.KIND_ANSWER),
                 )
             except SessionIOError as exc:
@@ -3707,7 +4480,7 @@ def create_app(
                 option=option,
                 options=[str(item) for item in options],
                 attachments=[item for item in attachments if isinstance(item, dict)],
-                meta=_caller_meta(body.get("meta"), kind),
+                meta=_credential_meta(caller, _caller_meta(body.get("meta"), kind)),
                 authority=_authority_of(caller, session_id, kind),
             )
         except comms.NoBus:
@@ -4721,6 +5494,7 @@ def create_app(
                 # arriving as ``None`` and reading as "leave this field alone".
                 title=body.get("title"),
                 description=body.get("description"),
+                issues=body.get("issues"),
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

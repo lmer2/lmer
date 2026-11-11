@@ -85,6 +85,73 @@ export function setProjectChannels(workspaceId, channels) {
   })
 }
 
+// Time tracking (#604). The daemon decides whose time it is from the credential,
+// so nothing here names a person. A refusal arrives as {code, message}: 503
+// `time_tracking_off` when tracking is not running, 409 `time_no_default_person`
+// when the operator credential acts for nobody, 422 `time_refused` for a start the
+// tracker would not make.
+export function fetchTimeStatus({ project } = {}) {
+  const query = runQuery({ project }).toString()
+  return request(query ? `api/time/status?${query}` : 'api/time/status')
+}
+
+// `prompt` answers a prompt from time status (#665): its project is the prompt's.
+export function startTime({ project, client, title, fields, prompt } = {}) {
+  return request('api/time/start', {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ project, client, title, fields, prompt }),
+  })
+}
+
+export function stopTime({ project } = {}) {
+  return request('api/time/stop', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ project }) })
+}
+
+// `base` is what the form loaded: a value still equal to it was not edited (D24).
+export function updateTime(changes, base) {
+  return request('api/time/current', {
+    method: 'PATCH', headers: jsonHeaders, body: JSON.stringify(base ? { ...changes, base } : changes),
+  })
+}
+
+// Off stays until turned back on; manual start and stop still work.
+export function setTimeAutomatic(on) {
+  return request('api/time/auto', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ on }) })
+}
+
+// The time-tracking settings: the registry, the switch and the platform-wide
+// defaults. Every write answers the settings as they now are, with `applied`
+// (`started`, `stopped`, `updated`, `off`, or `restart`) saying what the daemon did.
+export function fetchTimeSettings() {
+  return request('api/time/settings')
+}
+
+export function addTimePerson(person) {
+  return request('api/time/people', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(person) })
+}
+
+// A list given replaces the stored one; `add` is ['slack:U…'] moved from whoever had it.
+export function updateTimePerson(key, changes) {
+  return request(`api/time/people/${encodeURIComponent(key)}`, {
+    method: 'PATCH', headers: jsonHeaders, body: JSON.stringify(changes),
+  })
+}
+
+export function removeTimePerson(key) {
+  return request(`api/time/people/${encodeURIComponent(key)}`, { method: 'DELETE' })
+}
+
+// null clears a key so the default (or an export) shows through.
+export function updateTimeDefaults(changes) {
+  return request('api/time/defaults', { method: 'PATCH', headers: jsonHeaders, body: JSON.stringify(changes) })
+}
+
+// `from`/`to` are a YYYY-MM-DD day or an ISO timestamp; `status` is a stage or a
+// sync status (`held`, `pending`, …), as GET /api/time/entries reads them.
+export function fetchTimeEntries({ from, to, project, client, handler, status } = {}) {
+  const query = runQuery({ from, to, project, client, handler, status }).toString()
+  return request(query ? `api/time/entries?${query}` : 'api/time/entries')
+}
+
 export function moveRun(run, destinationId) {
   return request('api/runs/move', {
     method: 'POST', headers: jsonHeaders,
