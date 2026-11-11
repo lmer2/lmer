@@ -818,7 +818,7 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin, nudge and "
     "rotation groups on its next tick, so a change there takes effect without a "
     "rotation. "
-    "chat_show_transcript, chat_tint_operator and dock_keep_last_notes are browser "
+    "chat_show_transcript, chat_tint_operator, chat_enter_sends and dock_keep_last_notes are browser "
     "display settings applied on config refresh; none requires an assistant rotation. The "
     "resources group is "
     "read-only and environment-only, and like the launch settings it applies "
@@ -5631,7 +5631,7 @@ def create_app(
         Keys are the launch-setting names (including ``threads``) plus the integer settings
         (display-only ``dock_keep_last_notes`` from #465, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
-        #446) and the booleans ``chat_show_transcript`` (#488) and ``chat_tint_operator`` (#646),
+        #446) and the booleans ``chat_show_transcript`` (#488), ``chat_tint_operator`` (#646) and ``chat_enter_sends`` (#663),
         which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. A boolean takes ``true``/``false`` (the JSON

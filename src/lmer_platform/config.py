@@ -546,6 +546,7 @@ INT_SETTINGS = {
 BOOL_SETTINGS = {
     "chat_show_transcript": False,
     "chat_tint_operator": True,
+    "chat_enter_sends": True,
 }
 
 #: setting key -> (PlatformConfig field, optional env var). The one table the loader,
@@ -679,6 +680,10 @@ class PlatformConfig:
     #: Whether the operator's chat bubbles take their project's hue (issue #646).
     #: A display setting like ``chat_show_transcript``.
     chat_tint_operator: bool = True
+    #: Whether a bare Enter sends in the UI's three message boxes (issue #663).
+    #: Off, Enter is a newline and Ctrl/Cmd+Enter sends. A touch-first device
+    #: keeps Enter as a newline either way — the browser decides that, not this.
+    chat_enter_sends: bool = True
     #: Visual graph groups; read fresh for UI requests, independent of run ownership.
     fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
@@ -1672,7 +1677,11 @@ def chat_settings() -> dict:
     it is a browser display setting, and the pane re-reads it on config refresh.
     """
     return _bool_group_settings(
-        {"show_transcript": ("chat_show_transcript", None), "tint_operator": ("chat_tint_operator", None)},
+        {
+            "show_transcript": ("chat_show_transcript", None),
+            "tint_operator": ("chat_tint_operator", None),
+            "enter_sends": ("chat_enter_sends", None),
+        },
         group="chat",
     )
 

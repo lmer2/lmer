@@ -12,6 +12,14 @@ export const chatShowTranscript = ref(false)
 // Whether the operator's bubbles take the project's hue (issue 646). On unless
 // the platform says an explicit `false`.
 export const chatTintOperator = ref(true)
+// Whether a bare Enter sends in the three message boxes (issue 663). On unless
+// the platform says an explicit `false`; composerKeys.js keeps a touch-first
+// device on Enter = newline regardless.
+export const chatEnterSends = ref(true)
+// Whether any config reply has landed in this page. composerKeys.js keeps Enter a
+// newline until it has: an operator who turned Enter-sends off must not have a
+// half-written answer sent because the first fetch was slow or failed.
+export const chatSettingsLoaded = ref(false)
 export const chatConfigProblem = ref(null)
 const readEntries = new Map()
 let configGeneration = 0
@@ -22,6 +30,8 @@ export function applyChatSettings(config) {
   dockKeepLastNotes.value = Number.isSafeInteger(value) && value >= 0 ? value : null
   chatShowTranscript.value = config.chat?.show_transcript?.value === true
   chatTintOperator.value = config.chat?.tint_operator?.value !== false
+  chatEnterSends.value = config.chat?.enter_sends?.value !== false
+  chatSettingsLoaded.value = true
   chatConfigProblem.value = null
 }
 

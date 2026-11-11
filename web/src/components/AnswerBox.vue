@@ -31,6 +31,7 @@
 import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import { mdiCommentQuestionOutline, mdiReplyOutline } from '@mdi/js'
 import { answerRun } from '../api.js'
+import { composerKeydown, enterHint } from '../composerKeys.js'
 
 // Deferred into its own chunk, like every other consumer of it — Markdown.vue's
 // header says why, and why nothing is drawn until it lands.
@@ -54,7 +55,7 @@ const NO_QUESTION_NOTE = 'question text was not recorded — open the run to see
 
 const draft = ref('')
 const projectConfirmed = ref(false)
-// The reason a blocked send attempt was refused, held only so the chord says
+// The reason a blocked send attempt was refused, held only so a key press says
 // something: it is what the live region announces and what marks the reason on
 // screen. Cleared by `watch(disabledReason)` below — the reason changing is the
 // state changing — so neither the highlight nor the announcement can outlive
@@ -274,10 +275,8 @@ function cancelUnsignedSource() {
       </v-alert>
 
       <!-- Send is a labelled control on its own row (`.send-row`, style.css),
-           reachable by a thumb on any device and by Ctrl+Enter (Cmd+Enter on a Mac)
-           from a keyboard; bare Enter stays a newline, because this is a box someone
-           writes a paragraph in and a phone's return key is the only way to make
-           one. Chat.vue's composer carries the reasoning for all three of those,
+           reachable by a thumb on any device. Enter follows the shared rule in
+           composerKeys.js (issue 663). Chat.vue's composer carries the reasoning,
            including why the icon that used to sit in the field's corner could not
            be reached on a phone (issue 194).
            This box's one distinguishing fact — that sending it starts a container —
@@ -290,15 +289,14 @@ function cancelUnsignedSource() {
         v-model="draft"
         :disabled="busy || handedOff"
         label="your answer"
-        hint="Tap answer below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Goes to a new session for this run — the one that asked has exited"
+        :hint="`Tap answer below — ${enterHint}. Goes to a new session for this run — the one that asked has exited`"
         persistent-hint
         rows="3"
         auto-grow
         max-rows="10"
         autocapitalize="sentences"
         class="mt-3"
-        @keydown.ctrl.enter.prevent="submit"
-        @keydown.meta.enter.prevent="submit"
+        @keydown.enter="composerKeydown($event, submit)"
       />
       <v-select v-model="selectedSlot" :items="slots.filter(slot => slot.applicable_projects?.includes(run.workspace_id))"
           item-title="name" item-value="name" label="Service slot" clearable
@@ -326,9 +324,9 @@ function cancelUnsignedSource() {
           :class="{ 'send-reason--pressed': pressedReason }"
           role="status"
         >{{ disabledReason }}</p>
-        <!-- Announced, not only coloured: a blocked Ctrl/Cmd+Enter produces no
-             visible change at all (the reason already reads this), so this is
-             what a screen reader gets. Empty until a chord is refused, and
+        <!-- Announced, not only coloured: a blocked Enter or Ctrl/Cmd+Enter
+             produces no visible change at all (the reason already reads this), so
+             this is what a screen reader gets. Empty until a key press is refused, and
              emptied again by the watcher as soon as the reason changes. -->
         <span class="send-announcer" aria-live="polite" aria-atomic="true">{{ pressedReason || '' }}</span>
         <v-btn
@@ -373,14 +371,14 @@ function cancelUnsignedSource() {
   margin: 0;
 }
 
-/* A blocked Ctrl/Cmd+Enter is the same reason, said louder: the chord would
+/* A blocked Enter is the same reason, said louder: the key press would
    otherwise look like it did nothing at all. */
 .send-reason--pressed {
   color: rgb(var(--v-theme-warning));
   opacity: 1;
 }
 
-/* The live region that announces a blocked chord. Visually hidden (the standard
+/* The live region that announces a blocked key press. Visually hidden (the standard
    clip recipe): the sentence is already on screen beside the control, and
    showing it twice would be the duplication this rule exists to avoid. */
 .send-announcer {

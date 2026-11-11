@@ -2,11 +2,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AssistantSettings from '../src/components/AssistantSettings.vue'
 import { fetchAssistantConfig, setAssistantConfig } from '../src/api.js'
-import { chatShowTranscript, chatTintOperator, applyChatSettings } from '../src/operatorChat.js'
+import { chatEnterSends, chatShowTranscript, chatTintOperator, applyChatSettings } from '../src/operatorChat.js'
 import { deferred, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ fetchAssistantConfig: vi.fn(), setAssistantConfig: vi.fn() }))
-const config = (changed = [], shown = false, tint = undefined) => ({
+const config = (changed = [], shown = false, tint = undefined, enter = undefined) => ({
   settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'effort', 'threads'].map((key) => [
     key, { value: null, stored: null, source: 'default' },
   ])),
@@ -15,6 +15,7 @@ const config = (changed = [], shown = false, tint = undefined) => ({
       value: shown, stored: shown ? true : null, source: shown ? 'config.json' : 'default',
     },
     ...(tint === undefined ? {} : { tint_operator: { value: tint, stored: tint, source: 'config.json' } }),
+    ...(enter === undefined ? {} : { enter_sends: { value: enter, stored: enter, source: 'config.json' } }),
   },
   changed,
 })
@@ -40,6 +41,7 @@ beforeEach(() => {
   fetchAssistantConfig.mockResolvedValue(config())
   setAssistantConfig.mockImplementation(async (named) => config(
     Object.keys(named), named.chat_show_transcript ?? false, named.chat_tint_operator,
+    named.chat_enter_sends,
   ))
 })
 
@@ -168,6 +170,29 @@ it('tints by default and turning it off stores an explicit false that applies at
   expect(setAssistantConfig).toHaveBeenCalledWith({ chat_tint_operator: false })
   expect(chatTintOperator.value).toBe(false)
   expect(document.body.textContent).toContain('applies now')
+})
+
+// Issue 663: Enter sends unless the platform stores false.
+const enterSwitch = () => document.querySelector('.assistant-settings .enter-sends input')
+
+it('sends on Enter by default and turning it off stores an explicit false that applies at once', async () => {
+  await open({ groups: ['conversation'] })
+  expect(chatEnterSends.value).toBe(true)
+  const input = enterSwitch()
+  expect(input.checked).toBe(true)
+  input.click()
+  await flushPromises()
+  await save()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_enter_sends: false })
+  expect(chatEnterSends.value).toBe(false)
+  expect(document.body.textContent).toContain('applies now')
+})
+
+it('reads a stored false back into the switch', async () => {
+  fetchAssistantConfig.mockResolvedValue(config([], false, undefined, false))
+  await open({ groups: ['conversation'] })
+  expect(enterSwitch().checked).toBe(false)
+  expect(chatEnterSends.value).toBe(false)
 })
 
 it('offers the launch effort beside the other launch settings', async () => {

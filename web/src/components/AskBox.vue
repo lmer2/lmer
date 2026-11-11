@@ -35,6 +35,7 @@
 import { computed, defineAsyncComponent, ref } from 'vue'
 import { mdiCommentQuestionOutline, mdiSendOutline } from '@mdi/js'
 import { answerSessionQuestion } from '../api.js'
+import { composerKeydown, enterHint } from '../composerKeys.js'
 import { ago } from '../format.js'
 
 // Deferred into its own chunk, like every other consumer of it — Markdown.vue's
@@ -104,8 +105,8 @@ function chooseOption(option) {
   draft.value += (/\s$/.test(draft.value) ? '' : ' ') + option
 }
 
-// What the send control and the chord are bound to. Both hand their handler an
-// event, so this takes no argument at all and reads the box itself; the guards it
+// What the send control and the Enter key are bound to. The control hands its
+// handler an event, so this ignores its argument and reads the box itself; the guards it
 // used to carry live in `send`, which every path now goes through.
 function submit() {
   return send(draft.value)
@@ -172,26 +173,23 @@ function submit() {
       </v-alert>
 
       <!-- Send is a labelled control on its own row (`.send-row`, style.css),
-           reachable by a thumb on any device and by Ctrl+Enter (Cmd+Enter on a
-           Mac) from a keyboard; bare Enter stays a newline, because a reply to a
-           real question is written in sentences — and on a phone the return key is
-           the only way to type one. Chat.vue's composer carries the reasoning for
-           all three of those, including why the icon that used to sit in the
-           field's corner was not reachable (issue 194). The word is "reply", not
-           "answer", because nothing is started here. -->
+           reachable by a thumb on any device. Enter follows the shared rule in
+           composerKeys.js (issue 663). Chat.vue's composer carries the reasoning,
+           including why the icon that used to sit in the field's corner was not
+           reachable (issue 194). The word is "reply", not "answer", because
+           nothing is started here. -->
       <v-textarea
         v-model="draft"
         :disabled="busy || sent"
         label="your reply"
-        hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Goes straight to the running session — nothing is started"
+        :hint="`Tap send below — ${enterHint}. Goes straight to the running session — nothing is started`"
         persistent-hint
         rows="2"
         auto-grow
         max-rows="10"
         autocapitalize="sentences"
         class="mt-3"
-        @keydown.ctrl.enter.prevent="submit"
-        @keydown.meta.enter.prevent="submit"
+        @keydown.enter="composerKeydown($event, submit)"
       />
       <div class="send-row">
         <v-btn

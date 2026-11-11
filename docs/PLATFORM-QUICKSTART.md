@@ -290,6 +290,14 @@ consult relevant prior exchanges when context is missing.
   hue, at a lightness where the message text and its header both clear WCAG AA
   in either color scheme; off, they use the theme's one operator color. The
   General project and a chat with no project always use that one color.
+  **Enter sends messages** (on by default, `chat_enter_sends`) sets the
+  keys in all three message boxes — the chat composer, a live session's ask
+  reply and a stopped run's answer. On, Enter sends and Shift+Enter starts a
+  new line; off, Enter starts a new line and Ctrl+Enter (Cmd+Enter on a Mac)
+  sends. Ctrl/Cmd+Enter sends either way. On a phone or other touch-first
+  device Enter always starts a new line, because it is the only newline key
+  there; the send button under each box works everywhere. Send privately's
+  editor is not one of the three: Enter there is always a new line.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
