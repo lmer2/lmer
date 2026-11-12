@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { archiveProject, fetchPlatformSettings, setPlatformSettings, fetchConversationRequests, parkConversationRequest, releaseConversationRequest } from '../api.js'
+import { archiveProject, fetchPlatformSettings, setPlatformSettings, fetchConversationRequests, parkConversationRequest, releaseConversationRequest, releaseThread } from '../api.js'
 import AssistantSettings from './AssistantSettings.vue'
 import IngressStatus from './IngressStatus.vue'
 import RotateAllAssistants from './RotateAllAssistants.vue'
@@ -80,6 +80,10 @@ const parkingBusy = ref(false)
 const releasing = ref(null)
 const releaseReason = ref('')
 const releaseBusy = ref(false)
+const threadRelease = ref(null)
+const threadReleaseBusy = ref(false)
+const activeProjects = computed(() => props.projects.filter(row => !row.archived))
+const handoffTargets = computed(() => activeProjects.value.filter(row => row.id !== threadRelease.value?.project_id))
 const requestsBusy = ref(false)
 const requestsError = ref(null)
 const archived = computed(() => props.projects.filter(row => row.archived))
@@ -293,6 +297,8 @@ function actionProblems(request) {
 }
 function edit(row) { slotName.value = row?.name || null; slotOpen.value = true }
 function projectName(request) { return props.projects.find(project => project.id === request.project_id)?.name || request.project_id }
+function parksReply(request) { return ['reply_sending', 'reply_uncertain'].includes(request.state) }
+function parkLabel(request) { return parksReply(request) ? 'Park uncertain reply' : 'Park uncertain request' }
 function confirmParking(request) { parking.value = request; parkingReason.value = ''; error.value = null }
 async function park() {
   const target = parking.value
@@ -315,6 +321,21 @@ async function release() {
     await refreshRequests()
     emit('changed')
   } catch (exc) { error.value = exc.message } finally { releaseBusy.value = false }
+}
+function confirmThreadRelease(request) {
+  threadRelease.value = { permalink: request?.permalink || '', project_id: request?.project_id || null, to: null, reason: '', fromRequest: !!request }
+  error.value = null
+}
+async function submitThreadRelease() {
+  const target = threadRelease.value
+  threadReleaseBusy.value = true
+  try {
+    await releaseThread(target.permalink.trim(), target.project_id, target.to, target.reason)
+    threadRelease.value = null
+    error.value = null
+    await refreshRequests()
+    emit('changed')
+  } catch (exc) { error.value = exc.message } finally { threadReleaseBusy.value = false }
 }
 </script>
 
@@ -462,10 +483,14 @@ async function release() {
                 {{ action.method }} {{ action.path }}: complete — receipt retained
               </p>
               <v-btn v-if="request.recovery?.release_allowed" variant="tonal" color="error" @click="confirmRelease(request)">Release blocked request</v-btn>
+              <v-btn v-if="request.permalink && request.project_id && request.state !== 'invalid'" variant="tonal" @click="confirmThreadRelease(request)">Release thread…</v-btn>
               <p v-if="request.parking">Parked by {{ request.parking.by }} at {{ request.parking.at }}: {{ request.parking.reason }}. Delivery remains unknown; archive stays blocked.</p>
-              <v-btn v-else-if="['reply_sending', 'reply_uncertain'].includes(request.state)" variant="tonal" @click="confirmParking(request)">Park uncertain reply</v-btn>
+              <v-btn v-else-if="request.parkable || ['reply_sending', 'reply_uncertain'].includes(request.state)" variant="tonal" @click="confirmParking(request)">{{ parkLabel(request) }}</v-btn>
             </v-list-item></v-list>
-            <template #actions><v-btn variant="tonal" :loading="requestsBusy" @click="refreshRequests">Refresh requests</v-btn></template>
+            <template #actions>
+              <v-btn variant="tonal" :loading="requestsBusy" @click="refreshRequests">Refresh requests</v-btn>
+              <v-btn variant="tonal" @click="confirmThreadRelease(null)">Release a thread…</v-btn>
+            </template>
           </SettingsSection>
         </div>
       </div>
@@ -482,11 +507,11 @@ async function release() {
       </v-card>
     </v-dialog>
     <v-dialog :model-value="!!parking" :persistent="parkingBusy" max-width="560" @update:model-value="value => { if (!value) parking = null }">
-      <v-card v-if="parking" :title="`Park uncertain reply for ${projectName(parking)}`">
+      <v-card v-if="parking" :title="`${parkLabel(parking)} for ${projectName(parking)}`">
         <v-card-text>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
           <p>{{ parking.transport }} · {{ parking.conversation }} · {{ parking.root }}</p>
-          <p class="mb-3">Allow independent work in this project. The reply stays uncertain and will not be resent or marked delivered. Archive remains blocked.</p>
+          <p class="mb-3">Allow independent work in this project. {{ parksReply(parking) ? 'The reply stays uncertain and will not be resent or marked delivered.' : 'Its uncertain actions keep their receipts and will not be repeated or marked complete.' }} Archive remains blocked.</p>
           <v-textarea v-model="parkingReason" label="Reason for parking" maxlength="2000" :disabled="parkingBusy" />
         </v-card-text>
         <v-card-actions>
@@ -507,6 +532,27 @@ async function release() {
         <v-card-actions>
           <v-btn variant="tonal" :disabled="releaseBusy" @click="releasing = null">Cancel</v-btn>
           <v-btn color="error" variant="flat" :loading="releaseBusy" :disabled="!releaseReason.trim()" @click="release">Release and allow independent work</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    <v-dialog :model-value="!!threadRelease" :persistent="threadReleaseBusy" max-width="560" @update:model-value="value => { if (!value) threadRelease = null }">
+      <v-card v-if="threadRelease" title="Release thread claim" class="thread-release">
+        <v-card-text>
+          <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+          <p class="mb-3">The owning project gives up its claim on this thread. With a hand-off target, that project gets the original request as a new one; nothing is replayed and nothing is posted to the thread. A session still connected to the thread refuses the release.</p>
+          <v-text-field v-if="!threadRelease.fromRequest" v-model="threadRelease.permalink" label="Thread permalink" :disabled="threadReleaseBusy" />
+          <p v-else>{{ threadRelease.permalink }}</p>
+          <v-select v-model="threadRelease.project_id" :items="activeProjects" item-title="name" item-value="id"
+            label="Project giving up the claim" :disabled="threadReleaseBusy || threadRelease.fromRequest" />
+          <v-select v-model="threadRelease.to" :items="handoffTargets" item-title="name" item-value="id" clearable
+            label="Hand off to (optional)" :disabled="threadReleaseBusy" />
+          <v-textarea v-model="threadRelease.reason" label="Reason" maxlength="2000" :disabled="threadReleaseBusy" />
+        </v-card-text>
+        <v-card-actions>
+          <v-btn variant="tonal" :disabled="threadReleaseBusy" @click="threadRelease = null">Cancel</v-btn>
+          <v-btn color="primary" variant="flat" :loading="threadReleaseBusy"
+            :disabled="!threadRelease.permalink.trim() || !threadRelease.project_id || !threadRelease.reason.trim()"
+            @click="submitThreadRelease">{{ threadRelease.to ? 'Hand off thread' : 'Release thread' }}</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

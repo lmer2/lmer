@@ -107,6 +107,11 @@ To hand work off, the assistant can use `lmer-ctl spawn` with an additional
 rule applies. The assistant decides whether to answer or spawn; ingress
 does not infer that decision from the message text.
 
+A mention that clearly belongs to another project can be passed on with
+`lmer-ctl threads release <permalink> --to <project>`. The target project's
+assistant receives it as a new request and can spawn on the thread. See
+[Releasing or handing off a thread claim](PROJECTS.md#releasing-or-handing-off-a-thread-claim).
+
 ## Replay and failures
 
 An accepted request and the hash of its transport/conversation/message identity

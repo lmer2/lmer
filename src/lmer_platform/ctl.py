@@ -573,6 +573,12 @@ def _call_threads_disconnect(args) -> Call:
     return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
 
 
+def _call_threads_release(args) -> Call:
+    return Call("POST", "/api/threads/release", body={
+        "permalink": _text(args.permalink), **_given(args, ("to", "reason")),
+    })
+
+
 def _call_threads_recover(args) -> Call:
     return Call("POST", f"/api/sessions/{args.session}/threads/{args.thread}/recover", body={
         "action": args.action, "operation": args.operation, "remote_ref": args.remote_ref,
@@ -961,7 +967,7 @@ def create_parser() -> argparse.ArgumentParser:
     requests_reply.add_argument("text")
     requests_reply.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/reply",
                                                       body={"text": _text(args.text)}))
-    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining uncertain delivery.")
+    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining an uncertain reply or action.")
     requests_park.add_argument("identity")
     requests_park.add_argument("reason")
     requests_park.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/park",
@@ -1312,6 +1318,18 @@ def create_parser() -> argparse.ArgumentParser:
         "reference", help="Reference id, as `threads references` reports it.",
     )
     threads_unreference.set_defaults(call=_call_threads_unreference)
+    threads_release = threads_sub.add_parser(
+        "release",
+        help=(
+            "Give up this project's claim on a thread a mention gave it; with --to, "
+            "hand it to another project as a new request. Refused while a session "
+            "holds the thread (POST /api/threads/release)."
+        ),
+    )
+    threads_release.add_argument("permalink", help="Thread permalink.")
+    threads_release.add_argument("--to", metavar="PROJECT", help="Project id or name to hand the thread to.")
+    threads_release.add_argument("--reason", help="Why; required for the operator.")
+    threads_release.set_defaults(call=_call_threads_release)
 
     exit_p = sub.add_parser(
         "exit",
