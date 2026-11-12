@@ -152,7 +152,7 @@ class Remote:
         return conversation
     def room_is_encrypted(self, room): return False
     def encrypts(self, room): return False
-    def get_replies(self, room, thread, oldest=None):
+    def get_replies(self, room, thread, oldest=None, **kw):
         if mode() == "inbound-fail": raise RuntimeError("injected persistent inbound failure")
         result = [{"ts": thread_root, "text": "root", "user": "U1"}]
         result += [{"ts": item["ref"], "thread_ts": thread_root, "text": item["text"],

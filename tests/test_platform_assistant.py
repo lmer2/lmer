@@ -3007,7 +3007,7 @@ def thread_component(platform_root, tmp_path, monkeypatch):
 
 
 class _ThreadSlack:
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         return [{"ts": ts}]
 
 
@@ -3087,7 +3087,7 @@ class _RateLimitedSlack:
     def __init__(self, code="ratelimited", retry_after=None):
         self.code, self.retry_after, self.calls = code, retry_after, 0
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         self.calls += 1
         # The client only ever sees `ratelimited` as an HTTP 429.
         raise SlackError(f"Slack API error: {self.code}", code=self.code,
@@ -3114,7 +3114,12 @@ def test_a_thread_slack_cannot_verify_is_refused_naming_the_method(thread_compon
     with pytest.raises(connectors.ThreadError) as caught:
         thread_component.refuse_held_targets([OTHER_LINK])
     assert "conversations.replies" in str(caught.value) and code in str(caught.value)
-    assert str(caught.value).endswith(")" + later)
+    volume = (
+        r"; recent conversations\.replies calls: \d+ from this daemon in the last 60s, plus 0 "
+        r"live Slack connector\(s\) polling every 3s, slowing to 30s when quiet "
+        r"\(configured, at most 0/min\)"
+    ) if code == "ratelimited" else ""
+    assert re.search(r"\)" + re.escape(later) + volume + r"\Z", str(caught.value))
     assert caught.value.transient is (code == "ratelimited")
     assert caught.value.retry_after == retry_after
 

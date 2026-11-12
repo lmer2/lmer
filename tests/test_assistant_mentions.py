@@ -77,7 +77,7 @@ class Slack:
         sender = kwargs["params"]["user"]
         return {"ok": True, "user": {"id": sender, "name": self.handles.get(sender, "somebody")}}
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         return [{"ts": ts, "user": SLACK_USER, "text": "root"}]
 
     def post_message(self, channel, thread_ts, text):

@@ -80,7 +80,7 @@ def platform(tmp_path, monkeypatch):
 class _FakeSlack:
     """Slack reporting a root: for a root link, its own ts."""
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         return [{"ts": ts}]
 
 

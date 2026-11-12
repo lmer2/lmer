@@ -41,8 +41,8 @@ from lmer_cli.connector_recovery import Recovery
 from lmer_cli.threads import ThreadError, ThreadRef, parse_thread
 
 from slack_chat import registry as thread_registry
-from slack_chat.client import SlackClient, SlackError
-from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV
+from slack_chat.client import CALL_WINDOW_SECONDS, SlackClient, SlackError, recent_calls
+from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV, poll_intervals
 from matrix_chat.client import MatrixClient, MatrixError
 
 from . import comms as platform_comms
@@ -404,10 +404,32 @@ class ThreadConnectors:
                 later = "; it is transient, but no retry time was given"
             else:
                 later = ""
+            if ref.channel == CHANNEL_SLACK and exc.transient:
+                later += f"; {self._replies_volume()}"
             raise ThreadError(
                 f"cannot check who holds {ref.permalink}: {method} failed ({exc}){later}",
                 status=exc.status, transient=exc.transient, retry_after=exc.retry_after,
             ) from None
+
+    def _replies_volume(self) -> str:
+        """What this daemon spends of the token's ``conversations.replies`` budget.
+
+        The first figure is measured, in this process. Connectors poll from
+        processes of their own, so theirs is the configured rate, and a host
+        ``lmer`` on the same token is in neither.
+        """
+        poll, idle = poll_intervals(self._environ)
+        with self._lock:
+            live = sum(
+                1 for proc in self._procs.values()
+                if proc.ref.channel == CHANNEL_SLACK and proc.popen.poll() is None
+            )
+        every = f"every {poll:g}s" if idle <= poll else f"every {poll:g}s, slowing to {idle:g}s when quiet"
+        return (
+            f"recent conversations.replies calls: {recent_calls('conversations.replies')} from "
+            f"this daemon in the last {CALL_WINDOW_SECONDS:g}s, plus {live} live Slack "
+            f"connector(s) polling {every} (configured, at most {live * 60 / poll:g}/min)"
+        )
 
     def prepare(self, permalink: object, *, checks: bool = True) -> ThreadRef:
         """Parse *permalink* and check this host can actually serve it.
@@ -1197,7 +1219,7 @@ def _slack_client(token: str):
 
 
 def _matrix_client(account):
-    return MatrixClient(account, timeout=REMOTE_TIMEOUT_SECONDS)
+    return MatrixClient(account, timeout=REMOTE_TIMEOUT_SECONDS, pause_on_rate_limit=False)
 
 
 _LOCK = threading.Lock()
