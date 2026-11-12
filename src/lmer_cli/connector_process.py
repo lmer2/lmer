@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ask_channel import bus
 
+from . import comms
 from .connector_delivery import RecoveryRequired, marker_path
 from .connector_lifecycle import DRAIN_SECONDS, PLATFORM_SESSION_ENV
 from .connector_ownership import (
@@ -211,6 +212,7 @@ class ConnectorProcess:
         with contextlib.suppress(Exception):
             bus.BusClient(bus.Endpoint(*self.endpoint)).post(
                 "note", text, source={"channel": self.key.transport},
+                meta={"notification_class": comms.NOTIFICATION_CONNECTOR_STATUS},
             )
 
     def _supervise(self):

@@ -115,7 +115,7 @@ import { ago } from '../format.js'
 import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
 import { operatorGround, readDraft, storeDraft } from '../projects.js'
-import { chatTintOperator } from '../operatorChat.js'
+import { chatScrollLongMessages, chatTintOperator } from '../operatorChat.js'
 import { composerKeydown, enterHint } from '../composerKeys.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 import { dispatchRunRef, parseRunRef, runKey } from '../runref.js'
@@ -472,6 +472,13 @@ let generation = 0
 // Nothing automated hangs off it: it decides one <img>.
 const UPLOAD_REFERENCE = /^\[lmer upload\] (\S+) \(([^,)]+)[,)]/gm
 
+// A turn this pane's operator sent. A peer, Ratchet or a relayed post also reach
+// the session as user input; they lean left, and an upload line they quote was
+// not attached by this pane. A transcript turn carries no party.
+function operatorsOwn(message) {
+  return message.role === 'user' && (!message.party || message.party === 'operator')
+}
+
 // Only images, and only the ones the daemon said were images when it stored
 // them: everything else in a store is a file to open, not a picture to draw.
 function uploadsIn(text) {
@@ -525,14 +532,18 @@ function uploadUrl(name, message) {
   return sessionUploadUrl(owner, name)
 }
 
+// An older connector's retry blip is served in its place so that positions do
+// not move under a polling pane; it is never drawn, internal or not.
+const served = computed(() => messages.value.filter((message) => !message.blip))
+
 const presented = computed(() => {
   let shown
   if (props.view === 'session') {
     shown = showInjected.value
-      ? messages.value
-      : messages.value.filter((message) => message.kind === 'said')
+      ? served.value
+      : served.value.filter((message) => message.kind === 'said')
   } else {
-    shown = messages.value.filter((message) => inView(props.view, message))
+    shown = served.value.filter((message) => inView(props.view, message))
   }
   const rows = props.assistantHistory ? historyWithoutOutboundCopies(shown) : withoutOutboundCopies(shown)
   return rows.map((message) => ({
@@ -541,7 +552,7 @@ const presented = computed(() => {
     ...(message.private ? { text: '' } : {}),
     // Only what you sent: these lines are put in a message by this pane, and an
     // agent quoting one back is quoting, not attaching.
-    uploads: message.role === 'user' && !message.private ? uploadsIn(message.text) : [],
+    uploads: operatorsOwn(message) && !message.private ? uploadsIn(message.text) : [],
   }))
 })
 
@@ -555,7 +566,7 @@ const visible = computed(() => presented.value.filter((message) => !emptyWrapper
 const wrappers = computed(() => presented.value.filter(emptyWrapper))
 
 const hiddenCount = computed(
-  () => messages.value.length - messages.value.filter((m) => m.kind === 'said').length,
+  () => served.value.length - served.value.filter((m) => m.kind === 'said').length,
 )
 
 
@@ -600,11 +611,27 @@ const spansSessions = computed(() => sessions.value.length > 1)
 // The agent ground is the *assistant's* rather than "not the operator's", which
 // is the part worth stating: a watch firing is neither party, and drawing it as
 // the agent talking would attribute an event to the session that only received
-// it. Still keyed on the role alone, so where a turn came from stays a caption.
+// it.
+//
+// A bus turn says who sent it (`party`), stamped by the server from the
+// record's provenance: everything that is not the session reaches it as user
+// input, and only the operator's is drawn as the operator's. A transcript turn
+// carries no party and is keyed on its role as before.
+const PARTY_GROUNDS = {
+  operator: 'operator', agent: 'agent', ratchet: 'agent', peer: 'peer', relay: 'relay', platform: 'action',
+}
+
 function ground(message) {
   if (message.kind !== 'said') return 'action'
+  if (PARTY_GROUNDS[message.party]) return PARTY_GROUNDS[message.party]
   if (message.role === 'user') return 'operator'
   return message.role === 'assistant' ? 'agent' : 'action'
+}
+
+// The side a turn sits on: `turn-user` leans right, and only the operator's turns
+// may carry it.
+function side(message) {
+  return message.role === 'user' && !operatorsOwn(message) ? 'inbound' : message.role
 }
 
 // The operator's ground in this project's hue (issue 646), checked against the ink
@@ -614,15 +641,33 @@ const operatorStyle = computed(() => {
   if (!chatTintOperator.value || !props.projectColor || !props.workspaceId || props.workspaceId === 'general') {
     return undefined
   }
+  const tinted = operatorGround(props.projectColor, themeInk())
+  return { '--chat-operator-ground': tinted }
+})
+
+function themeInk() {
   const current = theme.current.value
-  const tinted = operatorGround(props.projectColor, {
+  return {
     dark: current.dark,
     ink: current.colors['on-surface'],
     emphasis: [current.variables['high-emphasis-opacity'], current.variables['medium-emphasis-opacity']]
       .map(Number).filter((alpha) => alpha > 0 && alpha <= 1),
-  })
-  return { '--chat-operator-ground': tinted }
-})
+  }
+}
+
+// Another project's assistant on the sending project's hue, under the same
+// switch and contrast walk as the operator's own; the fixed peer ground otherwise.
+// Memoised: the contrast walk is up to a hundred steps, and this runs per turn
+// per render.
+const peerGrounds = new Map()
+function peerStyle(message) {
+  const color = message.peer?.project_color
+  if (message.party !== 'peer' || !chatTintOperator.value || !color) return undefined
+  const ink = themeInk()
+  const key = JSON.stringify([color, ink])
+  if (!peerGrounds.has(key)) peerGrounds.set(key, operatorGround(color, ink))
+  return { '--chat-peer-ground': peerGrounds.get(key) }
+}
 
 // A private file goes when its session does, so an entry from a session that has
 // ended names that; nothing records the deletion itself.
@@ -677,10 +722,17 @@ function threadLink(message) {
 // the operator's own channel, which is still "you". An agent record keeps the
 // agent's label; its kind is a chip in the header, not a speaker.
 function speaker(message) {
-  if (message.digest) return SPEAKERS.platform
+  // A slash command is drawn as machinery but still says who sent it.
+  if (message.digest || (message.party === 'platform' && message.comms_kind !== 'command')) {
+    return SPEAKERS.platform
+  }
+  if (message.party === 'peer') {
+    const project = message.peer?.project_name || message.source?.author
+    return project ? `from ${assistantName.value} · ${project}` : `from ${assistantName.value}`
+  }
   const source = message.source
   if (source && source.channel && source.channel !== 'agent') {
-    if (source.channel === 'platform' && (!source.author || source.author === 'operator')) {
+    if (source.channel === 'platform' && source.author === 'operator') {
       return SPEAKERS.user
     }
     return sourceLabel(source)
@@ -1481,7 +1533,8 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
           v-for="message in visible"
           :key="message.id ?? message.seq"
           class="turn"
-          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation', 'turn-digest': !!message.digest }]"
+          :class="[`turn-${side(message)}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation', 'turn-digest': !!message.digest, 'said-capped': chatScrollLongMessages }]"
+          :style="peerStyle(message)"
         >
           <!-- A Send Privately reference (issue 646): the line the agent was given
                is instructions for it, so the operator sees that one was sent. -->
@@ -1663,6 +1716,7 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
           v-for="item in pending"
           :key="item.id"
           class="turn turn-user ground-operator"
+          :class="{ 'said-capped': chatScrollLongMessages }"
         >
           <div class="d-flex align-center ga-1 text-body-small text-medium-emphasis">
             <span>
@@ -2042,6 +2096,14 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
   background: rgb(var(--v-theme-chat-action));
 }
 
+.ground-peer {
+  background: var(--chat-peer-ground, rgb(var(--v-theme-chat-peer)));
+}
+
+.ground-relay {
+  background: rgb(var(--v-theme-chat-relay));
+}
+
 /* The tool rows as a block, so one turn's actions are one shape rather than a
    stack of striped lines. `start` is stated rather than inherited: an injected turn
    carries the operator's role without being the operator's words, so machine text
@@ -2083,6 +2145,11 @@ defineExpose({ total, canLoadEarlier, loadEarlier, composerOpen: computed(() => 
 
 .said {
   margin: 2px 0 4px;
+}
+
+/* The cap is the operator's choice (off by default): without it a
+   long message is shown whole and the feed is the one scroll area. */
+.said-capped .said {
   max-height: 30vh;
   max-height: 30dvh;
   overflow-y: auto;

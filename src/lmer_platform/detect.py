@@ -341,6 +341,7 @@ from .store import (
     utc_now_iso,
     write_json,
 )
+from .provenance import PLATFORM_PREFIX
 from .transcripts import _scrub
 from .workrepo import resolve_run_dir
 from . import project_context, projects
@@ -354,7 +355,21 @@ __all__ = [
     "SESSION_SIGNALLED", "SIGNAL_DIGEST_KIND", "SIGNAL_MARKS_FILE",
     "Signal", "SessionSignal", "Detector", "sweep_finished_sessions",
     "new_signals", "record_ingested_signals",
+    "CODEX_WAKE_TEXT", "CODEX_IDLE_TEXT",
 ]
+
+#: The codex assistant's digest reminders. They carry the platform's marker so
+#: the chat draws them as the platform's, not as something the operator typed.
+CODEX_WAKE_TEXT = (
+    f"{PLATFORM_PREFIX} Your digest spool has pending items. This is an automatic wake-up, "
+    "not a new task. Take the spool with POST /api/assistant/pending, "
+    "act on what you took, and continue the current conversation."
+)
+CODEX_IDLE_TEXT = (
+    f"{PLATFORM_PREFIX} Your digest spool is still pending. This is an automatic idle reminder, "
+    "not a new task. Take the spool with POST /api/assistant/pending, "
+    "act on what you took, and continue the current conversation."
+)
 
 #: How often a tick runs. See the module docstring for why this is a constant
 #: rather than ``config.work_repo_pull_interval``, and why it is the same number.
@@ -1903,9 +1918,7 @@ class Detector:
         if not isinstance(adapter, dict) or not adapter.get('runtime'):
             return
         if self._codex_notice(status.session_id, adapter, ident,
-                              '[platform] Your digest spool has pending items. This is an automatic wake-up, '
-                              'not a new task. Take the spool with POST /api/assistant/pending, '
-                              'act on what you took, and continue the current conversation.'):
+                              CODEX_WAKE_TEXT):
             marked = assistant.mark_codex_wake(status.session_id, state.pending_seq, ident)
             if not marked:
                 raise SessionIOError('Codex wake confirmed but acknowledgement was not persisted; idle held')
@@ -1917,7 +1930,11 @@ class Detector:
 
     @staticmethod
     def _codex_accumulation_id(session_id, pending_seq):
-        return 'digest-' + hashlib.sha256(f'{session_id}:{pending_seq}'.encode()).hexdigest()[:32]
+        # The text is part of the identity: the adapter refuses a reused id
+        # whose text differs, so a reworded reminder must never inherit a
+        # receipt an older wording left behind.
+        key = f'{session_id}:{pending_seq}:{CODEX_WAKE_TEXT}'
+        return 'digest-' + hashlib.sha256(key.encode()).hexdigest()[:32]
 
     def _codex_notice(self, session_id, adapter, ident, text) -> bool:
         """A stable notice is complete only when its native receipt confirms it."""
@@ -1993,11 +2010,9 @@ class Detector:
                 )
                 if due is None:
                     return None
-                key = f'{status.session_id}:{durable.pending_seq}:{durable.nudged_at or ""}'
+                key = f'{status.session_id}:{durable.pending_seq}:{durable.nudged_at or ""}:{CODEX_IDLE_TEXT}'
                 ident = 'digest-idle-' + hashlib.sha256(key.encode()).hexdigest()[:32]
-                text = ('[platform] Your digest spool is still pending. This is an automatic idle reminder, '
-                        'not a new task. Take the spool with POST /api/assistant/pending, '
-                        'act on what you took, and continue the current conversation.')
+                text = CODEX_IDLE_TEXT
                 if not self._codex_notice(status.session_id, adapter, ident, text):
                     return None
             else:

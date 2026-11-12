@@ -445,6 +445,29 @@ MONITOR_ROLE = "monitor"
 #: attribution; ordinary occurrences later in a message remain operator text.
 PLATFORM_ROLE = "platform"
 
+#: Who a bus turn is from. Only ``operator`` is drawn as the operator.
+PARTY_OPERATOR = "operator"
+PARTY_AGENT = "agent"
+PARTY_RATCHET = "ratchet"
+PARTY_PEER = "peer"
+PARTY_PLATFORM = "platform"
+PARTY_RELAY = "relay"
+PARTIES = (PARTY_OPERATOR, PARTY_AGENT, PARTY_RATCHET, PARTY_PEER, PARTY_PLATFORM, PARTY_RELAY)
+
+#: ``source.ref`` prefixes of the records the daemon posts on the operator's
+#: channel for itself: a rotation request, a thread reference announcement.
+_PLATFORM_REFS = ("rotate-request:", "reference:")
+
+#: A connector's retry note answered by a recovery inside this many seconds was
+#: a blip, flagged when history is read the way the connector no longer posts it.
+CONNECTOR_BLIP_SECONDS = 60.0
+
+#: Channels that are not a thread connector's.
+_NON_CONNECTOR_CHANNELS = frozenset({
+    None, bus.CHANNEL_AGENT, bus.CHANNEL_PLATFORM, bus.CHANNEL_UBER, bus.CHANNEL_PEER_UL,
+    bus.CHANNEL_SUPERVISOR, bus.CHANNEL_TERMINAL,
+})
+
 #: Record ``type`` values each harness writes, shared with the usage adapters so
 #: both read one dispatch rule (:mod:`lmer_usage.shape`).
 _CLAUDE_RECORD_TYPES = shape.CLAUDE_RECORD_TYPES
@@ -860,6 +883,15 @@ class Message:
     #: A Send Privately reference the operator sent (issue #646): ``{"purpose"}``.
     #: The view draws a compact entry in place of the agent-facing text.
     private: Optional[dict] = None
+    #: Who said a :data:`COMMS_VIA` turn, from the record's stamped provenance
+    #: (:func:`_party`): one of :data:`PARTIES`. ``None`` on a transcript turn,
+    #: which the view draws by :attr:`role` as before.
+    party: Optional[str] = None
+    #: An older connector's retry note, or its recovery, that closed within
+    #: :data:`CONNECTOR_BLIP_SECONDS`. Served in place and left undrawn by the
+    #: view: dropping it would renumber every later turn, and a live pane polls
+    #: by position.
+    blip: bool = False
 
     @property
     def empty(self) -> bool:
@@ -890,6 +922,8 @@ class Message:
             **({"peer": self.peer} if self.peer else {}),
             **({"digest": self.digest} if self.digest else {}),
             **({"private": self.private} if self.private else {}),
+            **({"party": self.party} if self.party else {}),
+            **({"blip": True} if self.blip else {}),
         }
 
 
@@ -2812,6 +2846,106 @@ def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tu
     return _comms_turns(events, session_id, assistant_name)
 
 
+def _connector_note(source: dict, meta: dict, *classes: str) -> bool:
+    """Whether a record is a connector's own note of one of *classes*.
+
+    ``meta`` is the caller's, so the class counts only on a connector's own
+    channel, where only the connector posts notes.
+    """
+    return (meta.get("notification_class") in classes
+            and source.get("channel") not in _NON_CONNECTOR_CHANNELS
+            and not meta.get("session_origin"))
+
+
+def _connector_health(source: dict, meta: dict) -> bool:
+    return _connector_note(source, meta, bus.NOTIFICATION_CONNECTOR_HEALTH)
+
+
+def _party(kind: object, source: dict, meta: dict) -> str:
+    """Who said a bus record, from what the bus and the daemon stamped on it.
+
+    Never from the text: any sender can write an operator-looking line. The
+    channel is stamped from the posting credential and an agent cannot name one
+    other than its own, so a record only reads as the operator's when it came
+    in on a channel a human types into.
+    """
+    channel = source.get("channel")
+    if channel in (None, bus.CHANNEL_AGENT) or meta.get("session_origin"):
+        return PARTY_AGENT
+    if kind in ("command", "digest") or _connector_note(
+            source, meta, bus.NOTIFICATION_CONNECTOR_HEALTH, bus.NOTIFICATION_CONNECTOR_STATUS):
+        return PARTY_PLATFORM
+    if channel == bus.CHANNEL_PEER_UL:
+        return PARTY_PEER
+    if channel == bus.CHANNEL_UBER:
+        return PARTY_RATCHET
+    if channel == bus.CHANNEL_SUPERVISOR:
+        return PARTY_PLATFORM
+    if channel == bus.CHANNEL_PLATFORM:
+        ref = source.get("ref")
+        if not source.get("author") or (isinstance(ref, str) and ref.startswith(_PLATFORM_REFS)):
+            return PARTY_PLATFORM
+        return PARTY_OPERATOR
+    if channel == bus.CHANNEL_TERMINAL:
+        return PARTY_OPERATOR
+    # A thread connector's channel. Slack and matrix records from before the
+    # connectors stamped the poster carry none and stay the operator's, as
+    # they always read; any other bridge has to say a human posted.
+    poster = meta.get(bus.META_POSTER)
+    if poster == bus.POSTER_HUMAN:
+        return PARTY_OPERATOR
+    if poster is None and channel in (bus.CHANNEL_SLACK, bus.CHANNEL_MATRIX):
+        return PARTY_OPERATOR
+    return PARTY_RELAY
+
+
+def _connector_blips(events: list) -> set:
+    """Cursors of older connectors' retry notes, and their recovery, that closed
+    within :data:`CONNECTOR_BLIP_SECONDS`.
+
+    Those connectors posted both on every transient error. A note that stamps
+    its state comes from a connector that already waited out the grace window,
+    so it was a real outage and is never a blip.
+    """
+    hidden: set = set()
+    open_failures: dict = {}
+    for event in events:
+        record = event.message
+        meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        if record.get("kind") != "note" or not _connector_health(source, meta):
+            continue
+        state, direction = _connector_health_state(meta, record.get("text"))
+        if state is None:
+            continue
+        key = (source.get("channel"), direction)
+        if state == bus.CONNECTOR_FAILING:
+            open_failures[key] = event
+            continue
+        failed = open_failures.pop(key, None)
+        if failed is None:
+            continue
+        began = _timestamp_key(failed.message.get("at"))
+        ended = _timestamp_key(record.get("at"))
+        if began is not None and ended is not None and 0 <= ended - began <= CONNECTOR_BLIP_SECONDS:
+            hidden.update((failed.cursor, event.cursor))
+    return hidden
+
+
+def _connector_health_state(meta: dict, text: object) -> tuple:
+    """An unstamped health note's side of an incident, read from the text the
+    older connectors posted; ``(None, None)`` for a stamped note."""
+    if bus.META_CONNECTOR_STATE in meta:
+        return None, None
+    words = str(text or "").strip()
+    head = words.split(" ", 1)[0]
+    if words.endswith("connector delivery is retrying after an error"):
+        return bus.CONNECTOR_FAILING, head
+    if words.endswith("connector delivery recovered"):
+        return bus.CONNECTOR_RECOVERED, head
+    return None, None
+
+
 def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = None) -> tuple:
     # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via lmer_platform.comms)
     from .assistant_conversation import digest_run
@@ -2819,6 +2953,8 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
     questions: dict = {}
     turns: list = []
     copies: list = []
+    blips = _connector_blips(events)
+    colors: dict = {}
     for event in events:
         record = event.message
         kind = record.get("kind")
@@ -2859,12 +2995,14 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                 source=dict(source) if source else None, comms_kind=label,
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
-                peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
+                peer=_peer_of(meta, colors) if channel == bus.CHANNEL_PEER_UL else None,
                 digest={
                     "kind": str(meta.get("digest_kind") or "event"),
                     "run": digest_run(meta.get("run")),
                 } if kind == "digest" else None,
                 private=_private_send(kind, source, meta, record.get("text")),
+                party=_party(kind, source, meta),
+                blip=event.cursor in blips,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``
@@ -2892,6 +3030,35 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                             alias_line = line.replace(f"[{current}", f"[{alias}", 1)
                             copies.append(("user", _collapsed(_scrub(alias_line)), None))
     return turns, copies
+
+
+def _peer_of(meta: dict, colors: dict) -> Optional[dict]:
+    """A peer record's provenance, with the sending project's colour as it is now.
+
+    The colour is read here rather than stamped at send time so a recolored
+    project repaints its old messages too; *colors* memoises it per read.
+    """
+    if not isinstance(meta.get("peer"), dict):
+        return None
+    peer = _scrub_decoded(meta["peer"])
+    project = peer.get("project_id")
+    if isinstance(project, str) and project:
+        if project not in colors:
+            colors[project] = _project_color(project)
+        if colors[project]:
+            peer["project_color"] = colors[project]
+    return peer
+
+
+def _project_color(project_id: str) -> Optional[str]:
+    try:
+        if not projects.enabled():
+            return None
+        color = projects.get(project_id).get("color")
+    except Exception as exc:  # best-effort: an uncoloured peer draws in the fixed peer colour
+        logger.debug("platform_peer_color_unavailable project=%s error=%s", project_id, exc)
+        return None
+    return color if isinstance(color, str) and color else None
 
 
 def _private_send(kind: object, source: dict, meta: dict, text: object) -> Optional[dict]:

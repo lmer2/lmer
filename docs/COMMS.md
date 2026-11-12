@@ -539,6 +539,28 @@ Removing the position from the run-chat read path is issue 419; a client that ne
 a shift can withdraw, replace and insert as well as append. Until then the pane's
 window is also unbounded — it grows as the session runs — which is the same issue.
 
+### Who said a turn
+
+Each bus turn on the messages route carries `party`, derived from the record's
+stamped provenance and never from its text. The pane draws only `operator`
+on the right, on the operator's ground.
+
+| `party` | Records | Drawn |
+|---|---|---|
+| `operator` | channel `platform` with an author and no platform ref; a connector channel with `meta.poster` `human`, or `slack`/`matrix` with no poster (written before connectors stamped it); `terminal` | right, operator ground |
+| `agent` | the session's own records (`agent`, or `session_origin`) | left, agent ground |
+| `ratchet` | channel `uber-lmer` | left, agent ground, Ratchet's name |
+| `peer` | channel `peer-ul` | left, peer ground, "from Ratchet · project"; the sending project's hue while **Tint my messages** is on (`peer.project_color`) |
+| `platform` | channel `supervisor`; `platform` with no author; `connector_health` and `connector_status` notes on a connector channel; `command` and `digest` records; refs `rotate-request:*` and `reference:*` | left, action ground, "lmer platform" (a command keeps its sender's name) |
+| `relay` | a connector channel with a poster other than `human` (a bot, another run, the platform), or another bridge's channel with no poster | left, relay ground |
+
+A transcript turn has no `party` and is drawn by its role. Some inbound turns
+cannot be told apart from the operator's, and are still drawn as the
+operator's: a connector supervisor's status note written before it carried
+`connector_status`, a command copy typed without a tag, the terminal mirror, an answer
+taken from an ask directory before the bus, a launch or resume prompt, untagged
+`/input`, and a relay copy older than the bus read window.
+
 ### What a turn is, and what each view draws
 
 A **turn** is one harness response cycle. It starts when an input lands — an
@@ -1124,7 +1146,23 @@ class from its durable checkpoint. Recovery clears that status after a successfu
 iteration. The existing consecutive-failure limit can restart a persistently
 failing connector; its checkpoint retains cursors and pending delivery identity.
 Routine retry/recovery notes retain `connector_health` metadata and do not wake
-project assistants (#512).
+project assistants (#512). The chat hears of a failure only once delivery has
+failed for 60 seconds with no success in between, and a "recovered" note only
+follows a posted failing note. A recovery the bus refuses is posted again on
+the next success, and only an accepted one starts the cooldown: after a
+recovery, a new failure stays out of the chat for five minutes, so a flapping
+connector reads as one incident. Both notes carry `meta.direction` and
+`meta.connector_state` (`failing` or `recovered`). A connector that gives up
+posts no health note of its own: a direct connector's supervisor posts
+"connector exited (…)" (class `connector_status`, which does reach project
+assistants), and a platform-owned connector's give-up shows in the connectors
+panel. Notes from connectors older than this rule carry no `connector_state`;
+on read, such a failing note whose recovery on the same channel and direction
+came within 60 seconds is served with `blip: true` along with that recovery,
+and the pane does not draw either. They stay in place, so positions a live pane
+polls by never move, and a note a pane drew before its recovery arrived stays
+drawn until the pane reloads. The journal keeps both. Stamped notes are never
+blips.
 
 **Limits stated plainly.** The matrix connector speaks the client-server API
 as a bot account. It handles an end-to-end encrypted room only when it acts as

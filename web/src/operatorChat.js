@@ -20,6 +20,9 @@ export const chatEnterSends = ref(true)
 // newline until it has: an operator who turned Enter-sends off must not have a
 // half-written answer sent because the first fetch was slow or failed.
 export const chatSettingsLoaded = ref(false)
+// Whether a long message scrolls inside a capped bubble. Off unless
+// the platform says an explicit `true`: the feed is then the only scroll area.
+export const chatScrollLongMessages = ref(false)
 export const chatConfigProblem = ref(null)
 const readEntries = new Map()
 let configGeneration = 0
@@ -32,6 +35,7 @@ export function applyChatSettings(config) {
   chatTintOperator.value = config.chat?.tint_operator?.value !== false
   chatEnterSends.value = config.chat?.enter_sends?.value !== false
   chatSettingsLoaded.value = true
+  chatScrollLongMessages.value = config.chat?.scroll_long_messages?.value === true
   chatConfigProblem.value = null
 }
 

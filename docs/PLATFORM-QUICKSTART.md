@@ -290,6 +290,12 @@ consult relevant prior exchanges when context is missing.
   hue, at a lightness where the message text and its header both clear WCAG AA
   in either color scheme; off, they use the theme's one operator color. The
   General project and a chat with no project always use that one color.
+  The same switch paints a message from another project's Ratchet in that
+  project's hue; off, or when the project is unknown, it uses one fixed peer
+  color. **Scroll long messages inside their bubble** (off by default,
+  `chat_scroll_long_messages`) caps a long message at a third of the screen
+  with its own scroll bar; off, every message is shown at full length and the
+  chat is the only thing that scrolls.
   **Enter sends messages** (on by default, `chat_enter_sends`) sets the
   keys in all three message boxes — the chat composer, a live session's ask
   reply and a stopped run's answer. On, Enter sends and Shift+Enter starts a

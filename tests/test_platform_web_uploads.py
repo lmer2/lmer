@@ -640,8 +640,9 @@ def test_only_images_are_drawn_and_only_from_your_own_turns():
     """Everything else in a store is a file to open. And a line in an agent's
     turn is a quotation — the attachments are what this pane put in a message."""
     assert "type.startsWith('image/')" in _chat_function("function uploadsIn(")
-    visible = _chat_function("const visible = computed(")
-    assert "message.role === 'user'" in visible
+    presented = _chat_function("const presented = computed(")
+    assert "uploads: operatorsOwn(message)" in presented
+    assert "message.party === 'operator'" in _chat_function("function operatorsOwn(")
 
 
 def test_a_thumbnail_is_asked_for_by_name_not_by_path():

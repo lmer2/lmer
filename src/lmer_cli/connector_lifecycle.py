@@ -11,6 +11,7 @@ import time
 from typing import Optional
 
 from ask_channel import bus
+from . import comms
 from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired, verified_rejection
 from .connector_ownership import Lease, same_process
 from .connector_receipts import ReceiptReactions
@@ -29,6 +30,15 @@ EXIT_DRAIN = 3
 EXIT_RECOVERY = 4
 #: A run is often titled after its connector starts, so its tag is re-read.
 SPEAKER_REFRESH_SECONDS = 60.0
+#: How long delivery must fail without a success before the chat hears of it.
+#: Most errors clear on the next backoff; the connectors panel shows them live.
+HEALTH_GRACE_SECONDS = 60.0
+#: After a noted incident recovers, how long a fresh one stays out of the chat,
+#: so a flapping connector reads as one incident rather than a stream of pairs.
+HEALTH_COOLDOWN_SECONDS = 300.0
+#: ``meta`` key naming which side of an incident a health note is; the
+#: platform reads the same constant to tell these notes from older ones.
+HEALTH_STATE_KEY = comms.META_CONNECTOR_STATE
 
 #: The platform's id for the session a connector serves. The supervisor reports
 #: the container's own session id, a different namespace, and the platform's
@@ -204,13 +214,19 @@ class ConnectorLifecycle:
             self._warn(str(exc))
         self._stop.set()
 
-    def _transition_note(self, text):
+    def _transition_note(self, text, *, direction=None, state=None):
+        """Post a health note; whether the bus took it."""
+        meta = {"notification_class": comms.NOTIFICATION_CONNECTOR_HEALTH}
+        if direction and state:
+            meta.update({"direction": direction, HEALTH_STATE_KEY: state})
+        posted = False
         with contextlib.suppress(Exception):
-            self.bus.post("note", text, source={"channel": self._lease.key.transport},
-                          meta={"notification_class": "connector_health"})
+            self.bus.post("note", text, source={"channel": self._lease.key.transport}, meta=meta)
+            posted = True
         if self._notify is not None:
             with contextlib.suppress(Exception):
                 self._notify(text)
+        return posted
 
     def _loop(self, direction, step, *, interval=0):
         while not self._stop.is_set():
@@ -229,34 +245,88 @@ class ConnectorLifecycle:
                 self._direction_failures[direction] = count
                 self.failures = max(self._direction_failures.values())
                 self._record_delivery_health(direction, exc)
-                if count == 1:
-                    self._transition_note(f"{direction} connector delivery is retrying after an error")
                 if count >= FAILURE_LIMIT:
                     self._terminal(exc)
                     return
+                # Marked only once the bus took it: the failing delivery may be
+                # the bus itself, and a lone "recovered" would answer nothing.
+                if self._failing_noteworthy(direction) and self._transition_note(
+                        f"{direction} connector delivery is retrying after an error",
+                        direction=direction, state=comms.CONNECTOR_FAILING):
+                    self._mark_delivery_health(direction, noted=True)
                 self._backoff()
                 continue
-            if self._direction_failures.get(direction) or self._delivery_health.get(direction, {}).get("failures"):
-                self._transition_note(f"{direction} connector delivery recovered")
-                self._record_delivery_health(direction)
+            health = self._delivery_health.get(direction, {})
+            if self._direction_failures.get(direction) or health.get("failures") or health.get("noted"):
+                if not health.get("noted"):
+                    self._record_delivery_health(direction)
+                elif self._transition_note(f"{direction} connector delivery recovered",
+                                           direction=direction, state=comms.CONNECTOR_RECOVERED):
+                    self._record_delivery_health(direction, quiet_until=time.time() + HEALTH_COOLDOWN_SECONDS)
+                else:
+                    # The chat holds a failing note and nothing yet answers it:
+                    # stay noted so the next success tries the recovery again.
+                    self._record_delivery_health(direction, noted=True)
             self._direction_failures[direction] = 0
             self.failures = max(self._direction_failures.values(), default=0)
             self._stop.wait(interval)
 
-    def _record_delivery_health(self, direction, error=None):
+    def _record_delivery_health(self, direction, error=None, *, quiet_until=None, noted=False):
+        def entry(previous):
+            now = time.time()
+            failing = bool(error)
+            value = {
+                "failures": previous.get("failures", 0) + 1 if failing else 0,
+                "error": type(error).__name__ if failing else None,
+                "at": now,
+            }
+            if failing:
+                # Kept through a restart so the grace window measures the
+                # incident, not the process that happens to be retrying it.
+                value["since"] = previous.get("since") or now
+                value["noted"] = bool(previous.get("noted"))
+            elif noted:
+                value["noted"] = True
+            quiet = quiet_until if quiet_until is not None else previous.get("quiet_until")
+            if quiet and quiet > now:
+                value["quiet_until"] = quiet
+            return value
+
+        self._save_delivery_health(direction, entry)
+
+    def _mark_delivery_health(self, direction, **fields):
+        self._save_delivery_health(direction, lambda previous: {**previous, **fields})
+
+    def _save_delivery_health(self, direction, update):
         if self._state is None or self._state.session is None:
+            # Unbound, nothing can be checkpointed, but the grace window still
+            # has to see the incident or a connector failing before it binds
+            # would never be noted short of giving up.
+            self._delivery_health[direction] = update(self._delivery_health.get(direction, {}))
             return
         try:
             with self._state.lock:
-                previous = self._delivery_health.get(direction, {})
-                self._delivery_health[direction] = {
-                    "failures": previous.get("failures", 0) + 1 if error else 0,
-                    "error": type(error).__name__ if error else None,
-                    "at": time.time(),
-                }
+                self._delivery_health[direction] = update(self._delivery_health.get(direction, {}))
                 self._state.save()
         except (OSError, RecoveryRequired, IdentityUnavailable):
             logger.exception("connector_health_checkpoint_failed direction=%s", direction)
+
+    def _failing_noteworthy(self, direction):
+        """Whether this failure is the one that tells the chat delivery is failing.
+
+        Once per incident, and only after :data:`HEALTH_GRACE_SECONDS` of failing
+        with no success between. A give-up posts nothing here (``_warn`` only
+        logs): a direct connector's supervisor notes the exit, and a
+        platform-owned one shows it in the connectors panel. With instant
+        failures and the real :meth:`_backoff`, the seventh failure is the last
+        one inside :data:`FAILURE_LIMIT` and lands just past the grace window.
+        """
+        health = self._delivery_health.get(direction) or {}
+        if health.get("noted") or not health.get("since"):
+            return False
+        now = time.time()
+        return (now - health["since"] >= HEALTH_GRACE_SECONDS
+                and now >= (health.get("quiet_until") or 0))
 
     def _backoff(self):
         self._stop.wait(min(30.0, 0.5 * 2 ** min(self.failures, 6)))
