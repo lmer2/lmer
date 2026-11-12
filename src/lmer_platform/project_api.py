@@ -47,7 +47,8 @@ def _run(data):
 
 
 def receipted(path):
-    return path not in ("/api/assistant/pending", "/api/assistant/requests", "/api/comms/thread") and not (
+    return path not in ("/api/assistant/pending", "/api/assistant/requests", "/api/comms/thread",
+                        project_requests.THREAD_RELEASE) and not (
         path.startswith("/api/assistant/requests/") and path.endswith(("/reply", "/park", "/release")))
 
 
@@ -182,7 +183,9 @@ def recheck():
             binding["request_id"] = binding["request_id"] or current
             if current and binding["path"].endswith("/tty-ticket"):
                 raise projects.ProjectError("Use request-bound HTTP input while handling a conversation request.", status=409)
-    if binding["request_id"] and not binding.get("parking"):
+    # A thread release checks the bound request itself: its ownership has changed
+    # once the release ran, and a repeat must still reach the route.
+    if binding["request_id"] and not binding.get("parking") and binding["path"] != project_requests.THREAD_RELEASE:
         if binding["path"] == "/api/assistant/pending":
             row = project_requests.get(binding["request_id"])
             current = project_requests.active(workspace_id)

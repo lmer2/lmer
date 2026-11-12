@@ -3134,6 +3134,7 @@ def create_app(
             "  POST /api/assistant/requests/{request_id}/reply  reply to recorded source once\n"
             "  POST /api/assistant/requests/{request_id}/park  operator parks uncertainty without resending\n"
             "  POST /api/assistant/requests/{request_id}/release  operator releases a blocked request with known effects\n"
+            "  POST /api/threads/release  give up this project's thread claim, optionally to another project\n"
             "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
@@ -6339,6 +6340,22 @@ def create_app(
         if caller.kind != CALLER_OPERATOR:
             raise HTTPException(status_code=403, detail="only an operator may release a blocked request")
         return project_requests.release(request_id, body.get("reason"), workspace_id=project_scope.current())
+
+    @app.post("/api/threads/release", dependencies=guard)
+    def thread_release(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Give up this project's claim on a thread, or hand it to another project."""
+        if not projects.enabled():
+            raise HTTPException(status_code=409, detail="Thread claims exist only once projects are enabled.")
+        operator = caller.kind == CALLER_OPERATOR
+        if not operator and not caller.is_assistant:
+            raise HTTPException(status_code=403, detail="only a project assistant or the operator may release a thread claim")
+        try:
+            return project_requests.release_thread(
+                body.get("permalink"), workspace_id=project_scope.current(), to=body.get("to"),
+                reason=body.get("reason"), by="operator" if operator else "assistant",
+                bound=None if operator else project_api.capture().get("request_id"))
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:

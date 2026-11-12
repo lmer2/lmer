@@ -1,0 +1,4 @@
+added:
+- "A project assistant or the operator can release a mention's thread claim or hand it to another project with `lmer-ctl threads release --to`."
+changed:
+- "Operator `requests park` also accepts a delivered conversation request whose actions are uncertain, not only an uncertain reply."

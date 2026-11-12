@@ -1300,7 +1300,14 @@ lmer-ctl threads connect SESSION THREAD_PERMALINK
 lmer-ctl threads open SESSION CHANNEL [--title "…"]
 lmer-ctl threads disconnect SESSION THREAD_ID
 lmer-ctl threads recover SESSION THREAD_ID inspect
+lmer-ctl threads release THREAD_PERMALINK [--to PROJECT] [--reason "…"]
 ```
+
+`threads release` is project-scoped rather than session-scoped. It gives up the
+calling project's ownership claim on a thread, usually one a mention gave it, and
+can hand the thread to another project. It refuses while any session holds the
+thread, so disconnect first. See
+[Releasing or handing off a thread claim](PROJECTS.md#releasing-or-handing-off-a-thread-claim).
 
 The daemon automatically settles saved receipts and permits one safe recovery
 retry. Unknown send outcomes remain parked, with one assistant digest per

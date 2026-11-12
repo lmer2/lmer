@@ -183,6 +183,13 @@ export function releaseConversationRequest(identity, workspaceId, reason) {
   })
 }
 
+export function releaseThread(permalink, workspaceId, to, reason) {
+  return request('api/threads/release', {
+    method: 'POST', headers: jsonHeaders,
+    body: JSON.stringify({ workspace_id: workspaceId, permalink, reason, ...(to ? { to } : {}) }),
+  })
+}
+
 export function fetchHealth() {
   return request('api/health')
 }

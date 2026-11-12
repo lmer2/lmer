@@ -6,7 +6,7 @@ import json
 import re
 
 from lmer_cli import thread_access, thread_posts
-from lmer_cli.threads import ThreadError
+from lmer_cli.threads import ThreadError, parse_thread
 from . import assistant, channel_routes, project_context as scope, project_threads, projects, session_threads, store
 from .transcripts import scrub_credentials
 from . import assistant_conversation
@@ -18,6 +18,10 @@ OWNERSHIP_CHANGED = (
     "or use the operator's Release blocked request control. Keep completed action receipts; "
     "ask for a new request in the source thread instead of repeating completed work."
 )
+#: The thread release route: it settles the bound request itself, so receipts and rechecks skip it.
+THREAD_RELEASE = "/api/threads/release"
+#: Fields tied to one destination — what :func:`_queue` adds, and a DM reply's parent session.
+_QUEUED_FIELDS = ("workspace_id", "request_id", "instruction", "actions", "handoff", "parent")
 
 
 def preflight():
@@ -98,9 +102,11 @@ def listing(workspace_id=None):
         if workspace_id is not None and row["project_id"] != workspace_id:
             continue
         row["recovery"] = recovery(row)
+        row["parkable"] = not row["parking"] and _parkable(row)
         if row["recovery"]:
             row["error"] = row["recovery"]["reason"]
-        result.append({key: value for key, value in row.items() if key not in ("payload", "ownership", "reply")})
+        result.append({**{key: value for key, value in row.items() if key not in ("payload", "ownership", "reply")},
+                       "permalink": row["payload"].get("permalink")})
     return result
 
 
@@ -117,14 +123,41 @@ def park(identity, reason, *, workspace_id):
         if row["project_id"] != workspace_id:
             raise projects.ProjectError("This request belongs to another project.", code="project_changed", status=409)
         projects.get(workspace_id, active=True)
-        if row["state"] not in ("reply_sending", "reply_uncertain"):
-            raise projects.ProjectError("Only an uncertain reply can be parked.", status=409)
+        if not _parkable(row):
+            raise projects.ProjectError("Only an uncertain reply, or a delivered request with an uncertain action, "
+                                        "can be parked.", status=409)
         with projects.database() as db:
             db.execute("INSERT OR IGNORE INTO request_parking VALUES (?,?,?,?)",
                        (identity, store.utc_now_iso(), "operator", scrub_credentials(reason.strip())))
             db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (workspace_id, identity))
             parked = dict(db.execute("SELECT at,by,reason FROM request_parking WHERE request_id=?", (identity,)).fetchone())
     return {"request_id": identity, "workspace_id": workspace_id, "state": row["state"], "parking": parked}
+
+
+def _parkable(row):
+    # Queued too: recover() re-queues a delivered request for the next assistant generation.
+    if row["state"] in ("reply_sending", "reply_uncertain"):
+        return True
+    if row["state"] not in ("queued", "delivered") or row["generation"] is None:
+        return False
+    return bool(_uncertain_actions(row["id"]))
+
+
+def _uncertain_actions(identity):
+    with projects.database() as db:
+        return [dict(action) for action in db.execute(
+            "SELECT method,path,state FROM request_actions WHERE request_id=? AND state IN ('sending','uncertain')",
+            (identity,))]
+
+
+def _uncertain_effect(row):
+    """An uncertain reply or action. Unlike :func:`_uncertain`, a source-thread notice does not count."""
+    return row["state"] in ("reply_sending", "reply_uncertain") or bool(_uncertain_actions(row["id"]))
+
+
+def _parked(identity):
+    with projects.database() as db:
+        return db.execute("SELECT 1 FROM request_parking WHERE request_id=?", (identity,)).fetchone() is not None
 
 
 def authorize(identity, workspace_id):
@@ -141,11 +174,7 @@ def authorize(identity, workspace_id):
 
 
 def _uncertain(row):
-    if row["state"] in ("reply_sending", "reply_uncertain") or row["prompt_state"] in ("sending", "uncertain"):
-        return True
-    with projects.database() as db:
-        return db.execute("SELECT 1 FROM request_actions WHERE request_id=? AND state IN ('sending','uncertain')",
-                          (row["id"],)).fetchone() is not None
+    return row["prompt_state"] in ("sending", "uncertain") or _uncertain_effect(row)
 
 
 def recovery(row):
@@ -167,14 +196,18 @@ def recovery(row):
 
 def _release(row, reason):
     with projects.database() as db:
-        db.execute("UPDATE requests SET state='invalid',error=? WHERE id=?", (reason, row["id"]))
-        db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (row["project_id"], row["id"]))
-        raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (row["project_id"],)).fetchone()
-        state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=row["project_id"])
-        retained = tuple(note for note in state.pending if not (
-            note.kind == "conversation_request" and (note.data or {}).get("request_id") == row["id"]))
-        state = replace(state, pending=retained, pending_since=retained[0].at if retained else None)
-        db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(state.to_dict()), row["project_id"]))
+        _close(db, row, reason)
+
+
+def _close(db, row, reason):
+    db.execute("UPDATE requests SET state='invalid',error=? WHERE id=?", (reason, row["id"]))
+    db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (row["project_id"], row["id"]))
+    raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (row["project_id"],)).fetchone()
+    state = assistant.AssistantState.from_dict(json.loads(raw[0]), memo_spool=row["project_id"])
+    retained = tuple(note for note in state.pending if not (
+        note.kind == "conversation_request" and (note.data or {}).get("request_id") == row["id"]))
+    state = replace(state, pending=retained, pending_since=retained[0].at if retained else None)
+    db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(state.to_dict()), row["project_id"]))
 
 
 def release(identity, reason, *, workspace_id):
@@ -236,6 +269,13 @@ def _queue(db, row, project_id, ownership):
         "On an ownership refusal, take pending to release safely before unrelated work or handoff/rotation. "
         "Do not redirect or repeat a completed action; request fresh instructions in the source thread."
     )
+    handoff = payload.get("handoff")
+    if handoff:
+        payload["instruction"] += (f" Project {handoff['from_project_name']} handed this thread to you"
+                                   + (f": {handoff['reason']}." if handoff.get("reason") else "."))
+        if handoff.get("uncertain_actions"):
+            payload["instruction"] += (" Its outcome is unknown for the actions in handoff.uncertain_actions; "
+                                       "check with the operator before repeating any of them.")
     payload["instruction"] += " Your credential is bound to this request until it is answered and you take pending again."
     payload["actions"] = [dict(action) for action in db.execute(
         "SELECT method,path,state,result,error FROM request_actions WHERE request_id=?", (row["id"],))]
@@ -410,7 +450,8 @@ def recover(project_id):
             return
         with projects.database() as db:
             rows = [_decode(row) for row in db.execute(
-                "SELECT * FROM requests WHERE project_id=? AND state='delivered' AND generation<>?",
+                "SELECT * FROM requests WHERE project_id=? AND state='delivered' AND generation<>? "
+                "AND id NOT IN (SELECT request_id FROM request_parking)",
                 (project_id, session))]
             for row in rows:
                 _queue(db, row, project_id, row["ownership"])
@@ -499,7 +540,7 @@ def drain(state):
             notes.append(note.to_dict())
             continue
         row = get(identity)
-        if identity == unavailable:
+        if identity == unavailable or _parked(identity):
             continue
         if unavailable:
             retained.append(note)
@@ -578,3 +619,155 @@ def reply(identity, text, *, workspace_id, session_id):
             recorded = f"🔒 direct reply sent — {len(text)} characters, body not recorded" if private else text
             assistant_conversation.record(recorded, kind="reply", thread=row["payload"]["permalink"], session_id=session_id)
         return {"request_id": identity, "posted": posted}
+
+
+def _for_thread(thread, workspace_id):
+    """*workspace_id*'s requests for a thread, newest first."""
+    with projects.database() as db:
+        rows = [_decode(row) for row in db.execute(
+            "SELECT * FROM requests WHERE project_id=? AND state NOT IN ('choice','choice_reply') ORDER BY rowid DESC",
+            (workspace_id,))]
+    return [row for row in rows if project_threads.key(row["payload"]["permalink"]) == thread]
+
+
+def _handoff_target(value, source_id):
+    if not isinstance(value, str) or not value.strip():
+        raise projects.ProjectError("Name the project to hand the thread to.")
+    wanted = value.strip()
+    listed = projects.listing()
+    match = (next((project for project in listed if project["id"] == wanted), None)
+             or next((project for project in listed if project["name"].casefold() == wanted.casefold()), None))
+    if not match:
+        raise projects.ProjectError(f"No project is named or identified as {wanted!r}.", status=404)
+    if match["id"] == source_id:
+        raise projects.ProjectError("A thread cannot be handed to the project releasing it.")
+    return projects.get(match["id"], active=True)
+
+
+def _handoff_payload(old, permalink, source, reason, by, uncertain):
+    if old:
+        payload = {key: value for key, value in old["payload"].items() if key not in _QUEUED_FIELDS}
+    else:
+        ref = parse_thread(permalink)
+        conversation, root = ref.registry_key()
+        payload = {"source": {"channel": ref.channel}, "conversation": conversation, "root": root,
+                   "sender": f"project {source['name']}", "permalink": permalink, "entry": "handoff",
+                   "message": {"text": f"Read the thread with lmer-ctl thread read {permalink}."}}
+    payload["handoff"] = {"from_project": source["id"], "from_project_name": source["name"],
+                          "from_request": old["id"] if old else None, "reason": reason, "by": by}
+    if uncertain:
+        payload["handoff"]["uncertain_actions"] = uncertain
+    return payload
+
+
+def _handoff_ids(base, workspace_id, target_id):
+    """The newest existing id of this source → target handoff, and the next unused one.
+
+    Chained rather than fixed, so a thread handed back and handed on again gets a
+    new request instead of matching the first one.
+    """
+    previous, index = None, 0
+    with projects.database() as db:
+        while True:
+            identity = hashlib.sha256(json.dumps([base, workspace_id, "handoff", target_id, index]).encode()).hexdigest()
+            if not db.execute("SELECT 1 FROM requests WHERE id=?", (identity,)).fetchone():
+                return previous, identity
+            previous, index = identity, index + 1
+
+
+def release_thread(permalink, *, workspace_id, to=None, reason=None, by="assistant", bound=None):
+    """Give up *workspace_id*'s claim on a thread, optionally handing it to another project.
+
+    *bound* is the assistant's active request, if any: only that request's own
+    thread can be released while it is open.
+    """
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 2000):
+        raise projects.ProjectError("A release reason is at most 2000 characters.")
+    reason = scrub_credentials(reason.strip()) if reason and reason.strip() else None
+    if by == "operator" and not reason:
+        raise projects.ProjectError("Releasing a thread needs a reason of 1–2000 characters.")
+    if not isinstance(permalink, str):
+        raise projects.ProjectError("Name the thread by its permalink.")
+    thread = project_threads.key(permalink)
+    with projects.operation(), assistant._LOCK:
+        source = projects.get(workspace_id, active=True)
+        if bound and project_threads.key(get(bound)["payload"]["permalink"]) != thread:
+            raise projects.ProjectError("Finish the active conversation request before releasing another thread.",
+                                        status=409)
+        target = _handoff_target(to, workspace_id) if to is not None else None
+        requests = _for_thread(thread, workspace_id)
+        old = requests[0] if requests else None
+        current = project_threads.ownership(permalink)
+        claimed = any(row["project_id"] == workspace_id for row in current)
+        unchanged = {"permalink": permalink, "workspace_id": workspace_id, "released": [],
+                     "to": target["id"] if target else None, "duplicate": True}
+        handoff_id = None
+        if target:
+            previous_id, handoff_id = _handoff_ids(old["id"] if old else thread, workspace_id, target["id"])
+            if previous_id and not claimed and {row["project_id"] for row in current} == {target["id"]}:
+                return {**unchanged, "request_id": previous_id}
+        if not claimed and not old:
+            raise projects.ProjectError(
+                f"Project {source['name']} holds no claim on this thread. "
+                "A Slack reply link must be the thread's root link.", status=403)
+        if not claimed and not target:
+            with projects.database() as db:
+                released_before = old and db.execute(
+                    "SELECT 1 FROM request_actions WHERE request_id=? AND path=? AND state='complete'",
+                    (old["id"], THREAD_RELEASE)).fetchone()
+            if not released_before:
+                raise projects.ProjectError(f"Project {source['name']} holds no claim on this thread.", status=403)
+            return {**unchanged, "request_id": None}
+        owners = project_threads.releasable(permalink, workspace_id)
+        note = f"Handed off to project {target['name']}." if target else "Thread released by its project."
+        # Every open request on the thread, not only the newest: the assistant may be bound to an older one.
+        # An uncertain source-thread notice does not keep a request open; closing it sends nothing.
+        settled = [row for row in requests if row["state"] in ("queued", "delivered") and not _uncertain_effect(row)]
+        closed_ids = {row["id"] for row in settled}
+        uncertain = [{"request_id": row["id"], **action} for row in requests for action in _uncertain_actions(row["id"])]
+        to_park = [row["id"] for row in requests if row["id"] not in closed_ids and _parkable(row)
+                   and not _parked(row["id"])]
+        previous = None
+        if old:
+            previous = {"request_id": old["id"], "state": "invalid" if old["id"] in closed_ids else old["state"],
+                        "closed": old["id"] in closed_ids}
+            if closed_ids - {old["id"]}:
+                previous["also_closed"] = [row["id"] for row in settled if row["id"] != old["id"]]
+            if to_park:
+                previous["instruction"] = (
+                    f"Uncertain effects keep {', '.join(to_park)} bound to this project's assistant. "
+                    "Ask the operator to park each one: Platform settings, or "
+                    + "; ".join(f"lmer-ctl --workspace-id {workspace_id} requests park {identity} REASON"
+                                for identity in to_park) + ".")
+        result = {"permalink": permalink, "workspace_id": workspace_id, "released": owners,
+                  "to": target["id"] if target else None, "request_id": handoff_id, "previous": previous}
+        with projects.database() as db:
+            project_threads.drop(db, permalink, owners, target["id"] if target else None)
+            for row in settled:
+                _close(db, row, note)
+            if old:
+                body = {"permalink": permalink, "to": result["to"], "reason": reason}
+                identity = hashlib.sha256(json.dumps([old["id"], "POST", THREAD_RELEASE, body],
+                                                     sort_keys=True).encode()).hexdigest()
+                db.execute("INSERT OR REPLACE INTO request_actions (id,request_id,method,path,state,result) "
+                           "VALUES (?,?,?,?,'complete',?)", (identity, old["id"], "POST", THREAD_RELEASE,
+                                                             json.dumps({"status": 200, "body": result})))
+            if target:
+                # Exactly what ownership() reads after drop(): releasable() refused any other owner.
+                ownership = [{"owner": "choice", "project_id": target["id"], "run_key": None, "revision": None}]
+                payload = _handoff_payload(old, permalink, source, reason, by, uncertain)
+                row = {"id": handoff_id, "transport": payload["source"]["channel"],
+                       "conversation": payload["conversation"], "root": payload["root"], "sender": payload["sender"],
+                       "payload": payload, "ownership": ownership}
+                _insert(db, row, "queued", target["id"])
+                _queue(db, row, target["id"], ownership)
+        store.append_event("thread_released", data={**result, "reason": reason, "by": by})
+    text = note + (f" Reason: {reason}" if reason else "")
+    with scope.bound(workspace_id):
+        assistant_conversation.record(f"{text} {permalink}", kind="thread_released")
+    if target:
+        with scope.bound(target["id"]):
+            assistant_conversation.record(f"Project {source['name']} handed this thread to you as request "
+                                          f"{handoff_id}. {permalink}" + (f" Reason: {reason}" if reason else ""),
+                                          kind="thread_received")
+    return result
