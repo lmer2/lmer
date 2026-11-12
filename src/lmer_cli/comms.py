@@ -51,6 +51,8 @@ __all__ = [
     "option_conflict", "RESERVED_META_KEYS", "relay_payload", "relay_label", "one_turn",
     "utc_now_iso", "SUPERVISOR_AUTHORITY_LEVELS", "AUTHORITY_NONE",
     "META_AUTHORITY", "META_OPERATOR_ONLY", "ASSISTANT_CHANNELS", "CHANNEL_PEER_UL",
+    "NOTIFICATION_CONNECTOR_HEALTH", "NOTIFICATION_CONNECTOR_STATUS", "META_CONNECTOR_STATE",
+    "CONNECTOR_FAILING", "CONNECTOR_RECOVERED",
 ]
 
 SCHEMA_VERSION = 1
@@ -169,6 +171,19 @@ META_OFF_THREAD = "off_thread"
 META_POSTER = "poster"
 POSTER_HUMAN = "human"
 POSTER_BOT = "bot"
+
+#: ``meta.notification_class`` of a thread connector's delivery-health note. Its
+#: readers keep it out of the assistant's feed and digests: routine noise.
+NOTIFICATION_CONNECTOR_HEALTH = "connector_health"
+#: ``meta.notification_class`` of a direct connector supervisor's own status
+#: note ("connector exited", "recovery required"). Unlike a health note it still
+#: reaches the assistant, which may have to act on it.
+NOTIFICATION_CONNECTOR_STATUS = "connector_status"
+#: ``meta`` key on a health note naming its side of an incident, one of
+#: :data:`CONNECTOR_FAILING` and :data:`CONNECTOR_RECOVERED`.
+META_CONNECTOR_STATE = "connector_state"
+CONNECTOR_FAILING = "failing"
+CONNECTOR_RECOVERED = "recovered"
 
 
 def off_thread(record: Optional[Mapping]) -> bool:

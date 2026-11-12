@@ -97,6 +97,11 @@ import './style.css'
 //   chat-action    one step further back, so tool rows and the internals behind
 //                  the "show N internal" toggle read as machinery under the
 //                  conversation rather than as a third voice in it.
+//   chat-peer      another project's assistant: a cool wash, so it
+//                  never reads as the operator's warm one. Replaced by the
+//                  sending project's hue while "Tint my messages" is on.
+//   chat-relay     a thread post nobody typed here (a bot, another run): neutral
+//                  and cool, apart from the agent's warm grey.
 //
 // Chosen against the ink that actually lands on them, which is the medium-emphasis
 // header rather than body text: every ground clears WCAG AA (4.5:1) for that
@@ -121,6 +126,8 @@ const light = {
     'chat-agent': '#eae7e2',
     'chat-operator': '#f3d9ce',
     'chat-action': '#dedbd5',
+    'chat-peer': '#dbe4ee',
+    'chat-relay': '#e4e6e9',
     // The uber lmer toolbar: darker than `surface` in both schemes; dark deliberately reuses `background`.
     'uber-toolbar': '#e4e0da',
     // style.css renders <code> against these; without them the declarations are
@@ -161,6 +168,8 @@ const dark = {
     'chat-agent': '#1b1a19',
     'chat-operator': '#402922',
     'chat-action': '#0f0e0e',
+    'chat-peer': '#1d2733',
+    'chat-relay': '#26282b',
     'uber-toolbar': '#1b1a19',
     code: '#2e2c2a',
     'on-code': '#e8e6e3',

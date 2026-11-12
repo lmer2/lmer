@@ -2,11 +2,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import AssistantSettings from '../src/components/AssistantSettings.vue'
 import { fetchAssistantConfig, setAssistantConfig } from '../src/api.js'
-import { chatEnterSends, chatShowTranscript, chatTintOperator, applyChatSettings } from '../src/operatorChat.js'
+import { chatEnterSends, chatShowTranscript, chatTintOperator, chatScrollLongMessages, applyChatSettings } from '../src/operatorChat.js'
 import { deferred, mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({ fetchAssistantConfig: vi.fn(), setAssistantConfig: vi.fn() }))
-const config = (changed = [], shown = false, tint = undefined, enter = undefined) => ({
+const config = (changed = [], shown = false, tint = undefined, enter = undefined, scroll = undefined) => ({
   settings: Object.fromEntries(['model', 'harness', 'preset', 'agents', 'effort', 'threads'].map((key) => [
     key, { value: null, stored: null, source: 'default' },
   ])),
@@ -16,6 +16,7 @@ const config = (changed = [], shown = false, tint = undefined, enter = undefined
     },
     ...(tint === undefined ? {} : { tint_operator: { value: tint, stored: tint, source: 'config.json' } }),
     ...(enter === undefined ? {} : { enter_sends: { value: enter, stored: enter, source: 'config.json' } }),
+    ...(scroll === undefined ? {} : { scroll_long_messages: { value: scroll, stored: scroll, source: 'config.json' } }),
   },
   changed,
 })
@@ -42,6 +43,7 @@ beforeEach(() => {
   setAssistantConfig.mockImplementation(async (named) => config(
     Object.keys(named), named.chat_show_transcript ?? false, named.chat_tint_operator,
     named.chat_enter_sends,
+    named.chat_scroll_long_messages,
   ))
 })
 
@@ -193,6 +195,22 @@ it('reads a stored false back into the switch', async () => {
   await open({ groups: ['conversation'] })
   expect(enterSwitch().checked).toBe(false)
   expect(chatEnterSends.value).toBe(false)
+})
+
+// Long messages are shown whole unless the platform stores true.
+const scrollSwitch = () => document.querySelector('.assistant-settings .scroll-long-messages input')
+
+it('shows long messages whole by default and turning scrolling on applies at once', async () => {
+  await open()
+  expect(chatScrollLongMessages.value).toBe(false)
+  const input = scrollSwitch()
+  expect(input.checked).toBe(false)
+  input.click()
+  await flushPromises()
+  await save()
+  expect(setAssistantConfig).toHaveBeenCalledWith({ chat_scroll_long_messages: true })
+  expect(chatScrollLongMessages.value).toBe(true)
+  expect(document.body.textContent).toContain('applies now')
 })
 
 it('offers the launch effort beside the other launch settings', async () => {

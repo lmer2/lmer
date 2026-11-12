@@ -200,9 +200,10 @@ def test_failure_health_survives_restart_and_does_not_wake_models(transport_host
         assert component._delivery_health["inbound"]["failures"] == 3
         component._loop("inbound", lambda: component._stop.set())
         assert component._delivery_health["inbound"]["failures"] == 0
+        # Three failures in no time are inside the grace window: the
+        # connectors panel above showed them, the chat hears nothing.
         notes = [row for row in rig.log.read_since(0)[0] if row.kind == "note"]
-        assert len(notes) == 2
-        assert all(row.meta["notification_class"] == "connector_health" for row in notes)
+        assert notes == []
     finally:
         component.stop(announce=False)
         rig.bus._session._http.close()

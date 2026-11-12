@@ -591,6 +591,7 @@ BOOL_SETTINGS = {
     "chat_show_transcript": False,
     "chat_tint_operator": True,
     "chat_enter_sends": True,
+    "chat_scroll_long_messages": False,
 }
 
 #: PlatformConfig field -> its rule, for the time group's integers.
@@ -762,6 +763,9 @@ class PlatformConfig:
     #: Off, Enter is a newline and Ctrl/Cmd+Enter sends. A touch-first device
     #: keeps Enter as a newline either way — the browser decides that, not this.
     chat_enter_sends: bool = True
+    #: Whether a long chat message scrolls inside a capped bubble. Off,
+    #: the bubble is as tall as its text and the feed is the only scroll area.
+    chat_scroll_long_messages: bool = False
     #: Visual graph groups; read fresh for UI requests, independent of run ownership.
     fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
@@ -1891,6 +1895,7 @@ def chat_settings() -> dict:
             "show_transcript": ("chat_show_transcript", None),
             "tint_operator": ("chat_tint_operator", None),
             "enter_sends": ("chat_enter_sends", None),
+            "scroll_long_messages": ("chat_scroll_long_messages", None),
         },
         group="chat",
     )

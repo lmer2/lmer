@@ -1,9 +1,13 @@
 import { beforeEach, expect, it, vi } from 'vitest'
-import { flushPromises } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
+import { createVuetify } from 'vuetify'
+import * as components from 'vuetify/components'
+import * as directives from 'vuetify/directives'
 import Chat from '../src/components/Chat.vue'
 import { fetchSessionMessages } from '../src/api.js'
 import { deferred, mountPane } from './mount.js'
-import { chatTintOperator } from '../src/operatorChat.js'
+import { chatScrollLongMessages, chatTintOperator } from '../src/operatorChat.js'
+import { blend, contrastRatio, projectColors } from '../src/projects.js'
 
 vi.mock('../src/api.js', () => ({
   fetchSessionMessages: vi.fn(), sendSessionInput: vi.fn(),
@@ -538,5 +542,135 @@ it('tints the operator ground with the project color, and restores the fixed col
     expect(await tinted({ workspaceId: 'alpha', projectColor: 'Red' })).toBe('')
   } finally {
     chatTintOperator.value = true
+  }
+})
+
+// A bus turn is drawn by who sent it, and only the
+// operator's leans right on the operator ground.
+const fromParty = (party, extra = {}) => ({
+  id: `p-${party}-${extra.seq ?? 0}`, seq: 0, role: party === 'agent' ? 'assistant' : 'user', kind: 'said',
+  via: 'comms', comms_kind: null, text: `${party} says hi`, tools: [], party, ...extra,
+})
+
+async function conversation(messages, options = {}) {
+  fetchSessionMessages.mockResolvedValue({ messages, total: messages.length, cursor: messages.length, live: true })
+  const vuetify = createVuetify({ components, directives, theme: { defaultTheme: options.theme || 'light' } })
+  const wrapper = mount(Chat, {
+    props: { sessionId: 's-1', view: options.view || 'conversation' }, attachTo: document.body, global: { plugins: [vuetify] },
+  })
+  await flushPromises()
+  await vi.dynamicImportSettled()
+  await flushPromises()
+  return { wrapper, vuetify }
+}
+
+it.each([
+  ['operator', { source: { channel: 'platform', author: 'operator' } }, 'ground-operator', true, 'you'],
+  ['operator', { source: { channel: 'slack', author: 'tester' } }, 'ground-operator', true, 'slack · tester'],
+  ['ratchet', { source: { channel: 'uber-lmer' } }, 'ground-agent', false, 'Ratchet'],
+  ['peer', { source: { channel: 'peer-ul', author: 'Beta' }, comms_kind: 'peer UL message',
+    peer: { project_id: 'p2', project_name: 'Beta' } }, 'ground-peer', false, 'from Ratchet · Beta'],
+  ['relay', { source: { channel: 'slack', author: 'ci-bot' } }, 'ground-relay', false, 'slack · ci-bot'],
+  ['platform', { source: { channel: 'platform' }, comms_kind: 'note' }, 'ground-action', false, 'lmer platform'],
+  ['platform', { source: { channel: 'slack' }, comms_kind: 'note' }, 'ground-action', false, 'lmer platform'],
+  ['agent', { source: { channel: 'agent' } }, 'ground-agent', false, 'lmer'],
+  // A slash command is machinery, but who sent it is still said.
+  ['platform', { source: { channel: 'uber-lmer' }, comms_kind: 'command', text: '/compact' }, 'ground-action', false, 'Ratchet'],
+  ['platform', { source: { channel: 'platform', author: 'operator' }, comms_kind: 'command', text: '/clear' }, 'ground-action', false, 'you'],
+])('draws a %s turn on its own ground (%j)', async (party, extra, groundClass, leansRight, label) => {
+  const { wrapper } = await conversation([fromParty(party, extra)])
+  const entry = wrapper.get('.turn')
+  expect(entry.classes()).toContain(groundClass)
+  expect(entry.classes().includes('turn-user')).toBe(leansRight)
+  expect(entry.text()).toContain(label)
+  if (party !== 'operator' && label !== 'you') expect(entry.text()).not.toMatch(/^\s*you\b/)
+  wrapper.unmount()
+})
+
+it.each([
+  ['operator', { source: { channel: 'platform', author: 'operator' } }, 1],
+  ['peer', { source: { channel: 'peer-ul', author: 'Beta' }, peer: { project_id: 'p2', project_name: 'Beta' } }, 0],
+  ['relay', { source: { channel: 'slack', author: 'ci-bot' } }, 0],
+  ['ratchet', { source: { channel: 'uber-lmer' } }, 0],
+])('draws upload thumbnails from the operator\'s own turns only (%s)', async (party, extra, thumbs) => {
+  const text = '[lmer upload] /home/developer/.lmer-uploads/20261111-120000-shot.png (image/png, 42 KB)'
+  const { wrapper } = await conversation([fromParty(party, { ...extra, text })])
+  expect(wrapper.findAll('.attached-thumb')).toHaveLength(thumbs)
+  wrapper.unmount()
+})
+
+it('keys a transcript turn without a party on its role, as before', async () => {
+  const { wrapper } = await conversation(
+    [fromParty('agent', { party: undefined, role: 'user', via: undefined, source: undefined })], { view: 'session' },
+  )
+  expect(wrapper.get('.turn').classes()).toEqual(expect.arrayContaining(['turn-user', 'ground-operator']))
+  wrapper.unmount()
+})
+
+it.each(['conversation', 'session'])('never draws an older connector\'s retry blip (%s view)', async (view) => {
+  const blip = (seq, text) => fromParty('platform', {
+    seq, id: `blip-${seq}`, source: { channel: 'slack' }, comms_kind: 'note', text, blip: true,
+  })
+  const { wrapper } = await conversation([
+    blip(0, 'inbound connector delivery is retrying after an error'),
+    fromParty('agent', { seq: 1, id: 'work-1', source: { channel: 'agent' }, text: 'working' }),
+    blip(2, 'inbound connector delivery recovered'),
+  ], { view })
+  expect(wrapper.findAll('.turn').map((entry) => entry.text())).toEqual([expect.stringContaining('working')])
+  // Not an internal turn either: nothing for the session view's toggle to reveal.
+  expect(wrapper.text()).not.toMatch(/\d+ internal/)
+  wrapper.unmount()
+})
+
+const peerFrom = (color, seq = 0) => fromParty('peer', {
+  seq, id: `peer-${seq}`, source: { channel: 'peer-ul', author: 'Beta' },
+  peer: { project_id: `p-${seq}`, project_name: 'Beta', ...(color ? { project_color: color } : {}) },
+})
+
+it('paints a peer in its project hue only while the tint is on and the project is known', async () => {
+  const { wrapper } = await conversation([peerFrom('Red', 1), peerFrom('Teal', 2), peerFrom(null, 3)])
+  const grounds = wrapper.findAll('.turn').map((entry) => entry.element.style.getPropertyValue('--chat-peer-ground'))
+  expect(grounds[0]).toMatch(/^#[0-9a-f]{6}$/)
+  expect(grounds[1]).toMatch(/^#[0-9a-f]{6}$/)
+  expect(grounds[0]).not.toBe(grounds[1])
+  expect(grounds[2]).toBe('')
+  chatTintOperator.value = false
+  try {
+    await flushPromises()
+    expect(wrapper.findAll('.turn').map((entry) => entry.element.style.getPropertyValue('--chat-peer-ground')))
+      .toEqual(['', '', ''])
+  } finally {
+    chatTintOperator.value = true
+    wrapper.unmount()
+  }
+})
+
+it.each(['light', 'dark'])('keeps the header and body ink AA over every preset peer ground (%s)', async (scheme) => {
+  const presets = Object.keys(projectColors)
+  const { wrapper, vuetify } = await conversation(presets.map((color, index) => peerFrom(color, index)), { theme: scheme })
+  const theme = vuetify.theme.computedThemes.value[scheme]
+  const ink = theme.colors['on-surface']
+  const alphas = [theme.variables['high-emphasis-opacity'], theme.variables['medium-emphasis-opacity']].map(Number)
+  const grounds = wrapper.findAll('.turn').map((entry) => entry.element.style.getPropertyValue('--chat-peer-ground'))
+  expect(grounds).toHaveLength(presets.length)
+  grounds.forEach((ground, index) => {
+    for (const alpha of alphas) {
+      expect(contrastRatio(blend(ink, alpha, ground), ground), `${presets[index]} at ${alpha}`).toBeGreaterThanOrEqual(4.5)
+    }
+  })
+  wrapper.unmount()
+})
+
+// The bubble cap is the operator's choice, off by default.
+it('caps a long message only while scrolling long messages is on', async () => {
+  const { wrapper } = await conversation([fromParty('agent', { source: { channel: 'agent' }, text: 'long\n'.repeat(200) })])
+  expect(wrapper.get('.turn').classes()).not.toContain('said-capped')
+  chatScrollLongMessages.value = true
+  try {
+    await flushPromises()
+    expect(wrapper.get('.turn').classes()).toContain('said-capped')
+  } finally {
+    chatScrollLongMessages.value = false
+    wrapper.unmount()
   }
 })

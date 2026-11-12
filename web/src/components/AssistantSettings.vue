@@ -144,6 +144,7 @@ const fields = reactive({
   showTranscript: false,
   tintOperator: true,
   enterSends: true,
+  scrollLongMessages: false,
   checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
   rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
 })
@@ -161,6 +162,7 @@ function readings() {
   out.showTranscript = fields.showTranscript
   out.tintOperator = fields.tintOperator
   out.enterSends = fields.enterSends
+  out.scrollLongMessages = fields.scrollLongMessages
   for (const spec of TICK_FIELDS) {
     out[spec.field] = numberReading(fields[spec.field])
   }
@@ -173,6 +175,7 @@ const FIELD_GROUP = {
   showTranscript: 'conversation',
   tintOperator: 'conversation',
   enterSends: 'conversation',
+  scrollLongMessages: 'conversation',
   ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.field, 'reminders'])),
   rotationOn: 'reminders',
   rotationPercent: 'reminders',
@@ -234,6 +237,7 @@ function prefill(config, apply = true) {
   fields.showTranscript = config.chat?.show_transcript?.value === true
   fields.tintOperator = config.chat?.tint_operator?.value !== false
   fields.enterSends = config.chat?.enter_sends?.value !== false
+  fields.scrollLongMessages = config.chat?.scroll_long_messages?.value === true
   if (apply) applyChatSettings(config)
   for (const spec of TICK_FIELDS) {
     const stored = config[spec.group]?.[spec.key]?.stored
@@ -289,6 +293,9 @@ function diff() {
     if (fields.enterSends !== (reply.value?.chat?.enter_sends?.value !== false)) {
       named.chat_enter_sends = fields.enterSends
     }
+    if (fields.scrollLongMessages !== (reply.value?.chat?.scroll_long_messages?.value === true)) {
+      named.chat_scroll_long_messages = fields.scrollLongMessages
+    }
   }
   if (!show('reminders')) return { named, refused: null }
   for (const spec of TICK_FIELDS) {
@@ -340,7 +347,8 @@ async function save() {
     const changed = config.changed || []
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
-    savedDisplay.value = ['chat_show_transcript', 'chat_tint_operator', 'chat_enter_sends'].some((key) => changed.includes(key))
+    savedDisplay.value = ['chat_show_transcript', 'chat_tint_operator', 'chat_enter_sends',
+      'chat_scroll_long_messages'].some((key) => changed.includes(key))
     // Split by provenance, not by which fields moved: a reminder setting an
     // export still pins is persisted and has no effect, so promising it "applies
     // on the next check" is the same lie the launch banner already refuses to
@@ -526,6 +534,21 @@ defineExpose({ save, reset })
             On, Enter sends and Shift+Enter starts a new line. Off, Enter starts a
             new line and Ctrl+Enter (Cmd on a Mac) sends. On a phone or other touch
             device Enter always starts a new line; use the send button.
+          </p>
+        </div>
+        <div class="settings-field">
+          <v-switch
+            v-model="fields.scrollLongMessages"
+            class="scroll-long-messages"
+            color="primary"
+            density="compact"
+            hide-details
+            :disabled="saving"
+            label="Scroll long messages inside their bubble"
+          />
+          <p class="text-body-small text-medium-emphasis setting-source">
+            Off, a long message is shown at full length and the chat scrolls past it.
+            On, it is capped at a third of the screen and scrolls on its own.
           </p>
         </div>
       </div>
