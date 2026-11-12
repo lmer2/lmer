@@ -142,6 +142,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.parse import quote
@@ -192,6 +193,19 @@ ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
 #: the registry and the projects database into a process an agent starts once
 #: per operation; ``tests/test_platform_ctl.py`` pins it against the index's.
 UID_RE = re.compile(r"^[0-9a-f]{32}\Z")
+
+#: How long ``spawn`` keeps resending a launch the daemon answered 503 with
+#: ``Retry-After`` (a thread check the chat transport rate limited), across
+#: every attempt, and how many attempts it makes. No attempt starts once the
+#: budget has passed. Spelled here rather than imported from
+#: :mod:`lmer_platform.spawn` for the reason :data:`UID_RE` is;
+#: ``tests/test_platform_ctl.py`` pins them against ``spawn``'s.
+SPAWN_WAIT_SECONDS = 30.0
+SPAWN_ATTEMPTS = 4
+SPAWN_MIN_PAUSE_SECONDS = 1.0
+#: The ``detail.code`` of the only 503 ``spawn`` resends, spelled here for the
+#: same reason and pinned against :data:`lmer_platform.api.THREAD_CHECK_RATE_LIMITED`.
+THREAD_CHECK_RATE_LIMITED = "thread_check_rate_limited"
 
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
@@ -268,7 +282,8 @@ def _payload(text: str) -> Any:
 
 
 def _emit(
-    response: Any, endpoint: Endpoint, *, late_fails: bool = False, out=None, err=None,
+    response: Any, endpoint: Endpoint, *, late_fails: bool = False, extra: Optional[dict] = None,
+    out=None, err=None,
 ) -> int:
     """Print the reply and return the exit code.
 
@@ -279,6 +294,9 @@ def _emit(
     *late_fails* is ``answer`` sent by full bus id: ``/comms`` takes a late answer
     with a 200 where the answer route refuses it with a 409, and one verb keeps one
     exit status for the same outcome (#602).
+
+    *extra* goes beside ``status`` on a refusal: how many times a resent call
+    was made, and for how long (:func:`_resending_rate_limited`).
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
@@ -295,9 +313,68 @@ def _emit(
         print(json.dumps(payload), file=out)
         return 0
     print(
-        json.dumps({"error": "http", "status": status, "body": payload}), file=err
+        json.dumps({"error": "http", "status": status, **(extra or {}), "body": payload}), file=err
     )
     return EXIT_FAILURE
+
+
+#: The clock and the pause :func:`_resending_rate_limited` uses, as names a test
+#: can replace without slowing down a daemon running in the same process.
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def _retry_after(response: Any) -> Optional[float]:
+    """The seconds a rate-limited launch asks to wait, or ``None`` to report it as is.
+
+    Only a 503 whose ``detail`` is :data:`THREAD_CHECK_RATE_LIMITED` and
+    ``retryable``: the same route also answers the daemon's ``state_busy`` 503,
+    with ``Retry-After`` too, after a launch may already have happened, and
+    sending that again could start a second session. Only the delta-seconds
+    form: the daemon sends nothing else, and a reply without a number in it is a
+    refusal to report, not one to wait out.
+    """
+    if response.status_code != 503:
+        return None
+    detail = _payload(response.text)
+    detail = detail.get("detail") if isinstance(detail, dict) else None
+    if not isinstance(detail, dict) or detail.get("code") != THREAD_CHECK_RATE_LIMITED \
+            or detail.get("retryable") is not True:
+        return None
+    try:
+        seconds = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _resending_rate_limited(send) -> tuple:
+    """``send()``, made again while the daemon answers a rate-limited launch.
+
+    The daemon answers a launch that way when the chat transport rate limited
+    the check on who holds a thread target, and it waits nowhere itself: the
+    route runs inside the project operation, which every other change waits on.
+    So the wait is here, in the caller, and each resend is a fresh request whose
+    checks all run again.
+
+    Waits at least :data:`SPAWN_MIN_PAUSE_SECONDS`, makes at most
+    :data:`SPAWN_ATTEMPTS` calls, and starts none once
+    :data:`SPAWN_WAIT_SECONDS` have passed or would pass during the wait.
+    Returns the last reply, the number of calls and the seconds they took.
+    """
+    started = _clock()
+    attempts = 0
+    while True:
+        response = send()
+        attempts += 1
+        pause = _retry_after(response)
+        if pause is None or attempts >= SPAWN_ATTEMPTS:
+            break
+        pause = max(SPAWN_MIN_PAUSE_SECONDS, pause)
+        if _clock() - started + pause >= SPAWN_WAIT_SECONDS:
+            break
+        _sleep(pause)
+    return response, attempts, _clock() - started
 
 
 def _text(value: str) -> str:
@@ -1820,10 +1897,18 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
                 headers["X-Lmer-Workspace-ID"] = args.workspace_id
             if args.request_id:
                 headers["X-Lmer-Request-ID"] = args.request_id
-            response = _request(
-                endpoint, call, timeout=args.timeout, transport=transport,
-                **({"headers": headers} if headers else {}),
-            )
+            def send(call=call, headers=headers):
+                return _request(
+                    endpoint, call, timeout=args.timeout, transport=transport,
+                    **({"headers": headers} if headers else {}),
+                )
+            extra = None
+            if call.method == "POST" and call.path == "/api/sessions":
+                response, attempts, elapsed = _resending_rate_limited(send)
+                if attempts > 1:
+                    extra = {"attempts": attempts, "elapsed_seconds": round(elapsed, 1)}
+            else:
+                response = send()
             if call.method == "POST" and call.path == "/api/comms/thread" and 200 <= response.status_code < 300:
                 payload = _payload(response.text)
                 posted = payload.get("posted") if isinstance(payload, dict) else None
@@ -1840,6 +1925,7 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     return _emit(
         response, endpoint,
         late_fails=call.path.endswith("/comms") and (call.body or {}).get("kind") == "answer",
+        extra=extra,
     )
 
 

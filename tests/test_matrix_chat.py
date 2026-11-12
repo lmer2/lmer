@@ -1115,6 +1115,21 @@ def test_only_a_transport_failure_is_worth_retrying(monkeypatch, reply, transien
     assert (caught.value.transient, caught.value.retry_after) == (transient, retry_after)
 
 
+@pytest.mark.parametrize("pause, slept", [(True, [2.5]), (False, [])])
+def test_a_429_pauses_before_raising_unless_the_caller_waits_elsewhere(monkeypatch, pause, slept):
+    from matrix_chat.client import MatrixAccount, MatrixClient
+
+    sleeps = []
+    monkeypatch.setattr("matrix_chat.client.time.sleep", sleeps.append)
+    client = MatrixClient(
+        MatrixAccount("https://hs.example.org", BOT, "test-token"), pause_on_rate_limit=pause,
+        session=_Homeserver(_Reply(429, {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 2500})),
+    )
+    with pytest.raises(MatrixError) as caught:
+        client.resolve_room("#lmer:example.org")
+    assert sleeps == slept and caught.value.retry_after == 2.5
+
+
 def test_matrix_replayed_history_is_never_an_answer_and_leaves_the_free_slot(rig):
     """The backlog predates the attach, so it answers nothing and does not spend
     the first-free-text slot — the next real message still can (issue #426)."""

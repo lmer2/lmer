@@ -279,11 +279,16 @@ def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False,
     A held-thread refusal check uses *require_resolution*: an unavailable or
     empty answer cannot establish that another spelling is not already held.
     That deciding path refuses every lookup failure; ordinary reads and
-    adoption keep the best-effort default.
+    adoption keep the best-effort default. It needs only the root, so it reads
+    one message rather than paging the thread, and returns no messages, since
+    one is not the thread.
     """
     channel, ts = ref.key["channel"], ref.key["thread_ts"]
     try:
-        messages = client.get_replies(channel, ts)
+        if require_resolution:
+            messages = client.get_replies(channel, ts, limit=1)
+        else:
+            messages = client.get_replies(channel, ts)
     except Exception as exc:
         if require_resolution or (refuse_refusals and getattr(exc, "code", None) in _SLACK_UNSEEABLE):
             raise _slack_failure(exc, channel) from None
@@ -300,7 +305,7 @@ def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False,
             status=502,
         )
     if not isinstance(root, str) or not root or root == ts:
-        return ref, messages
+        return ref, None if require_resolution else messages
     logger.info("thread_root_resolved channel=%s from=%s to=%s", channel, ts, root)
     return ref.rekeyed({"channel": channel, "thread_ts": root}), None
 

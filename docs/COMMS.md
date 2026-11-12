@@ -1018,7 +1018,9 @@ is never blindly replayed. The connector runs until stopped:
   original option. `post_thread` and `open_thread` scrub the same way on both
   transports. Direct messages to a person are not scrubbed (tracked separately);
 - **inbound**: Slack polls `conversations.replies` every
-  `LMER_SLACK_POLL_SECONDS` (default 3); matrix `/sync`s with a filter on the
+  `LMER_SLACK_POLL_SECONDS` (default 3) while the thread is active, slowing to
+  `LMER_SLACK_IDLE_POLL_SECONDS` (default 30) when it is quiet (see "The
+  `conversations.replies` budget" below); matrix `/sync`s with a filter on the
   one room. Each new human message — and each post another run or the platform
   made, below — becomes `POST /messages` with `source
   {channel, author, ref}` — the Slack display name (from `users.info`) or the
@@ -1178,6 +1180,42 @@ The matrix chat connector is not the fleet bridge (`lmer-matrix-bridge`,
 `docs/MATRIX-CHAT.md`), which announces runs wanting a human into one room per
 orchestrator as an appservice. The two coexist; the connector reuses the
 bridge's scrub and, in an encrypted room, the bridge's device.
+
+### The `conversations.replies` budget
+
+Slack rate-limits each method per app and workspace, so everything holding the
+one bot token draws on one `conversations.replies` budget. Slack documents the
+method as Tier 3, about 50 calls a minute, for internal apps. The callers:
+
+| Caller | Process | Rate | On a 429 |
+|---|---|---|---|
+| Each live Slack connector | its own | one call every `LMER_SLACK_POLL_SECONDS` (3 s) while the thread is active, up to 20 a minute | sleeps `Retry-After`, up to 3 retries |
+| `lmer-signal read` / `lmer-ctl thread read`, and resolving a link to post or open | the servicer: the daemon, or a host `lmer` | one call per page of the thread, per read | sleeps `Retry-After`, up to 3 retries |
+| A launch's held-thread check (below) | the daemon | one call per attempt, for the thread's first message only | the check refuses at once; `POST /api/sessions` answers 503 `thread_check_rate_limited` with `Retry-After` and `lmer-ctl spawn` resends, up to 4 attempts within 30 s |
+| A live connect | the daemon | one call per page | no retry; connects with the link as given |
+| `receipt`, recovering a connector's uncertain post ([CONNECTOR-RECOVERY.md](CONNECTOR-RECOVERY.md)) | the daemon | one whole-thread read per recovery | no retry |
+| `lmer-slack history`, `poll` and `watch` | the caller's | one call per read; `poll` and `watch` repeat every `--interval` (5 s) | sleeps `Retry-After`, up to 3 retries |
+
+Mention ingress uses `conversations.history`, not this method.
+
+Three connectors on active threads reach Slack's figure on their own. Their
+retries are silent, so the limit can be real while nobody is reading by hand,
+and a one-shot caller is the one that sees the 429. A connector therefore slows
+down once its thread has been quiet for two minutes. It doubles its interval
+on each poll that finds nothing, up to `LMER_SLACK_IDLE_POLL_SECONDS` (30 s).
+It returns to the fast interval once a poll finds a new message, or once the
+connector posts into the thread itself. A wait already under way is not cut
+short, so after a quiet spell the first reply can take up to the idle interval
+to arrive. A setting at or below `LMER_SLACK_POLL_SECONDS` turns this off.
+Either interval is at most 300 s. One shared poll per bot token instead of one
+per connector is #687.
+
+A launch refused because Slack would not answer says how much of the budget
+this daemon is spending. It gives the `conversations.replies` calls made from
+the daemon's own process in the last 60 s, measured, and the number of live
+Slack connectors it runs with their configured interval, which is configured
+rather than measured, since each polls from a process of its own. A host `lmer`
+on the same token appears in neither figure.
 
 ### Posts from other runs, and from the platform
 
@@ -1481,9 +1519,13 @@ noise.
 live-connect route's. A spawn whose launch `targets` name a thread another live
 run holds — `POST /api/sessions`, `lmer-ctl spawn --target-thread` — is refused
 **409** naming that run, before a command line is built, a control port drawn or
-a directory made: no session starts and the thread is posted nothing. The same
-409 answers an **explicit** `threads` override on `POST /api/assistant/start` or
-`/rotate`, and `lmer-ctl` relays status and text to the agent that asked. What
+a directory made: no session starts and the thread is posted nothing. When
+the transport rate limited the check, the answer is a **503** with
+`Retry-After` and `detail.code` `thread_check_rate_limited` instead, and
+`lmer-ctl spawn` sends the launch again (see the held-thread check below). The
+same 409 answers an **explicit** `threads` override on
+`POST /api/assistant/start` or `/rotate`, and `lmer-ctl` relays status and text
+to the agent that asked. What
 does *not* refuse is Ratchet's **standing** `threads` list: a worker can take
 one of those threads during the seconds a rotation is between incarnations, and
 an orchestrator that will not come back up over one thread is worse than one
@@ -1533,16 +1575,45 @@ record's identity as it stands, so a rotation reads no history from Slack for it
 on a 2,000-message thread that read was what a 429 refused for seven hours, while
 posts to the same thread went through. (The successor's launch adoption still
 resolves its targets best-effort, as every launch does; a failure there only
-logs.) Any other named thread must still resolve, and a failure refuses the
-launch with a message naming the method (`conversations.replies`, or the matrix
-alias lookup) and the error. When the transport said "not now" (an HTTP 429 or
-5xx, or no answer at all) rather than "no", the message adds the wait a 429 asked
-for (Slack's `Retry-After`, matrix's `retry_after_ms`) or says that none was
-given. A definite answer without a status, such as an alias that names no room,
-is not "not now". Reused records
-include ones a launch adopted best-effort, and the check on them cannot see
-another live session holding the same conversation under a different spelling
-(a reply link rather than its root, an alias rather than the `!room` id).
+logs.) Any other named thread must still resolve. For Slack that is one
+`conversations.replies` call for the thread's first message, not a read of the
+thread. The check runs under the daemon's launch lock and never sleeps there,
+for a matrix 429 included.
+
+Only a rate limit is waited out: a 429 that says how long (Slack's
+`Retry-After`, matrix's `retry_after_ms`). The wait is at least 1 s, a spawn
+makes at most 4 attempts within 30 s, and a wait that would not end inside the
+30 s is not started. Where the wait happens depends on who holds what:
+
+- `POST /api/sessions` runs inside the daemon's project operation, which every
+  other change waits on, so the daemon does not wait. It answers **503 with
+  `Retry-After`** and a `detail` of `{code: "thread_check_rate_limited",
+  message, retryable: true}`, the shape of the daemon's `state_busy` 503.
+  `lmer-ctl spawn` waits that long and sends the launch again, for that code
+  only: a `state_busy` 503 on the same route can follow a launch that already
+  happened, so it is reported, not resent. Each resend is a new request whose
+  checks all run again. When it gives
+  up, `lmer-ctl` prints the last refusal with `attempts` and `elapsed_seconds`
+  beside its `status`. The web UI and other HTTP callers get the 503 and decide
+  for themselves. A request's action receipt records the refusal as made before
+  any effect, so a resend under the same `X-Lmer-Request-ID` is not refused as
+  uncertain.
+- `lmer platform spawn` holds no project operation. It waits in the daemon
+  process, with the launch lock released, and runs all its checks again.
+- The assistant's start and rotation do not wait, and neither do a resume or an
+  answer, whose routes hold the project operation too.
+
+A failure refuses the launch with a message naming the method
+(`conversations.replies`, or the matrix alias lookup) and the error. When the
+transport said "not now" (an HTTP 429 or 5xx, or no answer at all) rather than
+"no", the message adds the wait a 429 asked for (Slack's `Retry-After`,
+matrix's `retry_after_ms`) or says that none was given. For Slack it also adds
+the call volume described under "The `conversations.replies` budget". A
+definite answer without a status, such as an alias that names no room, is not
+"not now". Reused records include ones a launch adopted best-effort, and the
+check on them cannot see another live session holding the same conversation
+under a different spelling (a reply link rather than its root, an alias rather
+than the `!room` id).
 
 **Where the connectors run.** For a session the platform spawned — Ratchet
 included — the **daemon** runs them, one process per connection, with the
@@ -1715,7 +1786,8 @@ ask-directory readers and the steering form of `POST /api/sessions/{id}/input`.
 | `LMER_COMMS_TERMINAL_MIRROR` | container, bool (default on) | the terminal line tracker |
 | `LMER_CHAT_CHANNEL` | container, set by a chat-thread target handler | `slack` or `matrix`; arms the reply guard and the chat taskdef |
 | `SLACK_BOT_TOKEN` | host (the `lmer` process, the listener) | the Slack bot; required for a Slack thread target, never forwarded into the container |
-| `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval (default 3) |
+| `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval while its thread is active (default 3) |
+| `LMER_SLACK_IDLE_POLL_SECONDS` | host | the slowest a quiet thread is polled (default 30, at most 300); at or below `LMER_SLACK_POLL_SECONDS`, polling never slows |
 | `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID`, `LMER_MATRIX_ACCESS_TOKEN` | host | the bot account the matrix connector and listener act as; required for a matrix thread target, never forwarded |
 | `LMER_MATRIX_BRIDGE_URL` | host | where `lmer-matrix-bridge`'s listener is reached from this host; lets the connector and thread verbs work in encrypted rooms through the bridge's device, acting as its appservice user; never forwarded |
 | `LMER_MATRIX_AUTHENTICATED_MEDIA` | host, bool | the operator's assertion that the homeserver requires authentication for media; the agent's attachments are withheld until set |

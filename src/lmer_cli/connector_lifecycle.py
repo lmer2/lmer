@@ -269,7 +269,7 @@ class ConnectorLifecycle:
                     self._record_delivery_health(direction, noted=True)
             self._direction_failures[direction] = 0
             self.failures = max(self._direction_failures.values(), default=0)
-            self._stop.wait(interval)
+            self._stop.wait(interval() if callable(interval) else interval)
 
     def _record_delivery_health(self, direction, error=None, *, quiet_until=None, noted=False):
         def entry(previous):

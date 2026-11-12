@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import html
 import logging
+import math
 import os
 import re
 import signal
@@ -44,7 +45,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ConnectorConfig", "SlackConnector", "render_outbound", "option_for",
     "post_replay_notice", "replay_stamp", "attachment_notice", "detach_notice",
-    "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "SUBSCRIBER", "CHANNEL", "main",
+    "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "DEFAULT_IDLE_POLL_SECONDS",
+    "IDLE_POLL_SECONDS_ENV", "IDLE_AFTER_SECONDS", "MAX_POLL_SECONDS", "poll_intervals", "SUBSCRIBER", "CHANNEL", "main",
     "ATTACH_ACK", "DETACH_NOTE", "ATTACH_ACK_ENV", "ATTACH_FROM_NOW_ENV",
     "ATTACH_SINCE_ENV",
 ]
@@ -54,6 +56,36 @@ SUBSCRIBER = "slack"
 
 POLL_SECONDS_ENV = "LMER_SLACK_POLL_SECONDS"
 DEFAULT_POLL_SECONDS = 3.0
+#: The slowest a quiet thread is polled. At or below the poll interval, polling
+#: never slows.
+IDLE_POLL_SECONDS_ENV = "LMER_SLACK_IDLE_POLL_SECONDS"
+DEFAULT_IDLE_POLL_SECONDS = 30.0
+#: How long a thread has to be quiet before its polling starts to slow.
+IDLE_AFTER_SECONDS = 120.0
+#: The longest either interval may be set to, so a quiet thread is still read.
+MAX_POLL_SECONDS = 300.0
+
+
+def poll_intervals(environ: Mapping[str, str]) -> tuple:
+    """``(poll, idle)``: a thread's polling interval while active, and its slowest.
+
+    Every connector on a bot token spends one ``conversations.replies`` budget
+    (docs/COMMS.md, "The conversations.replies budget"), so the daemon quotes
+    these when a check is refused for a rate limit.
+    """
+    def seconds(name, default):
+        raw = (environ.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        return min(MAX_POLL_SECONDS, max(1.0, value)) if math.isfinite(value) else default
+
+    return seconds(POLL_SECONDS_ENV, DEFAULT_POLL_SECONDS), seconds(
+        IDLE_POLL_SECONDS_ENV, DEFAULT_IDLE_POLL_SECONDS,
+    )
 
 #: Enable attachment and matching detach notices. Listener-owned threads disable
 #: these because the listener announces their lifecycle.
@@ -117,6 +149,8 @@ class ConnectorConfig:
     thread_ts: str
     bot_token: str = field(repr=False)
     poll_seconds: float = DEFAULT_POLL_SECONDS
+    #: See :data:`IDLE_POLL_SECONDS_ENV`.
+    idle_poll_seconds: float = DEFAULT_IDLE_POLL_SECONDS
     #: See :data:`ATTACH_ACK_ENV`.
     attach_ack: bool = True
     #: See :data:`ATTACH_FROM_NOW_ENV`.
@@ -164,17 +198,11 @@ class ConnectorConfig:
         bot_token = (environ.get("SLACK_BOT_TOKEN") or "").strip()
         if not bot_token:
             raise ValueError("SLACK_BOT_TOKEN is required to run the Slack connector")
-        raw = (environ.get(POLL_SECONDS_ENV) or "").strip()
-        poll = DEFAULT_POLL_SECONDS
-        if raw:
-            try:
-                poll = max(1.0, float(raw))
-            except ValueError:
-                poll = DEFAULT_POLL_SECONDS
+        poll, idle_poll = poll_intervals(environ)
         return cls(
             supervisor_url=supervisor_url, supervisor_token=supervisor_token,
             channel=channel, thread_ts=thread_ts, bot_token=bot_token,
-            poll_seconds=poll, uploads_dir=uploads_dir,
+            poll_seconds=poll, idle_poll_seconds=idle_poll, uploads_dir=uploads_dir,
             container_uploads_dir=container_uploads_dir,
             connect_budget=bus.connect_budget(environ),
             attach_ack=(
@@ -424,6 +452,8 @@ class SlackConnector(ConnectorLifecycle):
         self._names: dict = {}
         self._bot_user_id: Optional[str] = None
         self._cursor_ts: Optional[str] = None
+        self._last_activity = clock()
+        self._poll_interval = config.poll_seconds
         self._bus_cursor = 0
         self._launch_settings: Optional[dict] = None
         #: questions whose one free-text chance has been used (`_first_since`)
@@ -482,7 +512,16 @@ class SlackConnector(ConnectorLifecycle):
     # -- inbound: Slack → bus --------------------------------------------------
 
     def _inbound_loop(self):
-        self._loop("inbound", self._inbound_once, interval=self.config.poll_seconds)
+        self._loop("inbound", self._inbound_once, interval=self._inbound_interval)
+
+    def _inbound_interval(self) -> float:
+        """The wait before the next poll: doubling while the thread is quiet."""
+        active, idle = self.config.poll_seconds, self.config.idle_poll_seconds
+        if idle <= active or self._clock() - self._last_activity < IDLE_AFTER_SECONDS:
+            self._poll_interval = active
+        else:
+            self._poll_interval = min(idle, self._poll_interval * 2)
+        return self._poll_interval
 
     @property
     def thread_label(self) -> str:
@@ -575,7 +614,12 @@ class SlackConnector(ConnectorLifecycle):
         return self._display_name(message.get("user"))
 
     def _mirrored(self, ts: object) -> None:
-        """Identify our own echoes and attribute live posts for other runs."""
+        """Identify our own echoes and attribute live posts for other runs.
+
+        A post is activity: the run that just spoke is the likeliest to be
+        answered, so the next poll is a fast one again."""
+        self._last_activity = self._clock()
+        self._poll_interval = self.config.poll_seconds
         self._posters.wrote(ts)
         poster = thread_posts.Poster.for_session(self._posters.session)
         if poster is not None and isinstance(ts, str) and ts:
@@ -808,7 +852,13 @@ class SlackConnector(ConnectorLifecycle):
         self.slack.add_reaction(self.config.channel, ref, "inbox_tray")
 
     def _inbound_once(self):
+        # Any new message counts, this connector's own posts included: a run
+        # that has just said something is the likeliest to be answered, and
+        # its post is seen by this poll at the latest.
+        before = self._cursor_ts
         self._poll_thread(replay=not self._replayed)
+        if self._cursor_ts != before:
+            self._last_activity = self._clock()
         with self._state.lock:
             self._replayed = True
             self._state.save()

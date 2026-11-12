@@ -44,7 +44,7 @@ class FakeSlack:
         self.opened = []
         self.calls = 0
 
-    def get_replies(self, channel, thread_ts, oldest=None):
+    def get_replies(self, channel, thread_ts, oldest=None, **kw):
         """Slack's own shape: given a message inside a thread it answers with
         that message, whose `thread_ts` names the root."""
         self.calls += 1
@@ -584,7 +584,7 @@ class TestResolvingBeforeADecision:
 
     def _client(self, code):
         class Failing(FakeSlack):
-            def get_replies(inner, channel, ts, oldest=None):
+            def get_replies(inner, channel, ts, oldest=None, **kw):
                 from slack_chat.client import SlackError
 
                 raise SlackError(
@@ -662,6 +662,39 @@ class TestResolvingBeforeADecision:
         read or post go through."""
         ref = parse_thread(SLACK_LINK)
         assert thread_access.slack_rooted(ref, self._client("not_in_channel")) == ref
+
+
+class TestTheHeldCheckRead:
+    """A held-thread check needs the root and nothing else."""
+
+    class Recording(FakeSlack):
+        def __init__(self, messages):
+            super().__init__()
+            self.messages, self.asked = messages, []
+
+        def get_replies(self, channel, ts, oldest=None, **kw):
+            self.asked.append(kw)
+            return self.messages
+
+    def test_it_reads_one_message_and_hands_back_none(self):
+        ref = parse_thread(SLACK_LINK)
+        slack = self.Recording([{"ts": ref.key["thread_ts"]}])
+        rooted, messages = thread_access.slack_thread(ref, slack, require_resolution=True)
+        assert (rooted, messages) == (ref, None)
+        assert slack.asked == [{"limit": 1}]
+
+    def test_it_still_finds_the_root_of_a_reply(self):
+        ref = parse_thread(SLACK_LINK)
+        slack = self.Recording([{"ts": ref.key["thread_ts"], "thread_ts": "1712340000.000100"}])
+        rooted, _ = thread_access.slack_thread(ref, slack, require_resolution=True)
+        assert rooted.key["thread_ts"] == "1712340000.000100"
+
+    def test_an_ordinary_read_still_takes_the_whole_thread(self):
+        ref = parse_thread(SLACK_LINK)
+        whole = [{"ts": ref.key["thread_ts"]}, {"ts": "1712345679.000100"}]
+        slack = self.Recording(whole)
+        assert thread_access.slack_thread(ref, slack) == (ref, whole)
+        assert slack.asked == [{}]
 
 
 class TestNamingAChannel:

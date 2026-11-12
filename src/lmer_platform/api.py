@@ -57,6 +57,7 @@ import contextlib
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import secrets as secrets_mod
 import sqlite3
@@ -203,6 +204,7 @@ from .spawn import (
     absorb_ports,
     derive_run_identity,
     live_session_for_run,
+    rate_limit_pause,
     schema_two,
     spawn_session,
 )
@@ -250,6 +252,12 @@ WS_POLICY_VIOLATION = 1008
 #: What a 503 for transient state contention tells a client to wait (seconds,
 #: as the ``Retry-After`` header carries it).
 RETRY_AFTER_SECONDS = "1"
+
+
+#: The ``detail.code`` of the 503 ``POST /api/sessions`` answers when the chat
+#: transport rate limited a thread check. Nothing was started, so it is always
+#: ``retryable``; ``lmer-ctl spawn`` resends this code and no other.
+THREAD_CHECK_RATE_LIMITED = "thread_check_rate_limited"
 
 
 def _busy_detail(reason: str, *, retryable: bool, advice: str) -> dict:
@@ -3944,7 +3952,22 @@ def create_app(
         # 409 for the third instance of the reason above: a thread has one live
         # session at a time (issue #413), so a target another run holds is a
         # request that works once that run lets it go. Nothing was started.
+        #
+        # A check the chat transport rate limited is a 503 with Retry-After
+        # instead: the wait is the caller's (``lmer-ctl spawn`` resends), since
+        # this route runs inside the project operation and sleeping here would
+        # hold every other change. The receipt already says refused (the
+        # preflight above), so a resend under the same request id goes through.
+        # Its own code, because this route also answers the app-wide
+        # ``state_busy`` 503, which may follow a launch and must not be resent.
         except ThreadHeld as exc:
+            pause = rate_limit_pause(exc)
+            if pause is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": THREAD_CHECK_RATE_LIMITED, "message": str(exc), "retryable": True},
+                    headers={"Retry-After": str(math.ceil(pause))},
+                )
             raise HTTPException(status_code=409, detail=str(exc))
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

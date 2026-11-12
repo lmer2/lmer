@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import threading
 import time
+from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
@@ -83,7 +84,7 @@ class FakeSlack:
             self.replies[-1]["blocks"] = [{"block_id": connector.CONNECTION_NOTICE_BLOCK_PREFIX + ts}]
         return ts
 
-    def get_replies(self, channel, thread_ts, oldest=None):
+    def get_replies(self, channel, thread_ts, oldest=None, **kw):
         parent = {"ts": thread_ts, "user": "U1", "text": "@lmer help me"}
         found = [parent] + [m for m in self.replies if oldest is None or m["ts"] > oldest]
         return found
@@ -789,6 +790,79 @@ class TestPostsFromOtherRuns:
         self._recorded(rig, ts, thread_posts.Poster.for_session("s-other", "chat-mr-288"))
         assert reconnected._poll_thread() == 1
         assert rig.log.read_since(0)[0][-1].source.author == "lmer chat-mr-288"
+
+
+class TestIdleBackoff:
+    """A quiet thread is polled less often; any new message brings it back."""
+
+    def _connector(self, *, poll=3.0, idle=30.0):
+        now = [1000.0]
+        config = connector.ConnectorConfig(
+            supervisor_url="http://testserver", supervisor_token="tok",
+            channel="C1", thread_ts="1699999999.000000", bot_token="xoxb-test",
+            poll_seconds=poll, idle_poll_seconds=idle, attach_ack=False,
+        )
+        conn = connector.SlackConnector(config, slack=FakeSlack(), clock=lambda: now[0])
+        return conn, now
+
+    def test_polling_slows_after_a_quiet_spell_and_stops_at_the_idle_interval(self):
+        conn, now = self._connector()
+        assert conn._inbound_interval() == 3.0
+        now[0] += connector.IDLE_AFTER_SECONDS - 1
+        assert conn._inbound_interval() == 3.0
+        now[0] += 1
+        assert [conn._inbound_interval() for _ in range(5)] == [6.0, 12.0, 24.0, 30.0, 30.0]
+
+    def test_a_new_message_restores_the_fast_interval(self, monkeypatch):
+        conn, now = self._connector()
+        now[0] += connector.IDLE_AFTER_SECONDS + 60
+        assert conn._inbound_interval() == 6.0
+
+        def found(replay=False):
+            conn._cursor_ts = "1700000001.000100"
+
+        conn._state = SimpleNamespace(lock=threading.Lock(), save=lambda: None)
+        try:
+            monkeypatch.setattr(conn, "_poll_thread", lambda replay=False: None)
+            conn._inbound_once()
+            assert conn._inbound_interval() == 12.0, "a poll that found nothing is not activity"
+            monkeypatch.setattr(conn, "_poll_thread", found)
+            conn._inbound_once()
+            assert conn._inbound_interval() == 3.0
+        finally:
+            conn._state = None
+
+    def test_the_connectors_own_post_restores_the_fast_interval(self, monkeypatch):
+        """Its answer is likeliest now, so the next wait is not an idle one."""
+        conn, now = self._connector()
+        monkeypatch.setattr(conn._posters, "_session_of", lambda: None)
+        now[0] += connector.IDLE_AFTER_SECONDS + 60
+        assert [conn._inbound_interval() for _ in range(3)] == [6.0, 12.0, 24.0]
+        conn._mirrored("1700000002.000100")
+        assert conn._inbound_interval() == 3.0
+
+    def test_an_idle_interval_at_or_below_the_poll_never_slows(self):
+        conn, now = self._connector(poll=5.0, idle=5.0)
+        now[0] += 10 * connector.IDLE_AFTER_SECONDS
+        assert [conn._inbound_interval() for _ in range(3)] == [5.0, 5.0, 5.0]
+
+    @pytest.mark.parametrize("environ, intervals", [
+        ({}, (3.0, 30.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "7", "LMER_SLACK_IDLE_POLL_SECONDS": "90"}, (7.0, 90.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "0.2", "LMER_SLACK_IDLE_POLL_SECONDS": "x"}, (1.0, 30.0)),
+        # Finite and bounded, so a quiet thread is still read.
+        ({"LMER_SLACK_IDLE_POLL_SECONDS": "inf"}, (3.0, 30.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "nan", "LMER_SLACK_IDLE_POLL_SECONDS": "86400"},
+         (3.0, connector.MAX_POLL_SECONDS)),
+    ])
+    def test_the_intervals_come_from_the_environment(self, environ, intervals):
+        assert connector.poll_intervals(environ) == intervals
+        config = connector.ConnectorConfig.from_env({
+            "LMER_FASTAPI_PORT": "8701", "LMER_FASTAPI_TOKEN": "t",
+            "LMER_SLACK_CHANNEL": "C1", "LMER_SLACK_THREAD_TS": "1.2",
+            "SLACK_BOT_TOKEN": "xoxb", **environ,
+        })
+        assert (config.poll_seconds, config.idle_poll_seconds) == intervals
 
 
 class TestConfig:

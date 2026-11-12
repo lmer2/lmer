@@ -1,0 +1,6 @@
+fixed:
+- "`lmer-ctl spawn --target-thread` now waits out a Slack rate limit for up to 30 seconds instead of being refused on the first 429: the daemon answers 503 with Retry-After and `lmer-ctl` sends the launch again."
+- "A matrix 429 during a launch's thread check no longer sleeps inside the daemon's launch lock."
+changed:
+- "A spawn refused because Slack is rate limiting names the Retry-After and this daemon's recent `conversations.replies` volume."
+- "Slack connectors poll a quiet thread less often, slowing to `LMER_SLACK_IDLE_POLL_SECONDS` (default 30, at most 300) and speeding up on new messages or their own posts."

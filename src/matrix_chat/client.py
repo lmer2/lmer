@@ -64,8 +64,11 @@ def _q(value: str) -> str:
 
 class MatrixClient:
     def __init__(self, account: MatrixAccount, session=None, *, timeout: float = _REQUEST_TIMEOUT,
-                 crypto: Optional[BridgeCrypto] = None) -> None:
+                 crypto: Optional[BridgeCrypto] = None, pause_on_rate_limit: bool = True) -> None:
+        """*pause_on_rate_limit* off raises a 429 at once with its ``retry_after``,
+        for a caller that waits elsewhere, without a lock held."""
         self.account = account
+        self._pause_on_rate_limit = pause_on_rate_limit
         self._session = session if session is not None else requests.Session()
         self._timeout = timeout
         if crypto is None and account.bridge_url:
@@ -120,7 +123,8 @@ class MatrixClient:
                     pass
                 if retry is not None and not 0 <= retry <= 86400:
                     retry = None
-                time.sleep(min(1.0 if retry is None else retry, 10.0))
+                if self._pause_on_rate_limit:
+                    time.sleep(min(1.0 if retry is None else retry, 10.0))
             raise MatrixError(
                 f"{method} {path} → {response.status_code} {errcode or ''} {detail}".strip(),
                 status=response.status_code, errcode=errcode,

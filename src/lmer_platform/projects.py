@@ -167,6 +167,11 @@ def operation(*, force=False):
                 os.close(fd)
 
 
+def operation_held() -> bool:
+    """Whether this thread is inside :func:`operation`, so leaving one ``with`` releases nothing."""
+    return getattr(_LOCAL, "depth", 0) > 0
+
+
 @contextmanager
 def database():
     store.ensure_state_dir(path().parent)

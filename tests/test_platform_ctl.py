@@ -1038,6 +1038,99 @@ def test_spawn_accepts_repeatable_thread_targets():
     assert "targets" not in build("spawn", "develop", "issue").body
 
 
+class Script:
+    """A transport answering each request with the next reply; the last repeats."""
+
+    def __init__(self, *replies):
+        self.replies, self.calls = replies, []
+
+    def request(self, method, url, **_kwargs):
+        self.calls.append((method, url))
+        return self.replies[min(len(self.calls), len(self.replies)) - 1]
+
+
+RATE_LIMITED = {"code": "thread_check_rate_limited", "message": "cannot check who holds it", "retryable": True}
+#: The app-wide 503 for a busy projects database, after the launch may have happened.
+STATE_BUSY = {"code": "state_busy", "message": "The project state is busy.", "retryable": False}
+
+
+@dataclass
+class Limited:
+    """A 503 as the daemon sends it for a rate-limited thread check, or another *detail*."""
+
+    retry_after: str = "5"
+    detail: object = None
+    status_code: int = 503
+
+    @property
+    def text(self):
+        return json.dumps({"detail": RATE_LIMITED if self.detail is None else self.detail})
+
+    @property
+    def headers(self):
+        return {} if self.retry_after is None else {"retry-after": self.retry_after}
+
+
+@pytest.mark.parametrize("replies, slept, calls, extra", [
+    # Waited out, then started: the reply is the launch's.
+    ([Limited("2"), Reply(201, '{"session_id": "s"}')], [2.0], 2, None),
+    # The budget is the whole spawn's, checked before each wait.
+    ([Limited("10")], [10.0, 10.0], 3, {"attempts": 3, "elapsed_seconds": 20.0}),
+    # The calls are bounded, and Retry-After 0 still leaves a gap.
+    ([Limited("0")], [1.0, 1.0, 1.0], ctl.SPAWN_ATTEMPTS, {"attempts": 4, "elapsed_seconds": 3.0}),
+    # A wait that cannot end inside the budget is not started.
+    ([Limited("40")], [], 1, None),
+    # Not a rate limit: a 503 without Retry-After, a held thread, a bad one.
+    ([Limited(None)], [], 1, None),
+    ([Limited("soon")], [], 1, None),
+    # The daemon's busy-state 503 also carries Retry-After, but the launch may
+    # have happened: resending it could start a second session.
+    ([Limited("1", STATE_BUSY), Reply(201, '{"session_id": "s"}')], [], 1, None),
+    ([Limited("1", {**STATE_BUSY, "retryable": True})], [], 1, None),
+    ([Limited("1", {**RATE_LIMITED, "retryable": False})], [], 1, None),
+    ([Limited("1", "cannot check who holds it")], [], 1, None),
+    ([Reply(409, '{"detail": "connected to another run"}')], [], 1, None),
+])
+def test_spawn_resends_a_rate_limited_launch_within_its_budget(configured, monkeypatch, capsys, replies, slept, calls, extra):
+    now, waits = [0.0], []
+    monkeypatch.setattr(ctl, "_clock", lambda: now[0])
+    monkeypatch.setattr(ctl, "_sleep", lambda seconds: (waits.append(seconds), now.__setitem__(0, now[0] + seconds)))
+    transport = Script(*replies)
+
+    code, out, err = run(["spawn", "develop", "issue", "--target-thread",
+                          "https://team.slack.com/archives/C1/p1700000000000001"], transport, capsys)
+
+    assert (waits, len(transport.calls)) == (slept, calls)
+    assert set(transport.calls) == {("POST", f"{BASE_URL}/api/sessions")}
+    last = replies[min(calls, len(replies)) - 1]
+    if last.status_code == 201:
+        assert (code, json.loads(out)) == (0, {"session_id": "s"})
+    else:
+        failure = json.loads(err)
+        assert code == ctl.EXIT_FAILURE and failure["status"] == last.status_code
+        assert {key: failure[key] for key in ("attempts", "elapsed_seconds") if key in failure} == (extra or {})
+
+
+def test_only_spawn_resends_a_503(configured, monkeypatch, capsys):
+    """Every other verb reports the daemon's 503 as it came."""
+    monkeypatch.setattr(ctl, "_sleep", lambda seconds: pytest.fail(f"slept {seconds}s"))
+    transport = Script(Limited("1"), Reply())
+
+    code, _out, err = run(["runs", "forget", RUN_KEY], transport, capsys)
+
+    assert (code, len(transport.calls)) == (ctl.EXIT_FAILURE, 1)
+    assert "attempts" not in json.loads(err)
+
+
+def test_the_spawn_wait_is_the_daemon_s_own():
+    """Spelled in ``ctl`` to keep its imports off the spawn stack, so pinned here."""
+    from lmer_platform import spawn
+
+    assert (ctl.SPAWN_WAIT_SECONDS, ctl.SPAWN_ATTEMPTS, ctl.SPAWN_MIN_PAUSE_SECONDS) == (
+        spawn.THREAD_CHECK_WAIT_SECONDS, spawn.THREAD_CHECK_ATTEMPTS, spawn.THREAD_CHECK_MIN_PAUSE_SECONDS)
+    assert ctl.THREAD_CHECK_RATE_LIMITED == api.THREAD_CHECK_RATE_LIMITED == RATE_LIMITED["code"]
+
+
 # --- rotate: the one verb that is two calls (issue #446) -----------------------
 #
 # Self-rotation is the assistant ending its own context window, so what these pin
