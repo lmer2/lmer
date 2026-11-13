@@ -113,6 +113,18 @@ def _rate_limited_message(endpoint: str, retries: int, retry_after: Optional[int
     return f"Slack API rate limited after {retries} retries (HTTP 429 on {endpoint}; {detail})"
 
 
+def scopes_granted(response) -> Optional[List[str]]:
+    """The scopes Slack's ``x-oauth-scopes`` header grants; ``None`` without one.
+
+    Reads a ``requests`` response or a slack_sdk one alike: both carry
+    case-insensitive ``headers``.
+    """
+    granted = (getattr(response, "headers", None) or {}).get("x-oauth-scopes")
+    if not isinstance(granted, str):
+        return None
+    return [scope.strip() for scope in granted.split(",") if scope.strip()]
+
+
 class SlackClient:
     """Hand-rolled Slack Web API client using requests.Session with Bearer auth."""
 
@@ -134,6 +146,9 @@ class SlackClient:
         self.bot_token = bot_token or os.getenv("SLACK_BOT_TOKEN")
         self.timeout = timeout
         self.retries = retries
+        #: The token's granted scopes as the last :meth:`auth_test` reported
+        #: them; ``None`` before one, or when Slack sent no header.
+        self.granted_scopes: Optional[List[str]] = None
 
         if not self.bot_token:
             raise SlackError(
@@ -424,14 +439,7 @@ class SlackClient:
         host = urlparse(url).hostname if isinstance(url, str) else None
         if not host:
             raise SlackError("Slack auth.test response carries no workspace url")
-        granted = response.headers.get("x-oauth-scopes")
-        return {
-            "host": host,
-            "scopes": (
-                [scope.strip() for scope in granted.split(",") if scope.strip()]
-                if isinstance(granted, str) else None
-            ),
-        }
+        return {"host": host, "scopes": scopes_granted(response)}
 
     def get_replies(
         self,
@@ -513,11 +521,15 @@ class SlackClient:
             no ``bot_user_id`` field — for an xoxb token, ``user_id`` is the
             bot's own user ID, which is what message ``user`` fields carry.)
 
+        The same call reports the token's granted scopes, kept in
+        :attr:`granted_scopes`.
+
         Raises:
             SlackError: On Slack API errors.
         """
-        data = self._request("POST", "auth.test")
+        data, response = self._request_with_response("POST", "auth.test")
         user_id = data.get("user_id")
         if user_id is None:
             raise SlackError("Slack auth.test response missing 'user_id' field")
+        self.granted_scopes = scopes_granted(response)
         return user_id

@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import requests
+
 from ask_channel import bus
 from lmer_cli import thread_access, thread_posts
 from lmer_cli.comms import MAX_REF_CHARS, off_thread
@@ -676,9 +678,9 @@ class MatrixConnector(ConnectorLifecycle):
         content = event.get("content") if isinstance(event.get("content"), dict) else {}
         msgtype = content.get("msgtype")
         if msgtype in _MEDIA_TYPES:
-            staged = self._stage_media(content)
+            staged, reason = self._stage_media(content)
             if staged is None:
-                return f"[{msgtype} {content.get('body') or 'attachment'} — not stored]", []
+                return f"[{msgtype} {content.get('body') or 'attachment'} — not stored: {reason}]", []
             return "", [staged]
         return strip_reply_fallback(str(content.get("body") or "")).strip(), []
 
@@ -814,8 +816,9 @@ class MatrixConnector(ConnectorLifecycle):
         qid = question.get("id")
         return bool(qid and qid not in self._answered_freely)
 
-    def _stage_media(self, content: dict) -> Optional[dict]:
-        """Copy one inbound media event into the session's upload store.
+    def _stage_media(self, content: dict) -> tuple:
+        """``(staged, None)`` for one inbound media event copied into the
+        session's upload store, or ``(None, why it was not)``.
 
         Through the shared bounded helpers, for the reasons recorded on #416: the
         file is posted by whoever is in the room, so its size is not a question
@@ -828,29 +831,34 @@ class MatrixConnector(ConnectorLifecycle):
         store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
         encrypted = isinstance(content.get("file"), dict)
         mxc = content["file"].get("url") if encrypted else content.get("url")
-        if store is None or not isinstance(mxc, str):
-            return None
+        if store is None:
+            return None, thread_access.NO_STORE
+        if not isinstance(mxc, str):
+            return None, thread_access.NOT_FETCHED_NO_URL
         if encrypted and not self.matrix.can_encrypt:
-            return None
+            return None, f"{thread_access.NOT_FETCHED}: it is encrypted and no lmer-matrix-bridge can decrypt it"
         name = str(content.get("filename") or content.get("body") or "file")
         info = content.get("info") if isinstance(content.get("info"), dict) else {}
         declared = info.get("size")
         if isinstance(declared, int) and not isinstance(declared, bool) and declared > thread_access.MAX_FILE_BYTES:
             # What the event claims, before asking for the bytes.
             logger.info("matrix_connector_file_too_large name=%s bytes=%s", name, declared)
-            return None
+            return None, thread_access.NOT_FETCHED_TOO_LARGE
         try:
             if encrypted:
                 data, media_type = self.matrix.download_content(content, max_bytes=thread_access.MAX_FILE_BYTES)
             else:
                 data, media_type = self.matrix.download(mxc, max_bytes=thread_access.MAX_FILE_BYTES)
-        except MatrixError as exc:
+        except (MatrixError, requests.RequestException) as exc:
             logger.warning("matrix_connector_download_failed mxc=%s error=%s", mxc, exc)
-            return None
+            return None, thread_access.matrix_fetch_reason(exc)
         if data is None:
             logger.info("matrix_connector_file_too_large name=%s bytes=over %s", name, thread_access.MAX_FILE_BYTES)
-            return None
-        return thread_access.stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+            return None, thread_access.NOT_FETCHED_TOO_LARGE
+        staged = thread_access.stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+        if staged is None:
+            return None, thread_access.NOT_WRITTEN
+        return staged, None
 
     def _prepare(self):
         if self.room_id is None:

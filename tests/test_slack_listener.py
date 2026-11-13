@@ -90,6 +90,7 @@ def slack_app(monkeypatch) -> types.SimpleNamespace:
     fake_app = types.SimpleNamespace(client=client)
     monkeypatch.setattr(listener, "app", fake_app)
     monkeypatch.setattr(listener, "_bot_user_id", None)
+    monkeypatch.setattr(listener, "_granted_scopes", None)
     return fake_app
 
 
@@ -1432,3 +1433,65 @@ class TestMainLmerEnvFile:
         rc = listener.main([])
         assert rc == 0
         assert captured.get("lmer_env_file") is None
+
+
+def sdk_auth_response(scopes):
+    """An auth.test answer as slack_sdk hands it over, scopes in the header."""
+    headers = {} if scopes is None else {"x-oauth-scopes": ",".join(scopes)}
+    return AsyncSlackResponse(
+        client=None, http_verb="POST", api_url="https://slack.com/api/auth.test",
+        req_args={}, data={"ok": True, "user_id": "U_BOT"},
+        headers=headers, status_code=200,
+    )
+
+
+class TestAnAppThatCannotReadFiles:
+    """The spawned connector runs with attach_ack off, so the listener's own
+    announcement is the only place the thread can hear that files will not
+    reach the session."""
+
+    @pytest.mark.asyncio
+    async def test_the_announcement_says_so_without_naming_the_scope(self, manager, slack_app):
+        slack_app.client.auth_test = AsyncMock(return_value=sdk_auth_response(["chat:write", "channels:history"]))
+        await listener._get_bot_user_id()
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        text = say.await_args.kwargs["text"]
+        assert text.startswith("Connecting a session to this thread")
+        assert listener.FILES_UNREADABLE_NOTE in text
+        assert "files:read" not in text and "scope" not in text
+        slack_app.client.auth_test.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_token_with_files_read_announces_as_before(self, manager, slack_app):
+        slack_app.client.auth_test = AsyncMock(return_value=sdk_auth_response(["chat:write", "files:read"]))
+        await listener._get_bot_user_id()
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        assert listener.FILES_UNREADABLE_NOTE not in say.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answer", [
+        sdk_auth_response(None), {"ok": True, "user_id": "U_BOT"}, RuntimeError("no network"),
+    ], ids=["no-scope-header", "plain-dict", "auth-test-failed"])
+    async def test_scopes_not_known_leave_the_announcement_as_it_was(self, manager, slack_app, answer):
+        slack_app.client.auth_test = AsyncMock(side_effect=[answer])
+        await listener._get_bot_user_id()
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        assert listener.FILES_UNREADABLE_NOTE not in say.await_args.kwargs["text"]
+        slack_app.client.auth_test.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_connect_path_makes_no_auth_test_of_its_own(self, manager, slack_app):
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        slack_app.client.auth_test.assert_not_awaited()

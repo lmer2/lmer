@@ -15,9 +15,10 @@ from pathlib import Path
 
 import pytest
 import requests
+import urllib3
 
 from ask_channel import bus
-from lmer_cli import comms, supervisor, targets, thread_posts
+from lmer_cli import comms, supervisor, targets, thread_access, thread_posts
 from matrix_chat import connector, listener, permalink
 from lmer_cli.connector_delivery import verified_rejection
 from lmer_cli.connector_process import child_environment
@@ -535,7 +536,6 @@ class TestConnector:
         chosen a moment earlier, in a directory the container mounts `rw`. A
         symlink planted at that name took the write and the mode. It goes through
         `stage_upload`'s `O_EXCL` create now, which takes the next name instead."""
-        from lmer_cli import thread_access
 
         store = tmp_path / "uploads"
         store.mkdir()
@@ -581,7 +581,6 @@ class TestConnector:
     def test_an_inbound_file_over_the_cap_is_not_stored(self, tmp_path):
         """#416: the download was unbounded, and the file is posted by whoever is
         in the room rather than by anyone here."""
-        from lmer_cli import thread_access
 
         store = tmp_path / "uploads"
         store.mkdir()
@@ -598,8 +597,100 @@ class TestConnector:
         try:
             record = rig.log.read_since(0)[0][-1]
             assert not record.attachments
-            assert "not stored" in record.text
+            assert record.text == "[m.file core.dump — not stored: it is over the size this copies in]"
             assert list(store.iterdir()) == []
+        finally:
+            rig.connector.stop()
+
+    def test_a_refused_download_says_why_with_the_status_only(self, tmp_path, monkeypatch):
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+
+        def refuse(mxc, *, max_bytes=None):
+            raise MatrixError(f"GET /_matrix/client/v1/media/download/{mxc[6:]} → 403 M_FORBIDDEN",
+                              status=403, errcode="M_FORBIDDEN")
+
+        monkeypatch.setattr(rig.matrix, "download", refuse)
+        rig.connector.replay()
+        rig.matrix.human_says("shot.png", msgtype="m.image", url="mxc://example.org/pic",
+                              info={"mimetype": "image/png"})
+        assert rig.connector.sync_once() == 1
+        try:
+            record = rig.log.read_since(0)[0][-1]
+            assert record.text == (
+                "[m.image shot.png — not stored: it could not be fetched: the homeserver answered HTTP 403]"
+            )
+            assert "/_matrix" not in record.text
+        finally:
+            rig.connector.stop()
+
+    def test_a_download_that_stalls_mid_body_is_a_line_not_a_retry(self, tmp_path, monkeypatch):
+        """A stalled stream reaches here as requests' own ConnectionError, not
+        a MatrixError; it used to escape and fail the whole sync."""
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+
+        def stall(mxc, *, max_bytes=None):
+            raise requests.ConnectionError(
+                urllib3.exceptions.ReadTimeoutError(None, "https://matrix.example.org/x", "Read timed out."),
+            )
+
+        monkeypatch.setattr(rig.matrix, "download", stall)
+        rig.connector.replay()
+        rig.matrix.human_says("shot.png", msgtype="m.image", url="mxc://example.org/pic",
+                              info={"mimetype": "image/png"})
+        assert rig.connector.sync_once() == 1
+        try:
+            record = rig.log.read_since(0)[0][-1]
+            assert record.text == "[m.image shot.png — not stored: it could not be fetched: the download timed out]"
+        finally:
+            rig.connector.stop()
+
+    def test_a_store_that_refuses_the_write_says_so(self, tmp_path, monkeypatch):
+
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+        rig.matrix.media["mxc://example.org/pic"] = (b"\x89PNG\r\n\x1a\n", "image/png")
+        monkeypatch.setattr(thread_access, "stage_upload", lambda *a, **kw: None)
+        rig.connector.replay()
+        rig.matrix.human_says("shot.png", msgtype="m.image", url="mxc://example.org/pic",
+                              info={"mimetype": "image/png"})
+        assert rig.connector.sync_once() == 1
+        try:
+            record = rig.log.read_since(0)[0][-1]
+            assert record.text == "[m.image shot.png — not stored: it could not be written to the upload store]"
+        finally:
+            rig.connector.stop()
+
+    def test_an_encrypted_file_with_no_bridge_says_so(self, tmp_path):
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+        rig.connector.replay()
+        rig.matrix.human_says("shot.png", msgtype="m.image", file={"url": "mxc://example.org/sealed"},
+                              info={"mimetype": "image/png"})
+        assert rig.connector.sync_once() == 1
+        try:
+            record = rig.log.read_since(0)[0][-1]
+            assert record.text == (
+                "[m.image shot.png — not stored: it could not be fetched: "
+                "it is encrypted and no lmer-matrix-bridge can decrypt it]"
+            )
+        finally:
+            rig.connector.stop()
+
+    def test_without_an_upload_store_the_line_says_so(self, tmp_path):
+        rig = Rig(tmp_path, uploads=None)
+        rig.connector.replay()
+        rig.matrix.human_says("shot.png", msgtype="m.image", url="mxc://example.org/pic",
+                              info={"mimetype": "image/png"})
+        assert rig.connector.sync_once() == 1
+        try:
+            record = rig.log.read_since(0)[0][-1]
+            assert record.text == "[m.image shot.png — not stored: this session has no upload store]"
         finally:
             rig.connector.stop()
 

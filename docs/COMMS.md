@@ -1035,7 +1035,23 @@ is never blindly replayed. The connector runs until stopped:
 - **files**: a file in a live thread message is downloaded into the session's upload
   store — capped at the same size a read of a thread copies in — and the record
   names it with the `[lmer upload] <path> (<type>, <size>)` reference #246
-  defines. The agent's `--attach` goes the other way, under one set of rules
+  defines. A file that does not come in is never dropped: the record's text
+  carries a line for it, with the reasons listed under §12's thread reads. On
+  Slack it is the line `lmer-signal read` prints,
+  `📎 <name> (<type>, <size> B) — not copied in: <reason>`. On Matrix it is
+  `[m.image <name> — not stored: <reason>]`. Downloading a Slack file needs the
+  **`files:read`** scope. The connector reads the token's scopes from the
+  `auth.test` it already makes, and the Slack listener from the `auth.test` it
+  makes at startup. When `files:read` is missing, the thread's connect
+  announcement says that files posted in the thread will not reach the session:
+  the connector's attach notice, or, for a session the listener spawned (whose
+  connector runs with the attach notice off), the listener's own announcement.
+  It names neither the app nor the scope, because people outside the team may
+  read the thread. Each fetch is still tried, because the scopes are read only once and a
+  scope granted since then must take effect. A fetch that Slack refuses (an HTTP
+  error, a web page, or bytes other than the file) then names the scope in its
+  line. Scopes that Slack did not
+  report are *not knowing*. The agent's `--attach` goes the other way, under one set of rules
   for both transports and both doors (the connector and `post --thread`). The
   message text names each file (`📎 <name>`). Each file then follows as its own
   thread item, either uploaded or replaced by a
@@ -2029,6 +2045,35 @@ bounded (25 MiB) and so is a whole read (100 MiB), counted as the bytes arrive
 rather than after they are resident — the files are posted by whoever is in the
 thread, and on the platform route the process fetching them serves the fleet. A
 description that could not become a copy says which of those reasons it was.
+A fetch that failed tells its failures apart with fixed phrases. It never quotes
+the error, which carries the file's URL: over the size this copies in;
+`Slack answered HTTP <status>` or `the homeserver answered HTTP <status>`; the
+download timed out; the download was cut off (Matrix); the homeserver could not
+be reached; `lmer-matrix-bridge answered HTTP <status>`; lmer-matrix-bridge
+could not be reached (no status at all); an encrypted Matrix file that could
+not be decrypted; the kind of any other transport failure
+(`ConnectionError`, `SSLError`); and, on a connected Slack thread only, the
+missing `files:read` scope (§9). A read makes no `auth.test`, so it shows Slack's
+own answer instead.
+
+A Slack answer that is not the file that was posted is not staged. Two checks
+decide, in this order:
+
+- An answer labelled `text/html` is refused as a web page unless Slack declared
+  the file as HTML.
+- When Slack declares the file as PNG, JPEG, GIF, WebP or PDF, the first bytes
+  must carry one of those signatures, however the answer is labelled (no label,
+  `application/octet-stream`, the declared type). It need not be the declared
+  one: Slack's mimetype can name a different image format than the bytes, and
+  that is still the file, so JPEG bytes declared as `image/png` are staged.
+  Bytes with no known signature (an HTML or JSON error body) are refused. The
+  line says Slack answered with a web page instead of the file when they start
+  with markup, and with something other than the file when they do not.
+
+For any other declared type the bytes have no signature to check, so only the
+label can show that a page came back. Both types are compared without
+parameters or case. The full error stays in the host log, on the
+`thread_read_file_failed` line.
 
 `meta.thread` on a record is the one field the pane turns into a link, so the
 daemon drops it unless it parses as a thread permalink — the marker still renders
