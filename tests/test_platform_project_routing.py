@@ -567,6 +567,18 @@ def test_inflight_authority_from_crashed_assistant_cannot_start_worker_before_re
     assert spawn._live_worker_count() == 0
 
 
+@pytest.mark.parametrize("path", ["/api/settings", "/api/projects", "/api/prune"])
+def test_a_non_operator_settings_change_is_refused_with_the_binding_sentence(client, path):
+    """Plan test 8 (#561): the binding's operator-only refusal, status and
+    sentence, unchanged by moving the binding off the event loop."""
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+    with scope.bound(alpha["id"]):
+        token = config.active_assistant_credential()
+    response = client.post(path, headers={"Authorization": f"Bearer {token}"}, json={})
+    assert response.status_code == 403, response.text
+    assert "Only an operator may change platform or project settings." in response.text
+
+
 SLACK_THREAD = "https://team.slack.com/archives/C1/p1700000000000001"
 
 

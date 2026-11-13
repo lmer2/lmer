@@ -37,6 +37,7 @@ import pathlib
 import stat
 import time
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -254,7 +255,13 @@ def test_the_minted_credential_is_attributed_to_the_assistant(config, long_lived
     app = api.create_app(
         config, SECRET, state_builder=lambda config, force_pull=False: {}
     )
-    guard = _guard_of(app)
+    # The authenticator is async since #561 (it runs its check on a thread
+    # limiter of its own), so it is driven through an event loop here.
+    authenticator = _guard_of(app)
+
+    def guard(header):
+        return anyio.run(authenticator, header)
+
     with started(config):
         minted = cfg.active_assistant_credential()
         caller = guard(f"Bearer {minted}")

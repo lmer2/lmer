@@ -1259,6 +1259,72 @@ chat.
   with a 404 before anything is stored. The editor then says the daemon needs a
   restart rather than "Not Found" (see [Install and first run](#install-and-first-run)).
 
+## Daemon load and degraded health
+
+`GET /api/health` answers two different questions. `ok: true` means only that
+the process answers. Whether it is answering *well* is in `load`, and
+`degraded` with `degraded_reasons` summarise it. Alert on `degraded`, not on
+`ok`: restarting a daemon that is slow but recovering loses its in-memory
+state and fixes nothing.
+
+Health runs its authentication, request binding and checks on two threads of
+its own. Every other route authenticates and binds on a separate pool of 8, and
+handles the request on the shared handler pool. So health still answers when
+every handler thread is busy, or when every binding thread is stuck behind a busy
+database, and then `load.pool` shows it.
+
+| field | what it reports |
+|---|---|
+| `load.requests.waiting` | Requests that have arrived and not yet started a response. The health call itself is not counted. |
+| `load.requests.oldest`, `oldest_read` | The longest-waiting request, and the longest-waiting GET/HEAD: method, path and `overdue_seconds`. A long-poll's own `timeout` parameter is subtracted. |
+| `load.loop.lag_seconds`, `lag_max_60s` | How late the event loop wakes from a 1-second sleep, now and over the last minute. Blocking work on the loop shows here. |
+| `load.pool.borrowed`, `total`, `waiting` | The threadpool the route handlers share. When `borrowed` equals `total` and `waiting` is above 0, requests are queueing for a thread. |
+| `load.state_build.in_flight`, `last` | Fleet-view builds running now, and the last one's duration, finish time and per-stage `stages`. |
+| `load.reconcile` | The project supervisor's last pass: `last_seconds`, the `interval_seconds` between pass starts (normally about 2), and `finished_at`. `running_seconds` is how long the pass now open has been running, or `null` between passes: a pass that never finishes shows here, since the interval only updates when the next pass starts. |
+| `load.db_write_wait` | Waits for the projects database's write lock over the last minute: `count_60s`, `total_60s`, `max_60s`. |
+
+`degraded` is true when any of these holds, and each one adds a sentence to
+`degraded_reasons`:
+
+- a read has been waiting 30 s or more past its own allowance;
+- the event loop lagged 2 s or more in the last minute;
+- reconcile passes are 30 s or more apart, or one pass has been running 30 s
+  or more;
+- the last fleet-view build took 30 s or more.
+
+Writes never count: a spawn, a rotation or a rescan is slow by design. These
+thresholds describe a condition and trigger nothing.
+
+The daemon also logs, at WARNING:
+
+- `platform_slow_request method= path= status= waited=`, when a request starts
+  its response 5 s or more past its allowance. For `/api/state` the line carries
+  the build's `stages`, so you can see where the time went.
+- `platform_request_stuck method= path= waited=`, once per request still in
+  flight 30 s past its allowance. This is how a request that never finishes is
+  still reported.
+
+Only the path is logged, never the query string.
+
+### Shared fleet-view builds
+
+Concurrent `GET /api/state` requests in the same project share a build that is
+already running. A finished build is never reused. A request joins a running
+build only if it started after the last write the daemon answered and after the
+last mirror pull, and is less than 10 s old. Otherwise the request waits for
+that project's next build, which starts when the running one finishes. Every
+request that arrives meanwhile shares that next build, so a project has at most
+one build running and one waiting. A refused write (any 4xx answer) changed
+nothing, so it does not count as a write here. The mirror pull itself happens per request, before
+any sharing, so only the request that wins the pull throttle waits on
+`git fetch`.
+
+At most 3 builds run at once. A request that waits 25 s without getting a build
+is answered 503 with `{"detail": {"code": "state_busy", "retryable": true}}`
+and `Retry-After: 5`. Nothing was changed, so it is safe to retry.
+`load.state_build.flight` in `/api/health` reports how many builds are
+`running` and `pending`, and how many requests are `joiners` waiting on one.
+
 ## Where things live
 
 | what | where |
