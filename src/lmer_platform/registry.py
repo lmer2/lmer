@@ -55,7 +55,8 @@ from typing import Callable, Optional
 
 from . import SCHEMA_VERSION
 from .store import (
-    StoreError, mutating, path_component, read_json, sessions_dir, utc_now_iso, write_json,
+    StoreError, ensure_state_dir, mutating, path_component, read_json, sessions_dir,
+    utc_now_iso, write_json,
 )
 
 logger = logging.getLogger("lmer_platform.registry")
@@ -361,7 +362,9 @@ def list_sessions(*, live_only: bool = True, strict: bool = False) -> list[dict]
     directory = sessions_dir()
     try:
         paths = sorted(
-            directory / name for name in _entry_names(directory) if name.endswith(".json")
+            directory / name
+            for name in _entry_names(directory, missing_ok=not strict)
+            if name.endswith(".json")
         )
     except OSError as exc:
         if strict:
@@ -392,27 +395,45 @@ def set_aside_ids() -> set[str]:
     """Ids of sessions whose entry :func:`~lmer_platform.store.read_json` moved
     aside as corrupt (``<id>.json.bad-<stamp>``): the registry has lost what
     it knew about them, not learned that they ended. Raises
-    :class:`StoreError` when the directory cannot be listed."""
+    :class:`StoreError` when the directory cannot be listed, or is missing
+    (see :func:`_entry_names`)."""
     directory = sessions_dir()
     try:
-        names = _entry_names(directory)
+        names = _entry_names(directory, missing_ok=False)
     except OSError as exc:
         raise StoreError(f"cannot list {directory} ({exc})") from exc
-    return {name.split(".json.bad-", 1)[0] for name in names if ".json.bad-" in name}
+    return {name.rsplit(".json.bad-", 1)[0] for name in names if ".json.bad-" in name}
 
 
-def _entry_names(directory: Path) -> list[str]:
-    """The non-hidden names in ``directory``; none when it does not exist yet,
-    as before the first session registers.
+def _entry_names(directory: Path, *, missing_ok: bool) -> list[str]:
+    """The non-hidden names in ``directory``. Raises :class:`OSError` when it
+    cannot be listed.
 
     ``os.scandir`` rather than ``Path.glob``, which swallows every error from
     listing the directory and answers an unreadable one with no entries.
+
+    A missing directory is no names only with ``missing_ok``. A strict reader
+    passes ``False``: ``platform run`` creates the directory at start
+    (:func:`ensure_sessions_dir`), so by the time the sweep reads it, its
+    absence means the registry was lost, not that no session has registered.
     """
     try:
         with os.scandir(directory) as entries:
             return [entry.name for entry in entries if not entry.name.startswith(".")]
     except FileNotFoundError:
-        return []
+        if missing_ok:
+            return []
+        raise
+
+
+def ensure_sessions_dir() -> None:
+    """Create the sessions directory, owner-only, if it is not there yet.
+
+    Called by ``platform run`` before anything reads the registry strictly,
+    so that a strict read can treat a missing directory as lost rather than
+    as a host where no session has registered yet. Raises :class:`OSError`.
+    """
+    ensure_state_dir(sessions_dir())
 
 
 def remove(session_id: str, *, force: bool = False) -> bool:
