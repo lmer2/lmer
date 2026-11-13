@@ -73,6 +73,7 @@ const SLOT_META = {
   occupied: { label: 'in use', tone: 'idle', icon: 'circle' },
   service_down: { label: 'service not running', tone: 'attention', icon: 'alert' },
   misconfigured: { label: 'misconfigured', tone: 'bad', icon: 'alert-circle' },
+  unknown: { label: 'not checked yet', tone: 'idle', icon: 'help-circle' },
 }
 
 export function stateMeta(state) {

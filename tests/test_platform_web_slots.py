@@ -252,6 +252,9 @@ def test_slot_meta_labels_and_falls_back(tmp_path):
         "assert.equal(slotMeta('occupied').tone, 'idle')",
         "assert.equal(slotMeta('misconfigured').tone, 'bad')",
         "assert.equal(slotMeta('service_down').tone, 'attention')",
+        # Not known is not an outage: neither the warning tone nor its icon.
+        "assert.equal(slotMeta('unknown').tone, 'idle')",
+        "assert.notEqual(slotMeta('unknown').icon, slotMeta('service_down').icon)",
         # A daemon newer than this bundle: named and painted, never blank.
         "assert.equal(slotMeta('quarantined').label, 'quarantined')",
         "assert.ok(toneColor(slotMeta('quarantined').tone))",
@@ -266,6 +269,7 @@ def test_only_a_free_slot_reads_as_free(tmp_path):
         "assert.equal(slotIsFree({state: 'occupied'}), false)",
         "assert.equal(slotIsFree({state: 'service_down'}), false)",
         "assert.equal(slotIsFree({state: 'misconfigured'}), false)",
+        "assert.equal(slotIsFree({state: 'unknown'}), false)",
         "assert.equal(slotIsFree(null), false)",
         "assert.equal(slotIsFree({}), false)",
     ]))

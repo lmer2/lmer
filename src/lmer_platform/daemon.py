@@ -88,7 +88,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, assistant, detect, mute, project_context
+from . import projects, assistant, containers, detect, mute, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -380,7 +380,11 @@ def _watch_for_attention(config) -> Detector:
     and notifies nobody. Making the bind wait on a ``git`` operation would delay
     the one thing that must come up.
     """
-    detector = Detector(config)
+    detector = Detector(
+        config,
+        container_sweep=containers.sweep,
+        container_sweep_interval=containers.SWEEP_INTERVAL_SECONDS,
+    )
     print(detector.notice, flush=True)
     detector.start()
     return detector
