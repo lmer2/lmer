@@ -71,6 +71,7 @@ from .config import (
 from .detect import Detector
 from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
+from .registry import ensure_sessions_dir
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
@@ -442,6 +443,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(notice, flush=True)
 
     projects.migrate()
+
+    # Before the detector's first tick sweeps: the sweep's strict registry read
+    # treats a missing sessions directory as a lost registry and removes
+    # nothing, so a host where no session has registered yet needs it to exist.
+    try:
+        ensure_sessions_dir()
+    except OSError as exc:
+        print(f"⚠️  cannot create the session registry directory ({exc}); "
+              "container sweeps will remove nothing until it exists.", flush=True)
 
     # After the re-attach and before the server, in that order for both halves:
     # a surviving assistant has to be re-attached first or this would see it as

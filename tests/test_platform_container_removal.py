@@ -29,6 +29,8 @@ SWEEP = containers.sweep
 def fake(tmp_path, monkeypatch):
     strip_lmer_env(monkeypatch)
     monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
+    # As ``platform run`` does before its first sweep.
+    registry.ensure_sessions_dir()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     shim = bin_dir / "docker"
@@ -43,6 +45,7 @@ def fake(tmp_path, monkeypatch):
     log = tmp_path / "runtime.log"
     monkeypatch.setenv("FAKE_RUNTIME_LOG", str(log))
     monkeypatch.setattr(containers, "_WARNED", set())
+    monkeypatch.setattr(containers, "_SWEEP_FAILING", threading.Event())
     monkeypatch.setattr(containers, "sweep", SWEEP)
     assert containers.wait_for_removals(timeout=SETTLE)
     yield SimpleNamespace(state=state, tmp=tmp_path, verbs=lambda: _verbs(log))
@@ -285,36 +288,76 @@ def test_the_sweep_removes_nothing_while_the_registry_cannot_be_read_in_full(
     assert not (fake.state / ended).exists()
 
 
-def test_the_sweep_fails_closed_when_the_registry_cannot_be_listed(fake):
-    """Through the real listing: a regular file where the directory belongs
-    fails ``os.scandir`` with ENOTDIR for root too, unlike a mode-000 directory."""
-    cid = labelled(fake, "s-1")
-    half_removed(fake, cid)
+def _unlistable_by_file():
+    """The sessions directory replaced by a regular file: the real
+    enumeration gets ``NotADirectoryError``, and so does root CI."""
     directory = store.sessions_dir()
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    if directory.is_dir():
-        directory.rmdir()
+    directory.rmdir()
     directory.write_text("")
 
-    for _ in range(2):
-        containers.sweep()
-        assert containers.wait_for_removals(timeout=SETTLE)
+
+def _unlistable_by_scandir(monkeypatch):
+    """Every scan of the sessions directory fails, as with EACCES or EIO."""
+    real_scandir, real_listdir = os.scandir, os.listdir
+    target = os.fspath(store.sessions_dir())
+
+    def refuse(real):
+        def call(path=".", *args):
+            if os.fspath(path) == target:
+                raise PermissionError(13, "injected", target)
+            return real(path, *args)
+        return call
+
+    monkeypatch.setattr(os, "scandir", refuse(real_scandir))
+    monkeypatch.setattr(os, "listdir", refuse(real_listdir))
+
+
+def _unlistable_by_removal():
+    """Missing after ``platform run`` created it: the registry was lost."""
+    store.sessions_dir().rmdir()
+
+
+@pytest.mark.parametrize("break_it", ["file", "scandir", "missing"])
+def test_the_sweep_fails_closed_when_the_registry_cannot_be_listed(
+    fake, monkeypatch, caplog, break_it
+):
+    """Through the real enumeration: ``Path.glob`` would read every one of
+    these as an empty directory."""
+    cid = labelled(fake, "s-1")
+    half_removed(fake, cid)
+    if break_it == "file":
+        _unlistable_by_file()
+    elif break_it == "scandir":
+        _unlistable_by_scandir(monkeypatch)
+    else:
+        _unlistable_by_removal()
+
+    with caplog.at_level(logging.WARNING, logger="lmer_platform.containers"):
+        for _ in range(2):
+            containers.sweep()
+            assert containers.wait_for_removals(timeout=SETTLE)
     assert (fake.state / cid).exists()
+    assert rm_calls(fake, cid) == []
+    [warning] = platform_warnings(caplog)
+    assert "platform_container_sweep_failed" in warning
     with pytest.raises(store.StoreError):
         registry.list_sessions(live_only=False, strict=True)
     with pytest.raises(store.StoreError):
         registry.set_aside_ids()
+    # The tolerant read is unchanged.
     assert registry.list_sessions(live_only=False) == []
 
 
-def test_the_sweep_treats_a_sessions_directory_not_made_yet_as_empty(fake):
-    cid = labelled(fake, "s-ended")
+def test_a_queued_sweep_removal_fails_closed_when_the_registry_cannot_be_listed(
+    fake, monkeypatch
+):
+    """The re-check in ``_sweep_remove`` enumerates the same way."""
+    cid = labelled(fake, "s-1")
     half_removed(fake, cid)
-    assert not store.sessions_dir().exists()
-
-    containers.sweep()
-    assert containers.wait_for_removals(timeout=SETTLE)
-    assert not (fake.state / cid).exists()
+    _unlistable_by_scandir(monkeypatch)
+    containers._sweep_remove("docker", containers._platform_filter(), cid)
+    assert (fake.state / cid).exists()
+    assert rm_calls(fake, cid) == []
 
 
 def test_the_sweep_spares_a_session_whose_entry_was_set_aside_as_corrupt(fake):

@@ -250,9 +250,10 @@ The sweep acts only on a complete read of the session registry. If any entry
 cannot be read (an I/O error, or a schema newer than this daemon) or the
 registry directory cannot be listed, that sweep removes nothing and warns once
 (`platform_container_sweep_failed`), and the next one tries again. A session
-missing from the read is not a session that ended. A registry directory that
-does not exist yet, as before the first session registers, reads as empty;
-any other error listing it counts as an unreadable registry.
+missing from the read is not a session that ended. A missing registry
+directory counts as unreadable too: `lmer platform run` creates it at start,
+so its absence means the registry was lost, not that no session has
+registered yet.
 
 Each is checked again just before its turn in the queue, then killed and
 removed with `rm --force`. A removal logs
