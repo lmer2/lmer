@@ -93,6 +93,7 @@ import { toneColor } from '../format.js'
 import {
   rememberChoice, rememberFlag, storedChoice, storedFlag,
 } from '../preferences.js'
+import { silenceTerminalQueries } from '../terminalQueries.js'
 
 const props = defineProps({
   // The id, not the session object: the fleet poll replaces that object every ten
@@ -536,6 +537,7 @@ function buildTerminal() {
     scrollback: 5000,
     theme: terminalTheme(),
   })
+  silenceTerminalQueries(term)
   fit = new FitAddon()
   term.loadAddon(fit)
   term.open(host.value)

@@ -21,6 +21,15 @@ works with the existing Vite 6 toolchain. The setup supplies non-layout
 its components and restores timers. These tests do not verify geometry, scrolling
 or visual appearance. One worker bounds memory use on development hosts.
 
+The terminal's three suites cover different layers of the same fault. `TerminalQueries`
+writes sequences into a real `Terminal` and watches its `onData`; `TerminalReplies`
+mounts `Terminal.vue` against a fake socket and checks that no query reply is typed
+into a live session. `TerminalBundle` builds a small xterm entry with the project's own
+vite config and runs the minified result in a child Node process with jsdom,
+because xterm 6.0.0 minified by Vite 6.4.3 / esbuild 0.25.12 throws on DECRQM and
+the unit suites run xterm unminified. Its control case fails once a minifier stops
+breaking it; delete that case then and keep the rest.
+
 The pane's outbound-copy and thread-pending rules, including complete-command and file/stdin
 correlation limit, are documented in [COMMS.md §4](../../docs/COMMS.md#what-the-chat-pane-draws).
 
