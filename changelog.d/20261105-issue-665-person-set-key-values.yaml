@@ -1,2 +1,0 @@
-changed:
-- "Only the field values a person set (typed, answered or edited) are remembered for an entry's work item, its issue or else its run. A value from the handler's issue map or the project's last value is read fresh each time, so a corrected map entry applies to the next time entry."

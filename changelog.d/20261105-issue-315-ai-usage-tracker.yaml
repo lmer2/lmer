@@ -1,3 +1,0 @@
-added:
-- "Every session now writes its own AI usage record, `ai-usage/<session-id>.yaml`, in its run directory: tokens per harness, model and agent (fan-out children included), wall clock and a per-day split, checkpointed every 15 minutes and finalised at session end. Standalone and platform sessions alike; see docs/USAGE-TRACKING.md (#647)."
-- "The platform shows fleet AI usage live: totals, a \"most expensive now\" order for the run list, limit headroom per harness and operator with a time-to-limit projection, a usage section on the run detail view, and per-project and per-period rollups. Costs appear only when an operator price table is configured (`LMER_PLATFORM_USAGE_PRICES`) (#315)."

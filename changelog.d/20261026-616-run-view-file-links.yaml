@@ -1,2 +1,0 @@
-fixed:
-- "Bare filenames no longer render as dead links; a run file's name in the run view now links to the file in the work repo."
