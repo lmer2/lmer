@@ -1,0 +1,2 @@
+fixed:
+- "The web terminal now shows an agy session's whole screen instead of its first line, and no longer types xterm's terminal-query replies into the session."

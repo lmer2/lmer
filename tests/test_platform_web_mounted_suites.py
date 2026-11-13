@@ -10,7 +10,8 @@ issue #646 the rotate-every-assistant modal; issue #650 the outdated-daemon
 banner; issue #315 the usage strip's headroom chips, the run view's usage
 section, the rollup panel, the fleet card's burn reading and ranking, and the
 list's "most expensive now" order; issue #663 Enter-to-send in the three
-message boxes; issue #649 the thread release dialog).
+message boxes; issue #649 the thread release dialog; issue #699 the terminal's
+silence towards xterm's automatic replies, including through the minifier).
 """
 import os
 from pathlib import Path
@@ -42,6 +43,9 @@ SUITES = [
     "tests/SessionsPerTarget.test.js",
     "tests/StaleDaemon.test.js",
     "tests/StatusStrip.test.js",
+    "tests/TerminalBundle.test.js",
+    "tests/TerminalQueries.test.js",
+    "tests/TerminalReplies.test.js",
     "tests/ThreadRelease.test.js",
     "tests/TimeEntries.test.js",
     "tests/TimeSettings.test.js",
