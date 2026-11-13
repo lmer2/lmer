@@ -64,7 +64,7 @@ __all__ = [
     "RegistryError", "SESSION_KINDS", "WORKER_KIND", "ASSISTANT_KIND",
     "new_session_id", "SESSION_ID_SUFFIX_BYTES", "session_path",
     "token_path", "register", "update", "read_session", "list_sessions",
-    "remove", "prune_dead", "is_live",
+    "remove", "prune_dead", "is_live", "set_aside_ids",
 ]
 
 #: A session is either a worker doing a task or the orchestrating assistant.
@@ -347,17 +347,25 @@ def read_session(session_id: str) -> Optional[dict]:
         return None
 
 
-def list_sessions(*, live_only: bool = True) -> list[dict]:
+def list_sessions(*, live_only: bool = True, strict: bool = False) -> list[dict]:
     """Every registered session, oldest first, each carrying a computed ``live``.
 
     ``live`` is derived on read and never persisted. With ``live_only`` (the
     default) stale entries are filtered out but left on disk — reclaiming them is
     :func:`prune_dead`'s job, so that reads stay side-effect free.
+
+    With ``strict``, an unreadable entry or listing raises :class:`StoreError`
+    instead of being skipped: for a caller that would act on a session's
+    *absence*, a list with a hole in it is not a list.
     """
     directory = sessions_dir()
     try:
-        paths = sorted(directory.glob("*.json"))
+        paths = sorted(
+            directory / name for name in _entry_names(directory) if name.endswith(".json")
+        )
     except OSError as exc:
+        if strict:
+            raise StoreError(f"cannot list {directory} ({exc})") from exc
         logger.warning("platform_session_list_failed dir=%s error=%s", directory, exc)
         return []
 
@@ -366,6 +374,8 @@ def list_sessions(*, live_only: bool = True) -> list[dict]:
         try:
             entry = read_json(path)
         except StoreError as exc:
+            if strict:
+                raise
             logger.warning("platform_session_unreadable path=%s error=%s", path, exc)
             continue
         if entry is None:
@@ -376,6 +386,33 @@ def list_sessions(*, live_only: bool = True) -> list[dict]:
         entries.append(entry)
     entries.sort(key=lambda e: (e.get("started_at") or "", e.get("id") or ""))
     return entries
+
+
+def set_aside_ids() -> set[str]:
+    """Ids of sessions whose entry :func:`~lmer_platform.store.read_json` moved
+    aside as corrupt (``<id>.json.bad-<stamp>``): the registry has lost what
+    it knew about them, not learned that they ended. Raises
+    :class:`StoreError` when the directory cannot be listed."""
+    directory = sessions_dir()
+    try:
+        names = _entry_names(directory)
+    except OSError as exc:
+        raise StoreError(f"cannot list {directory} ({exc})") from exc
+    return {name.split(".json.bad-", 1)[0] for name in names if ".json.bad-" in name}
+
+
+def _entry_names(directory: Path) -> list[str]:
+    """The non-hidden names in ``directory``; none when it does not exist yet,
+    as before the first session registers.
+
+    ``os.scandir`` rather than ``Path.glob``, which swallows every error from
+    listing the directory and answers an unreadable one with no entries.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            return [entry.name for entry in entries if not entry.name.startswith(".")]
+    except FileNotFoundError:
+        return []
 
 
 def remove(session_id: str, *, force: bool = False) -> bool:

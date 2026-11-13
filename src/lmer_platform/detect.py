@@ -308,6 +308,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import time
 import uuid
 import threading
 from dataclasses import dataclass, field, replace
@@ -319,8 +320,8 @@ from work_repo import run_state
 from lmer_cli import runref
 
 from . import (
-    ask, assistant, checkin, comms, mr_activity, nudge, registry, rotation, runs,
-    stall, statusline, teardown, transcripts, uploads,
+    ask, assistant, checkin, comms, containers, mr_activity, nudge, registry, rotation,
+    runs, stall, statusline, teardown, transcripts, uploads,
 )
 from .api import build_state
 from . import config as config_module
@@ -1307,9 +1308,19 @@ class Detector:
         sender=None,
         sleep=None,
         mr_fetch=None,
+        container_sweep=None,
+        container_sweep_interval: float = containers.SWEEP_INTERVAL_SECONDS,
     ) -> None:
         self.config = config
         self.interval = interval
+        #: Queues the removal of half-removed session containers
+        #: (:func:`lmer_platform.containers.sweep`). ``None`` skips the stage, so
+        #: a detector built by a test never reaches a container runtime.
+        self._container_sweep = container_sweep
+        self._container_sweep_interval = container_sweep_interval
+        #: ``time.monotonic()`` of the last container sweep; ``None`` makes the
+        #: first tick sweep, which is the daemon-start one.
+        self._container_swept_at: Optional[float] = None
         #: How a review run's MR is read for the check-in pass (#401). ``None`` is
         #: the GitLab API; tests hand in a fake (:mod:`lmer_platform.mr_activity`).
         self._mr_fetch = mr_fetch
@@ -1497,6 +1508,22 @@ class Detector:
             "a run that stops moving emits nothing at all."
         )
 
+    def _container_sweep_stage(self) -> None:
+        if self._container_sweep is None:
+            return
+        now = time.monotonic()
+        if (self._container_swept_at is not None
+                and now - self._container_swept_at < self._container_sweep_interval):
+            return
+        self._container_swept_at = now
+        try:
+            # Only queues: the removals run on the containers module's own thread.
+            self._container_sweep()
+        except Exception as exc:  # noqa: BLE001 - one failed stage must not stop detection
+            self._absorb("containers", exc)
+        else:
+            self._clear("containers")
+
     def start(self) -> threading.Thread:
         """Run the detection loop on a daemon thread."""
         thread = threading.Thread(
@@ -1580,6 +1607,8 @@ class Detector:
             self._absorb("teardown", exc)
         else:
             self._clear("teardown")
+
+        self._container_sweep_stage()
 
         try:
             payload = self._read_state(self.config)

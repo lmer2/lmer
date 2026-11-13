@@ -10,6 +10,7 @@ import {
   mdiAlertOutline,
   mdiCheckboxBlankCircleOutline,
   mdiCircleSlice8,
+  mdiHelpCircleOutline,
   mdiPencil,
 } from '@mdi/js'
 
@@ -32,6 +33,7 @@ const ICONS = {
   circle: mdiCircleSlice8,
   alert: mdiAlertOutline,
   'alert-circle': mdiAlertCircleOutline,
+  'help-circle': mdiHelpCircleOutline,
 }
 
 const meta = computed(() => slotMeta(props.row.state))

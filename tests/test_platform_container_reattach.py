@@ -221,6 +221,7 @@ def test_a_container_that_ended_while_no_daemon_was_up_keeps_its_code(
     assert registry.read_session(session_id)["exited"]["code"] == 5
     assert [e["data"]["exit_code"] for e in exit_events(session_id)] == [5]
     assert "exited with code 5" in log_text(session_id)
+    assert containers.wait_for_removals(timeout=20)
     assert containers.discover() == []
 
 
@@ -290,6 +291,7 @@ def test_a_container_not_yet_started_is_neither_followed_nor_recorded(
     [found] = containers.discover()
     assert not found.started and found.exit_code is None
     assert reattach.reattach_all(config=config) == []
+    assert containers.wait_for_removals(timeout=20)
     assert containers.discover() == []
 
 
@@ -322,6 +324,7 @@ def test_two_platforms_on_one_runtime_keep_to_their_own(platform_root, tmp_path,
     time.sleep(0.5)
     assert containers.discover() == []
     containers.stop_for_session("s-other")
+    assert containers.wait_for_removals(timeout=20)
     assert (tmp_path / "containers" / cid_file.read_text()).exists()
 
 
@@ -407,6 +410,7 @@ def test_a_vanished_container_is_gone_and_an_unreadable_one_is_not(
     assert containers.discover() == []  # skipped, and logged
     monkeypatch.delenv("FAKE_RUNTIME_FAIL_INSPECT")
     containers.remove(cid)
+    assert containers.wait_for_removals(timeout=20)
     assert containers.inspect_one(cid) is None
 
 

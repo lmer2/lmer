@@ -24,6 +24,11 @@ running. Anyone can follow it again with `lmer follow`.
    `<runtime> wait <id>` for the real exit code, prints
    `── lmer: container exited with code N ──`, removes the container and exits
    with `N`.
+   - The removal has no timeout: on a busy disk podman can take minutes to
+     delete a container's storage, and a podman killed partway leaves the
+     container stuck in `removing`. A failed `rm` is tried once more; if the
+     container is still listed after that, `lmer` prints
+     `── lmer: could not remove container <id> (…) ──` with the runtime's error.
    - A console that ends while the container still runs is treated as a
      **detach** when `lmer` is interactive and its terminal is still there:
      `lmer` hands the terminal back and leaves the container running. It does
@@ -194,8 +199,67 @@ before acting.
 The exit verb and the assistant's stop end the follower, then stop and remove
 the container in the background. That stop uses the container's stop timeout,
 so the session-end backstop gets its time, and the exit route does not block
-on it. If the background stop fails, the next daemon start finds the container
-untracked and stops it again.
+on it. A stop that fails (podman refuses to stop a container in `removing`) is
+followed by the kill and `rm --force` anyway.
+
+Every removal the daemon makes (the startup removals above, the exit and stop
+removals, and a failed launch's cleanup) works in two steps, and nothing that
+serves a request or holds the launch lock waits on either:
+
+1. The stop or kill runs at once, on its own thread. A container that has to
+   stop, such as an old assistant beside its successor, never waits for an
+   unrelated removal.
+2. The `rm --force` then goes through one background thread, one container at
+   a time, and a container already queued is not queued again. A removal on a
+   saturated disk slows every other reader, and a second one in parallel would
+   make that worse rather than finish sooner.
+
+One removal may take 30 minutes in all, its retry included (other runtime
+queries keep their 60 s timeout). An `rm --force` that fails is tried once more
+within what is left of that budget; one that timed out has used it up, so it is
+not tried again and the sweep picks the container up. A removal that still
+fails is logged as `platform_container_remove_failed id=<container id>`.
+
+The `rm` runs in a session of its own, so a Ctrl-C in the daemon's terminal does
+not reach a removal halfway through, which is what leaves a container in
+`removing`. Under systemd it still shares the daemon's cgroup; see
+[Running the daemon under systemd](#running-the-daemon-under-systemd).
+
+A sweep's removal (below) re-checks the container before it acts and may do
+nothing. If an exit or stop asks to remove the same container while that is
+queued, the unconditional removal takes its place; while it is running, the
+unconditional one queues behind it.
+
+### The sweep
+
+At daemon start and every 10 minutes after, from the detection loop, the daemon
+queues a sweep of its own `launcher=platform` containers that a removal left
+half done:
+
+- listed by the runtime in `removing` state (`ps --filter status=removing`), or
+- listed but unreadable by `inspect` and not running (podman's half-removed
+  container, whose storage is gone), and
+- not held by a session: neither a live one (its launcher may still be running
+  its own `rm`, which the runtime would make a second one wait behind) nor one
+  whose exit is not recorded yet (the container may hold the only copy of the
+  code, which the next daemon start records), nor one whose registry entry was
+  moved aside as corrupt (`<id>.json.bad-<stamp>`), since nothing then says
+  which of those it was.
+
+The sweep acts only on a complete read of the session registry. If any entry
+cannot be read (an I/O error, or a schema newer than this daemon) or the
+registry directory cannot be listed, that sweep removes nothing and warns once
+(`platform_container_sweep_failed`), and the next one tries again. A session
+missing from the read is not a session that ended. A registry directory that
+does not exist yet, as before the first session registers, reads as empty;
+any other error listing it counts as an unreadable registry.
+
+Each is checked again just before its turn in the queue, then killed and
+removed with `rm --force`. A removal logs
+`platform_container_swept id=…` at info. One that fails is warned about once
+per container per daemon run, and so is a container that discovery cannot read,
+rather than on every sweep or every start. A sweep that cannot ask the runtime
+at all warns once until a sweep succeeds again.
 
 If the runtime's log driver cannot replay output (e.g. docker's `none`), the
 session log records the gap instead of failing the follow.
@@ -211,7 +275,7 @@ The replay is approximate:
 
 **Expected, pending the probe.** Every verb used here is documented with the
 same meaning on both runtimes: `create --name`, `start --attach`, `attach`,
-`wait`, `inspect`, `ps --filter label=`, `stop`, `rm` and `logs --since`. None of this
+`wait`, `inspect`, `ps --filter label=`, `ps --filter status=`, `stop`, `rm` and `logs --since`. None of this
 has been measured on a real runtime yet.
 
 `python3 scripts/probe_detached_container.py podman docker` checks the
@@ -260,7 +324,9 @@ file before removing the container, and the other one reads it from there.
 Restart survival depends on the unit's `KillMode`. Followers are started in
 their own sessions but stay in the daemon's cgroup, so with the default
 `KillMode=control-group` a `systemctl restart` sends every follower SIGTERM —
-and a follower stops its container on SIGTERM. Use `KillMode=process`.
+and a follower stops its container on SIGTERM. Use `KillMode=process`. The same
+holds for the daemon's own `rm --force`: under `control-group`, a stop kills a
+removal halfway, and the next start's sweep has to clear it.
 
 `mixed` SIGKILLs the followers, which leaves the containers running only when
 the runtime's container processes are outside the unit's cgroup: true for

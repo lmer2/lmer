@@ -912,6 +912,33 @@ def _isolate_dm_registry(tmp_path_factory):
     dm_parents.REGISTRY_DIR = original
 
 
+@pytest.fixture(autouse=True)
+def _contain_container_removals():
+    """Keep the platform's container sweep and removal queue inside one test.
+
+    A test that starts the real daemon starts its detector, whose first tick
+    sweeps through whatever runtime is on ``PATH`` — the host's own, unless the
+    test put a fake there. So the sweep is a no-op unless a test restores it
+    (``tests/test_platform_container_removal.py`` does). The queue is drained
+    on both sides, so a removal one test queued never runs against the next
+    one's fake runtime.
+
+    Patched by hand, not through ``monkeypatch``: an autouse fixture that takes
+    ``monkeypatch`` moves its undo after every later autouse teardown, which
+    then runs with the test's own patches still in place.
+    """
+    from lmer_platform import containers as platform_containers
+
+    real_sweep = platform_containers.sweep
+    platform_containers.sweep = lambda: None
+    platform_containers.wait_for_removals(timeout=60)
+    try:
+        yield
+    finally:
+        platform_containers.wait_for_removals(timeout=60)
+        platform_containers.sweep = real_sweep
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _isolate_platform_state(tmp_path_factory):
     """Point platform state away from the real ~/.lmer/platform (issue #141).
