@@ -24,17 +24,15 @@ def _history_dir(session_id=None):
         return project_context.assistant_dir()
 
 
-@contextmanager
-def _database(session_id=None):
-    directory = _history_dir(session_id)
-    path = directory / "assistant-history.sqlite3"
-    try:
-        store.ensure_state_dir(directory)
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
-        os.close(fd)
-        with closing(sqlite3.connect(path, timeout=10)) as db, db:
-            db.row_factory = sqlite3.Row
-            db.executescript("""
+#: The schema :func:`_ensure_schema` builds, as recorded in ``PRAGMA
+#: user_version``; bump it whenever :data:`_SCHEMA` changes (see
+#: :data:`lmer_platform.projects.PROJECTS_SCHEMA`, which follows the same rule).
+HISTORY_SCHEMA = 1
+
+#: Directories this process has already tightened.
+_PREPARED: set = set()
+
+_SCHEMA = """
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS generations (
                     session TEXT PRIMARY KEY,
@@ -58,7 +56,53 @@ def _database(session_id=None):
                     session TEXT PRIMARY KEY,
                     fingerprint TEXT UNIQUE
                 );
-            """)
+"""
+
+
+def _ensure_schema(db):
+    """Build the schema unless the file's ``user_version`` already records it.
+
+    The per-call ``executescript`` this replaces ran on every history read — on
+    every assistant-credential request among them (#561). Decided by the file's
+    content rather than its inode, so a file restored in place heals.
+    """
+    if db.execute("PRAGMA user_version").fetchone()[0] == HISTORY_SCHEMA:
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("PRAGMA user_version").fetchone()[0] != HISTORY_SCHEMA:
+            for statement in _SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute(f"PRAGMA user_version = {HISTORY_SCHEMA}")
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+@contextmanager
+def _database(session_id=None, *, read_only=False, directory=None):
+    """One connection to the history file of *session_id*'s project.
+
+    *read_only* sets ``query_only`` for the pure reads: they never took a write
+    lock here, and now they cannot write by accident either. *directory* names
+    the history directory directly, for a caller that already resolved it.
+    """
+    directory = directory or _history_dir(session_id)
+    path = directory / "assistant-history.sqlite3"
+    try:
+        if str(directory) not in _PREPARED:
+            store.ensure_state_dir(directory)
+            _PREPARED.add(str(directory))
+        if not path.exists():
+            store.ensure_state_dir(directory)
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        with closing(sqlite3.connect(path, timeout=10)) as db, db:
+            db.row_factory = sqlite3.Row
+            _ensure_schema(db)
+            if read_only:
+                db.execute("PRAGMA query_only = ON")
             yield db
     except (OSError, sqlite3.Error) as exc:
         raise StoreError(f"cannot access assistant history ({exc})") from exc
@@ -72,7 +116,7 @@ def generation(session_id: str | None) -> dict | None:
         registry.session_path(session_id)
     except registry.RegistryError:
         return None
-    with _database(session_id) as db:
+    with _database(session_id, read_only=True) as db:
         row = db.execute("SELECT * FROM generations WHERE session = ?", (session_id,)).fetchone()
     return dict(row) if row else None
 
@@ -107,11 +151,28 @@ def register(session_id: str, *, number: int, started_at: str | None,
     return generation(session_id)
 
 
+def generations_of(workspace_id: str) -> tuple[dict, str | None]:
+    """One project's generations by session, and its head, in one read (#561).
+
+    What :func:`generation` and :func:`latest` answer one at a time, for a
+    caller that would otherwise ask once per retired generation — the fleet
+    read does, under the lock ``GET /api/assistant`` waits on.
+    """
+    with project_context.bound(workspace_id):
+        directory = project_context.assistant_dir()
+    if not (directory / "assistant-history.sqlite3").is_file():
+        return {}, None
+    with _database(directory=directory, read_only=True) as db:
+        rows = {row["session"]: dict(row) for row in db.execute("SELECT * FROM generations")}
+        head = db.execute("SELECT value FROM metadata WHERE key = 'head'").fetchone()
+    return rows, head[0] if head and head[0] in rows else None
+
+
 def latest() -> dict | None:
     """Return the last explicitly published generation, including stopped ones."""
     if not (_history_dir() / "assistant-history.sqlite3").is_file():
         return None
-    with _database() as db:
+    with _database(read_only=True) as db:
         row = db.execute(
             "SELECT generations.* FROM generations JOIN metadata "
             "ON generations.session = metadata.value WHERE metadata.key = 'head'"
@@ -132,7 +193,7 @@ def credential_owner(credential: str) -> dict | None:
     if not (_history_dir() / "assistant-history.sqlite3").is_file():
         return None
     fingerprint = hashlib.sha256(credential.encode()).hexdigest()
-    with _database() as db:
+    with _database(read_only=True) as db:
         row = db.execute(
             "SELECT generations.* FROM generations JOIN credentials USING (session) "
             "WHERE credentials.fingerprint = ?", (fingerprint,),
@@ -200,7 +261,7 @@ def events(session_id: str) -> list:
 
     if not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
         return []
-    with _database(session_id) as db:
+    with _database(session_id, read_only=True) as db:
         rows = db.execute(
             "SELECT position, payload FROM records WHERE session = ? ORDER BY position LIMIT ?",
             (session_id, MAX_MESSAGES_PER_SOURCE),
@@ -216,7 +277,7 @@ def transcript_limit_note(session_id: str) -> str | None:
 
     if not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
         return None
-    with _database(session_id) as db:
+    with _database(session_id, read_only=True) as db:
         more = db.execute(
             "SELECT 1 FROM records WHERE session = ? ORDER BY position LIMIT 1 OFFSET ?",
             (session_id, MAX_MESSAGES_PER_SOURCE),
@@ -265,7 +326,7 @@ def _conversation_page(session_id: str, prefix: list, *, since: int,
     from .transcripts import _comms_turns
 
     offset = len(prefix)
-    with _database(session_id) as db:
+    with _database(session_id, read_only=True) as db:
         count = db.execute("SELECT count(*) FROM records WHERE session = ?", (session_id,)).fetchone()[0]
         total = count + offset
         end = total

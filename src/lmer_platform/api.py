@@ -102,6 +102,8 @@ from . import checkin
 from . import comms
 from . import connectors
 from . import lifecycle
+from . import load
+from . import state_flight
 from lmer_cli import comms as bus_comms
 from lmer_cli import pi_providers
 from lmer_cli import routing_receipts
@@ -235,6 +237,14 @@ __all__ = [
 
 REALM = "lmer platform"
 
+#: Threads for authentication and request binding (#561): a small pool of
+#: their own, apart from the 40-token pool the handlers share.
+CONTROL_THREADS = 8
+#: ``/api/health``'s own threads for its authentication, binding and body
+#: (#561), so blocked bindings holding every control thread cannot silence it.
+#: Enough for a watch and a person at once.
+HEALTH_THREADS = 2
+
 #: Who a request came from, once authenticated — one value per credential
 #: (issue #244). ``operator`` names *everything else* rather than a person: a
 #: browser, ``curl`` and a script all present the same shared secret and are
@@ -252,6 +262,10 @@ WS_POLICY_VIOLATION = 1008
 #: What a 503 for transient state contention tells a client to wait (seconds,
 #: as the ``Retry-After`` header carries it).
 RETRY_AFTER_SECONDS = "1"
+
+#: ``Retry-After`` on a ``GET /api/state`` that found no build within the join
+#: deadline (#561): long enough for the build in hand to finish.
+STATE_RETRY_AFTER_SECONDS = "5"
 
 
 #: The ``detail.code`` of the 503 ``POST /api/sessions`` answers when the chat
@@ -1333,7 +1347,7 @@ def _fold_readopt(payload: dict, marks: dict) -> None:
         row["readopt"] = dict(mark) if mark else None
 
 
-def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
+def build_state(config: PlatformConfig, *, force_pull: bool = False, mirror=None) -> dict:
     """Assemble the fleet view for the runs **this orchestrator tracks**.
 
     Scope comes from the local run index, never from the shared work repo (spec
@@ -1345,8 +1359,30 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     evidence that a session crashed, and filtering it out here would silently
     drop crashed runs from the attention list (see
     :mod:`lmer_platform.inventory`).
+
+    Each stage is timed into :data:`lmer_platform.load.BUILDS` (#561), so
+    ``/api/health`` and the slow-request log can say which stage a slow build
+    spent its time in — the publication-lock wait separately from the work done
+    under it, since that lock is what ``GET /api/assistant`` queues on.
+
+    ``mirror`` is the status of a pull the caller has already made, and this
+    build then pulls nothing: ``GET /api/state`` pulls per request and shares
+    the build (:mod:`lmer_platform.state_flight`), and a ``git fetch`` inside a
+    shared build would hold every request that joined it.
     """
-    mirror = pull(config, force=force_pull).to_dict()
+    stages = load.BUILDS.begin()
+    try:
+        payload = _build_state(config, force_pull=force_pull, pulled=mirror, stages=stages)
+    except BaseException:
+        load.BUILDS.abandon()
+        raise
+    load.BUILDS.end(stages, finished_at=utc_now_iso())
+    return payload
+
+
+def _build_state(config: PlatformConfig, *, force_pull: bool, pulled, stages) -> dict:
+    mirror = (pulled if pulled is not None else pull(config, force=force_pull)).to_dict()
+    stages.mark("pull")
     # The tree's form, so the UI can gate its schema views (#374): a presence
     # test and no validation — the validator runs only behind
     # GET /api/workrepo/schema, never on the poll.
@@ -1358,10 +1394,13 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # A read of the index and nothing else once every entry carries its uid.
     run_transition.reconcile(config)
     readopt = run_transition.readopt_marks()
+    stages.mark("reconcile")
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
     with assistant._PUBLICATION_LOCK:
+        stages.mark("publication_wait")
         sessions = projects.inventory_sessions(list_sessions(live_only=False))
+    stages.mark("sessions")
     # A forgotten run's index entry is gone, but its retained registry sessions
     # are evidence: leave them on disk and out of the fleet view (#527).
     sessions = filter_forgotten(sessions)
@@ -1400,6 +1439,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
             backstop_after=config.stall_backstop_seconds,
         ),
     )
+    stages.mark("inventory")
 
     slot_entries, slots_problem = stored_slots_or_problem()
     payload = {
@@ -1441,6 +1481,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     _fold_relations(payload)
     _fold_readopt(payload, readopt)
     usage_api.fold_state(payload, usage_live.current(), table=usage_api.price_table(config)[0])
+    stages.mark("folds")
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -2689,8 +2730,50 @@ def create_app(
     adopt_ui = started_ui is None and is_built()
     if adopt_ui:
         logger.warning("platform_ui_fingerprint_unavailable dir=%s; the first readable bundle becomes the baseline", dist_dir())
-    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
-                  lifespan=ingress.lifespan if ingress else None)
+    # Per app, like the ticket store below: a second app in one process (tests)
+    # must not report the first one's requests (#561).
+    in_flight = load.InFlight()
+    monitor = load.LoopMonitor(in_flight)
+    flights = state_flight.StateFlights()
+
+    if builder is build_state:
+        # Pulled per request by the route, never inside a shared build: the
+        # build is handed the status its leader's own pull returned.
+        def _pull_for_request():
+            return pull(config)
+
+        def _shared_build(status):
+            def build():
+                load.BUILDS.thread_last()  # a pool thread may hold another route's record
+                payload = build_state(config, mirror=status)
+                return payload, (load.BUILDS.thread_last() or {}).get("stages")
+            return build
+    else:
+        # An injected builder (tests) is called as it always was, and pulls
+        # nothing; a missing head never differs from another missing head.
+        def _pull_for_request():
+            return None
+
+        def _shared_build(_status):
+            return lambda: (builder(config), None)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app_):
+        # The monitor runs on the loop it measures; it needs no pool thread, so
+        # it still reports when the pool is full.
+        task = asyncio.create_task(monitor.run(), name="platform-loop-monitor")
+        try:
+            if ingress:
+                async with ingress.lifespan(app_):
+                    yield
+            else:
+                yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION), lifespan=lifespan)
     app.router.route_class = project_api.WorkspaceRoute
 
     @app.exception_handler(projects.ProjectError)
@@ -2745,15 +2828,41 @@ def create_app(
     from starlette.middleware.gzip import GZipMiddleware
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Outside compression: a request counts as waiting from the moment it
+    # reaches the app until its response starts, compression included.
+    app.add_middleware(load.RequestTracker, ledger=in_flight)
+    # Outermost (added last), so its bump at response start comes after
+    # everything inside, compression included, has produced that response.
+    app.add_middleware(state_flight.WriteGeneration, flights=flights)
 
     # Per app rather than per module so tests get a fresh store and a second app
     # in one process cannot redeem the first one's tickets. In production there is
     # exactly one app in exactly one process (see session_io on why that matters).
     tickets = session_io.TicketStore()
 
-    def authenticate(
+    # Authentication and request binding run here rather than in the shared
+    # threadpool or on the event loop (#561): their own tokens mean blocked
+    # handlers cannot starve authentication.
+    control = anyio.CapacityLimiter(CONTROL_THREADS)
+    # /api/health's own tokens, for its authentication, binding and body. A
+    # binding can still block (a busy projects database, the assistant lock),
+    # and with every control token held by one, health sharing them could not
+    # answer at all — which is exactly when `degraded` must be readable.
+    health_threads = anyio.CapacityLimiter(HEALTH_THREADS)
+
+    async def authenticate(
         authorization: Optional[str] = Header(default=None)
     ) -> Caller:
+        """Authenticate on the control limiter; see :func:`_authenticate`."""
+        return await anyio.to_thread.run_sync(_authenticate, authorization, limiter=control)
+
+    async def authenticate_for_health(
+        authorization: Optional[str] = Header(default=None)
+    ) -> Caller:
+        """:func:`authenticate` on /api/health's own limiter."""
+        return await anyio.to_thread.run_sync(_authenticate, authorization, limiter=health_threads)
+
+    def _authenticate(authorization: Optional[str]) -> Caller:
         """Authenticate, and say who called (issue #244).
 
         The shared secret first — the common case, and the one this app was
@@ -2820,7 +2929,8 @@ def create_app(
             headers={"WWW-Authenticate": f'Basic realm="{REALM}"'},
         )
 
-    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+    @contextlib.asynccontextmanager
+    async def _bound(request, caller, limiter):
         body = {}
         if "application/json" in request.headers.get("content-type", ""):
             try:
@@ -2831,11 +2941,28 @@ def create_app(
         # Read by project_store_busy: a failure between these two marks is in
         # the binding, before the handler, so it applied nothing.
         request.state.binding_entered = True
-        with project_api.bind(request, caller, body):
+        # The lookups — sqlite, and for an assistant caller a registry scan —
+        # used to run right here on the event loop and stall every request,
+        # /api/health included (#561). Only the context variables are set here.
+        binding = await anyio.to_thread.run_sync(
+            project_api.resolve_binding, project_api.request_inputs(request), caller, body,
+            limiter=limiter,
+        )
+        with project_api.applied(binding):
             request.state.binding_done = True
+            yield
+
+    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+        async with _bound(request, caller, control):
+            yield caller
+
+    async def require_secret_for_health(request: Request, caller: Caller = Depends(authenticate_for_health)):
+        """:func:`require_secret` — the same checks and refusals — on health's own limiter."""
+        async with _bound(request, caller, health_threads):
             yield caller
 
     require_secret.__annotations__["request"] = Request
+    require_secret_for_health.__annotations__["request"] = Request
     guard = [Depends(require_secret)]
 
     def _unreadable_config(exc: StoreError) -> HTTPException:
@@ -3810,13 +3937,15 @@ def create_app(
             _write_assistant_settings({key: value for key, value in body.items() if key != "fleet_groups"}, changes)
             return platform_settings()
 
-    @app.get("/api/health", dependencies=guard)
-    def health() -> dict:
-        """Cheap liveness — deliberately does not pull the mirror.
+    async def _request_state(request: Request):
+        # async so it costs no pool thread: /api/health must not need one.
+        return request.state
 
-        Health checks run often; making one depend on a network fetch would turn
-        a slow remote into a false "unhealthy".
-        """
+    # The same late binding as require_secret: Request is imported in this
+    # function, so the string annotation would not resolve.
+    _request_state.__annotations__["request"] = Request
+
+    def _health_body() -> dict:
         nonlocal started_ui
         status = mirror_status(config)
         serving_ui = bundle_fingerprint()
@@ -3836,9 +3965,68 @@ def create_app(
             },
         }
 
+    @app.get("/api/health", dependencies=[Depends(require_secret_for_health)])
+    async def health(request_state=Depends(_request_state)) -> dict:
+        """Cheap liveness — deliberately does not pull the mirror.
+
+        Health checks run often; making one depend on a network fetch would turn
+        a slow remote into a false "unhealthy".
+
+        ``ok`` is liveness and nothing more. ``load`` is what the process is
+        doing — requests still waiting, loop lag, pool use, the state build, the
+        project supervisor's cadence, the projects database's write-lock wait —
+        and ``degraded``/``degraded_reasons`` read it (#561), so a daemon whose
+        other routes have wedged can no longer answer here looking idle.
+
+        Nothing on this route needs the handlers' threadpool or the control
+        limiter (#561): its authentication, binding and file reads run on its
+        own small limiter and the load numbers are read on the loop, so a full
+        pool, or every binding thread blocked, is reported here instead of
+        making health time out.
+        """
+        body = await anyio.to_thread.run_sync(_health_body, limiter=health_threads)
+        return {**body, **_load_report(exclude=getattr(request_state, load.IN_FLIGHT_KEY, None))}
+
+    def _load_report(*, exclude=None) -> dict:
+        """What the process is doing now (#561): ``load``, ``degraded``, why.
+
+        *exclude* is the asking request's own ledger key: a health call is
+        itself in flight while it answers, and must not report itself.
+        """
+        current = {
+            "requests": in_flight.snapshot(exclude=exclude),
+            **monitor.snapshot(),
+            "state_build": {**load.BUILDS.snapshot(), "flight": flights.snapshot()},
+            "reconcile": load.RECONCILE.snapshot(),
+            "db_write_wait": load.DB_WRITE_WAIT.snapshot(),
+        }
+        reasons = load.assess(current)
+        return {"load": current, "degraded": bool(reasons), "degraded_reasons": reasons}
+
     @app.get("/api/state", dependencies=guard)
-    def state() -> dict:
-        payload = builder(config)
+    def state(request_state=Depends(_request_state)) -> dict:
+        """The fleet view, from a build this request shares when it may (#561).
+
+        The pull stays per request and outside the shared build: only the
+        request that wins the pull throttle waits on ``git fetch``, never the
+        requests that join its build. Past the join deadline the answer is a 503
+        with ``Retry-After``, which nothing was changed by.
+        """
+        status = _pull_for_request()
+        # A status without a head (none yet, or a stand-in) never matches a
+        # build that has one, so it only ever joins a headless build.
+        head = getattr(status, "head_sha", None)
+        try:
+            payload, stages = flights.get(project_scope.current(), head, _shared_build(status))
+        except state_flight.FlightTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_busy_detail(f"The fleet view is busy ({exc}).", retryable=True,
+                                    advice="Nothing was changed; retry the request."),
+                headers={"Retry-After": STATE_RETRY_AFTER_SECONDS},
+            ) from exc
+        # Read by the slow-request log: which stage the time went to.
+        request_state.timings = stages
         return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.post("/api/rescan", dependencies=guard)

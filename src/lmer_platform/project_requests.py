@@ -67,7 +67,8 @@ def active(workspace_id):
 
 def bound(workspace_id):
     """The request the project's credential is bound to, without binding one as :func:`active` does."""
-    with projects.database() as db:
+    # A pure read: no write lock (#561), as the request binding reaches it.
+    with projects.reader() as db:
         row = db.execute("SELECT request_id FROM request_context WHERE project_id=?", (workspace_id,)).fetchone()
     return row[0] if row else None
 
@@ -82,7 +83,9 @@ def _decode(row):
 
 
 def get(identity):
-    with projects.database() as db:
+    # A pure read: no write lock (#561). The request binding calls it, directly
+    # and through authorize(), for every request that carries a request id.
+    with projects.reader() as db:
         row = db.execute("SELECT * FROM requests WHERE id=?", (identity,)).fetchone()
     if row is None:
         raise projects.ProjectError("This conversation request does not exist.", status=404)
