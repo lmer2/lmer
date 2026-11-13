@@ -40,9 +40,20 @@ def connector_lifetimes(monkeypatch):
 
 
 class FakeSlack:
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail=False, scopes=None, identify_fails=False):
         self.posted = []
         self.fail = fail
+        self.granted_scopes = None
+        self._scopes = scopes
+        self._identify_fails = identify_fails
+        self.identified = 0
+
+    def auth_test(self):
+        self.identified += 1
+        if self._identify_fails:
+            raise SlackError("Request failed: ConnectionError", transient=True)
+        self.granted_scopes = self._scopes
+        return "UBOT"
 
     def post_message(self, channel, thread_ts, text, *, connection_notice=False):
         if self.fail:
@@ -113,6 +124,42 @@ class TestTheConnectorsOwnLines:
             built._announce_attached()
         assert built._state.blocked
         assert built._announced is False
+
+    def test_an_app_that_cannot_read_files_says_so_without_naming_the_scope(self):
+        slack = FakeSlack(scopes=["chat:write", "channels:history"])
+        built = slack_connector_with(slack=slack)
+        built._ensure_ready()
+        built._announce_attached()
+        (notice,) = slack.posted
+        assert notice == f"{slack_connector.ATTACH_ACK} {slack_connector.FILES_UNREADABLE_NOTE}"
+        assert "files:read" not in notice and "scope" not in notice
+        assert slack.identified == 1
+
+    def test_with_the_ack_off_the_files_sentence_is_left_to_the_listener(self):
+        """The listener's announcement carries it (tests/test_slack_listener.py)."""
+        slack = FakeSlack(scopes=["chat:write", "channels:history"])
+        built = slack_connector_with(attach_ack=False, slack=slack)
+        built._ensure_ready()
+        built._announce_attached()
+        assert slack.posted == []
+
+    def test_the_one_auth_test_the_notice_asked_is_the_one_the_poll_uses(self):
+        slack = FakeSlack(scopes=["chat:write", "files:read"])
+        built = slack_connector_with(slack=slack)
+        built._ensure_ready()
+        built._announce_attached()
+        built._identify()
+        assert slack.posted == [slack_connector.ATTACH_ACK]
+        assert slack.identified == 1
+
+    @pytest.mark.parametrize("slack", [
+        FakeSlack(scopes=None), FakeSlack(identify_fails=True),
+    ], ids=["scopes-unknown", "auth-test-failed"])
+    def test_not_knowing_the_scopes_leaves_the_notice_as_it_was(self, slack):
+        built = slack_connector_with(slack=slack)
+        built._ensure_ready()
+        built._announce_attached()
+        assert slack.posted == [slack_connector.ATTACH_ACK]
 
     def test_the_env_switch_reaches_the_config(self):
         env = {

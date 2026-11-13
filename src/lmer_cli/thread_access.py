@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import requests
+import urllib3  # requests' own transport, installed with it
 
 from ask_channel import bus
 from matrix_chat.client import MatrixAccount, MatrixClient
@@ -56,7 +57,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "UploadStore", "ThreadServicer", "resolve_thread", "read_thread",
     "post_thread", "open_thread", "send_dm", "render_record", "stage_upload",
-    "read_from_store", "stored_name_of",
+    "read_from_store", "stored_name_of", "attachment_line", "stage_slack_file",
+    "FileNotFetched", "fetch_slack_file",
     "slack_token", "matrix_account", "DAEMON_ENVIRONMENT", "CLI_ENVIRONMENT",
 ]
 
@@ -147,6 +149,19 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 #: Why a file read from a thread was described rather than copied in.
 NO_STORE = "this session has no upload store"
+NOT_FETCHED = "it could not be fetched"
+#: Every reason that is Slack's own answer, as opposed to no answer at all.
+NOT_FETCHED_SLACK_ANSWERED = f"{NOT_FETCHED}: Slack answered"
+NOT_FETCHED_WEB_PAGE = f"{NOT_FETCHED_SLACK_ANSWERED} with a web page instead of the file"
+NOT_FETCHED_NOT_THE_FILE = f"{NOT_FETCHED_SLACK_ANSWERED} with something other than the file"
+NOT_FETCHED_TOO_LARGE = "it is over the size this copies in"
+NOT_FETCHED_NO_URL = "the thread does not say where to fetch it"
+NOT_WRITTEN = "it could not be written to the upload store"
+SLACK_FILES_READ = "files:read"
+NOT_FETCHED_SLACK_SCOPE = f"{NOT_FETCHED}: the Slack app lacks the {SLACK_FILES_READ} scope"
+
+#: Seconds a file download may wait for the connection, or for its next bytes.
+FETCH_TIMEOUT = 30
 
 #: A message in an encrypted thread whose room key lmer-matrix-bridge's device
 #: never received: there, but not readable to lmer.
@@ -568,11 +583,11 @@ def render_record(record: dict) -> str:
     who = f"{channel} · {author}" if author else channel
     lines = [f"[{who}] {record.get('text') or ''}".rstrip()]
     for item in record.get("attachments") or []:
-        lines.append(f"    {_attachment_line(item)}")
+        lines.append(f"    {attachment_line(item)}")
     return "\n".join(lines)
 
 
-def _attachment_line(item: object) -> str:
+def attachment_line(item: object) -> str:
     """A staged file names the path the session can open; one that was only
     described names what it is, because there was nowhere to put it."""
     if not isinstance(item, dict):
@@ -711,53 +726,100 @@ def _stage_slack_files(
     for item in files:
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or item.get("title") or "file"
-        media_type = (item.get("mimetype") or "application/octet-stream").split(";")[0]
-        url = item.get("url_private_download") or item.get("url_private")
-        record = {"name": name, "media_type": media_type, "bytes": item.get("size")}
+        record = describe_slack_file(item)
         if store is None:
             record["reason"] = unstored
-        elif not url:
-            record["reason"] = "the thread does not say where to fetch it"
         elif budget[0] <= 0:
             record["reason"] = "this read has already copied in as much as it will"
         else:
-            data = fetch_slack_file(url, client.bot_token, max_bytes=min(MAX_FILE_BYTES, budget[0]))
-            if data is None:
-                record["reason"] = "it could not be fetched, or is over the size this copies in"
-            else:
-                staged = stage_upload(store, name, data, media_type)
-                if staged is None:
-                    # Told apart from the fetch failing, as the matrix path does:
-                    # the two send an operator to different places.
-                    record["reason"] = "it could not be written to the upload store"
-                else:
-                    budget[0] -= len(data)
-                    record = staged
+            record, cost = stage_slack_file(
+                item, client.bot_token, store, max_bytes=min(MAX_FILE_BYTES, budget[0]),
+            )
+            budget[0] -= cost
         described.append(record)
     return described
 
 
+def describe_slack_file(item: dict) -> dict:
+    """What a Slack file object says the file is, before any of it is fetched."""
+    return {
+        "name": item.get("name") or item.get("title") or "file",
+        "media_type": _media_type(item.get("mimetype")) or "application/octet-stream",
+        "bytes": item.get("size"),
+    }
+
+
+def _media_type(value: Optional[str]) -> str:
+    """A Content-Type reduced to its comparable part: no parameters, no case."""
+    return (value or "").split(";")[0].strip().lower()
+
+
+def stage_slack_file(
+    item: dict, token: str, store: UploadStore, *, max_bytes: int = MAX_FILE_BYTES,
+) -> tuple:
+    """``(record, bytes staged)`` for one Slack file: the staged upload, or its
+    description with the reason it is not one, at a cost of 0."""
+    described = describe_slack_file(item)
+    url = item.get("url_private_download") or item.get("url_private")
+    if not url:
+        return {**described, "reason": NOT_FETCHED_NO_URL}, 0
+    try:
+        data = fetch_slack_file(
+            url, token, max_bytes=max_bytes, expected_type=described["media_type"],
+        )
+    except FileNotFetched as exc:
+        return {**described, "reason": exc.reason}, 0
+    staged = stage_upload(store, described["name"], data, described["media_type"])
+    if staged is None:
+        return {**described, "reason": NOT_WRITTEN}, 0
+    return staged, len(data)
+
+
+class FileNotFetched(Exception):
+    """A thread file that could not be had; :attr:`reason` is safe to show anyone.
+
+    A fixed phrase plus at most a status number or an exception's class name:
+    the exception's own text carries the file's URL, and the line it ends up in
+    is read in the session and, through it, wherever the session posts.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def fetch_slack_file(
-    url: str, token: str, *, max_bytes: int = MAX_FILE_BYTES,
-) -> Optional[bytes]:
-    """One Slack file, or ``None`` when it cannot be had inside the bound.
+    url: str, token: str, *, max_bytes: int = MAX_FILE_BYTES, expected_type: Optional[str] = None,
+) -> bytes:
+    """One Slack file's bytes; :class:`FileNotFetched` when they cannot be had inside the bound.
 
     Streamed and counted as it arrives. The unstreamed version applied the same
     bound *after* the body was resident, which is not a bound on this process at
     all: a thread the run was merely pointed at could hold a file of any size,
     and on the platform route the process reading it is the daemon that serves
     every session in the fleet.
+
+    What arrives in place of the file that was posted is refused rather than
+    staged: an agent handed a sign-in page named ``image.png`` would read it as
+    the screenshot. For a declared type with a byte signature the first bytes
+    decide, whatever the response is labelled: they must carry a known
+    signature, though not necessarily the declared one. For any other declared
+    type only a ``text/html`` label can show it.
     """
+    expected = _media_type(expected_type)
     try:
         with requests.get(
-            url, headers={"Authorization": f"Bearer {token}"}, timeout=30, stream=True,
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=FETCH_TIMEOUT, stream=True,
         ) as response:
             response.raise_for_status()
+            served = _media_type(response.headers.get("Content-Type"))
+            if served == "text/html" and expected != "text/html":
+                logger.warning("thread_read_file_failed error=html_page expected=%s", expected)
+                raise FileNotFetched(NOT_FETCHED_WEB_PAGE)
             declared = response.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
                 logger.info("thread_read_file_too_large bytes=%s", declared)
-                return None
+                raise FileNotFetched(NOT_FETCHED_TOO_LARGE)
             body = bytearray()
             for chunk in response.iter_content(chunk_size=65536):
                 body.extend(chunk)
@@ -765,11 +827,81 @@ def fetch_slack_file(
                     # A Content-Length is a claim, not a promise: the count of
                     # what actually arrived is what stops here.
                     logger.info("thread_read_file_too_large bytes=over %s", max_bytes)
-                    return None
+                    raise FileNotFetched(NOT_FETCHED_TOO_LARGE)
+            if _lacks_signature(expected, body):
+                logger.warning("thread_read_file_failed error=signature_mismatch expected=%s", expected)
+                raise FileNotFetched(NOT_FETCHED_WEB_PAGE if _looks_like_markup(body) else NOT_FETCHED_NOT_THE_FILE)
             return bytes(body)
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        logger.warning("thread_read_file_failed status=%s error=%s", status, exc)
+        if isinstance(status, int):
+            raise FileNotFetched(f"{NOT_FETCHED_SLACK_ANSWERED} HTTP {status}") from None
+        raise FileNotFetched(NOT_FETCHED) from None
     except requests.RequestException as exc:
         logger.warning("thread_read_file_failed error=%s", exc)
-        return None
+        if _timed_out(exc):
+            raise FileNotFetched(f"{NOT_FETCHED}: the download timed out ({FETCH_TIMEOUT} s without data)") from None
+        raise FileNotFetched(f"{NOT_FETCHED}: {type(exc).__name__}") from None
+
+
+def _lacks_signature(declared: str, body: bytes) -> bool:
+    """Whether Slack declared a type with a byte signature and *body* carries no
+    known signature at all.
+
+    Any known signature passes, not only the declared one: Slack's mimetype for
+    an image can name a different image format than its bytes, and that is
+    still the file. ``False`` for a declared type with no signature to check:
+    those are left to the response's label.
+    """
+    # deferred: import cost — lmer_platform.uploads adds ~100 ms to the lmer-signal path
+    from lmer_platform.uploads import HEAD_BYTES, KNOWN_TYPES, _signature_kind
+
+    for kind in KNOWN_TYPES.values():
+        if not kind.text and _media_type(kind.content_type) == declared:
+            return _signature_kind(bytes(body[:HEAD_BYTES])) is None
+    return False
+
+
+def _looks_like_markup(body: bytes) -> bool:
+    return bytes(body[:1024]).lstrip().startswith(b"<")
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """Whether a transport failure was a timeout. A read that times out once the
+    body is streaming reaches the caller as a ``ConnectionError`` wrapping
+    urllib3's ``ReadTimeoutError``, not as :class:`requests.Timeout`."""
+    if isinstance(exc, requests.Timeout):
+        return True
+    return any(isinstance(arg, urllib3.exceptions.ReadTimeoutError) for arg in exc.args)
+
+
+def matrix_fetch_reason(exc: BaseException) -> str:
+    """Why a Matrix file could not be downloaded, as a fixed phrase: the
+    status, never the error's text, which names the homeserver and the path."""
+    cause = exc.__cause__ or exc.__context__
+    crypto = next((each for each in (exc, cause) if isinstance(each, CryptoError)), None)
+    if crypto is not None:
+        # Its status is the bridge's, not the homeserver's. An event the bridge
+        # cannot decrypt comes back as a per-event errcode, not as a status.
+        if isinstance(crypto.status, int) and not isinstance(crypto.status, bool):
+            return f"{NOT_FETCHED}: lmer-matrix-bridge answered HTTP {crypto.status}"
+        if crypto.transient:
+            return f"{NOT_FETCHED}: lmer-matrix-bridge could not be reached"
+        return f"{NOT_FETCHED}: it could not be decrypted"
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{NOT_FETCHED}: the homeserver answered HTTP {status}"
+    for transport in (exc, cause):
+        if isinstance(transport, requests.RequestException):
+            if _timed_out(transport):
+                return f"{NOT_FETCHED}: the download timed out"
+            if isinstance(transport, requests.exceptions.ChunkedEncodingError):
+                return f"{NOT_FETCHED}: the download was cut off"
+            return f"{NOT_FETCHED}: the homeserver could not be reached"
+    if getattr(exc, "transient", False):
+        return f"{NOT_FETCHED}: the homeserver could not be reached"
+    return NOT_FETCHED
 
 
 def _read_matrix(
@@ -830,7 +962,7 @@ def _stage_matrix_file(
     if isinstance(declared, int) and not isinstance(declared, bool) and declared > MAX_FILE_BYTES:
         # What the event claims, before asking for the bytes: a homeserver's
         # download has no bound of its own to fall back on.
-        return [{**described, "reason": "it is over the size this copies in"}]
+        return [{**described, "reason": NOT_FETCHED_TOO_LARGE}]
     bound = min(MAX_FILE_BYTES, budget[0])
     try:
         if encrypted:
@@ -839,12 +971,12 @@ def _stage_matrix_file(
             data, media_type = client.download(mxc, max_bytes=bound)
     except Exception as exc:
         logger.warning("thread_read_file_failed mxc=%s error=%s", mxc, exc)
-        return [{**described, "reason": "it could not be fetched"}]
+        return [{**described, "reason": matrix_fetch_reason(exc)}]
     if data is None or len(data) > MAX_FILE_BYTES:
-        return [{**described, "reason": "it is over the size this copies in"}]
+        return [{**described, "reason": NOT_FETCHED_TOO_LARGE}]
     staged = stage_upload(store, name, data, media_type)
     if staged is None:
-        return [{**described, "reason": "it could not be written to the upload store"}]
+        return [{**described, "reason": NOT_WRITTEN}]
     budget[0] -= len(data)
     return [staged]
 

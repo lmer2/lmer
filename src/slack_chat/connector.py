@@ -103,6 +103,16 @@ ATTACH_SINCE_ENV = "LMER_CHAT_ATTACH_SINCE"
 #: two transports cannot drift.
 ATTACH_ACK = "🔗 lmer is listening in this thread."
 DETACH_NOTE = "🔌 lmer has stopped listening in this thread."
+#: Said in the thread, by the connector or by the listener that spawned it, when
+#: the app cannot download files. Plain on purpose: a thread may be read by
+#: people outside the team, and the per-file line the session gets names the scope.
+FILES_UNREADABLE_NOTE = "Files posted here will not reach the session."
+
+
+def files_unreadable(scopes: Optional[Iterable[str]]) -> bool:
+    """Whether the scopes ``auth.test`` reported lack the one a file download
+    needs. ``None`` — scopes not known — says nothing either way."""
+    return scopes is not None and thread_access.SLACK_FILES_READ not in scopes
 
 
 def _as_speaker(line: str, speaker: Optional[str], slack_markup: bool) -> str:
@@ -368,11 +378,13 @@ def _epoch(ts: object) -> Optional[float]:
         return None
 
 
-def _with_references(text: str, staged: Iterable[Mapping]) -> str:
-    """*text* with each staged file's ``[lmer upload]`` reference after it."""
-    for item in staged:
-        reference = item["reference"]
-        text = f"{text}\n\n{reference}" if text else reference
+def _with_references(text: str, staged: Iterable[Mapping], unstaged: Iterable[Mapping] = ()) -> str:
+    """*text* with each staged file's ``[lmer upload]`` reference after it, then
+    a line for each file that did not become one, saying why."""
+    lines = [item["reference"] for item in staged]
+    lines += [thread_access.attachment_line(item) for item in unstaged]
+    for line in lines:
+        text = f"{text}\n\n{line}" if text else line
     return text.strip()
 
 
@@ -531,8 +543,7 @@ class SlackConnector(ConnectorLifecycle):
     def _poll_thread(self, *, replay=False):
         self._ensure_ready()
         resumed = self._resume_pending_inbound()
-        if self._bot_user_id is None:
-            self._bot_user_id = self.slack.auth_test()
+        self._identify()
         messages = self.slack.get_replies(self.config.channel, self.config.thread_ts,
                                          oldest=None if replay else self._cursor_ts)
         try:
@@ -594,11 +605,10 @@ class SlackConnector(ConnectorLifecycle):
         )
 
     def _inbound_body(self, message: dict) -> tuple:
-        """One message's own text, and the files it brought into the store."""
-        return (
-            str(message.get("text") or "").strip(),
-            self._stage_files(message.get("files") or []),
-        )
+        """One message's own text, the files it brought into the store, and
+        the ones it could not, each with the reason."""
+        staged, unstaged = self._stage_files(message.get("files") or [])
+        return str(message.get("text") or "").strip(), staged, unstaged
 
     def _is_human(self, message: dict) -> bool:
         return bool(
@@ -644,8 +654,8 @@ class SlackConnector(ConnectorLifecycle):
                     self._state.save()
                 return {}
         def prepare():
-            body, attachments = self._inbound_body(message)
-            text = _with_references(body, attachments)
+            body, attachments, unstaged = self._inbound_body(message)
+            text = _with_references(body, attachments, unstaged)
             if not text:
                 return None
             if not ts:
@@ -689,42 +699,59 @@ class SlackConnector(ConnectorLifecycle):
     def _display_name(self, user_id: Optional[str]) -> Optional[str]:
         return slack_display_name(self.slack, user_id, self._names)
 
-    def _stage_files(self, files: list) -> list:
-        """Copy a message's files into the session's upload store, if it has one.
+    def _stage_files(self, files: list) -> tuple:
+        """``(staged, unstaged)``: a message's files copied into the session's
+        upload store, and the ones that were not, each described with the reason.
 
         The fetch is the same bounded one the read path uses
-        (:func:`lmer_cli.thread_access.fetch_slack_file`): the same Slack file
+        (:func:`lmer_cli.thread_access.stage_slack_file`): the same Slack file
         was accepted through a connected thread and refused through
         ``lmer-signal read``, which is not a distinction anything intends — and
         the unbounded side was this one.
         """
         store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
-        if store is None or not files:
-            return []
-        staged = []
+        staged, unstaged = [], []
         for item in files:
             if not isinstance(item, dict):
                 continue
-            url = item.get("url_private_download") or item.get("url_private")
-            name = item.get("name") or item.get("title") or "file"
-            if not url:
-                continue
-            data = thread_access.fetch_slack_file(url, self.config.bot_token)
-            if data is None:
-                logger.warning("slack_connector_file_failed name=%s", name)
-                continue
-            record = thread_access.stage_upload(
-                store, name, data, item.get("mimetype") or "application/octet-stream",
-            )
-            if record is not None:
+            if store is None:
+                record = {**thread_access.describe_slack_file(item), "reason": thread_access.NO_STORE}
+            else:
+                # Tried even when the scopes say it cannot work: they are read
+                # once, and a scope granted since then must not stay refused.
+                record, _cost = thread_access.stage_slack_file(item, self.config.bot_token, store)
+                answered = record.get("reason", "").startswith(thread_access.NOT_FETCHED_SLACK_ANSWERED)
+                if answered and self._files_unreadable():
+                    record = {**record, "reason": thread_access.NOT_FETCHED_SLACK_SCOPE}
+            if record.get("reference"):
                 staged.append(record)
-        return staged
+            else:
+                logger.warning("slack_connector_file_failed name=%s reason=%s", record["name"], record["reason"])
+                unstaged.append(record)
+        return staged, unstaged
+
+    def _files_unreadable(self) -> bool:
+        return files_unreadable(getattr(self.slack, "granted_scopes", None))
+
+    def _identify(self) -> None:
+        if self._bot_user_id is None:
+            self._bot_user_id = self.slack.auth_test()
+            if self._files_unreadable():
+                logger.warning("slack_connector_scope_missing scope=%s", thread_access.SLACK_FILES_READ)
 
     def _prepare(self):
         self._acquire(ThreadKey(CHANNEL, self.config.channel, self.config.thread_ts))
 
     def _attachment_notice(self):
-        return attachment_notice(self._launch_settings, speaker=self._speaker_label())
+        notice = attachment_notice(self._launch_settings, speaker=self._speaker_label())
+        try:
+            self._identify()
+        except Exception as exc:
+            # The first poll asks again; the notice goes out either way.
+            logger.warning("slack_connector_identify_failed error=%s", exc)
+        if self._files_unreadable():
+            notice += f" {FILES_UNREADABLE_NOTE}"
+        return notice
 
     def _detach_notice(self):
         return detach_notice(self._speaker_label())

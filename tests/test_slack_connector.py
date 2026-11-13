@@ -16,9 +16,10 @@ from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
+import requests
 
 from ask_channel import bus
-from lmer_cli import comms, supervisor, targets, thread_posts
+from lmer_cli import comms, supervisor, targets, thread_access, thread_posts
 from slack_chat import connector, registry
 from slack_chat.client import SlackError
 from tests.conftest import drain_connectors, strip_lmer_env
@@ -180,7 +181,6 @@ class _StreamedPNG:
 
 
 def _stub_file_download(monkeypatch):
-    from lmer_cli import thread_access
 
     monkeypatch.setattr(thread_access.requests, "get", lambda *a, **kw: _StreamedPNG())
 
@@ -473,10 +473,156 @@ class TestInbound:
         rig.connector.stop()
 
 
+class _SlackAnswers:
+    """A Slack file server that answers with *status* and a body of *content_type*."""
+
+    def __init__(self, status=200, content_type="image/png", body=b"\x89PNG\r\n\x1a\n"):
+        self.status_code = status
+        self.headers = {"Content-Type": content_type}
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error: Forbidden for url: https://files.slack/x", response=self,
+            )
+
+    def iter_content(self, chunk_size=65536):
+        yield self.body
+
+
+SCREENSHOT = {"name": "image.png", "mimetype": "image/png", "size": 60047,
+              "url_private_download": "https://files.slack/files-pri/T1-F1/image.png"}
+
+
+class TestAFileThatCannotBeFetched:
+    """The message reaches the session either way, with a line naming the file
+    and why it did not come with it."""
+
+    def _deliver(self, tmp_path, monkeypatch, get, *, uploads=True, scopes=None):
+
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store) if uploads else None)
+        rig.slack.granted_scopes = scopes
+        calls = []
+
+        def fetch(*args, **kwargs):
+            calls.append(args)
+            return get(*args, **kwargs)
+
+        monkeypatch.setattr(thread_access.requests, "get", fetch)
+        rig.connector._poll_thread(replay=True)
+        rig.slack.human_says("check open PRs i guess", files=[SCREENSHOT])
+        assert rig.connector._poll_thread() == 1
+        record = rig.log.read_since(0)[0][-1]
+        rig.connector.stop()
+        return record, store, calls
+
+    def test_a_403_arrives_as_a_line_with_the_status(self, tmp_path, monkeypatch):
+        record, store, _calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(status=403),
+        )
+        assert record.text == (
+            "check open PRs i guess\n\n"
+            "📎 image.png (image/png, 60047 B) — not copied in: "
+            "it could not be fetched: Slack answered HTTP 403"
+        )
+        assert not record.attachments and list(store.iterdir()) == []
+
+    def test_a_timeout_arrives_as_a_line_that_says_so(self, tmp_path, monkeypatch):
+        def get(*args, **kwargs):
+            raise requests.ReadTimeout("read timed out (https://files.slack/x)")
+
+        record, _store, _calls = self._deliver(tmp_path, monkeypatch, get)
+        assert record.text.endswith("it could not be fetched: the download timed out (30 s without data)")
+        assert "files.slack" not in record.text
+
+    def test_a_web_page_where_the_image_was_is_not_staged(self, tmp_path, monkeypatch):
+        page = b"<!DOCTYPE html><html><body>Sign in</body></html>"
+        record, store, _calls = self._deliver(
+            tmp_path, monkeypatch,
+            lambda *a, **kw: _SlackAnswers(content_type="text/html; charset=utf-8", body=page),
+        )
+        assert record.text.endswith(
+            "it could not be fetched: Slack answered with a web page instead of the file"
+        )
+        assert not record.attachments and list(store.iterdir()) == []
+
+    WITHOUT_FILES_READ = ["chat:write", "channels:history", "im:history"]
+
+    @pytest.mark.parametrize("answer", [
+        lambda *a, **kw: _SlackAnswers(status=403),
+        lambda *a, **kw: _SlackAnswers(content_type="text/html", body=b"<html>Sign in</html>"),
+    ], ids=["403", "html-page"])
+    def test_a_refusal_without_files_read_names_the_scope(self, tmp_path, monkeypatch, answer):
+        record, _store, calls = self._deliver(
+            tmp_path, monkeypatch, answer, scopes=self.WITHOUT_FILES_READ,
+        )
+        assert record.text.endswith("it could not be fetched: the Slack app lacks the files:read scope")
+        assert len(calls) == 1
+
+    def test_a_scope_granted_since_the_connect_is_not_refused(self, tmp_path, monkeypatch):
+        """The scopes are read once, at connect; an app reinstalled with
+        files:read keeps its token, and its files must come in from then on."""
+        record, store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(), scopes=self.WITHOUT_FILES_READ,
+        )
+        assert len(record.attachments) == 1 and len(list(store.iterdir())) == 1
+        assert len(calls) == 1
+
+    def test_no_answer_at_all_is_not_blamed_on_the_scope(self, tmp_path, monkeypatch):
+        def get(*args, **kwargs):
+            raise requests.ConnectTimeout("connect timed out")
+
+        record, _store, _calls = self._deliver(
+            tmp_path, monkeypatch, get, scopes=self.WITHOUT_FILES_READ,
+        )
+        assert record.text.endswith("it could not be fetched: the download timed out (30 s without data)")
+
+    def test_a_token_with_files_read_fetches_as_before(self, tmp_path, monkeypatch):
+        record, store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(),
+            scopes=["chat:write", "files:read"],
+        )
+        assert len(record.attachments) == 1 and len(list(store.iterdir())) == 1
+        assert len(calls) == 1
+
+    def test_without_an_upload_store_the_file_is_still_named(self, tmp_path, monkeypatch):
+        record, _store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(), uploads=False,
+        )
+        assert record.text.endswith(
+            "📎 image.png (image/png, 60047 B) — not copied in: this session has no upload store"
+        )
+        assert calls == []
+
+    def test_a_file_only_message_still_arrives(self, tmp_path, monkeypatch):
+
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+        monkeypatch.setattr(thread_access.requests, "get", lambda *a, **kw: _SlackAnswers(status=404))
+        rig.connector._poll_thread(replay=True)
+        rig.slack.human_says("", files=[SCREENSHOT])
+        assert rig.connector._poll_thread() == 1
+        record = rig.log.read_since(0)[0][-1]
+        rig.connector.stop()
+        assert record.text == (
+            "📎 image.png (image/png, 60047 B) — not copied in: "
+            "it could not be fetched: Slack answered HTTP 404"
+        )
+
+
 class TestAttachNotice:
     def test_the_notice_has_the_range_and_link_and_downloads_nothing(self, tmp_path, monkeypatch):
         from unittest.mock import Mock
-        from lmer_cli import thread_access
 
         store = tmp_path / "uploads"
         store.mkdir()

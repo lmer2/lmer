@@ -353,6 +353,26 @@ class TestAuthTest:
         with pytest.raises(SlackError):
             client.auth_test()
 
+    @pytest.mark.parametrize("headers, scopes", [
+        ({"x-oauth-scopes": "chat:write, files:read,channels:history"},
+         ["chat:write", "files:read", "channels:history"]),
+        ({}, None),
+    ], ids=["header", "no-header"])
+    def test_auth_test_keeps_the_scopes_its_own_answer_carried(self, monkeypatch, headers, scopes):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+        calls = []
+
+        def answer(*args, **kwargs):
+            calls.append(args)
+            return _make_response({"ok": True, "user_id": "U1"}, headers=headers)
+
+        monkeypatch.setattr(client.session, "request", answer)
+        assert client.granted_scopes is None
+        client.auth_test()
+        assert client.granted_scopes == scopes
+        assert len(calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # 5. {ok: false} response -> typed SlackError
