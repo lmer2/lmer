@@ -1,9 +1,0 @@
-fixed:
-- "The platform no longer kills a container removal after 60 seconds, which left podman containers stuck in `removing`; one removal may take 30 minutes in all, and its `rm` is out of reach of a Ctrl-C in the daemon's terminal."
-- "The platform now removes its own containers stuck in `removing` or left unreadable, at start and every 10 minutes, warning once per container. It removes nothing on a pass where the session registry cannot be listed or read in full."
-- "A container whose stop fails is still removed, so podman's `removing` containers no longer survive every daemon restart."
-- "`lmer` now retries a failed container removal once and prints the container id when it still fails."
-- "The service-slot probes no longer hold `GET /api/state` for as long as the container runtime is slow: a read waits 2 s for them in all, then a row keeps its last answer. sqlite lock waits on the same request are #561's and are not changed here."
-changed:
-- "The platform daemon removes containers one at a time on a background thread, so startup and other launches no longer wait on a slow removal."
-- "A service slot whose probe has not answered yet reads `unknown` (\"not checked yet\") rather than `service_down`."

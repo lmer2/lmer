@@ -1,6 +1,0 @@
-added:
-- "Platform settings → Time tracking edits the people registry, a new time_tracking switch and the time defaults, applied without a daemon restart."
-- "Ratchet can set up time tracking from chat: new lmer-ctl time verbs list the asker, set the project and check handler definitions."
-changed:
-- "The time-tracking bar spans the full width under the header, is slim or editing, and stays open while a timer runs."
-- "The header clock shows the running mode in a colour derived from the project tint; the time line moved into the bar."

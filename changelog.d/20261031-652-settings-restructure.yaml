@@ -1,9 +1,0 @@
-changed:
-- "Platform settings is grouped into sections with a side nav (a picker on phones), one card style and Save buttons enabled only for edited cards."
-- "The chat tint and transcript switches are under Platform settings → Chat and display instead of a dialog."
-- "Leaving Platform settings with unsaved edits asks first; archiving a project now asks for confirmation."
-- "The project color picker opens on swatches for every color, with the full picker behind Custom…."
-- "The service slot editor uses the same buttons: a filled Save, a tonal cancel and an error-coloured remove."
-fixed:
-- "In dark mode, filled primary and error buttons use dark text and the error color is a lighter rose, so they meet WCAG AA contrast."
-- "Keyboard focus rings on app bar buttons use the bar's own text color, so they stay visible on every project color."

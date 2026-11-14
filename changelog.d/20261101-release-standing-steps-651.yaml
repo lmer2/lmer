@@ -1,5 +1,0 @@
-added:
-- "`lmer-release-guard`: a leak scan and pre-push guard for releases, with project-private patterns read from the project tier's `release.leak_scan` block"
-changed:
-- "The release taskdef now leak-scans, guards every mirror push and requires green GitHub CI on the exact merge SHA before tagging; adopters must declare `leak_scan`"
-- "`LMER_RELEASE_SIGNING_KEY` holds the key's container path, a locator, so redaction and the leak scan no longer treat its value as a secret"

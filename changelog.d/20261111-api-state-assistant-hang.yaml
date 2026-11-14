@@ -1,8 +1,0 @@
-fixed:
-- "`/api/state` and `/api/assistant` no longer slow to a minute on project hosts: project database reads stop queueing behind writers."
-- "One request's project lookups no longer stall every other request, `/api/health` included."
-- "The project supervisor's reconcile loop keeps its 2-second cadence instead of drifting to 30 seconds."
-added:
-- "`/api/health` reports `load`, `degraded` and `degraded_reasons`, including a reconcile pass that never finishes, and the daemon logs slow and stuck requests. Health answers on threads of its own, so it stays readable when every request binding is blocked."
-changed:
-- "Concurrent `/api/state` requests share a build already in progress, and a project runs at most one build at a time; a request still waiting after 25 seconds gets a 503 with `Retry-After`."

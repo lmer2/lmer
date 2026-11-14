@@ -1,4 +1,0 @@
-fixed:
-- "A file posted in a connected Slack thread that cannot be fetched now arrives as a line naming it and why, instead of vanishing."
-- "Thread file reasons now tell apart over-size, the HTTP status (the homeserver's or lmer-matrix-bridge's), a timeout and a missing files:read scope, on Slack and Matrix."
-- "A Slack app without files:read now says so in the thread's connect announcement, without naming the scope, including threads the Slack listener starts a session for."

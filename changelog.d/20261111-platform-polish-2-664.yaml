@@ -1,6 +1,0 @@
-added:
-- "Platform setting `chat_scroll_long_messages` (off by default) caps long chat messages in a scrolling bubble; off, messages show at full length."
-changed:
-- "Chat panes draw peer Ratchets, Ratchet, platform notices and bot or relayed thread posts in their own styles; only the operator's messages lean right."
-- "Connector retry notes reach the chat only after 60 seconds of failure; short retry and recovery pairs from older connectors are no longer drawn. A direct connector's own status notes (running, exited, recovery required) are drawn as the platform's."
-- "Codex digest wake and idle reminders carry the `[lmer platform]` marker, so the chat draws them as the platform's."
