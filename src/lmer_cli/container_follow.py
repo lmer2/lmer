@@ -140,15 +140,70 @@ def stop(runtime: str, container: str) -> Optional[subprocess.Popen]:
         return None
 
 
-def remove(runtime: str, container: str) -> None:
-    """Remove *container* now. `kill` first: podman's `rm --force` would honour
-    the container's stop timeout and wait minutes; docker's `rm` has no
-    `--time`. Killing a container that is not running fails harmlessly."""
-    for verb in (["kill"], ["rm", "--force"]):
-        subprocess.run(
-            [runtime, *verb, container],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+def _container_id(runtime: str, container: str) -> str:
+    """*container*'s id when it is a name the runtime can resolve, else as given."""
+    if _HEX_ID.fullmatch(container):
+        return container
+    try:
+        result = subprocess.run(
+            [runtime, "inspect", "--type", "container", "--format", "{{.Id}}", container],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
+    except OSError:
+        return container
+    found = result.stdout.strip()
+    return found if result.returncode == 0 and _HEX_ID.fullmatch(found) else container
+
+
+def _still_listed(runtime: str, container: str) -> bool:
+    """Whether the runtime still has *container*. Asked of ``ps`` for an id:
+    ``inspect`` fails on podman's half-removed containers, which ``ps`` still
+    lists. ``True`` when the runtime cannot say."""
+    if not _HEX_ID.fullmatch(container):
+        return name_taken(runtime, container)
+    try:
+        result = subprocess.run(
+            [runtime, "ps", "-a", "-q", "--no-trunc", "--filter", f"id={container}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return True
+    return result.returncode != 0 or bool(result.stdout.strip())
+
+
+def remove(runtime: str, container: str) -> bool:
+    """Remove *container* now, retrying once; ``False`` (and a line naming the
+    container) when it is still there.
+
+    `kill` first: podman's `rm --force` would honour the container's stop
+    timeout and wait minutes; docker's `rm` has no `--time`. Killing a container
+    that is not running fails harmlessly. No timeout on `rm`: podman killed
+    mid-removal leaves the container stuck in ``removing``, and on a busy disk
+    a removal can take minutes.
+    """
+    # By id from here: a name stops resolving once podman's removal is halfway.
+    container = _container_id(runtime, container)
+    subprocess.run(
+        [runtime, "kill", container],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    detail = ""
+    for _ in range(2):
+        try:
+            result = subprocess.run(
+                [runtime, "rm", "--force", container],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+        except OSError as exc:
+            detail = str(exc)
+            continue
+        if result.returncode == 0:
+            return True
+        detail = f"exit {result.returncode}: {result.stderr.strip()}"
+        if not _still_listed(runtime, container):
+            return True
+    _say(f"\r\n── lmer: could not remove container {container} ({runtime} rm {detail}) ──\r\n")
+    return False
 
 
 def read_container_id(path: Path) -> str:

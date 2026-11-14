@@ -787,7 +787,7 @@ def test_the_rows_one_piece_of_agent_prose_costs_the_landing_screen_nothing():
     )
     detail = _read(WEB / "src" / "components" / "RunDetail.vue")
     assert re.search(
-        r'<Markdown\s+:text="run\.attention\.note"\s+inline\s*/>', detail,
+        r'<Markdown\s+:text="run\.attention\.note"\s+[^>]*?\binline\b', detail,
     ), (
         "the detail view does not render the note either, so the row's decision "
         "costs the operator the rendering entirely rather than deferring it"

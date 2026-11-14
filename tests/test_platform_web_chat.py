@@ -12,7 +12,7 @@ so a third consumer cannot be the one that ends up without the sanitiser.
 What is left here is what belongs to the *conversation* rather than to rendering,
 and all of it is invisible in a desktop window:
 
-- a rendered turn is taller than the text it came from, so the 30dvh cap on one
+- a rendered turn is taller than the text it came from, so the 30dvh cap (opt-in) on one
   message and the remembered stick-to-bottom flag have to still be there;
 - what *you* sent is still shown verbatim, so the two sides of the conversation
   do not turn into one wall of formatted prose — and the bubble carrying it leans
@@ -99,6 +99,10 @@ CHAT_GROUNDS = {
     "chat-operator": "ground-operator",
     # What the agent *did*: the tool rows, and the internals behind the toggle.
     "chat-action": "ground-action",
+    # Another project's assistant.
+    "chat-peer": "ground-peer",
+    # A thread post from a bot or another run.
+    "chat-relay": "ground-relay",
 }
 
 
@@ -201,7 +205,8 @@ def test_the_cap_on_one_message_survives_a_rendered_one():
     operator channel's entries (short, and not in a scrolling pane) do not get one.
     """
     text = _read(CHAT)
-    rule = _chat_rule(".said")
+    # Opt-in: the cap lives under the class the setting turns on.
+    rule = _chat_rule(".said-capped .said")
     assert "max-height" in rule and "overflow-y: auto" in rule, (
         "one message stretches the conversation box instead of scrolling"
     )
@@ -215,7 +220,7 @@ def test_the_cap_on_one_message_survives_a_rendered_one():
     # Still the same conversation box, still only following when it is being read.
     assert "const following = ref(true)" in text
     assert "if (follow) nextTick(stickToBottom)" in text
-    assert "max-height: 30dvh" in _chat_rule(".said")
+    assert "max-height: 30dvh" in _chat_rule(".said-capped .said")
 
 
 def test_a_long_line_anywhere_in_a_turn_wraps_instead_of_scrolling_the_pane():
@@ -284,7 +289,7 @@ def test_the_three_kinds_of_turn_are_drawn_on_three_different_grounds():
     """
     text = _read(CHAT)
 
-    assert len(set(CHAT_GROUNDS.values())) == 3, "the fixture lost a class"
+    assert len(set(CHAT_GROUNDS.values())) == 5, "the fixture lost a class"
     for colour, css_class in CHAT_GROUNDS.items():
         rule = _chat_rule(f".{css_class}")
         assert f"rgb(var(--v-theme-{colour}))" in rule, (

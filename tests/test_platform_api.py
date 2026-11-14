@@ -11,6 +11,7 @@ import base64
 import importlib.metadata
 import json
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -18,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from lmer_platform import api, connectors
 from lmer_platform import config as cfg
-from lmer_platform import registry, spawn, store
+from lmer_platform import registry, spawn, store, ui_build
 from tests.conftest import strip_lmer_env
 
 # The taskdef-tier fixtures, imported rather than copied — the same trade
@@ -219,6 +220,174 @@ def test_health_is_cheap_and_does_not_pull(client, fake_state):
     assert payload["bind"].startswith("http://127.0.0.1:")
     assert set(payload["mirror"]) == {"present", "healthy", "last_pull_at"}
     assert fake_state.calls == [], "health must not build the full state"
+
+
+def _bundle(root, script="console.log('one')"):
+    (root / "assets").mkdir(parents=True, exist_ok=True)
+    (root / "index.html").write_text("<script src=assets/app.js></script>")
+    (root / "assets" / "app.js").write_text(script)
+    return root
+
+
+def _stale(client):
+    return client.get("/api/health", headers=bearer_header()).json()["ui"]["stale"]
+
+
+def test_health_reports_a_bundle_replaced_after_the_daemon_started(
+    config, fake_state, tmp_path, monkeypatch,
+):
+    """#650: a new bundle served by a process without its routes."""
+    bundle = _bundle(tmp_path / "ui")
+    monkeypatch.setenv(ui_build.ENV_UI_DIST, str(bundle))
+    client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    assert _stale(client) is False
+    (bundle / "assets" / "app.js").write_text("console.log('a longer two')")
+    assert _stale(client) is True
+
+
+def test_health_ignores_a_reinstall_of_the_same_bundle(config, fake_state, tmp_path, monkeypatch):
+    """install_ui copies a fresh tree, so new mtimes and inodes alone are no change."""
+    bundle = _bundle(tmp_path / "ui")
+    monkeypatch.setenv(ui_build.ENV_UI_DIST, str(bundle))
+    client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    copy = _bundle(tmp_path / "ui.new")
+    os.utime(copy / "assets" / "app.js", ns=(1, 1))
+    monkeypatch.setenv(ui_build.ENV_UI_DIST, str(copy))
+    assert _stale(client) is False
+
+
+def test_a_daemon_started_without_a_bundle_never_reads_stale(config, fake_state, tmp_path, monkeypatch):
+    monkeypatch.setattr(ui_build, "dist_dir", lambda: None)
+    client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    assert _stale(client) is False
+    bundle = _bundle(tmp_path / "ui")
+    monkeypatch.setattr(ui_build, "dist_dir", lambda: bundle)
+    assert _stale(client) is False
+
+
+def test_health_rehashes_only_a_bundle_that_changed(config, fake_state, tmp_path, monkeypatch):
+    """A poll of an unchanged bundle stats it and reads no file's contents."""
+    bundle = _bundle(tmp_path / "ui")
+    monkeypatch.setenv(ui_build.ENV_UI_DIST, str(bundle))
+    reads = []
+    hashed = ui_build._sha256
+    monkeypatch.setattr(ui_build, "_sha256", lambda path: reads.append(path) or hashed(path))
+    client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    assert len(reads) == 2
+    assert _stale(client) is False
+    assert _stale(client) is False
+    assert len(reads) == 2
+    (bundle / "assets" / "app.js").write_text("console.log('a longer two')")
+    assert _stale(client) is True
+    assert len(reads) == 4
+
+
+def test_health_follows_bundles_that_install_ui_swaps_in(config, fake_state, tmp_path, monkeypatch):
+    """The path production takes: setup-ui's rename swap into the installed dir."""
+    monkeypatch.delenv(ui_build.ENV_UI_DIST, raising=False)
+    monkeypatch.setattr(ui_build, "platform_dir", lambda: tmp_path / "platform")
+    ui_build.install_ui(_bundle(tmp_path / "build-1"))
+    client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    assert _stale(client) is False
+    ui_build.install_ui(_bundle(tmp_path / "build-2"))
+    assert _stale(client) is False
+    ui_build.install_ui(_bundle(tmp_path / "build-3", "console.log('two')"))
+    assert _stale(client) is True
+
+
+def test_a_startup_read_that_failed_takes_the_first_readable_bundle(
+    config, fake_state, tmp_path, monkeypatch, caplog,
+):
+    """A bundle unreadable at startup must not turn the check off for good."""
+    bundle = _bundle(tmp_path / "ui")
+    monkeypatch.setenv(ui_build.ENV_UI_DIST, str(bundle))
+    reads = []
+
+    def unreadable_at_startup():
+        reads.append(1)
+        return None if len(reads) == 1 else ui_build.bundle_fingerprint()
+
+    monkeypatch.setattr(api, "bundle_fingerprint", unreadable_at_startup)
+    with caplog.at_level("WARNING", logger="lmer_platform.api"):
+        client = TestClient(api.create_app(config, SECRET, state_builder=fake_state))
+    assert "platform_ui_fingerprint_unavailable" in caplog.text
+    assert _stale(client) is False
+    (bundle / "assets" / "app.js").write_text("console.log('a longer two')")
+    assert _stale(client) is True
+
+
+def test_a_bundle_renamed_away_and_never_replaced_has_no_fingerprint(tmp_path, monkeypatch):
+    bundle = _bundle(tmp_path / "ui")
+    listing = Path.rglob
+
+    def swapped_away(self, pattern):
+        self.rename(tmp_path / "ui.old")
+        return listing(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", swapped_away)
+    assert ui_build.bundle_fingerprint(bundle) is None
+
+
+def _cut_walk(monkeypatch, bundle, away, back):
+    """The first listing of ``assets`` runs between install_ui's two renames."""
+    listing = Path._scandir
+    cuts = []
+
+    def scandir(self):
+        if self != bundle / "assets" or cuts:
+            return listing(self)
+        cuts.append(self)
+        away()
+        try:
+            return listing(self)
+        finally:
+            back()
+
+    monkeypatch.setattr(Path, "_scandir", scandir)
+    return cuts
+
+
+def test_a_walk_cut_by_install_ui_reads_the_tree_swapped_in(tmp_path, monkeypatch):
+    """#650 review: rglob skips what the swap moved away instead of raising."""
+    bundle = _bundle(tmp_path / "ui")
+    swapped_in = _bundle(tmp_path / "ui.new", "console.log('two')")
+    expected = ui_build.bundle_fingerprint(swapped_in)
+    cuts = _cut_walk(
+        monkeypatch, bundle,
+        away=lambda: bundle.rename(tmp_path / "ui.old"),
+        back=lambda: swapped_in.rename(bundle),
+    )
+    assert ui_build.bundle_fingerprint(bundle) == expected
+    assert cuts
+
+
+def test_a_walk_cut_by_install_ui_putting_the_old_tree_back_reads_it_whole(tmp_path, monkeypatch):
+    """install_ui's failure path renames the previous tree back: same inode, partly walked."""
+    bundle = _bundle(tmp_path / "ui")
+    expected = ui_build.bundle_fingerprint(bundle)
+    # Each rename sets the ctime, but on a coarse-clock kernel possibly to the tick
+    # the bundle was made in: a count of the renames stands in for it here.
+    renames = []
+    identity = ui_build._identity
+    monkeypatch.setattr(ui_build, "_identity", lambda dist: identity(dist)[:2] + (len(renames),))
+
+    def rename(source, target):
+        renames.append(target)
+        source.rename(target)
+
+    cuts = _cut_walk(
+        monkeypatch, bundle,
+        away=lambda: rename(bundle, tmp_path / "ui.old"),
+        back=lambda: rename(tmp_path / "ui.old", bundle),
+    )
+    assert ui_build.bundle_fingerprint(bundle) == expected
+    assert cuts
+
+
+def test_a_dangling_link_in_the_bundle_leaves_its_fingerprint(tmp_path):
+    bundle = _bundle(tmp_path / "ui")
+    (bundle / "assets" / "dangle.js").symlink_to(tmp_path / "nowhere.js")
+    assert ui_build.bundle_fingerprint(bundle) == ui_build.bundle_fingerprint(_bundle(tmp_path / "twin"))
 
 
 def test_state_returns_the_inventory(client, fake_state):
@@ -1504,6 +1673,45 @@ def test_a_fleet_poll_records_no_check_in(platform_root):
     api.build_state(cfg.load())
     api.build_state(cfg.load())
     assert checkin.read_marks() == {}, "build_state wrote check-in state"
+
+
+def test_the_badge_reads_the_mr_activity_the_digest_used(platform_root):
+    """A review whose MR is quiet is not marked stale on the row (#401).
+
+    The fold only *reads* the cache the detector refreshed: a fleet poll from a
+    phone must never become a GitLab request per row.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from lmer_platform import checkin, mr_activity
+
+    def iso(**delta):
+        when = datetime.now(timezone.utc) - timedelta(**delta)
+        return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    target = "https://gitlab.example.com/acme/widgets/-/merge_requests/7"
+    review = {
+        "host": "gitlab.example.com", "project": "acme/widgets",
+        "slug": "review-mr-7", "state": "dormant", "orchestrator": False,
+        "target": target, "review_posted_at": iso(hours=6),
+    }
+    payload = {"runs": [review], "attention": []}
+    checkin.observe(payload)
+    store.write_json(checkin.marks_path(), {"runs": {
+        "gitlab.example.com/acme/widgets/review-mr-7": {"first_seen": iso(hours=48)},
+    }})
+
+    api._fold_checkins(payload)
+    assert review["checkin"]["stale"] is True, "no cache: named, fail open"
+
+    mr_activity.refresh(
+        [("gitlab.example.com/acme/widgets/review-mr-7", target)],
+        window=3600,
+        fetch=lambda ref: {"head_sha": "a", "pushed_at": iso(hours=7),
+                           "comments": [], "page_floor": None, "state": "opened"},
+    )
+    api._fold_checkins(payload)
+    assert review["checkin"]["stale"] is False
 
 
 # --- the work repo's taskdef tiers, in both tree shapes (issue #353) ---------

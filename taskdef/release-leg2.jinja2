@@ -17,13 +17,14 @@ merge SHA or it does not run.
 On entry (and on every re-entry) run `work release status` first: it prints
 the recorded fields, the derived leg, and the single next step. Record each
 step's phase before starting it (`work state set --phase=<step name>`, using
-the step names below). Two of these names — `leg2-record-merge` and
-`leg2-preconditions` — extend the resume decision table's derived-step
-vocabulary without ever appearing as a derived next step: `work release
-status` folds them into its rows. A derivation of `leg2-create-tag`
-therefore runs steps 1 through 3: step 1 as an idempotent re-record (its
-mismatch check runs every time, even when the gate already recorded the
-merge SHA), then step 2's preconditions, then the tag.
+the step names below). Four of these names — `leg2-record-merge`,
+`leg2-preconditions`, `leg2-leak-scan` and `leg2-ci-candidate` — extend the
+resume decision table's derived-step vocabulary without ever appearing as a
+derived next step: `work release status` folds them into its rows. A
+derivation of `leg2-create-tag` therefore runs steps 1 through 3: step 1 as
+an idempotent re-record (its mismatch check runs every time, even when the
+gate already recorded the merge SHA), then step 2's preconditions, step
+2a's leak scan and step 2b's GitHub CI candidate, then the tag.
 
 Credentials are provisioned, never fetched: the GitHub fine-grained PAT
 arrives through this session's credential env as `LMER_RELEASE_GITHUB_TOKEN`,
@@ -37,17 +38,18 @@ RULES), never a workaround.
 
 `release.github_target` is a bare `https://` URL and the container carries no
 persistent credential helper for the mirror host, with `~/.gitconfig` a
-read-only mount. Every operation against the `github` remote — the fetch in
-step 2, both `ls-remote` checks, and both `bin/gate-push` invocations —
-therefore fails unauthenticated. Supply the PAT through lmer's action-free
+read-only mount. Every operation against the `github` remote — every fetch,
+every `ls-remote` check, and every `bin/gate-push` invocation (the
+release-candidate branch, `main`, the tag) — therefore fails
+unauthenticated. Supply the PAT through lmer's action-free
 ASKPASS helper. The helper only answers Git's credential prompts from its own
 environment; it performs no network or filesystem action.
 
 Supply it PER COMMAND, never once for the leg: each command runs in a fresh
 shell, so an `export` in one invocation does not reach the next. The prefix
 below goes in front of EACH `github`-remote command, in the same shell
-invocation as that command — the step-2 fetch, both `ls-remote` checks, and
-both `bin/gate-push` invocations (`bin/gate-push` shells out to `git`, so
+invocation as that command — every fetch, `ls-remote` check and
+`bin/gate-push` invocation (`bin/gate-push` shells out to `git`, so
 ASKPASS reaches Git through the environment it inherits):
 
 ```
@@ -125,7 +127,178 @@ The remediation path is a human one: inspect what landed on the mirror
 out-of-band, remove or merge it deliberately on the canonical GitLab side,
 and relaunch the release — leg 2 re-derives from run state and re-checks.
 
+### Step 2a — `leg2-leak-scan` — the gating leak scan at the merge SHA
+
+The gate's early scan saw the bump; this one sees exactly what a push of the
+merge SHA publishes, the release merge and its message included. It runs on
+every entry to this step; it is cheap, and re-running it is how a re-entry
+converges.
+
+- [ ] `leak_scan.public_mirror` is `false` → `work log` that the scan and
+      the pre-push guard are opted out; go to step 2b.
+- [ ] With both remotes freshly fetched in step 2:
+      `work verify leak-scan -- lmer-release-guard scan --config <resolved task.yaml> --base <previous tag> --candidate <merge-sha> --published github/main --out <scratch dir>/leak-scan.json`
+      where `<previous tag>` is
+      `git describe --tags --abbrev=0 --match 'v[0-9]*' github/main`.
+- [ ] Triage exactly as the gate's early scan does (exit 1 is a hard stop,
+      never zero hits; exit 2 is a finding by definition; every other hit
+      is cleared against the exceptions file,
+      the published history and recorded operator decisions, or it is a
+      finding). Add a "Gating rescan at `<merge-sha>`" section to
+      `leak-scan.md` and persist it again with `work artifact`.
+- [ ] Any finding → STOP before anything is pushed: `lmer-signal ask
+      --operator-only` naming each finding (masked), record the question,
+      `work commit`, end the session. Nothing is rewritten without the
+      operator's decision.
+
+### Step 2b — `leg2-ci-candidate` — GitHub CI on the exact merge SHA
+
+**No tag, local or remote, until GitHub CI has passed on exactly the
+recorded merge SHA.** The tag push runs `release.yml`, whose checks are the
+same suite on the same runner image: a candidate that is red here would fail
+there after the tag exists, leaving an immutable tag with nothing published.
+GitHub's runner image differs from the gate container and GitLab CI (it
+ships tools they lack), so this is the one place that class of failure
+shows.
+
+Every `gh` command below runs in its own subshell exporting `GH_TOKEN`,
+`GH_REPO` and `GH_PROMPT_DISABLED=1`, exactly as step 5 describes; every
+`github`-remote git command carries the ASKPASS prefix. Write each finding
+of this step to `github-ci-candidate.md` as you go and persist it with
+`work artifact`.
+
+1. [ ] **Guard** (skip when opted out): on a fresh credentialed fetch,
+       `work verify prepush-guard-candidate -- lmer-release-guard prepush --config <resolved task.yaml> --version <X.Y.Z> --published github/main <merge-sha> refs/heads/release-candidate/v<X.Y.Z>`.
+       `GUARD FAIL` → STOP with an operator-only ask quoting its FAIL lines;
+       a non-zero exit without a `GUARD FAIL` line is an error, and a stop
+       too — the guard did not run.
+2. [ ] **Push the candidate** — skip when current:
+       `git ls-remote github refs/heads/release-candidate/v<X.Y.Z>` already
+       showing the merge SHA. Otherwise:
+       `bin/gate-push --ref <merge-sha>:refs/heads/release-candidate/v<X.Y.Z> --remote github`.
+       The push allow list must grant that ref on the mirror. A refusal is
+       an operator-only ask for the grant, never a different route; an
+       operator can grant it for one command (a command-scoped
+       `LMER_PUSH_ALLOW_LIST` union) or standing. A non-fast-forward
+       rejection (a candidate branch from a superseded run at a commit
+       this SHA does not descend from) is an operator-only ask — never a
+       force-push.
+3. [ ] **Draft PR into `main`** — adopt the open PR whose head is
+       `release-candidate/v<X.Y.Z>` if there is one
+       (`gh pr list --head release-candidate/v<X.Y.Z> --state open`);
+       otherwise
+       `gh pr create --draft --base main --head release-candidate/v<X.Y.Z> --title "Release candidate v<X.Y.Z> (CI only, not for merge)" --body "CI evidence for the v<X.Y.Z> release candidate. Not for merge."`
+       The PR is public: its title and body carry nothing else. It is CI
+       evidence only — NEVER merge it.
+4. [ ] **Wait for CI** without watching it in the foreground, in ONE
+       background job with one completion callback to this session; yield
+       until it fires. No polling loop in the session. The job:
+       - waits for the first run to appear, bounded: retry
+         `gh run list --commit <merge-sha> --event pull_request --limit 100 --json databaseId,status,conclusion,headSha,workflowName`
+         every 30 seconds for at most 15 minutes. No run by then → the job
+         saves that result and ends; record it and STOP with an
+         operator-only ask (CI never started);
+       - then `gh run watch <run-id> --exit-status` per run, each result
+         saved to a file, and lists the runs once more at the end, saving
+         that list too. If the final list holds a run not yet completed,
+         it watches that run too and lists again.
+5. [ ] **Green** means the final run list (`--limit 100`: fewer than 100
+       entries, or it is not the whole list — list again with a higher
+       limit) holds at least one `pull_request` run for head SHA
+       `<merge-sha>`, and every run in it concluded `success`. An empty run
+       list is not green: it means CI has not started yet. Record the run URLs with
+       `work event ci-candidate --note "<run URLs>: success at <merge-sha>"`.
+       Then prove CI tested exactly the candidate: read the PR's base SHA
+       (`gh pr view <pr> --json baseRefOid`) and
+       `work verify candidate-merge-tree -- sh -c 'test "$(git merge-tree --write-tree <base-sha> <merge-sha>)" = "$(git rev-parse <merge-sha>^{tree})"'`.
+       A differing tree means CI tested something else: STOP with an
+       operator-only ask.
+6. [ ] **Code scanning** (CodeQL), before the tag and before anything
+       reaches `main` on the mirror. Read the alerts on the candidate PR's
+       analysis
+       (`gh api --paginate "repos/<owner>/<repo>/code-scanning/alerts?ref=refs/pull/<pr>/head&state=open"`).
+       An empty alert list proves nothing until an analysis exists for this
+       candidate: first require one in
+       `gh api --paginate "repos/<owner>/<repo>/code-scanning/analyses?ref=refs/pull/<pr>/head"`
+       created after the candidate push (default-setup CodeQL does not run
+       as a `pull_request` workflow, so item 4 may not have waited for it;
+       wait for it the same way). A 403 means the token lacks code-scanning
+       read: an operator-only ask, never a skip. Only a 404 saying code
+       scanning is not enabled counts as "not configured": record that in
+       `github-ci-candidate.md` and go on.
+       Otherwise triage every alert the analysis reports into
+       `codeql-triage.md` (`work artifact`), each marked **new** (not open
+       on the mirror's `main`, from
+       `gh api --paginate "repos/<owner>/<repo>/code-scanning/alerts?ref=refs/heads/main&state=open"`)
+       or **pre-existing**: the sink, the tainted source, and **who can
+       actually reach that code path**, judged against the project's
+       documented trust boundaries (its project info, from
+       `work read-project-info`: who can reach the deployment, and what
+       each caller can send). No documented boundaries → every caller is a
+       non-operator. Probe a confinement claim rather than reading it off
+       the code.
+       - Any **new** alert a non-operator can reach with real impact → STOP
+         with an operator-only ask before the tag and the `main` push, with
+         `codeql-triage.md` attached.
+       - Otherwise (every new alert operator-only or a false positive) →
+         proceed without asking. Draft a follow-up issue at the end of
+         `codeql-triage.md` covering those alerts and every pre-existing
+         alert a non-operator can reach; pre-existing alerts never stop the
+         release. `lmer-signal post` the draft to the supervising uber
+         lmer, who files it.
+       - Dismissing an alert needs the operator's explicit authorization,
+         every time. Dismissal comments are public: self-contained, at most
+         280 characters, no internal names, hosts, issue or MR numbers or
+         run paths; run each through `lmer-release-guard scan-text` (0
+         hits) before sending, and read each alert back afterwards.
+7. [ ] **Red** — read the failing jobs (`gh run view <run-id> --log-failed`)
+       and diagnose before anything else:
+       - **Suspected flaky** (a timing or load failure in a test that
+         passes locally): re-run the failed jobs ONCE on the same SHA
+         (`gh run rerun <run-id> --failed`) without asking, record it
+         (`work event ci-candidate-rerun --note "<run URL>"`), `lmer-signal
+         post` that you did and why, and go back to item 4. ONCE is per
+         candidate, across sessions: a `ci-candidate-rerun` event already in
+         the run's `events.jsonl` (the run dir is in `work state`), or any
+         run for the candidate with `attempt` above 1
+         (`gh run view <run-id> --json attempt`, which survives a session
+         that died before recording the event), means the rerun is spent,
+         and this red is classified below.
+       - **Test-only fix**, a fact about paths, not a judgement: every path
+         in the fix's
+         `git diff --name-only --no-renames origin/prep-release...HEAD` (a
+         moved file shows both of its paths) is under `tests/`, or under a
+         test root the project info names as one. Do not wait for the operator.
+         Adopt, never duplicate: a `ci-candidate-fix` event in the run's
+         `events.jsonl`, or an open MR from a `fix/release-ci-v<X.Y.Z>-*`
+         branch, means the fix already exists — go to its merge check
+         below. Otherwise branch off `origin/prep-release`
+         (`fix/release-ci-v<X.Y.Z>-<topic>`), fix it, `bin/gate-commit`,
+         and check the path predicate on the commit before anything is
+         pushed; a path outside the test roots makes it the case below,
+         and the branch stays local. Then `bin/gate-push`, and open an MR
+         into `prep-release` — never `main`. Record it at once
+         (`work event ci-candidate-fix --note "<MR URL>"`), add it to
+         `github-ci-candidate.md`, and `lmer-signal post` the MR to the
+         supervising uber lmer to coordinate its review. Then
+         `work commit` and end the session; the scheduled relaunch checks
+         the MR. The release holds:
+         no tag, no further push to the mirror. The merge SHA is
+         write-once, so this run can never tag: once the fix MR has
+         MERGED, end the run with
+         `work release abort --reason "superseded: GitHub CI red at <merge-sha>; test-only fix <MR URL> merged"`
+         and report it — a fresh release run re-enters leg 1 idempotently
+         and releases the same version from a new release merge. Until the
+         fix MR merges, a follow-up session finds it open and exits; it
+         never aborts early.
+       - **Any fix outside test code** (a path outside the test roots):
+         STOP with an operator-only ask carrying the diagnosis and the
+         failing job URL. Change nothing.
+
 ### Step 3 — `leg2-create-tag` — the SSH-signed tag, at exactly the merge SHA
+
+Only after step 2a found nothing and step 2b is green with its code-scanning
+check passed.
 
 The tag name is `release.tag_prefix` + the version re-read in step 1 at the
 merge SHA — and Phase 0.5 pins `tag_prefix` to exactly `"v"`, so the name is
@@ -171,9 +344,20 @@ session's push allow list already grants the mirror's branch push and its
 tags (the `repo|refs/tags/*` grammar). A gate refusal is a provisioning gap
 to report, never something to route around.
 
+Before EACH of the two pushes, unless `leak_scan.public_mirror` is
+`false`: a fresh credentialed `git fetch github`, then the guard for exactly
+that object and ref —
+`work verify prepush-guard-main -- lmer-release-guard prepush --config <resolved task.yaml> --version <X.Y.Z> --published github/main <merge-sha> refs/heads/main`
+before `main`, and
+`work verify prepush-guard-tag -- lmer-release-guard prepush --config <resolved task.yaml> --version <X.Y.Z> --published github/main <tag> refs/tags/<tag>`
+before the tag. `GUARD FAIL` → do not push: STOP with an operator-only ask
+quoting its FAIL lines. A non-zero exit without a `GUARD FAIL` line means
+the guard did not run: a stop as well, never a pass.
+
 - [ ] `main` first — skip when current: `git rev-parse github/main` already
       equal to the merge SHA → record the receipt (if absent) and move on.
-      Otherwise, with local `main` checked out at the merge SHA:
+      Otherwise, with local `main` checked out at the merge SHA, guard it,
+      then:
       `bin/gate-push --remote github`
       A non-fast-forward rejection here is the divergence hard stop from
       step 2 (the mirror moved between check and push) — same contract, no
@@ -181,7 +365,8 @@ to report, never something to route around.
 - [ ] Record: `work release record receipt github-main-push`
 - [ ] Then the tag — skip when current:
       `git ls-remote github refs/tags/<tag>` already showing the recorded
-      merge SHA → record the receipt (if absent) and move on. Otherwise:
+      merge SHA → record the receipt (if absent) and move on. Otherwise
+      guard it, then:
       `bin/gate-push --tag <tag> --remote github`
 - [ ] Record: `work release record receipt github-tag-push`
 
@@ -350,6 +535,8 @@ target to the recorded merge SHA before acting:
 | Observed state | Action |
 | --- | --- |
 | Merge SHA already recorded | Re-record with the freshly re-read version — the mismatch check runs every time |
+| No tag yet, a `ci-candidate-fix` event recorded | Checked BEFORE the next row. Fix MR merged → `work release abort` as superseded; still open → nothing to advance, exit |
+| No tag yet | Re-run step 2a's leak scan (cheap) and step 2b from its first missing item: candidate branch already at the merge SHA → skip the push; open draft PR → adopt it; CI already green for the merge SHA → skip the wait; a `ci-candidate-rerun` event → the rerun is spent |
 | Tag exists at the recorded merge SHA, signature valid | Skip creation; ensure the tag record exists |
 | Tag exists anywhere else, or unsigned/invalid | HARD ERROR — never re-point, never re-sign, never delete |
 | GitHub `main` already at the merge SHA | Skip the push; ensure the receipt exists |

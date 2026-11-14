@@ -13,10 +13,12 @@ and its honest limits, and the error paths.
 **The GitLab instance is canonical.** All development, MRs, and release
 decisions happen there. The GitHub repository (`github.com/lmer2/lmer`) is a
 **mirror** in the strictest sense: a publish target that receives exactly
-two kinds of writes — `main`, and SSH-signed `v*` tags — and nothing else.
+three kinds of writes — `main`, SSH-signed `v*` tags, and the release run's
+`release-candidate/v*` CI branch — and nothing else.
 
-- No PRs. The mirror does not accept pull requests; contribution happens on
-  the canonical repo.
+- No contributed PRs. The mirror does not accept pull requests;
+  contribution happens on the canonical repo. The one PR it carries is the
+  release run's own draft CI-candidate PR, which is never merged.
 - No direct human or agent pushes. The only writer is the release taskdef's
   bot credential, and only during a release run.
 - No sync branches. `main` on the mirror is a fast-forward image of
@@ -51,8 +53,11 @@ The run has two legs with a human gate between them.
 
 ### The gate — human merge
 
-The run arms the `--check-updates --watch` primitive on the release MR and
-idles with pushed state. The human merging the protected-`main` release MR
+Before arming, the run leak-scans everything the release would publish to
+the mirror (see [Leak scan and pre-push guard](#leak-scan-and-pre-push-guard)
+below), so a finding reaches the operator while it is still a cheap history
+decision. Then it arms the `--check-updates --watch` primitive on the
+release MR and idles with pushed state. The human merging the protected-`main` release MR
 on the canonical GitLab instance is the release approval — that merge is the
 procedural
 trust anchor for everything that follows.
@@ -70,16 +75,36 @@ On merge detection:
    - The GitLab `main` pipeline at the merge SHA is green.
    - GitHub `main` is an ancestor of the merge SHA (any divergence is a
      hard stop with a documented remediation path, never a force-push).
-3. Create an **SSH-signed** tag `vX.Y.Z` at exactly the merge SHA
+3. **Leak rescan** at the merge SHA: the same scan as the gate's, now over
+   exactly what a push of the merge SHA publishes, the release merge and
+   its message included. A finding stops the run before any push.
+4. **GitHub CI candidate.** The merge SHA is pushed (behind the pre-push
+   guard) to `release-candidate/vX.Y.Z` on the mirror, with a draft PR into
+   `main` that is never merged. CI must pass on exactly that SHA, and the
+   CI merge tree is shown to equal the candidate tree. The release
+   workflow runs the same checks on the same runner image, so a red
+   candidate would otherwise fail after the immutable tag exists. The
+   PR's code-scanning analysis is triaged by who can reach each alert's
+   code path, judged against the trust boundaries the project documents
+   in its project info: a new alert a non-operator can reach with real
+   impact stops the run for the operator; otherwise the run proceeds with
+   a follow-up issue drafted, which also lists any pre-existing reachable
+   alert. Pre-existing alerts never stop a release. Dismissing an alert is always the
+   operator's call. A red candidate gets one rerun when it looks flaky; a
+   test-only fix goes in as an MR to `prep-release` without waiting for
+   the operator, after which the run is superseded by a fresh release run
+   (the merge SHA is write-once); any other fix is the operator's call.
+5. Create an **SSH-signed** tag `vX.Y.Z` at exactly the merge SHA
    (`git tag -s`, release signing key).
-4. Push to **GitHub — `main` first, then the tag**. The ordering matters:
+6. Push to **GitHub — `main` first, then the tag**, each behind the
+   pre-push guard. The ordering matters:
    the tag push triggers the release workflow, and the verify job asserts
    the tag equals `main` HEAD, so `main` must land before the trigger
    fires. Poll the Actions release run to completion. Green means PyPI has
    the version (with attestations) and the GitHub Release exists. Red
    means fail loudly with the Actions run URL — and at this point nothing
    has been published internally yet.
-5. **Only after GitHub is green**, push the tag to GitLab origin, whose
+7. **Only after GitHub is green**, push the tag to GitLab origin, whose
    tag pipeline publishes the internal package registry and container
    image. Public-before-internal ordering means a GitHub failure leaves no
    half-released internal state — the flow cannot silently drift into
@@ -92,7 +117,7 @@ On merge detection:
    fails if the registry does not serve the built digest under it, so
    "the released image is the verified image" is checked in the job log
    rather than assumed (#189).
-6. **Open the next cycle's dependency refresh.** `prep-release` now carries
+8. **Open the next cycle's dependency refresh.** `prep-release` now carries
    exactly what shipped, so this is where the new cycle starts: run the
    adopter's declared `dep_refresh` command, gate the result, and open an MR
    for the refreshed lockfiles targeting `prep-release`. It never blocks the
@@ -100,8 +125,32 @@ On merge detection:
    happen during leg 1, where a relock would ship the same day it resolved
    instead of soaking for a cycle. A repository that declares no
    `dep_refresh` parameter records the receipt with a note and skips it.
-7. Record receipts (verification events, Actions run URL, PyPI URL,
+9. Record receipts (verification events, Actions run URL, PyPI URL,
    dependency-refresh MR) and complete the run.
+
+### Leak scan and pre-push guard
+
+The mirror is public, so nothing reaches it unscanned. The tool is
+`lmer-release-guard` ([RELEASE-GUARD.md](./RELEASE-GUARD.md)):
+
+- `scan` covers the cumulative diff from the previous release tag, each
+  commit's own added and removed lines, each merge against the automatic
+  merge of its parents, every commit message and author/committer
+  identity, and the session's live secret values. Output is masked. The
+  run triages each hit against the project's exceptions file and records
+  the result as `leak-scan.md` in the run directory. Any finding stops the
+  run with an operator-only question; nothing is rewritten without the
+  operator's decision.
+- `prepush` runs before every push to the mirror (release candidate,
+  `main`, tag): the destination ref must be one of the three this release
+  may write, no commit on the project's ancestry denylist may be an
+  ancestor, and none of the project's guard strings or live secret values
+  may appear in what the push adds.
+
+What is project-private — internal hostnames, people's handles, the
+denylist, the guard strings, the exceptions file — lives in the project
+tier's `release.leak_scan` block, never in this repository. A project whose
+mirror is not public opts out with `public_mirror: false`.
 
 Git operations in both legs authenticate through the maintained,
 action-free `/Agents/global/bin/lmer-git-askpass` helper. Each command passes
@@ -240,8 +289,9 @@ Mechanics:
   GitLab (procedural, recorded by GitLab).
 
 **Residual risk, stated plainly.** The release PAT is fine-grained but
-carries `contents:write` + `workflows:write` + `actions:write` on the
-mirror (the workflows scope is required: mirrored `main` routinely carries
+carries `contents:write` + `workflows:write` + `actions:write` +
+`pull_requests:write` (plus code-scanning read) on the mirror (the
+workflows scope is required: mirrored `main` routinely carries
 `.github/workflows/*` changes, and GitHub rejects workflow-touching pushes
 without it). An attacker holding that PAT can rewrite `main`, workflows,
 and tags together, and re-run or cancel Actions runs, defeating all in-repo

@@ -33,13 +33,17 @@ from lmer_cli.harness import HARNESSES
 from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
+from lmer_platform import connectors
 from lmer_platform import (
-    ask, memory, registry, runs, session_io, spawn, statusline, store,
+    ask, memory, projects, registry, runs, session_io, spawn, statusline, store,
     transcripts, uploads, workrepo,
 )
+from tests._child_dump import json_dump_python
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 from work_repo.utils import repository_of
+
+SLACK_TARGET = "https://team.slack.com/archives/C1/p1700000000000001"
 
 
 @pytest.fixture(autouse=True)
@@ -1944,7 +1948,7 @@ def resolving_lmer(tmp_path):
         # "LMER_FASTAPI_TOKEN": ns.fastapi_token or os.environ.get(...)
         "    'token': None or os.environ.get('LMER_FASTAPI_TOKEN'),\n"
         "}\n"
-        f"open({str(dump)!r}, 'w').write(json.dumps(resolved))\n"
+        f"{json_dump_python(dump, 'resolved')}"
         "import time; time.sleep(30)\n",
         encoding="utf-8",
     )
@@ -4840,3 +4844,98 @@ def test_derive_run_identity_slug_agrees_with_both_containers(config, target):
     request = request_for(taskdef="chat", target=target)
     _host, _project, slug = spawn.derive_run_identity(request, None)
     assert slug == run_state.derive_slug("chat", target) == _derive_run_slug("chat", target)
+
+
+
+class _HeldCheck:
+    """A connectors component answering the held-thread check from a script.
+
+    Each entry is ``(retry_after, transient)`` for a refusal; the script's last
+    entry repeats. Notes whether the launch lock was held at each check."""
+
+    def __init__(self, *script):
+        self.script, self.lock_held = script, []
+
+    def refuse_held_targets(self, targets, *, besides=None):
+        self.lock_held.append(spawn._LAUNCH_LOCK.locked())
+        retry_after, transient = self.script[min(len(self.lock_held), len(self.script)) - 1]
+        raise connectors.ThreadError(
+            "cannot check who holds it" if transient else "connected to another run",
+            status=502 if transient else 409, transient=transient, retry_after=retry_after,
+        )
+
+
+class _Clock:
+    """``time`` for spawn, with a clock its sleeps advance; notes the lock at each sleep."""
+
+    def __init__(self):
+        self.now, self.slept, self.lock_held = 100.0, [], []
+        for name in dir(time):
+            if not name.startswith("_") and name not in {"sleep", "monotonic"}:
+                setattr(self, name, getattr(time, name))
+        self.monotonic = lambda: self.now
+
+    def sleep(self, seconds):
+        self.lock_held.append(spawn._LAUNCH_LOCK.locked())
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+@pytest.mark.parametrize("script, slept, checks, refusal", [
+    # Slack asks for a wait, then answers: the answer decides.
+    ([(5, True), (None, False)], [5], 2, "connected to another run$"),
+    # A timeout or a 5xx is not a rate limit: refused at once.
+    ([(None, True)], [], 1, "cannot check who holds it$"),
+    # A wait that does not end inside the budget refuses at once, as Slack said it.
+    ([(40, True)], [], 1, "cannot check who holds it$"),
+    ([(30, True), (None, False)], [], 1, "cannot check who holds it$"),
+    # The budget is the spawn's, not each attempt's.
+    ([(10, True), (10, True), (15, True)], [10, 10], 3,
+     r"cannot check who holds it; gave up after 3 attempts in 20s of 30s$"),
+    # And the attempts are bounded, since each one spends the rate limit too.
+    ([(1, True)], [1, 1, 1], spawn.THREAD_CHECK_ATTEMPTS,
+     r"cannot check who holds it; gave up after 4 attempts in 3s of 30s$"),
+    # Retry-After 0 still leaves a gap between attempts.
+    ([(0, True)], [1.0, 1.0, 1.0], spawn.THREAD_CHECK_ATTEMPTS,
+     r"cannot check who holds it; gave up after 4 attempts in 3s of 30s$"),
+    # A definite answer is never retried.
+    ([(None, False)], [], 1, "connected to another run$"),
+])
+def test_a_rate_limited_thread_check_is_waited_out_with_the_launch_lock_released(
+    config, monkeypatch, script, slept, checks, refusal,
+):
+    check, clock = _HeldCheck(*script), _Clock()
+    monkeypatch.setattr(connectors, "get_connectors", lambda: check)
+    monkeypatch.setattr(spawn, "time", clock)
+
+    with pytest.raises(spawn.ThreadHeld, match=refusal):
+        spawn.spawn_session(config, spawn.SpawnRequest("chat", "fleet", targets=[SLACK_TARGET], no_repo=True))
+
+    assert clock.slept == slept and len(check.lock_held) == checks
+    assert all(check.lock_held) and not any(clock.lock_held)
+
+
+def test_a_thread_named_as_the_target_beside_a_repo_is_checked(config, monkeypatch):
+    """validate() makes such a target a thread target; the check sees it."""
+    check = _HeldCheck((None, False))
+    monkeypatch.setattr(connectors, "get_connectors", lambda: check)
+
+    with pytest.raises(spawn.ThreadHeld, match="connected to another run"):
+        spawn.spawn_session(config, spawn.SpawnRequest(
+            "develop", SLACK_TARGET, repo_url="https://github.com/example/repo",
+        ))
+    assert check.lock_held == [True]
+
+
+def test_a_spawn_inside_a_callers_project_operation_does_not_wait(config, monkeypatch):
+    """Leaving spawn's own ``with`` would not release a caller's operation lock."""
+    check, clock = _HeldCheck((5, True), (None, False)), _Clock()
+    monkeypatch.setattr(connectors, "get_connectors", lambda: check)
+    monkeypatch.setattr(spawn, "time", clock)
+
+    with projects.operation(force=True):
+        with pytest.raises(spawn.ThreadHeld, match="cannot check who holds it$") as caught:
+            spawn.spawn_session(config, spawn.SpawnRequest("chat", "fleet", targets=[SLACK_TARGET], no_repo=True))
+
+    assert (clock.slept, len(check.lock_held)) == ([], 1)
+    assert caught.value.transient and caught.value.retry_after == 5

@@ -12,12 +12,14 @@ from __future__ import annotations
 import html
 import threading
 import time
+from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
+import requests
 
 from ask_channel import bus
-from lmer_cli import comms, supervisor, targets, thread_posts
+from lmer_cli import comms, supervisor, targets, thread_access, thread_posts
 from slack_chat import connector, registry
 from slack_chat.client import SlackError
 from tests.conftest import drain_connectors, strip_lmer_env
@@ -83,7 +85,7 @@ class FakeSlack:
             self.replies[-1]["blocks"] = [{"block_id": connector.CONNECTION_NOTICE_BLOCK_PREFIX + ts}]
         return ts
 
-    def get_replies(self, channel, thread_ts, oldest=None):
+    def get_replies(self, channel, thread_ts, oldest=None, **kw):
         parent = {"ts": thread_ts, "user": "U1", "text": "@lmer help me"}
         found = [parent] + [m for m in self.replies if oldest is None or m["ts"] > oldest]
         return found
@@ -179,7 +181,6 @@ class _StreamedPNG:
 
 
 def _stub_file_download(monkeypatch):
-    from lmer_cli import thread_access
 
     monkeypatch.setattr(thread_access.requests, "get", lambda *a, **kw: _StreamedPNG())
 
@@ -472,10 +473,156 @@ class TestInbound:
         rig.connector.stop()
 
 
+class _SlackAnswers:
+    """A Slack file server that answers with *status* and a body of *content_type*."""
+
+    def __init__(self, status=200, content_type="image/png", body=b"\x89PNG\r\n\x1a\n"):
+        self.status_code = status
+        self.headers = {"Content-Type": content_type}
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error: Forbidden for url: https://files.slack/x", response=self,
+            )
+
+    def iter_content(self, chunk_size=65536):
+        yield self.body
+
+
+SCREENSHOT = {"name": "image.png", "mimetype": "image/png", "size": 60047,
+              "url_private_download": "https://files.slack/files-pri/T1-F1/image.png"}
+
+
+class TestAFileThatCannotBeFetched:
+    """The message reaches the session either way, with a line naming the file
+    and why it did not come with it."""
+
+    def _deliver(self, tmp_path, monkeypatch, get, *, uploads=True, scopes=None):
+
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store) if uploads else None)
+        rig.slack.granted_scopes = scopes
+        calls = []
+
+        def fetch(*args, **kwargs):
+            calls.append(args)
+            return get(*args, **kwargs)
+
+        monkeypatch.setattr(thread_access.requests, "get", fetch)
+        rig.connector._poll_thread(replay=True)
+        rig.slack.human_says("check open PRs i guess", files=[SCREENSHOT])
+        assert rig.connector._poll_thread() == 1
+        record = rig.log.read_since(0)[0][-1]
+        rig.connector.stop()
+        return record, store, calls
+
+    def test_a_403_arrives_as_a_line_with_the_status(self, tmp_path, monkeypatch):
+        record, store, _calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(status=403),
+        )
+        assert record.text == (
+            "check open PRs i guess\n\n"
+            "📎 image.png (image/png, 60047 B) — not copied in: "
+            "it could not be fetched: Slack answered HTTP 403"
+        )
+        assert not record.attachments and list(store.iterdir()) == []
+
+    def test_a_timeout_arrives_as_a_line_that_says_so(self, tmp_path, monkeypatch):
+        def get(*args, **kwargs):
+            raise requests.ReadTimeout("read timed out (https://files.slack/x)")
+
+        record, _store, _calls = self._deliver(tmp_path, monkeypatch, get)
+        assert record.text.endswith("it could not be fetched: the download timed out (30 s without data)")
+        assert "files.slack" not in record.text
+
+    def test_a_web_page_where_the_image_was_is_not_staged(self, tmp_path, monkeypatch):
+        page = b"<!DOCTYPE html><html><body>Sign in</body></html>"
+        record, store, _calls = self._deliver(
+            tmp_path, monkeypatch,
+            lambda *a, **kw: _SlackAnswers(content_type="text/html; charset=utf-8", body=page),
+        )
+        assert record.text.endswith(
+            "it could not be fetched: Slack answered with a web page instead of the file"
+        )
+        assert not record.attachments and list(store.iterdir()) == []
+
+    WITHOUT_FILES_READ = ["chat:write", "channels:history", "im:history"]
+
+    @pytest.mark.parametrize("answer", [
+        lambda *a, **kw: _SlackAnswers(status=403),
+        lambda *a, **kw: _SlackAnswers(content_type="text/html", body=b"<html>Sign in</html>"),
+    ], ids=["403", "html-page"])
+    def test_a_refusal_without_files_read_names_the_scope(self, tmp_path, monkeypatch, answer):
+        record, _store, calls = self._deliver(
+            tmp_path, monkeypatch, answer, scopes=self.WITHOUT_FILES_READ,
+        )
+        assert record.text.endswith("it could not be fetched: the Slack app lacks the files:read scope")
+        assert len(calls) == 1
+
+    def test_a_scope_granted_since_the_connect_is_not_refused(self, tmp_path, monkeypatch):
+        """The scopes are read once, at connect; an app reinstalled with
+        files:read keeps its token, and its files must come in from then on."""
+        record, store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(), scopes=self.WITHOUT_FILES_READ,
+        )
+        assert len(record.attachments) == 1 and len(list(store.iterdir())) == 1
+        assert len(calls) == 1
+
+    def test_no_answer_at_all_is_not_blamed_on_the_scope(self, tmp_path, monkeypatch):
+        def get(*args, **kwargs):
+            raise requests.ConnectTimeout("connect timed out")
+
+        record, _store, _calls = self._deliver(
+            tmp_path, monkeypatch, get, scopes=self.WITHOUT_FILES_READ,
+        )
+        assert record.text.endswith("it could not be fetched: the download timed out (30 s without data)")
+
+    def test_a_token_with_files_read_fetches_as_before(self, tmp_path, monkeypatch):
+        record, store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(),
+            scopes=["chat:write", "files:read"],
+        )
+        assert len(record.attachments) == 1 and len(list(store.iterdir())) == 1
+        assert len(calls) == 1
+
+    def test_without_an_upload_store_the_file_is_still_named(self, tmp_path, monkeypatch):
+        record, _store, calls = self._deliver(
+            tmp_path, monkeypatch, lambda *a, **kw: _SlackAnswers(), uploads=False,
+        )
+        assert record.text.endswith(
+            "📎 image.png (image/png, 60047 B) — not copied in: this session has no upload store"
+        )
+        assert calls == []
+
+    def test_a_file_only_message_still_arrives(self, tmp_path, monkeypatch):
+
+        store = tmp_path / "uploads"
+        store.mkdir()
+        rig = Rig(tmp_path, uploads=str(store))
+        monkeypatch.setattr(thread_access.requests, "get", lambda *a, **kw: _SlackAnswers(status=404))
+        rig.connector._poll_thread(replay=True)
+        rig.slack.human_says("", files=[SCREENSHOT])
+        assert rig.connector._poll_thread() == 1
+        record = rig.log.read_since(0)[0][-1]
+        rig.connector.stop()
+        assert record.text == (
+            "📎 image.png (image/png, 60047 B) — not copied in: "
+            "it could not be fetched: Slack answered HTTP 404"
+        )
+
+
 class TestAttachNotice:
     def test_the_notice_has_the_range_and_link_and_downloads_nothing(self, tmp_path, monkeypatch):
         from unittest.mock import Mock
-        from lmer_cli import thread_access
 
         store = tmp_path / "uploads"
         store.mkdir()
@@ -621,6 +768,7 @@ class TestPostsFromOtherRuns:
         assert rig.connector._poll_thread() == 1
         assert rig.log.read_since(1)[0][0].source.author == "platform \u00b7 operator"
         assert b"[slack \xc2\xb7 platform \xc2\xb7 operator]" in b"".join(rig.sink)
+        assert rig.log.read_since(1)[0][0].meta.get("poster") == "platform"
 
     def test_the_assistants_post_cannot_open_a_turn_on_a_drop_in_harness(self, tmp_path, monkeypatch):
         """The assistant's ``POST /api/comms/thread`` into this thread arrives as
@@ -664,6 +812,8 @@ class TestPostsFromOtherRuns:
         authors = [record.source.author for record in rig.log.read_since(1)[0]]
         assert authors == ["lmer chat-mr-288", "tester"]
         assert [record.source.channel for record in rig.log.read_since(1)[0]] == ["slack"] * 2
+        posters = [record.meta.get("poster") for record in rig.log.read_since(1)[0]]
+        assert posters == ["session", "human"], "who posted reaches the bus as data (#674)"
 
     def test_it_is_not_mirrored_straight_back_into_the_thread(self, rig):
         """A live inbound record is never mirrored back to its own channel."""
@@ -786,6 +936,79 @@ class TestPostsFromOtherRuns:
         self._recorded(rig, ts, thread_posts.Poster.for_session("s-other", "chat-mr-288"))
         assert reconnected._poll_thread() == 1
         assert rig.log.read_since(0)[0][-1].source.author == "lmer chat-mr-288"
+
+
+class TestIdleBackoff:
+    """A quiet thread is polled less often; any new message brings it back."""
+
+    def _connector(self, *, poll=3.0, idle=30.0):
+        now = [1000.0]
+        config = connector.ConnectorConfig(
+            supervisor_url="http://testserver", supervisor_token="tok",
+            channel="C1", thread_ts="1699999999.000000", bot_token="xoxb-test",
+            poll_seconds=poll, idle_poll_seconds=idle, attach_ack=False,
+        )
+        conn = connector.SlackConnector(config, slack=FakeSlack(), clock=lambda: now[0])
+        return conn, now
+
+    def test_polling_slows_after_a_quiet_spell_and_stops_at_the_idle_interval(self):
+        conn, now = self._connector()
+        assert conn._inbound_interval() == 3.0
+        now[0] += connector.IDLE_AFTER_SECONDS - 1
+        assert conn._inbound_interval() == 3.0
+        now[0] += 1
+        assert [conn._inbound_interval() for _ in range(5)] == [6.0, 12.0, 24.0, 30.0, 30.0]
+
+    def test_a_new_message_restores_the_fast_interval(self, monkeypatch):
+        conn, now = self._connector()
+        now[0] += connector.IDLE_AFTER_SECONDS + 60
+        assert conn._inbound_interval() == 6.0
+
+        def found(replay=False):
+            conn._cursor_ts = "1700000001.000100"
+
+        conn._state = SimpleNamespace(lock=threading.Lock(), save=lambda: None)
+        try:
+            monkeypatch.setattr(conn, "_poll_thread", lambda replay=False: None)
+            conn._inbound_once()
+            assert conn._inbound_interval() == 12.0, "a poll that found nothing is not activity"
+            monkeypatch.setattr(conn, "_poll_thread", found)
+            conn._inbound_once()
+            assert conn._inbound_interval() == 3.0
+        finally:
+            conn._state = None
+
+    def test_the_connectors_own_post_restores_the_fast_interval(self, monkeypatch):
+        """Its answer is likeliest now, so the next wait is not an idle one."""
+        conn, now = self._connector()
+        monkeypatch.setattr(conn._posters, "_session_of", lambda: None)
+        now[0] += connector.IDLE_AFTER_SECONDS + 60
+        assert [conn._inbound_interval() for _ in range(3)] == [6.0, 12.0, 24.0]
+        conn._mirrored("1700000002.000100")
+        assert conn._inbound_interval() == 3.0
+
+    def test_an_idle_interval_at_or_below_the_poll_never_slows(self):
+        conn, now = self._connector(poll=5.0, idle=5.0)
+        now[0] += 10 * connector.IDLE_AFTER_SECONDS
+        assert [conn._inbound_interval() for _ in range(3)] == [5.0, 5.0, 5.0]
+
+    @pytest.mark.parametrize("environ, intervals", [
+        ({}, (3.0, 30.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "7", "LMER_SLACK_IDLE_POLL_SECONDS": "90"}, (7.0, 90.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "0.2", "LMER_SLACK_IDLE_POLL_SECONDS": "x"}, (1.0, 30.0)),
+        # Finite and bounded, so a quiet thread is still read.
+        ({"LMER_SLACK_IDLE_POLL_SECONDS": "inf"}, (3.0, 30.0)),
+        ({"LMER_SLACK_POLL_SECONDS": "nan", "LMER_SLACK_IDLE_POLL_SECONDS": "86400"},
+         (3.0, connector.MAX_POLL_SECONDS)),
+    ])
+    def test_the_intervals_come_from_the_environment(self, environ, intervals):
+        assert connector.poll_intervals(environ) == intervals
+        config = connector.ConnectorConfig.from_env({
+            "LMER_FASTAPI_PORT": "8701", "LMER_FASTAPI_TOKEN": "t",
+            "LMER_SLACK_CHANNEL": "C1", "LMER_SLACK_THREAD_TS": "1.2",
+            "SLACK_BOT_TOKEN": "xoxb", **environ,
+        })
+        assert (config.poll_seconds, config.idle_poll_seconds) == intervals
 
 
 class TestConfig:

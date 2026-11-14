@@ -58,6 +58,7 @@ from .comms import CommsHub, register_hub
 from .connectors import ThreadConnectors, register_connectors
 from .ctl import segment_field
 from .thread_service import ThreadServices, register_services
+from .usage_live import UsageLive, register as register_usage
 from .config import (
     connector_path,
     list_connectors,
@@ -70,10 +71,12 @@ from .config import (
 from .detect import Detector
 from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
+from .registry import ensure_sessions_dir
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import RunIndexError, forget, get_tracked, key_parts, list_tracked, run_key
 from .spawn import CapacityError, RunAlreadyLive, SpawnError, SpawnRequest, spawn_session
 from .store import StoreError, append_event, platform_dir
+from .timetrack_live import TimeTracking, register_tracking
 from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
@@ -86,7 +89,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
-from . import projects, assistant, detect, mute, project_context
+from . import projects, assistant, containers, detect, mute, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -378,7 +381,11 @@ def _watch_for_attention(config) -> Detector:
     and notifies nobody. Making the bind wait on a ``git`` operation would delay
     the one thing that must come up.
     """
-    detector = Detector(config)
+    detector = Detector(
+        config,
+        container_sweep=containers.sweep,
+        container_sweep_interval=containers.SWEEP_INTERVAL_SECONDS,
+    )
     print(detector.notice, flush=True)
     detector.start()
     return detector
@@ -437,6 +444,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     projects.migrate()
 
+    # Before the detector's first tick sweeps: the sweep's strict registry read
+    # treats a missing sessions directory as a lost registry and removes
+    # nothing, so a host where no session has registered yet needs it to exist.
+    try:
+        ensure_sessions_dir()
+    except OSError as exc:
+        print(f"⚠️  cannot create the session registry directory ({exc}); "
+              "container sweeps will remove nothing until it exists.", flush=True)
+
     # After the re-attach and before the server, in that order for both halves:
     # a surviving assistant has to be re-attached first or this would see it as
     # unmarked and the ensure would race the marking, and an assistant that is up
@@ -448,9 +464,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # about correctness — it is that the assistant's own row is in the fleet view
     # the first tick baselines against, so its start is never itself an event.
     detector = _watch_for_attention(config)
-    hub = _subscribe_to_comms()
+    # Before the hub: its consumer has to be on the hub when the hub starts, or
+    # the first records it journals are nobody's activity.
+    tracking = _track_time(config)
+    hub = _subscribe_to_comms(tracking)
     threads = _run_thread_connectors(config)
     services = _serve_thread_requests()
+    usage = _collect_usage(config)
 
     app = create_app(config, secret, ingress=ingress)
     uvicorn.run(
@@ -477,6 +497,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     detector.stop()
     hub.stop()
     register_hub(None)
+    # After the hub, which calls the consumer, and before the connectors, whose
+    # bindings the last decisions read.
+    tracking.stop()
+    register_tracking(None)
     # Last, and after the hub: a connector still running would go on posting
     # into a thread from a daemon that has stopped watching it, and the note it
     # posts on the way out is the only thing that tells the thread so.
@@ -486,6 +510,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # answering for a daemon that has stopped.
     services.stop()
     register_services(None)
+    usage.stop()
+    register_usage(None)
     return 0
 
 
@@ -518,17 +544,43 @@ def _serve_thread_requests() -> ThreadServices:
     return services
 
 
-def _subscribe_to_comms() -> CommsHub:
+def _collect_usage(config) -> UsageLive:
+    """Start the live usage collector (issue #315), read-only: published for the
+    usage routes, and a no-op object when ``LMER_PLATFORM_USAGE`` turns it off."""
+    live = UsageLive(config)
+    if config.usage_enabled:
+        live.start()
+        register_usage(live)
+    return live
+
+
+def _subscribe_to_comms(*consumers) -> CommsHub:
     """Start the comms hub: one subscriber per session bus, one fleet journal
     (issue #407). Published like the assistant supervisor so the API routes and
     the detector can reach it; milestones it delivers are skipped by the ask-dir
     reader, and everything else it sees is batched into the assistant's spool.
+
+    *consumers* are added before the hub starts, so none misses a record.
     """
     hub = CommsHub()
     hub.add_consumer(_assistant_consumer(hub))
+    for consumer in consumers:
+        hub.add_consumer(consumer)
     hub.start()
     register_hub(hub)
     return hub
+
+
+def _track_time(config) -> TimeTracking:
+    """Start human time tracking (issue #604) and publish it for the settings
+    routes to reconfigure (issue #668).
+
+    Called from :func:`_cmd_run` only, like the detector. Never fatal; see
+    :meth:`lmer_platform.timetrack_live.TimeTracking.start`.
+    """
+    tracking = TimeTracking().start(config)
+    register_tracking(tracking)
+    return tracking
 
 
 def _assistant_consumer(hub: CommsHub):

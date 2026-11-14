@@ -180,6 +180,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -192,7 +193,7 @@ from lmer_cli.codex_delivery import MAX_RPC_TIMEOUT, input_budget
 
 from . import assistant_history, registry
 from .spawn import container_log_path_for, log_path_for, read_control_token
-from .store import append_event
+from .store import append_event, path_component
 
 logger = logging.getLogger("lmer_platform.session_io")
 
@@ -207,7 +208,7 @@ __all__ = [
     "read_log_at", "follow_log", "control_endpoint", "send_input", "apply_resize",
     "probe_health", "read_control_output", "session_activity",
     "session_output_state",
-    "control_plane_answers", "ACTIVITY_TIMEOUT_SECONDS",
+    "control_plane_answers", "control_plane_refused", "ACTIVITY_TIMEOUT_SECONDS",
 ]
 
 #: ``LogChunk.source``: the session wrote this log itself, from inside its
@@ -481,7 +482,7 @@ def _validated(session_id: str) -> str:
         registry.session_path(session_id)
     except registry.RegistryError as exc:
         raise SessionNotFound(str(exc)) from exc
-    return session_id
+    return path_component(session_id)
 
 
 def session_log_path(session_id: str) -> Path:
@@ -1269,6 +1270,27 @@ def control_plane_answers(session_id: str) -> bool:
     proved" rather than as "the container is gone".
     """
     return quiet_health(session_id) is not None
+
+
+def control_plane_refused(session_id: str) -> bool:
+    """Whether a TCP connect to *session_id*'s recorded control port is refused.
+
+    A raw socket, because ``requests`` honours ``HTTP_PROXY`` and would report
+    a dead proxy's refusal as this port's. Any other failure is not proof.
+    """
+    try:
+        endpoint = control_endpoint(session_id)
+    except SessionIOError:
+        return False
+    try:
+        with socket.create_connection(
+            (endpoint.host, endpoint.port), timeout=ACTIVITY_TIMEOUT_SECONDS
+        ):
+            return False
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
 
 
 def session_activity(session_id: str) -> Optional[dict]:

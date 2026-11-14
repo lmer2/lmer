@@ -51,11 +51,12 @@ import os
 import re
 import secrets
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import SCHEMA_VERSION
 from .store import (
-    StoreError, mutating, read_json, sessions_dir, utc_now_iso, write_json,
+    StoreError, ensure_state_dir, mutating, path_component, read_json, sessions_dir,
+    utc_now_iso, write_json,
 )
 
 logger = logging.getLogger("lmer_platform.registry")
@@ -64,7 +65,7 @@ __all__ = [
     "RegistryError", "SESSION_KINDS", "WORKER_KIND", "ASSISTANT_KIND",
     "new_session_id", "SESSION_ID_SUFFIX_BYTES", "session_path",
     "token_path", "register", "update", "read_session", "list_sessions",
-    "remove", "prune_dead", "is_live",
+    "remove", "prune_dead", "is_live", "set_aside_ids",
 ]
 
 #: A session is either a worker doing a task or the orchestrating assistant.
@@ -119,7 +120,7 @@ def _validate_session_id(session_id: str) -> str:
         )
     if os.sep in session_id or "/" in session_id:  # pragma: no cover - regex covers
         raise RegistryError(f"invalid session id {session_id!r}: path separator")
-    return session_id
+    return path_component(session_id)
 
 
 def session_path(session_id: str) -> Path:
@@ -347,17 +348,27 @@ def read_session(session_id: str) -> Optional[dict]:
         return None
 
 
-def list_sessions(*, live_only: bool = True) -> list[dict]:
+def list_sessions(*, live_only: bool = True, strict: bool = False) -> list[dict]:
     """Every registered session, oldest first, each carrying a computed ``live``.
 
     ``live`` is derived on read and never persisted. With ``live_only`` (the
     default) stale entries are filtered out but left on disk — reclaiming them is
     :func:`prune_dead`'s job, so that reads stay side-effect free.
+
+    With ``strict``, an unreadable entry or listing raises :class:`StoreError`
+    instead of being skipped: for a caller that would act on a session's
+    *absence*, a list with a hole in it is not a list.
     """
     directory = sessions_dir()
     try:
-        paths = sorted(directory.glob("*.json"))
+        paths = sorted(
+            directory / name
+            for name in _entry_names(directory, missing_ok=not strict)
+            if name.endswith(".json")
+        )
     except OSError as exc:
+        if strict:
+            raise StoreError(f"cannot list {directory} ({exc})") from exc
         logger.warning("platform_session_list_failed dir=%s error=%s", directory, exc)
         return []
 
@@ -366,6 +377,8 @@ def list_sessions(*, live_only: bool = True) -> list[dict]:
         try:
             entry = read_json(path)
         except StoreError as exc:
+            if strict:
+                raise
             logger.warning("platform_session_unreadable path=%s error=%s", path, exc)
             continue
         if entry is None:
@@ -376,6 +389,51 @@ def list_sessions(*, live_only: bool = True) -> list[dict]:
         entries.append(entry)
     entries.sort(key=lambda e: (e.get("started_at") or "", e.get("id") or ""))
     return entries
+
+
+def set_aside_ids() -> set[str]:
+    """Ids of sessions whose entry :func:`~lmer_platform.store.read_json` moved
+    aside as corrupt (``<id>.json.bad-<stamp>``): the registry has lost what
+    it knew about them, not learned that they ended. Raises
+    :class:`StoreError` when the directory cannot be listed, or is missing
+    (see :func:`_entry_names`)."""
+    directory = sessions_dir()
+    try:
+        names = _entry_names(directory, missing_ok=False)
+    except OSError as exc:
+        raise StoreError(f"cannot list {directory} ({exc})") from exc
+    return {name.rsplit(".json.bad-", 1)[0] for name in names if ".json.bad-" in name}
+
+
+def _entry_names(directory: Path, *, missing_ok: bool) -> list[str]:
+    """The non-hidden names in ``directory``. Raises :class:`OSError` when it
+    cannot be listed.
+
+    ``os.scandir`` rather than ``Path.glob``, which swallows every error from
+    listing the directory and answers an unreadable one with no entries.
+
+    A missing directory is no names only with ``missing_ok``. A strict reader
+    passes ``False``: ``platform run`` creates the directory at start
+    (:func:`ensure_sessions_dir`), so by the time the sweep reads it, its
+    absence means the registry was lost, not that no session has registered.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            return [entry.name for entry in entries if not entry.name.startswith(".")]
+    except FileNotFoundError:
+        if missing_ok:
+            return []
+        raise
+
+
+def ensure_sessions_dir() -> None:
+    """Create the sessions directory, owner-only, if it is not there yet.
+
+    Called by ``platform run`` before anything reads the registry strictly,
+    so that a strict read can treat a missing directory as lost rather than
+    as a host where no session has registered yet. Raises :class:`OSError`.
+    """
+    ensure_state_dir(sessions_dir())
 
 
 def remove(session_id: str, *, force: bool = False) -> bool:
@@ -444,7 +502,7 @@ def remove(session_id: str, *, force: bool = False) -> bool:
     return True
 
 
-def prune_dead() -> list[str]:
+def prune_dead(gone: Optional[Callable[[dict], bool]] = None) -> list[str]:
     """Remove entries whose session process is gone. Returns the ids removed.
 
     The explicit reclaim path (see the module docstring): unique session ids mean
@@ -457,13 +515,18 @@ def prune_dead() -> list[str]:
     exactly that), so discarding it is an acknowledgement the operator makes, not
     housekeeping that quietly erases a crash nobody saw.
 
-    ``force=True`` because the sessions being pruned are dead by definition, and
+    ``force=True`` because the sessions being pruned are dead (or, through
+    *gone*, have lost their control plane), and
     their entries are frequently owned by a *previous* daemon process; refusing
     to clean those up is exactly the litter this exists to remove.
+
+    *gone* also condemns an entry whose pid still reads live, for the caller
+    that can ask more than the pid (the control-plane probe this module cannot
+    import, #538).
     """
     removed: list[str] = []
     for entry in list_sessions(live_only=False):
-        if entry.get("live"):
+        if entry.get("live") and not (gone and gone(entry)):
             continue
         session_id = entry.get("id")
         if not isinstance(session_id, str):

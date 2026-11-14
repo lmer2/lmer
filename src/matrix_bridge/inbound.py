@@ -22,7 +22,8 @@ one is written out:
    puts authorization in the bridge at all. The header ships now because a
    request that arrives without one cannot be attributed retroactively, and
    because the per-principal work (#202, slice 2) reads it rather than inventing
-   it. Until then, the bridge's own log line is the attribution.
+   it. Until then, the bridge's own log line is the attribution, plus a live
+   answer's ``author``: the sender's MXID, which the bus record keeps.
 5. The room is told what happened — in the thread, in the words of the thing
    that actually happened: the session continued, a session started, the
    concurrency cap refused it, or the platform's own ``detail``.
@@ -211,7 +212,7 @@ class Inbound:
             )
             return Outcome(False, f"denied: {capability}")
 
-        call = self._call_for(reason, run, row, message.body)
+        call = self._call_for(reason, run, row, message.body, message.sender)
         if call is None:
             return self._ignored(
                 f"{run} says {reason} but the row carries no question to answer",
@@ -229,7 +230,7 @@ class Inbound:
     # --- the two routes -------------------------------------------------------
 
     def _call_for(
-        self, reason: str, run: RunKey, row: Mapping, text: str,
+        self, reason: str, run: RunKey, row: Mapping, text: str, sender: str,
     ) -> Optional[Call]:
         if reason == "live_question":
             session_id = (row.get("session") or {}).get("id")
@@ -239,10 +240,13 @@ class Inbound:
                 return None
             # The oldest unanswered question, because that is the one the
             # session is blocked in — the same one the attention note renders.
+            # The author is the sender: the platform credential is the
+            # operator's, and an answer that names nobody is the operator's
+            # own, which time tracking reads as default_person's (#604).
             return Call(
                 "POST",
                 f"/api/sessions/{session_id}/ask/{question_id}/answer",
-                body={"answer": text},
+                body={"answer": text, "author": sender},
             )
         return Call(
             "POST", "/api/runs/answer",

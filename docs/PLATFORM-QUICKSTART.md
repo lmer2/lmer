@@ -24,6 +24,22 @@ directory (`~/.lmer/platform/`), so `lmer platform run` afterwards works from
 any directory. Re-run it after every update — `npm run build` alone does not
 refresh what the daemon serves.
 
+**Restart the daemon after an update, too.** The daemon reads the UI bundle from
+disk on every page load, but its routes are fixed when it starts. A daemon left
+running across an update serves the new page without that page's newer routes,
+so new controls fail with "Not Found". `GET /api/health` reports this as
+`ui.stale: true` (the bundle on disk differs, by content, from the one there at
+startup). The page then shows a banner asking for a restart, and shows the same
+banner for a daemon too old to report `ui` at all. A daemon started before any
+bundle existed has nothing to compare against and never reports stale. If the
+bundle is there but cannot be read at startup (for example, `setup-ui` is
+swapping it in at that moment), the daemon logs
+`platform_ui_fingerprint_unavailable` and uses the first bundle a health check
+reads as its baseline. `ui.stale: false` only means the bundle has not changed
+since the daemon took its baseline (at startup, or at the first readable health
+check). It does not prove that the page and the daemon come from the same
+version.
+
 By default the daemon binds loopback (`127.0.0.1:8600`). Open the printed URL
 in a browser; it prompts for credentials — any username, and the shared secret
 as the password:
@@ -253,18 +269,17 @@ consult relevant prior exchanges when context is missing.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
 - **Ratchet settings** — how its session is *run* (model, harness, preset,
-  agents fan-out, Slack/matrix threads), per platform instance: **Execution and chat
-  defaults** in Platform settings, or `GET`/`POST /api/assistant/config`. The dialog groups its
-  fields as **Session launch**, **Conversation** and **Reminders**, each with a line
-  saying when its changes apply. Each value shows which
-  layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
-  dialog persists to `config.json`, and the dialog says so). Changes apply to
-  the **next** incarnation — the running one keeps its context window until
-  you restart it, and the dialog offers the restart. Standing orders are the
-  chat's to edit and are deliberately not in this dialog. Thread permalinks go
-  one per line; save and rotate to connect. The saved list survives rotations.
-  The dialog also holds the chat pane's **Show Ratchet's working transcript**
-  switch: off (the default) the pane draws the conversation only — your
+  agents fan-out, Slack/matrix threads), per platform instance: Platform settings
+  → **Assistants** (cards **Launch defaults** and **Reminders**), or
+  `GET`/`POST /api/assistant/config`. Each card says when its changes apply. Each
+  value shows which layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats
+  what the card persists to `config.json`, and the card says so). Launch changes
+  apply to the **next** incarnation — the running one keeps its context window
+  until you restart it from the project chat. Standing orders are the chat's to
+  edit and are deliberately not here. Thread permalinks go one per line; save and
+  rotate to connect. The saved list survives rotations.
+  Platform settings → **Chat and display** holds the chat pane's **Show
+  Ratchet's working transcript** switch: off (the default) the pane draws the conversation only — your
   messages, and what Ratchet posted, asked and answered; on, its tool calls,
   watch events, hook re-prompts and unposted working notes appear muted beside
   them. Platform state (`chat_show_transcript` in `config.json`): the browser
@@ -275,6 +290,20 @@ consult relevant prior exchanges when context is missing.
   hue, at a lightness where the message text and its header both clear WCAG AA
   in either color scheme; off, they use the theme's one operator color. The
   General project and a chat with no project always use that one color.
+  The same switch paints a message from another project's Ratchet in that
+  project's hue; off, or when the project is unknown, it uses one fixed peer
+  color. **Scroll long messages inside their bubble** (off by default,
+  `chat_scroll_long_messages`) caps a long message at a third of the screen
+  with its own scroll bar; off, every message is shown at full length and the
+  chat is the only thing that scrolls.
+  **Enter sends messages** (on by default, `chat_enter_sends`) sets the
+  keys in all three message boxes — the chat composer, a live session's ask
+  reply and a stopped run's answer. On, Enter sends and Shift+Enter starts a
+  new line; off, Enter starts a new line and Ctrl+Enter (Cmd+Enter on a Mac)
+  sends. Ctrl/Cmd+Enter sends either way. On a phone or other touch-first
+  device Enter always starts a new line, because it is the only newline key
+  there; the send button under each box works everywhere. Send privately's
+  editor is not one of the three: Enter there is always a new line.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
@@ -1226,6 +1255,75 @@ chat.
     stays until dismissed, because the rotation one asks you to send again.
 - **Same limits as attach:** the per-file cap applies, and a session started
   before uploads existed has no store and is refused.
+- **A daemon older than the page** has no `/private` route, so the send fails
+  with a 404 before anything is stored. The editor then says the daemon needs a
+  restart rather than "Not Found" (see [Install and first run](#install-and-first-run)).
+
+## Daemon load and degraded health
+
+`GET /api/health` answers two different questions. `ok: true` means only that
+the process answers. Whether it is answering *well* is in `load`, and
+`degraded` with `degraded_reasons` summarise it. Alert on `degraded`, not on
+`ok`: restarting a daemon that is slow but recovering loses its in-memory
+state and fixes nothing.
+
+Health runs its authentication, request binding and checks on two threads of
+its own. Every other route authenticates and binds on a separate pool of 8, and
+handles the request on the shared handler pool. So health still answers when
+every handler thread is busy, or when every binding thread is stuck behind a busy
+database, and then `load.pool` shows it.
+
+| field | what it reports |
+|---|---|
+| `load.requests.waiting` | Requests that have arrived and not yet started a response. The health call itself is not counted. |
+| `load.requests.oldest`, `oldest_read` | The longest-waiting request, and the longest-waiting GET/HEAD: method, path and `overdue_seconds`. A long-poll's own `timeout` parameter is subtracted. |
+| `load.loop.lag_seconds`, `lag_max_60s` | How late the event loop wakes from a 1-second sleep, now and over the last minute. Blocking work on the loop shows here. |
+| `load.pool.borrowed`, `total`, `waiting` | The threadpool the route handlers share. When `borrowed` equals `total` and `waiting` is above 0, requests are queueing for a thread. |
+| `load.state_build.in_flight`, `last` | Fleet-view builds running now, and the last one's duration, finish time and per-stage `stages`. |
+| `load.reconcile` | The project supervisor's last pass: `last_seconds`, the `interval_seconds` between pass starts (normally about 2), and `finished_at`. `running_seconds` is how long the pass now open has been running, or `null` between passes: a pass that never finishes shows here, since the interval only updates when the next pass starts. |
+| `load.db_write_wait` | Waits for the projects database's write lock over the last minute: `count_60s`, `total_60s`, `max_60s`. |
+
+`degraded` is true when any of these holds, and each one adds a sentence to
+`degraded_reasons`:
+
+- a read has been waiting 30 s or more past its own allowance;
+- the event loop lagged 2 s or more in the last minute;
+- reconcile passes are 30 s or more apart, or one pass has been running 30 s
+  or more;
+- the last fleet-view build took 30 s or more.
+
+Writes never count: a spawn, a rotation or a rescan is slow by design. These
+thresholds describe a condition and trigger nothing.
+
+The daemon also logs, at WARNING:
+
+- `platform_slow_request method= path= status= waited=`, when a request starts
+  its response 5 s or more past its allowance. For `/api/state` the line carries
+  the build's `stages`, so you can see where the time went.
+- `platform_request_stuck method= path= waited=`, once per request still in
+  flight 30 s past its allowance. This is how a request that never finishes is
+  still reported.
+
+Only the path is logged, never the query string.
+
+### Shared fleet-view builds
+
+Concurrent `GET /api/state` requests in the same project share a build that is
+already running. A finished build is never reused. A request joins a running
+build only if it started after the last write the daemon answered and after the
+last mirror pull, and is less than 10 s old. Otherwise the request waits for
+that project's next build, which starts when the running one finishes. Every
+request that arrives meanwhile shares that next build, so a project has at most
+one build running and one waiting. A refused write (any 4xx answer) changed
+nothing, so it does not count as a write here. The mirror pull itself happens per request, before
+any sharing, so only the request that wins the pull throttle waits on
+`git fetch`.
+
+At most 3 builds run at once. A request that waits 25 s without getting a build
+is answered 503 with `{"detail": {"code": "state_busy", "retryable": true}}`
+and `Retry-After: 5`. Nothing was changed, so it is safe to retry.
+`load.state_build.flight` in `/api/health` reports how many builds are
+`running` and `pending`, and how many requests are `joiners` waiting on one.
 
 ## Where things live
 

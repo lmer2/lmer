@@ -23,13 +23,16 @@ to the operator who typed its name.
 The service probe is memoised for :data:`PROBE_TTL_SECONDS` because the fleet
 payload is polled every ten seconds and a subprocess per slot per poll is a
 cost a row does not need; the spawn path asks for a fresh answer instead, since
-a poll can afford a stale one and an action taken on it cannot. The probe holds
+a poll can afford a stale one and an action taken on it cannot. A poll also
+never waits longer than :data:`PROBE_WAIT_SECONDS` for a probe, which runs on
+its own thread, one per binding. The probe holds
 no opinion about the container runtime — it passes one to
 :func:`lmer_cli.service.resolve_container`.
 """
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -58,7 +61,7 @@ logger = logging.getLogger("lmer_platform.slots")
 
 __all__ = [
     "SLOT_FREE", "SLOT_OCCUPIED", "SLOT_SERVICE_DOWN", "SLOT_MISCONFIGURED",
-    "SLOT_STATES", "PROBE_TTL_SECONDS",
+    "SLOT_UNKNOWN", "SLOT_STATES", "PROBE_TTL_SECONDS", "PROBE_WAIT_SECONDS", "PROBE_UNANSWERED",
     "SlotDefinition", "SlotStatus",
     "parse_slots", "slot_definitions", "slot_status", "slot_rows",
     "probe_service", "probe_group", "group_members", "group_membership",
@@ -90,14 +93,31 @@ SLOT_OCCUPIED = "occupied"
 SLOT_SERVICE_DOWN = "service_down"
 #: The definition names a preset this host cannot use. The row carries why.
 SLOT_MISCONFIGURED = "misconfigured"
+#: The service probe has not answered yet, so whether the service runs is not
+#: known. Not an outage: the row says so and updates when the probe answers.
+SLOT_UNKNOWN = "unknown"
 
 #: Every state a row may report, in the order a reader should think about them.
-SLOT_STATES = (SLOT_FREE, SLOT_OCCUPIED, SLOT_SERVICE_DOWN, SLOT_MISCONFIGURED)
+SLOT_STATES = (
+    SLOT_FREE, SLOT_OCCUPIED, SLOT_SERVICE_DOWN, SLOT_MISCONFIGURED, SLOT_UNKNOWN,
+)
 
 #: How long a service probe's answer is reused: longer than the fleet view's
 #: ten-second poll, short enough that a service the operator just started shows
 #: up while they are still looking at the screen.
 PROBE_TTL_SECONDS = 30.0
+
+#: How long a fleet read waits for a probe before it answers without one. A
+#: runtime stuck behind a long container removal answers in minutes, and every
+#: read that waited for it held a request thread.
+PROBE_WAIT_SECONDS = 2.0
+
+#: The reason a row carries when no probe has answered yet. Worded as unknown
+#: rather than down, which is what it is.
+PROBE_UNANSWERED = (
+    f"the container runtime did not answer within {PROBE_WAIT_SECONDS:g} s; "
+    "this row updates when it does"
+)
 
 #: Keys a slot entry may define. Anything else is logged rather than fatal, so a
 #: key added by a newer build does not invalidate the slot on an older one.
@@ -255,6 +275,8 @@ class SlotStatus:
             return SLOT_MISCONFIGURED
         if self.definition.applicability_reason() is not None:
             return SLOT_MISCONFIGURED
+        if self.service_down_reason == PROBE_UNANSWERED:
+            return SLOT_UNKNOWN
         if self.service_down_reason is not None:
             return SLOT_SERVICE_DOWN
         return SLOT_FREE
@@ -439,6 +461,33 @@ def equivalent_slots(config, request):
 _PROBE_CACHE: dict[tuple[str, str, str], tuple[float, Optional[str], tuple]] = {}
 _PROBE_LOCK = threading.Lock()
 
+#: ``key -> Event`` for the one background probe in flight per binding, set when
+#: it has answered. Guarded by :data:`_PROBE_LOCK`.
+_PROBE_FLIGHTS: dict[tuple[str, str, str], threading.Event] = {}
+#: Bumped by :func:`clear_probe_cache`, so a probe started before a clear does
+#: not write its answer into the cleared cache.
+_PROBE_GENERATION = 0
+
+#: ``time.monotonic()`` by which the current fleet read stops waiting for
+#: probes, shared by every binding it asks about (:func:`_begin_read`).
+_READ_DEADLINE: contextvars.ContextVar = contextvars.ContextVar(
+    "lmer_platform_slots_read_deadline", default=None
+)
+
+
+def _begin_read():
+    """Start one :data:`PROBE_WAIT_SECONDS` budget for a whole read, however
+    many bindings it probes; ``None`` inside a read that already has one.
+    Hand the result to :func:`_end_read`."""
+    if _READ_DEADLINE.get() is not None:
+        return None
+    return _READ_DEADLINE.set(time.monotonic() + PROBE_WAIT_SECONDS)
+
+
+def _end_read(token) -> None:
+    if token is not None:
+        _READ_DEADLINE.reset(token)
+
 #: Slot name → the session ids last warned about, so a collision warns on a
 #: *transition* rather than on every ten-second poll. Guarded by
 #: :data:`_PROBE_LOCK`, the module's one lock.
@@ -451,8 +500,11 @@ def clear_probe_cache() -> None:
     Not called on a config reload — the cache is keyed on the service name, so
     a slot pointed at a different service simply misses.
     """
+    global _PROBE_GENERATION
     with _PROBE_LOCK:
         _PROBE_CACHE.clear()
+        _PROBE_FLIGHTS.clear()
+        _PROBE_GENERATION += 1
         _WARNED_COLLISIONS.clear()
         _REBIND_CACHE.clear()
 
@@ -466,9 +518,9 @@ def probe_service(
     """Why *service* is not usable right now, or ``None`` when it is.
 
     With ``cached`` (the default) an answer younger than
-    :data:`PROBE_TTL_SECONDS` is reused. The lock is released across the probe
-    itself: holding it would serialise every other slot behind a slow query,
-    and the worst a concurrent miss costs is the same query run twice.
+    :data:`PROBE_TTL_SECONDS` is reused, and a miss waits at most
+    :data:`PROBE_WAIT_SECONDS` for the one background probe per binding, then
+    answers with the last known reason, or :data:`PROBE_UNANSWERED`.
     """
     return _probe((_SERVICE, service), runtime=runtime, cached=cached)
 
@@ -552,12 +604,65 @@ def _probe_full(
 
     kind, name = binding
     key = (runtime, kind, name)
-    if cached:
-        with _PROBE_LOCK:
-            entry = _PROBE_CACHE.get(key)
+    if not cached:
+        return _measure(key)
+
+    with _PROBE_LOCK:
+        entry = _PROBE_CACHE.get(key)
         if entry is not None and entry[0] > time.monotonic():
             return entry[1], entry[2]
+        flight = _PROBE_FLIGHTS.get(key)
+        if flight is None:
+            flight = threading.Event()
+            _PROBE_FLIGHTS[key] = flight
+            # Off the request thread: the fleet read must not wait out a
+            # runtime that cannot answer, and one probe per binding means a
+            # stuck runtime costs one thread, not one per poll.
+            try:
+                threading.Thread(
+                    target=_fly, args=(key, flight, _PROBE_GENERATION),
+                    name="lmer-platform-slot-probe", daemon=True,
+                ).start()
+            except RuntimeError as exc:
+                # No flight left registered that nothing will ever land:
+                # the next read tries again rather than waiting it out.
+                del _PROBE_FLIGHTS[key]
+                flight.set()
+                logger.warning("platform_slot_probe_start_failed binding=%s error=%s", name, exc)
+    deadline = _READ_DEADLINE.get()
+    wait = PROBE_WAIT_SECONDS if deadline is None else deadline - time.monotonic()
+    if wait > 0:
+        flight.wait(min(wait, PROBE_WAIT_SECONDS))
+    with _PROBE_LOCK:
+        entry = _PROBE_CACHE.get(key)
+    if entry is not None:
+        return entry[1], entry[2]
+    return PROBE_UNANSWERED, ()
 
+
+def _fly(key: tuple, flight: threading.Event, generation: int) -> None:
+    try:
+        _measure(key, generation=generation)
+    except Exception as exc:  # noqa: BLE001 - a background probe has nobody to raise to
+        logger.exception("platform_slot_probe_failed binding=%s", key[1:])
+        # Cached like any answer, so a probe that always raises costs one
+        # thread and one traceback per TTL, and the row says what happened.
+        with _PROBE_LOCK:
+            if generation == _PROBE_GENERATION:
+                _PROBE_CACHE[key] = (
+                    time.monotonic() + PROBE_TTL_SECONDS,
+                    f"the service probe failed: {exc!r}", (),
+                )
+    finally:
+        with _PROBE_LOCK:
+            if _PROBE_FLIGHTS.get(key) is flight:
+                del _PROBE_FLIGHTS[key]
+        flight.set()
+
+
+def _measure(key: tuple, *, generation: Optional[int] = None) -> tuple:
+    """Run the probe for *key* now and cache its answer."""
+    runtime, kind, name = key
     members: tuple = ()
     try:
         if kind == _GROUP:
@@ -577,7 +682,8 @@ def _probe_full(
     # runtime's ten-second timeout, and an answer dated from before it would
     # arrive having already spent a third of its life.
     with _PROBE_LOCK:
-        _PROBE_CACHE[key] = (time.monotonic() + PROBE_TTL_SECONDS, reason, members)
+        if generation is None or generation == _PROBE_GENERATION:
+            _PROBE_CACHE[key] = (time.monotonic() + PROBE_TTL_SECONDS, reason, members)
     return reason, members
 
 
@@ -987,6 +1093,14 @@ def slot_rows(
     rather than paying for a second read; the fleet payload does. It is
     filtered for liveness here regardless (see :func:`_live_entries`).
     """
+    token = _begin_read()
+    try:
+        return _slot_rows(config, sessions=sessions, cached=cached)
+    finally:
+        _end_read(token)
+
+
+def _slot_rows(config: PlatformConfig, *, sessions: Optional[list], cached: bool) -> list:
     definitions = slot_definitions(config)
     if not definitions:
         return []
@@ -1138,6 +1252,16 @@ def slot_status(
     otherwise, so the spawn gate's ``cached=False`` call pays one per group
     project this host declares even when the slot it asks about names no group.
     """
+    token = _begin_read()
+    try:
+        return _slot_status(config, name, sessions=sessions, cached=cached)
+    finally:
+        _end_read(token)
+
+
+def _slot_status(
+    config: PlatformConfig, name: str, *, sessions: Optional[list], cached: bool
+) -> Optional[SlotStatus]:
     definitions = slot_definitions(config)
     if not any(definition.name == name for definition in definitions):
         return None

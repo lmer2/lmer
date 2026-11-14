@@ -83,7 +83,7 @@ def component(platform_root, monkeypatch):
 class _FakeSlack:
     """Slack reporting a root: for a root link, its own ts."""
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         return [{"ts": ts}]
 
 
@@ -94,7 +94,7 @@ class _RefusingSlack:
     def __init__(self, code):
         self.code = code
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         from slack_chat.client import SlackError
 
         raise SlackError(
@@ -446,7 +446,7 @@ class TestARunActingOnItsOwnThreads:
         class ReadRefused(FakeSlack):
             """One client behind both paths, as the real one is."""
 
-            def get_replies(self, channel, ts, oldest=None):
+            def get_replies(self, channel, ts, oldest=None, **kw):
                 from slack_chat.client import SlackError
 
                 raise SlackError("Slack API error: missing_scope", code="missing_scope")

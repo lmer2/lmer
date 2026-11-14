@@ -52,6 +52,13 @@ as it streams, so the check no longer depends on the caller having captured
 (#152). Whether prose amounts to a *complete* answer is deliberately not guessed
 at — see :func:`classify_degenerate_output`. Operator-facing account of the tee
 and what it changes about a pipeline: ``docs/HARNESSES.md``.
+
+Every child is marked ``LMER_USAGE_CHILD=1``, so it writes no usage record of
+its own; its usage is counted in its parent's record from the child's own
+directory, ``<transcript dir>/.lmer-children/<child>/`` (#647 Q6,
+:mod:`lmer_usage.children`). claude and pi children keep text mode and keep
+their transcript there; codex runs in its JSON mode, which reproduces its text
+output byte for byte; any other child is a ``not_collected`` row.
 """
 
 from __future__ import annotations
@@ -60,19 +67,23 @@ import argparse
 import codecs
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
 from lmer_cli.harness import (
     HARNESS_ENV,
     LLM_NAME_ENV,
+    FANOUT_CHILD_ENV,
     NONINTERACTIVE_ENV,
     Harness,
     build_exec_argv,
@@ -94,7 +105,9 @@ from lmer_cli.presets import (
     SPAWN_AGENTS_ENV,
 )
 from lmer_cli.model_aliases import expand_model_alias, load_model_aliases
+from lmer_cli.mounts import CONTAINER_HOME
 from lmer_cli.user_harnesses import CONTAINER_HARNESS_CACHE_DIR
+from lmer_usage import children as child_usage
 
 #: Exit code for a child killed by ``--timeout`` (the coreutils convention).
 TIMEOUT_EXIT_CODE = 124
@@ -223,9 +236,14 @@ def build_child_env(
     its turn on ``Shall I proceed? (yes/no)`` exits 0 with a near-empty output
     file, so the orchestrator consolidates from N-1 agents with nothing to
     show it lost one.
+
+    ``LMER_FANOUT_CHILD`` is set last for the same reason. It stands down the
+    Stop hooks that would replace the child's captured last turn (#323).
     """
     # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
     from work_repo import session_record
+    # deferred: import cost — work_repo adds ~50 ms to every spawn-harness start
+    from work_repo.usage import CHILD_ENV as USAGE_CHILD_ENV
 
     child = dict(parent_env)
     # The parent's launch name and goal (`lmer --name/--goal`) describe the
@@ -252,6 +270,9 @@ def build_child_env(
     ):
         child.pop(key, None)
     child[NONINTERACTIVE_ENV] = "1"
+    child[FANOUT_CHILD_ENV] = "1"
+    # Set last like the markers above: a child must never write its own record.
+    child[USAGE_CHILD_ENV] = "1"
     _expand_spawn_time_model(child, extra_env)
     return child
 
@@ -919,6 +940,181 @@ def _raise_sigterm(signum, frame) -> None:
     raise SystemExit(128 + signum)
 
 
+#: The file a captured child writes its final answer to, in its capture dir.
+LAST_MESSAGE_NAME = "last-message"
+
+
+@dataclass
+class ChildUsage:
+    """One child's usage record (#647 Q6).
+
+    The child owns ``root/<child_session>/`` (:mod:`lmer_usage.children`):
+    its manifest, and its transcript when ``transcript_dir`` is set (the
+    harness's transcript dir; text output stays untouched). ``directory`` is a
+    private temporary directory, set only when the child runs in its harness's
+    JSON mode: its stdout is then read through a pipe and turned back into the
+    text its text mode prints. ``rows`` are what the manifest records.
+    """
+
+    harness: str
+    agent: str
+    child_session: str
+    root: Path
+    model: Optional[str] = None
+    directory: Optional[str] = None
+    transcript_dir: Optional[Path] = None
+    rows: list = field(default_factory=list)
+
+    @property
+    def capturing(self) -> bool:
+        return self.directory is not None
+
+    @property
+    def keeps_transcript(self) -> bool:
+        return self.transcript_dir is not None
+
+    @property
+    def child_dir(self) -> Path:
+        return self.root / self.child_session
+
+    @property
+    def last_message(self) -> Optional[str]:
+        return os.path.join(self.directory, LAST_MESSAGE_NAME) if self.directory else None
+
+
+def harness_session_dir(harness: Harness) -> Optional[Path]:
+    """Where *harness* writes transcripts for this process's ``HOME``.
+
+    The registry declares the container path; the harness itself resolves it
+    from ``HOME``, which is the same place in a session container.
+    """
+    if not harness.session_dir:
+        return None
+    declared = Path(harness.session_dir)
+    try:
+        return Path.home() / declared.relative_to(CONTAINER_HOME)
+    except ValueError:
+        return declared
+
+
+def _pump_capture(stream, capture) -> None:
+    """Feed a captured child's stdout to its parser as it arrives
+    (:func:`lmer_usage.children.stream`), so the stream is never held whole.
+
+    A parser failure stops the parsing, never the read, so the child is never
+    left blocked on a full pipe (the hazard :func:`_pump_stdout` documents).
+    """
+    try:
+        failed = False
+        for chunk in iter(lambda: stream.read1(STDOUT_CHUNK_BYTES), b""):
+            if failed:
+                continue
+            try:
+                capture.feed(chunk)
+            except Exception as exc:  # the pipe must keep draining whatever the parser does
+                print(f"⚠️  spawn-harness: cannot parse the child's output: {exc}", file=sys.stderr)
+                failed = True
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _read_last_message(path: str) -> Optional[bytes]:
+    try:
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(f"⚠️  spawn-harness: cannot read the child's final message: {exc}", file=sys.stderr)
+        return None
+
+
+def _deliver_captured(
+    usage: ChildUsage, child_session: str, capture, handle, tally, drained: bool,
+    output: Optional[str],
+) -> None:
+    """Deliver a captured child's text where its stdout would have gone.
+
+    The text is rebuilt from the JSON output; output that does not parse is
+    passed through raw, so a parse failure never loses the child's answer.
+    """
+    result = capture.finish(
+        _read_last_message(usage.last_message),
+        model=usage.model, agent=usage.agent, child_session=child_session,
+    )
+    usage.rows = result.rows
+    data = result.text
+    if data is None:
+        data = capture.raw
+        if data is None:
+            data = b""
+            print(f"⚠️  spawn-harness: the child's output was not JSON events and exceeded "
+                  f"{child_usage.RAW_LIMIT} bytes; it cannot be passed through", file=sys.stderr)
+    if handle is not None:
+        try:
+            handle.flush()
+            handle.buffer.write(data)
+            handle.flush()
+        except OSError as exc:
+            print(
+                f"⚠️  spawn-harness: cannot write the child's answer to --output {output}: {exc}",
+                file=sys.stderr,
+            )
+        return
+    try:
+        _write_stdout_bytes(data)
+    except (OSError, ValueError) as exc:
+        print(f"⚠️  spawn-harness: cannot forward the child's stdout ({exc})", file=sys.stderr)
+        _abandon_stdout()
+    tally.feed(data)
+    if drained:
+        tally.finish()
+
+
+def _child_manifest(usage: ChildUsage, parent_session: Optional[str], rows: list) -> dict:
+    return {
+        "parent_session": parent_session, "child_session": usage.child_session,
+        "harness": usage.harness, "agent": usage.agent, "model": usage.model,
+        "transcript": usage.keeps_transcript, "rows": rows,
+    }
+
+
+def _start_child_record(usage: ChildUsage, parent_session: Optional[str]) -> None:
+    """Create the child's directory before it runs: a claude child's transcript
+    is recognised as a child's by it while still in the parent's dir."""
+    try:
+        child_usage.write_manifest(usage.child_dir, _child_manifest(usage, parent_session, []))
+    except (OSError, ValueError) as exc:
+        print(f"⚠️  spawn-harness: cannot record the child's usage: {exc}", file=sys.stderr)
+
+
+def _finish_child_record(usage: ChildUsage, parent_session: Optional[str]) -> None:
+    """Gather the child's transcript and record its rows; warn, never raise."""
+    rows = usage.rows
+    if usage.keeps_transcript:
+        rows = []
+        if usage.harness == "claude":
+            try:
+                child_usage.move_transcript(usage.transcript_dir, usage.child_session, usage.child_dir)
+            except OSError as exc:
+                print(f"⚠️  spawn-harness: cannot move the child's transcript: {exc}", file=sys.stderr)
+    elif not rows:
+        reason = (
+            "usage capture did not complete" if usage.capturing
+            else child_usage.unsupported_reason(usage.harness)
+        )
+        rows = [child_usage.not_collected_row(
+            harness=usage.harness, model=usage.model, agent=usage.agent,
+            child_session=usage.child_session, reason=reason,
+        )]
+    try:
+        child_usage.write_manifest(usage.child_dir, _child_manifest(usage, parent_session, rows))
+    except (OSError, ValueError) as exc:
+        print(f"⚠️  spawn-harness: cannot record the child's usage: {exc}", file=sys.stderr)
+
+
 def run_child(
     argv: list,
     child_env: Dict[str, str],
@@ -926,6 +1122,7 @@ def run_child(
     timeout: Optional[float],
     heartbeat: float = DEFAULT_HEARTBEAT_SECONDS,
     agent_name: str = "child",
+    usage: Optional[ChildUsage] = None,
 ) -> int:
     """Run the child process, capturing stdout to ``output`` when given.
 
@@ -953,10 +1150,18 @@ def run_child(
     configuration problem — but once the child has run, the mirrored code
     wins over our own I/O trouble: a footer or close we cannot complete
     warns and leaves the code alone (:func:`_write_failure_footer`).
+
+    With ``usage``, the child is named ``usage.child_session`` (its schema-2
+    uid too), its directory is created before it runs, and its manifest is
+    completed once it has run (:mod:`lmer_usage.children`). A capturing
+    ``usage`` reads the child's JSON stdout through a pipe and delivers the
+    rebuilt text, to ``output`` or our stdout, before any footer, on every exit
+    path.
     """
     # deferred: import cost — the work_repo package adds ~50 ms to every spawn-harness start
     from work_repo import session_record
 
+    parent_session = os.environ.get("LMER_SESSION_ID")
     own_session = session_record.schema_version(
         Path(child_env.get("LMER_WORK_REPO_PATH", "/work"))
     ) >= 2
@@ -970,7 +1175,7 @@ def run_child(
             config={"agent": agent_name, "unattended": True},
         )
         metadata["parent"] = session_record.scrub_metadata(supplied)
-        metadata["uid"] = uuid.uuid4().hex
+        metadata["uid"] = usage.child_session if usage else uuid.uuid4().hex
         # Only the child exec trampoline can report the actual harness PID.
         for key in ("pid", "started_at", "execution_hostname",
                     "source_session_uid", "unsigned_source_acknowledged"):
@@ -978,32 +1183,56 @@ def run_child(
         child_env["LMER_SESSION_ID"] = metadata["uid"]
         child_env[session_record.METADATA_ENV] = json.dumps(metadata)
         argv = [sys.executable, "-m", "lmer_cli.container.harness_session", "exec", *argv]
+    child_session = usage.child_session if usage else uuid.uuid4().hex
+    capturing = usage is not None and usage.capturing
     proc = None
     try:
         stdout = open(output, "w") if output else None
     except OSError as exc:
         raise _fail(f"Cannot write --output: {exc}") from None
     stderr_tail: deque = deque(maxlen=STDERR_TAIL_LINES)
+
+    def child_error(line: str) -> None:
+        # What text mode would have printed on stderr (lmer_usage.children.CodexStream).
+        sys.stderr.write(line + "\n")
+        stderr_tail.append(line + "\n")
+
+    capture = child_usage.stream(usage.harness, on_error=child_error) if capturing else None
     # Uncaptured runs are teed rather than inherited (issue #152), so the
     # degenerate-output check applies with or without --output.
     tally = None if stdout else _StdoutTally()
     # One list, one join helper: a stream some exit path forgets is a child
     # writing into a buffer nobody reads.
     pumps: list = []
+
+    def deliver() -> None:
+        # The capture pump is last in ``pumps``; alive means a prefix.
+        _deliver_captured(
+            usage, child_session, capture, stdout, tally,
+            not pumps[-1].is_alive(), output,
+        )
+
     try:
+        if usage is not None:
+            _start_child_record(usage, parent_session)
         try:
             proc = subprocess.Popen(
                 argv,
                 env=child_env,
                 stdin=subprocess.DEVNULL,
-                stdout=stdout if stdout else subprocess.PIPE,
+                stdout=stdout if stdout and not capturing else subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
+            if usage is not None:
+                # Nothing ran, so nothing is owed to the parent's record.
+                shutil.rmtree(usage.child_dir, ignore_errors=True)
             raise _fail(f"Cannot run {argv[0]!r}: {exc}") from None
         pumps.append(_start_pump(_pump_stderr, proc.stderr, stderr_tail))
-        if tally is not None:
+        if capturing:
+            pumps.append(_start_pump(_pump_capture, proc.stdout, capture))
+        elif tally is not None:
             pumps.append(_start_pump(_pump_stdout, proc.stdout, tally))
         try:
             # SIGTERM's default handler would exit without unwinding — map it
@@ -1038,6 +1267,8 @@ def run_child(
             _kill_process_group(proc)
             _join_pumps(pumps)
             print("❌ spawn-harness interrupted — child killed", file=sys.stderr)
+            if capturing:
+                deliver()
             if stdout:
                 # Narrow on purpose: only the footer write is guarded, so the
                 # OSError it may raise is absorbed while the interrupt itself
@@ -1055,6 +1286,8 @@ def run_child(
             _kill_process_group(proc)
             print(f"❌ Child timed out after {timeout:g}s", file=sys.stderr)
         _join_pumps(pumps)
+        if capturing:
+            deliver()
         if timed_out:
             if stdout:
                 _write_failure_footer(
@@ -1082,6 +1315,8 @@ def run_child(
     finally:
         if stdout:
             _close_output(stdout, output)
+        if usage is not None and proc is not None:
+            _finish_child_record(usage, parent_session)
         if own_session and proc is not None:
             # The wrapper has waited for (or killed/reaped) the exec'd harness.
             # Teardown is a helper of that execution and inherits its UID.
@@ -1183,36 +1418,57 @@ def main(argv: Optional[list] = None) -> None:
             (os.environ.get(HARNESS_ENV) or ""), child_env
         )
 
+    session_dir = harness_session_dir(harness)
+    usage = ChildUsage(
+        harness=harness.name, agent=ns.agent, model=child_env.get(LLM_NAME_ENV),
+        child_session=uuid.uuid4().hex, root=child_usage.children_root(session_dir),
+    )
+    transcript = None
+    if harness.exec_profile.usage_capture_args and child_usage.supports(harness.name):
+        usage.directory = tempfile.mkdtemp(prefix="spawn-harness-usage-")
+    elif harness.exec_profile.transcript_args and session_dir is not None:
+        usage.transcript_dir = session_dir
+        transcript = {
+            "session_id": child_usage.transcript_id(usage.child_session),
+            "session_dir": str(usage.child_dir),
+        }
     try:
-        child_argv, warnings = build_exec_argv(
-            harness,
-            prompt,
-            model=child_env.get(LLM_NAME_ENV),
-            effort=child_env.get("LMER_REASONING_EFFORT"),
-            # Fan-out children run with no human attached — opt into the
-            # harness's permission-bypass posture (container is the boundary).
-            unattended=True,
-        )
-    except ValueError as exc:
-        raise _fail(str(exc)) from None
-    for warning in warnings:
-        print(f"⚠️  {warning}", file=sys.stderr)
+        try:
+            child_argv, warnings = build_exec_argv(
+                harness,
+                prompt,
+                model=child_env.get(LLM_NAME_ENV),
+                effort=child_env.get("LMER_REASONING_EFFORT"),
+                # Fan-out children run with no human attached — opt into the
+                # harness's permission-bypass posture (container is the boundary).
+                unattended=True,
+                last_message_file=usage.last_message,
+                transcript=transcript,
+            )
+        except ValueError as exc:
+            raise _fail(str(exc)) from None
+        for warning in warnings:
+            print(f"⚠️  {warning}", file=sys.stderr)
 
-    # The prompt is elided — it can be huge and is the caller's own text.
-    print(
-        f"🚀 spawn-harness {ns.agent}: {' '.join(child_argv[:-1])} <prompt>",
-        file=sys.stderr,
-    )
-    raise SystemExit(
-        run_child(
-            child_argv,
-            child_env,
-            ns.output,
-            ns.timeout,
-            heartbeat=ns.heartbeat,
-            agent_name=ns.agent,
+        # The prompt is elided — it can be huge and is the caller's own text.
+        print(
+            f"🚀 spawn-harness {ns.agent}: {' '.join(child_argv[:-1])} <prompt>",
+            file=sys.stderr,
         )
-    )
+        raise SystemExit(
+            run_child(
+                child_argv,
+                child_env,
+                ns.output,
+                ns.timeout,
+                heartbeat=ns.heartbeat,
+                agent_name=ns.agent,
+                usage=usage,
+            )
+        )
+    finally:
+        if usage.directory:
+            shutil.rmtree(usage.directory, ignore_errors=True)
 
 
 if __name__ == "__main__":

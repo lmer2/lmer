@@ -17,6 +17,8 @@ The properties that matter, in the order the issue names them:
 """
 
 import json
+import threading
+import time
 import urllib.parse
 
 import pytest
@@ -807,3 +809,24 @@ def test_a_service_held_under_another_slot_does_not_block_this_one(client):
 
     assert response.status_code == 200, response.text
     assert stored_slots()[1]["preset"] == "other_dev"
+
+
+def test_api_state_answers_while_the_runtime_cannot(client, monkeypatch):
+    """A runtime stuck behind a long container removal costs the slot row its
+    answer, not the fleet read its response."""
+    release = threading.Event()
+
+    def stuck(runtime, service_name, *, announce=True):
+        release.wait(30)
+        return "container-id"
+
+    monkeypatch.setattr(slots, "resolve_container", stuck)
+    write_config({"slots": [{"name": "webapp", "preset": "webapp_dev"}]})
+    try:
+        started = time.monotonic()
+        row = row_of(client, "webapp")
+        assert time.monotonic() - started < slots.PROBE_WAIT_SECONDS + 10
+        assert row["state"] == slots.SLOT_UNKNOWN
+        assert row["reason"] == slots.PROBE_UNANSWERED
+    finally:
+        release.set()

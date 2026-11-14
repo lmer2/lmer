@@ -1040,9 +1040,11 @@ class TestTheLaunchThatFinishedAReleaseInSchemaForm:
                                match="refusing to start a new run"):
                 run_state.ensure_run(session=SID_NEXT)
         else:
-            assert _session_start(SID_NEXT) == 0
-            assert "session-start skipped: refusing to start a new run" in \
-                capsys.readouterr().out
+            # An explicit id naming no session dir is refused before any seed
+            # is attempted (#639), with or without LMER_SESSION_ID.
+            assert _session_start(SID_NEXT) == 2
+            assert "Session start refused: no session dir" in \
+                capsys.readouterr().err
         assert not (area / SCHEMA_BASE).exists()
 
 

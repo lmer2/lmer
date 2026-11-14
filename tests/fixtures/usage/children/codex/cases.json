@@ -1,0 +1,22 @@
+{
+  "answer": {
+    "stdout": "answer.jsonl",
+    "last_message": "No findings in the diff.\n\nThe retry path in `fetch()` is covered by `test_retry_backoff`.",
+    "text_mode_stdout": "No findings in the diff.\n\nThe retry path in `fetch()` is covered by `test_retry_backoff`.\n"
+  },
+  "trailing-newline": {
+    "stdout": "trailing-newline.jsonl",
+    "last_message": "Done.\nAll checks pass.\n",
+    "text_mode_stdout": "Done.\nAll checks pass.\n\n"
+  },
+  "no-usage": {
+    "stdout": "no-usage.jsonl",
+    "last_message": "No findings in the diff.\n\nThe retry path in `fetch()` is covered by `test_retry_backoff`.",
+    "text_mode_stdout": "No findings in the diff.\n\nThe retry path in `fetch()` is covered by `test_retry_backoff`.\n"
+  },
+  "turn-failed": {
+    "stdout": "turn-failed.jsonl",
+    "last_message": "",
+    "text_mode_stdout": ""
+  }
+}

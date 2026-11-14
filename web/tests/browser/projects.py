@@ -144,6 +144,24 @@ class Browser:
         await self.switcher_entry(name)
         await self.wait(f"{self.SWITCHER}?.textContent.trim() === {json.dumps(name)}")
 
+    async def reload(self):
+        """Reload and wait for the new document: Page.reload returns before the old one is gone."""
+        origin = await self.evaluate("performance.timeOrigin")
+        await self.call("Page.reload")
+        await self.wait(f"performance.timeOrigin !== {origin!r} && document.readyState !== 'loading'")
+
+    async def settings_section(self, title):
+        """Show one Platform settings section: the side nav on desktop, the select on a phone (issue 652)."""
+        await self.wait("document.querySelector('.platform-settings')")
+        if await self.evaluate("document.querySelector('.settings-nav').checkVisibility()"):
+            await self.click_element(f"[...document.querySelectorAll('.settings-nav button')].find(e => e.querySelector('.settings-nav-label').textContent.trim() === {json.dumps(title)})")
+        else:
+            await self.click_element("document.querySelector('.settings-picker .v-field')")
+            item = f"[...document.querySelectorAll('.v-overlay .v-list-item')].find(e => e.checkVisibility() && e.textContent.trim().startsWith({json.dumps(title)}))"
+            await self.wait(item)
+            await self.click_element(item)
+        await self.wait(f"document.querySelector('.settings-nav button[aria-current=\"page\"] .settings-nav-label')?.textContent.trim() === {json.dumps(title)}")
+
     async def shot(self, output, name):
         reply = await self.call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
         (output / f"{name}.png").write_bytes(base64.b64decode(reply["data"]))

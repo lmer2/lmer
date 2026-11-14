@@ -5,6 +5,214 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.14.0:
+  added:
+  - "A release session warns when a release credential exported in the environment\
+    \ (e.g. the platform daemon's shell) differs from its .env value; the export still\
+    \ wins, and the warning names the variable and file, never the value \u2014 and\
+    \ is printed even when the exported signing key is missing and the launch aborts"
+  - 'Human time tracking on the platform: a person''s time starts when they write
+    in a project''s thread, stops after an idle grace, and each finished entry is
+    committed to `timesheet.d/` in the work repo. See docs/TIME-TRACKING.md.'
+  - A `people` registry and `default_person` in the platform's `config.json` map Slack
+    user ids, Matrix MXIDs and the web chat to a person; only listed people are tracked.
+    With one person listed, `default_person` is implied.
+  - 'Per-project time settings: a stable project key kept across renames, a tracking
+    handler, client labels and an idle grace override, in Project settings.'
+  - Tracking handlers defined in the work repo (`timesheet.d/.handlers/<name>.yaml`)
+    declare required entry fields; a sync process outside lmer reports each entry's
+    status through `timesheet.d/<person>/.sync/<handler>.jsonl`, shown as synced,
+    held or pending.
+  - Manual start and stop from a clock button and a time-tracking panel pinned under
+    the control UI header, a sidebar marker on the tracking project, and a read-only
+    Time entries dialog with filters and per-day totals.
+  - A per-person switch that turns automatic tracking off until it is turned back
+    on, in the time-tracking bar, as `lmer-ctl time auto on|off` and `PUT /api/time/auto`;
+    manual start and stop still work while it is off.
+  - '`lmer-ctl time status|start|stop|set|auto|entries` and `/api/time/*`; Ratchet
+    starts, stops, retitles and checks time for whoever asked, turns their automatic
+    tracking on or off, and asks for a missing handler field.'
+  - '`LMER_PLATFORM_TIME_*` settings for the idle grace, minimum entry length, pause
+    after a manual stop (none by default), how long recent values are kept, the idle
+    sweep interval, and the writer''s commit identity and push token.'
+  - Bus records keep a human sender's Slack user id or Matrix MXID in `source.author_id`.
+  - 'Time entries name the runs they covered in an optional `sessions:` list (each
+    item a run key and, for a schema-2 run, its uid): an automatic entry the runs
+    of the sessions its activity came from, an entry an assistant started by hand
+    that assistant''s run. A parser that predates the key still reads the entry.'
+  - The Time entries page lists an entry's linked runs; each opens that run in the
+    fleet view.
+  - "Project settings \u2192 Time tracking suggests the work repo registry's short\
+    \ names for the project key, those the project's repositories resolve to first;\
+    \ a key changes only when one is picked."
+  - '`GET /api/health` reports `ui.stale` when the UI bundle changed on disk after
+    the platform daemon started'
+  - '`lmer-release-guard`: a leak scan and pre-push guard for releases, with project-private
+    patterns read from the project tier''s `release.leak_scan` block'
+  - 'An automatic time entry belongs to the run its activity came from: it takes the
+    run''s title (and follows it until a person sets one) and lists the run''s issues
+    and merge requests in an optional `issues:` key.'
+  - 'Handler fields can be marked `per_issue: true`, and a handler can keep an issue
+    map at `timesheet.d/.handlers/<name>/issues.yaml`: an entry''s field values follow
+    its first issue (the person''s last value for it, then the map), and a missing
+    one prompts per issue.'
+  - A prompt is answered from the time bar or with `lmer-ctl time start --prompt ID
+    --field KEY=VALUE`; the value is remembered for that issue.
+  - '`lmer-ctl runs meta set <key> --issue URL` (and `issues` on `POST /api/runs/meta`)
+    lists the issues a run is about beyond its target.'
+  - 'Every session now writes its own AI usage record, `ai-usage/<session-id>.yaml`,
+    in its run directory: tokens per harness, model and agent (fan-out children included),
+    wall clock and a per-day split, checkpointed every 15 minutes and finalised at
+    session end. Standalone and platform sessions alike; see docs/USAGE-TRACKING.md
+    (#647).'
+  - 'The platform shows fleet AI usage live: totals, a "most expensive now" order
+    for the run list, limit headroom per harness and operator with a time-to-limit
+    projection, a usage section on the run detail view, and per-project and per-period
+    rollups. Costs appear only when an operator price table is configured (`LMER_PLATFORM_USAGE_PRICES`)
+    (#315).'
+  - '`work decisions` lists a run''s recorded decisions and who made them; `lmer-signal`
+    answers and `work decision` record them with the answer''s authority.'
+  - Slack and Matrix connectors stamp `meta.poster` (human, bot, or the lmer origin)
+    on what they relay into a session's bus.
+  - "Platform settings \u2192 Time tracking edits the people registry, a new time_tracking\
+    \ switch and the time defaults, applied without a daemon restart."
+  - 'Ratchet can set up time tracking from chat: new lmer-ctl time verbs list the
+    asker, set the project and check handler definitions.'
+  - A project assistant or the operator can release a mention's thread claim or hand
+    it to another project with `lmer-ctl threads release --to`.
+  - '`/api/health` reports `load`, `degraded` and `degraded_reasons`, including a
+    reconcile pass that never finishes, and the daemon logs slow and stuck requests.
+    Health answers on threads of its own, so it stays readable when every request
+    binding is blocked.'
+  - Platform setting `chat_scroll_long_messages` (off by default) caps long chat messages
+    in a scrolling bubble; off, messages show at full length.
+  fixed:
+  - Fixed flaky platform spawn tests that could read a partially written child environment
+    dump and lose the variable under test.
+  - Stabilized the connector reconstruction test so it drains the previous thread
+    owner before asserting, removing an OwnershipBusy race on loaded runners (#469).
+  - Stop stale-run check-in digests naming a dormant review run whose MR has not moved
+    since its review was posted; the run is named again once someone pushes or comments
+    after the review (the reviewer's own replies, which gitlab-review now records
+    on the run as review_note events in review sessions, its resolves, and system
+    notes such as cross-references, do not count), a review on a merged or closed
+    MR is left out, and a failed MR read leaves the run named. MRs are read in parallel,
+    and a merged MR is not read again (#401)
+  - Release credentials edited into ~/.lmer/.env now take effect on the next session,
+    without a platform restart; a credential deleted from the file stops being forwarded
+  - Bare filenames no longer render as dead links; a run file's name in the run view
+    now links to the file in the work repo.
+  - The platform UI now warns when its daemon is older than the page, and Send Privately
+    asks for a restart instead of failing with "Not Found"
+  - In dark mode, filled primary and error buttons use dark text and the error color
+    is a lighter rose, so they meet WCAG AA contrast.
+  - Keyboard focus rings on app bar buttons use the bar's own text color, so they
+    stay visible on every project color.
+  - The lmer container image builds again now that Node LTS is 26, which needs libatomic;
+    the image now installs it.
+  - 'The time-tracking docs no longer say a manual start by Ratchet adds a run: Ratchet
+    has no run.'
+  - '`work session-start --session <id>` now refuses an id that names no session instead
+    of seeding a phantom run.'
+  - A stray Ctrl-S in a platform terminal no longer freezes the session's output.
+  - After a daemon restart, `prune` removes a stale session whose control port refuses
+    connections, and duplicate-assistant errors stop repeating every poll.
+  - Fan-out children are no longer prompted by lmer's Stop hooks, so their findings
+    are not replaced by a reply to the hook.
+  - Fixed usage records from platform-spawned sessions carrying a null platform_session;
+    the session id is now forwarded into the container.
+  - '`/api/state` and `/api/assistant` no longer slow to a minute on project hosts:
+    project database reads stop queueing behind writers.'
+  - One request's project lookups no longer stall every other request, `/api/health`
+    included.
+  - The project supervisor's reconcile loop keeps its 2-second cadence instead of
+    drifting to 30 seconds.
+  - '`lmer-ctl spawn --target-thread` now waits out a Slack rate limit for up to 30
+    seconds instead of being refused on the first 429: the daemon answers 503 with
+    Retry-After and `lmer-ctl` sends the launch again.'
+  - A matrix 429 during a launch's thread check no longer sleeps inside the daemon's
+    launch lock.
+  - A file posted in a connected Slack thread that cannot be fetched now arrives as
+    a line naming it and why, instead of vanishing.
+  - Thread file reasons now tell apart over-size, the HTTP status (the homeserver's
+    or lmer-matrix-bridge's), a timeout and a missing files:read scope, on Slack and
+    Matrix.
+  - A Slack app without files:read now says so in the thread's connect announcement,
+    without naming the scope, including threads the Slack listener starts a session
+    for.
+  - The platform no longer kills a container removal after 60 seconds, which left
+    podman containers stuck in `removing`; one removal may take 30 minutes in all,
+    and its `rm` is out of reach of a Ctrl-C in the daemon's terminal.
+  - The platform now removes its own containers stuck in `removing` or left unreadable,
+    at start and every 10 minutes, warning once per container. It removes nothing
+    on a pass where the session registry cannot be listed or read in full.
+  - A container whose stop fails is still removed, so podman's `removing` containers
+    no longer survive every daemon restart.
+  - '`lmer` now retries a failed container removal once and prints the container id
+    when it still fails.'
+  - 'The service-slot probes no longer hold `GET /api/state` for as long as the container
+    runtime is slow: a read waits 2 s for them in all, then a row keeps its last answer.
+    sqlite lock waits on the same request are #561''s and are not changed here.'
+  - The web terminal now shows an agy session's whole screen instead of its first
+    line, and no longer types xterm's terminal-query replies into the session.
+  changed:
+  - Platform settings is grouped into sections with a side nav (a picker on phones),
+    one card style and Save buttons enabled only for edited cards.
+  - "The chat tint and transcript switches are under Platform settings \u2192 Chat\
+    \ and display instead of a dialog."
+  - Leaving Platform settings with unsaved edits asks first; archiving a project now
+    asks for confirmation.
+  - "The project color picker opens on swatches for every color, with the full picker\
+    \ behind Custom\u2026."
+  - 'The service slot editor uses the same buttons: a filled Save, a tonal cancel
+    and an error-coloured remove.'
+  - The release taskdef now leak-scans, guards every mirror push and requires green
+    GitHub CI on the exact merge SHA before tagging; adopters must declare `leak_scan`
+  - '`LMER_RELEASE_SIGNING_KEY` holds the key''s container path, a locator, so redaction
+    and the leak scan no longer treat its value as a secret'
+  - A run switch inside a project splits the time entry (`switch`); the person's messages
+    to Ratchet extend the running entry. A manual timer follows runs in its project
+    the same way and stays manual.
+  - 'Changing the title, client or a handler field after time has accrued splits the
+    entry (`trigger.stop: edit` / `trigger.start: edit`); filling an empty value still
+    edits in place. The time bar sends what its form loaded, so a title the run renamed
+    meanwhile is not taken for an edit.'
+  - An automatic entry with no run no longer takes the session's run name as its title.
+  - Enter now sends in the control UI's message boxes, Shift+Enter adds a line; a
+    Chat and display setting turns this off; touch keeps newline.
+  - Only the field values a person set (typed, answered or edited) are remembered
+    for an entry's work item, its issue or else its run. A value from the handler's
+    issue map or the project's last value is read fresh each time, so a corrected
+    map entry applies to the next time entry.
+  - '`work event` refuses `goals_frozen`, `goal_amended`, `question_answered` and
+    `decision`; record decisions with `work decision`.'
+  - The time-tracking bar spans the full width under the header, is slim or editing,
+    and stays open while a timer runs.
+  - The header clock shows the running mode in a colour derived from the project tint;
+    the time line moved into the bar.
+  - Operator `requests park` also accepts a delivered conversation request whose actions
+    are uncertain, not only an uncertain reply.
+  - Concurrent `/api/state` requests share a build already in progress, and a project
+    runs at most one build at a time; a request still waiting after 25 seconds gets
+    a 503 with `Retry-After`.
+  - Chat panes draw peer Ratchets, Ratchet, platform notices and bot or relayed thread
+    posts in their own styles; only the operator's messages lean right.
+  - Connector retry notes reach the chat only after 60 seconds of failure; short retry
+    and recovery pairs from older connectors are no longer drawn. A direct connector's
+    own status notes (running, exited, recovery required) are drawn as the platform's.
+  - Codex digest wake and idle reminders carry the `[lmer platform]` marker, so the
+    chat draws them as the platform's.
+  - A spawn refused because Slack is rate limiting names the Retry-After and this
+    daemon's recent `conversations.replies` volume.
+  - Slack connectors poll a quiet thread less often, slowing to `LMER_SLACK_IDLE_POLL_SECONDS`
+    (default 30, at most 300) and speeding up on new messages or their own posts.
+  - The platform daemon removes containers one at a time on a background thread, so
+    startup and other launches no longer wait on a slow removal.
+  - A service slot whose probe has not answered yet reads `unknown` ("not checked
+    yet") rather than `service_down`.
+  security:
+  - 'Fixed a platform daemon freeze: an upload whose filename held a long run of dashes
+    could stall every session''s API for seconds to minutes.'
 0.13.0:
   added:
   - --env-only and LMER_ENV_ISOLATED let a launch load only its --env-file, so a second

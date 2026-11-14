@@ -30,8 +30,10 @@ this file's idea of them. One test goes further and drives the real supervisor
 FastAPI app, pinning the response shape the platform reads.
 """
 
+import errno
 import json
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1589,3 +1591,109 @@ def test_the_log_route_tells_a_terminal_its_scrollback_has_a_seam(
 
     assert payload["detached"]["output"] == reattach.OUTPUT_CONTROL_PLANE
     assert payload["live"] is True
+
+
+# --- #538: a detached entry from a previous daemon, judged by its control plane ---
+
+@pytest.fixture
+def refusing_port():
+    """A loopback port held bound but not listening: a connect is refused,
+    and no other process can take the number while the test runs."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield sock.getsockname()[1]
+
+
+@pytest.fixture
+def prune_client(platform_root):
+    # deferred: import cost — only the route tests need the whole API app
+    from fastapi.testclient import TestClient
+
+    from lmer_platform import api
+    from lmer_platform import config as cfg
+
+    secret = "test-secret-value"
+    client = TestClient(
+        api.create_app(cfg.load(), secret, state_builder=lambda config, **kw: {})
+    )
+
+    def prune():
+        return client.post(
+            "/api/prune", headers={"Authorization": f"Bearer {secret}"}
+        ).json()
+
+    return prune
+
+
+@pytest.mark.parametrize("probe", ["reused pid", "permission denied"])
+def test_prune_removes_a_detached_entry_whose_control_plane_is_gone(
+    prune_client, refusing_port, monkeypatch, probe
+):
+    """The incident: the old session's pid still answers `kill(pid, 0)` (reused,
+    or another user's), so only its control plane can say it is gone."""
+    plant_session("s-old", port=refusing_port)  # pid = this live test process
+    reattach.mark_detached("s-old", output=reattach.OUTPUT_NONE, detail="restart")
+    if probe == "permission denied":
+        def denied(pid, sig):
+            raise PermissionError(pid)
+
+        monkeypatch.setattr(registry.os, "kill", denied)
+    assert registry.list_sessions()[0]["live"] is True
+
+    assert prune_client() == {"removed": ["s-old"], "count": 1}
+    assert registry.read_session("s-old") is None
+
+
+def test_prune_keeps_a_detached_session_that_survived_the_restart(
+    prune_client, plane
+):
+    plant_session("s-survivor", port=plane.port)
+    reattach.reattach_session("s-survivor", poll=FAST_POLL)
+    assert reattach.detached_record(registry.read_session("s-survivor"))
+
+    assert prune_client() == {"removed": [], "count": 0}
+    assert registry.read_session("s-survivor") is not None
+
+
+def test_prune_keeps_a_listening_session_when_a_dead_proxy_refuses(
+    prune_client, refusing_port, monkeypatch
+):
+    """A refusal must come from the session's own port: an HTTP client routed
+    through a dead proxy reports the proxy's refusal instead."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        proxy = f"http://127.0.0.1:{refusing_port}"
+        for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.setenv(name, proxy)
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        plant_session("s-healthy", port=listener.getsockname()[1])
+        reattach.mark_detached("s-healthy", output=reattach.OUTPUT_NONE, detail="restart")
+
+        assert prune_client() == {"removed": [], "count": 0}
+    assert registry.read_session("s-healthy") is not None
+
+
+@pytest.mark.parametrize("failure", [
+    TimeoutError("timed out"),
+    OSError(errno.EHOSTUNREACH, "No route to host"),
+], ids=["timeout", "unreachable"])
+def test_prune_keeps_a_detached_entry_whose_connect_fails_without_refusal(
+    prune_client, refusing_port, monkeypatch, failure
+):
+    """A wedged container (dropped SYN) or an unreachable host is not proof
+    of absence. The planted port would refuse, so only the stub keeps it."""
+    attempts = []
+
+    def connect(address, timeout=None):
+        attempts.append(address)
+        raise failure
+
+    monkeypatch.setattr(session_io.socket, "create_connection", connect)
+    plant_session("s-wedged", port=refusing_port)
+    reattach.mark_detached("s-wedged", output=reattach.OUTPUT_NONE, detail="restart")
+
+    assert prune_client() == {"removed": [], "count": 0}
+    assert attempts == [("127.0.0.1", refusing_port)]
+    assert registry.read_session("s-wedged") is not None

@@ -32,13 +32,16 @@ section below:
    version and roll the changelog, open an MR targeting `prep-release`. Once
    the bump MR lands, the standing `prep-release` → `main` MR is the release
    MR. Record the release version and the bump-MR merge SHA in run state.
-2. **Gate — human merge.** Arm the watch on the release MR and idle with
-   pushed state. The human merging the protected-`main` release MR on the
+2. **Gate — human merge.** Run the early leak scan, then arm the watch on
+   the release MR and idle with pushed state. The human merging the protected-`main` release MR on the
    canonical repository is the release approval. Watch is best-effort;
    resume is the contract.
 3. **Leg 2 — ship.** Record the release MR's merge SHA; verify preconditions
-   (green GitLab pipeline, GitHub `main` ancestry); create the SSH-signed
-   tag at exactly the merge SHA; push GitHub `main` first, then the tag;
+   (green GitLab pipeline, GitHub `main` ancestry); rescan for leaks at the
+   merge SHA; prove GitHub CI green on exactly that SHA through the
+   `release-candidate/v<X.Y.Z>` branch; create the SSH-signed tag at
+   exactly the merge SHA; push GitHub `main` first, then the tag, each
+   behind the pre-push guard;
    poll the Actions release run to completion; only after GitHub is green,
    push the tag to GitLab. Then open the next cycle's dependency-refresh MR
    against `prep-release`. Record receipts and complete the run.
@@ -83,8 +86,8 @@ consumes that lock through one verb and obeys its exit code:
 
 Record the phase: `work state set --phase=release-parameters`
 
-Every repository adopting this flow supplies four required parameters — and
-optionally a fifth — in a `task.yaml`
+Every repository adopting this flow supplies four required parameters, the
+`leak_scan` block, and optionally a dependency-refresh command, in a `task.yaml`
 manifest inside a `release` taskdef directory. The manifest resolves per-file
 through the standard taskdef tier precedence — first match wins:
 
@@ -109,6 +112,16 @@ release:
   changelog: <exactly "fragments" or "legacy">
   dep_refresh: <shell command that refreshes the repository's dependency
     lockfiles — OPTIONAL, see below>
+  leak_scan:
+    public_mirror: <exactly true or false — false opts out of the leak
+      scan and the pre-push guard>
+    exceptions: <file name in the project's work-repo info/ directory
+      listing approved occurrences — optional>
+    ancestry_denylist: <full 40-hex SHAs that must never be published —
+      optional>
+    patterns: <project-private detectors, each `name` + `regex` — optional>
+    guard_strings: <regexes that fail the pre-push guard outright —
+      optional>
 ```
 
 Resolution rules — all of them hard:
@@ -132,6 +145,13 @@ Resolution rules — all of them hard:
   then `work commit` and end the session.
 - `changelog` set to anything other than exactly `fragments` or `legacy` →
   HARD STOP naming the offending value, same recording contract.
+- The `leak_scan` block is validated by the tool that consumes it:
+  `lmer-release-guard check-config --config <resolved task.yaml>`. A
+  non-zero exit → HARD STOP quoting its error, same recording contract.
+  The tool's rules (docs/RELEASE-GUARD.md) decide what a missing block
+  means; do not decide it here. `lmer-release-guard` not installed means
+  the image predates this flow step: HARD STOP naming it, and never fall
+  back to a copy of the scan tool from an old run directory.
 - `tag_prefix` set to anything other than exactly `v` → HARD STOP naming
   the offending value, same recording contract. The release kernel derives
   tag names as `v<version>` (`work release record tag` refuses any other
@@ -149,15 +169,19 @@ Resolution rules — all of them hard:
 - Log the resolved values with `work log` before proceeding (the
   signing key REFERENCE only — never key material), so the receipts show
   what the release ran with. Log `dep_refresh` as absent when it is absent
-  — a silent omission reads as a session that forgot to look.
+  — a silent omission reads as a session that forgot to look. Log the
+  `check-config` output too: it names the private patterns by name only,
+  and says when the leak scan is opted out.
 
 ## Phase 0.75: Project info
 
 MANDATORY: run `work read-project-info` before any release work. Whatever it
 returns — conventions, setup notes, known gotchas — is binding in addition
 to these instructions. It is prose context only: it does NOT substitute for
-the four release parameters above, and a release description found there
-does not relax the fail-loud rules.
+the release parameters above, and a release description found there
+does not relax the fail-loud rules. The one file it supplies to this flow
+is the leak-scan exceptions file that `leak_scan.exceptions` names: read it
+before triaging any leak-scan hit.
 
 ## Secrets
 
@@ -221,5 +245,14 @@ claim` handles the case where a run never got that far.
 - HARD RULE: Push ordering is fixed: GitHub `main`, then the GitHub tag,
   then — only after the GitHub Actions release run is green — the GitLab
   tag. Never reorder, never skip ahead.
+- HARD RULE: Nothing reaches the GitHub mirror without a `GUARD PASS` from
+  `lmer-release-guard prepush` for that exact object and ref, run right
+  before the push on a fresh fetch (unless `leak_scan.public_mirror` is
+  `false`). A leak-scan finding or a guard failure stops the run with an
+  operator-only ask; nothing is rewritten without the operator's decision.
+- HARD RULE: NO tag, local or remote, until GitHub CI has passed on exactly
+  the recorded merge SHA (Leg 2 step 2b).
+- HARD RULE: NEVER dismiss a code-scanning alert without the operator's
+  explicit authorization.
 - HARD RULE: DO NOT add `Co-Authored-By`, `Signed-off-by`, or any
   self-reference tags to commit messages.

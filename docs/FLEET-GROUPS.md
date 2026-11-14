@@ -1,6 +1,6 @@
 # Graph groups
 
-Open **Platform settings → Graph groups** to give related repository clusters a
+Open **Platform settings → Graph** to give related repository clusters a
 shared label. Add a group name and matching text, one entry per line. Use **Up**
 and **Down** to set priority, then **Save groups**. Changes apply when returning
 to the graph; other open graphs receive them on their next normal state poll.

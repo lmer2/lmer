@@ -78,6 +78,11 @@ CODEX_SEED_ERROR_ENV = "LMER_CODEX_CONFIG_SEED_ERROR"
 #: readers, matching every other boolean ``LMER_*`` variable.
 NONINTERACTIVE_ENV = "LMER_NONINTERACTIVE"
 
+#: Set only on ``spawn-harness`` children, whose captured output is their last
+#: turn, so lmer's Stop hooks can stand down for them without also standing
+#: down for a headless top-level session (#323).
+FANOUT_CHILD_ENV = "LMER_FANOUT_CHILD"
+
 #: Word-bounded, case-insensitive model-name words that imply a harness, in
 #: match order. Used only when neither ``--harness`` nor ``LMER_HARNESS`` is
 #: set: a model family name is usually enough to pick the right CLI
@@ -208,6 +213,18 @@ class ExecProfile:
     with ``-`` cannot be parsed as flags by the child CLI; a harness whose
     parser does not honor ``--`` leaves it unset and
     :func:`build_exec_argv` rejects such prompts instead.
+
+    ``usage_capture_args`` switches the child's stdout to the harness's JSON
+    event mode, so ``spawn-harness`` can read the child's token usage without
+    a transcript (#647 Q6). ``{last_message}`` is the file the
+    harness writes its final answer to, from which the text-mode stdout is
+    rebuilt byte for byte. A harness whose JSON mode cannot reproduce its text
+    output exactly leaves this empty (``lmer_usage/children.py``).
+
+    ``transcript_args`` keeps a child's transcript instead, so its usage can be
+    counted from it: the ``no_persistence_args`` entries of ``base_args`` are
+    dropped and these added, ``{session_id}`` / ``{session_dir}`` naming where
+    the transcript goes. Text output is untouched.
     """
 
     base_args: Tuple[str, ...]
@@ -216,6 +233,9 @@ class ExecProfile:
     effort_args: Tuple[str, ...] = ()
     effort_max_value: str = "max"
     dashdash_before_prompt: bool = False
+    usage_capture_args: Tuple[str, ...] = ()
+    no_persistence_args: Tuple[str, ...] = ()
+    transcript_args: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -322,6 +342,11 @@ HARNESSES: dict[str, Harness] = {
             effort_args=("--effort", "{effort}"),
             # commander.js honors `--` (operands follow verbatim).
             dashdash_before_prompt=True,
+            # claude has no projects-only redirect (CLAUDE_CONFIG_DIR moves
+            # credentials, settings and memory too), so the transcript is named
+            # and moved after exit (lmer_usage/children.py).
+            no_persistence_args=("--no-session-persistence",),
+            transcript_args=("--session-id", "{session_id}"),
         ),
         description="Claude Code (Anthropic) — full feature tier",
         credential_env=("CLAUDE_CODE_OAUTH_TOKEN",),
@@ -367,6 +392,8 @@ HARNESSES: dict[str, Harness] = {
             effort_max_value="xhigh",
             # clap honors `--` (everything after is the positional prompt).
             dashdash_before_prompt=True,
+            # JSONL events on stdout; the final message goes to the file.
+            usage_capture_args=("--json", "--output-last-message", "{last_message}"),
         ),
         description="Codex CLI (OpenAI) — core feature tier",
         # codex-cli 0.147.0: rollout files under a year/month/day tree in here.
@@ -423,6 +450,8 @@ HARNESSES: dict[str, Harness] = {
             effort_max_value="xhigh",
             # pi's argv parser has no documented `--` handling; prompts that
             # could parse as flags are rejected by build_exec_argv instead.
+            no_persistence_args=("--no-session",),
+            transcript_args=("--session-dir", "{session_dir}"),
         ),
         description="pi (earendil-works/pi, formerly badlogic/pi-mono) — core feature tier",
         extra_env=(("PI_SKIP_VERSION_CHECK", "1"),),
@@ -637,14 +666,16 @@ def build_exec_argv(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     unattended: bool = False,
+    last_message_file: Optional[str] = None,
+    transcript: Optional[Mapping[str, str]] = None,
 ) -> Tuple[list, list]:
     """Build the argv for a non-interactive run of ``harness``.
 
-    Assembles ``binary + base_args [+ permission_bypass_args] [+ model_args]
-    [+ effort_args] [+ --] + prompt`` from the harness's
-    :class:`ExecProfile`. Returns ``(argv, warnings)`` — an unknown effort
-    tier becomes a warning rather than an error, matching the interactive
-    runners.
+    Assembles ``binary + base_args [+ permission_bypass_args]
+    [+ usage_capture_args] [+ model_args] [+ effort_args] [+ --] + prompt``
+    from the harness's :class:`ExecProfile`. Returns ``(argv, warnings)`` — an
+    unknown effort tier becomes a warning rather than an error, matching the
+    interactive runners.
 
     ``unattended=True`` opts into the profile's
     :attr:`ExecProfile.permission_bypass_args` — the caller's explicit
@@ -653,15 +684,29 @@ def build_exec_argv(
     permission checks intact so a future consumer cannot inherit the bypass
     posture silently.
 
+    ``last_message_file`` opts into :attr:`ExecProfile.usage_capture_args`;
+    the caller then owns turning the JSON stdout back into text. ``transcript``
+    (``session_id`` / ``session_dir``) opts into
+    :attr:`ExecProfile.transcript_args`, in place of the no-persistence flags.
+
     Raises:
         ValueError: when the prompt could be parsed as flags by the child
             (starts with ``-``) and the harness's parser has no ``--``
             sentinel to protect it.
     """
     profile = harness.exec_profile
-    argv = [harness.binary, *profile.base_args]
+    keep_transcript = transcript is not None and bool(profile.transcript_args)
+    dropped = profile.no_persistence_args if keep_transcript else ()
+    argv = [harness.binary, *(arg for arg in profile.base_args if arg not in dropped)]
     if unattended:
         argv += profile.permission_bypass_args
+    if keep_transcript:
+        argv += [arg.format(**transcript) for arg in profile.transcript_args]
+    if last_message_file is not None:
+        argv += [
+            arg.format(last_message=last_message_file)
+            for arg in profile.usage_capture_args
+        ]
     warnings = []
     if model:
         if profile.model_args:

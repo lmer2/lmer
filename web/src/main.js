@@ -97,6 +97,11 @@ import './style.css'
 //   chat-action    one step further back, so tool rows and the internals behind
 //                  the "show N internal" toggle read as machinery under the
 //                  conversation rather than as a third voice in it.
+//   chat-peer      another project's assistant: a cool wash, so it
+//                  never reads as the operator's warm one. Replaced by the
+//                  sending project's hue while "Tint my messages" is on.
+//   chat-relay     a thread post nobody typed here (a bot, another run): neutral
+//                  and cool, apart from the agent's warm grey.
 //
 // Chosen against the ink that actually lands on them, which is the medium-emphasis
 // header rather than body text: every ground clears WCAG AA (4.5:1) for that
@@ -121,6 +126,8 @@ const light = {
     'chat-agent': '#eae7e2',
     'chat-operator': '#f3d9ce',
     'chat-action': '#dedbd5',
+    'chat-peer': '#dbe4ee',
+    'chat-relay': '#e4e6e9',
     // The uber lmer toolbar: darker than `surface` in both schemes; dark deliberately reuses `background`.
     'uber-toolbar': '#e4e0da',
     // style.css renders <code> against these; without them the declarations are
@@ -143,11 +150,17 @@ const dark = {
     surface: '#252423',
     // Deep, not bright. A lighter orange (#ff7043 and friends) turns every
     // filled button into a salmon slab that shouts louder than the accent is
-    // meant to; the darker tone reads as the brand and lets white sit on it.
+    // meant to; the darker tone reads as the brand.
     primary: '#e64a19',
     success: '#3fb950',
     warning: '#ffd23f',
-    error: '#f43f5e',
+    // Rose-400: the deeper #f43f5e read 4.2:1 as ink on `surface` and 3.7:1
+    // under white on a filled button. This one clears AA for both uses.
+    error: '#fb7185',
+    // White on the primary and error fills measured 3.9:1 and 3.7:1 (issue 652).
+    // Near-black clears AA on both: 4.9:1 on primary, 7.2:1 on error.
+    'on-primary': '#0f0e0e',
+    'on-error': '#0f0e0e',
     'tone-idle': '#9a9793',
     'tone-done': '#a371f7',
     terminal: '#141312',
@@ -155,6 +168,8 @@ const dark = {
     'chat-agent': '#1b1a19',
     'chat-operator': '#402922',
     'chat-action': '#0f0e0e',
+    'chat-peer': '#1d2733',
+    'chat-relay': '#26282b',
     'uber-toolbar': '#1b1a19',
     code: '#2e2c2a',
     'on-code': '#e8e6e3',

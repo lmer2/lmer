@@ -9,7 +9,7 @@ run's home, so a binding never points at a home that has moved on.
 import json
 
 from lmer_cli.threads import parse_thread
-from . import projects, runs
+from . import projects, registry, runs
 from . import connectors
 
 
@@ -79,3 +79,37 @@ def authorize(permalink, project_id):
     owners = {row["project_id"] for row in ownership(permalink)}
     if owners and owners != {project_id}:
         raise projects.ProjectError("This thread belongs to another project or has conflicting ownership.", status=409)
+
+
+def releasable(permalink, project_id):
+    """The owners *project_id* may drop on a thread, refusing anything that would steal it.
+
+    A connector record or a standing settings thread re-seeds its owner row on the
+    next :func:`ownership` read, so either has to go before the claim can.
+    """
+    thread = key(permalink)
+    for session, records in connectors.ensure_connectors().sessions().items():
+        record = next((record for record in records if key(record["permalink"]) == thread), None)
+        if record:
+            held = ("holds this thread live" if registry.is_live(registry.read_session(session))
+                    else "still records a connection to this thread")
+            raise projects.ProjectError(
+                f"Session {session} {held}; a release never takes a thread from a session. "
+                f"Disconnect it first: lmer-ctl threads disconnect {session} {record['id']}", status=409)
+    project = projects.get(project_id)
+    if any(key(link) == thread for link in project["settings"].get("threads") or []):
+        raise projects.ProjectError(
+            f"This thread is in project {project['name']}'s standing thread list; "
+            "remove it from the project's settings first.", status=409)
+    rows = ownership(permalink)
+    if {row["project_id"] for row in rows} - {project_id}:
+        raise projects.ProjectError("This thread belongs to another project or has conflicting ownership.", status=409)
+    return [row["owner"] for row in rows]
+
+
+def drop(db, permalink, owners, to=None):
+    """Delete *owners* on the thread inside the caller's transaction; *to* becomes its choice."""
+    thread = key(permalink)
+    db.executemany("DELETE FROM thread_owners WHERE thread=? AND owner=?", [(thread, owner) for owner in owners])
+    if to:
+        db.execute("INSERT OR REPLACE INTO thread_owners VALUES (?,?,?,NULL)", (thread, "choice", to))

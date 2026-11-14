@@ -760,6 +760,9 @@ class TestRoutes:
         assert client.post("/messages", json={
             "kind": "note", "text": "mine", "source": {"channel": "agent", "author": "someone"},
         }, headers=agent).status_code == 403
+        assert client.post("/messages", json={
+            "kind": "note", "text": "mine", "source": {"channel": "agent", "author_id": "U1"},
+        }, headers=agent).status_code == 403
         assert [m.text for m in log.read_since(0)[0]] == []
 
     def test_the_session_posts_as_the_agent_and_the_holder_of_the_control_token_speaks_for_a_channel(self, tmp_path):

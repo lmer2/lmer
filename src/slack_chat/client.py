@@ -4,8 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -40,6 +42,33 @@ COMPLETE_UPLOAD_REFUSALS = frozenset({
     "not_authed", "not_in_channel", "posting_to_channel_denied", "team_access_not_granted",
     "token_expired", "token_revoked", "two_factor_setup_required", "user_is_external_guest",
 })
+
+
+#: How far back :func:`recent_calls` can look.
+CALL_WINDOW_SECONDS = 60.0
+_CALLS: Dict[str, deque] = {}
+_CALLS_LOCK = threading.Lock()
+
+
+def _count_call(endpoint: str) -> None:
+    now = time.monotonic()
+    with _CALLS_LOCK:
+        calls = _CALLS.setdefault(endpoint, deque())
+        calls.append(now)
+        while calls and calls[0] < now - CALL_WINDOW_SECONDS:
+            calls.popleft()
+
+
+def recent_calls(endpoint: str, window: float = CALL_WINDOW_SECONDS) -> int:
+    """HTTP requests this process sent to *endpoint* in the last *window* seconds.
+
+    Every attempt counts, a rate-limited one included, since Slack counts it too.
+    Only this process: another process on the same token spends the same budget
+    unseen.
+    """
+    since = time.monotonic() - min(window, CALL_WINDOW_SECONDS)
+    with _CALLS_LOCK:
+        return sum(1 for at in _CALLS.get(endpoint, ()) if at >= since)
 
 
 def strip_run_references(text: str) -> str:
@@ -79,6 +108,23 @@ class SlackError(Exception):
         self.retry_after = retry_after
 
 
+def _rate_limited_message(endpoint: str, retries: int, retry_after: Optional[int]) -> str:
+    detail = f"Retry-After {retry_after}s" if retry_after is not None else "no Retry-After"
+    return f"Slack API rate limited after {retries} retries (HTTP 429 on {endpoint}; {detail})"
+
+
+def scopes_granted(response) -> Optional[List[str]]:
+    """The scopes Slack's ``x-oauth-scopes`` header grants; ``None`` without one.
+
+    Reads a ``requests`` response or a slack_sdk one alike: both carry
+    case-insensitive ``headers``.
+    """
+    granted = (getattr(response, "headers", None) or {}).get("x-oauth-scopes")
+    if not isinstance(granted, str):
+        return None
+    return [scope.strip() for scope in granted.split(",") if scope.strip()]
+
+
 class SlackClient:
     """Hand-rolled Slack Web API client using requests.Session with Bearer auth."""
 
@@ -100,6 +146,9 @@ class SlackClient:
         self.bot_token = bot_token or os.getenv("SLACK_BOT_TOKEN")
         self.timeout = timeout
         self.retries = retries
+        #: The token's granted scopes as the last :meth:`auth_test` reported
+        #: them; ``None`` before one, or when Slack sent no header.
+        self.granted_scopes: Optional[List[str]] = None
 
         if not self.bot_token:
             raise SlackError(
@@ -143,6 +192,7 @@ class SlackClient:
         if self.timeout is not None:
             kwargs.setdefault("timeout", self.timeout)
         for attempt in range(self.retries + 1):
+            _count_call(endpoint)
             try:
                 response = self.session.request(method, url, **kwargs)
                 response.raise_for_status()
@@ -161,9 +211,8 @@ class SlackClient:
                         time.sleep(1 if retry_after is None else retry_after)
                         continue
                     raise SlackError(
-                        f"Slack API rate limited after {self.retries} retries "
-                        f"(HTTP 429)", code="ratelimited", transient=True,
-                        retry_after=retry_after,
+                        _rate_limited_message(endpoint, self.retries, retry_after),
+                        code="ratelimited", transient=True, retry_after=retry_after,
                     ) from exc
                 raise SlackError(
                     f"Slack API HTTP error: {exc}",
@@ -390,20 +439,15 @@ class SlackClient:
         host = urlparse(url).hostname if isinstance(url, str) else None
         if not host:
             raise SlackError("Slack auth.test response carries no workspace url")
-        granted = response.headers.get("x-oauth-scopes")
-        return {
-            "host": host,
-            "scopes": (
-                [scope.strip() for scope in granted.split(",") if scope.strip()]
-                if isinstance(granted, str) else None
-            ),
-        }
+        return {"host": host, "scopes": scopes_granted(response)}
 
     def get_replies(
         self,
         channel: str,
         thread_ts: str,
         oldest: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve all replies in a thread, following cursor pagination.
 
@@ -411,6 +455,8 @@ class SlackClient:
             channel: Slack channel ID.
             thread_ts: Thread timestamp (parent message ``ts``).
             oldest: Optional lower bound timestamp for messages.
+            limit: Fetch one page of at most this many messages and stop there,
+                instead of paging through the whole thread.
 
         Returns:
             Flat list of message dicts across all pages.
@@ -424,12 +470,16 @@ class SlackClient:
         }
         if oldest is not None:
             params["oldest"] = oldest
+        if limit is not None:
+            params["limit"] = limit
 
         messages: List[Dict[str, Any]] = []
 
         while True:
             data = self._request("GET", "conversations.replies", params=params)
             messages.extend(data.get("messages", []))
+            if limit is not None:
+                break
 
             next_cursor = (
                 data.get("response_metadata", {}).get("next_cursor") or ""
@@ -471,11 +521,15 @@ class SlackClient:
             no ``bot_user_id`` field — for an xoxb token, ``user_id`` is the
             bot's own user ID, which is what message ``user`` fields carry.)
 
+        The same call reports the token's granted scopes, kept in
+        :attr:`granted_scopes`.
+
         Raises:
             SlackError: On Slack API errors.
         """
-        data = self._request("POST", "auth.test")
+        data, response = self._request_with_response("POST", "auth.test")
         user_id = data.get("user_id")
         if user_id is None:
             raise SlackError("Slack auth.test response missing 'user_id' field")
+        self.granted_scopes = scopes_granted(response)
         return user_id

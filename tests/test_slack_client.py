@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, call
 
 # Deferred import — collected regardless; fails at runtime until impl lands.
 try:
+    from slack_chat import client as client_module
     from slack_chat.client import SlackClient, SlackError
     _IMPORT_OK = True
 except ImportError:
@@ -352,6 +353,26 @@ class TestAuthTest:
         with pytest.raises(SlackError):
             client.auth_test()
 
+    @pytest.mark.parametrize("headers, scopes", [
+        ({"x-oauth-scopes": "chat:write, files:read,channels:history"},
+         ["chat:write", "files:read", "channels:history"]),
+        ({}, None),
+    ], ids=["header", "no-header"])
+    def test_auth_test_keeps_the_scopes_its_own_answer_carried(self, monkeypatch, headers, scopes):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+        calls = []
+
+        def answer(*args, **kwargs):
+            calls.append(args)
+            return _make_response({"ok": True, "user_id": "U1"}, headers=headers)
+
+        monkeypatch.setattr(client.session, "request", answer)
+        assert client.granted_scopes is None
+        client.auth_test()
+        assert client.granted_scopes == scopes
+        assert len(calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # 5. {ok: false} response -> typed SlackError
@@ -655,3 +676,71 @@ class TestWorkspaceProbe:
         probe = self._client(monkeypatch, {}).workspace()
         assert probe["host"] == "example.slack.com"
         assert probe["scopes"] is None
+
+
+# ---------------------------------------------------------------------------
+# A rate limit named, a single-page read, and the per-method call count
+# ---------------------------------------------------------------------------
+
+def _sequence(*answers):
+    """A ``session.request`` that answers each call with the next of *answers*.
+
+    An int is a 429 with that Retry-After; a dict is a 200 with that body.
+    """
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append({"url": url, "params": dict(kwargs.get("params") or {})})
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if isinstance(answer, dict):
+            return _make_response(answer)
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.headers = {"Retry-After": str(answer)}
+        resp.raise_for_status.side_effect = requests.HTTPError(response=resp)
+        return resp
+
+    return request, calls
+
+
+class TestRateLimitsAndVolume:
+    REPLY = {"ok": True, "messages": [{"ts": "1.0"}]}
+
+    def test_a_rate_limit_names_the_method_and_the_wait_asked_for(self, monkeypatch):
+        client = SlackClient(bot_token=BOT_TOKEN, retries=0)
+        request, calls = _sequence(10, self.REPLY)
+        monkeypatch.setattr(client.session, "request", request)
+        monkeypatch.setattr("time.sleep", lambda s: pytest.fail("a retries=0 client slept"))
+
+        with pytest.raises(SlackError) as caught:
+            client.get_replies("C1", "1.0")
+        assert len(calls) == 1 and caught.value.retry_after == 10
+        assert str(caught.value) == (
+            "Slack API rate limited after 0 retries (HTTP 429 on conversations.replies; Retry-After 10s)"
+        )
+
+    def test_a_limit_reads_one_page_and_stops(self, monkeypatch):
+        client = SlackClient(bot_token=BOT_TOKEN)
+        request, calls = _sequence({
+            "ok": True, "messages": [{"ts": "1.0"}],
+            "response_metadata": {"next_cursor": "more"},
+        })
+        monkeypatch.setattr(client.session, "request", request)
+
+        assert client.get_replies("C1", "1.0", limit=1) == [{"ts": "1.0"}]
+        assert [call["params"] for call in calls] == [{"channel": "C1", "ts": "1.0", "limit": 1}]
+
+    def test_every_attempt_is_counted_against_its_method(self, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(client_module, "_CALLS", {})
+        monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+        client = SlackClient(bot_token=BOT_TOKEN, retries=1)
+        request, _ = _sequence(1, self.REPLY)
+        monkeypatch.setattr(client.session, "request", request)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        client.get_replies("C1", "1.0")
+        assert client_module.recent_calls("conversations.replies") == 2
+        assert client_module.recent_calls("auth.test") == 0
+        clock[0] += 61
+        assert client_module.recent_calls("conversations.replies") == 0

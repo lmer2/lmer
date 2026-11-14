@@ -47,17 +47,67 @@ def _run(data):
 
 
 def receipted(path):
-    return path not in ("/api/assistant/pending", "/api/assistant/requests", "/api/comms/thread") and not (
+    return path not in ("/api/assistant/pending", "/api/assistant/requests", "/api/comms/thread",
+                        project_requests.THREAD_RELEASE) and not (
         path.startswith("/api/assistant/requests/") and path.endswith(("/reply", "/park", "/release")))
+
+
+def request_inputs(request):
+    """The plain values the binding reads off a request.
+
+    Taken on the event loop and handed to :func:`resolve_binding` in a worker
+    thread (#561), so the thread never touches the request object itself.
+    """
+    return {
+        "query": dict(request.query_params),
+        "path": request.url.path,
+        "method": request.method,
+        "headers": {name: request.headers.get(name)
+                    for name in ("x-lmer-workspace-id", "x-lmer-request-id")},
+        "path_params": dict(request.path_params),
+    }
+
+
+@contextmanager
+def applied(binding):
+    """Make *binding* the request's: the two context variables handlers read.
+
+    Kept on the event loop, in the request's own context, so what reaches a
+    handler is exactly what it was before the lookups moved to a thread.
+    """
+    if binding is None:
+        yield
+        return
+    token = _REQUEST.set(binding)
+    try:
+        with scope.bound(binding["workspace_id"]):
+            yield
+    finally:
+        _REQUEST.reset(token)
 
 
 @contextmanager
 def bind(request, caller, body):
-    if not projects.enabled():
+    """Resolve and apply the binding in the calling thread: :func:`resolve_binding` then :func:`applied`."""
+    with applied(resolve_binding(request_inputs(request), caller, body)):
         yield
-        return
-    query = dict(request.query_params)
-    path = request.url.path
+
+
+def resolve_binding(inputs, caller, body):
+    """Every lookup and refusal the binding makes, returning the rechecked binding.
+
+    Blocking work — sqlite reads, the registry scan :func:`recheck` does for an
+    assistant caller — so the server runs it in a worker thread rather than on
+    the event loop (#561). ``None`` outside projects mode. The binding returned
+    is the dict :func:`recheck` ran against (it can fill in ``request_id``).
+    """
+    if not projects.enabled():
+        return None
+    query = inputs["query"]
+    path = inputs["path"]
+    method = inputs["method"]
+    headers = inputs["headers"]
+    path_params = inputs["path_params"]
     parking = path.startswith("/api/assistant/requests/") and path.endswith(("/park", "/release"))
     if caller.kind != "operator" and parking:
         raise projects.ProjectError("Only an operator may release or park a conversation request.", status=403)
@@ -67,9 +117,13 @@ def bind(request, caller, body):
     # fleet panel that reads it is the operator's all-projects view.
     if caller.kind != "operator" and path == "/api/workrepo/schema":
         raise projects.ProjectError("Only an operator may read the whole work repo's validator report.", status=403)
+    # A rollup sums a repository's records across every project that ran
+    # against it, so it is the operator's all-projects view, like the above.
+    if caller.kind != "operator" and path == "/api/usage/rollup":
+        raise projects.ProjectError("Only an operator may read usage rolled up across projects.", status=403)
     candidates = [value for value in (
         body.get("workspace_id"), query.get("workspace_id"),
-        request.headers.get("x-lmer-workspace-id"), request.path_params.get("workspace_id"),
+        headers.get("x-lmer-workspace-id"), path_params.get("workspace_id"),
     ) if value]
     if any(not isinstance(value, str) for value in candidates):
         raise projects.ProjectError("Invalid project identity.")
@@ -79,10 +133,10 @@ def bind(request, caller, body):
     destination = body.get("destination_id") if path == "/api/runs/move" else None
     if destination is not None and not isinstance(destination, str):
         raise projects.ProjectError("Invalid project identity.")
-    session = request.path_params.get("session_id")
+    session = path_params.get("session_id")
     caller_home = projects.session_home(caller.session_id) if caller.kind == "assistant" else None
     peer = bool(caller_home and session and projects.session_home(session) != caller_home
-                and path == f"/api/sessions/{session}/comms" and request.method == "POST")
+                and path == f"/api/sessions/{session}/comms" and method == "POST")
     key = _run(body) or _run(query) or projects.session_run(session)
     if peer:
         peers.validate_body(body)
@@ -90,7 +144,7 @@ def bind(request, caller, body):
         key = None
     home = projects.run_home(key) if key else None
     owner = caller_home if peer else projects.session_home(session) if session else None
-    request_id = body.get("request_id") or request.headers.get("x-lmer-request-id") or request.path_params.get("request_id")
+    request_id = body.get("request_id") or headers.get("x-lmer-request-id") or path_params.get("request_id")
     if request_id:
         requested_owner = project_requests.get(request_id)["project_id"]
         if owner and requested_owner != owner:
@@ -121,9 +175,9 @@ def bind(request, caller, body):
         "/api/comms/feed", "/api/comms/questions", "/api/comms/connectors", "/api/spawn-options",
         "/api/prune", "/api/runs/forget",
         "/api/assistant/peers", "/api/workrepo/schema", "/api/channel-routes",
-        "/api/assistant/rotate-all",
-    } or path.startswith(("/assets/", "/api/slots"))
-    operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
+        "/api/assistant/rotate-all", "/api/usage", "/api/usage/rollup",
+    } or path.startswith(("/assets/", "/api/slots", "/api/time/"))
+    operator_history_read = caller.kind == "operator" and method == "GET" and session and path in {
         f"/api/sessions/{session}/messages", f"/api/sessions/{session}/log", f"/api/sessions/{session}/ask",
     }
     if path.startswith("/api/") and not chosen and not unbound and not operator_history_read:
@@ -133,10 +187,10 @@ def bind(request, caller, body):
         # is archived: the destination is validated active by ``projects.move``,
         # and this is how a run stranded in an archived project is recovered.
         moving_out = path == "/api/runs/move" and home and chosen == home["project_id"]
-        projects.get(chosen, active=request.method not in ("GET", "HEAD")
+        projects.get(chosen, active=method not in ("GET", "HEAD")
                      and not path.endswith("/restore") and not moving_out)
     if caller.kind != "operator" and (path.startswith("/api/projects") or path in ("/api/settings", "/api/channel-routes")
-                                       or path.startswith("/api/slots") or path in ("/api/runs/move", "/api/prune")) and request.method != "GET":
+                                       or path.startswith("/api/slots") or path in ("/api/runs/move", "/api/prune")) and method != "GET":
         raise projects.ProjectError("Only an operator may change platform or project settings.", status=403)
     expected = body.get("home_revision", query.get("home_revision"))
     if expected is not None:
@@ -146,17 +200,19 @@ def bind(request, caller, body):
             raise projects.ProjectError("Invalid project ownership revision.") from exc
     binding = {"workspace_id": chosen, "key": key, "session": session,
                "revision": expected if expected is not None else home["revision"] if home else None,
-               "body": body, "path": path, "method": request.method, "request_id": request_id,
+               "body": body, "path": path, "method": method, "request_id": request_id,
                "parking": parking,
                "peer": peer,
                "caller_session": caller.session_id if caller.kind == "assistant" else None}
+    # recheck() reads the binding through _REQUEST and the bound scope. Set here,
+    # in this thread's own copy of the context; applied() sets them for real.
     token = _REQUEST.set(binding)
     try:
         with scope.bound(chosen):
             recheck()
-            yield
     finally:
         _REQUEST.reset(token)
+    return binding
 
 
 def recheck():
@@ -178,7 +234,9 @@ def recheck():
             binding["request_id"] = binding["request_id"] or current
             if current and binding["path"].endswith("/tty-ticket"):
                 raise projects.ProjectError("Use request-bound HTTP input while handling a conversation request.", status=409)
-    if binding["request_id"] and not binding.get("parking"):
+    # A thread release checks the bound request itself: its ownership has changed
+    # once the release ran, and a repeat must still reach the route.
+    if binding["request_id"] and not binding.get("parking") and binding["path"] != project_requests.THREAD_RELEASE:
         if binding["path"] == "/api/assistant/pending":
             row = project_requests.get(binding["request_id"])
             current = project_requests.active(workspace_id)
@@ -219,7 +277,27 @@ def invoke_captured(binding, function, *args, mutation=False, **kwargs):
         _REQUEST.reset(token)
 
 
-def annotate(payload, *, workspace_id=None):
+class _NoProjects:
+    """What the per-row lookups answer outside projects mode: nothing is homed."""
+
+    @staticmethod
+    def run_home(_key):
+        return None
+
+    @staticmethod
+    def session_home(_session_id):
+        return None
+
+
+def annotate(payload, *, workspace_id=None, _lookup=None):
+    """Stamp each fleet row with its project, and keep only *workspace_id*'s.
+
+    Builds new dicts and never mutates *payload*: since #561 one payload can be
+    shared by several requests. Every lookup goes through one
+    :func:`lmer_platform.projects.snapshot`, where each row used to cost about
+    eight fresh database connections.
+    """
+    lookup = _lookup or projects.snapshot() or _NoProjects()
     result = dict(payload)
     for collection in ("runs", "sessions", "attention"):
         if not isinstance(result.get(collection), list):
@@ -230,26 +308,27 @@ def annotate(payload, *, workspace_id=None):
             key = _run(row)
             if not key and isinstance(row.get("run"), dict):
                 key = _run(row["run"])
-            home = projects.run_home(key) if key else None
+            home = lookup.run_home(key) if key else None
             session = row.get("session")
             session_id = session.get("id") if isinstance(session, dict) else row.get("id") or session
-            owner = home["project_id"] if home else projects.session_home(session_id)
+            owner = home["project_id"] if home else lookup.session_home(session_id)
             row["workspace_id"] = owner
             row["home_revision"] = home["revision"] if home else None
             row["confirm_project"] = bool(home and home["reconfirm"])
             if owner:
-                project = projects.get(owner)
+                project = lookup.get(owner)
                 row["workspace_name"], row["workspace_color"] = project["name"], project["color"]
             if workspace_id is None or owner == workspace_id:
                 rows.append(row)
         result[collection] = rows
     if workspace_id is not None:
         if isinstance(result.get("tracked"), dict):
-            tracked = annotate({"runs": result["tracked"].get("runs", [])}, workspace_id=workspace_id)["runs"]
+            tracked = annotate({"runs": result["tracked"].get("runs", [])}, workspace_id=workspace_id,
+                               _lookup=lookup)["runs"]
             result["tracked"] = {"runs": tracked, "count": len(tracked)}
         if "relations" in result:
             result["relations"] = [edge for edge in result["relations"] if all(
-                (projects.run_home(edge.get(end)) or {}).get("project_id") == workspace_id
+                (lookup.run_home(edge.get(end)) or {}).get("project_id") == workspace_id
                 for end in ("a", "b")
             )]
         if "totals" in result:

@@ -101,7 +101,7 @@ __all__ = [
     "SCHEMA_VERSION", "StoreError", "PLATFORM_DIR", "SNAPSHOT_FILE_MODE",
     "STATE_DIR_MODE", "utc_now_iso", "TS_FORMAT", "age_seconds", "clamp_text",
     "platform_dir", "sessions_dir", "logs_dir", "snapshot_path", "events_path",
-    "ensure_state_dir",
+    "ensure_state_dir", "path_component",
     "read_json", "write_json", "mutating", "append_event", "read_events",
 ]
 
@@ -270,6 +270,29 @@ def snapshot_path(name: str) -> Path:
 def events_path() -> Path:
     """Path of the append-only platform history."""
     return platform_dir() / EVENTS_FILE
+
+
+#: A placeholder for a purely lexical check: nothing is ever created or read there.
+_CONFINE_ROOT = os.path.join(os.sep, "confine")
+
+
+def path_component(name: str) -> str:
+    """*name*, refused with :class:`ValueError` unless it is exactly one entry
+    of the directory it is joined to.
+
+    Callers have already checked *name* against a stricter pattern; this
+    repeats the part that matters in the one form CodeQL accepts as a
+    path-injection barrier (``docs/DEVELOPMENT.md``, "Paths built from caller
+    input"), and returns the checked value so the sink is seen to use it.
+    """
+    joined = os.path.normpath(os.path.join(_CONFINE_ROOT, name))
+    prefix = _CONFINE_ROOT + os.sep
+    if not joined.startswith(prefix):
+        raise ValueError(f"{name!r} is not a single path component")
+    component = joined[len(prefix):]
+    if component != name or os.sep in component:
+        raise ValueError(f"{name!r} is not a single path component")
+    return component
 
 
 def _owned_levels(directory: Path) -> list[Path]:

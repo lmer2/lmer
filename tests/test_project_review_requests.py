@@ -148,6 +148,30 @@ def test_proven_pre_spawn_refusals_remain_retryable_and_do_not_poison_archive(tr
         assert client.post(f"/api/projects/{project['id']}/archive").status_code == 200
 
 
+def test_a_rate_limited_launch_is_refused_on_its_receipt_and_resent(transport_host, fleet, monkeypatch):
+    """The 503 ``lmer-ctl spawn`` resends on comes before any effect."""
+    client, _transports, _component = transport_host
+    _project, _request, identity, headers = delivered(transport_host, fleet)
+    headers = {**headers, "X-Lmer-Request-Id": identity}
+    original, attempts = api.spawn_session, []
+
+    def rate_limited_once(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise spawn.ThreadHeld("cannot check who holds it", transient=True, retry_after=2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "spawn_session", rate_limited_once)
+    payload = {"taskdef": "chat", "target": "rate-limited", "repo_url": "https://forge.test/repository"}
+    first = client.post("/api/sessions", headers=headers, json=payload)
+    assert (first.status_code, first.headers.get("retry-after")) == (503, "2"), first.text
+    assert first.json()["detail"]["code"] == api.THREAD_CHECK_RATE_LIMITED
+    assert actions(identity)[0]["state"] == "refused"
+    again = client.post("/api/sessions", headers=headers, json=payload)
+    assert again.status_code == 201, again.text
+    assert len(attempts) == 2
+
+
 @pytest.mark.parametrize("status", [400, 403, 409, 429, 503])
 def test_post_commit_errors_remain_uncertain_regardless_of_http_status(transport_host, fleet, monkeypatch, status):
     client, _transports, _component = transport_host

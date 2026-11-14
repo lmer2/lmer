@@ -1139,13 +1139,11 @@ def native_wake_adapter(tmp_path, monkeypatch):
 
 
 def test_codex_idle_fallback_response_loss_and_restart_do_not_replay(detector, native_wake_adapter):
-    import hashlib
-
     adapter, thread, starts = native_wake_adapter
     assistant.notify('pending question')
     _age_spool(minutes=10)
     state = assistant.read_state()
-    ident = 'digest-' + hashlib.sha256(f'assistant-1:{state.pending_seq}'.encode()).hexdigest()[:32]
+    ident = detect.Detector._codex_accumulation_id('assistant-1', state.pending_seq)
     assistant._write_state(replace(state, session_id='assistant-1', codex_wake=ident))
 
     def sender(session, text, **kwargs):
@@ -1196,13 +1194,11 @@ def test_codex_wake_recovers_only_proven_unsent_input_across_restart(detector, n
 
 @pytest.mark.parametrize('idle', [0, 600])
 def test_codex_uncertain_wake_is_blocked_across_restart(detector, native_wake_adapter, idle):
-    import hashlib
-
     adapter, _, starts = native_wake_adapter
     assistant.notify('pending question')
     _age_spool(minutes=10)
     state = assistant.read_state()
-    ident = 'digest-' + hashlib.sha256(f'assistant-1:{state.pending_seq}'.encode()).hexdigest()[:32]
+    ident = detect.Detector._codex_accumulation_id('assistant-1', state.pending_seq)
     assistant._write_state(replace(state, session_id='assistant-1', codex_wake=ident if idle else None))
     request = adapter._request
 

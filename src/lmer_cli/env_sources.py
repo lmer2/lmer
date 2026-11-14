@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 
 
 DEFAULT_SOURCES_ENV = "LMER_PLATFORM_ENV_DEFAULTS"
@@ -59,3 +59,26 @@ def consume_env_defaults() -> dict[str, str]:
     sources = _sources(os.environ)
     os.environ.pop(DEFAULT_SOURCES_ENV, None)
     return sources
+
+
+def drop_env_file_defaults(
+    sources: MutableMapping[str, str],
+    names: Iterable[str],
+    env: MutableMapping[str, str] | None = None,
+) -> None:
+    """Forget file-supplied defaults for *names* so a fresh ``.env`` load can
+    re-supply them.
+
+    ``lmer platform`` seeds its own environment from ``.env`` once at startup
+    and records which keys that supplied; a child inherits the snapshot and its
+    first-wins ``.env`` seeding then keeps the launch-time value, so editing the
+    file has no effect until a restart (#467). Dropping the key here — before
+    the child's early ``.env`` load — lets the file as it is *now* decide. Only
+    defaults recorded from a file are dropped: a value that was exported in the
+    environment was never recorded, so it keeps its documented precedence.
+    """
+    target = os.environ if env is None else env
+    for name in names:
+        if name in sources:
+            target.pop(name, None)
+            sources.pop(name, None)

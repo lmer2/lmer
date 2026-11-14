@@ -23,7 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ask_channel import signal_cli
-from lmer_platform import api, detect, registry, rotate_requests, spawn, store, transcripts, uploads
+from lmer_platform import api, detect, projects, registry, rotate_requests, runs, spawn, store, transcripts, uploads
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
 from tests.test_platform_comms import BusPlane, auth, bearer, live_session
@@ -136,6 +136,19 @@ def test_two_sends_in_one_second_are_two_files(platform_root):
 def test_a_session_without_a_store_is_refused(platform_root):
     with pytest.raises(uploads.StoreUnavailable):
         uploads.store_private(WORKER, {"id": WORKER, "kind": registry.WORKER_KIND}, "x")
+
+
+def test_a_session_id_that_is_not_one_name_never_reaches_the_shared_store(platform_root):
+    """The routes refuse such an id first; the store no longer relies on that.
+    The assistant's store is the one whose path does not pass through the id."""
+    entry = entry_for(ASSISTANT, registry.ASSISTANT_KIND)
+    for call in (
+        lambda: uploads.store_private("../x", entry, "x"),
+        lambda: uploads.withdraw_private("../x", entry, "20261028-120000-private.txt"),
+    ):
+        with pytest.raises(uploads.UploadNotFound):
+            call()
+    assert not (uploads.assistant_upload_dir() / "x").exists()
 
 
 @pytest.mark.parametrize("planted", ["root", "session"])
@@ -635,5 +648,40 @@ def test_end_to_end_a_private_send_reads_back_as_a_private_entry(platform_root, 
             page = client.get(f"/api/sessions/{session_id}/messages", headers=auth()).json()
             [turn] = [m for m in page["messages"] if m.get("private")]
             assert turn["private"] == {"purpose": "GitLab deploy token"}
+    finally:
+        plane.stop()
+
+
+# --- a worker run, as the run pane sends to it (#650) ----------------------------
+
+@pytest.mark.parametrize("home", ["general", "project"])
+def test_a_worker_run_takes_a_private_send_in_general_and_in_a_project(platform_root, tmp_path, marker, home):
+    projects.migrate()
+    plane = BusPlane(tmp_path)
+    try:
+        with TestClient(api.create_app(cfg.load(), SECRET), headers=auth()) as client:
+            workspace = (projects.GENERAL if home == "general"
+                         else client.post("/api/projects", json={"name": "Alpha"}).json()["id"])
+            session_id = live_session(plane)
+            run = registry.read_session(session_id)["run"]
+            projects.bind_run(runs.run_key(run["host"], run["project"], run["slug"]), workspace)
+            directory = uploads.prepare_upload_dir(uploads.upload_dir_for(session_id, registry.WORKER_KIND))
+            registry.update(session_id, uploads=uploads.registry_pointer(directory))
+
+            stored = client.post(f"/api/sessions/{session_id}/private",
+                                 json={"text": marker, "purpose": "deploy token", "workspace_id": workspace})
+            assert stored.status_code == 201, stored.text
+            reference = stored.json()["reference"]
+            sent = client.post(f"/api/sessions/{session_id}/comms", json={
+                "kind": "message", "text": reference, "workspace_id": workspace,
+                "meta": {"private": {"purpose": stored.json()["purpose"]}},
+            })
+            assert sent.status_code == 200, sent.text
+            typed = b"".join(plane.sink)
+            assert reference.encode() in typed and marker.encode() not in typed
+            history = client.get(f"/api/sessions/{session_id}/messages", params={"workspace_id": workspace})
+            assert marker not in history.text
+            [turn] = [m for m in history.json()["messages"] if m.get("private")]
+            assert turn["private"] == {"purpose": "deploy token"}
     finally:
         plane.stop()

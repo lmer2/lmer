@@ -235,6 +235,49 @@ def test_run_creates_the_secret_before_serving(platform_root, monkeypatch):
     assert cfg.read_secret(cfg.load())
 
 
+def test_run_creates_the_sessions_directory_before_the_first_sweep(platform_root, monkeypatch):
+    """The sweep's strict registry read takes a missing sessions directory for
+    a lost registry, so it has to exist before the detector's first tick, on a
+    host where no session has registered yet."""
+    seen = {}
+
+    def watch(config):
+        seen["at_detector"] = store.sessions_dir().is_dir()
+        return _NoSupervisor()
+
+    class FakeUvicorn:
+        @staticmethod
+        def run(app, **kwargs):
+            seen["at_serve"] = store.sessions_dir().is_dir()
+
+    monkeypatch.setattr(daemon, "_watch_for_attention", watch)
+    monkeypatch.setitem(__import__("sys").modules, "uvicorn", FakeUvicorn)
+    assert not store.sessions_dir().exists()
+    daemon.main(["run"])
+    assert seen == {"at_detector": True, "at_serve": True}
+    assert store.sessions_dir().stat().st_mode & 0o777 == store.STATE_DIR_MODE
+
+
+def test_run_still_serves_when_the_sessions_directory_cannot_be_made(
+    platform_root, capsys, monkeypatch
+):
+    served = []
+
+    def refuse():
+        raise PermissionError(13, "injected")
+
+    class FakeUvicorn:
+        @staticmethod
+        def run(app, **kwargs):
+            served.append(True)
+
+    monkeypatch.setattr(daemon, "ensure_sessions_dir", refuse)
+    monkeypatch.setitem(__import__("sys").modules, "uvicorn", FakeUvicorn)
+    daemon.main(["run"])
+    assert served == [True]
+    assert "cannot create the session registry directory" in capsys.readouterr().out
+
+
 def test_run_warns_when_mirror_absent(platform_root, capsys, monkeypatch):
     class FakeUvicorn:
         @staticmethod

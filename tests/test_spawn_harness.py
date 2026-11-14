@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -491,9 +492,10 @@ class TestMainEndToEnd:
         )
         assert code == 0
         argv = argv_file.read_text().splitlines()
-        assert argv[:8] == [
+        # The child keeps its transcript under a known id (#647 Q6), so
+        # --no-session-persistence gives way to --session-id <uuid>.
+        assert argv[:2] + argv[4:9] == [
             "-p",
-            "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--model",
             "opus",
@@ -501,9 +503,10 @@ class TestMainEndToEnd:
             "max",
             "--",
         ]
+        assert argv[2] == "--session-id" and str(uuid.UUID(argv[3])) == argv[3]
         # The prompt is the notice plus the caller's text; the stub writes argv
         # one entry per line, so the notice's own newlines land as extra lines.
-        assert "\n".join(argv[8:]) == f"{NONINTERACTIVE_NOTICE}\n\nreview the diff"
+        assert "\n".join(argv[9:]) == f"{NONINTERACTIVE_NOTICE}\n\nreview the diff"
         env_lines = env_file.read_text().splitlines()
         assert "LMER_LLM_NAME=opus" in env_lines
         # The marker must survive all the way to the spawned process, not just

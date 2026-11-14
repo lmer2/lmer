@@ -95,6 +95,28 @@ walking the container-platform spike.
 
 ---
 
+### [TIME-TRACKING.md](./TIME-TRACKING.md)
+**Human time tracking**
+
+How the platform records people's working time per project and writes each
+finished entry to `timesheet.d/` in the work repo, tied to no tracker:
+- The person registry (`people`, `default_person`) and how Slack, Matrix and
+  web-chat identities map to a person
+- Per-project settings: the stable project key, the tracking handler, client
+  labels and the idle grace
+- Handler definitions in `timesheet.d/.handlers/`, required fields, and the
+  ledger a sync process outside lmer writes back
+- The entry format and layout, hand-written entries, and the automatic and
+  manual rules (idle grace, pause window, short entries)
+- The timesheet writer's clone, identity, credential and change-set guard
+- The settings page for people and platform-wide defaults, applied without a restart
+- `/api/time/*`, `lmer-ctl time`, asking Ratchet (including setup), and the control UI
+
+**Best for**: Turning time tracking on, defining a handler for your tracker,
+and writing a sync process against the entry and ledger contract.
+
+---
+
 ### [AUTHENTICATION.md](./AUTHENTICATION.md)
 **Container Authentication and SSH Setup**
 
@@ -179,6 +201,22 @@ troubleshooting. Verified against opencode 1.18.4.
 
 **Best for**: Setting up your first user-installed harness, or a template to
 adapt for any other agent CLI.
+
+---
+
+### [USAGE-TRACKING.md](./USAGE-TRACKING.md)
+**AI usage tracking: the per-run record and the live fleet view**
+
+What a session spent, kept in its run directory and shown live:
+- The token buckets per harness, and the deduplication rules (claude
+  `message.id`, codex snapshot deltas, the pi tree)
+- `ai-usage/<session-id>.yaml`: its format, who writes it and when, and what a
+  killed container leaves behind
+- The live view's routes, the burn ranking, limit headroom and its projection
+- Per-project and per-period rollups, and the optional read-time price table
+
+**Best for**: Reading a run's usage record, setting up prices, or interpreting
+the headroom chips.
 
 ---
 
@@ -422,11 +460,23 @@ Canonical explanation of how a public release ships, as a tracked lmer run with 
 
 ---
 
+### [RELEASE-GUARD.md](./RELEASE-GUARD.md)
+**Release Guard — Leak Scan and Pre-Push Guard**
+
+Reference for `lmer-release-guard`, the tool the release run uses before anything reaches the public mirror:
+- `scan` / `scan-text`: what is scanned, the generic detectors, masking, exit codes
+- `prepush`: the ref allow list, the ancestry denylist, guard strings and live secrets
+- The project tier's `release.leak_scan` block and its validation (`check-config`)
+
+**Best for**: Onboarding a project's leak-scan configuration and reading a release run's `leak-scan.md`.
+
+---
+
 ### [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md)
 **Release Flow — Per-Repo Adoption Checklist & Runbooks**
 
 How a repository adopts the release flow (configuration plus prerequisites, never design changes):
-- The four-parameter surface (GitHub target URL, tag prefix, signing-key reference, changelog mechanism)
+- The parameter surface (GitHub target URL, tag prefix, signing-key reference, changelog mechanism, the `leak_scan` block, optional dependency refresh)
 - Prerequisite checklists: GitHub mirror controls, PyPI trusted publisher, GitLab protected tags, credentials
 - Rotation runbook for the fine-grained PAT and the release SSH signing key
 - Burned-version and GitHub `main` divergence remediation runbooks
@@ -457,6 +507,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
 - **Talking to a session from Slack, matrix or the chat pane?** See [COMMS.md](./COMMS.md)
 - **Announcing runs that want a human into a Matrix room?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
+- **Tracking people's time per project?** See [TIME-TRACKING.md](./TIME-TRACKING.md)
 - **Migrating a work repo to the schema?** Start with [SCHEMA-GUIDE.md](./SCHEMA-GUIDE.md) for the plan and the checks, and read [SCHEMA.md](./SCHEMA.md) for the normative layout
 - **Need to troubleshoot?** All documents include troubleshooting sections
 

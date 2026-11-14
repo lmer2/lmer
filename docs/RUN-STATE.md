@@ -323,7 +323,9 @@ never left readable-but-stale.
 `session_end`, `phase`, `state_changed` (non-phase mutations to
 status/stop_reason/critical_error; on `status=complete` its data also
 carries the estimate-vs-actual `actuals`), `question_answered` (the recorded open
-question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
+question plus its human answer, both secret-redacted; when written from the
+session bus it also says who answered — see "Decisions" below), `decision`
+(see "Decisions"), `goal_set`, `run_named`,
 `artifact_written`, `gate`, `verify`, `task` (every ledger mutation, §2),
 `run_dir_renamed` (the freeze-gate rename, §1), `goals_frozen`,
 `goal_amended`, `goals_assessed` (the goal-set lifecycle, §2), `claim`
@@ -331,6 +333,70 @@ question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
 `release` (every release.yaml mutation, §7 — prior receipt values live
 here), `run_aborted` (the release-run abort, §7). The type set
 is open-ended — later growth adds types without schema churn.
+
+### Decisions (`work decision`, `work decisions`)
+
+The human review report's Decisions section lists what was decided and who
+decided it, from records rather than from an agent's memory (issue #674).
+Four event types count, because the tooling writes them: `goals_frozen`,
+`goal_amended`, `question_answered` and `decision`. Ad hoc types an agent
+invented with `work event` do not, and `work event` refuses these four: a
+hand-typed one would carry whatever "who" it was given.
+
+Who decided is stamped at write time from the session bus record the
+decision came from, so the agent never types it:
+
+- `lmer-signal ask`, `wait` and `close` record an accepted answer by running
+  `work decision --ref <answer id>` (only in a session with
+  `LMER_WORK_REPO_PATH`; a failure is one stderr line and never changes
+  their exit code).
+- `work decision --ref <id>` names a bus record. An answer, or a question by
+  its own id, becomes `question_answered`; a `message` from a human or an
+  assistant becomes `decision` (which then needs the "what" text). Refused:
+  the agent's own records (including an assistant session's own posts),
+  notes and closes (often the system's own), late answers, and another
+  session's id.
+- `work decision "<what>"` without `--ref` records a decision the agent made
+  on its own.
+
+Fields added to `data`: `by`, `channel`, `author`, `label` (the channel's
+display name, or the assistant's), `ref` (the bus record id), `source_ref`
+(where a connector or the ask directory says the record came from, when it
+says), `message` (the referenced message's text, shown beside the agent's
+summary), `authority`, and for answers `question`, `question_ref`, `answer`,
+`operator_only`.
+
+- `by` is `assistant` on an assistant's channel; `human` on `terminal` and
+  `platform`, and on `slack`/`matrix` only when the connector stamped
+  `meta.poster: human` (COMMS.md §1); `unknown` for any other thread post (another lmer run,
+  the platform's post button, a bot, or a connector too old to say, kept as
+  `poster`), listed as "…, not confirmed as a human"; `agent` without `--ref`.
+- `authority` counts only on the supervising assistant's channel with a level
+  the daemon stamps; anything else, a peer assistant included, is `none`. The
+  reader applies the same rule to what it reads.
+- An event without `by` (every record written before this, `work answer`,
+  `lmer --answer`, `goals_frozen`) is listed as "not recorded"; nothing is
+  inferred from its note.
+
+The listing collapses only exact repeats (same type, `ref` and note). Two
+decisions recorded on one message both list. A `work decision "<summary>"
+--ref <answer id>` after the automatic record replaces it in the listing, with
+the summary beside the answer (`summary` in JSON). A `goal_amended` without a
+note lists its goal changes (`diff` in JSON).
+
+**Strength of the attribution.** Who decided comes from the bus, where the
+session cannot claim a channel, author or authority. The stored event is
+not tamper-evident against the session, though: `events.jsonl` is writable
+from the container, and an older lmer's `work event` still writes these types.
+The listing is a report for a human to read, not a security control.
+
+In schema form `work decisions` without `--target` reads only this
+execution's record, and each row names its execution (`<name>/<session>`);
+use `--target` to include earlier executions of the same work.
+
+An answer that reached the agent only as a relayed message (no `wait` ran)
+is recorded once the agent runs `lmer-signal wait <id>`, as the bus rules
+already require, or `work decision --ref <id>`.
 
 ### Receipt events (`gate`, `verify`)
 
@@ -750,6 +816,8 @@ genuinely new engagement seeds a fresh run.
 | `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>] [--question "<text>"]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
 | `work answer "<text>"` | Record an answer to the run's recorded open question (§2) from inside a session. On a schema-2 tree the verb needs the launch's session UID: a bare shell is refused (exit 2) with a message naming the human's route — the platform's answer card or `POST /api/runs/answer`, which starts a session carrying the answer. It appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
+| `work decision ["<what>"] [--ref <message id>]` | Record a decision (§2 "Decisions"): with `--ref`, who decided and at what authority come from that session-bus record; without it the decision is the agent's own. Exit 1 when the bus cannot be read, or the record is the agent's own (an assistant session's own posts included), a note or close, a late answer, an unanswered question, another session's id, or a message with no "what". |
+| `work decisions [--target <url>] [--json]` | Read-only. Lists the current run's decisions, or with `--target` those of every run whose recorded target is that URL (`/-/work_items/` and `/-/issues/` match; trailing slash and fragment ignored). Oldest first, exact repeats collapsed; agent-only decisions are marked `AGENT-ONLY` (`agent_only` in JSON); no run context exits 0. Never modifies a record, even a corrupt one. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
 | `work resume [--json] [--session <id>]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
@@ -764,7 +832,7 @@ genuinely new engagement seeds a fresh run.
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). On schema 2 the seed is a record of its own, never this launch's (#535): a fresh uid is minted and the record is written in full inside `.new-<uid>-*` — `state.yaml` with the goal and name, then `run_seeded`, `goal_set`, `run_named` — and renamed once to `_runs/<slug>/<uid>`. It carries `session: {uid, seeded_by, started_at}` (`seeded_by` is the seeding launch's uid; none of that launch's other metadata is copied) and an empty lineage, and after the rename it is read-only to the seeding launch like any other prior record. The command prints the uid and the launch line that consumes it — `lmer <taskdef> [<target>] --source-session <uid>` — which on schema 2 is the only way a seed is picked up. A group that already holds records is informational (`group already holds N record(s)`): the seed goes beside them. Legacy trees keep the existing-run refusal (there the directory is the record). Does **not** claim `owner` (seeding is not owning) and does **not** push. A name conflict is an error only in a legacy tree; on schema 2 a name is a label, so `--name` never conflicts. |
 | `work release claim` / `claim-status` / `unclaim` / `record …` / `status` / `abort` | The release-run verbs (§7): the single-flight release claim (claim-by-push CAS — never the rebase-retry push path), the write-once release record (`release.yaml`), the derived-leg status view, and the terminal abort. Verb-by-verb tables, exit codes, and semantics live in §7. |
 | `work sessions [--running] [--json]` | Read-only listing of the run's launches (schema form: one row per session dir; legacy: one row per run dir, id `-`, since several launches interleave in one directory). Columns: session id, address (run-area-relative), status, phase, `updated`, and — on a schema-1 record — `orphaned`: an in-progress record with no live claim, or a claim stale past the threshold. A schema-2 record has no claim verdict; its row ends with `state=<word>`, derived from the record and the listing's own clock: `closed` (status complete or archived), `waiting on question` (`stop_reason` question, which outranks a sign-out), `seeded` (a `work seed` record nobody has run in), `ended, not closed` (in progress with a recorded final `session_end`), `active` (no sign-out, `updated` within the validator's 14-day `record.session-stale` window) or `stale` (no sign-out, quiet for longer) — never auto-ended, and `stale` is a reading of the record, not a verdict on the run; the header of such a listing counts the non-zero states. `--running` filters to `status == in-progress` and not orphaned (schema 1) or not signed out, i.e. `active` or `stale` (schema 2); an orphan stays listed and marked rather than hidden (hiding it is how a crashed session reads as a finished one). `--json` emits `{form, count, sessions[…]}`, every row carrying `stop_reason` and a schema-2 row also `session`, `signed_out` and `state`; a record whose state cannot be read — or cannot be represented in JSON — is listed with its address fields and null state, never dropped. Always exits 0. |
-| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), append `session_start`, apply the launch name and goal (below), decide the resume brief *before* claiming, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). `--session <id>` continues an existing launch instead of opening a new one (schema form): the id is chained into that record's `sessions:` lineage (§2), so every later `work` invocation of this launch finds the directory through the record and no *second* variable has to be minted and kept in step with it. It is one of two ways a launch says which record it writes in, and the container's ordinary one is the other — with no flag the kernel resolves to the record that answers to this launch's `LMER_SESSION_ID` (§5, then the lineage, then the launch's creation address), so a launch the host already addressed (`lmer --session`) needs no flag at all and `hooks/start.py` passes none. With neither — a relaunch carrying only `LMER_ANSWER`, which has opened no record of its own — the verb reroutes itself to the launch that asked the question, because an answer filed in a fresh record leaves the question standing in the record that asked it. The id names one launch inside the run's group; a value that is a path or a pattern is refused. Applies `LMER_RUN_NAME`/`LMER_RUN_GOAL` (from `lmer --name/--goal`) **once**, on the call that opens the record's session: the name through the `work name` rules (on schema 2 the launch name replaces a default or inherited name; a held or unusable name is a stdout warning and the record keeps its default label, while a legacy record stays unnamed), the goal replacing one inherited from a continuation source (`run_named`/`goal_set` events with `data.source: launch`); a failure to apply either is a warning, never a refusal. Both land *before* anything is printed, because this verb's stdout is all the agent sees of them (`hooks/start.py` injects it into the prompt): a schema-1 brief carries them in its `Run: <name> (slug: …)` header and `Goal:` line; a schema-2 start, which prints no brief of its own — only a continuation's read-only `Context from session <uid> (read-only):` block — follows it with `This launch (lmer --name/--goal, already recorded):` and the `Run name:` / `Goal:` lines that landed. When the launch goal replaced a continuation's inherited one, the context block drops its `Goal:` line and the old goal appears once, as `Predecessor goal (context only, replaced by the launch goal): …`, so it is never read as the current goal. A held or unusable name prints no `Run name:` line, and the run-state taskdef fragment's naming step stays the agent's. Warns when a continuation's source was recorded under another slug (a `chat-.` record continued under `chat` after the local-path rule, §3): the new record keeps `source_session_uid` provenance into the old group, which stays as history. Always exits 0. |
+| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), append `session_start`, apply the launch name and goal (below), decide the resume brief *before* claiming, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). `--session <id>` continues an existing launch instead of opening a new one (schema form): the id is chained into that record's `sessions:` lineage (§2), so every later `work` invocation of this launch finds the directory through the record and no *second* variable has to be minted and kept in step with it. It is one of two ways a launch says which record it writes in, and the container's ordinary one is the other — with no flag the kernel resolves to the record that answers to this launch's `LMER_SESSION_ID` (§5, then the lineage, then the launch's creation address), so a launch the host already addressed (`lmer --session`) needs no flag at all and `hooks/start.py` passes none. With neither — a relaunch carrying only `LMER_ANSWER`, which has opened no record of its own — the verb reroutes itself to the launch that asked the question, because an answer filed in a fresh record leaves the question standing in the record that asked it. The id names one launch inside the run's group; a value that is a path or a pattern is refused. An id that names no session dir (a writer only recorded in another record's lineage, a mistyped `--<name>` half, or nothing at all) is refused on stderr with exit 2 and seeds nothing (#639): an explicit `--session` continues a record, it never opens one. Applies `LMER_RUN_NAME`/`LMER_RUN_GOAL` (from `lmer --name/--goal`) **once**, on the call that opens the record's session: the name through the `work name` rules (on schema 2 the launch name replaces a default or inherited name; a held or unusable name is a stdout warning and the record keeps its default label, while a legacy record stays unnamed), the goal replacing one inherited from a continuation source (`run_named`/`goal_set` events with `data.source: launch`); a failure to apply either is a warning, never a refusal. Both land *before* anything is printed, because this verb's stdout is all the agent sees of them (`hooks/start.py` injects it into the prompt): a schema-1 brief carries them in its `Run: <name> (slug: …)` header and `Goal:` line; a schema-2 start, which prints no brief of its own — only a continuation's read-only `Context from session <uid> (read-only):` block — follows it with `This launch (lmer --name/--goal, already recorded):` and the `Run name:` / `Goal:` lines that landed. When the launch goal replaced a continuation's inherited one, the context block drops its `Goal:` line and the old goal appears once, as `Predecessor goal (context only, replaced by the launch goal): …`, so it is never read as the current goal. A held or unusable name prints no `Run name:` line, and the run-state taskdef fragment's naming step stays the agent's. Warns when a continuation's source was recorded under another slug (a `chat-.` record continued under `chat` after the local-path rule, §3): the new record keeps `source_session_uid` provenance into the old group, which stays as history. Exits 0, except that a refusal exits 2: a schema-2 start refused by the state layer, or the explicit-`--session` refusal above (#639), which the hook never triggers because it passes no `--session`. |
 | `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path together with the project's regenerated `README.md` index block via `work commit`. Always exits 0. |
 
 `work state set` field choices: `--stop-reason` is one of

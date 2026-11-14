@@ -149,3 +149,11 @@ dl.kv dd {
 }
 .settings-field { margin-bottom: 12px; }
 .setting-source { margin: 4px 0 0; overflow-wrap: anywhere; }
+
+/* Vuetify marks keyboard focus on a button with a faint overlay only; a ring
+   outside the button stays visible on every fill and in both schemes. A surface
+   painted in a project colour sets --focus-ring to its own contrast-picked ink. */
+.v-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, rgb(var(--v-theme-primary)));
+  outline-offset: 2px;
+}

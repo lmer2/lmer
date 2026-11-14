@@ -162,7 +162,8 @@ def test_peer_send_and_reply_have_native_bus_history_and_durable_provenance(host
     with scope.bound(beta["id"]):
         retained = assistant_history.page(second["session"], since=0)["messages"]
     shown = next(row for row in retained if row.get("peer"))
-    assert shown["peer"] == record["meta"]["peer"]
+    # The pane also gets the sending project's current colour for its tint.
+    assert shown["peer"] == {**record["meta"]["peer"], "project_color": alpha["color"]}
     assert shown["comms_kind"] == "peer UL message"
     with scope.bound(beta["id"]):
         assert assistant_history.events(second["session"])[0].message["meta"]["peer"] == record["meta"]["peer"]

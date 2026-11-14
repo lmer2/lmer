@@ -137,7 +137,7 @@ def test_a_host_with_no_slots_says_so():
     # different things, and only one of them is worth a sentence. .index() is
     # the pin — the section is gone the moment that condition changes shape.
     section = text.index('<template v-if="!loading">')
-    title = text.index('>Service slots</h2>')
+    title = text.index('title="Service slots"')
     assert "No service slots configured." in text, (
         "a host with no slots is told nothing"
     )
@@ -252,6 +252,9 @@ def test_slot_meta_labels_and_falls_back(tmp_path):
         "assert.equal(slotMeta('occupied').tone, 'idle')",
         "assert.equal(slotMeta('misconfigured').tone, 'bad')",
         "assert.equal(slotMeta('service_down').tone, 'attention')",
+        # Not known is not an outage: neither the warning tone nor its icon.
+        "assert.equal(slotMeta('unknown').tone, 'idle')",
+        "assert.notEqual(slotMeta('unknown').icon, slotMeta('service_down').icon)",
         # A daemon newer than this bundle: named and painted, never blank.
         "assert.equal(slotMeta('quarantined').label, 'quarantined')",
         "assert.ok(toneColor(slotMeta('quarantined').tone))",
@@ -266,6 +269,7 @@ def test_only_a_free_slot_reads_as_free(tmp_path):
         "assert.equal(slotIsFree({state: 'occupied'}), false)",
         "assert.equal(slotIsFree({state: 'service_down'}), false)",
         "assert.equal(slotIsFree({state: 'misconfigured'}), false)",
+        "assert.equal(slotIsFree({state: 'unknown'}), false)",
         "assert.equal(slotIsFree(null), false)",
         "assert.equal(slotIsFree({}), false)",
     ]))

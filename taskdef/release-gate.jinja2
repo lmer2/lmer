@@ -25,7 +25,9 @@ the approval.
    then `work commit`. The gate is not armed until the pushed run state
    says so — a watcher idling on unpushed state is invisible to every
    other launch.
-2. Arm the watch on the release MR:
+2. Run the early leak scan (below). A finding ends the session here, before
+   any watch is armed.
+3. Arm the watch on the release MR:
 
    ```bash
    gitlab-review <project> <release-mr-iid> --host <hostname> --check-updates --watch --command "/followup"
@@ -34,7 +36,7 @@ the approval.
    The `--check-updates --watch` primitive blocks on MR activity and
    fires the follow-up command when the MR changes; the merge is the
    activity this gate is waiting for.
-3. Idle. Do no other work while the gate is open — the run advances only
+4. Idle. Do no other work while the gate is open — the run advances only
    on the human's merge. A long idle will outlive the claim's stale
    threshold; that is expected and safe BECAUSE of the wake-time re-claim
    below, never a reason to hold the gate with a hand-rolled refresh loop.
@@ -53,6 +55,53 @@ On merge detection:
    refusal.
 3. Proceed to Leg 2. Its FIRST action is recording the release MR's merge
    SHA into run state.
+
+### The early leak scan
+
+A leak-scan finding is a history decision, and history decisions are cheap
+before the release MR moves `main` and expensive after. So the scan runs
+on every entry to the gate (a first arming or a re-arm), after the gate
+phase is recorded and before the watch is armed. It is cheap; re-running it
+is the idempotency rule.
+
+- `leak_scan.public_mirror` is `false` → `work log` that the scan is opted
+  out, and arm the watch.
+- Add the mirror remote once (`git remote add github
+  <release.github_target>` — skip if already present), then fetch both
+  remotes (`git fetch origin`; the `github` fetch carries the per-command
+  ASKPASS prefix described under Leg 2, in the same shell invocation). The scan base is the previous release tag on the mirror:
+  `git describe --tags --abbrev=0 --match 'v[0-9]*' github/main`.
+- Scan everything a push of the candidate would publish, with the
+  recorded bump-MR merge SHA as the candidate:
+  `work verify leak-scan-early -- lmer-release-guard scan --config <resolved task.yaml> --base <previous tag> --candidate <bump-merge-sha> --published github/main --out <scratch dir>/leak-scan-early.json`
+  It scans the cumulative diff, each commit's own added and removed lines,
+  each merge against `git merge-tree --write-tree` of its parents, every
+  commit message and author/committer identity, and the session's live
+  secret values; a binary file's bytes are checked for held values, token
+  shapes, project patterns and guard strings (`binary` records). Hit
+  values are masked in all of its output; keep them masked in everything
+  you write. The JSON's
+  `hosts` inventory is the exception: it lists hostnames no pattern
+  matched, whole, to help spot an internal host. Read it; never copy it
+  into `leak-scan.md`.
+- Exit 1 means the scan did NOT run (bad config, git failure, no previous
+  tag): HARD STOP quoting its stderr — never read it as zero hits. Exit 2
+  is a live secret or a guard string in the range: a finding by
+  definition. Exit 0 means the scan ran, not that the range is clean: triage EVERY hit in the JSON against the exceptions
+  file (`leak_scan.exceptions`, from `work read-project-info`), against what
+  the already-published history carries, and against operator decisions
+  recorded in an earlier `leak-scan.md` for this release. A hit that none
+  of those clears is a finding.
+- Write `leak-scan.md` — scope (SHAs, ranges, counts), scans run, findings,
+  cleared hits by class, informational notes — and persist it with
+  `work artifact leak-scan.md --file <path>`.
+- Any finding → do NOT arm the watch. Ask with
+  `lmer-signal ask --operator-only`, naming each finding by commit,
+  file:line and category (masked), record the question
+  (`work state set --stop-reason=question --question "<the question>"`),
+  `work commit`, and end the session. Rewriting, reverting or squashing
+  anything is the operator's decision, never this session's. Record the
+  operator's decision in `leak-scan.md` so the next scan clears that hit.
 
 ### Watch is best-effort; resume is the contract
 

@@ -555,7 +555,8 @@ def test_fleet_rows_carry_muted_before_check_ins_read_it(tracked, monkeypatch):
 
 
 def test_build_state_folds_mute_before_check_ins():
-    source = inspect.getsource(api.build_state)
+    # build_state times the stages; the folds live in the body it wraps (#561).
+    source = inspect.getsource(api._build_state)
     assert source.index("_fold_mute(") < source.index("_fold_checkins(")
 
 

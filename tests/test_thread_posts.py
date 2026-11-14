@@ -285,3 +285,14 @@ class TestAttribution:
             rig.attribution.wrote(f"own{index}")
         assert len(rig.attribution._held) <= thread_posts.HELD_LIMIT
         assert len(rig.attribution._wrote) <= thread_posts.WROTE_LIMIT
+
+
+@pytest.mark.parametrize("poster, human, expected", [
+    (None, True, "human"),
+    (None, False, "bot"),
+    (thread_posts.Poster.for_session("s-other", "chat-mr-288"), False, "session"),
+    (thread_posts.Poster.for_platform("operator"), False, "platform"),
+])
+def test_relay_meta_names_who_posted(poster, human, expected):
+    """What a connector stamps on a relayed record; `work decisions` reads it (#674)."""
+    assert thread_posts.relay_meta(poster, human) == {"poster": expected}

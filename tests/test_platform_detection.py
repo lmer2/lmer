@@ -49,6 +49,7 @@ from lmer_platform import (
     daemon,
     detect,
     inventory,
+    mr_activity,
     registry,
     spawn,
     store,
@@ -1825,6 +1826,73 @@ def test_a_failing_check_in_pass_does_not_cost_the_diff(config, monkeypatch, det
     assert any(
         "stage=checkin" in record.message for record in detected.records
     ), "the absorbed failure has to name its own stage"
+
+
+MR = "https://gitlab.example.com/group/project/-/merge_requests/202"
+
+
+def review_fleet(**reported):
+    """One review run that posted its review 6h ago, unchecked for 4h."""
+    from datetime import datetime, timedelta, timezone
+
+    payload = stale_fleet("review-mr-202")
+    posted = datetime.now(timezone.utc) - timedelta(hours=6)
+    payload["runs"][0].update(
+        target=MR, phase="cleanup", status="in-progress",
+        review_posted_at=posted.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    return payload
+
+
+def mr_fetcher(reported):
+    calls = []
+
+    def fetch(ref):
+        calls.append(ref.key)
+        if isinstance(reported, Exception):
+            raise reported
+        return dict(reported)
+
+    fetch.calls = calls
+    return fetch
+
+
+QUIET_MR = {"head_sha": "abc123", "pushed_at": "2020-01-01T00:00:00Z",
+            "comments": [], "page_floor": None, "state": "opened"}
+
+
+def test_a_review_whose_mr_has_not_moved_is_not_announced(config):
+    fetch = mr_fetcher(QUIET_MR)
+    spool = Spool()
+    tick = detector(config, review_fleet(), spool=spool, mr_fetch=fetch)
+
+    tick.tick_once()
+    tick.tick_once()
+
+    assert checkin_digests(spool) == []
+    assert fetch.calls == ["gitlab.example.com/group/project!202"], (
+        "one fetch for the window, not one per tick"
+    )
+
+
+def test_a_review_whose_mr_moved_is_announced(config):
+    from datetime import datetime, timezone
+
+    moved = dict(QUIET_MR, pushed_at=datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"))
+    spool = Spool()
+    detector(config, review_fleet(), spool=spool, mr_fetch=mr_fetcher(moved)).tick_once()
+
+    digests = checkin_digests(spool)
+    assert len(digests) == 1 and "review-mr-202" in digests[0]["note"]
+
+
+def test_a_review_whose_mr_cannot_be_read_is_announced(config):
+    spool = Spool()
+    failing = mr_fetcher(mr_activity.FetchError("HTTP 503"))
+    detector(config, review_fleet(), spool=spool, mr_fetch=failing).tick_once()
+
+    assert len(checkin_digests(spool)) == 1, "fail open: unknown is not quiet"
 
 
 def test_the_startup_notice_says_the_window(config):

@@ -470,6 +470,7 @@ release verb because there is nothing to release.
 | `in use` | a live session holds it; the row links to that run | wait, or use another slot |
 | `service not running` | the definition is fine, the dev service is not up | start the stack |
 | `misconfigured` | see below | fix the presets file — the slot recovers without a config edit — or re-point the slot from the fleet view |
+| `not checked yet` (`unknown`) | the service probe has not answered yet (below) | wait: the row updates when it answers; a spawn probes afresh |
 
 A slot is `misconfigured` when:
 
@@ -505,6 +506,17 @@ The service state comes from a probe that is cached for 30 seconds — the fleet
 view is polled every ten, and a container query per slot per poll is a cost the
 row does not need. A spawn re-probes without the cache, because an action taken
 on the answer cannot afford a stale one.
+
+On the fleet view the probe runs on its own background thread, one per slot
+binding at a time, and a read waits at most 2 seconds in all for the probes it
+needs, however many slots it shows. A runtime that
+cannot answer (podman waiting behind a long container removal, say) then costs
+the row its fresh answer, not the fleet read its response: the row keeps its
+last known state, or, with none yet, reads `unknown` (shown as "not checked
+yet") with the reason "the container runtime did not answer within 2 s; this
+row updates when it does". `unknown` is not an outage, and a spawn picker does
+not offer the slot until the probe answers.
+The spawn path still waits for its own answer.
 
 ### Refusals
 

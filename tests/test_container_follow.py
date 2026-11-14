@@ -411,3 +411,59 @@ def test_a_stop_leaves_room_for_the_session_end_backstop():
     assert runtime.STOP_TIMEOUT_SECONDS > clone_and_exec.SESSION_END_TIMEOUT_SECONDS
     args = runtime.base_run_args("docker", False, "developer")
     assert args[args.index("--stop-timeout") + 1] == str(runtime.STOP_TIMEOUT_SECONDS)
+
+
+def test_an_rm_that_fails_once_is_retried(fake_runtime, capfd, monkeypatch, tmp_path):
+    counter = tmp_path / "rm-failures"
+    counter.write_text("1")
+    monkeypatch.setenv("FAKE_RUNTIME_RM_FAIL", str(counter))
+    cid = fake_runtime("exit 0")
+    assert container_follow.remove("docker", cid) is True
+    assert not (fake_runtime.state / cid).exists()
+    assert counter.read_text() == "0"
+    assert "could not remove" not in both(capfd)
+
+
+def test_an_rm_that_keeps_failing_names_the_container(fake_runtime, capfd, monkeypatch, tmp_path):
+    counter = tmp_path / "rm-failures"
+    counter.write_text("2")
+    monkeypatch.setenv("FAKE_RUNTIME_RM_FAIL", str(counter))
+    cid = fake_runtime("exit 0")
+    assert container_follow.remove("docker", cid) is False
+    assert (fake_runtime.state / cid).exists()
+    text = both(capfd)
+    assert f"could not remove container {cid}" in text
+    assert "device or resource busy" in text
+
+
+def test_a_half_removed_container_is_still_there_for_the_retry_check(fake_runtime):
+    """podman's half-removed container fails ``inspect`` but ``ps`` lists it."""
+    cid = fake_runtime("exit 0")
+    (fake_runtime.state / cid / "removing").touch()
+    (fake_runtime.state / cid / "storage-gone").touch()
+    assert not container_follow.name_taken("docker", cid)
+    assert container_follow._still_listed("docker", cid)
+
+
+def test_a_container_named_rather_than_id_is_checked_by_its_id(
+    fake_runtime, capfd, monkeypatch, tmp_path
+):
+    """`lmer follow <name>` removes by name; a half-removed container no longer
+    answers to it, so the check after a failed `rm` must use the id."""
+    counter = tmp_path / "rm-failures"
+    counter.write_text("2")
+    monkeypatch.setenv("FAKE_RUNTIME_RM_FAIL", str(counter))
+    cid = fake_runtime("exit 0")
+    name = json.loads((fake_runtime.state / cid / "config.json").read_text())["name"]
+    real_run = subprocess.run
+
+    def half_remove_on_rm(args, *a, **kw):
+        result = real_run(args, *a, **kw)
+        if args[1:2] == ["rm"]:
+            for marker in ("removing", "storage-gone"):
+                (fake_runtime.state / cid / marker).touch()
+        return result
+
+    monkeypatch.setattr(container_follow.subprocess, "run", half_remove_on_rm)
+    assert container_follow.remove("docker", name) is False
+    assert f"could not remove container {cid}" in both(capfd)

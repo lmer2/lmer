@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+import requests
+import urllib3
 
 from ask_channel import bus
 from lmer_cli import thread_access, thread_posts
@@ -19,6 +21,8 @@ from lmer_cli.thread_access import (
     read_from_store, read_thread, render_record, resolve_thread, stored_name_of,
 )
 from lmer_cli.threads import ThreadError, parse_channel, parse_thread
+from matrix_chat.client import MatrixError
+from matrix_chat.crypto import CryptoError
 
 SLACK_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
 SLACK_ENV = {"SLACK_BOT_TOKEN": "xoxb-test"}
@@ -44,7 +48,7 @@ class FakeSlack:
         self.opened = []
         self.calls = 0
 
-    def get_replies(self, channel, thread_ts, oldest=None):
+    def get_replies(self, channel, thread_ts, oldest=None, **kw):
         """Slack's own shape: given a message inside a thread it answers with
         that message, whose `thread_ts` names the root."""
         self.calls += 1
@@ -161,13 +165,16 @@ class FakeMatrix:
 class _SlackDownload:
     """What `requests.get(..., stream=True)` gives the fetcher back."""
 
-    def __init__(self, body: bytes, *, declared=None):
+    def __init__(self, body: bytes, *, declared=None, status=200, content_type="text/plain",
+                 stall=None):
         self.body = body
-        self.headers = {"Content-Type": "text/plain"}
+        self.status_code = status
+        self.headers = {} if content_type is None else {"Content-Type": content_type}
         if declared is not None:
             self.headers["Content-Length"] = str(declared)
         self.closed = False
         self.read = 0
+        self.stall = stall
 
     def __enter__(self):
         return self
@@ -176,13 +183,19 @@ class _SlackDownload:
         self.closed = True
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error: Forbidden for url: https://files.slack.com/files-pri/T1-F1/x",
+                response=self,
+            )
 
     def iter_content(self, chunk_size=65536):
         for start in range(0, len(self.body), chunk_size):
             chunk = self.body[start:start + chunk_size]
             self.read += len(chunk)
             yield chunk
+        if self.stall is not None:
+            raise self.stall
 
 
 @pytest.fixture
@@ -345,7 +358,7 @@ class TestFiles:
         payload = read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
         assert download.read <= 1024 + 65536  # one chunk past the bound, at most
         line = render_record(payload["messages"][0])
-        assert "over the size this copies in" in line or "could not be fetched" in line
+        assert line.endswith("not copied in: it is over the size this copies in")
 
     def test_a_declared_length_over_the_bound_is_not_fetched_at_all(self, monkeypatch, store):
         client = FakeSlack(messages=[{
@@ -369,11 +382,156 @@ class TestFiles:
             "files": [{"name": "build.log", "url_private_download": "https://files.slack.com/x"}],
         }])
         monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
-        monkeypatch.setattr(thread_access, "fetch_slack_file", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            thread_access.requests, "get", lambda *a, **kw: _SlackDownload(b"", status=403),
+        )
         payload = read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
         line = render_record(payload["messages"][0])
         assert "no upload store" not in line
         assert "could not be fetched" in line
+
+    def _read_one_png(self, monkeypatch, store, get):
+        client = FakeSlack(messages=[{
+            "ts": "1712345678.000900", "user": "U1", "text": "see",
+            "files": [{"name": "image.png", "mimetype": "image/png", "size": 60047,
+                       "url_private_download": "https://files.slack.com/files-pri/T1-F1/image.png"}],
+        }])
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
+        monkeypatch.setattr(thread_access.requests, "get", get)
+        payload = read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
+        return render_record(payload["messages"][0])
+
+    def test_an_http_error_names_the_status_and_nothing_of_the_url(self, monkeypatch, store, tmp_path):
+        line = self._read_one_png(
+            monkeypatch, store, lambda *a, **kw: _SlackDownload(b"", status=403),
+        )
+        assert line.endswith(
+            "📎 image.png (image/png, 60047 B) — not copied in: "
+            "it could not be fetched: Slack answered HTTP 403"
+        )
+        assert "files.slack.com" not in line and "files-pri" not in line
+        assert list((tmp_path / "uploads").iterdir()) == []
+
+    def test_a_timeout_before_the_answer_says_it_timed_out(self, monkeypatch, store):
+        def get(*a, **kw):
+            raise requests.ConnectTimeout("connect timed out (https://files.slack.com/x)")
+
+        line = self._read_one_png(monkeypatch, store, get)
+        assert line.endswith("it could not be fetched: the download timed out (30 s without data)")
+
+    def test_a_timeout_while_the_body_streams_says_it_timed_out_too(self, monkeypatch, store):
+        """requests reports a read that stalls mid-body as a ConnectionError
+        wrapping urllib3's ReadTimeoutError, not as a Timeout."""
+        stalled = requests.ConnectionError(
+            urllib3.exceptions.ReadTimeoutError(None, "https://files.slack.com/x", "Read timed out."),
+        )
+        line = self._read_one_png(
+            monkeypatch, store,
+            lambda *a, **kw: _SlackDownload(b"\x89PNG", content_type="image/png", stall=stalled),
+        )
+        assert line.endswith("it could not be fetched: the download timed out (30 s without data)")
+
+    def test_another_transport_failure_names_only_its_kind(self, monkeypatch, store):
+        def get(*a, **kw):
+            raise requests.ConnectionError("Max retries exceeded with url: https://files.slack.com/x")
+
+        line = self._read_one_png(monkeypatch, store, get)
+        assert line.endswith("it could not be fetched: ConnectionError")
+        assert "files.slack.com" not in line
+
+    def test_a_web_page_where_an_image_was_expected_is_not_staged(self, monkeypatch, store, tmp_path):
+        page = b"<!DOCTYPE html><html><body>Sign in to Slack</body></html>"
+        line = self._read_one_png(
+            monkeypatch, store,
+            lambda *a, **kw: _SlackDownload(page, content_type="text/html; charset=utf-8"),
+        )
+        assert line.endswith("it could not be fetched: Slack answered with a web page instead of the file")
+        assert list((tmp_path / "uploads").iterdir()) == []
+
+    def test_an_html_file_posted_as_html_is_staged(self, monkeypatch, store, tmp_path):
+        client = FakeSlack(messages=[{
+            "ts": "1712345678.000900", "user": "U1", "text": "",
+            "files": [{"name": "report.html", "mimetype": "text/html",
+                       "url_private_download": "https://files.slack.com/report.html"}],
+        }])
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
+        monkeypatch.setattr(
+            thread_access.requests, "get",
+            lambda *a, **kw: _SlackDownload(b"<html></html>", content_type="text/html"),
+        )
+        payload = read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
+        assert payload["messages"][0]["attachments"][0]["reference"].startswith("[lmer upload] ")
+        assert len(list((tmp_path / "uploads").iterdir())) == 1
+
+    PAGE = b"\n  <!DOCTYPE html><html><body>Sign in to Slack</body></html>"
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    @pytest.mark.parametrize("label", [None, "application/octet-stream", "application/xhtml+xml", "image/png"])
+    def test_a_page_where_an_image_was_declared_is_refused_whatever_its_label(
+        self, monkeypatch, store, tmp_path, label,
+    ):
+        line = self._read_one_png(
+            monkeypatch, store, lambda *a, **kw: _SlackDownload(self.PAGE, content_type=label),
+        )
+        assert line.endswith("it could not be fetched: Slack answered with a web page instead of the file")
+        assert list((tmp_path / "uploads").iterdir()) == []
+
+    def test_an_error_body_that_is_no_known_file_is_refused(self, monkeypatch, store, tmp_path):
+        line = self._read_one_png(
+            monkeypatch, store,
+            lambda *a, **kw: _SlackDownload(b'{"ok":false,"error":"file_not_found"}', content_type="image/png"),
+        )
+        assert line.endswith("it could not be fetched: Slack answered with something other than the file")
+        assert list((tmp_path / "uploads").iterdir()) == []
+
+    def test_a_real_image_in_another_format_than_declared_is_staged(self, monkeypatch, store, tmp_path):
+        """Slack's mimetype can name a different image format than the bytes;
+        that is still the file that was posted."""
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+        line = self._read_one_png(
+            monkeypatch, store, lambda *a, **kw: _SlackDownload(jpeg, content_type="image/png"),
+        )
+        assert "[lmer upload]" in line
+        assert [path.read_bytes() for path in (tmp_path / "uploads").iterdir()] == [jpeg]
+
+    @pytest.mark.parametrize("label", [None, "application/octet-stream", "image/png"])
+    def test_the_real_image_is_staged_whatever_its_label(self, monkeypatch, store, tmp_path, label):
+        line = self._read_one_png(
+            monkeypatch, store, lambda *a, **kw: _SlackDownload(self.PNG, content_type=label),
+        )
+        assert "[lmer upload]" in line
+        assert [path.read_bytes() for path in (tmp_path / "uploads").iterdir()] == [self.PNG]
+
+    def test_a_declared_type_with_parameters_and_capitals_is_normalised(self, monkeypatch, store, tmp_path):
+        client = FakeSlack(messages=[{
+            "ts": "1712345678.000900", "user": "U1", "text": "",
+            "files": [{"name": "report.html", "mimetype": " Text/HTML ; charset=utf-8",
+                       "url_private_download": "https://files.slack.com/report.html"}],
+        }])
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
+        monkeypatch.setattr(
+            thread_access.requests, "get",
+            lambda *a, **kw: _SlackDownload(b"<html></html>", content_type="text/html"),
+        )
+        payload = read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
+        attachment = payload["messages"][0]["attachments"][0]
+        assert attachment["reference"].startswith("[lmer upload] ")
+        assert attachment["media_type"] == "text/html"
+
+    def test_a_declared_type_with_no_signature_is_left_to_the_label(self, monkeypatch, store, tmp_path):
+        """Nothing in a text file's bytes says it is one, so only a text/html
+        label can show a page came back instead."""
+        client = FakeSlack(messages=[{
+            "ts": "1712345678.000900", "user": "U1", "text": "",
+            "files": [{"name": "notes.txt", "mimetype": "text/plain",
+                       "url_private_download": "https://files.slack.com/notes.txt"}],
+        }])
+        monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
+        monkeypatch.setattr(
+            thread_access.requests, "get", lambda *a, **kw: _SlackDownload(self.PAGE, content_type=None),
+        )
+        read_thread(SLACK_LINK, env=SLACK_ENV, store=store)
+        assert len(list((tmp_path / "uploads").iterdir())) == 1
 
     def test_a_read_stops_copying_once_its_whole_budget_is_spent(self, monkeypatch, store):
         """`--limit 200` over a file-heavy thread would otherwise stage 200 times
@@ -584,7 +742,7 @@ class TestResolvingBeforeADecision:
 
     def _client(self, code):
         class Failing(FakeSlack):
-            def get_replies(inner, channel, ts, oldest=None):
+            def get_replies(inner, channel, ts, oldest=None, **kw):
                 from slack_chat.client import SlackError
 
                 raise SlackError(
@@ -662,6 +820,39 @@ class TestResolvingBeforeADecision:
         read or post go through."""
         ref = parse_thread(SLACK_LINK)
         assert thread_access.slack_rooted(ref, self._client("not_in_channel")) == ref
+
+
+class TestTheHeldCheckRead:
+    """A held-thread check needs the root and nothing else."""
+
+    class Recording(FakeSlack):
+        def __init__(self, messages):
+            super().__init__()
+            self.messages, self.asked = messages, []
+
+        def get_replies(self, channel, ts, oldest=None, **kw):
+            self.asked.append(kw)
+            return self.messages
+
+    def test_it_reads_one_message_and_hands_back_none(self):
+        ref = parse_thread(SLACK_LINK)
+        slack = self.Recording([{"ts": ref.key["thread_ts"]}])
+        rooted, messages = thread_access.slack_thread(ref, slack, require_resolution=True)
+        assert (rooted, messages) == (ref, None)
+        assert slack.asked == [{"limit": 1}]
+
+    def test_it_still_finds_the_root_of_a_reply(self):
+        ref = parse_thread(SLACK_LINK)
+        slack = self.Recording([{"ts": ref.key["thread_ts"], "thread_ts": "1712340000.000100"}])
+        rooted, _ = thread_access.slack_thread(ref, slack, require_resolution=True)
+        assert rooted.key["thread_ts"] == "1712340000.000100"
+
+    def test_an_ordinary_read_still_takes_the_whole_thread(self):
+        ref = parse_thread(SLACK_LINK)
+        whole = [{"ts": ref.key["thread_ts"]}, {"ts": "1712345679.000100"}]
+        slack = self.Recording(whole)
+        assert thread_access.slack_thread(ref, slack) == (ref, whole)
+        assert slack.asked == [{}]
 
 
 class TestNamingAChannel:
@@ -971,3 +1162,102 @@ class TestServicer:
         servicer._answer({"id": "r1", "op": "read", "permalink": SLACK_LINK})
         assert answered[0]["ok"] is False
         assert "invite it" in answered[0]["error"]
+
+
+class _RefusingMatrix:
+    def __init__(self, error):
+        self.error = error
+
+    def download(self, mxc, *, max_bytes=None):
+        raise self.error
+
+
+class TestMatrixFileReasons:
+    CONTENT = {"msgtype": "m.image", "body": "shot.png", "url": "mxc://example.org/pic",
+               "info": {"mimetype": "image/png", "size": 10}}
+
+    def _line(self, store, error):
+        (record,) = thread_access._stage_matrix_file(
+            _RefusingMatrix(error), self.CONTENT, store, [thread_access.MAX_READ_BYTES],
+        )
+        return thread_access.attachment_line(record)
+
+    def test_a_refused_download_names_the_status_not_the_error(self, store):
+        error = MatrixError(
+            "GET /_matrix/client/v1/media/download/example.org/pic → 403 M_FORBIDDEN",
+            status=403, errcode="M_FORBIDDEN",
+        )
+        line = self._line(store, error)
+        assert line.endswith("it could not be fetched: the homeserver answered HTTP 403")
+        assert "/_matrix" not in line and "M_FORBIDDEN" not in line
+
+    def test_an_unreachable_homeserver_says_so(self, store):
+        try:
+            try:
+                raise requests.ConnectionError("https://matrix.example.org down")
+            except requests.ConnectionError as exc:
+                raise MatrixError("cannot reach the homeserver at https://matrix.example.org (ConnectionError)",
+                                  transient=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        line = self._line(store, error)
+        assert line.endswith("it could not be fetched: the homeserver could not be reached")
+        assert "matrix.example.org" not in line
+
+    def test_a_timeout_is_told_apart_from_an_outage(self, store):
+        try:
+            try:
+                raise requests.ReadTimeout("read timed out")
+            except requests.ReadTimeout as exc:
+                raise MatrixError("cannot reach the homeserver (ReadTimeout)", transient=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        assert self._line(store, error).endswith("it could not be fetched: the download timed out")
+
+    @pytest.mark.parametrize("status, transient", [(503, True), (401, False)])
+    def test_a_bridge_status_is_named_as_the_bridges_not_the_homeservers(self, store, status, transient):
+        try:
+            try:
+                raise CryptoError(f"lmer-matrix-bridge refused /decrypt: {status} at http://bridge:9000",
+                                  status=status, transient=transient)
+            except CryptoError as exc:
+                raise MatrixError(str(exc), status=exc.status, not_sent=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        line = self._line(store, error)
+        assert line.endswith(f"it could not be fetched: lmer-matrix-bridge answered HTTP {status}")
+        assert "homeserver" not in line
+        assert "bridge:9000" not in line
+
+    def test_a_bridge_failure_with_no_status_or_outage_reads_as_a_decryption_failure(self, store):
+        try:
+            try:
+                raise CryptoError("lmer-matrix-bridge answered a different number of events")
+            except CryptoError as exc:
+                raise MatrixError(str(exc), not_sent=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        assert self._line(store, error).endswith("it could not be fetched: it could not be decrypted")
+
+    def test_an_unreachable_bridge_is_not_reported_as_a_decryption_failure(self, store):
+        try:
+            try:
+                raise CryptoError("cannot reach lmer-matrix-bridge at http://bridge:9000 (ConnectionError)",
+                                  transient=True)
+            except CryptoError as exc:
+                raise MatrixError(str(exc), transient=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        line = self._line(store, error)
+        assert line.endswith("it could not be fetched: lmer-matrix-bridge could not be reached")
+        assert "bridge:9000" not in line
+
+    def test_a_body_cut_off_mid_transfer_does_not_say_the_homeserver_was_unreachable(self, store):
+        try:
+            try:
+                raise requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
+            except requests.RequestException as exc:
+                raise MatrixError("download failed (ChunkedEncodingError)", transient=True) from exc
+        except MatrixError as wrapped:
+            error = wrapped
+        assert self._line(store, error).endswith("it could not be fetched: the download was cut off")

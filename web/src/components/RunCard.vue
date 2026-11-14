@@ -11,6 +11,7 @@ import {
   portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
 import { assistantName } from '../ratchet.js'
+import { burnLabel, burnTitle } from '../usage.js'
 import StatusStrip from './StatusStrip.vue'
 import ThreadLinks from './ThreadLinks.vue'
 
@@ -98,6 +99,11 @@ const idle = computed(() => {
 // Unpainted, like every other addition here: colour is urgency, and a quiet run is
 // not more urgent than a crashed one. The *word* carries the signal.
 const checkin = computed(() => checkinLabel(props.run.checkin, props.now))
+
+// What the run is spending now (issue 315), off the poll's `usage`: a word in the
+// dimmed line, unpainted, because spend is not urgency. Null, and absent, when
+// the collector has nothing for the run.
+const burn = computed(() => burnLabel(props.run.usage))
 
 // The platform's own session, read once so that everything the treatment touches —
 // the card's border and the badge — is the same fact, and no other row can pay for
@@ -351,6 +357,11 @@ const forgettable = computed(
             : 'nothing has read this run yet'"
         >{{ checkin }}</span>
         <span :title="run.updated || ''">{{ ago(run.updated, now) }}</span>
+        <span
+          v-if="burn"
+          class="run-burn"
+          :title="burnTitle(run.usage)"
+        >{{ burn }}</span>
         <!-- The live session's own status line (issue 248). In this line rather
              than a chip group of its own for `idle`'s reason: a fact the state
              chip does not contain, not a competing verdict. -->

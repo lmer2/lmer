@@ -1,0 +1,7 @@
+{"timestamp": "2026-11-05T09:00:00Z", "type": "session_meta", "payload": {"id": "thread-main", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5-codex", "cwd": "/workspace"}}
+{"timestamp": "2026-11-05T09:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "user"}}
+{"timestamp": "2026-11-05T09:00:10Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 800, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40, "total_tokens": 1100}}}}
+{"timestamp": "2026-11-05T09:00:11Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 800, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40, "total_tokens": 1100}}}}
+{"timestamp": "2026-11-05T09:00:12Z", "type": "event_msg", "payload": {"type": "token_count", "info": null}}
+{"timestamp": "2026-11-05T09:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 3000, "cached_input_tokens": 2500, "cache_write_input_tokens": 100, "output_tokens": 250, "reasoning_output_tokens": 90, "total_tokens": 3250}}}}

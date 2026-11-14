@@ -30,7 +30,7 @@ def test_cli_endpoint_reaches_connector_forwarding(transport_host, monkeypatch, 
     api_client, transports, _component = transport_host
     runner = Runner()
     noop = SimpleNamespace(stop=lambda: None)
-    for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests"):
+    for name in ("_supervise_assistant", "_watch_for_attention", "_subscribe_to_comms", "_serve_thread_requests", "_collect_usage"):
         monkeypatch.setattr(daemon, name, lambda *args: noop)
     monkeypatch.setattr(daemon, "reattach_all", lambda **_: [])
     monkeypatch.setattr(connectors.ThreadConnectors, "start", lambda self: None)
@@ -200,9 +200,10 @@ def test_failure_health_survives_restart_and_does_not_wake_models(transport_host
         assert component._delivery_health["inbound"]["failures"] == 3
         component._loop("inbound", lambda: component._stop.set())
         assert component._delivery_health["inbound"]["failures"] == 0
+        # Three failures in no time are inside the grace window: the
+        # connectors panel above showed them, the chat hears nothing.
         notes = [row for row in rig.log.read_since(0)[0] if row.kind == "note"]
-        assert len(notes) == 2
-        assert all(row.meta["notification_class"] == "connector_health" for row in notes)
+        assert notes == []
     finally:
         component.stop(announce=False)
         rig.bus._session._http.close()

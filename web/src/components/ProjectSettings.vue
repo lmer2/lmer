@@ -1,27 +1,35 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { archiveProject, fetchAssistantInstructions, fetchChannelRoutes, setAssistantInstructions, setProjectChannels,
-  updateProject } from '../api.js'
+import { archiveProject, fetchAssistantInstructions, fetchChannelRoutes, fetchProjects, setAssistantInstructions,
+  setProjectChannels, updateProject } from '../api.js'
 import { ago } from '../format.js'
 import { LAUNCH_SETTING_HINTS, LAUNCH_SETTING_KEYS, LAUNCH_SETTING_LABELS } from '../launchSettings.js'
+import { numberReading } from '../numberField.js'
 import { projectColor, projectColors, projectTextColor, storedProjectColor } from '../projects.js'
 import { assistantName } from '../ratchet.js'
 
 // `focus` is `{ id, section, nonce }`; the nonce makes a repeat tap count.
 // `isDefault` is whether this browser opens this project on load; `default` reports a change.
+// `time` is GET api/time/status, or null while time tracking is off, which hides its section.
 const props = defineProps({ project: { type: Object, required: true }, focus: { type: Object, default: null },
-  now: { type: Number, default: () => Date.now() }, isDefault: Boolean })
+  now: { type: Number, default: () => Date.now() }, isDefault: Boolean, time: { type: Object, default: null } })
 const emit = defineEmits(['changed', 'close', 'default', 'focused'])
 const openOnLoad = computed({
   get: () => props.isDefault,
   set: (on) => emit('default', on ? props.project.id : ''),
 })
 const form = ref({})
+// The settings the form was filled from, so a save sends only what was edited here.
+const savedSettings = ref({})
+const blank = (value) => (value === undefined || value === '' || (Array.isArray(value) && !value.length) ? null : value)
+const same = (a, b) => JSON.stringify(blank(a)) === JSON.stringify(blank(b))
+const copy = (value) => JSON.parse(JSON.stringify(value ?? {}))
 const orders = ref(null)
 const instructions = ref('')
 const savedInstructions = ref('')
 const ordersOpen = ref(undefined)
 const ordersPanel = ref(null)
+const actionsRow = ref(null)
 const error = ref(null)
 const ordersError = ref(null)
 const busy = ref(false)
@@ -38,14 +46,32 @@ const swatches = Object.values(projectColors).reduce((rows, hex, index) => {
   rows.at(-1).push(hex)
   return rows
 }, [])
-// The canvas, sliders and HEX field: open for a color no swatch holds.
+// The canvas, sliders and HEX field, behind "Custom…" even for a color no swatch
+// holds (issue 652): the chip beside the legend names the current one.
 const customColor = ref(false)
+const archiving = ref(false)
 const colorName = computed(() => (Object.hasOwn(projectColors, form.value.color) ? form.value.color : pickedColor.value))
 const authorityLevels = [
   { value: 'none', title: 'None: its messages carry no approval' },
   { value: 'approvals', title: 'Approvals: answer workers\' asks and say go within the task' },
   { value: 'full', title: 'Full: direction and scope within a run\'s target' },
 ]
+const timeProject = computed(() => props.time?.projects?.[props.project.id] || null)
+// The work repo's project names (issue #648), offered for the key and never
+// applied by themselves. A taken one is listed but cannot be picked: the daemon
+// would refuse it.
+const keySuggestions = computed(() => (timeProject.value?.key_suggestions || []).map(item => ({
+  value: item.key, title: item.key,
+  props: { disabled: item.taken, subtitle: item.taken ? 'another project\'s key'
+    : item.matched ? 'matches this project\'s repository' : undefined },
+})))
+const handlerItems = computed(() => (props.time?.handlers || []).map(handler => ({ value: handler.name,
+  title: handler.label && handler.label !== handler.name ? `${handler.label} (${handler.name})` : handler.name })))
+const TIME_KEYS = ['time_project_key', 'time_handler', 'time_clients']
+// The section's Unsaved mark, as a settings card shows one (issue 652); the form
+// still saves through Save project.
+const timeDirty = computed(() => TIME_KEYS.some(key => !same(form.value.settings[key], savedSettings.value[key]))
+  || numberReading(form.value.settings.time_idle_grace_minutes) !== numberReading(savedSettings.value.time_idle_grace_minutes))
 // Unset is `none`; choosing `none` clears the key rather than storing it, so
 // a project has opted in only when it holds a level.
 const supervisorAuthority = computed({
@@ -71,7 +97,9 @@ watch(() => props.project.id, (id) => {
   ordersError.value = null
   form.value = { name: props.project.name, color: props.project.color,
     repositories: (props.project.repositories || []).join('\n'), settings: { ...props.project.settings } }
-  customColor.value = !Object.hasOwn(projectColors, props.project.color || 'Gray')
+  customColor.value = false
+  archiving.value = false
+  savedSettings.value = copy(props.project.settings)
   readForNonce = props.focus?.nonce
   readOrders(id)
   readChannels(id)
@@ -112,8 +140,36 @@ watch(() => props.focus?.nonce, async () => {
   if (props.focus.nonce !== readForNonce) readOrders(props.project.id)
   emit('focused')
   await nextTick()
-  ordersPanel.value?.$el?.scrollIntoView?.({ block: 'start' })
+  const panel = ordersPanel.value?.$el
+  if (!panel) return
+  // The sticky actions row would cover the panel's top; it wraps, so its height is read now.
+  panel.style.setProperty('--project-actions-height', `${actionsRow.value?.$el?.offsetHeight || 0}px`)
+  panel.scrollIntoView?.({ block: 'start' })
 }, { immediate: true })
+
+const labelKey = (key, item) => (key === 'time_clients' && typeof item === 'string' ? item.toLowerCase() : item)
+
+// Other writers change these settings while the form is open (the time-tracking bar
+// adds a client label, spec D12), so a save lays only this form's edits over the
+// project as it is now: an edited list keeps this form's order and spelling, then
+// what was added elsewhere since it opened.
+function mergedSettings(current) {
+  const merged = { ...current }
+  for (const [key, value] of Object.entries(form.value.settings)) {
+    const before = savedSettings.value[key]
+    if (same(value, before)) continue
+    if (!Array.isArray(value) && !Array.isArray(before)) {
+      merged[key] = value
+      continue
+    }
+    const id = (item) => labelKey(key, item)
+    const list = []
+    for (const item of value || []) if (!list.some(other => id(other) === id(item))) list.push(item)
+    const known = new Set([...(before || []), ...list].map(id))
+    merged[key] = [...list, ...(Array.isArray(current[key]) ? current[key] : []).filter(item => !known.has(id(item)))]
+  }
+  return merged
+}
 
 async function save() {
   const id = props.project.id
@@ -129,9 +185,18 @@ async function save() {
         instructions.value = savedInstructions.value = saved.instructions || ''
       }
     }
+    const current = (await fetchProjects()).projects.find(row => row.id === id)
+    if (!current) throw new Error('This project is no longer listed; reload before saving.')
+    const settings = copy(mergedSettings(current.settings || {}))
+    // Only an emptied field becomes null ("inherit"): a 0 is sent for the daemon to
+    // refuse, and an emptied list stays [], which for threads is an explicit "none".
     await updateProject(id, { name: form.value.name, color: form.value.color,
       repositories: form.value.repositories.split('\n').map(value => value.trim()).filter(Boolean),
-      settings: Object.fromEntries(Object.entries(form.value.settings).map(([key, value]) => [key, value || null])) })
+      settings: Object.fromEntries(Object.entries(settings).map(([key, value]) => [key, value === '' ? null : value])) })
+    if (id === props.project.id) {
+      form.value.settings = { ...settings }
+      savedSettings.value = copy(settings)
+    }
     emit('changed')
     if (savedChannels.value !== null && channels.value !== savedChannels.value) {
       const { routes } = await setProjectChannels(id, channelList(channels.value))
@@ -143,16 +208,16 @@ async function save() {
 async function archive() {
   busy.value = true
   error.value = null
-  try { await archiveProject(props.project.id); emit('changed'); emit('close') }
+  try { await archiveProject(props.project.id); archiving.value = false; emit('changed'); emit('close') }
   catch (exc) { error.value = exc.message } finally { busy.value = false }
 }
 </script>
 
 <template>
   <v-card title="Project settings" :subtitle="project.name" class="project-settings">
-    <v-card-actions class="project-actions">
-      <v-btn :loading="busy" color="primary" variant="tonal" @click="save">Save project</v-btn>
-      <v-spacer /><v-btn :disabled="busy" @click="emit('close')">Close</v-btn>
+    <v-card-actions ref="actionsRow" class="project-actions">
+      <v-btn :loading="busy" color="primary" variant="flat" @click="save">Save project</v-btn>
+      <v-spacer /><v-btn variant="tonal" :disabled="busy" @click="emit('close')">Close</v-btn>
     </v-card-actions>
     <v-card-text class="settings-body">
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
@@ -175,7 +240,7 @@ async function archive() {
           <v-color-picker v-model="pickedColor" mode="hex" :modes="['hex']" show-swatches :swatches="swatches"
             swatches-max-height="none" :hide-canvas="!customColor" :hide-sliders="!customColor" :hide-inputs="!customColor"
             canvas-height="120" :disabled="busy" elevation="0" width="100%" max-width="360" class="project-color-picker" />
-          <v-btn variant="text" size="small" class="custom-color" :aria-expanded="customColor" :disabled="busy"
+          <v-btn variant="tonal" size="small" class="custom-color" :aria-expanded="customColor" :disabled="busy"
             @click="customColor = !customColor">{{ customColor ? 'Swatches only' : 'Custom…' }}</v-btn>
         </fieldset>
         <div class="settings-field">
@@ -211,8 +276,42 @@ async function archive() {
           </div>
         </div>
         <div class="settings-field">
-          <v-combobox v-model="form.settings.threads" label="Project thread connections" multiple chips :disabled="busy"
+          <v-combobox v-model="form.settings.threads" class="project-threads" label="Project thread connections" multiple chips :disabled="busy"
             persistent-hint hint="Slack or Matrix thread permalinks. Press Enter after each one." />
+        </div>
+      </section>
+
+      <section v-if="time" class="settings-group project-time" aria-labelledby="project-time">
+        <div class="project-time-head mb-1">
+          <h3 id="project-time" class="text-title-small">Time tracking</h3>
+          <v-chip v-if="timeDirty" color="warning" variant="outlined" size="small" class="settings-unsaved">Unsaved</v-chip>
+        </div>
+        <p class="text-body-small text-medium-emphasis mb-3">
+          How entries on this project are filed and which handler they are tracked under.
+        </p>
+        <div class="settings-grid">
+          <div class="settings-field">
+            <v-combobox v-model="form.settings.time_project_key" class="time-project-key" label="Project key"
+              :items="keySuggestions" :return-object="false" :placeholder="timeProject?.project_key || ''"
+              persistent-hint :disabled="busy" spellcheck="false"
+              hint="Entries are filed under this key in timesheet.d/. The work repo's project names are suggested. Changing it does not move earlier entries." />
+          </div>
+          <div class="settings-field">
+            <v-select v-model="form.settings.time_handler" class="time-handler" label="Tracking handler"
+              :items="handlerItems" clearable persistent-hint :disabled="busy"
+              hint="Empty tracks under the built-in timesheet handler. Other handlers are defined in the work repo." />
+          </div>
+          <div class="settings-field">
+            <v-text-field v-model.number="form.settings.time_idle_grace_minutes" class="time-idle-grace" type="number"
+              inputmode="numeric" min="1" step="1" label="Idle grace (minutes)" persistent-hint :disabled="busy"
+              hint="How long after the last activity an automatic timer stops. Empty inherits the platform default." />
+          </div>
+        </div>
+        <p v-if="timeProject?.handler_warning" class="time-handler-warning text-body-small mb-3">{{ timeProject.handler_warning }}</p>
+        <div class="settings-field">
+          <v-combobox v-model="form.settings.time_clients" class="time-clients" label="Client labels" multiple chips
+            closable-chips persistent-hint :disabled="busy"
+            hint="The first label is the default for automatic entries. A label typed in the time-tracking bar is added here." />
         </div>
       </section>
 
@@ -265,7 +364,22 @@ async function archive() {
         <p class="text-body-small text-medium-emphasis mb-3">
           Takes the project out of the switcher and the sidebar. It can be restored from Platform settings.
         </p>
-        <v-btn color="warning" :disabled="busy" @click="archive">Archive project</v-btn>
+        <v-btn color="error" variant="tonal" :disabled="busy">Archive project
+          <v-dialog v-model="archiving" activator="parent" max-width="480" :persistent="busy">
+            <v-card class="archive-confirm" :title="`Archive ${project.name}?`">
+              <v-card-text>
+                <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+                Its assistant is stopped and the project leaves the switcher and the sidebar.
+                Restore it from Platform settings to bring it back.
+              </v-card-text>
+              <v-card-actions>
+                <v-spacer />
+                <v-btn variant="tonal" :disabled="busy" @click="archiving = false">Cancel</v-btn>
+                <v-btn color="error" variant="flat" :loading="busy" @click="archive">Archive project</v-btn>
+              </v-card-actions>
+            </v-card>
+          </v-dialog>
+        </v-btn>
       </section>
     </v-card-text>
   </v-card>
@@ -282,6 +396,9 @@ async function archive() {
 }
 .project-color { border: 0; padding: 0; min-width: 0; text-align: center; }
 .project-color-picker { margin-inline: auto; }
-.project-color legend { display: flex; align-items: center; flex-wrap: wrap; padding: 0; }
-.project-actions { position: sticky; top: var(--v-layout-top, 64px); z-index: 1; flex-wrap: wrap; background: rgb(var(--v-theme-surface)); }
+.project-color legend { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; width: 100%; padding: 0; }
+.project-orders { scroll-margin-top: calc(var(--v-layout-top, 64px) + var(--project-actions-height, 0px) + 8px); }
+.project-actions { position: sticky; top: calc(var(--v-layout-top, 64px)); z-index: 1; flex-wrap: wrap; background: rgb(var(--v-theme-surface)); }
+.project-time-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.archive-confirm :deep(.v-card-title) { white-space: normal; overflow-wrap: anywhere; }
 </style>

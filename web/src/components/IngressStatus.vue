@@ -34,27 +34,19 @@ onUnmounted(() => clearInterval(poll))
 </script>
 
 <template>
-  <v-expansion-panels class="mb-3" variant="accordion">
-    <v-expansion-panel>
-      <v-expansion-panel-title>
-        <div>
-          <div>Assistant message ingress</div>
-          <div class="text-caption mt-1">
-            {{ error ? 'Status unavailable' : rows.map(([name, state]) => `${name}: ${states[state.state] || 'Unknown'}`).join(' · ') }}
-          </div>
-        </div>
-      </v-expansion-panel-title>
-      <v-expansion-panel-text>
-        <div v-if="error" role="alert">Could not refresh ingress status: {{ error }}</div>
-        <div v-else-if="!health">Loading ingress status…</div>
-        <div v-for="[name, state] in rows" :key="name" class="mb-2">
-          <strong>{{ name === 'slack' ? 'Slack' : 'Matrix' }}</strong>:
-          {{ error ? 'Unknown (last known status below)' : states[state.state] || 'Unknown' }}
-          <span v-if="error">{{ states[state.state] || 'Unknown' }}</span>
-          <div>Last event: {{ state.last_event_at ? ago(state.last_event_at, props.now) : 'None received' }}</div>
-          <div v-if="state.last_error">Last error: {{ state.last_error }}</div>
-        </div>
-      </v-expansion-panel-text>
-    </v-expansion-panel>
-  </v-expansion-panels>
+  <div class="ingress-status">
+    <p class="text-body-medium mb-2">
+      {{ error ? 'Status unavailable' : rows.map(([name, state]) => `${name}: ${states[state.state] || 'Unknown'}`).join(' · ') }}
+    </p>
+    <div v-if="error" role="alert">Could not refresh ingress status: {{ error }}</div>
+    <div v-else-if="!health">Loading ingress status…</div>
+    <p v-else-if="health.ingress && !rows.length" class="text-medium-emphasis">No chat transports configured.</p>
+    <div v-for="[name, state] in rows" :key="name" class="ingress-row mb-2">
+      <strong>{{ name === 'slack' ? 'Slack' : 'Matrix' }}</strong>:
+      {{ error ? 'Unknown (last known status below)' : states[state.state] || 'Unknown' }}
+      <span v-if="error">{{ states[state.state] || 'Unknown' }}</span>
+      <div>Last event: {{ state.last_event_at ? ago(state.last_event_at, props.now) : 'None received' }}</div>
+      <div v-if="state.last_error">Last error: {{ state.last_error }}</div>
+    </div>
+  </div>
 </template>

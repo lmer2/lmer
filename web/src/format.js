@@ -73,6 +73,7 @@ const SLOT_META = {
   occupied: { label: 'in use', tone: 'idle', icon: 'circle' },
   service_down: { label: 'service not running', tone: 'attention', icon: 'alert' },
   misconfigured: { label: 'misconfigured', tone: 'bad', icon: 'alert-circle' },
+  unknown: { label: 'not checked yet', tone: 'idle', icon: 'help-circle' },
 }
 
 export function stateMeta(state) {
@@ -454,4 +455,12 @@ export function resetsLabel(iso, now = Date.now()) {
   if (seconds <= 0) return null
   const span = duration(seconds)
   return span ? `resets in ${span}` : null
+}
+
+// `#12` for an issue or a GitHub pull, `!7` for a merge request, as the daemon labels them.
+export function issueLabel(url) {
+  const path = (url || '').replace(/[?#].*$/, '').replace(/\/+$/, '')
+  const match = path.match(/\/-\/(issues|work_items|merge_requests)\/(\d+)$/) || path.match(/\/(issues|pull)\/(\d+)$/)
+  if (!match) return url
+  return `${match[1] === 'merge_requests' ? '!' : '#'}${match[2]}`
 }

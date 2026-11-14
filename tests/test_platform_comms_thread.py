@@ -117,7 +117,7 @@ class TestFilesOnARead:
             "files": [{"name": "shot.png", "mimetype": "image/png", "url_private": "https://files.slack/x"}],
         }])
         monkeypatch.setattr(thread_access, "_slack_client", lambda token: client)
-        monkeypatch.setattr(thread_access, "fetch_slack_file", lambda url, token, max_bytes: self.PNG)
+        monkeypatch.setattr(thread_access, "fetch_slack_file", lambda url, token, **kw: self.PNG)
         return client
 
     @pytest.fixture

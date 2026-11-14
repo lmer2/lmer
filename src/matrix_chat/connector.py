@@ -17,9 +17,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import requests
+
 from ask_channel import bus
 from lmer_cli import thread_access, thread_posts
-from lmer_cli.comms import off_thread
+from lmer_cli.comms import MAX_REF_CHARS, off_thread
 from lmer_cli.connector_delivery import RecoveryRequired
 from lmer_cli.connector_lifecycle import PLATFORM_SESSION_ENV, ConnectorLifecycle
 from lmer_cli.connector_ownership import ThreadKey
@@ -34,7 +36,7 @@ from slack_chat.connector import (
 
 from .client import MatrixAccount, MatrixClient, MatrixError
 from .crypto import BRIDGE_URL_ENV, NO_SESSION, CryptoError, encrypted_room_refusal
-from .permalink import matrix_to_link, parse_matrix_permalink
+from .permalink import matrix_to_link, parse_matrix_permalink, thread_ref
 from lmer_cli.assistant_mentions import route_connected_mention
 
 logger = logging.getLogger(__name__)
@@ -663,7 +665,7 @@ class MatrixConnector(ConnectorLifecycle):
         posted = post_replay_notice(
             self.bus, channel=CHANNEL, label=self.thread_label,
             permalink=matrix_to_link(self.room_id, self.config.thread_event),
-            count=len(events), oldest=stamp(events[0]), newest=stamp(events[-1]), ref=newest,
+            count=len(events), oldest=stamp(events[0]), newest=stamp(events[-1]), ref=self._ref(newest),
         )
         if posted:
             with self._state.lock:
@@ -676,9 +678,9 @@ class MatrixConnector(ConnectorLifecycle):
         content = event.get("content") if isinstance(event.get("content"), dict) else {}
         msgtype = content.get("msgtype")
         if msgtype in _MEDIA_TYPES:
-            staged = self._stage_media(content)
+            staged, reason = self._stage_media(content)
             if staged is None:
-                return f"[{msgtype} {content.get('body') or 'attachment'} — not stored]", []
+                return f"[{msgtype} {content.get('body') or 'attachment'} — not stored: {reason}]", []
             return "", [staged]
         return strip_reply_fallback(str(content.get("body") or "")).strip(), []
 
@@ -725,7 +727,9 @@ class MatrixConnector(ConnectorLifecycle):
                 return None
             if not event_id:
                 raise ValueError("Matrix input has no event identity")
-            source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": event_id}
+            source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": self._ref(event_id)}
+            if human:
+                source["author_id"] = event.get("sender")
             kind, in_reply_to = "message", None
             states = [state for state in self.bus.questions() if not off_thread(state["question"])]
             related = next((state["question"] for state in states
@@ -745,6 +749,7 @@ class MatrixConnector(ConnectorLifecycle):
             return {"question": question["id"] if question else None,
                     "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "meta": thread_posts.relay_meta(poster, human),
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         posted = bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
         if refused:
@@ -777,6 +782,16 @@ class MatrixConnector(ConnectorLifecycle):
         except Exception as error:
             logger.warning("matrix_connector_operator_notice_failed error=%s", error)
 
+    def _ref(self, event_id: str) -> str:
+        """The ``source.ref`` of one of this thread's events. It names the
+        thread, so the platform finds it in every session's bindings; an id
+        too long to carry its tag, or one read before the room resolved, goes
+        bare."""
+        if self.room_id is None:
+            return event_id
+        ref = thread_ref(self.room_id, self.config.thread_event, event_id)
+        return ref if len(ref) <= MAX_REF_CHARS else event_id
+
     def _accept_inbound(self, ref):
         self._seen.add(ref)
         self._last_event_id = ref
@@ -801,8 +816,9 @@ class MatrixConnector(ConnectorLifecycle):
         qid = question.get("id")
         return bool(qid and qid not in self._answered_freely)
 
-    def _stage_media(self, content: dict) -> Optional[dict]:
-        """Copy one inbound media event into the session's upload store.
+    def _stage_media(self, content: dict) -> tuple:
+        """``(staged, None)`` for one inbound media event copied into the
+        session's upload store, or ``(None, why it was not)``.
 
         Through the shared bounded helpers, for the reasons recorded on #416: the
         file is posted by whoever is in the room, so its size is not a question
@@ -815,29 +831,34 @@ class MatrixConnector(ConnectorLifecycle):
         store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
         encrypted = isinstance(content.get("file"), dict)
         mxc = content["file"].get("url") if encrypted else content.get("url")
-        if store is None or not isinstance(mxc, str):
-            return None
+        if store is None:
+            return None, thread_access.NO_STORE
+        if not isinstance(mxc, str):
+            return None, thread_access.NOT_FETCHED_NO_URL
         if encrypted and not self.matrix.can_encrypt:
-            return None
+            return None, f"{thread_access.NOT_FETCHED}: it is encrypted and no lmer-matrix-bridge can decrypt it"
         name = str(content.get("filename") or content.get("body") or "file")
         info = content.get("info") if isinstance(content.get("info"), dict) else {}
         declared = info.get("size")
         if isinstance(declared, int) and not isinstance(declared, bool) and declared > thread_access.MAX_FILE_BYTES:
             # What the event claims, before asking for the bytes.
             logger.info("matrix_connector_file_too_large name=%s bytes=%s", name, declared)
-            return None
+            return None, thread_access.NOT_FETCHED_TOO_LARGE
         try:
             if encrypted:
                 data, media_type = self.matrix.download_content(content, max_bytes=thread_access.MAX_FILE_BYTES)
             else:
                 data, media_type = self.matrix.download(mxc, max_bytes=thread_access.MAX_FILE_BYTES)
-        except MatrixError as exc:
+        except (MatrixError, requests.RequestException) as exc:
             logger.warning("matrix_connector_download_failed mxc=%s error=%s", mxc, exc)
-            return None
+            return None, thread_access.matrix_fetch_reason(exc)
         if data is None:
             logger.info("matrix_connector_file_too_large name=%s bytes=over %s", name, thread_access.MAX_FILE_BYTES)
-            return None
-        return thread_access.stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+            return None, thread_access.NOT_FETCHED_TOO_LARGE
+        staged = thread_access.stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+        if staged is None:
+            return None, thread_access.NOT_WRITTEN
+        return staged, None
 
     def _prepare(self):
         if self.room_id is None:

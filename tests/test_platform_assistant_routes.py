@@ -1756,14 +1756,16 @@ def test_an_unusable_stored_dock_retention_reads_as_unset(platform_root, caplog)
     assert "platform_dock_keep_last_notes_invalid" in caplog.text
 
 
-# The pane's display toggles: the transcript toggle (issue #488) and the
-# operator bubble tint (issue #646). Booleans in the ``chat`` group, stored
+# The pane's display toggles: the transcript toggle (issue #488), the
+# operator bubble tint (issue #646) and long-message scrolling. Booleans in the ``chat`` group, stored
 # platform-side so they survive browsers, applied on the pane's next config
 # refresh rather than at a rotate.
 
 CHAT_TOGGLES = pytest.mark.parametrize("key, field, default", [
     ("chat_show_transcript", "show_transcript", False),
     ("chat_tint_operator", "tint_operator", True),
+    ("chat_enter_sends", "enter_sends", True),
+    ("chat_scroll_long_messages", "scroll_long_messages", False),
 ])
 
 

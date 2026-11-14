@@ -11,6 +11,14 @@ detached container does. Set ``FAKE_RUNTIME_NO_LOGS=1`` to make ``logs`` fail.
 ``FAKE_RUNTIME_DEADLINE`` (seconds) bounds every wait a verb makes: past it the
 verb exits 124, so a container that never runs fails its test instead of
 stalling the gate (#636).
+
+Removal, as podman does it on a slow disk: ``rm`` first marks the container
+``removing``, then deletes it. ``FAKE_RUNTIME_RM_DELAY`` (seconds) is how long
+the delete takes; a client killed meanwhile leaves the container ``removing``.
+``FAKE_RUNTIME_RM_FAIL`` names a counter file: while it holds a number above
+zero, ``rm`` decrements it and fails with 125. A container whose directory holds
+``removing`` and ``storage-gone`` is podman's half-removed one: listed, but
+``inspect`` and ``stop`` fail with 125 and only ``rm --force`` clears it.
 """
 
 import json
@@ -103,11 +111,24 @@ def running(cid):
     return (box(cid) / "pid").exists() and not (box(cid) / "exit").exists()
 
 
+def removing(cid):
+    return (box(cid) / "removing").exists()
+
+
+def status(cid):
+    if removing(cid):
+        return "removing"
+    return "running" if running(cid) else "exited" if (box(cid) / "exit").exists() else "created"
+
+
 def stream(cid, offset):
     """Copy the container's output from *offset* until it has exited and all is read."""
     out = box(cid) / "out.log"
     while True:
         done = (box(cid) / "exit").exists()
+        if removing(cid):
+            print(f"Error: container {cid} was removed", file=sys.stderr)
+            return 1
         try:
             with out.open("rb") as handle:
                 handle.seek(offset)
@@ -204,8 +225,8 @@ def wait(args):
     if not box(cid).exists():
         print(f"Error: no such container: {cid}", file=sys.stderr)
         return 1
-    while not (box(cid) / "exit").exists():
-        if not box(cid).exists():
+    while not (box(cid) / "exit").exists() or removing(cid):
+        if not box(cid).exists() or removing(cid):
             # Removed while waited on: `rm` leaves no exit code behind.
             print(f"Error: no such container: {cid}", file=sys.stderr)
             return 1
@@ -225,14 +246,15 @@ def inspect(args):
         cid = args[-1]
         if not box(cid).exists():
             return 1
-        exited = (box(cid) / "exit").exists()
-        status = "running" if running(cid) else "exited" if exited else "created"
+        if (box(cid) / "storage-gone").exists():
+            print(_not_known(cid), file=sys.stderr)
+            return 125
         if "Labels" in args[1]:
             key = args[1].split('"')[1]
             labels = json.loads((box(cid) / "config.json").read_text())["labels"]
             print(labels.get(key, "<no value>"))
         elif "Status" in args[1]:
-            print(status)
+            print(status(cid))
         elif args[1] == "{{.Id}}":
             print(box(cid).name)
         else:
@@ -243,6 +265,9 @@ def inspect(args):
         if not box(cid).exists():
             print(f"Error: no such object: {cid}", file=sys.stderr)
             return 1
+        if (box(cid) / "storage-gone").exists():
+            print(_not_known(cid), file=sys.stderr)
+            return 125
         config = json.loads((box(cid) / "config.json").read_text())
         exited = (box(cid) / "exit").exists()
         records.append({
@@ -252,7 +277,7 @@ def inspect(args):
             + config.get("name", ""),
             "Config": {"Labels": config["labels"]},
             "State": {
-                "Status": "running" if running(cid) else "exited" if exited else "created",
+                "Status": status(cid),
                 "Running": running(cid),
                 "ExitCode": int((box(cid) / "exit").read_text()) if exited else 0,
                 "FinishedAt": (box(cid) / "finished").read_text() if exited else None,
@@ -267,8 +292,11 @@ def ps(args):
     filters = values.get("--filter", [])
     wanted = [f.split("=", 1)[1] for f in filters if f.startswith("label=")]
     ids = [f.split("=", 1)[1] for f in filters if f.startswith("id=")]
+    statuses = [f.split("=", 1)[1] for f in filters if f.startswith("status=")]
     for path in sorted(STATE.iterdir()) if STATE.exists() else []:
         if ids and path.name not in ids:
+            continue
+        if statuses and status(path.name) not in statuses:
             continue
         try:
             labels = json.loads((path / "config.json").read_text())["labels"]
@@ -285,6 +313,9 @@ def ps(args):
 def stop(args):
     """TERM, then KILL once the container's stop timeout runs out."""
     cid = args[-1]
+    if removing(cid):
+        print(_improper(cid), file=sys.stderr)
+        return 125
     if not running(cid):
         return 0
     pid = int((box(cid) / "pid").read_text())
@@ -309,10 +340,43 @@ def kill(args):
     return 0
 
 
+def _not_known(cid):
+    return f'Error: getting container from store "{cid}": container not known'
+
+
+def _improper(cid):
+    return (f"Error: container {cid} is running or paused, refusing to clean up: "
+            "container state improper")
+
+
+def _fail_rm():
+    counter = os.environ.get("FAKE_RUNTIME_RM_FAIL")
+    if not counter:
+        return False
+    path = Path(counter)
+    try:
+        left = int(path.read_text() or "0")
+    except (OSError, ValueError):
+        return False
+    if left <= 0:
+        return False
+    publish(path, str(left - 1))
+    return True
+
+
 def rm(args):
     cid = args[-1]
     if not box(cid).exists():
         return 0
+    if _fail_rm():
+        print(f"Error: removing container {cid}: device or resource busy", file=sys.stderr)
+        return 125
+    delay = float(os.environ.get("FAKE_RUNTIME_RM_DELAY") or 0)
+    if delay:
+        if running(cid):
+            os.kill(int((box(cid) / "pid").read_text()), signal.SIGKILL)
+        (box(cid) / "removing").touch()
+        time.sleep(delay)
     was_running = running(cid)
     # Gone at once, as a real removal is: a concurrent `wait` must not read an
     # exit code the kill below produces.

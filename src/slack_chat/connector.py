@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import html
 import logging
+import math
 import os
 import re
 import signal
@@ -44,7 +45,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ConnectorConfig", "SlackConnector", "render_outbound", "option_for",
     "post_replay_notice", "replay_stamp", "attachment_notice", "detach_notice",
-    "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "SUBSCRIBER", "CHANNEL", "main",
+    "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "DEFAULT_IDLE_POLL_SECONDS",
+    "IDLE_POLL_SECONDS_ENV", "IDLE_AFTER_SECONDS", "MAX_POLL_SECONDS", "poll_intervals", "SUBSCRIBER", "CHANNEL", "main",
     "ATTACH_ACK", "DETACH_NOTE", "ATTACH_ACK_ENV", "ATTACH_FROM_NOW_ENV",
     "ATTACH_SINCE_ENV",
 ]
@@ -54,6 +56,36 @@ SUBSCRIBER = "slack"
 
 POLL_SECONDS_ENV = "LMER_SLACK_POLL_SECONDS"
 DEFAULT_POLL_SECONDS = 3.0
+#: The slowest a quiet thread is polled. At or below the poll interval, polling
+#: never slows.
+IDLE_POLL_SECONDS_ENV = "LMER_SLACK_IDLE_POLL_SECONDS"
+DEFAULT_IDLE_POLL_SECONDS = 30.0
+#: How long a thread has to be quiet before its polling starts to slow.
+IDLE_AFTER_SECONDS = 120.0
+#: The longest either interval may be set to, so a quiet thread is still read.
+MAX_POLL_SECONDS = 300.0
+
+
+def poll_intervals(environ: Mapping[str, str]) -> tuple:
+    """``(poll, idle)``: a thread's polling interval while active, and its slowest.
+
+    Every connector on a bot token spends one ``conversations.replies`` budget
+    (docs/COMMS.md, "The conversations.replies budget"), so the daemon quotes
+    these when a check is refused for a rate limit.
+    """
+    def seconds(name, default):
+        raw = (environ.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        return min(MAX_POLL_SECONDS, max(1.0, value)) if math.isfinite(value) else default
+
+    return seconds(POLL_SECONDS_ENV, DEFAULT_POLL_SECONDS), seconds(
+        IDLE_POLL_SECONDS_ENV, DEFAULT_IDLE_POLL_SECONDS,
+    )
 
 #: Enable attachment and matching detach notices. Listener-owned threads disable
 #: these because the listener announces their lifecycle.
@@ -71,6 +103,16 @@ ATTACH_SINCE_ENV = "LMER_CHAT_ATTACH_SINCE"
 #: two transports cannot drift.
 ATTACH_ACK = "🔗 lmer is listening in this thread."
 DETACH_NOTE = "🔌 lmer has stopped listening in this thread."
+#: Said in the thread, by the connector or by the listener that spawned it, when
+#: the app cannot download files. Plain on purpose: a thread may be read by
+#: people outside the team, and the per-file line the session gets names the scope.
+FILES_UNREADABLE_NOTE = "Files posted here will not reach the session."
+
+
+def files_unreadable(scopes: Optional[Iterable[str]]) -> bool:
+    """Whether the scopes ``auth.test`` reported lack the one a file download
+    needs. ``None`` — scopes not known — says nothing either way."""
+    return scopes is not None and thread_access.SLACK_FILES_READ not in scopes
 
 
 def _as_speaker(line: str, speaker: Optional[str], slack_markup: bool) -> str:
@@ -117,6 +159,8 @@ class ConnectorConfig:
     thread_ts: str
     bot_token: str = field(repr=False)
     poll_seconds: float = DEFAULT_POLL_SECONDS
+    #: See :data:`IDLE_POLL_SECONDS_ENV`.
+    idle_poll_seconds: float = DEFAULT_IDLE_POLL_SECONDS
     #: See :data:`ATTACH_ACK_ENV`.
     attach_ack: bool = True
     #: See :data:`ATTACH_FROM_NOW_ENV`.
@@ -164,17 +208,11 @@ class ConnectorConfig:
         bot_token = (environ.get("SLACK_BOT_TOKEN") or "").strip()
         if not bot_token:
             raise ValueError("SLACK_BOT_TOKEN is required to run the Slack connector")
-        raw = (environ.get(POLL_SECONDS_ENV) or "").strip()
-        poll = DEFAULT_POLL_SECONDS
-        if raw:
-            try:
-                poll = max(1.0, float(raw))
-            except ValueError:
-                poll = DEFAULT_POLL_SECONDS
+        poll, idle_poll = poll_intervals(environ)
         return cls(
             supervisor_url=supervisor_url, supervisor_token=supervisor_token,
             channel=channel, thread_ts=thread_ts, bot_token=bot_token,
-            poll_seconds=poll, uploads_dir=uploads_dir,
+            poll_seconds=poll, idle_poll_seconds=idle_poll, uploads_dir=uploads_dir,
             container_uploads_dir=container_uploads_dir,
             connect_budget=bus.connect_budget(environ),
             attach_ack=(
@@ -340,11 +378,13 @@ def _epoch(ts: object) -> Optional[float]:
         return None
 
 
-def _with_references(text: str, staged: Iterable[Mapping]) -> str:
-    """*text* with each staged file's ``[lmer upload]`` reference after it."""
-    for item in staged:
-        reference = item["reference"]
-        text = f"{text}\n\n{reference}" if text else reference
+def _with_references(text: str, staged: Iterable[Mapping], unstaged: Iterable[Mapping] = ()) -> str:
+    """*text* with each staged file's ``[lmer upload]`` reference after it, then
+    a line for each file that did not become one, saying why."""
+    lines = [item["reference"] for item in staged]
+    lines += [thread_access.attachment_line(item) for item in unstaged]
+    for line in lines:
+        text = f"{text}\n\n{line}" if text else line
     return text.strip()
 
 
@@ -424,6 +464,8 @@ class SlackConnector(ConnectorLifecycle):
         self._names: dict = {}
         self._bot_user_id: Optional[str] = None
         self._cursor_ts: Optional[str] = None
+        self._last_activity = clock()
+        self._poll_interval = config.poll_seconds
         self._bus_cursor = 0
         self._launch_settings: Optional[dict] = None
         #: questions whose one free-text chance has been used (`_first_since`)
@@ -482,7 +524,16 @@ class SlackConnector(ConnectorLifecycle):
     # -- inbound: Slack → bus --------------------------------------------------
 
     def _inbound_loop(self):
-        self._loop("inbound", self._inbound_once, interval=self.config.poll_seconds)
+        self._loop("inbound", self._inbound_once, interval=self._inbound_interval)
+
+    def _inbound_interval(self) -> float:
+        """The wait before the next poll: doubling while the thread is quiet."""
+        active, idle = self.config.poll_seconds, self.config.idle_poll_seconds
+        if idle <= active or self._clock() - self._last_activity < IDLE_AFTER_SECONDS:
+            self._poll_interval = active
+        else:
+            self._poll_interval = min(idle, self._poll_interval * 2)
+        return self._poll_interval
 
     @property
     def thread_label(self) -> str:
@@ -492,8 +543,7 @@ class SlackConnector(ConnectorLifecycle):
     def _poll_thread(self, *, replay=False):
         self._ensure_ready()
         resumed = self._resume_pending_inbound()
-        if self._bot_user_id is None:
-            self._bot_user_id = self.slack.auth_test()
+        self._identify()
         messages = self.slack.get_replies(self.config.channel, self.config.thread_ts,
                                          oldest=None if replay else self._cursor_ts)
         try:
@@ -555,11 +605,10 @@ class SlackConnector(ConnectorLifecycle):
         )
 
     def _inbound_body(self, message: dict) -> tuple:
-        """One message's own text, and the files it brought into the store."""
-        return (
-            str(message.get("text") or "").strip(),
-            self._stage_files(message.get("files") or []),
-        )
+        """One message's own text, the files it brought into the store, and
+        the ones it could not, each with the reason."""
+        staged, unstaged = self._stage_files(message.get("files") or [])
+        return str(message.get("text") or "").strip(), staged, unstaged
 
     def _is_human(self, message: dict) -> bool:
         return bool(
@@ -575,7 +624,12 @@ class SlackConnector(ConnectorLifecycle):
         return self._display_name(message.get("user"))
 
     def _mirrored(self, ts: object) -> None:
-        """Identify our own echoes and attribute live posts for other runs."""
+        """Identify our own echoes and attribute live posts for other runs.
+
+        A post is activity: the run that just spoke is the likeliest to be
+        answered, so the next poll is a fast one again."""
+        self._last_activity = self._clock()
+        self._poll_interval = self.config.poll_seconds
         self._posters.wrote(ts)
         poster = thread_posts.Poster.for_session(self._posters.session)
         if poster is not None and isinstance(ts, str) and ts:
@@ -600,24 +654,29 @@ class SlackConnector(ConnectorLifecycle):
                     self._state.save()
                 return {}
         def prepare():
-            body, attachments = self._inbound_body(message)
-            text = _with_references(body, attachments)
+            body, attachments, unstaged = self._inbound_body(message)
+            text = _with_references(body, attachments, unstaged)
             if not text:
                 return None
             if not ts:
                 raise ValueError("Slack input has no source timestamp")
+            human = poster is None and self._is_human(message)
             source = {"channel": CHANNEL, "author": self._author(message, poster),
                       "ref": f"{self.config.channel}:{self.config.thread_ts}:{ts}"}
+            if human:
+                source["author_id"] = message.get("user")
             kind, in_reply_to = "message", None
             oldest = self._oldest_open_question()
             if oldest is not None:
                 bound = answer_binding(text, oldest, first_since_question=self._first_since(oldest),
-                                       refuse_operator_only=poster is not None or not self._is_human(message))
+                                       refuse_operator_only=not human)
                 if bound is not None:
                     kind, in_reply_to, text = "answer", oldest.get("id"), bound
+            human = poster is None and self._is_human(message)
             return {"question": oldest.get("id") if oldest else None,
-                    "human_receipt": poster is None and self._is_human(message),
+                    "human_receipt": human,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "meta": thread_posts.relay_meta(poster, human),
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         return self._post_prepared(ts, prepare, lambda: self._accept_inbound(ts)) or {}
 
@@ -640,42 +699,59 @@ class SlackConnector(ConnectorLifecycle):
     def _display_name(self, user_id: Optional[str]) -> Optional[str]:
         return slack_display_name(self.slack, user_id, self._names)
 
-    def _stage_files(self, files: list) -> list:
-        """Copy a message's files into the session's upload store, if it has one.
+    def _stage_files(self, files: list) -> tuple:
+        """``(staged, unstaged)``: a message's files copied into the session's
+        upload store, and the ones that were not, each described with the reason.
 
         The fetch is the same bounded one the read path uses
-        (:func:`lmer_cli.thread_access.fetch_slack_file`): the same Slack file
+        (:func:`lmer_cli.thread_access.stage_slack_file`): the same Slack file
         was accepted through a connected thread and refused through
         ``lmer-signal read``, which is not a distinction anything intends — and
         the unbounded side was this one.
         """
         store = thread_access.UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
-        if store is None or not files:
-            return []
-        staged = []
+        staged, unstaged = [], []
         for item in files:
             if not isinstance(item, dict):
                 continue
-            url = item.get("url_private_download") or item.get("url_private")
-            name = item.get("name") or item.get("title") or "file"
-            if not url:
-                continue
-            data = thread_access.fetch_slack_file(url, self.config.bot_token)
-            if data is None:
-                logger.warning("slack_connector_file_failed name=%s", name)
-                continue
-            record = thread_access.stage_upload(
-                store, name, data, item.get("mimetype") or "application/octet-stream",
-            )
-            if record is not None:
+            if store is None:
+                record = {**thread_access.describe_slack_file(item), "reason": thread_access.NO_STORE}
+            else:
+                # Tried even when the scopes say it cannot work: they are read
+                # once, and a scope granted since then must not stay refused.
+                record, _cost = thread_access.stage_slack_file(item, self.config.bot_token, store)
+                answered = record.get("reason", "").startswith(thread_access.NOT_FETCHED_SLACK_ANSWERED)
+                if answered and self._files_unreadable():
+                    record = {**record, "reason": thread_access.NOT_FETCHED_SLACK_SCOPE}
+            if record.get("reference"):
                 staged.append(record)
-        return staged
+            else:
+                logger.warning("slack_connector_file_failed name=%s reason=%s", record["name"], record["reason"])
+                unstaged.append(record)
+        return staged, unstaged
+
+    def _files_unreadable(self) -> bool:
+        return files_unreadable(getattr(self.slack, "granted_scopes", None))
+
+    def _identify(self) -> None:
+        if self._bot_user_id is None:
+            self._bot_user_id = self.slack.auth_test()
+            if self._files_unreadable():
+                logger.warning("slack_connector_scope_missing scope=%s", thread_access.SLACK_FILES_READ)
 
     def _prepare(self):
         self._acquire(ThreadKey(CHANNEL, self.config.channel, self.config.thread_ts))
 
     def _attachment_notice(self):
-        return attachment_notice(self._launch_settings, speaker=self._speaker_label())
+        notice = attachment_notice(self._launch_settings, speaker=self._speaker_label())
+        try:
+            self._identify()
+        except Exception as exc:
+            # The first poll asks again; the notice goes out either way.
+            logger.warning("slack_connector_identify_failed error=%s", exc)
+        if self._files_unreadable():
+            notice += f" {FILES_UNREADABLE_NOTE}"
+        return notice
 
     def _detach_notice(self):
         return detach_notice(self._speaker_label())
@@ -803,7 +879,13 @@ class SlackConnector(ConnectorLifecycle):
         self.slack.add_reaction(self.config.channel, ref, "inbox_tray")
 
     def _inbound_once(self):
+        # Any new message counts, this connector's own posts included: a run
+        # that has just said something is the likeliest to be answered, and
+        # its post is seen by this poll at the latest.
+        before = self._cursor_ts
         self._poll_thread(replay=not self._replayed)
+        if self._cursor_ts != before:
+            self._last_activity = self._clock()
         with self._state.lock:
             self._replayed = True
             self._state.save()

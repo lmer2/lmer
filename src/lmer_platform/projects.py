@@ -13,18 +13,28 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 
 from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS
+from lmer_timesheet import is_project_key, is_slug
 
 from . import project_context as scope, registry, store
-from . import assistant_history, runs
+from . import assistant_history, load, runs
 
 logger = logging.getLogger(__name__)
 GENERAL = scope.GENERAL
+#: Per-project time tracking (issue #604): the project's stable key (D15), its
+#: handler (D19), its client labels (D12) and its idle grace (D1).
+PROJECT_TIME_SETTING_KEYS = ("time_project_key", "time_handler", "time_clients", "time_idle_grace_minutes")
 #: Project settings that are not assistant launch settings: they never reach an
-#: assistant start (issue #594, :mod:`lmer_platform.authority`).
-WORKER_SETTING_KEYS = ("supervisor_authority",)
+#: assistant start (issue #594, :mod:`lmer_platform.authority`; issue #604).
+WORKER_SETTING_KEYS = ("supervisor_authority", *PROJECT_TIME_SETTING_KEYS)
+MAX_PROJECT_KEY_CHARS = 64
+MAX_CLIENT_LABEL_CHARS = 32
+MAX_CLIENT_LABELS = 50
+#: What a project whose name has no ASCII letter or digit is keyed as.
+FALLBACK_PROJECT_KEY = "project"
 COLORS = (
     "Red", "Orange", "Amber", "Yellow", "Lime", "Green", "Emerald", "Teal",
     "Cyan", "Sky blue", "Blue", "Indigo", "Violet", "Purple", "Magenta",
@@ -53,13 +63,52 @@ def path():
     return store.platform_dir() / "projects.sqlite3"
 
 
+#: path -> stat signature of the file last verified as migrated (see enabled()).
+_MIGRATED: dict = {}
+
+
+def _signature(file):
+    try:
+        status = os.stat(file)
+    except FileNotFoundError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+
+
 def enabled():
-    if not path().is_file():
+    """Whether this host runs in projects mode: the database exists and is migrated.
+
+    Called on nearly every projects code path, hundreds of times per fleet read,
+    so a *positive* answer is remembered against the file's stat signature and
+    re-verified whenever the file changes (#561). Any write — sqlite's own, or a
+    file copied over this one — moves the size or mtime, so a replaced file is
+    asked again. A negative answer is never remembered: migration can happen at
+    any time, and nothing ever removes the ``migrated`` row once written.
+
+    The check itself opens a normal connection with ``query_only`` instead of
+    ``mode=ro``, which could not roll back a hot journal, and it never builds
+    the schema: asking must not change the file.
+    """
+    file = path()
+    signature = _signature(file)
+    if signature is None:
         return False
-    with closing(sqlite3.connect(path().absolute().as_uri() + "?mode=ro", uri=True, timeout=30)) as db:
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='metadata'").fetchone():
-            return False
-        return bool(db.execute("SELECT 1 FROM metadata WHERE key='migrated'").fetchone())
+    key = str(file)
+    if _MIGRATED.get(key) == signature:
+        return True
+    with closing(sqlite3.connect(file, timeout=30)) as db:
+        db.execute("PRAGMA query_only = ON")
+        migrated = bool(
+            db.execute("SELECT 1 FROM sqlite_master WHERE name='metadata'").fetchone()
+            and db.execute("SELECT 1 FROM metadata WHERE key='migrated'").fetchone()
+        )
+    if migrated:
+        # The signature from before the read: if the file changed meanwhile,
+        # the next call sees a different one and verifies again.
+        _MIGRATED[key] = signature
+    else:
+        _MIGRATED.pop(key, None)
+    return migrated
 
 
 def serialized(function):
@@ -157,15 +206,19 @@ def operation(*, force=False):
                 os.close(fd)
 
 
-@contextmanager
-def database():
-    store.ensure_state_dir(path().parent)
-    fd = os.open(path(), os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(fd)
-    with closing(sqlite3.connect(path(), timeout=30)) as db, db:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys = ON")
-        db.executescript("""
+def operation_held() -> bool:
+    """Whether this thread is inside :func:`operation`, so leaving one ``with`` releases nothing."""
+    return getattr(_LOCAL, "depth", 0) > 0
+
+
+#: The schema :func:`_ensure_schema` builds, as recorded in ``PRAGMA
+#: user_version``. **Bump it whenever** :data:`_SCHEMA` **or the column checks
+#: change**: a connection runs the setup only when the file's number differs
+#: (#561), so a new table behind an unbumped number never reaches an existing
+#: file. Older code ignores the field and runs its own setup every time.
+PROJECTS_SCHEMA = 1
+
+_SCHEMA = """
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT UNIQUE NOT NULL,
                 color TEXT NOT NULL, settings TEXT NOT NULL DEFAULT '{}',
@@ -222,12 +275,107 @@ def database():
                 project_id TEXT NOT NULL REFERENCES projects(id), label TEXT NOT NULL,
                 PRIMARY KEY(transport, conversation)
             );
-        """)
-        if "run_key" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
-            db.execute("ALTER TABLE sessions ADD COLUMN run_key TEXT")
-        if "launch" not in {row[1] for row in db.execute("PRAGMA table_info(homes)")}:
-            db.execute("ALTER TABLE homes ADD COLUMN launch TEXT")
+"""
+
+#: Directories this process has already tightened (see :func:`_prepare`).
+_PREPARED: set = set()
+
+
+def _prepare(file):
+    """Create *file* owner-only before sqlite would, and tighten its directory once.
+
+    Once per process per directory rather than per call: the per-call version
+    was a stat walk and an ``open`` on every one of the hundreds of database
+    calls a fleet read made (#561), and a directory tightened at this process's
+    first touch stays as it was left.
+    """
+    directory = str(file.parent)
+    if directory not in _PREPARED:
+        store.ensure_state_dir(file.parent)
+        _PREPARED.add(directory)
+    if not file.exists():
+        store.ensure_state_dir(file.parent)
+        os.close(os.open(file, os.O_CREAT | os.O_WRONLY, 0o600))
+
+
+def _ensure_schema(db):
+    """Build the schema unless the file already records this one.
+
+    Decided by the database's own ``user_version``, never by the file's inode:
+    a file restored or truncated in place keeps its inode and loses its tables,
+    and it heals on its next connection here. The check and the build share one
+    ``BEGIN IMMEDIATE`` so two first connections cannot both add a column.
+    """
+    if db.execute("PRAGMA user_version").fetchone()[0] == PROJECTS_SCHEMA:
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("PRAGMA user_version").fetchone()[0] != PROJECTS_SCHEMA:
+            _build_schema(db)
+            db.execute(f"PRAGMA user_version = {PROJECTS_SCHEMA}")
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def _build_schema(db):
+    """The tables and column checks :data:`PROJECTS_SCHEMA` numbers."""
+    for statement in _SCHEMA.split(";"):
+        if statement.strip():
+            db.execute(statement)
+    if "run_key" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+        db.execute("ALTER TABLE sessions ADD COLUMN run_key TEXT")
+    if "launch" not in {row[1] for row in db.execute("PRAGMA table_info(homes)")}:
+        db.execute("ALTER TABLE homes ADD COLUMN launch TEXT")
+
+
+def _connect():
+    file = path()
+    _prepare(file)
+    db = sqlite3.connect(file, timeout=30)
+    try:
+        db.row_factory = sqlite3.Row
+        _ensure_schema(db)
+        db.execute("PRAGMA foreign_keys = ON")
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+@contextmanager
+def database():
+    """A write transaction: ``BEGIN IMMEDIATE``, committed when the block ends.
+
+    For writers, and for readers that must not see the row change before they
+    write. A pure read uses :func:`reader`, which takes no write lock.
+    """
+    with closing(_connect()) as db, db:
+        # Timed for /api/health (#561): the wait here is every other thread's
+        # transaction, and it was invisible until strace measured it.
+        waiting = time.monotonic()
         db.execute("BEGIN IMMEDIATE")
+        load.DB_WRITE_WAIT.record(time.monotonic() - waiting)
+        yield db
+
+
+@contextmanager
+def reader():
+    """A read-only connection that takes no write lock (#561).
+
+    Every :func:`database` call begins ``BEGIN IMMEDIATE``, so a plain lookup
+    used to queue behind every writer in every thread and sleep in sqlite's busy
+    handler — on the event loop, when the lookup was the request binding. Here
+    each statement is its own read transaction holding only a SHARED lock.
+
+    Deliberately a read-write connection with ``query_only`` rather than
+    ``mode=ro``: a read-only open cannot roll back the hot journal a writer that
+    died mid-transaction leaves, and every read would fail until some writer
+    opened the file. ``query_only`` still refuses an accidental write.
+    """
+    with closing(_connect()) as db:
+        db.execute("PRAGMA query_only = ON")
         yield db
 
 
@@ -298,7 +446,7 @@ def _decode(row):
 def get(workspace_id, *, active=False):
     if not workspace_id:
         raise ProjectError("Choose a project before starting new work.", code="project_required")
-    with database() as db:
+    with reader() as db:
         row = _decode(db.execute("SELECT * FROM projects WHERE id=?", (workspace_id,)).fetchone())
     if row is None:
         raise ProjectError("This project does not exist.", code="project_not_found", status=404)
@@ -310,7 +458,7 @@ def get(workspace_id, *, active=False):
 def listing(*, archived=True):
     if not enabled():
         return []
-    with database() as db:
+    with reader() as db:
         return [_decode(row) for row in db.execute(
             "SELECT * FROM projects" + ("" if archived else " WHERE archived=0") + " ORDER BY name_key"
         )]
@@ -366,10 +514,13 @@ def update(workspace_id, values):
     settings = values.get("settings", current["settings"])
     if not isinstance(settings, dict) or set(settings) - set(ASSISTANT_SETTING_KEYS) - set(WORKER_SETTING_KEYS):
         raise ProjectError("Invalid assistant overrides.")
+    settings = dict(settings)
     for key, value in settings.items():
         if value is None:
             continue
-        if key == "supervisor_authority":
+        if key in PROJECT_TIME_SETTING_KEYS:
+            settings[key] = _time_setting(key, value)
+        elif key == "supervisor_authority":
             if value not in SUPERVISOR_AUTHORITY_LEVELS:
                 raise ProjectError(
                     f"supervisor_authority must be one of {', '.join(SUPERVISOR_AUTHORITY_LEVELS)}."
@@ -380,11 +531,157 @@ def update(workspace_id, values):
     if not isinstance(repositories, list) or any(not isinstance(item, str) or not item.strip() for item in repositories):
         raise ProjectError("Repositories must be a list of repository URLs.")
     with operation(), database() as db:
+        _keep_project_key(db, workspace_id, settings)
         try:
             db.execute("UPDATE projects SET name=?,name_key=?,color=?,settings=?,repositories=? WHERE id=?",
                        (name, name.casefold(), color, json.dumps(settings), json.dumps(repositories), workspace_id))
         except sqlite3.IntegrityError as exc:
             raise ProjectError("A project with that name already exists.", code="name_taken", status=409) from exc
+    return get(workspace_id)
+
+
+def _time_setting(key, value):
+    """The stored form of one explicit :data:`PROJECT_TIME_SETTING_KEYS` value, or a refusal."""
+    # deferred: cycle — lmer_platform.config imports this module at top (via lmer_platform.uploads)
+    from .config import ConfigError, validate_int_setting
+
+    if key == "time_idle_grace_minutes":
+        try:
+            return validate_int_setting(key, value)
+        except ConfigError as exc:
+            raise ProjectError(str(exc)) from exc
+    if key == "time_clients":
+        if not isinstance(value, list) or len(value) > MAX_CLIENT_LABELS:
+            raise ProjectError(f"time_clients must be a list of at most {MAX_CLIENT_LABELS} client labels.")
+        labels = [_client_label(item) for item in value]
+        if len({label.casefold() for label in labels}) != len(labels):
+            raise ProjectError("time_clients lists the same client label twice.")
+        return labels
+    key_value = value.strip() if isinstance(value, str) else value
+    if key == "time_project_key":
+        if not valid_project_key(key_value):
+            raise ProjectError(
+                f"{key} must be 1–{MAX_PROJECT_KEY_CHARS} characters of lower-case letters, digits, "
+                "'.', '_' or '-', starting with a letter or digit, with no '--'."
+            )
+    elif not is_slug(key_value) or len(key_value) > MAX_PROJECT_KEY_CHARS:
+        raise ProjectError(
+            f"{key} must be 1–{MAX_PROJECT_KEY_CHARS} characters of lower-case letters, digits, "
+            "'.', '_' or '-', starting with a letter or digit."
+        )
+    return key_value
+
+
+def validate_time_settings(changes):
+    """Refuse the first unusable value in *changes* (time setting key -> value, ``None``
+    clears) the way :func:`update` would, before anything is written (issue #668)."""
+    for key, value in changes.items():
+        if key in PROJECT_TIME_SETTING_KEYS and value is not None:
+            _time_setting(key, value)
+
+
+def valid_project_key(value):
+    """*value* can be stored as a ``time_project_key``."""
+    return is_project_key(value) and len(value) <= MAX_PROJECT_KEY_CHARS
+
+
+def _client_label(value):
+    label = value.strip() if isinstance(value, str) else ""
+    if not label or len(label) > MAX_CLIENT_LABEL_CHARS or not label.isprintable():
+        raise ProjectError(f"A client label needs 1–{MAX_CLIENT_LABEL_CHARS} printable characters.")
+    return label
+
+
+def _derived_key(name):
+    """A slug of *name*: ASCII letters and digits, every other run turned into one ``-``."""
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:MAX_PROJECT_KEY_CHARS].rstrip("-")
+    return slug or FALLBACK_PROJECT_KEY
+
+
+def _time_keys(db):
+    """``{workspace id: key}`` for every project: stored, or the one its name would derive."""
+    return {
+        row["id"]: json.loads(row["settings"]).get("time_project_key") or _derived_key(row["name"])
+        for row in db.execute("SELECT id,name,settings FROM projects")
+    }
+
+
+def _taken_keys(db, workspace_id):
+    """Every other project's key: stored, or the one its name would derive."""
+    return {key for other, key in _time_keys(db).items() if other != workspace_id}
+
+
+def time_keys():
+    """``{workspace id: key}`` for every project, archived ones included, as
+    :func:`update` weighs a new key against them. Reads only: a key not yet
+    stored is the one its name would derive, and stays unstored."""
+    with database() as db:
+        return _time_keys(db)
+
+
+def _keep_project_key(db, workspace_id, settings):
+    """Hold *settings*' ``time_project_key`` to the project's stable key.
+
+    A settings write that leaves the key out, or nulls it, keeps the stored one:
+    every settings writer replaces the whole map, and a key that fell out of it
+    would be re-derived from a name that may have changed since. A new explicit
+    key must not be any other project's.
+    """
+    row = db.execute("SELECT settings FROM projects WHERE id=?", (workspace_id,)).fetchone()
+    stored = json.loads(row[0]).get("time_project_key") if row else None
+    wanted = settings.get("time_project_key")
+    if wanted is None:
+        settings.pop("time_project_key", None)
+        if stored:
+            settings["time_project_key"] = stored
+    elif wanted != stored and wanted in _taken_keys(db, workspace_id):
+        raise ProjectError(f"Another project already uses the project key {wanted!r}.",
+                           code="project_key_taken", status=409)
+
+
+def project_key(workspace_id):
+    """The project's stable key (D15), stored the first time it is asked for.
+
+    The first call derives a slug of the name, made unique against every other
+    project with ``-2``, ``-3``…, and stores it, so a later rename keeps the key
+    every entry was written under.
+    """
+    with operation(), database() as db:
+        row = db.execute("SELECT name,settings FROM projects WHERE id=?", (workspace_id,)).fetchone()
+        if row is None:
+            raise ProjectError("This project does not exist.", code="project_not_found", status=404)
+        settings = json.loads(row["settings"])
+        if settings.get("time_project_key"):
+            return settings["time_project_key"]
+        taken = _taken_keys(db, workspace_id)
+        base = key = _derived_key(row["name"])
+        number = 2
+        while key in taken:
+            suffix = f"-{number}"
+            key = base[:MAX_PROJECT_KEY_CHARS - len(suffix)].rstrip("-") + suffix
+            number += 1
+        settings["time_project_key"] = key
+        db.execute("UPDATE projects SET settings=? WHERE id=?", (json.dumps(settings), workspace_id))
+    return key
+
+
+def add_client_label(workspace_id, label):
+    """Append *label* to the project's ``time_clients`` unless it is there already (spec D12)."""
+    label = _client_label(label)
+    with operation(), database() as db:
+        row = db.execute("SELECT settings,archived FROM projects WHERE id=?", (workspace_id,)).fetchone()
+        if row is None:
+            raise ProjectError("This project does not exist.", code="project_not_found", status=404)
+        if row["archived"]:
+            raise ProjectError("This project is archived; restore it first.", code="project_archived", status=409)
+        settings = json.loads(row["settings"])
+        labels = list(settings.get("time_clients") or [])
+        if label.casefold() not in {item.casefold() for item in labels}:
+            if len(labels) >= MAX_CLIENT_LABELS:
+                raise ProjectError(f"A project holds at most {MAX_CLIENT_LABELS} client labels.")
+            settings["time_clients"] = [*labels, label]
+            db.execute("UPDATE projects SET settings=? WHERE id=?", (json.dumps(settings), workspace_id))
     return get(workspace_id)
 
 
@@ -408,7 +705,7 @@ def session_home(session_id):
         home = run_home(runs.run_key(*key))
         if home:
             return home["project_id"]
-    with database() as db:
+    with reader() as db:
         row = db.execute("SELECT project_id FROM sessions WHERE session=?", (session_id,)).fetchone()
     return row[0] if row else None
 
@@ -417,7 +714,7 @@ def session_home(session_id):
 def session_run(session_id):
     if not enabled() or not session_id:
         return None
-    with database() as db:
+    with reader() as db:
         row = db.execute("SELECT run_key FROM sessions WHERE session=?", (session_id,)).fetchone()
     return row[0] if row else None
 
@@ -431,9 +728,68 @@ def bind_session(session_id, workspace_id, run_key=None):
 def run_home(key):
     if not enabled():
         return None
-    with database() as db:
+    with reader() as db:
         row = db.execute("SELECT * FROM homes WHERE run_key=?", (key,)).fetchone()
     return dict(row) if row else None
+
+
+class Snapshot:
+    """``homes``, ``sessions`` and ``projects`` as one read saw them (#561).
+
+    For callers that look up every row of a fleet read: ``annotate`` used to ask
+    the database again for each one — about eight connections per row. Answers
+    the same questions as :func:`run_home`, :func:`session_home` and
+    :func:`get`, with the same rules, from memory.
+    """
+
+    def __init__(self, homes, sessions, rows):
+        self._homes, self._sessions, self._projects = homes, sessions, rows
+
+    def run_home(self, key):
+        home = self._homes.get(key)
+        return dict(home) if home else None
+
+    def session_home(self, session_id):
+        if not session_id:
+            return None
+        entry = registry.read_session(session_id)
+        key = runs.run_key_of_entry(entry) if entry else None
+        if key:
+            home = self._homes.get(runs.run_key(*key))
+            if home:
+                return home["project_id"]
+        return self._sessions.get(session_id)
+
+    def get(self, workspace_id):
+        if not workspace_id:
+            raise ProjectError("Choose a project before starting new work.", code="project_required")
+        row = self._projects.get(workspace_id)
+        if row is None:
+            raise ProjectError("This project does not exist.", code="project_not_found", status=404)
+        return row
+
+    def listing(self, *, archived=True):
+        # Read ORDER BY name_key, like listing(); _decode drops the key itself.
+        return [row for row in self._projects.values() if archived or not row["archived"]]
+
+
+def snapshot():
+    """One :class:`Snapshot`, or ``None`` outside projects mode.
+
+    The three reads share one deferred read transaction, so a run moved between
+    them is seen wholly before or wholly after the move, never half-moved.
+    """
+    if not enabled():
+        return None
+    with reader() as db:
+        db.execute("BEGIN")
+        try:
+            homes = {row["run_key"]: dict(row) for row in db.execute("SELECT * FROM homes")}
+            sessions = {row[0]: row[1] for row in db.execute("SELECT session, project_id FROM sessions")}
+            rows = {row["id"]: _decode(row) for row in db.execute("SELECT * FROM projects ORDER BY name_key")}
+        finally:
+            db.execute("COMMIT")
+    return Snapshot(homes, sessions, rows)
 
 
 def bind_run(key, workspace_id):
@@ -773,7 +1129,7 @@ def status(workspace_id):
     project = get(workspace_id)
     with scope.bound(workspace_id):
         result = assistant.status().to_dict()
-    with database() as db:
+    with reader() as db:
         queue = [row[0] for row in db.execute("SELECT project_id FROM starts ORDER BY ticket")]
     result.update(workspace_id=workspace_id, project_name=project["name"], color=project["color"],
                   desired=project["desired"], lifecycle=project["status"], error=project["error"],
@@ -784,25 +1140,51 @@ def status(workspace_id):
 
 
 def inventory_sessions(sessions):
-    """Omit retired assistant generations from the fleet, retaining their records."""
-    if not enabled():
+    """Omit retired assistant generations from the fleet, retaining their records.
+
+    Runs under the publication lock ``GET /api/assistant`` waits on, so it reads
+    the projects tables once and each project's history once, whatever the
+    number of retired generations (#561); before, each one cost several fresh
+    connections.
+    """
+    snap = snapshot()
+    if snap is None:
         return sessions
-    owners = {row["id"]: row for row in listing()}
+    owners = {row["id"]: row for row in snap.listing()}
+    histories = {}
+
+    def history(workspace_id):
+        if workspace_id not in histories:
+            histories[workspace_id] = assistant_history.generations_of(workspace_id)
+        return histories[workspace_id]
+
+    def generation(session_id):
+        # assistant_history.generation(), answered from the owner's history read.
+        if not session_id:
+            return None
+        try:
+            registry.session_path(session_id)
+        except registry.RegistryError:
+            return None
+        owner = snap.session_home(session_id)
+        if owner is None:
+            # Unowned: the original resolves against the bound scope; ask it.
+            return assistant_history.generation(session_id)
+        return history(owner)[0].get(session_id)
+
     visible = []
     for entry in sessions:
         if entry.get("kind") == registry.ASSISTANT_KIND and not entry.get("live"):
-            project = owners.get(session_home(entry["id"]))
+            project = owners.get(snap.session_home(entry["id"]))
             if project:
                 current = project["assistant_state"].get("session_id")
                 if not current:
-                    with scope.bound(project["id"]):
-                        latest = assistant_history.latest()
-                    current = latest["session"] if latest else None
+                    current = history(project["id"])[1]
                 if current == entry["id"] and project["status"] in ("starting", "rotating"):
                     continue
                 if current and current != entry["id"]:
-                    previous = assistant_history.generation(entry["id"])
-                    head = assistant_history.generation(current)
+                    previous = generation(entry["id"])
+                    head = generation(current)
                     if (previous and head and previous["conversation"] == head["conversation"]
                             and previous["generation"] < head["generation"]):
                         continue
@@ -867,54 +1249,139 @@ def _failed(workspace_id, error, *, retry):
 
 
 def reconcile(config):
-    """Reconcile one fleet pass; reservations include starts and rotations."""
+    """Reconcile one fleet pass; reservations include starts and rotations.
+
+    Shaped for its 2 s cadence (#561). On a production host a pass took about
+    25 s: it held ``operation()`` throughout, scanned the whole registry once
+    per project, and wrote every row on every pass whether or not anything had
+    changed. Now:
+
+    - the registry is scanned once per pass (:func:`_live_projects`);
+    - a row is written only when it changes, and ``recover()`` runs only for a
+      project with delivered requests to recover;
+    - ``operation()`` is held per project step and per admission, never across
+      the pass, and each step re-reads its row inside its hold.
+
+    Python's locks are not fair, so the narrower holds bound how long one hold
+    lasts; they do not promise a waiting request gets in between two steps.
+    """
     # deferred: cycle — lmer_platform.assistant and lmer_platform.project_requests import this module at top
-    from . import assistant, project_requests
+    from . import project_requests
+
+    snap = snapshot()
+    if snap is not None:
+        live = _live_projects(snap)
+        with reader() as db:
+            delivered = {row[0] for row in db.execute(
+                "SELECT DISTINCT project_id FROM requests WHERE state='delivered'")}
+        for listed in snap.listing(archived=False):
+            with operation():
+                _reconcile_project(listed["id"], listed["id"] in live,
+                                   listed["id"] in delivered, project_requests)
+    while _admit_next(config, project_requests):
+        pass
+
+
+def _live_projects(snap):
+    """Projects with a live assistant, from one registry scan.
+
+    What ``bool(assistant._live_assistant())`` answers per project, for every
+    project at once: a live ``assistant`` entry homed to it.
+    """
+    # deferred: cycle — lmer_platform.assistant imports this module at top
+    from . import assistant
+
+    homes = set()
+    for entry in registry.list_sessions(live_only=True):
+        if entry.get("kind") == assistant.KIND:
+            owner = snap.session_home(entry.get("id"))
+            if owner:
+                homes.add(owner)
+    return homes
+
+
+def _reconcile_project(workspace_id, live, delivered, project_requests):
+    """One project's step of a pass. Call only under ``operation()``."""
+    # deferred: cycle — lmer_platform.assistant imports this module at top
+    from . import assistant
+
+    # Re-read under the hold: the pass's own reads came before it, and a move,
+    # stop or start may have landed since.
+    with reader() as db:
+        row = _decode(db.execute("SELECT * FROM projects WHERE id=?", (workspace_id,)).fetchone())
+        queued = bool(db.execute("SELECT 1 FROM starts WHERE project_id=?", (workspace_id,)).fetchone())
+    if row is None or row["archived"]:
+        return
+    if live:
+        if row["desired"] == "stopped":
+            stop(workspace_id)
+            return
+        status = "running" if row["desired"] == "running" else "stopping"
+        age = store.age_seconds(row["assistant_state"].get("started_at"))
+        settled = (age is not None and age >= assistant.SETTLED_SECONDS
+                   and (row["retries"] or row["retry_at"]))
+        if row["status"] != status or not row["reserved"] or queued or settled:
+            with database() as db:
+                if row["status"] != status or not row["reserved"]:
+                    db.execute("UPDATE projects SET status=?,reserved=1 WHERE id=?", (status, workspace_id))
+                if queued:
+                    db.execute("DELETE FROM starts WHERE project_id=?", (workspace_id,))
+                if settled:
+                    db.execute("UPDATE projects SET retries=0,retry_at=0 WHERE id=?", (workspace_id,))
+        if delivered:
+            project_requests.recover(workspace_id)
+    elif row["status"] in ("running", "starting", "rotating"):
+        if row["desired"] == "running":
+            # The pass scanned the registry before this hold; a start that
+            # landed since must not be recorded as a crash.
+            with scope.bound(workspace_id):
+                if assistant._live_assistant():
+                    return
+            with database() as db:
+                db.execute("INSERT OR IGNORE INTO starts (project_id) VALUES (?)", (workspace_id,))
+            _failed(workspace_id, "Assistant exited unexpectedly.", retry=True)
+    elif row["desired"] == "stopped" and (row["status"] != "stopped" or row["reserved"]):
+        with database() as db:
+            db.execute("UPDATE projects SET status='stopped',reserved=0 WHERE id=?", (workspace_id,))
+
+
+def _admit_next(config, project_requests):
+    """Admit the next queued start, under its own ``operation()`` hold.
+
+    Returns whether to look again. Nothing queued is the common case, and it is
+    decided on a reader, so an idle pass takes no write lock here.
+    """
+    # deferred: cycle — lmer_platform.assistant imports this module at top
+    from . import assistant
 
     with operation():
-        for project in listing(archived=False):
-            workspace_id = project["id"]
-            with scope.bound(workspace_id):
-                live = assistant._live_assistant()
-            if live:
-                if project["desired"] == "stopped":
-                    stop(workspace_id)
-                    continue
-                with database() as db:
-                    db.execute("UPDATE projects SET status=?,reserved=1 WHERE id=?",
-                               ("running" if project["desired"] == "running" else "stopping", workspace_id))
-                    db.execute("DELETE FROM starts WHERE project_id=?", (workspace_id,))
-                    age = store.age_seconds(project["assistant_state"].get("started_at"))
-                    if age is not None and age >= assistant.SETTLED_SECONDS:
-                        db.execute("UPDATE projects SET retries=0,retry_at=0 WHERE id=?", (workspace_id,))
-                project_requests.recover(workspace_id)
-            elif project["status"] in ("running", "starting", "rotating"):
-                if project["desired"] == "running":
-                    with database() as db:
-                        db.execute("INSERT OR IGNORE INTO starts (project_id) VALUES (?)", (workspace_id,))
-                    _failed(workspace_id, "Assistant exited unexpectedly.", retry=True)
-            elif project["desired"] == "stopped":
-                with database() as db:
-                    db.execute("UPDATE projects SET status='stopped',reserved=0 WHERE id=?", (workspace_id,))
-        while True:
-            with database() as db:
-                used = db.execute("SELECT count(*) FROM projects WHERE reserved=1").fetchone()[0]
-                row = db.execute("SELECT p.* FROM starts s JOIN projects p ON p.id=s.project_id "
-                                 "WHERE p.desired='running' AND p.archived=0 ORDER BY s.ticket LIMIT 1").fetchone()
-                if used >= limit() or row is None or row["retry_at"] > time.time():
-                    return
-                workspace_id = row["id"]
-                db.execute("UPDATE projects SET status='starting',reserved=1 WHERE id=?", (workspace_id,))
-            try:
-                with scope.bound(workspace_id), admitting(workspace_id):
-                    assistant.start(config)
-            except Exception as exc:
-                _failed(workspace_id, str(exc), retry=bool(row["retries"]))
-                continue
-            with database() as db:
-                db.execute("UPDATE projects SET status='running',error=NULL WHERE id=?", (workspace_id,))
-                db.execute("DELETE FROM starts WHERE project_id=?", (workspace_id,))
-            project_requests.recover(workspace_id)
+        if not enabled():
+            return False
+        with reader() as db:
+            if not db.execute("SELECT 1 FROM starts s JOIN projects p ON p.id=s.project_id "
+                              "WHERE p.desired='running' AND p.archived=0 LIMIT 1").fetchone():
+                return False
+        with database() as db:
+            used = db.execute("SELECT count(*) FROM projects WHERE reserved=1").fetchone()[0]
+            row = db.execute("SELECT p.* FROM starts s JOIN projects p ON p.id=s.project_id "
+                             "WHERE p.desired='running' AND p.archived=0 ORDER BY s.ticket LIMIT 1").fetchone()
+            if used >= limit() or row is None or row["retry_at"] > time.time():
+                return False
+            workspace_id = row["id"]
+            db.execute("UPDATE projects SET status='starting',reserved=1 WHERE id=?", (workspace_id,))
+        try:
+            # Still inside this admission's hold: a launch keeps operation()
+            # while it runs, as it always has.
+            with scope.bound(workspace_id), admitting(workspace_id):
+                assistant.start(config)
+        except Exception as exc:
+            _failed(workspace_id, str(exc), retry=bool(row["retries"]))
+            return True
+        with database() as db:
+            db.execute("UPDATE projects SET status='running',error=NULL WHERE id=?", (workspace_id,))
+            db.execute("DELETE FROM starts WHERE project_id=?", (workspace_id,))
+        project_requests.recover(workspace_id)
+        return True
 
 
 class Supervisor:
@@ -959,10 +1426,15 @@ class Supervisor:
 
     def run(self):
         while not self._stop.is_set():
+            # This loop's passes, not reconcile() calls in general: routes call
+            # reconcile() too, and their passes would hide this cadence (#561).
+            started = load.RECONCILE.started()
             try:
                 reconcile(self.config)
             except Exception:
                 logger.exception("project_assistant_reconcile_failed")
+            finally:
+                load.RECONCILE.finished(started, finished_at=store.utc_now_iso())
             self._stop.wait(2)
 
     def stop(self):

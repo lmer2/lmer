@@ -57,6 +57,7 @@ import contextlib
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import secrets as secrets_mod
 import sqlite3
@@ -74,6 +75,7 @@ from typing import Callable, Optional
 from lmer_cli.cli import _discover_all_tasks, _discover_tasks, _get_taskdef_paths
 from lmer_cli.presets import load_presets
 from lmer_cli.runtime import repo_root_path
+from lmer_timesheet import DEFAULT_HANDLER, parse_handler
 
 # The forge URL mapping, imported rather than rebuilt (T66). ``web_url_for``
 # cannot be called from here — it resolves paths under the *container's* ``/work``
@@ -100,6 +102,8 @@ from . import checkin
 from . import comms
 from . import connectors
 from . import lifecycle
+from . import load
+from . import state_flight
 from lmer_cli import comms as bus_comms
 from lmer_cli import pi_providers
 from lmer_cli import routing_receipts
@@ -111,6 +115,7 @@ from lmer_cli.threads import ThreadError
 
 from . import meta
 from . import mention_routing
+from . import mr_activity
 from . import mute
 from .ingress import Ingress
 from . import references
@@ -123,7 +128,7 @@ from . import session_io
 from . import session_threads
 from . import statusline
 from . import transcripts
-from . import uploads
+from . import uploads, usage_api, usage_live, usage_rollup
 from .answer import AnswerError, AnswerRequest, answer_run
 from .ask import AskChannelError
 from .uploads import UploadError
@@ -143,8 +148,10 @@ from .config import (
     list_connectors,
     checkin_settings,
     _slots_value,
+    config_path,
     configured_repo_url,
     fleet_group_settings,
+    load as load_config,
     mutate_stored,
     nudge_settings,
     rotation_settings,
@@ -199,11 +206,12 @@ from .spawn import (
     absorb_ports,
     derive_run_identity,
     live_session_for_run,
+    rate_limit_pause,
     schema_two,
     spawn_session,
 )
-from .store import StoreError, utc_now_iso
-from .ui_build import dist_dir
+from .store import StoreError, read_json, utc_now_iso
+from .ui_build import bundle_fingerprint, dist_dir, is_built
 from .workrepo import (
     fold_registry,
     folded_identity,
@@ -214,6 +222,10 @@ from .workrepo import (
     run_dirs,
 )
 from . import channel_routes, projects, project_context as project_scope, project_requests, project_threads
+from . import timesheet_handlers, timetrack, timetrack_activity, timetrack_entries, timetrack_live
+from .people import CREDENTIAL_CONNECTOR, CREDENTIAL_OPERATOR, META_CREDENTIAL, Registry
+from .people import identity_of as people_identity
+from . import time_settings
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -224,6 +236,14 @@ __all__ = [
 ]
 
 REALM = "lmer platform"
+
+#: Threads for authentication and request binding (#561): a small pool of
+#: their own, apart from the 40-token pool the handlers share.
+CONTROL_THREADS = 8
+#: ``/api/health``'s own threads for its authentication, binding and body
+#: (#561), so blocked bindings holding every control thread cannot silence it.
+#: Enough for a watch and a person at once.
+HEALTH_THREADS = 2
 
 #: Who a request came from, once authenticated — one value per credential
 #: (issue #244). ``operator`` names *everything else* rather than a person: a
@@ -242,6 +262,16 @@ WS_POLICY_VIOLATION = 1008
 #: What a 503 for transient state contention tells a client to wait (seconds,
 #: as the ``Retry-After`` header carries it).
 RETRY_AFTER_SECONDS = "1"
+
+#: ``Retry-After`` on a ``GET /api/state`` that found no build within the join
+#: deadline (#561): long enough for the build in hand to finish.
+STATE_RETRY_AFTER_SECONDS = "5"
+
+
+#: The ``detail.code`` of the 503 ``POST /api/sessions`` answers when the chat
+#: transport rate limited a thread check. Nothing was started, so it is always
+#: ``retryable``; ``lmer-ctl spawn`` resends this code and no other.
+THREAD_CHECK_RATE_LIMITED = "thread_check_rate_limited"
 
 
 def _busy_detail(reason: str, *, retryable: bool, advice: str) -> dict:
@@ -672,6 +702,7 @@ def _meta_reply(run: dict, record) -> dict:
         "limits": {
             "title": meta.MAX_TITLE_CHARS,
             "description": meta.MAX_DESCRIPTION_CHARS,
+            "issues": meta.MAX_ISSUES,
         },
         "local": True,
         "note": meta.LOCALITY_NOTE,
@@ -817,7 +848,8 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin, nudge and "
     "rotation groups on its next tick, so a change there takes effect without a "
     "rotation. "
-    "chat_show_transcript, chat_tint_operator and dock_keep_last_notes are browser "
+    "chat_show_transcript, chat_tint_operator, chat_enter_sends, chat_scroll_long_messages and "
+    "dock_keep_last_notes are browser "
     "display settings applied on config refresh; none requires an assistant rotation. The "
     "resources group is "
     "read-only and environment-only, and like the launch settings it applies "
@@ -1173,12 +1205,19 @@ def _fold_checkins(payload: dict) -> None:
     caller check closes, arriving through the other door.
 
     Both lists get it: ``attention`` holds separate copies of the same rows.
+
+    The MR-activity cache is *read*, never refreshed, for the same reason: a poll
+    must not become a GitLab request per row. The detector keeps it current, so a
+    review whose MR has not moved reads the same here as in the digest (#401).
     """
     window = checkin_settings()["window_seconds"].value
     marks = checkin.read_marks()
+    activity = mr_activity.read_cache()
     for row in (payload.get("runs") or []) + (payload.get("attention") or []):
         if isinstance(row, dict):
-            row["checkin"] = checkin.row_checkin(row, marks, window=window)
+            row["checkin"] = checkin.row_checkin(
+                row, marks, window=window, activity=activity
+            )
 
 
 def _fold_mute(payload: dict, sessions: list) -> None:
@@ -1308,7 +1347,7 @@ def _fold_readopt(payload: dict, marks: dict) -> None:
         row["readopt"] = dict(mark) if mark else None
 
 
-def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
+def build_state(config: PlatformConfig, *, force_pull: bool = False, mirror=None) -> dict:
     """Assemble the fleet view for the runs **this orchestrator tracks**.
 
     Scope comes from the local run index, never from the shared work repo (spec
@@ -1320,8 +1359,30 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     evidence that a session crashed, and filtering it out here would silently
     drop crashed runs from the attention list (see
     :mod:`lmer_platform.inventory`).
+
+    Each stage is timed into :data:`lmer_platform.load.BUILDS` (#561), so
+    ``/api/health`` and the slow-request log can say which stage a slow build
+    spent its time in — the publication-lock wait separately from the work done
+    under it, since that lock is what ``GET /api/assistant`` queues on.
+
+    ``mirror`` is the status of a pull the caller has already made, and this
+    build then pulls nothing: ``GET /api/state`` pulls per request and shares
+    the build (:mod:`lmer_platform.state_flight`), and a ``git fetch`` inside a
+    shared build would hold every request that joined it.
     """
-    mirror = pull(config, force=force_pull).to_dict()
+    stages = load.BUILDS.begin()
+    try:
+        payload = _build_state(config, force_pull=force_pull, pulled=mirror, stages=stages)
+    except BaseException:
+        load.BUILDS.abandon()
+        raise
+    load.BUILDS.end(stages, finished_at=utc_now_iso())
+    return payload
+
+
+def _build_state(config: PlatformConfig, *, force_pull: bool, pulled, stages) -> dict:
+    mirror = (pulled if pulled is not None else pull(config, force=force_pull)).to_dict()
+    stages.mark("pull")
     # The tree's form, so the UI can gate its schema views (#374): a presence
     # test and no validation — the validator runs only behind
     # GET /api/workrepo/schema, never on the poll.
@@ -1333,10 +1394,13 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # A read of the index and nothing else once every entry carries its uid.
     run_transition.reconcile(config)
     readopt = run_transition.readopt_marks()
+    stages.mark("reconcile")
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
     with assistant._PUBLICATION_LOCK:
+        stages.mark("publication_wait")
         sessions = projects.inventory_sessions(list_sessions(live_only=False))
+    stages.mark("sessions")
     # A forgotten run's index entry is gone, but its retained registry sessions
     # are evidence: leave them on disk and out of the fleet view (#527).
     sessions = filter_forgotten(sessions)
@@ -1375,6 +1439,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
             backstop_after=config.stall_backstop_seconds,
         ),
     )
+    stages.mark("inventory")
 
     slot_entries, slots_problem = stored_slots_or_problem()
     payload = {
@@ -1415,6 +1480,8 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     _fold_references(payload)
     _fold_relations(payload)
     _fold_readopt(payload, readopt)
+    usage_api.fold_state(payload, usage_live.current(), table=usage_api.price_table(config)[0])
+    stages.mark("folds")
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -2302,10 +2369,24 @@ def _caller_meta(meta: object, kind: str) -> Optional[dict]:
     """
     if not isinstance(meta, dict):
         return None
-    kept = {key: value for key, value in meta.items() if key != bus_comms.META_AUTHORITY}
+    kept = {key: value for key, value in meta.items()
+            if key not in (bus_comms.META_AUTHORITY, META_CREDENTIAL)}
     if kind != bus_comms.KIND_QUESTION:
         kept.pop(bus_comms.META_OPERATOR_ONLY, None)
     return kept
+
+
+def _credential_meta(caller: "Caller", meta: Optional[dict] = None) -> Optional[dict]:
+    """*meta* stamped with the kind of credential behind the post (#604).
+
+    The person registry reads it: only the operator credential's own post is
+    the web chat, and a connector's author is its caller's text, never a
+    verified identity (:func:`lmer_platform.people._identity`).
+    """
+    if caller.kind not in (CALLER_OPERATOR, CALLER_CONNECTOR):
+        return meta
+    stamp = CREDENTIAL_OPERATOR if caller.kind == CALLER_OPERATOR else CREDENTIAL_CONNECTOR
+    return {**(meta or {}), META_CREDENTIAL: stamp}
 
 
 def _thread_label(caller: "Caller", config: PlatformConfig) -> str:
@@ -2390,6 +2471,206 @@ def _note_check_started(caller: "Caller", result, body: dict) -> None:
         )
 
 
+# --- time tracking (issue #604): who a time call is for --------------------------
+
+class TimeRefusal(Exception):
+    """A time route's refusal: the reply is ``{"detail": {"code", "message", ...}}``."""
+
+    def __init__(self, status: int, code: str, message: str, **extra) -> None:
+        super().__init__(message)
+        self.status = status
+        self.detail = {"code": code, "message": message, **extra}
+
+
+#: How :func:`time_actor` found the person, as ``acting.via`` says.
+TIME_VIA_DEFAULT_PERSON = "default_person"
+TIME_VIA_RECORD = "record"
+TIME_VIA_REQUEST = "request"
+TIME_VIA_SESSION = "session"
+
+_HUMAN_KINDS = (bus_comms.KIND_MESSAGE, bus_comms.KIND_ANSWER)
+_JOURNAL_PAGE = 2000
+
+
+def _session_events(hub: "comms.CommsHub", session_id: str):
+    """Every journaled record of *session_id*, oldest first."""
+    cursor = 0
+    while True:
+        events, cursor = hub.feed(cursor, session=session_id, limit=_JOURNAL_PAGE)
+        if not events:
+            return
+        yield from events
+
+
+def _record_person(registry: Registry, message: dict) -> str:
+    """The person *message* speaks for, or the refusal saying why it speaks for nobody."""
+    record = message.get("id")
+    if message.get("kind") not in _HUMAN_KINDS:
+        raise TimeRefusal(422, "time_record_not_human",
+                          f"record {record} is a {message.get('kind')}, not a human's message or answer.")
+    person = registry.person_for(message)
+    if person is not None:
+        return person
+    identity = registry.unmapped(message)
+    if identity is not None:
+        raise TimeRefusal(403, "time_identity_unmapped",
+                          f"record {record} is from {identity}, who is not a listed person; "
+                          "an unmapped identity cannot start or stop time.")
+    raise TimeRefusal(422, "time_record_not_human",
+                      f"record {record} names no human the person registry could map.")
+
+
+def _handling(request_id: str, session_id: str) -> bool:
+    """Whether *session_id* is handling *request_id* now: delivered to it and not yet answered.
+
+    The credential's context row outlives the reply until the next take-pending,
+    and :func:`lmer_platform.project_requests.active` names a queued request
+    nobody has taken; neither says who is asking now.
+    """
+    row = project_requests.get(request_id)
+    return row is not None and row["state"] == "delivered" and row["generation"] == session_id
+
+
+def time_actor(caller: "Caller", registry: Registry, *, hub: "comms.CommsHub",
+               record: Optional[str] = None, request_id: Optional[str] = None) -> dict:
+    """Who a time call acts for: ``{"person", "name", "via", "record", "request_id"}`` (D9).
+
+    Taken only from the credential and the records the platform itself holds,
+    never from a name in the request:
+
+    - the operator credential acts for ``default_person``;
+    - an assistant credential acts for the author of *record*, which must be
+      a human message or answer journaled on the assistant's own session; with
+      no *record*, for the sender of the conversation request it is handling
+      (*request_id*, when that request is delivered to this session and not
+      yet answered); otherwise for the author of the latest human message or
+      answer on its session;
+    - a connector credential acts for nobody.
+
+    An author the registry does not map is refused, not passed over for an
+    earlier one: the latest human is who asked. Raises :class:`TimeRefusal`.
+    """
+    acting = {"person": None, "name": None, "via": None, "record": None, "request_id": None}
+    if caller.kind == CALLER_OPERATOR:
+        if record is not None:
+            raise TimeRefusal(400, "time_record_not_operator",
+                              "record names who asked on an assistant's session; the operator "
+                              "credential always acts for default_person.")
+        if not registry.default_person:
+            raise TimeRefusal(409, "time_no_default_person",
+                              "No default_person is set in the platform config, so the operator "
+                              "credential acts for nobody. Set default_person to a listed person.")
+        acting.update(person=registry.default_person, via=TIME_VIA_DEFAULT_PERSON)
+    elif caller.kind != CALLER_ASSISTANT:
+        raise TimeRefusal(403, "time_caller_refused",
+                          f"A {caller.kind} credential acts for no person and cannot track time.")
+    elif not caller.session_id:
+        raise TimeRefusal(403, "time_no_session",
+                          "This assistant credential names no session, so no record says who asked.")
+    elif record is not None:
+        message = next((event.message for event in _session_events(hub, caller.session_id)
+                        if event.message.get("id") == record), None)
+        if message is None:
+            raise TimeRefusal(403, "time_record_foreign",
+                              f"record {record} is not on this assistant's session.")
+        acting.update(person=_record_person(registry, message), via=TIME_VIA_RECORD, record=record)
+    elif request_id and _handling(request_id, caller.session_id):
+        row = project_requests.get(request_id)
+        person = registry.person_for_sender(row["transport"], row["sender"])
+        if person is None:
+            raise TimeRefusal(403, "time_identity_unmapped",
+                              f"The conversation request's sender {row['transport']}:{row['sender']} "
+                              "is not a listed person; an unmapped identity cannot start or stop time.")
+        acting.update(person=person, via=TIME_VIA_REQUEST, request_id=request_id)
+    else:
+        latest = None
+        for event in _session_events(hub, caller.session_id):
+            message = event.message
+            if message.get("kind") in _HUMAN_KINDS and (
+                    registry.person_for(message) or registry.unmapped(message)):
+                latest = message
+        if latest is None:
+            raise TimeRefusal(422, "time_no_record",
+                              "No human message on this assistant's session says who asked; "
+                              "pass the record that carried the request.")
+        acting.update(person=_record_person(registry, latest), via=TIME_VIA_SESSION,
+                      record=latest.get("id"))
+    known = registry.person(acting["person"])
+    acting["name"] = known.name if known else acting["person"]
+    return acting
+
+
+def time_key_suggestions(registry, repositories, workspace_id: str, keys: dict) -> list:
+    """``[{"key", "matched", "taken"}]``: registry short names a project could take as its key.
+
+    Suggestions only (issue #648): nothing here stores or changes a key, and a
+    fresh key is still derived from the name. ``matched`` marks the names the
+    project's *repositories* resolve to, listed first in repository order;
+    ``taken`` marks a name that is already another project's key (*keys* is
+    :func:`lmer_platform.projects.time_keys`, the set an update is refused
+    against). A short name that cannot be a project key is left out.
+    """
+    if registry is None:
+        return []
+    matched = []
+    for url in repositories or ():
+        try:
+            found = registry.lookup(url)
+        except ValueError:
+            continue
+        if found is not None and found.name not in matched:
+            matched.append(found.name)
+    taken = {key for other, key in keys.items() if other != workspace_id}
+    names = matched + [name for name in registry if name not in matched]
+    return [{"key": name, "matched": name in matched, "taken": name in taken}
+            for name in names if projects.valid_project_key(name)]
+
+
+def _home_time_status(status: dict, home: str) -> dict:
+    """:meth:`Tracker.status` as an assistant on *home* sees it (P14).
+
+    A timer on another project is only ``running_elsewhere``. The writer's
+    refusal is dropped: the oldest queued entry may be anyone's, on any project.
+    """
+    running = status["running"]
+    elsewhere = running is not None and running["workspace_id"] != home
+    return {
+        **status,
+        "running": None if elsewhere else running,
+        "running_elsewhere": elsewhere,
+        "warnings": [] if elsewhere else status["warnings"],
+        "prompts": [prompt for prompt in status["prompts"] if prompt["workspace_id"] == home],
+        "outbox": {**status["outbox"], "last_error": None},
+        "writer_refusal": None,
+    }
+
+
+def _time_handler(handler) -> dict:
+    return {
+        "name": handler.name, "label": handler.label, "sync": handler.sync,
+        "fields": [{"key": item.key, "label": item.label, "required": item.required,
+                    "pattern": item.pattern, "hint": item.hint, "link": item.link,
+                    "per_issue": item.per_issue}
+                   for item in handler.fields],
+    }
+
+
+def _held_warnings(rows: list) -> list:
+    """One ``held`` warning per handler and reason, for the header (D17)."""
+    groups: dict = {}
+    for row in rows:
+        reason = (row["sync"] or {}).get("reason") or "no reason given"
+        group = groups.setdefault((row["handler"], reason), {
+            "kind": "held", "handler": row["handler"],
+            "handler_label": row["handler_label"] or row["handler"], "reason": reason, "count": 0,
+        })
+        group["count"] += 1
+    for group in groups.values():
+        noun = "entry" if group["count"] == 1 else "entries"
+        group["message"] = f"{group['count']} {group['handler_label']} {noun} held: {group['reason']}"
+    return list(groups.values())
+
+
 def _presented_secret(authorization: Optional[str]) -> Optional[str]:
     """Pull the candidate secret out of an ``Authorization`` header."""
     if not authorization:
@@ -2439,8 +2720,60 @@ def create_app(
         raise ValueError("refusing to serve without a shared secret")
 
     builder = state_builder or build_state
-    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
-                  lifespan=ingress.lifespan if ingress else None)
+    # This process's routes are the code it started with, while `/` and `/assets`
+    # read the bundle from disk per request: a bundle replaced after this point is
+    # UI this process may not have the routes for (#650). Started without a
+    # bundle, there is nothing to compare, so it never reads as stale.
+    started_ui = bundle_fingerprint()
+    # A bundle that could not be read now must not leave the check off for the
+    # life of the process: the first reading a poll gets becomes the baseline.
+    adopt_ui = started_ui is None and is_built()
+    if adopt_ui:
+        logger.warning("platform_ui_fingerprint_unavailable dir=%s; the first readable bundle becomes the baseline", dist_dir())
+    # Per app, like the ticket store below: a second app in one process (tests)
+    # must not report the first one's requests (#561).
+    in_flight = load.InFlight()
+    monitor = load.LoopMonitor(in_flight)
+    flights = state_flight.StateFlights()
+
+    if builder is build_state:
+        # Pulled per request by the route, never inside a shared build: the
+        # build is handed the status its leader's own pull returned.
+        def _pull_for_request():
+            return pull(config)
+
+        def _shared_build(status):
+            def build():
+                load.BUILDS.thread_last()  # a pool thread may hold another route's record
+                payload = build_state(config, mirror=status)
+                return payload, (load.BUILDS.thread_last() or {}).get("stages")
+            return build
+    else:
+        # An injected builder (tests) is called as it always was, and pulls
+        # nothing; a missing head never differs from another missing head.
+        def _pull_for_request():
+            return None
+
+        def _shared_build(_status):
+            return lambda: (builder(config), None)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app_):
+        # The monitor runs on the loop it measures; it needs no pool thread, so
+        # it still reports when the pool is full.
+        task = asyncio.create_task(monitor.run(), name="platform-loop-monitor")
+        try:
+            if ingress:
+                async with ingress.lifespan(app_):
+                    yield
+            else:
+                yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION), lifespan=lifespan)
     app.router.route_class = project_api.WorkspaceRoute
 
     @app.exception_handler(projects.ProjectError)
@@ -2475,6 +2808,10 @@ def create_app(
             content={"detail": detail},
             headers={"Retry-After": RETRY_AFTER_SECONDS},
         )
+
+    @app.exception_handler(TimeRefusal)
+    async def time_refusal(_request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
     mention_settings = ingress.settings if ingress else MentionSettings.from_env()
     ingress_status = ingress or Ingress(mention_settings)
 
@@ -2491,15 +2828,41 @@ def create_app(
     from starlette.middleware.gzip import GZipMiddleware
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Outside compression: a request counts as waiting from the moment it
+    # reaches the app until its response starts, compression included.
+    app.add_middleware(load.RequestTracker, ledger=in_flight)
+    # Outermost (added last), so its bump at response start comes after
+    # everything inside, compression included, has produced that response.
+    app.add_middleware(state_flight.WriteGeneration, flights=flights)
 
     # Per app rather than per module so tests get a fresh store and a second app
     # in one process cannot redeem the first one's tickets. In production there is
     # exactly one app in exactly one process (see session_io on why that matters).
     tickets = session_io.TicketStore()
 
-    def authenticate(
+    # Authentication and request binding run here rather than in the shared
+    # threadpool or on the event loop (#561): their own tokens mean blocked
+    # handlers cannot starve authentication.
+    control = anyio.CapacityLimiter(CONTROL_THREADS)
+    # /api/health's own tokens, for its authentication, binding and body. A
+    # binding can still block (a busy projects database, the assistant lock),
+    # and with every control token held by one, health sharing them could not
+    # answer at all — which is exactly when `degraded` must be readable.
+    health_threads = anyio.CapacityLimiter(HEALTH_THREADS)
+
+    async def authenticate(
         authorization: Optional[str] = Header(default=None)
     ) -> Caller:
+        """Authenticate on the control limiter; see :func:`_authenticate`."""
+        return await anyio.to_thread.run_sync(_authenticate, authorization, limiter=control)
+
+    async def authenticate_for_health(
+        authorization: Optional[str] = Header(default=None)
+    ) -> Caller:
+        """:func:`authenticate` on /api/health's own limiter."""
+        return await anyio.to_thread.run_sync(_authenticate, authorization, limiter=health_threads)
+
+    def _authenticate(authorization: Optional[str]) -> Caller:
         """Authenticate, and say who called (issue #244).
 
         The shared secret first — the common case, and the one this app was
@@ -2566,7 +2929,8 @@ def create_app(
             headers={"WWW-Authenticate": f'Basic realm="{REALM}"'},
         )
 
-    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+    @contextlib.asynccontextmanager
+    async def _bound(request, caller, limiter):
         body = {}
         if "application/json" in request.headers.get("content-type", ""):
             try:
@@ -2577,11 +2941,28 @@ def create_app(
         # Read by project_store_busy: a failure between these two marks is in
         # the binding, before the handler, so it applied nothing.
         request.state.binding_entered = True
-        with project_api.bind(request, caller, body):
+        # The lookups — sqlite, and for an assistant caller a registry scan —
+        # used to run right here on the event loop and stall every request,
+        # /api/health included (#561). Only the context variables are set here.
+        binding = await anyio.to_thread.run_sync(
+            project_api.resolve_binding, project_api.request_inputs(request), caller, body,
+            limiter=limiter,
+        )
+        with project_api.applied(binding):
             request.state.binding_done = True
+            yield
+
+    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+        async with _bound(request, caller, control):
+            yield caller
+
+    async def require_secret_for_health(request: Request, caller: Caller = Depends(authenticate_for_health)):
+        """:func:`require_secret` — the same checks and refusals — on health's own limiter."""
+        async with _bound(request, caller, health_threads):
             yield caller
 
     require_secret.__annotations__["request"] = Request
+    require_secret_for_health.__annotations__["request"] = Request
     guard = [Depends(require_secret)]
 
     def _unreadable_config(exc: StoreError) -> HTTPException:
@@ -2631,7 +3012,9 @@ def create_app(
         """Plain-text route list — useful from a terminal, and stable for scripts."""
         return (
             "lmer platform\n\n"
-            "  GET  /api/health            liveness and mirror presence (cheap)\n"
+            "  GET  /api/health            liveness, mirror presence, and\n"
+            "                              ui.stale: the bundle on disk changed\n"
+            "                              since this process started (cheap)\n"
             "  GET  /api/state             fleet view: runs THIS orchestrator\n"
             "                              tracks. A run's session block is\n"
             "                              narrowed to the fields a client reads,\n"
@@ -2671,12 +3054,12 @@ def create_app(
             "                              above, take uid beside slug (body or\n"
             "                              ?uid=) and address the record by it\n"
             "  GET  /api/runs/meta         what a run is about: this\n"
-            "                              orchestrator's title and description\n"
-            "                              for it ?host=&project=&slug=\n"
+            "                              orchestrator's title, description and\n"
+            "                              issues for it ?host=&project=&slug=\n"
             "  POST /api/runs/meta         set them {host,project,slug,title?,\n"
-            "                              description?} — an omitted field is\n"
-            "                              left alone, \"\" clears it. This is\n"
-            "                              PLATFORM state, never the work repo\n"
+            "                              description?,issues?} — an omitted\n"
+            "                              field is left alone, \"\" or [] clears\n"
+            "                              it. PLATFORM state, never the work repo\n"
             "                              (D3): local to this orchestrator,\n"
             "                              invisible to anyone else's fleet view,\n"
             "                              and dropped when the run is forgotten\n"
@@ -2887,6 +3270,7 @@ def create_app(
             "  POST /api/assistant/requests/{request_id}/reply  reply to recorded source once\n"
             "  POST /api/assistant/requests/{request_id}/park  operator parks uncertainty without resending\n"
             "  POST /api/assistant/requests/{request_id}/release  operator releases a blocked request with known effects\n"
+            "  POST /api/threads/release  give up this project's thread claim, optionally to another project\n"
             "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
@@ -2895,6 +3279,55 @@ def create_app(
             "                               pushed — it waits here; a spool left\n"
             "                               unread past the nudge interval gets\n"
             "                               one reminder typed into the session\n\n"
+            "Time tracking (docs/TIME-TRACKING.md). The operator credential acts\n"
+            "for default_person; an assistant's for the person behind the record\n"
+            "that carried the request — record, else the conversation request it\n"
+            "is handling, else the latest human message on its own session —\n"
+            "and only on its own project. A name in the body never picks the\n"
+            "person. 503 while tracking is off:\n"
+            "  GET  /api/time/status       the person's running timer, warnings,\n"
+            "                              prompts, pause window, automatic on/off,\n"
+            "                              outbox, unmapped\n"
+            "                              identities, and per-project options:\n"
+            "                              handler fields, client labels, recent\n"
+            "                              titles and values ?project=&record=\n"
+            "  POST /api/time/start        start by hand {project,client?,title?,\n"
+            "                              fields?,record?,prompt?}; project is the\n"
+            "                              workspace id; prompt answers a prompt\n"
+            "                              from status. 422 with missing until\n"
+            "                              every required handler field has a\n"
+            "                              value; a new client label joins the\n"
+            "                              project\n"
+            "  POST /api/time/stop         stop by hand {record?,project?}; a\n"
+            "                              pause follows only when\n"
+            "                              time_pause_hours is set\n"
+            "  PATCH /api/time/current     edit the running timer {client?,title?,\n"
+            "                              fields?,record?,base?}; \"\" clears a\n"
+            "                              value; a change after time accrued\n"
+            "                              splits the entry; base is what the\n"
+            "                              form loaded\n"
+            "  PUT  /api/time/auto         turn automatic tracking on or off\n"
+            "                              {on,record?}; off until turned on\n"
+            "  GET  /api/time/entries      the person's entries, newest first, each\n"
+            "                              with its stage and ledger status\n"
+            "                              ?from=&to=&project=&client=&handler=&\n"
+            "                              status=&record=\n"
+            "  GET  /api/time/settings     the registry, the time_tracking switch\n"
+            "                              and the platform-wide time defaults,\n"
+            "                              each with its source\n"
+            "  POST /api/time/people       add a person {key,name?,slack?,matrix?}\n"
+            "                              (operator)\n"
+            "  PATCH /api/time/people/{key} edit one {name?,slack?,matrix?,add?}\n"
+            "                              (operator)\n"
+            "  DELETE /api/time/people/{key} remove one (operator)\n"
+            "  PATCH /api/time/defaults    {tracking?,default_person?,<setting>?};\n"
+            "                              null clears (operator)\n"
+            "  POST /api/time/me           list or rename the person an assistant\n"
+            "                              is talking to {key?,name?,record?}\n"
+            "  PATCH /api/time/project     a project's time settings {project?,\n"
+            "                              handler?,clients?,idle_grace_minutes?,\n"
+            "                              project_key?}\n"
+            "  POST /api/time/handlers/check parse a handler definition {name,text}\n\n"
             "The fleet view is scoped to runs this orchestrator spawned or\n"
             "adopted — never the whole shared work repo.\n"
         )
@@ -2989,6 +3422,502 @@ def create_app(
                                    "source_name": source["name"]})
         return {"source_workspace_id": source["id"], "destination_id": destination["id"], "queued": True}
 
+    # --- time tracking (issue #604, docs/TIME-TRACKING.md) -------------------
+    #
+    # The person is the credential's (time_actor), never the body's. An
+    # assistant acts only on its own project. A refusal inside a conversation
+    # request is recorded as one, so the same call may be retried.
+
+    def _time_problems(caller: Caller, problems) -> list:
+        """*problems* for the operator; a count for anyone else, since a registry
+        problem quotes people's ids and keys."""
+        problems = list(problems)
+        if caller.kind == CALLER_OPERATOR or not problems:
+            return problems
+        return [f"config.json has {len(problems)} time-tracking problem(s); the operator sees "
+                "them in Platform settings → Time tracking."]
+
+    def _time_tracker(caller: Caller) -> "timetrack.Tracker":
+        tracker = timetrack.get_tracker()
+        if tracker is None:
+            live = timetrack_live.current_config(config)
+            problems = _time_problems(caller, live.time_problems)
+            if problems:
+                reasons = f": {'; '.join(problems)}"
+            elif not live.time_tracking:
+                reasons = ": it is switched off (time_tracking)"
+            else:
+                reasons = ""
+            raise TimeRefusal(503, "time_tracking_off", f"Time tracking is not running{reasons}.",
+                              problems=problems)
+        return tracker
+
+    def _time_text(values: dict, name: str) -> Optional[str]:
+        value = values.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TimeRefusal(400, "time_invalid", f"{name} must be text.")
+        return value
+
+    def _time_acting(tracker: "timetrack.Tracker", caller: Caller, record: Optional[str]) -> dict:
+        request_id = None
+        if caller.is_assistant and record is None:
+            binding = project_api.capture()
+            request_id = binding.get("request_id")
+            if not request_id and binding.get("workspace_id"):
+                request_id = project_requests.bound(binding["workspace_id"])
+        return time_actor(caller, Registry.from_config(tracker.config), hub=_require_hub(),
+                          record=record, request_id=request_id)
+
+    def _time_scope(caller: Caller, workspace_id: Optional[str]) -> Optional[str]:
+        """*workspace_id*, or for an assistant its own project, refusing any other."""
+        if not caller.is_assistant:
+            return workspace_id
+        home = projects.session_home(caller.session_id)
+        if not home:
+            raise TimeRefusal(403, "time_no_project", "This assistant belongs to no project.")
+        if workspace_id is not None and workspace_id != home:
+            raise TimeRefusal(403, "time_other_project",
+                              "An assistant tracks time only on its own project.")
+        return home
+
+    def _time_result(result, acting: dict, caller: Caller) -> dict:
+        payload = {**result.to_dict(), "acting": acting}
+        if caller.is_assistant:
+            # P14: a timer or finished entry on another project stays out of
+            # what the assistant reads, as in its status, and so does any
+            # reason that would describe it.
+            home = projects.session_home(caller.session_id)
+            if payload["entry"] and payload["entry"]["project"] != projects.project_key(home):
+                payload.update(entry=None, seq=None, kept=None,
+                               reasons=[reason for reason in payload["reasons"] if reason != result.kept])
+            if payload["timer"] and payload["timer"]["workspace_id"] != home:
+                # A success can describe that timer too (a remembered answer).
+                reason = "a timer is running on another project"
+                if result.outcome == timetrack.REMEMBERED:
+                    reason += "; the value is kept for the next time this starts"
+                payload.update(timer=None, warnings=[], reasons=[reason] if payload["reasons"] else [])
+                if not result.ok:
+                    payload.update(missing=[])
+        if not result.ok:
+            project_requests.refused_before_effect()
+            raise TimeRefusal(422, "time_refused", "; ".join(payload["reasons"]) or "refused", **payload)
+        return payload
+
+    def _time_values(body: dict) -> dict:
+        fields = body.get("fields")
+        if fields is not None and not isinstance(fields, dict):
+            raise TimeRefusal(400, "time_invalid", "fields must be an object of handler field values.")
+        return {"client": _time_text(body, "client"), "title": _time_text(body, "title"),
+                "fields": fields}
+
+    def _time_options(tracker: "timetrack.Tracker", person: str, workspace_id: str, *,
+                      registry=None, keys: Optional[dict] = None) -> dict:
+        row = projects.get(workspace_id)
+        settings = row["settings"]
+        handler, warning = timesheet_handlers.resolve(tracker.config, settings.get("time_handler"))
+        return {
+            "workspace_id": workspace_id, "name": row["name"], "archived": row["archived"],
+            "project_key": projects.project_key(workspace_id),
+            "key_suggestions": time_key_suggestions(registry, row["repositories"], workspace_id,
+                                                    keys or {}),
+            "handler": _time_handler(handler), "handler_warning": warning,
+            "clients": list(settings.get("time_clients") or []),
+            "idle_grace_minutes": settings.get("time_idle_grace_minutes"),
+            "recent": tracker.recents(person, workspace_id),
+        }
+
+    @app.get("/api/time/status", dependencies=guard)
+    def time_status(project: Optional[str] = None, record: Optional[str] = None,
+                    caller: Caller = Depends(require_secret)) -> dict:
+        """The acting person's time, and what the app bar offers for each project."""
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, record)
+        person = acting["person"]
+        status = tracker.status(person)
+        own = _time_scope(caller, project)
+        status["running_elsewhere"] = False
+        if caller.is_assistant:
+            status = _home_time_status(status, own)
+            shown = [own]
+        else:
+            shown = [row["id"] for row in projects.listing(archived=False)]
+            for extra in (project, (status["running"] or {}).get("workspace_id")):
+                if extra and extra not in shown:
+                    shown.append(extra)
+        # P14: which keys are taken describes other projects, so an assistant's
+        # reply suggests none.
+        registry = None if caller.is_assistant else fold_registry(tracker.config)
+        # A key is stored on its first ask, so the shown ones are allocated
+        # before reading which are taken.
+        for workspace_id in shown:
+            projects.project_key(workspace_id)
+        keys = projects.time_keys() if registry is not None else {}
+        options = {workspace_id: _time_options(tracker, person, workspace_id,
+                                               registry=registry, keys=keys)
+                   for workspace_id in shown}
+        handlers, handler_problems = timesheet_handlers.available(tracker.config)
+        held = timetrack_entries.held(tracker.config, person)
+        if caller.is_assistant:
+            held = [row for row in held if row["project"] == options[own]["project_key"]]
+        warnings = list(status["warnings"]) + _held_warnings(held)
+        if status["writer_refusal"]:
+            warnings.append({"kind": "writer",
+                             "message": f"Entries are waiting to be written: {status['writer_refusal']}"})
+        activity = timetrack_activity.get_activity()
+        return {
+            **status,
+            "acting": acting,
+            "warnings": warnings,
+            "projects": options,
+            "handlers": [_time_handler(handler) for handler in handlers.values()],
+            "handler_problems": handler_problems,
+            "unmapped": activity.unmapped_identities() if activity is not None else [],
+        }
+
+    @app.post("/api/time/start", dependencies=guard)
+    def time_start(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Start the acting person's time on a project by hand (D4, D19)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        prompt = body.get("prompt")
+        if prompt is not None and (isinstance(prompt, bool) or not isinstance(prompt, int)):
+            raise TimeRefusal(400, "time_invalid", "prompt must be a prompt id from time status.")
+        named = _time_text(body, "project")
+        if prompt is not None:
+            home = tracker.prompt_workspace(acting["person"], prompt)
+            if home is None:
+                raise TimeRefusal(404, "time_prompt_unknown",
+                                  f"No open prompt {prompt} for {acting['person']}.")
+            if named is not None and named != home:
+                raise TimeRefusal(400, "time_prompt_project",
+                                  "That prompt is for another project.")
+            named = home
+        workspace_id = _time_scope(caller, named)
+        if not workspace_id:
+            raise TimeRefusal(400, "time_project_required",
+                              "Name the project to track time on: project is its workspace id.")
+        values = _time_values(body)
+        # The run an assistant starts time from is the one it works in; the
+        # operator credential is no run's, so its entries name none (#648).
+        sessions = timetrack_activity.session_refs((caller.session_id,)) if caller.is_assistant else ()
+        project_requests.effect()
+        if prompt is not None:
+            result = tracker.answer_prompt(acting["person"], prompt, at=tracker.now(),
+                                           sessions=sessions, **values)
+        else:
+            result = tracker.start(acting["person"], workspace_id, at=tracker.now(),
+                                   trigger="manual", sessions=sessions, **values)
+        return _time_result(result, acting, caller)
+
+    @app.post("/api/time/stop", dependencies=guard)
+    def time_stop(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Stop the acting person's time by hand (D4)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        workspace_id = _time_scope(caller, _time_text(body, "project"))
+        project_requests.effect()
+        result = tracker.stop(acting["person"], workspace_id, at=tracker.now(), trigger="manual")
+        return _time_result(result, acting, caller)
+
+    @app.patch("/api/time/current", dependencies=guard)
+    def time_update(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Edit the running timer's client, title or handler fields (D8)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        values = _time_values(body)
+        base = body.get("base")
+        if base is not None:
+            if not isinstance(base, dict) or not isinstance(base.get("fields", {}), dict):
+                raise TimeRefusal(400, "time_invalid",
+                                  "base must be an object of the values the form loaded.")
+            base = {**_time_values(base), "fields": base.get("fields") or {}}
+        if caller.is_assistant:
+            running = tracker.status(acting["person"])["running"]
+            if running is not None:
+                _time_scope(caller, running["workspace_id"])
+        project_requests.effect()
+        result = tracker.update_running(acting["person"], base=base, **values)
+        return _time_result(result, acting, caller)
+
+    @app.put("/api/time/auto", dependencies=guard)
+    def time_auto(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """Turn the acting person's automatic tracking on or off, until it is turned back (D4)."""
+        project_requests.preflight()
+        body = body or {}
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, _time_text(body, "record"))
+        on = body.get("on")
+        if not isinstance(on, bool):
+            raise TimeRefusal(400, "time_invalid", "on must be true or false.")
+        project_requests.effect()
+        result = tracker.set_automatic(acting["person"], on)
+        payload = _time_result(result, acting, caller)
+        payload["automatic"] = tracker.status(acting["person"])["automatic"]
+        return payload
+
+    @app.get("/api/time/entries", dependencies=guard)
+    def time_entries(
+        start: Optional[str] = Query(default=None, alias="from"),
+        end: Optional[str] = Query(default=None, alias="to"),
+        project: Optional[str] = None, client: Optional[str] = None,
+        handler: Optional[str] = None, status: Optional[str] = None,
+        record: Optional[str] = None, caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """The acting person's entries with their stage and ledger status (D18)."""
+        tracker = _time_tracker(caller)
+        acting = _time_acting(tracker, caller, record)
+        try:
+            filters = timetrack_entries.Filters.parse(
+                start=start, end=end, project=project, client=client, handler=handler,
+                status=status)
+        except ValueError as exc:
+            raise TimeRefusal(400, "time_invalid_filter", str(exc)) from exc
+        if caller.is_assistant:
+            home = _time_scope(caller, None)
+            if filters.project not in (None, home, projects.project_key(home)):
+                raise TimeRefusal(403, "time_other_project",
+                                  "An assistant reads time only on its own project.")
+            filters = replace(filters, project=home)
+        return {**timetrack_entries.entries(tracker.config, tracker, acting["person"], filters),
+                "acting": acting}
+
+
+    # --- time-tracking settings (issue #668, docs/TIME-TRACKING.md#settings) ---
+    #
+    # The registry and the platform-wide defaults are the operator's; an
+    # assistant maps only the person who asked (time/me) and sets its own
+    # project. Every write applies to the running tracking at once.
+
+    def _time_operator_only(caller: Caller, what: str) -> None:
+        if caller.kind != CALLER_OPERATOR:
+            raise TimeRefusal(403, "time_settings_operator_only",
+                              f"{what} is for the operator: Platform settings → Time tracking, or "
+                              "lmer-ctl with the shared secret.")
+
+    def _time_write(compute: Callable[[dict], dict], caller: Caller) -> None:
+        """``mutate_stored``; every refusal it raises means nothing was written."""
+        try:
+            mutate_stored(compute)
+        except time_settings.SettingsRefused as exc:
+            problems = _time_problems(caller, exc.problems)
+            message = "; ".join(problems) if exc.problems else exc.message
+            raise TimeRefusal(exc.status, exc.code, message, problems=problems) from exc
+        except ConfigError as exc:
+            raise TimeRefusal(400, "time_settings_invalid", str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+
+    def _time_store(compute: Callable[[dict], dict], caller: Caller) -> dict:
+        _time_write(compute, caller)
+        return _time_settings_reply(caller, applied=_time_apply())
+
+    def _time_apply() -> str:
+        """Hand the stored change to the running tracking; ``restart`` when this
+        app runs without one (an embedding with no daemon behind it). The file is
+        read under the tracking's lock, so two writes cannot apply out of order."""
+        tracking = timetrack_live.get_tracking()
+        if tracking is None:
+            return "restart"
+        return tracking.reload(load_config)
+
+    def _time_settings_reply(caller: Caller, **extra) -> dict:
+        fresh = load_config()
+        try:
+            stored = read_json(config_path())
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+        stored = stored if isinstance(stored, dict) else {}
+        reply = time_settings.view(fresh, stored)
+        defaults = reply["defaults"]["idle_grace_minutes"]["value"]
+        reply["projects"] = [
+            {"workspace_id": row["id"], "name": row["name"],
+             "idle_grace_minutes": row["settings"].get("time_idle_grace_minutes"),
+             "effective_idle_grace_minutes": row["settings"].get("time_idle_grace_minutes") or defaults}
+            for row in projects.listing(archived=False)
+        ]
+        activity = timetrack_activity.get_activity()
+        reply["unmapped"] = activity.unmapped_identities() if activity is not None else []
+        tracking = timetrack_live.get_tracking()
+        reply["tracking"]["live"] = tracking is not None and tracking.running
+        if caller.kind != CALLER_OPERATOR:
+            # P14: other projects, and other people's ids, are the operator's to read.
+            home = projects.session_home(caller.session_id) if caller.is_assistant else None
+            reply.update(people=[], unmapped=[],
+                         projects=[row for row in reply["projects"] if row["workspace_id"] == home])
+            reply["tracking"]["problems"] = _time_problems(caller, reply["tracking"]["problems"])
+        return {**reply, **extra}
+
+    @app.get("/api/time/settings", dependencies=guard)
+    def time_settings_read(caller: Caller = Depends(require_secret)) -> dict:
+        """The registry, the switch and the platform-wide time defaults, with where each came from."""
+        return _time_settings_reply(caller)
+
+    @app.post("/api/time/people", dependencies=guard)
+    def time_person_add(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Adding a person")
+        return _time_store(lambda current: time_settings.add_person(current, body), caller)
+
+    @app.patch("/api/time/people/{key}", dependencies=guard)
+    def time_person_edit(key: str, body: Optional[dict] = None,
+                         caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Editing a person")
+        return _time_store(lambda current: time_settings.edit_person(current, key, body or {}), caller)
+
+    @app.delete("/api/time/people/{key}", dependencies=guard)
+    def time_person_remove(key: str, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Removing a person")
+        return _time_store(lambda current: time_settings.remove_person(current, key), caller)
+
+    @app.patch("/api/time/defaults", dependencies=guard)
+    def time_defaults(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        _time_operator_only(caller, "Changing the platform-wide time settings")
+        return _time_store(lambda current: time_settings.patch_defaults(current, body or {}), caller)
+
+    def _asker_identity(caller: Caller, record: Optional[str], *, writing: bool) -> tuple:
+        """``(transport, raw_id)`` of the human an assistant is acting for, mapped or not.
+
+        A write needs a delivered conversation request: only its sender is known
+        to have asked, and a thread holds other people's records.
+        """
+        if not caller.is_assistant:
+            raise TimeRefusal(403, "time_settings_assistant_only",
+                              "time/me maps the person an assistant is talking to; the operator "
+                              "edits people in Platform settings → Time tracking.")
+        if not caller.session_id:
+            raise TimeRefusal(403, "time_no_session",
+                              "This assistant credential names no session, so no record says who asked.")
+        hub = _require_hub()
+        binding = project_api.capture()
+        request_id = binding.get("request_id")
+        if not request_id and binding.get("workspace_id"):
+            request_id = project_requests.bound(binding["workspace_id"])
+        handled = project_requests.get(request_id) if request_id and _handling(request_id, caller.session_id) else None
+        if writing and handled is None:
+            raise TimeRefusal(403, "time_no_request",
+                              "No conversation request names who asked, so this assistant cannot list "
+                              "or rename anyone; the operator does it in Platform settings → Time tracking.")
+        if record is not None:
+            message = next((event.message for event in _session_events(hub, caller.session_id)
+                            if event.message.get("id") == record), None)
+            if message is None:
+                raise TimeRefusal(403, "time_record_foreign",
+                                  f"record {record} is not on this assistant's session.")
+            if message.get("kind") not in _HUMAN_KINDS:
+                raise TimeRefusal(422, "time_record_not_human",
+                                  f"record {record} is not a human's message or answer.")
+            identity = people_identity(message)
+            if handled is not None and identity != (handled["transport"], handled["sender"]):
+                raise TimeRefusal(403, "time_record_not_asker",
+                                  f"record {record} is not from the person whose request this is.")
+        else:
+            if handled is not None:
+                identity = (handled["transport"], handled["sender"])
+            else:
+                identity = None
+                for event in _session_events(hub, caller.session_id):
+                    if event.message.get("kind") in _HUMAN_KINDS and people_identity(event.message):
+                        identity = people_identity(event.message)
+        if identity is None:
+            raise TimeRefusal(422, "time_no_record",
+                              "No human message on this assistant's session says who asked; "
+                              "pass the record that carried the request.")
+        if identity[0] not in ("slack", "matrix"):
+            raise TimeRefusal(422, "time_settings_web_chat",
+                              "The web chat acts for default_person; set it in Platform settings → "
+                              "Time tracking.")
+        return identity
+
+    @app.post("/api/time/me", dependencies=guard)
+    def time_me(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """List the person an assistant is talking to, or rename them (docs/TIME-TRACKING.md#settings)."""
+        project_requests.preflight()
+        body = body or {}
+        outcome = {}
+
+        def compute(current: dict) -> dict:
+            changes, person, created = time_settings.map_identity(current, identity, key=key, name=name)
+            outcome.update(person=person, created=created)
+            if changes:
+                project_requests.effect()
+            return changes
+
+        try:
+            key, name = _time_text(body, "key"), _time_text(body, "name")
+            identity = _asker_identity(caller, _time_text(body, "record"),
+                                       writing=key is not None or name is not None)
+            _time_write(compute, caller)
+        except TimeRefusal:
+            project_requests.refused_before_effect()
+            raise
+        reply = _time_settings_reply(caller, applied=_time_apply())
+        return {**reply, "person": outcome["person"], "created": outcome["created"],
+                "identity": f"{identity[0]}:{identity[1]}"}
+
+    @app.patch("/api/time/project", dependencies=guard)
+    def time_project(body: Optional[dict] = None, caller: Caller = Depends(require_secret)) -> dict:
+        """A project's time settings: an assistant's own project, any one for the operator."""
+        if caller.kind != CALLER_OPERATOR and not caller.is_assistant:
+            raise TimeRefusal(403, "time_caller_refused",
+                              f"A {caller.kind} credential cannot change a project's time settings.")
+        project_requests.preflight()
+        body = body or {}
+        named = {"handler": "time_handler", "clients": "time_clients",
+                 "idle_grace_minutes": "time_idle_grace_minutes", "project_key": "time_project_key"}
+        unknown = set(body) - set(named) - {"project", "record"}
+        if unknown:
+            raise TimeRefusal(400, "time_invalid",
+                              f"unknown project time setting(s) {', '.join(sorted(unknown))}: "
+                              f"expected {', '.join(named)}")
+        workspace_id = _time_scope(caller, _time_text(body, "project"))
+        if not workspace_id:
+            raise TimeRefusal(400, "time_project_required", "Name the project: project is its workspace id.")
+        changes = {named[key]: (None if value == "" else value)
+                   for key, value in body.items() if key in named}
+        if not changes:
+            raise TimeRefusal(400, "time_invalid", f"name at least one of {', '.join(named)}.")
+        if "time_project_key" in changes and changes["time_project_key"] is None:
+            raise TimeRefusal(400, "time_invalid", "A project key cannot be cleared; name the key to use.")
+        try:
+            # Read and written under the projects lock, so a settings form saving the
+            # whole map at the same time cannot drop this change, or this one its.
+            with projects.operation():
+                current = projects.get(workspace_id, active=True)
+                projects.validate_time_settings(changes)
+                project_requests.effect()
+                row = projects.update(workspace_id, {"settings": {**current["settings"], **changes}})
+        except projects.ProjectError as exc:
+            # Raised inside projects.update's transaction, so nothing was written.
+            project_requests.refused_before_effect()
+            raise TimeRefusal(getattr(exc, "status", 400) or 400,
+                              getattr(exc, "code", None) or "time_invalid", str(exc)) from exc
+        settings = row["settings"]
+        return {"workspace_id": workspace_id, "project_key": projects.project_key(workspace_id),
+                **{key: settings.get(field) for key, field in named.items() if key != "project_key"}}
+
+    @app.post("/api/time/handlers/check", dependencies=guard)
+    def time_handler_check(body: Optional[dict] = None) -> dict:
+        """Parse a handler definition with this daemon's parser, before it is pushed."""
+        project_requests.preflight()
+        body = body or {}
+        name, text = body.get("name"), body.get("text")
+        if not isinstance(text, str) or not isinstance(name, str) or not name.strip():
+            raise TimeRefusal(400, "time_invalid",
+                              "send name (the file name without .yaml) and text (its contents).")
+        if name.strip() == DEFAULT_HANDLER:
+            return {"ok": False, "handler": None,
+                    "problems": ["timesheet is the built-in handler and cannot be defined"]}
+        handler, problems = parse_handler(text, path=f"{name.strip()}.yaml")
+        return {"ok": handler is not None, "handler": _time_handler(handler) if handler else None,
+                "problems": problems}
+
     @app.get("/api/settings", dependencies=guard)
     def platform_settings() -> dict:
         with project_scope.bound(None):
@@ -3008,20 +3937,27 @@ def create_app(
             _write_assistant_settings({key: value for key, value in body.items() if key != "fleet_groups"}, changes)
             return platform_settings()
 
-    @app.get("/api/health", dependencies=guard)
-    def health() -> dict:
-        """Cheap liveness — deliberately does not pull the mirror.
+    async def _request_state(request: Request):
+        # async so it costs no pool thread: /api/health must not need one.
+        return request.state
 
-        Health checks run often; making one depend on a network fetch would turn
-        a slow remote into a false "unhealthy".
-        """
+    # The same late binding as require_secret: Request is imported in this
+    # function, so the string annotation would not resolve.
+    _request_state.__annotations__["request"] = Request
+
+    def _health_body() -> dict:
+        nonlocal started_ui
         status = mirror_status(config)
+        serving_ui = bundle_fingerprint()
+        if adopt_ui and started_ui is None:
+            started_ui = serving_ui
         return {
             "ok": True,
             "schema": SCHEMA_VERSION,
             "at": utc_now_iso(),
             "bind": config.base_url,
             "ingress": ingress_status.snapshot(),
+            "ui": {"stale": bool(started_ui and serving_ui and serving_ui != started_ui)},
             "mirror": {
                 "present": status.present,
                 "healthy": status.healthy,
@@ -3029,9 +3965,68 @@ def create_app(
             },
         }
 
+    @app.get("/api/health", dependencies=[Depends(require_secret_for_health)])
+    async def health(request_state=Depends(_request_state)) -> dict:
+        """Cheap liveness — deliberately does not pull the mirror.
+
+        Health checks run often; making one depend on a network fetch would turn
+        a slow remote into a false "unhealthy".
+
+        ``ok`` is liveness and nothing more. ``load`` is what the process is
+        doing — requests still waiting, loop lag, pool use, the state build, the
+        project supervisor's cadence, the projects database's write-lock wait —
+        and ``degraded``/``degraded_reasons`` read it (#561), so a daemon whose
+        other routes have wedged can no longer answer here looking idle.
+
+        Nothing on this route needs the handlers' threadpool or the control
+        limiter (#561): its authentication, binding and file reads run on its
+        own small limiter and the load numbers are read on the loop, so a full
+        pool, or every binding thread blocked, is reported here instead of
+        making health time out.
+        """
+        body = await anyio.to_thread.run_sync(_health_body, limiter=health_threads)
+        return {**body, **_load_report(exclude=getattr(request_state, load.IN_FLIGHT_KEY, None))}
+
+    def _load_report(*, exclude=None) -> dict:
+        """What the process is doing now (#561): ``load``, ``degraded``, why.
+
+        *exclude* is the asking request's own ledger key: a health call is
+        itself in flight while it answers, and must not report itself.
+        """
+        current = {
+            "requests": in_flight.snapshot(exclude=exclude),
+            **monitor.snapshot(),
+            "state_build": {**load.BUILDS.snapshot(), "flight": flights.snapshot()},
+            "reconcile": load.RECONCILE.snapshot(),
+            "db_write_wait": load.DB_WRITE_WAIT.snapshot(),
+        }
+        reasons = load.assess(current)
+        return {"load": current, "degraded": bool(reasons), "degraded_reasons": reasons}
+
     @app.get("/api/state", dependencies=guard)
-    def state() -> dict:
-        payload = builder(config)
+    def state(request_state=Depends(_request_state)) -> dict:
+        """The fleet view, from a build this request shares when it may (#561).
+
+        The pull stays per request and outside the shared build: only the
+        request that wins the pull throttle waits on ``git fetch``, never the
+        requests that join its build. Past the join deadline the answer is a 503
+        with ``Retry-After``, which nothing was changed by.
+        """
+        status = _pull_for_request()
+        # A status without a head (none yet, or a stand-in) never matches a
+        # build that has one, so it only ever joins a headless build.
+        head = getattr(status, "head_sha", None)
+        try:
+            payload, stages = flights.get(project_scope.current(), head, _shared_build(status))
+        except state_flight.FlightTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_busy_detail(f"The fleet view is busy ({exc}).", retryable=True,
+                                    advice="Nothing was changed; retry the request."),
+                headers={"Retry-After": STATE_RETRY_AFTER_SECONDS},
+            ) from exc
+        # Read by the slow-request log: which stage the time went to.
+        request_state.timings = stages
         return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.post("/api/rescan", dependencies=guard)
@@ -3145,7 +4140,22 @@ def create_app(
         # 409 for the third instance of the reason above: a thread has one live
         # session at a time (issue #413), so a target another run holds is a
         # request that works once that run lets it go. Nothing was started.
+        #
+        # A check the chat transport rate limited is a 503 with Retry-After
+        # instead: the wait is the caller's (``lmer-ctl spawn`` resends), since
+        # this route runs inside the project operation and sleeping here would
+        # hold every other change. The receipt already says refused (the
+        # preflight above), so a resend under the same request id goes through.
+        # Its own code, because this route also answers the app-wide
+        # ``state_busy`` 503, which may follow a launch and must not be resent.
         except ThreadHeld as exc:
+            pause = rate_limit_pause(exc)
+            if pause is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": THREAD_CHECK_RATE_LIMITED, "message": str(exc), "retryable": True},
+                    headers={"Retry-After": str(math.ceil(pause))},
+                )
             raise HTTPException(status_code=409, detail=str(exc))
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -3288,6 +4298,7 @@ def create_app(
                     session_id, kind=kind, text=data.rstrip("\r\n"),
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    meta=_credential_meta(caller),
                     authority=_authority_of(caller, session_id, kind),
                 )
             except SessionIOError as exc:
@@ -3547,6 +4558,7 @@ def create_app(
                     option=option,
                     channel=caller.source_channel,
                     author=_author_of(caller, body.get("author")),
+                    meta=_credential_meta(caller),
                     authority=_authority_of(caller, session_id, comms.KIND_ANSWER),
                 )
             except SessionIOError as exc:
@@ -3681,7 +4693,7 @@ def create_app(
                 option=option,
                 options=[str(item) for item in options],
                 attachments=[item for item in attachments if isinstance(item, dict)],
-                meta=_caller_meta(body.get("meta"), kind),
+                meta=_credential_meta(caller, _caller_meta(body.get("meta"), kind)),
                 authority=_authority_of(caller, session_id, kind),
             )
         except comms.NoBus:
@@ -4695,6 +5707,7 @@ def create_app(
                 # arriving as ``None`` and reading as "leave this field alone".
                 title=body.get("title"),
                 description=body.get("description"),
+                issues=body.get("issues"),
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4825,6 +5838,89 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _note_check(caller, run=parts)
         return _run_files_reply(config, run)
+
+    # --- AI usage (#315, #647; docs/USAGE-TRACKING.md) ------------------------
+    #
+    # Read-only. The fleet view is account-wide, so it is unbound like
+    # /api/state; one run's usage is run-keyed and read on open like the file
+    # list above, never on the poll.
+
+    @app.get("/api/usage", dependencies=guard)
+    def usage_fleet(window: str = "1h", caller: Caller = Depends(require_secret)) -> dict:
+        """Fleet usage over *window*, the runs burning most now, and limit headroom.
+
+        Scoped like ``/api/state``: a request bound to a project (an assistant's
+        home, or a workspace the operator names) sees only that project's runs."""
+        table, problem = usage_api.price_table(config)
+        scope = project_scope.current() if projects.enabled() else None
+
+        def in_scope(key) -> bool:
+            return (projects.run_home(run_key(*key)) or {}).get("project_id") == scope
+
+        try:
+            reply = usage_api.fleet(
+                usage_live.current(), window=window, table=table,
+                projection_minutes=config.usage_projection_minutes,
+                include=in_scope if scope else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        reply["enabled"] = config.usage_enabled
+        reply["prices"] = {"configured": table is not None, "problem": problem,
+                           "table_hash": getattr(table, "hash", None)}
+        return reply
+
+    @app.get("/api/usage/rollup", dependencies=guard)
+    def usage_rollup_route(
+        project: str = "", period: str = "day", since: str = Query("", alias="from"),
+        until: str = Query("", alias="to"), caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """Usage per period for one repo project (``host/project``), from the
+        run-dir records in the mirror, standalone runs included. Never pulls."""
+        host, _, repo_project = project.partition("/")
+        if not host or not repo_project:
+            raise HTTPException(status_code=400, detail="project must be <host>/<project>")
+        table, problem = usage_api.price_table(config)
+        try:
+            reply = usage_rollup.rollup(
+                run_dirs(config), host=host, project=repo_project, period=period,
+                since=since or None, until=until or None, table=table,
+                live=usage_live.current(), mirror_sha=mirror_status(config).head_sha,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        reply["prices_problem"] = problem
+        return reply
+
+    @app.get("/api/runs/usage", dependencies=guard)
+    def run_usage(
+        host: str = "", project: str = "", slug: str = "", uid: str = "",
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """One run's usage per session: the run-dir record beside the live numbers."""
+        run = _query_run(host, project, slug, uid)
+        try:
+            parts = _run_parts(run)
+            run_key(*parts)
+        except RunIndexError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _note_check(caller, run=parts)
+        ref = resolve_run_dir(config, host, project, slug or None, uid=_bound_uid(run) or None)
+        records = []
+        if ref is not None:
+            base = _web_base_from_remote((config.work_repo_url or "").strip()) or ""
+            branch = checkout_branch(config.mirror_path)
+
+            def url_for(name: str) -> str:
+                return forge_web_url(base, branch, f"{ref.rel_path}/{name}",
+                                     forge=config.work_repo_forge, default_forge=FORGE_GITLAB)
+
+            records = usage_api.read_records(ref.path, url_for)
+        table, problem = usage_api.price_table(config)
+        reply = usage_api.run_detail(usage_live.current(), parts, records, slug=slug, table=table)
+        reply["present"] = ref is not None
+        reply["prices_problem"] = problem
+        return reply
 
     # --- the launches of one target (#374, spec §13.F) ------------------------
     #
@@ -5457,6 +6553,22 @@ def create_app(
             raise HTTPException(status_code=403, detail="only an operator may release a blocked request")
         return project_requests.release(request_id, body.get("reason"), workspace_id=project_scope.current())
 
+    @app.post("/api/threads/release", dependencies=guard)
+    def thread_release(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Give up this project's claim on a thread, or hand it to another project."""
+        if not projects.enabled():
+            raise HTTPException(status_code=409, detail="Thread claims exist only once projects are enabled.")
+        operator = caller.kind == CALLER_OPERATOR
+        if not operator and not caller.is_assistant:
+            raise HTTPException(status_code=403, detail="only a project assistant or the operator may release a thread claim")
+        try:
+            return project_requests.release_thread(
+                body.get("permalink"), workspace_id=project_scope.current(), to=body.get("to"),
+                reason=body.get("reason"), by="operator" if operator else "assistant",
+                bound=None if operator else project_api.capture().get("request_id"))
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:
         """Take the digests the daemon spooled for the assistant, and clear them.
@@ -5522,7 +6634,8 @@ def create_app(
         Keys are the launch-setting names (including ``threads``) plus the integer settings
         (display-only ``dock_keep_last_notes`` from #465, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
-        #446) and the booleans ``chat_show_transcript`` (#488) and ``chat_tint_operator`` (#646),
+        #446) and the booleans ``chat_show_transcript`` (#488), ``chat_tint_operator`` (#646),
+        ``chat_enter_sends`` (#663) and ``chat_scroll_long_messages``,
         which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. A boolean takes ``true``/``false`` (the JSON
@@ -5872,7 +6985,7 @@ def create_app(
         stays visible, so discarding it is an acknowledgement the operator makes
         explicitly rather than a side effect of refreshing the view.
         """
-        removed = prune_dead()
+        removed = prune_dead(gone=reattach.gone_since_restart)
         return {"removed": removed, "count": len(removed)}
 
     return app

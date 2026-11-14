@@ -125,6 +125,7 @@ __all__ = [
     "REGISTRY_HIT",
     "SCHEMA_AREAS",
     "SHORT_NAME_RE",
+    "WORK_REPO_DATA_DIRS",
     "Project",
     "Registry",
     "RegistryError",
@@ -151,6 +152,11 @@ LEGACY_AREAS = ("runs", "specs", "info", "memory")
 
 #: The §1 marker test, verbatim: any of these directly inside a dir.
 PROJECT_MARKERS = SCHEMA_AREAS + LEGACY_AREAS
+
+#: Dotted top-level names that hold work-repo data with a contract of its own
+#: (SCHEMA.md Inventory): never a host bucket, and nothing below one is a
+#: project. ``timesheet.d/`` is the time log (docs/TIME-TRACKING.md).
+WORK_REPO_DATA_DIRS = ("timesheet.d",)
 
 #: :attr:`Resolution.how` values.
 REGISTRY_HIT = "registry"
@@ -403,12 +409,14 @@ def is_short_name(name) -> bool:
 
 def is_host_bucket_name(name) -> bool:
     """§1: a top-level *name* that is a host bucket — it contains a dot and is
-    neither hidden (``.git``) nor schema-owned (``_*``). Dotless hosts are
-    unsupported as buckets at v1."""
+    neither hidden (``.git``), schema-owned (``_*``) nor one of
+    :data:`WORK_REPO_DATA_DIRS`. Dotless hosts are unsupported as buckets at
+    v1."""
     return (
         isinstance(name, str)
         and "." in name
         and not name.startswith((".", "_"))
+        and name not in WORK_REPO_DATA_DIRS
     )
 
 

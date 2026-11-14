@@ -22,6 +22,7 @@ from slack_chat import registry as thread_registry
 from slack_chat.client import SlackClient, SlackError
 from slack_chat.permalink import slack_thread_link
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import JOIN
 
 SECRET = "test-secret-value"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
@@ -76,7 +77,7 @@ class Slack:
         sender = kwargs["params"]["user"]
         return {"ok": True, "user": {"id": sender, "name": self.handles.get(sender, "somebody")}}
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         return [{"ts": ts, "user": SLACK_USER, "text": "root"}]
 
     def post_message(self, channel, thread_ts, text):
@@ -605,7 +606,9 @@ async def test_other_dm_thread_reply_reaches_worker_bus_only(tmp_path, client, m
         assert b"for the worker" in b"".join(rig.sink)
         assert pending(client) == []
     finally:
-        assert rig.connector.stop(timeout=10, announce=False)
+        # Finalize is a thread doing a bus ack and a state close, so it gets the
+        # join budget, which scales with a loaded host.
+        assert rig.connector.stop(timeout=JOIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
 

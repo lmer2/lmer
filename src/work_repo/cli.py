@@ -39,8 +39,8 @@ from .git_ops import (
     web_url_for,
 )
 from . import (
-    git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
-    specs_index, write_journal,
+    decisions, git_ops, goals, housekeep, knowledge, plan_index, release_claims, release_run, run_state,
+    specs_index, usage, write_journal,
 )
 from .memory import (
     MemoryRetirementError, forget_memory, memory_retirement_paths, memory_write_rel_paths,
@@ -410,6 +410,31 @@ Examples:
     event_parser.add_argument("--note", help="Short human-readable note")
     event_parser.add_argument("--data", help="JSON object with extra data")
 
+    # decision / decisions (the human review report's Decisions — issue #674)
+    decision_parser = subparsers.add_parser(
+        "decision",
+        help="Record a decision: who decided comes from the --ref message on the "
+             "session bus; without --ref it is the agent's own",
+    )
+    decision_parser.add_argument(
+        "what", nargs="?",
+        help="What was decided (optional for an answer: the answer is the decision)",
+    )
+    decision_parser.add_argument(
+        "--ref", metavar="<message id>",
+        help="The bus message the decision came from (`lmer-signal list` shows ids)",
+    )
+    decisions_parser = subparsers.add_parser(
+        "decisions",
+        help="List recorded decisions and who made them (read-only)",
+    )
+    decisions_parser.add_argument(
+        "--target", metavar="<url>",
+        help="Every run whose target is this URL (an issue or MR); default: the current run",
+    )
+    decisions_parser.add_argument("--json", action="store_true", dest="as_json",
+                                  help="Emit the decisions as JSON")
+
     # ledger command (per-task execution ledger — issue #89)
     ledger_parser = subparsers.add_parser(
         "ledger",
@@ -730,9 +755,22 @@ Examples:
              "harness id chains into its lineage and every later `work` "
              "invocation of the launch finds it there",
     )
-    subparsers.add_parser(
+    session_end_parser = subparsers.add_parser(
         "session-end",
         help="Record session end, release the owner claim, push run state (hook-facing)",
+    )
+    session_end_parser.add_argument(
+        "--exit-code", type=int, default=None, metavar="<n>",
+        help="The harness's exit status, from the runner; non-zero marks the usage record crashed",
+    )
+
+    usage_parser = subparsers.add_parser(
+        "usage",
+        help="Show this session's AI usage, or checkpoint it into the run dir (docs/USAGE-TRACKING.md)",
+    )
+    usage_parser.add_argument(
+        "--checkpoint", action="store_true",
+        help="Rewrite ai-usage/<session>.yaml if its counters changed and commit just that file",
     )
 
     return parser
@@ -900,6 +938,9 @@ def cmd_commit(message: str | None) -> int:
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
     _sync_masterplan_links()
+    # Refresh this session's usage record into the commit, at most once per
+    # checkpoint interval (#647). Fail-soft: never changes the commit.
+    usage.checkpoint(respect_interval=True)
     rc = commit_work_changes(message)
     # Napkin capture is best-effort in both modes and must never block the
     # worklog commit: a failure is logged but does not change the exit code.
@@ -1679,6 +1720,14 @@ def cmd_event(args) -> int:
         except json.JSONDecodeError as exc:
             print(f"❌ --data is not valid JSON: {exc}", file=sys.stderr)
             return 1
+    if args.type in decisions.DECISION_EVENT_TYPES:
+        # Their writers stamp who decided; a hand-typed one would be believed.
+        print(
+            f"❌ `{args.type}` is written by its own verb (work decision, work goals, "
+            "work answer), not by `work event`",
+            file=sys.stderr,
+        )
+        return 1
     rdir, _state = _require_run()
     if rdir is None:
         return 1
@@ -1690,6 +1739,55 @@ def cmd_event(args) -> int:
         data=_redact_json_values(data),
     )
     print(f"✅ Event appended: {args.type}")
+    return 0
+
+
+def cmd_decision(what: str | None, ref: str | None) -> int:
+    """Record a decision; who made it is read from the bus, never typed (#674).
+
+    The bus is read before the checkout lock is taken, so a slow supervisor
+    never holds up other `work` writers.
+    """
+    if ref is None and not (what or "").strip():
+        print("❌ decision requires what was decided, or --ref <message id>", file=sys.stderr)
+        return 1
+    try:
+        if ref is not None:
+            event_type, note, data = decisions.event_from_bus(ref, what)
+        else:
+            event_type, note, data = decisions.agent_decision(what)
+    except decisions.DecisionError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    return _append_decision(event_type, note, data)
+
+
+@work_transaction
+def _append_decision(event_type: str, note: str | None, data: dict) -> int:
+    rdir, _state = _require_run()
+    if rdir is None:
+        return 1
+    run_state.append_event(rdir, event_type, note=note, data=data)
+    print(f"✅ Decision recorded ({event_type}): {decisions.who_for(data)}")
+    return 0
+
+
+def cmd_decisions(target: str | None, as_json: bool) -> int:
+    """List recorded decisions (read-only; no run context exits 0 like the other readers)."""
+    if target:
+        runs = decisions.runs_for_target(target)
+    else:
+        rdir = run_state.run_dir()
+        state = run_state.read_state_best_effort(rdir) if rdir is not None else None
+        if state is None:
+            print(no_run_context_error() if rdir is None else "No run state recorded yet.")
+            return 0
+        runs = [(rdir, state)]
+    rows = decisions.decision_rows(runs)
+    if as_json:
+        print(json.dumps({"runs": [str(rdir) for rdir, _ in runs], "decisions": rows}, indent=2))
+    else:
+        print(decisions.format_text(rows))
     return 0
 
 
@@ -4316,7 +4414,9 @@ def _source_slug_warning(context: dict, slug: str | None) -> str | None:
 @work_transaction
 def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
-    ALWAYS exits 0 — a broken state layer must never break session start.
+    exits 0 — a broken state layer must never break session start. A refusal
+    exits 2: a schema-2 start refused by the state layer, or an explicit
+    `--session` naming no session dir (#639), which the hook never passes.
 
     `--session` is the D22 resume handshake, and it happens exactly once per
     launch: the named record is the one this session continues, and
@@ -4333,6 +4433,7 @@ def cmd_session_start(session: str | None = None) -> int:
     except SchemaContextError as exc:
         print(f"No run context: {exc} — run state skipped")
         return 0
+    explicit = session
     try:
         session = _launch_session(session)
         rdir = run_state.run_dir(session=session)
@@ -4341,6 +4442,13 @@ def cmd_session_start(session: str | None = None) -> int:
         # consequence is. Hook-facing: reported, never raised, still 0.
         print(f"⚠️  run-state session-start skipped: {exc}")
         return 0
+    if explicit and rdir is not None:
+        # Only an operator passes --session (the hook never does), so this
+        # refusal can be loud without breaking session start.
+        reason = run_state.unresolved_session_reason(rdir, explicit)
+        if reason:
+            print(f"Session start refused: {reason}", file=sys.stderr)
+            return 2
     if rdir is None:
         # The cause, not a guess at it. `hooks/start.py` runs this verb with
         # `capture_output=True` and injects its STDOUT into the agent's
@@ -4553,10 +4661,41 @@ def _release_claim_at_session_end(rdir) -> None:
           "leaving the claim to the stale threshold")
 
 
+def cmd_usage(checkpoint: bool = False) -> int:
+    """Print this session's usage, or checkpoint it (``--checkpoint``).
+
+    The checkpoint commits only this session's record file. It is driven by the
+    runner's timer and always exits 0: usage never fails a session.
+    """
+    if checkpoint:
+        return _checkpoint_usage()
+    summary = usage.summarise(usage.session_files())
+    print(json.dumps({
+        "totals": summary.totals,
+        "models": summary.row_list(),
+        "not_collected": summary.not_collected,
+        "active_seconds": summary.active_seconds,
+    }, indent=2))
+    return 0
+
+
 @work_transaction(failure_result=0)
-def cmd_session_end() -> int:
+def _checkpoint_usage() -> int:
+    path = usage.checkpoint()
+    if path is None:
+        return 0
+    rel = usage.rel_path(path)
+    if rel and commit_work_path([rel], f"usage: checkpoint {path.stem}") != 0:
+        print("⚠️  usage checkpoint saved locally; push failed (the next commit carries it)")
+    return 0
+
+
+@work_transaction(failure_result=0)
+def cmd_session_end(exit_code: int | None = None) -> int:
     """Record session end, release a claim we hold, and push the run dir.
-    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write."""
+    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write.
+    *exit_code* is the harness's, passed by the runner's backstop; the hook
+    passes none."""
     rdir = run_state.run_dir()
     if rdir is None:
         return 0
@@ -4573,6 +4712,8 @@ def cmd_session_end() -> int:
         if state is None:
             return 0
         run_state.append_event(rdir, "session_end")
+        # The final usage record rides this push (#647); fail-soft by design.
+        usage.finalise(exit_code)
         owner = state.get("owner")
         if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
             state["owner"] = None
@@ -4660,10 +4801,12 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         return None if args.description is None else run_candidates()
     if command == "name":
         return None if args.value is None else run_candidates()
-    if command in ("event", "verify", "report", "session-start"):
+    if command in ("event", "decision", "verify", "report", "session-start"):
         return run_candidates()
     if command in ("answer", "session-end"):
         return pushing(run_candidates())
+    if command == "usage":
+        return pushing(run_candidates()) if getattr(args, "checkpoint", False) else None
     if command == "release":
         action = getattr(args, "release_action", None)
         if action in ("claim", "unclaim", "abort", "record"):
@@ -4881,6 +5024,10 @@ def _dispatch(args, parser) -> int:
         return cmd_verify(raw[1], raw[3:])
     elif args.command == "event":
         return cmd_event(args)
+    elif args.command == "decision":
+        return cmd_decision(args.what, args.ref)
+    elif args.command == "decisions":
+        return cmd_decisions(args.target, args.as_json)
     elif args.command == "answer":
         return cmd_answer(args.text)
     elif args.command == "name":
@@ -4930,7 +5077,9 @@ def _dispatch(args, parser) -> int:
     elif args.command == "session-start":
         return cmd_session_start(args.session)
     elif args.command == "session-end":
-        return cmd_session_end()
+        return cmd_session_end(args.exit_code)
+    elif args.command == "usage":
+        return cmd_usage(args.checkpoint)
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

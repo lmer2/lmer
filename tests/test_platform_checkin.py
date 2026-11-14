@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from lmer_platform import checkin, store
+from lmer_platform import checkin, mr_activity, store
 
 WINDOW = 3600
 
@@ -139,6 +139,236 @@ def test_a_dormant_run_can_go_stale(platform_root):
     assert [run.slug for run in checkin.stale_runs(payload, window=WINDOW)] == [
         "review-mr-202"
     ]
+
+
+# --- a review waiting on an MR that has not moved (#401, #244) ----------------
+#
+# A clean wind-down leaves a review run `dormant` at `in-progress`, so neither
+# `state` nor `status` can tell "waiting on its author" from "stalled". The run's
+# phase cannot either: `cleanup` says the reviewer's turn is over, never that
+# nobody owes one (#244's review-mr-202 sat at `cleanup` with the fix pushed). The
+# discriminator is at the source: has the MR moved since `review_posted`? Quiet
+# means excluded; any movement, any failure to find out, or no review recorded
+# at all means named.
+
+MR = "https://git.example.com/acme/widgets/-/merge_requests/202"
+
+
+def review_row(slug="review-mr-202", **overrides):
+    """A review run that posted its review six hours ago and wound down."""
+    fields = {
+        "state": "dormant",
+        "status": "in-progress",
+        "phase": "cleanup",
+        "stop_reason": None,
+        "target": MR,
+        "review_posted_at": iso(hours=6),
+    }
+    fields.update(overrides)
+    return row(slug=slug, **fields)
+
+
+def mr_state(*, pushed=None, commented=None, state="opened", note_id=1):
+    """What the fetcher reports for the MR; defaults are "nothing since the review"."""
+    return {
+        "head_sha": "abc123",
+        "pushed_at": pushed or iso(hours=7),
+        "comments": [[note_id, commented or iso(hours=7)]],
+        "page_floor": None,
+        "state": state,
+    }
+
+
+def activity(payload, reported):
+    """The MR-activity cache after one refresh against a fake fetcher.
+
+    *reported* is what the fetcher answers, or an exception it raises.
+    """
+    def fetch(ref):
+        if isinstance(reported, Exception):
+            raise reported
+        return dict(reported)
+
+    candidates = checkin.review_candidates(payload, window=WINDOW)
+    return mr_activity.refresh(candidates, window=WINDOW, fetch=fetch)
+
+
+def named(payload, cache):
+    return [run.slug for run in checkin.stale_runs(payload, window=WINDOW, activity=cache)]
+
+
+def long_quiet(payload, *slugs):
+    checkin.observe(payload)
+    for slug in slugs:
+        stamp(slug, "first_seen", iso(hours=48))
+
+
+def test_a_review_run_at_cleanup_whose_mr_has_not_moved_is_not_named(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    assert named(payload, activity(payload, mr_state())) == [], (
+        "a review waiting on an author who has done nothing owes no turn"
+    )
+
+
+def test_the_same_run_is_named_again_once_the_mr_has_a_new_head(platform_root):
+    """The #244 case: the author pushed after the review, nobody turned the reviewer."""
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    assert named(payload, activity(payload, mr_state())) == [], "precondition"
+
+    # The window passes and the author pushes: the cache is due a refresh.
+    cache = mr_activity.read_cache()
+    for entry in cache["mrs"].values():
+        entry["fetched_at"] = iso(hours=2)
+    store.write_json(mr_activity.cache_path(), cache)
+
+    pushed = mr_state(pushed=iso(minutes=30))
+    assert named(payload, activity(payload, pushed)) == ["review-mr-202"]
+
+
+def test_the_401_evidence_shape_is_not_named_while_its_mr_is_quiet(platform_root):
+    """`dormant`, phase `cleanup`, status `in-progress`, no stop reason, no question."""
+    payload = fleet(
+        review_row(
+            slug="review-mr-7",
+            state="dormant",
+            status="in-progress",
+            phase="cleanup",
+            stop_reason=None,
+            target="https://git.example.com/acme/widgets/-/merge_requests/7",
+        )
+    )
+    long_quiet(payload, "review-mr-7")
+    assert named(payload, activity(payload, mr_state())) == []
+
+
+def test_a_new_note_since_the_review_names_the_run(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    replied = mr_state(commented=iso(minutes=20))
+    assert named(payload, activity(payload, replied)) == ["review-mr-202"], (
+        "an author who replied on the threads is owed a turn"
+    )
+
+
+def test_the_reviewers_own_recorded_replies_do_not_name_the_run(platform_root):
+    """!352 at 353dffa1: "verified in" replies right after `review_posted`,
+    each recorded by the review session as a `review_note` event."""
+    payload = fleet(review_row(review_note_ids=[9101]))
+    long_quiet(payload, "review-mr-202")
+    cleanup = mr_state(commented=iso(hours=5, minutes=59), note_id=9101)
+    assert named(payload, activity(payload, cleanup)) == []
+
+
+def test_a_reply_the_review_did_not_record_names_the_run(platform_root):
+    """F3 (!149's shape): however late the review session ended, an author
+    reply after the review is the author's turn, and it names the run."""
+    payload = fleet(review_row(review_note_ids=[9101]))
+    long_quiet(payload, "review-mr-202")
+    replied = mr_state(commented=iso(hours=5), note_id=4200)
+    assert named(payload, activity(payload, replied)) == ["review-mr-202"]
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_a_review_run_on_a_finished_mr_is_not_named(platform_root, state):
+    """#401's review-mr-160 (closed) and review-mr-167 (merged): nothing is owed."""
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    finished = mr_state(state=state, pushed=iso(minutes=5), commented=iso(minutes=5))
+    assert named(payload, activity(payload, finished)) == []
+
+
+def test_a_fetch_error_names_the_run(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    failed = mr_activity.FetchError("HTTP 503 from git.example.com")
+    assert named(payload, activity(payload, failed)) == ["review-mr-202"], (
+        "not knowing whether the MR moved is not knowing that it did not"
+    )
+
+
+def test_an_unexpected_fetcher_crash_still_names_the_run(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    assert named(payload, activity(payload, ValueError("bad JSON"))) == [
+        "review-mr-202"
+    ]
+
+
+def test_a_run_without_review_posted_keeps_todays_behaviour(platform_root):
+    """Phase names no longer matter: `cleanup` and `signed-off` are just text."""
+    payload = fleet(
+        review_row(slug="review-mr-7", review_posted_at=None),
+        review_row(slug="review-mr-83", phase="signed-off", review_posted_at=None),
+    )
+    long_quiet(payload, "review-mr-7", "review-mr-83")
+    assert sorted(named(payload, activity(payload, mr_state()))) == [
+        "review-mr-7", "review-mr-83",
+    ]
+
+
+def test_without_an_activity_cache_a_review_run_is_named(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    assert named(payload, None) == ["review-mr-202"]
+
+
+def test_a_target_that_is_not_a_gitlab_mr_keeps_todays_behaviour(platform_root):
+    payload = fleet(
+        review_row(target="https://github.com/acme/widgets/pull/9"),
+    )
+    long_quiet(payload, "review-mr-202")
+    assert named(payload, activity(payload, mr_state())) == ["review-mr-202"]
+
+
+@pytest.mark.parametrize("overrides", [
+    pytest.param(
+        {"state": "waiting_on_you", "stop_reason": "question",
+         "attention": {"reason": "question", "note": "which branch?"}},
+        id="open-question",
+    ),
+    pytest.param(
+        {"state": "yielded", "stop_reason": "yield",
+         "attention": {"reason": "yield", "note": "stopped at a phase boundary"}},
+        id="attention-card",
+    ),
+    pytest.param({"state": "running", "live": True}, id="live-session"),
+])
+def test_the_guards_outrank_a_quiet_mr(platform_root, overrides):
+    payload = fleet(review_row(**overrides))
+    long_quiet(payload, "review-mr-202")
+    cache = mr_activity.refresh(
+        [("git.example.com/acme/widgets/review-mr-202", MR)],
+        window=WINDOW,
+        fetch=lambda ref: mr_state(),
+    )
+    assert named(payload, cache) == ["review-mr-202"]
+
+
+def test_only_stale_review_runs_are_fetched_for(platform_root):
+    """The API is asked about a run only when it would otherwise be named."""
+    payload = fleet(review_row(), review_row(slug="review-mr-9", target=MR))
+    checkin.observe(payload)
+    stamp("review-mr-202", "first_seen", iso(hours=48))
+    stamp("review-mr-9", "checked_at", iso(minutes=5))
+    assert [key for key, _target in checkin.review_candidates(
+        payload, window=WINDOW
+    )] == ["git.example.com/acme/widgets/review-mr-202"]
+
+
+def test_the_fleet_badge_agrees_with_the_digest(platform_root):
+    payload = fleet(review_row())
+    long_quiet(payload, "review-mr-202")
+    cache = activity(payload, mr_state())
+    facts = checkin.row_checkin(
+        payload["runs"][0], checkin.read_marks(), window=WINDOW, activity=cache
+    )
+    assert facts["stale"] is False
+    moved = checkin.row_checkin(
+        payload["runs"][0], checkin.read_marks(), window=WINDOW, activity=None
+    )
+    assert moved["stale"] is True
 
 
 def test_an_unparseable_stamp_does_not_produce_an_endless_reminder(platform_root):

@@ -34,8 +34,11 @@ from lmer_cli import dm_access
 from lmer_cli import assistant_mentions
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
+from lmer_cli.thread_access import SLACK_FILES_READ
 from lmer_cli.tls import ensure_ca_bundle
 
+from .client import scopes_granted
+from .connector import FILES_UNREADABLE_NOTE, files_unreadable
 from .registry import is_thread_connected
 from .sessions import preset_ack_parts
 from .sessions import SessionManager
@@ -65,6 +68,9 @@ PERMALINK_FETCH_TIMEOUT_SECONDS = 10.0
 # The bot's own Slack user ID, resolved once at startup (used to render the
 # reconnect mention without hardcoding the bot's name).
 _bot_user_id: str | None = None
+
+# The scopes that same auth_test reported; None until it has answered.
+_granted_scopes: list[str] | None = None
 
 
 def _ensure_ca_bundle() -> None:
@@ -134,11 +140,14 @@ def build_app(token: str | None = None):
 
 async def _get_bot_user_id() -> str | None:
     """Return the bot's own Slack user ID, caching the auth_test result."""
-    global _bot_user_id
+    global _bot_user_id, _granted_scopes
     if _bot_user_id is None:
         try:
             auth = await app.client.auth_test()
             _bot_user_id = auth.get("user_id")
+            _granted_scopes = scopes_granted(auth)
+            if files_unreadable(_granted_scopes):
+                logger.warning("slack_listener_scope_missing scope=%s", SLACK_FILES_READ)
         except Exception as e:
             logger.warning("auth_test_failed error=%s", e)
     return _bot_user_id
@@ -371,6 +380,10 @@ async def _connect_lmer_session(
     ack += "... ⏳ (the first reply can take a minute)"
     if preset_warning:
         ack += f"\n{preset_warning}"
+    # The spawned connector runs with its own connect notice off, so this is
+    # the only place the thread can be told. From the cache: no Slack call here.
+    if files_unreadable(_granted_scopes):
+        ack += f"\n{FILES_UNREADABLE_NOTE}"
     if is_dm:
         ack += "\nPlease reply *in this thread* to continue the conversation."
     await say(text=ack, thread_ts=thread_ts)

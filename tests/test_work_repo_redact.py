@@ -83,7 +83,8 @@ class TestCollectSecretValues:
             assert "lowercase-key-value" in secrets
 
     def test_ignores_secret_named_locator_values(self):
-        env = {"LMER_GITLAB_TOKEN_HOST": "git.example.com"}
+        env = {"LMER_GITLAB_TOKEN_HOST": "git.example.com",
+               "LMER_RELEASE_SIGNING_KEY": "/release-signing-key"}
         with patch.dict(os.environ, env, clear=True):
             assert _collect_secret_values() == []
 

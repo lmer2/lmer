@@ -397,13 +397,18 @@ def test_the_conversation_scrolls_inside_its_own_box():
     )
 
 
-def test_one_huge_message_cannot_push_the_rest_out_of_reach():
+def test_one_huge_message_scrolls_in_its_bubble_only_when_the_operator_chose_it():
     """Tool output and pasted files are routine in these transcripts, so a single
-    turn taller than the pane it sits in is the common case, not the edge one."""
-    rule = _chat_rule(".said")
+    turn taller than the pane it sits in is the common case, not the edge one.
+
+    The cap is a platform setting, off by default: a bubble with its own
+    scroll area inside a scrolling feed is two scroll areas under one thumb."""
+    rule = _chat_rule(".said-capped .said")
     assert "max-height" in rule and "overflow-y: auto" in rule, (
-        "one message stretches the conversation box instead of scrolling"
+        "the capped bubble no longer scrolls"
     )
+    assert "max-height" not in _chat_rule(".said"), "every message is capped again"
+    assert "'said-capped': chatScrollLongMessages" in _chat_source()
 
 
 def test_the_conversation_follows_the_end_only_while_the_end_is_being_read():
@@ -489,6 +494,9 @@ ALLOWED_STORAGE_KEYS = {
     # `list` is the first mode and therefore the default, so an operator who
     # never touches the switch sees the view they already had.
     "FLEET_VIEW_STORAGE_KEY",
+    # Whether the run list is shown as listed or ranked "most expensive now"
+    # (#315). A reading preference, default as listed; it fetches nothing.
+    "LIST_ORDER_STORAGE_KEY",
     # Whether the status strip in uber lmer's chat pane is hidden (#507). A reading
     # preference for that one pane, default shown; run-view and run-list strips are
     # not governed by it, and hiding it fetches nothing less.

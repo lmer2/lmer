@@ -478,6 +478,53 @@ ROUTE_TABLE = [
      None, None),
     (["runs", "unmute", "--session", "s-chat"], "POST",
      "/api/sessions/s-chat/unmute", None, None),
+    # #604: no verb takes a person — the daemon resolves who asked.
+    (["time", "status"], "GET", "/api/time/status", {}, None),
+    (["time", "status", "--record", "s-a/000004", "--project", "w-1"], "GET",
+     "/api/time/status", {"project": "w-1", "record": "s-a/000004"}, None),
+    (["time", "start", "--project", "w-1"], "POST", "/api/time/start", None,
+     {"project": "w-1"}),
+    (["time", "start", "--project", "w-1", "--client", "acme", "--title", "checkout",
+      "--field", "task_id=abc123", "--field", "note=a=b", "--record", "s-a/000004"],
+     "POST", "/api/time/start", None,
+     {"project": "w-1", "client": "acme", "title": "checkout", "record": "s-a/000004",
+      "fields": {"task_id": "abc123", "note": "a=b"}}),
+    (["time", "stop"], "POST", "/api/time/stop", None, {}),
+    (["time", "stop", "--record", "s-a/000004"], "POST", "/api/time/stop", None,
+     {"record": "s-a/000004"}),
+    (["time", "set", "--title", "#604 now"], "PATCH", "/api/time/current", None,
+     {"title": "#604 now"}),
+    (["time", "set", "--client", "", "--field", "task_id=abc123", "--record", "s-a/000004"],
+     "PATCH", "/api/time/current", None,
+     {"client": "", "record": "s-a/000004", "fields": {"task_id": "abc123"}}),
+    (["time", "auto", "off"], "PUT", "/api/time/auto", None, {"on": False}),
+    (["time", "auto", "on", "--record", "s-a/000004"], "PUT", "/api/time/auto", None,
+     {"on": True, "record": "s-a/000004"}),
+    (["time", "entries"], "GET", "/api/time/entries", {}, None),
+    (["time", "entries", "--from", "2026-10-01", "--to", "2026-10-31", "--project", "webshop",
+      "--client", "acme", "--handler", "tracker-x", "--status", "held"],
+     "GET", "/api/time/entries",
+     {"from": "2026-10-01", "to": "2026-10-31", "project": "webshop", "client": "acme",
+      "handler": "tracker-x", "status": "held"}, None),
+    # #668: the settings a chat-driven setup reaches.
+    (["time", "settings"], "GET", "/api/time/settings", None, None),
+    (["time", "person", "add", "sam", "--name", "Sam", "--slack", "U0SAM", "--matrix", "@sam:example.org"],
+     "POST", "/api/time/people", None,
+     {"key": "sam", "name": "Sam", "slack": ["U0SAM"], "matrix": ["@sam:example.org"]}),
+    (["time", "person", "set", "sam", "--add", "slack:U0NEW", "--clear-matrix"], "PATCH",
+     "/api/time/people/sam", None, {"matrix": [], "add": ["slack:U0NEW"]}),
+    (["time", "person", "remove", "sam"], "DELETE", "/api/time/people/sam", None, None),
+    (["time", "defaults", "set", "--tracking", "off", "--idle-grace-minutes", "20",
+      "--default-person", ""], "PATCH", "/api/time/defaults", None,
+     {"tracking": False, "idle_grace_minutes": "20", "default_person": ""}),
+    (["time", "me", "--key", "sam", "--name", "Sam"], "POST", "/api/time/me", None,
+     {"key": "sam", "name": "Sam"}),
+    (["time", "me"], "POST", "/api/time/me", None, {}),
+    (["time", "project", "set", "--handler", "board", "--client", "acme", "--client", "globex"],
+     "PATCH", "/api/time/project", None, {"handler": "board", "clients": ["acme", "globex"]}),
+    (["time", "project", "set", "--project", "w-1", "--clear-clients", "--idle-grace-minutes", "",
+      "--key", "webshop"], "PATCH", "/api/time/project", None,
+     {"project": "w-1", "clients": "", "idle_grace_minutes": "", "project_key": "webshop"}),
 ]
 
 
@@ -489,6 +536,34 @@ def test_a_verb_is_one_route_and_the_arguments_it_was_given(
     assert (call.method, call.path) == (method, path)
     assert call.params == params
     assert call.body == body
+
+
+def test_time_set_with_nothing_to_change_is_refused_before_the_request(configured, capsys):
+    transport = Recorder()
+    assert ctl.main(["time", "set", "--record", "s-a/000004"], transport=transport) == ctl.EXIT_FAILURE
+    assert transport.calls == []
+    assert "--title, --client or --field" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv, words", [
+    (["time", "person", "set", "sam"], "--name, --slack, --matrix, --add"),
+    (["time", "defaults", "set"], "at least one setting"),
+    (["time", "project", "set", "--project", "w-1"], "--handler, --client"),
+    (["time", "handler", "check", "/nonexistent/board.yaml"], "cannot read"),
+])
+def test_a_time_settings_verb_with_nothing_to_send_is_refused_before_the_request(configured, capsys, argv, words):
+    transport = Recorder()
+    assert ctl.main(argv, transport=transport) == ctl.EXIT_FAILURE
+    assert transport.calls == []
+    assert words in capsys.readouterr().err
+
+
+def test_handler_check_sends_the_file_and_names_it_by_its_stem(tmp_path):
+    definition = tmp_path / "board.yaml"
+    definition.write_text("name: board\nfields: []\n", encoding="utf-8")
+    call = build("time", "handler", "check", str(definition))
+    assert (call.method, call.path) == ("POST", "/api/time/handlers/check")
+    assert call.body == {"name": "board", "text": "name: board\nfields: []\n"}
 
 
 def test_spawn_refuses_an_unknown_effort_before_the_request(configured, capsys):
@@ -520,6 +595,25 @@ def test_every_route_this_cli_names_is_served_by_the_app(client):
         assert any(pattern.match(built) for _served, pattern in patterns), (
             f"{' '.join(argv)} names {built}, which this build does not serve"
         )
+
+
+def test_no_time_verb_takes_a_person():
+    """D9: a name never selects the person, so the CLI offers no way to send one."""
+    for verb in ("status", "start", "stop", "entries"):
+        with pytest.raises(SystemExit):
+            build("time", verb, "--project", "w-1", "--person", "blair")
+
+
+@pytest.mark.parametrize("pair", ["task_id", "=abc123"])
+def test_a_field_that_is_not_key_value_is_refused_before_the_request(pair):
+    with pytest.raises(ctl.CtlError, match="key=value"):
+        build("time", "start", "--project", "w-1", "--field", pair)
+
+
+def test_time_with_tracking_off_passes_the_503_through(configured, client, capsys):
+    failure = refused(["time", "status"], client, capsys)
+    assert failure["status"] == 503
+    assert failure["body"]["detail"]["code"] == "time_tracking_off"
 
 
 def test_an_answer_with_neither_text_nor_an_option_is_refused_before_the_request():
@@ -576,6 +670,39 @@ def test_an_omitted_flag_is_absent_from_the_body_not_null():
     body = build("runs", "meta", "set", RUN_KEY, "--title", "auth fix").body
     assert "description" not in body
     assert body["title"] == "auth fix"
+
+
+ISSUE_A = "https://git.example.com/acme/widgets/-/issues/12"
+ISSUE_B = "https://git.example.com/acme/widgets/-/merge_requests/7"
+
+
+def test_runs_meta_set_issue_builds_the_list_in_order():
+    body = build("runs", "meta", "set", RUN_KEY, "--issue", ISSUE_A, "--issue", ISSUE_B).body
+    assert body["issues"] == [ISSUE_A, ISSUE_B]
+    assert "title" not in body and "description" not in body
+
+
+def test_runs_meta_set_clear_issues_sends_an_empty_list():
+    assert build("runs", "meta", "set", RUN_KEY, "--clear-issues").body["issues"] == []
+
+
+def test_runs_meta_set_refuses_issue_and_clear_issues_together():
+    with pytest.raises(ctl.CtlError, match="--clear-issues"):
+        build("runs", "meta", "set", RUN_KEY, "--issue", ISSUE_A, "--clear-issues")
+
+
+def test_runs_meta_set_without_issue_flags_sends_no_issues_key():
+    assert "issues" not in build("runs", "meta", "set", RUN_KEY, "--title", "x").body
+
+
+def test_time_start_answers_a_prompt_without_a_project():
+    call = build("time", "start", "--prompt", "7", "--field", "task_id=abc123")
+    assert call.body == {"prompt": 7, "fields": {"task_id": "abc123"}}
+
+
+def test_time_start_needs_a_project_or_a_prompt():
+    with pytest.raises(ctl.CtlError, match="--prompt"):
+        build("time", "start", "--title", "x")
 
 
 def test_a_run_key_keeps_a_project_that_contains_a_slash():
@@ -909,6 +1036,99 @@ def test_spawn_accepts_repeatable_thread_targets():
     call = build("spawn", "develop", "issue", "--target-thread", links[0], "--target-thread", links[1])
     assert call.body == {"taskdef": "develop", "target": "issue", "targets": links}
     assert "targets" not in build("spawn", "develop", "issue").body
+
+
+class Script:
+    """A transport answering each request with the next reply; the last repeats."""
+
+    def __init__(self, *replies):
+        self.replies, self.calls = replies, []
+
+    def request(self, method, url, **_kwargs):
+        self.calls.append((method, url))
+        return self.replies[min(len(self.calls), len(self.replies)) - 1]
+
+
+RATE_LIMITED = {"code": "thread_check_rate_limited", "message": "cannot check who holds it", "retryable": True}
+#: The app-wide 503 for a busy projects database, after the launch may have happened.
+STATE_BUSY = {"code": "state_busy", "message": "The project state is busy.", "retryable": False}
+
+
+@dataclass
+class Limited:
+    """A 503 as the daemon sends it for a rate-limited thread check, or another *detail*."""
+
+    retry_after: str = "5"
+    detail: object = None
+    status_code: int = 503
+
+    @property
+    def text(self):
+        return json.dumps({"detail": RATE_LIMITED if self.detail is None else self.detail})
+
+    @property
+    def headers(self):
+        return {} if self.retry_after is None else {"retry-after": self.retry_after}
+
+
+@pytest.mark.parametrize("replies, slept, calls, extra", [
+    # Waited out, then started: the reply is the launch's.
+    ([Limited("2"), Reply(201, '{"session_id": "s"}')], [2.0], 2, None),
+    # The budget is the whole spawn's, checked before each wait.
+    ([Limited("10")], [10.0, 10.0], 3, {"attempts": 3, "elapsed_seconds": 20.0}),
+    # The calls are bounded, and Retry-After 0 still leaves a gap.
+    ([Limited("0")], [1.0, 1.0, 1.0], ctl.SPAWN_ATTEMPTS, {"attempts": 4, "elapsed_seconds": 3.0}),
+    # A wait that cannot end inside the budget is not started.
+    ([Limited("40")], [], 1, None),
+    # Not a rate limit: a 503 without Retry-After, a held thread, a bad one.
+    ([Limited(None)], [], 1, None),
+    ([Limited("soon")], [], 1, None),
+    # The daemon's busy-state 503 also carries Retry-After, but the launch may
+    # have happened: resending it could start a second session.
+    ([Limited("1", STATE_BUSY), Reply(201, '{"session_id": "s"}')], [], 1, None),
+    ([Limited("1", {**STATE_BUSY, "retryable": True})], [], 1, None),
+    ([Limited("1", {**RATE_LIMITED, "retryable": False})], [], 1, None),
+    ([Limited("1", "cannot check who holds it")], [], 1, None),
+    ([Reply(409, '{"detail": "connected to another run"}')], [], 1, None),
+])
+def test_spawn_resends_a_rate_limited_launch_within_its_budget(configured, monkeypatch, capsys, replies, slept, calls, extra):
+    now, waits = [0.0], []
+    monkeypatch.setattr(ctl, "_clock", lambda: now[0])
+    monkeypatch.setattr(ctl, "_sleep", lambda seconds: (waits.append(seconds), now.__setitem__(0, now[0] + seconds)))
+    transport = Script(*replies)
+
+    code, out, err = run(["spawn", "develop", "issue", "--target-thread",
+                          "https://team.slack.com/archives/C1/p1700000000000001"], transport, capsys)
+
+    assert (waits, len(transport.calls)) == (slept, calls)
+    assert set(transport.calls) == {("POST", f"{BASE_URL}/api/sessions")}
+    last = replies[min(calls, len(replies)) - 1]
+    if last.status_code == 201:
+        assert (code, json.loads(out)) == (0, {"session_id": "s"})
+    else:
+        failure = json.loads(err)
+        assert code == ctl.EXIT_FAILURE and failure["status"] == last.status_code
+        assert {key: failure[key] for key in ("attempts", "elapsed_seconds") if key in failure} == (extra or {})
+
+
+def test_only_spawn_resends_a_503(configured, monkeypatch, capsys):
+    """Every other verb reports the daemon's 503 as it came."""
+    monkeypatch.setattr(ctl, "_sleep", lambda seconds: pytest.fail(f"slept {seconds}s"))
+    transport = Script(Limited("1"), Reply())
+
+    code, _out, err = run(["runs", "forget", RUN_KEY], transport, capsys)
+
+    assert (code, len(transport.calls)) == (ctl.EXIT_FAILURE, 1)
+    assert "attempts" not in json.loads(err)
+
+
+def test_the_spawn_wait_is_the_daemon_s_own():
+    """Spelled in ``ctl`` to keep its imports off the spawn stack, so pinned here."""
+    from lmer_platform import spawn
+
+    assert (ctl.SPAWN_WAIT_SECONDS, ctl.SPAWN_ATTEMPTS, ctl.SPAWN_MIN_PAUSE_SECONDS) == (
+        spawn.THREAD_CHECK_WAIT_SECONDS, spawn.THREAD_CHECK_ATTEMPTS, spawn.THREAD_CHECK_MIN_PAUSE_SECONDS)
+    assert ctl.THREAD_CHECK_RATE_LIMITED == api.THREAD_CHECK_RATE_LIMITED == RATE_LIMITED["code"]
 
 
 # --- rotate: the one verb that is two calls (issue #446) -----------------------

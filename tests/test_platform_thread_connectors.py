@@ -8,13 +8,17 @@ same file reattaches.
 """
 from __future__ import annotations
 
+import json
 import os
 import stat
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from lmer_platform import connectors, registry, spawn, store
+from matrix_chat import client as matrix_client
+from slack_chat import client as slack_client
 from slack_chat import registry as thread_registry
 from tests.conftest import strip_lmer_env
 
@@ -111,7 +115,7 @@ class FakeSlack:
         self.root = root
         self.asked = []
 
-    def get_replies(self, channel, ts, oldest=None):
+    def get_replies(self, channel, ts, oldest=None, **kw):
         self.asked.append((channel, ts))
         return [{"ts": ts, **({"thread_ts": self.root} if self.root else {})}]
 
@@ -502,7 +506,7 @@ class TestLaunchTargets:
         the runtime block is where the operator learns the connector will not
         run."""
         class Refuses(FakeSlack):
-            def get_replies(self, channel, ts, oldest=None):
+            def get_replies(self, channel, ts, oldest=None, **kw):
                 from slack_chat.client import SlackError
 
                 raise SlackError("Slack API error: not_in_channel", code="not_in_channel")
@@ -730,6 +734,86 @@ class TestOneLiveSessionPerThread:
 
         threads.refuse_held_targets([SLACK_LINK])
 
+    @staticmethod
+    def _slack_answers(monkeypatch, *answers):
+        """Slack over HTTP, for the daemon's own client: an int is a 429 with
+        that Retry-After, a list is the messages of a 200. Returns the
+        ``params`` of each call."""
+        calls = []
+
+        def request(session, method, url, **kwargs):
+            calls.append(dict(kwargs.get("params") or {}))
+            answer = answers[min(len(calls), len(answers)) - 1]
+            response = requests.Response()
+            if isinstance(answer, int):
+                response.status_code, response.headers["Retry-After"] = 429, str(answer)
+            else:
+                response.status_code = 200
+                response._content = json.dumps({"ok": True, "messages": answer}).encode()
+            return response
+
+        monkeypatch.setattr(requests.Session, "request", request)
+        monkeypatch.setattr(slack_client.time, "sleep", lambda s: pytest.fail("the daemon slept"))
+        return calls
+
+    def test_the_check_asks_slack_for_the_root_alone(self, platform_root, monkeypatch):
+        live_session("s-1")
+        threads = component(platform_root)
+        threads.connect("s-1", SLACK_LINK, by="operator")
+        threads._slack_client = connectors._slack_client
+        calls = self._slack_answers(monkeypatch, [{"ts": "1712345678.000900"}])
+
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets([SLACK_LINK])
+
+        assert caught.value.status == 409 and "develop-412" in str(caught.value)
+        assert [call.get("limit") for call in calls] == [1]
+
+    def test_a_rate_limited_check_refuses_at_once_naming_the_volume(
+        self, platform_root, monkeypatch
+    ):
+        """The daemon never sleeps holding a launch: the spawn waits, unlocked."""
+        live_session("s-1")
+        threads = component(platform_root)
+        threads.connect("s-1", SLACK_LINK, by="operator")
+        threads._slack_client = connectors._slack_client
+        calls = self._slack_answers(monkeypatch, 60)
+
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets([OTHER_SLACK_LINK])
+
+        message = str(caught.value)
+        assert len(calls) == 1
+        assert caught.value.retry_after == 60 and caught.value.transient
+        assert "(HTTP 429 on conversations.replies; Retry-After 60s)" in message
+        assert "retry in 60s or later" in message
+        assert message.endswith(
+            "from this daemon in the last 60s, plus 1 live Slack connector(s) polling "
+            "every 3s, slowing to 30s when quiet (configured, at most 20/min)"
+        )
+
+    def test_a_rate_limited_matrix_alias_refuses_at_once(self, platform_root, monkeypatch):
+        """A homeserver 429 is left to the spawn to wait out, unlocked, as Slack's is."""
+        calls = []
+
+        def request(session, method, url, **kwargs):
+            calls.append(url)
+            response = requests.Response()
+            response.status_code = 429
+            response._content = json.dumps({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 5000}).encode()
+            return response
+
+        monkeypatch.setattr(requests.Session, "request", request)
+        monkeypatch.setattr(matrix_client.time, "sleep", lambda s: pytest.fail("the daemon slept"))
+        threads = component(platform_root, environ=matrix_env())
+        threads._matrix_client = connectors._matrix_client
+
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets(["https://matrix.to/#/%23alias%3Aexample.org/%24event"])
+
+        assert len(calls) == 1
+        assert caught.value.transient and caught.value.retry_after == 5.0
+
     def test_an_unusable_target_is_not_this_checks_refusal(self, platform_root):
         threads = component(platform_root)
 
@@ -897,7 +981,7 @@ class TestTheThreadSlackReports:
         """A directory lookup must not be what makes a connect fail; the link's
         own reading stands."""
         class Unreachable:
-            def get_replies(self, channel, ts, oldest=None):
+            def get_replies(self, channel, ts, oldest=None, **kw):
                 raise RuntimeError("slack said no")
 
         live_session()

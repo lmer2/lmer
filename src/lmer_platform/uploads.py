@@ -312,7 +312,7 @@ def _validated(session_id: str) -> str:
         registry.session_path(session_id)
     except registry.RegistryError as exc:
         raise UploadNotFound(str(exc)) from exc
-    return session_id
+    return store.path_component(session_id)
 
 
 def session_upload_dir(session_id: str) -> Path:
@@ -572,6 +572,19 @@ def _is_text(raw: bytes) -> bool:
     return not _CONTROL_CHARS.search(text)
 
 
+def _join_dots_tightly(text: str) -> str:
+    """*text* with the dashes either side of every ``.`` dropped.
+
+    What ``re.sub(r"-*\\.-*", ".", text)`` does, without its quadratic
+    backtracking over a long dash run (CodeQL #68, issue #659).
+    """
+    first, *rest = text.split(".")
+    if not rest:
+        return first
+    *middle, last = rest
+    return ".".join([first.rstrip("-"), *(part.strip("-") for part in middle), last.lstrip("-")])
+
+
 def stored_name(name: object, kind: UploadKind, *, now: Optional[datetime] = None) -> str:
     """The name an upload is filed under: a timestamp, then the operator's name.
 
@@ -590,7 +603,7 @@ def stored_name(name: object, kind: UploadKind, *, now: Optional[datetime] = Non
     # The replacement is a placeholder for characters, not a separator to keep
     # beside one: ``my shot!.png`` reads better as ``my-shot.png`` than as
     # ``my-shot-.png``, and the name is something the operator will look at.
-    text = re.sub(r"-*\.-*", ".", text).strip("-._")
+    text = _join_dots_tightly(text).strip("-._")
     if not text:
         text = "upload"
     # Room for the stamp, its separator and the extension, so the bound holds
@@ -600,7 +613,7 @@ def stored_name(name: object, kind: UploadKind, *, now: Optional[datetime] = Non
         text = text[:room].rstrip("-._") or "upload"
     if not text.lower().endswith(kind.extension):
         text = f"{text}{kind.extension}"
-    return f"{stamp}-{text}"
+    return store.path_component(f"{stamp}-{text}")
 
 
 def _collision_name(filename: str, kind: UploadKind, attempt: int) -> str:
@@ -963,6 +976,7 @@ def _private_root(store_fd: int, *, create: bool) -> int:
 
 def _private_dir(session_id: str, entry: Optional[dict], *, create: bool) -> int:
     """Descriptor of ``<store>/.lmer-private/<session id>`` for a session with a store."""
+    session_id = _validated(session_id)
     store_fd = os.open(mounted_store(session_id, entry), os.O_RDONLY | os.O_DIRECTORY)
     try:
         root_fd = _private_root(store_fd, create=create)
@@ -1038,6 +1052,7 @@ def withdraw_private(session_id: str, entry: Optional[dict], name: object) -> bo
     """Delete one private file the client stored but could not deliver."""
     if not isinstance(name, str) or not _PRIVATE_NAME.fullmatch(name):
         raise UploadNotFound("no private file of that name")
+    name = store.path_component(name)
     try:
         dir_fd = _private_dir(session_id, entry, create=False)
     except FileNotFoundError:
@@ -1130,7 +1145,7 @@ def _discard_in(path: Path, names) -> list:
 
 def discard_private(session_id: str) -> int:
     """Delete every private file sent to *session_id*, in whichever store holds it."""
-    _validated(session_id)
+    session_id = _validated(session_id)
     removed = sum(len(_discard_in(path, [session_id])) for path in _private_stores())
     if removed:
         logger.info("platform_private_discarded id=%s", session_id)

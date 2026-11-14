@@ -49,11 +49,14 @@ What each test here pins, and what its loss looks like:
   the keystrokes itself. A composer has no second path in, and ``pointer: coarse``
   reads the *primary* pointer, so a touchscreen laptop would lose the button to a
   finger that is really there.
-- Ctrl+Enter sends, Cmd+Enter with it (same event, ``metaKey``), and a bare Enter
-  never does — now for a second reason as well as the paragraph one: on a phone the
-  return key is the *only* way to type a newline, so binding it to send would make
-  a multi-line message uncomposable on the device this UI is for.
-- the hint leads with the tap and names the chord second. The affordance that
+- every box routes Enter through the one shared rule in ``web/src/composerKeys.js``
+  (issue 663) and binds no key of its own beside it. That rule sends on Enter,
+  keeps Shift+Enter a newline, and sends on Ctrl/Cmd+Enter in every mode. Enter stays
+  a newline when the platform's ``chat_enter_sends`` is off or the primary pointer
+  is coarse, because on a phone the return key is the *only* way to type one. The
+  behaviour itself is exercised per box in ``web/tests/ComposerKeys.test.js``. What
+  is pinned here is that no box can step around the rule.
+- the hint leads with the tap and then says what Enter does in the mode in force. The affordance that
   always works is the one an operator must not have to already know, which is the
   half of this that a button alone does not fix.
 - the control keeps the disabled and loading states the buttons had. A send that
@@ -148,21 +151,15 @@ def _control(text):
 
 
 def _hint(text):
-    match = re.search(r'hint="([^"]+)"', text)
+    """The field's hint, whether a literal ``hint="…"`` or a ``:hint`` template."""
+    match = re.search(r'(?<![:\w-])hint="([^"]+)"', text) or re.search(
+        r':hint="`([^`]+)`"', text,
+    )
     assert match, "the field lost its hint"
     return match.group(1)
 
 
-def _keydown_modifiers(block, handler):
-    """The Vue modifier sets on every ``@keydown`` bound to *handler*.
-
-    A set per binding, so the assertions are about which modifiers are present
-    rather than about the order they were written in — ``.ctrl.enter.prevent`` and
-    ``.prevent.ctrl.enter`` are the same binding to Vue and must be the same
-    binding here.
-    """
-    found = re.findall(rf'@keydown((?:\.[a-z]+)+)="{handler}"', block)
-    return [set(modifiers.strip(".").split(".")) for modifiers in found]
+KEYS = Path(__file__).resolve().parents[1] / "web" / "src" / "composerKeys.js"
 
 
 def _style(text):
@@ -305,81 +302,67 @@ def test_the_send_row_is_a_thumb_target_at_every_width():
 # --- how it is reached from a keyboard ---------------------------------------
 
 @pytest.mark.parametrize("name,handler", sorted(COMPOSERS.items()))
-def test_ctrl_enter_sends_and_cmd_enter_with_it(name, handler):
-    """One chord, both platforms. Cmd is the same event with ``metaKey`` set.
+def test_enter_goes_through_the_shared_rule(name, handler):
+    """One rule for all three boxes (issue 663), and nothing beside it.
 
-    ``.prevent`` on both: a browser that would have inserted a newline for the
-    chord must not leave one behind in a draft — and a failed send deliberately
-    *keeps* the draft in two of these three boxes, so the stray line would survive
-    into the retry.
-    """
-    field = _field(_read(name))
-    bindings = _keydown_modifiers(field, handler)
-    assert any({"ctrl", "enter"} <= binding for binding in bindings), (
-        f"{name} does not send on Ctrl+Enter"
-    )
-    assert any({"meta", "enter"} <= binding for binding in bindings), (
-        f"{name} does not send on Cmd+Enter, so a Mac keyboard sends nothing"
-    )
-    for binding in bindings:
-        assert "prevent" in binding, (
-            f"{name} sends on {sorted(binding)} without preventing the default; "
-            "the chord can leave a newline in a draft a failed send keeps"
-        )
-
-
-@pytest.mark.parametrize("name,handler", sorted(COMPOSERS.items()))
-def test_enter_on_its_own_is_still_a_new_line(name, handler):
-    """These are paragraphs, not chat one-liners, and the fields say so.
-
-    ``auto-grow`` with ``max-rows`` exists precisely because an operator writes
-    several lines here — a question is answered in sentences, and a message to a
-    session routinely carries a path on its own line. Sending on a bare Enter would
-    cut every one of them off at the first line break, and the text is already gone
-    from the box by the time that is visible.
-
-    Issue 194 added the harder half of the same argument, which is why this survived
-    the control moving out rather than being traded for it: on a phone the return
-    key is the *only* way to type a newline. Bind it to send and a multi-line
-    message becomes uncomposable on the device this UI is driven from — and a
-    multi-line message arriving whole is the thing that issue was about.
+    An operator who learns what Enter does in one box has learned all three only
+    if no box binds a key of its own. A stray ``@keydown.ctrl.enter`` left next to
+    the shared handler would call the send path twice per chord (the box's busy
+    guard drops the second, but AnswerBox then announces a refusal), and an
+    ``@keydown.enter`` without it would skip the IME and touch-device checks.
     """
     text = _read(name)
     field = _field(text)
-    # Every binding that sends has to name a modifier key. Asserting the absence
-    # of the exact string ``@keydown.enter=`` is not enough: ``.enter.prevent``
-    # sends on Enter just as thoroughly and would have gone straight past it.
-    for binding in _keydown_modifiers(field, handler):
-        assert binding & {"ctrl", "meta"}, (
-            f"{name} sends on {sorted(binding)}, with no modifier key — a "
-            "paragraph is cut off at its first line break, and the text is out "
-            "of the box before that is visible"
-        )
+    bindings = re.findall(r'@keydown[\w.]*="([^"]+)"', field)
+    assert bindings == [f"composerKeydown($event, {handler})"], (
+        f"{name}'s field binds {bindings!r}; Enter must go through composerKeys.js "
+        "and nothing else"
+    )
+    assert re.search(r"@keydown\.enter=", field), f"{name} binds the rule to the wrong key"
+    assert "from '../composerKeys.js'" in text, f"{name} does not import the shared rule"
     assert "auto-grow" in field and "max-rows" in field, (
-        f"{name}'s field no longer grows, which is the reason Enter is a newline"
+        f"{name}'s field no longer grows; multi-line messages are still the point"
     )
-    assert "Enter is a new line" in _hint(text), (
-        f"{name} does not say what Enter does, which is the half of the chord an "
-        "operator finds out about by losing a paragraph"
+
+
+def test_the_shared_rule_keeps_the_cases_that_must_not_send():
+    """Source-level backstop for ``web/tests/ComposerKeys.test.js``.
+
+    The vitest suite drives every case through every box, but it only runs where
+    Node does. These are the four facts whose loss would cost a message: an IME
+    commit sent half-typed, Shift+Enter cutting a paragraph, a phone unable to
+    type a newline, and the setting doing nothing.
+    """
+    # Matched against code shapes, not words: each name also appears in the
+    # module's comments, which would satisfy a bare substring check.
+    source = KEYS.read_text()
+    assert re.search(r"event\.isComposing\s*\|\|\s*event\.keyCode\s*===\s*229\)\s*return", source), (
+        "an IME commit would send"
     )
+    assert re.search(r"!event\.shiftKey\s*&&", source), "Shift+Enter would send instead of breaking the line"
+    assert re.search(r"&&\s*!coarsePointer\.value", source), "a phone would lose its only newline key"
+    assert re.search(r"chatSettingsLoaded\.value\s*&&\s*chatEnterSends\.value", source), (
+        "the platform setting would do nothing, or a slow fetch would send a draft"
+    )
+    assert re.search(r"event\.ctrlKey\s*\|\|\s*event\.metaKey", source), "the chord would stop sending"
 
 
 @pytest.mark.parametrize("name", sorted(COMPOSERS))
-def test_the_chord_is_written_down_where_it_is_used(name):
-    """A shortcut nobody is told about is a shortcut nobody uses.
+def test_what_enter_does_is_written_down_where_it_is_used(name):
+    """A key rule nobody is told about is one an operator finds out by losing a draft.
 
-    The hint is already persistent on all three fields — it has to be, because each
-    says something about where the text goes that an operator must read *before*
-    sending — so naming the chord there costs no space and cannot be dismissed.
+    The hint is persistent on all three fields, and it is the rule's own sentence,
+    so it cannot go out of step with the mode in force. Both phrasings name what
+    Enter does, and the newline one names the chord with Cmd for a Mac.
     """
-    hint = _hint(_read(name))
-    assert "Ctrl+Enter" in hint, f"{name}'s hint does not name the chord"
-    assert "Cmd" in hint, (
-        f"{name}'s hint names Ctrl only; on a Mac that key sends nothing"
-    )
-    assert "persistent-hint" in _read(name), (
+    text = _read(name)
+    assert "${enterHint}" in _hint(_field(text)), f"{name}'s hint does not say what Enter does"
+    assert "persistent-hint" in text, (
         f"{name}'s hint is only shown on focus, which is not where it is needed"
     )
+    source = KEYS.read_text()
+    assert "Enter sends, Shift+Enter is a new line" in source
+    assert "Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends" in source
 
 
 @pytest.mark.parametrize("name", sorted(COMPOSERS))
@@ -388,20 +371,15 @@ def test_the_hint_leads_with_the_way_in_that_always_works(name):
 
     The operator's instruction: *"whatever you do about Enter, make the composer's
     behaviour discoverable rather than something you have to already know."* The
-    hint used to open with a chord — which on the device this is driven from is a
-    key combination that cannot be typed — so the first thing read was the one
-    thing that could not be done. It now opens with the tap, and Enter is named
-    before the chord, in that order: what always works, then what it does instead,
-    then the shortcut for a keyboard.
+    hint opens with the tap, which works on every device, then says what Enter
+    does.
     """
-    hint = _hint(_read(name))
+    hint = _hint(_field(_read(name)))
     assert hint.lower().startswith("tap"), (
         f"{name}'s hint opens with {hint.split('.')[0]!r} rather than with the "
         "affordance that works on every device"
     )
-    assert hint.index("Enter is a new line") < hint.index("Ctrl+Enter"), (
-        f"{name}'s hint names the chord before it says what the return key does"
-    )
+    assert hint.index("Tap") < hint.index("${enterHint}")
 
 
 # --- what the control still has to be ----------------------------------------

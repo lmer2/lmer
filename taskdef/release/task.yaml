@@ -28,7 +28,8 @@ needs:
   # receive them).
   credentials:
     # GitHub fine-grained PAT: contents:write + workflows:write +
-    # actions:write on the single mirror repo.
+    # actions:write + pull_requests:write + code_scanning_alerts:read on
+    # the single mirror repo.
     - release_github_pat
     # Release SSH signing key for tag signing — always a reference, never
     # key material.
@@ -43,9 +44,11 @@ needs:
   # whitespace — away from becoming one. The names are kept distinct so
   # that mistake cannot be made silently.
   push_targets:
-    # The adopter's GitHub mirror: `main` first, then the release tag.
+    # The adopter's GitHub mirror: the CI candidate branch, then `main`,
+    # then the release tag.
     - target: github_mirror
       refs:
+        - refs/heads/release-candidate/*
         - refs/heads/main
         - refs/tags/*
     # The canonical GitLab repo: the tag push, only after GitHub is green.

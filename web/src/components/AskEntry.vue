@@ -70,6 +70,9 @@ defineProps({
   // record — which is also the only view that owes it: the dock shows what is
   // waiting and what has just happened, and a half-read entry is neither.
   showProblem: { type: Boolean, default: false },
+  // The run's own files, so a filename in a question or its closure reason opens
+  // the file it names (issue 616).
+  files: { type: Array, default: () => [] },
   // Whether the closure line ends by saying a reply can no longer be delivered.
   // The dock is where a reply is typed, so a question the session stopped waiting
   // for has to say why there is no box under it; the record offers no box for any
@@ -117,7 +120,7 @@ function closureReason(entry) {
         :class="`text-${askPartColor('question')}`"
       >QUESTION</div>
 
-      <Markdown :text="entry.text" class="text-body-medium said" />
+      <Markdown :text="entry.text" :files="files" class="text-body-medium said" />
 
       <p
         v-if="showOptions && options(entry)"
@@ -153,6 +156,7 @@ function closureReason(entry) {
           v-if="closureReason(entry)"
         >: <Markdown
           :text="closureReason(entry)"
+          :files="files"
           inline
         /></template>.<template
           v-if="unreachable"

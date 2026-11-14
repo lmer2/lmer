@@ -12,6 +12,8 @@ import json
 import os
 import pathlib
 import re
+import threading
+import time
 
 import pytest
 
@@ -409,6 +411,186 @@ def test_distinct_services_are_cached_separately(
     assert sorted(service for _, service, _ in service_up) == [
         "other-web", "webapp-web"
     ]
+
+
+class _StuckRuntime:
+    """A resolver that does not answer until released: the runtime stuck
+    behind a long container removal."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, runtime, service_name, *, announce=True):
+        with self._lock:
+            self.calls += 1
+        self.release.wait(30)
+        return "container-id"
+
+
+@pytest.fixture
+def stuck_runtime(platform_root, presets_file, monkeypatch):
+    stuck = _StuckRuntime()
+    monkeypatch.setattr(slots, "resolve_container", stuck)
+    yield stuck
+    stuck.release.set()
+
+
+def test_a_fleet_read_does_not_wait_out_a_runtime_that_cannot_answer(stuck_runtime):
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+
+    started = time.monotonic()
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert time.monotonic() - started < slots.PROBE_WAIT_SECONDS + 5
+    # Unknown, not down: whether the service runs is what nobody knows yet.
+    assert row.state == slots.SLOT_UNKNOWN
+    assert row.reason == slots.PROBE_UNANSWERED
+    assert "did not answer" in row.reason
+
+
+def test_one_fleet_read_shares_one_wait_across_its_slots(stuck_runtime, monkeypatch):
+    """Waited per binding, N stuck slots would cost N waits on every poll."""
+    monkeypatch.setattr(slots, "PROBE_WAIT_SECONDS", 1.0)
+    _store_slots([
+        {"name": "a", "preset": "webapp_dev"},
+        {"name": "b", "preset": "other_dev"},
+    ])
+    started = time.monotonic()
+    rows = slots.slot_rows(cfg.load())
+    elapsed = time.monotonic() - started
+
+    assert stuck_runtime.calls == 2
+    assert [row.state for row in rows] == [slots.SLOT_UNKNOWN] * 2
+    assert elapsed < 1.9, f"two stuck slots took {elapsed:.2f}s: waited once per slot"
+
+
+def test_a_probe_that_raises_is_cached_with_what_happened(
+    platform_root, presets_file, monkeypatch
+):
+    calls = []
+
+    def broken(runtime, service_name, *, announce=True):
+        calls.append(service_name)
+        raise RuntimeError("the resolver broke")
+
+    monkeypatch.setattr(slots, "resolve_container", broken)
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+
+    first = slots.slot_rows(cfg.load())[0]
+    second = slots.slot_rows(cfg.load())[0]
+
+    assert "the resolver broke" in first.reason
+    assert second.reason == first.reason
+    assert calls == ["webapp-web"]
+
+
+def test_concurrent_fleet_reads_share_one_probe(stuck_runtime):
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    config = cfg.load()
+    rows = []
+    readers = [
+        threading.Thread(target=lambda: rows.append(slots.slot_rows(config)[0]))
+        for _ in range(8)
+    ]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(slots.PROBE_WAIT_SECONDS + 10)
+
+    assert len(rows) == 8
+    assert stuck_runtime.calls == 1
+    assert {row.reason for row in rows} == {slots.PROBE_UNANSWERED}
+    assert {row.state for row in rows} == {slots.SLOT_UNKNOWN}
+
+    stuck_runtime.release.set()
+    deadline = time.monotonic() + 10
+    while slots.slot_rows(config)[0].state != slots.SLOT_FREE:
+        assert time.monotonic() < deadline, "the probe's answer never landed"
+        time.sleep(0.05)
+    assert stuck_runtime.calls == 1
+
+
+def test_a_stuck_refresh_serves_the_last_known_answer(
+    platform_root, presets_file, monkeypatch
+):
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    assert slots.slot_rows(cfg.load())[0].state == slots.SLOT_FREE
+
+    stuck = _StuckRuntime()
+    monkeypatch.setattr(slots, "resolve_container", stuck)
+    with slots._PROBE_LOCK:
+        for key, (_, reason, members) in list(slots._PROBE_CACHE.items()):
+            slots._PROBE_CACHE[key] = (time.monotonic() - 1, reason, members)
+    try:
+        started = time.monotonic()
+        row = slots.slot_rows(cfg.load())[0]
+        assert time.monotonic() - started < slots.PROBE_WAIT_SECONDS + 5
+        assert row.state == slots.SLOT_FREE
+        assert stuck.calls == 1
+    finally:
+        stuck.release.set()
+
+
+def test_a_probe_thread_that_cannot_start_leaves_no_flight_behind(
+    platform_root, presets_file, monkeypatch
+):
+    """A flight nothing will ever land would cost every later read its full
+    wait until the cache is cleared."""
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    real_start = threading.Thread.start
+
+    def refuse(thread):
+        if thread.name == "lmer-platform-slot-probe":
+            raise RuntimeError("can't start new thread")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    started = time.monotonic()
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert time.monotonic() - started < slots.PROBE_WAIT_SECONDS
+    assert row.reason == slots.PROBE_UNANSWERED
+    assert slots._PROBE_FLIGHTS == {}
+
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    deadline = time.monotonic() + 10
+    while slots.slot_rows(cfg.load())[0].state != slots.SLOT_FREE:
+        assert time.monotonic() < deadline, "no later read started a probe"
+        time.sleep(0.05)
+
+
+def test_the_spawn_path_still_waits_for_its_answer(platform_root, presets_file, monkeypatch):
+    """An action must not run on a stale or unknown answer."""
+    answered = []
+
+    def slow(runtime, service_name, *, announce=True):
+        time.sleep(slots.PROBE_WAIT_SECONDS + 0.5)
+        answered.append(service_name)
+        return "container-id"
+
+    monkeypatch.setattr(slots, "resolve_container", slow)
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+
+    status = slots.slot_status(cfg.load(), "webapp", cached=False)
+
+    assert answered == ["webapp-web"]
+    assert status.state == slots.SLOT_FREE
+
+
+def test_a_probe_started_before_a_cache_clear_does_not_land_after_it(stuck_runtime):
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    before = set(threading.enumerate())
+    slots.slot_rows(cfg.load())
+    [probe] = [t for t in set(threading.enumerate()) - before
+               if t.name == "lmer-platform-slot-probe"]
+    slots.clear_probe_cache()
+    stuck_runtime.release.set()
+    probe.join(10)
+    assert not probe.is_alive()
+    with slots._PROBE_LOCK:
+        assert slots._PROBE_CACHE == {}
 
 
 # --- G5: runtime neutrality --------------------------------------------------

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, ref, watch } from 'vue'
 import {
   mdiRobot, mdiClipboardTextOutline, mdiClockAlertOutline,
   mdiClockOutline, mdiCommentQuestionOutline, mdiConsole, mdiExitRun,
@@ -18,6 +18,7 @@ import RunMeta from './RunMeta.vue'
 import SessionsPerTarget from './SessionsPerTarget.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
+import UsageTab from './UsageTab.vue'
 import { forgetRun, muteRun, resumeRun, moveRun } from '../api.js'
 import { useOperatorChat } from '../operatorChat.js'
 import {
@@ -154,11 +155,13 @@ watch(pane, (value) => rememberPane(value))
 // run dir holds the whole record — the spec, the goals, the plan, the ledger, the
 // events, the reports — and this view showed none of it.
 //
-// Fetched when the overview panel is first opened rather than with the fleet poll:
-// the payload that feeds every row must not grow a directory walk per run for
-// something only an open run renders. Once per visit is enough — the list is the
-// set of files a finished phase left behind, not a progress indicator, and the
-// panel is rebuilt whenever the operator opens the run again.
+// Fetched once per opened run, on mount, rather than when the overview panel is
+// first selected (issue 616): the attention note and the answer box sit above the
+// tabs, so a remembered terminal or chat tab would otherwise show a checklist
+// mention with nothing to resolve it against. The same list still feeds the
+// overview's "run files" card. Not with the fleet poll: the payload that feeds
+// every row must not grow a directory walk per run for something only an open run
+// renders.
 const runFiles = ref([])
 const runFilesMeta = ref(null)
 const runFilesError = ref(null)
@@ -193,11 +196,9 @@ async function loadRunFiles() {
   }
 }
 
-// `immediate` because overview is the default tab and a remembered one may already
-// select it, so there is no first switch to hear about.
-watch(tab, (value) => {
-  if (value === 'overview') loadRunFiles()
-}, { immediate: true })
+// `runFilesRequested` makes it one read per mount, shared by the overview card
+// and every prose link on the page.
+onMounted(loadRunFiles)
 
 // Why a file is named but not clickable, said next to the file rather than left in
 // the API docs. Both remaining reasons are the operator's own settings, since a
@@ -845,6 +846,7 @@ async function forget() {
       <strong>{{ attentionLabel(run.attention.reason) }}</strong>
       <template v-if="run.attention.note && !noteRepeatedBelow"> — <Markdown
         :text="run.attention.note"
+        :files="runFiles"
         inline
       /></template>
       <!-- Beside a crash this is the whole reason the row is one: with the
@@ -861,7 +863,12 @@ async function forget() {
          with the box that clears the question one tap out of sight. -->
     <template v-if="questionPending">
       <div class="section-title">answer</div>
-      <AnswerBox :run="run" :slots="slots" @answered="emit('changed')" />
+      <AnswerBox
+        :run="run"
+        :slots="slots"
+        :files="runFiles"
+        @answered="emit('changed')"
+      />
     </template>
 
     <!-- The session's own channel, docked here for the same reason and one of its
@@ -876,10 +883,12 @@ async function forget() {
     <AskChannel
       v-if="terminalSession"
       ref="askDock"
+      class="ask-dock"
       :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
       :live="!!run.live"
       :initial="run.questions || []"
+      :files="runFiles"
       @entries="receiveOperatorEntries"
       :now="now"
       @answered="emit('changed')"
@@ -959,7 +968,11 @@ async function forget() {
                    so it is rendered — inline, because a grid cell is a row and a
                    list in one would push the rest of the run's facts down the
                    page (T46). -->
-              <dd v-if="run.goal"><Markdown :text="run.goal" inline /></dd>
+              <dd v-if="run.goal"><Markdown
+                :text="run.goal"
+                :files="runFiles"
+                inline
+              /></dd>
               <dt v-if="run.phase">phase</dt>
               <dd v-if="run.phase">{{ run.phase }}</dd>
               <!-- Absent renders nothing, here as everywhere: a run that has
@@ -1208,11 +1221,16 @@ async function forget() {
                 <!-- The agent's own words about what happened, rendered inline:
                      an event line is a line, and a fenced block in one would make
                      the log unscannable — which is the only thing it is for. -->
-                <Markdown v-if="event.note" :text="event.note" inline />
+                <Markdown v-if="event.note" :text="event.note" :files="runFiles" inline />
               </div>
             </v-card-text>
           </v-card>
         </template>
+
+        <!-- What each session spent (issue 315), read once when this panel first
+             renders and never on the poll. In the overview and not a fifth tab
+             for the run files' reason below: four tabs on a phone is the ceiling. -->
+        <UsageTab :run="run" :now="now" />
 
         <!-- The run's own record, and last in this panel on purpose. It is the
              reference rather than the news: the facts at the top answer "what is
@@ -1353,6 +1371,7 @@ async function forget() {
                 :project-color="run.workspace_color"
                 :question-pending="questionPending"
                 :ask-pending="askPending"
+                :files="runFiles"
                 :now="now"
               />
             </v-tabs-window-item>
@@ -1372,6 +1391,7 @@ async function forget() {
                 :session-id="terminalSession"
                 :workspace-id="run.workspace_id"
                 :live="!!run.live"
+                :files="runFiles"
                 :now="now"
               />
             </v-tabs-window-item>
@@ -1558,6 +1578,7 @@ async function forget() {
 </template>
 
 <style scoped>
+.ask-dock { scroll-margin-top: calc(var(--v-layout-top, 64px) + 8px); }
 .operator-count {
   position: absolute;
   top: 2px;

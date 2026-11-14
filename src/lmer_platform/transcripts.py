@@ -278,6 +278,7 @@ from typing import Iterable, Iterator, Optional
 from ask_channel.protocol import KIND_QUESTION, AskError
 from lmer_cli import comms as bus
 from lmer_cli.threads import ThreadError, parse_thread
+from lmer_usage import children, shape
 
 from . import ask, assistant_history, registry, runs, uploads
 from .config import active_assistant_credential, active_secret
@@ -297,7 +298,7 @@ __all__ = [
     "MAX_MESSAGES_PER_SOURCE", "MAX_SOURCES", "TOOL_STATUSES", "MESSAGE_KINDS",
     "ASK_CHANNEL_VIA", "COMMS_VIA", "MONITOR_VIA", "MONITOR_ROLE", "PLATFORM_ROLE",
     "ToolCall", "Message", "Source", "MessagePage",
-    "transcript_root", "session_transcript_dir", "locate_sources",
+    "transcript_root", "session_transcript_dir", "locate_sources", "is_child_transcript",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
     "scrub_transcript", "scrub_session_transcripts", "scrub_credentials",
     "LAST_TURN_TAIL_BYTES", "last_turn",
@@ -444,32 +445,41 @@ MONITOR_ROLE = "monitor"
 #: attribution; ordinary occurrences later in a message remain operator text.
 PLATFORM_ROLE = "platform"
 
-#: Record ``type`` values each harness writes. Disjoint, which is what makes the
-#: dispatch per record (:func:`_harness_of_record`) rather than per file. Each
-#: set names the harness's *bookkeeping* types as well as its conversation ones,
-#: so a session that has so far written only its header is still labelled by what
-#: wrote it — and so a type this build has never seen stays unrecognised instead
-#: of being handed to whichever adapter guessed first.
-#: ``attachment`` is a turn when it delivers a queued command (see
-#: :data:`_QUEUED_COMMAND_ATTACHMENT`); ``queue-operation`` never is, but it is
-#: still claude's bookkeeping and belongs to claude's vocabulary — leaving it
-#: out would let a queue-heavy transcript open with rows no format claims.
-_CLAUDE_RECORD_TYPES = frozenset({
-    "user", "assistant", "system", "attachment", "queue-operation",
+#: Who a bus turn is from. Only ``operator`` is drawn as the operator.
+PARTY_OPERATOR = "operator"
+PARTY_AGENT = "agent"
+PARTY_RATCHET = "ratchet"
+PARTY_PEER = "peer"
+PARTY_PLATFORM = "platform"
+PARTY_RELAY = "relay"
+PARTIES = (PARTY_OPERATOR, PARTY_AGENT, PARTY_RATCHET, PARTY_PEER, PARTY_PLATFORM, PARTY_RELAY)
+
+#: ``source.ref`` prefixes of the records the daemon posts on the operator's
+#: channel for itself: a rotation request, a thread reference announcement.
+_PLATFORM_REFS = ("rotate-request:", "reference:")
+
+#: A connector's retry note answered by a recovery inside this many seconds was
+#: a blip, flagged when history is read the way the connector no longer posts it.
+CONNECTOR_BLIP_SECONDS = 60.0
+
+#: Channels that are not a thread connector's.
+_NON_CONNECTOR_CHANNELS = frozenset({
+    None, bus.CHANNEL_AGENT, bus.CHANNEL_PLATFORM, bus.CHANNEL_UBER, bus.CHANNEL_PEER_UL,
+    bus.CHANNEL_SUPERVISOR, bus.CHANNEL_TERMINAL,
 })
-_PI_RECORD_TYPES = frozenset({
-    "session", "model_change", "thinking_level_change", "message",
-})
-_CODEX_RECORD_TYPES = frozenset({
-    "session_meta", "response_item", "event_msg", "turn_context", "world_state",
-})
+
+#: Record ``type`` values each harness writes, shared with the usage adapters so
+#: both read one dispatch rule (:mod:`lmer_usage.shape`).
+_CLAUDE_RECORD_TYPES = shape.CLAUDE_RECORD_TYPES
+_PI_RECORD_TYPES = shape.PI_RECORD_TYPES
+_CODEX_RECORD_TYPES = shape.CODEX_RECORD_TYPES
 
 #: The canonical vocabulary — "lmer transcript format", version 1 (#296). Not a
 #: harness's dialect but this platform's own, written by a drop-in's in-container
 #: converter and the one format here that is a public contract
 #: (``docs/TRANSCRIPT-FORMAT.md``). Namespaced so it can never collide with a
 #: harness's own types, which claim bare words.
-_LMER_RECORD_TYPES = frozenset({"lmer.meta", "lmer.message", "lmer.tool_update"})
+_LMER_RECORD_TYPES = shape.LMER_RECORD_TYPES
 
 #: The canonical-format version this build speaks. A file's ``lmer.meta`` states
 #: its own (``format``), and a *higher* number is the one thing that cannot be
@@ -489,12 +499,12 @@ _LMER_FORMAT = 1
 #: falling through to "nobody recognises this" would make a version-2 file read as
 #: a format this build cannot open at all — the one wrong answer, since every
 #: record it *does* understand is still readable.
-_LMER_TYPE_PREFIX = "lmer."
+_LMER_TYPE_PREFIX = shape.LMER_TYPE_PREFIX
 
 #: What labels a canonical file that declares no usable ``lmer.meta``: the
 #: format's name, since the one thing known about such a writer is which format
 #: it chose. A valid meta record replaces it with the drop-in's own harness name.
-_LMER_HARNESS = "lmer"
+_LMER_HARNESS = shape.LMER_HARNESS
 
 #: The roles a canonical record may claim — the ones the view knows how to title.
 #: ``monitor`` is included because a converter may have the provenance to say a
@@ -873,6 +883,15 @@ class Message:
     #: A Send Privately reference the operator sent (issue #646): ``{"purpose"}``.
     #: The view draws a compact entry in place of the agent-facing text.
     private: Optional[dict] = None
+    #: Who said a :data:`COMMS_VIA` turn, from the record's stamped provenance
+    #: (:func:`_party`): one of :data:`PARTIES`. ``None`` on a transcript turn,
+    #: which the view draws by :attr:`role` as before.
+    party: Optional[str] = None
+    #: An older connector's retry note, or its recovery, that closed within
+    #: :data:`CONNECTOR_BLIP_SECONDS`. Served in place and left undrawn by the
+    #: view: dropping it would renumber every later turn, and a live pane polls
+    #: by position.
+    blip: bool = False
 
     @property
     def empty(self) -> bool:
@@ -903,6 +922,8 @@ class Message:
             **({"peer": self.peer} if self.peer else {}),
             **({"digest": self.digest} if self.digest else {}),
             **({"private": self.private} if self.private else {}),
+            **({"party": self.party} if self.party else {}),
+            **({"blip": True} if self.blip else {}),
         }
 
 
@@ -1078,6 +1099,28 @@ def _jsonl_files(directory: Path) -> list:
     return kept
 
 
+def is_child_transcript(path: Path, directory: Path) -> bool:
+    """Whether *path*, found in *directory*, is a fan-out child's transcript.
+
+    Children live in a reserved subtree of their parent's transcript dir
+    (:data:`lmer_usage.children.CHILDREN_DIRNAME`), named rather than recorded,
+    so the rule needs no state the container wrote; a claude child still at its
+    original place is recognised by the id its child directory carries. Only
+    names inside *directory* count, so a session can only ever exclude its own
+    files. The one predicate for every reader of a session's own conversation.
+    """
+    return children.is_child_path(path, directory)
+
+
+def _conversation_files(directory: Path) -> list:
+    """The session's own transcripts in *directory*: children's are excluded.
+
+    The scrub still walks every file (:func:`scrub_session_transcripts`): a
+    child's transcript is the session's to scrub even though it is not its chat.
+    """
+    return [p for p in _jsonl_files(directory) if not is_child_transcript(p, directory)]
+
+
 def _pointer_sources(session_id: str, pointer: dict, roots: list) -> list:
     """Resolve a session entry's recorded ``transcript`` pointer.
 
@@ -1111,7 +1154,7 @@ def _pointer_sources(session_id: str, pointer: dict, roots: list) -> list:
             return []
         return [
             Source(path=path, session=session_id, harness=harness)
-            for path in _jsonl_files(candidate)
+            for path in _conversation_files(candidate)
         ]
     return []
 
@@ -1137,7 +1180,7 @@ def locate_sources(session_id: str) -> list:
         if located:
             return located
 
-    return [Source(path=path, session=session_id) for path in _jsonl_files(own_dir)]
+    return [Source(path=path, session=session_id) for path in _conversation_files(own_dir)]
 
 
 def _run_key_of(entry: Optional[dict]) -> Optional[tuple]:
@@ -2215,22 +2258,7 @@ def _lmer_message(record: dict, pending: dict, *, presentation: bool = True) -> 
     return None if result.empty else result
 
 
-def _harness_of_record(record: dict) -> Optional[str]:
-    """Which harness's format one record is in, or ``None`` for a shape nobody
-    here recognises — a fourth harness, or a file that is not a transcript."""
-    kind = record.get("type")
-    if kind in _CLAUDE_RECORD_TYPES:
-        return "claude"
-    if kind in _PI_RECORD_TYPES:
-        return "pi"
-    if kind in _CODEX_RECORD_TYPES:
-        return "codex"
-    if isinstance(kind, str) and kind.startswith(_LMER_TYPE_PREFIX):
-        # The canonical format, claimed by its namespace rather than by the three
-        # known types: a record from a later version is this format's and skipped
-        # by its adapter, not a format this build cannot read.
-        return _LMER_HARNESS
-    return None
+_harness_of_record = shape.harness_of_record
 
 
 def _message_from_record(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
@@ -2818,6 +2846,106 @@ def _comms_messages(session_id: str, assistant_name: Optional[str] = None) -> tu
     return _comms_turns(events, session_id, assistant_name)
 
 
+def _connector_note(source: dict, meta: dict, *classes: str) -> bool:
+    """Whether a record is a connector's own note of one of *classes*.
+
+    ``meta`` is the caller's, so the class counts only on a connector's own
+    channel, where only the connector posts notes.
+    """
+    return (meta.get("notification_class") in classes
+            and source.get("channel") not in _NON_CONNECTOR_CHANNELS
+            and not meta.get("session_origin"))
+
+
+def _connector_health(source: dict, meta: dict) -> bool:
+    return _connector_note(source, meta, bus.NOTIFICATION_CONNECTOR_HEALTH)
+
+
+def _party(kind: object, source: dict, meta: dict) -> str:
+    """Who said a bus record, from what the bus and the daemon stamped on it.
+
+    Never from the text: any sender can write an operator-looking line. The
+    channel is stamped from the posting credential and an agent cannot name one
+    other than its own, so a record only reads as the operator's when it came
+    in on a channel a human types into.
+    """
+    channel = source.get("channel")
+    if channel in (None, bus.CHANNEL_AGENT) or meta.get("session_origin"):
+        return PARTY_AGENT
+    if kind in ("command", "digest") or _connector_note(
+            source, meta, bus.NOTIFICATION_CONNECTOR_HEALTH, bus.NOTIFICATION_CONNECTOR_STATUS):
+        return PARTY_PLATFORM
+    if channel == bus.CHANNEL_PEER_UL:
+        return PARTY_PEER
+    if channel == bus.CHANNEL_UBER:
+        return PARTY_RATCHET
+    if channel == bus.CHANNEL_SUPERVISOR:
+        return PARTY_PLATFORM
+    if channel == bus.CHANNEL_PLATFORM:
+        ref = source.get("ref")
+        if not source.get("author") or (isinstance(ref, str) and ref.startswith(_PLATFORM_REFS)):
+            return PARTY_PLATFORM
+        return PARTY_OPERATOR
+    if channel == bus.CHANNEL_TERMINAL:
+        return PARTY_OPERATOR
+    # A thread connector's channel. Slack and matrix records from before the
+    # connectors stamped the poster carry none and stay the operator's, as
+    # they always read; any other bridge has to say a human posted.
+    poster = meta.get(bus.META_POSTER)
+    if poster == bus.POSTER_HUMAN:
+        return PARTY_OPERATOR
+    if poster is None and channel in (bus.CHANNEL_SLACK, bus.CHANNEL_MATRIX):
+        return PARTY_OPERATOR
+    return PARTY_RELAY
+
+
+def _connector_blips(events: list) -> set:
+    """Cursors of older connectors' retry notes, and their recovery, that closed
+    within :data:`CONNECTOR_BLIP_SECONDS`.
+
+    Those connectors posted both on every transient error. A note that stamps
+    its state comes from a connector that already waited out the grace window,
+    so it was a real outage and is never a blip.
+    """
+    hidden: set = set()
+    open_failures: dict = {}
+    for event in events:
+        record = event.message
+        meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        if record.get("kind") != "note" or not _connector_health(source, meta):
+            continue
+        state, direction = _connector_health_state(meta, record.get("text"))
+        if state is None:
+            continue
+        key = (source.get("channel"), direction)
+        if state == bus.CONNECTOR_FAILING:
+            open_failures[key] = event
+            continue
+        failed = open_failures.pop(key, None)
+        if failed is None:
+            continue
+        began = _timestamp_key(failed.message.get("at"))
+        ended = _timestamp_key(record.get("at"))
+        if began is not None and ended is not None and 0 <= ended - began <= CONNECTOR_BLIP_SECONDS:
+            hidden.update((failed.cursor, event.cursor))
+    return hidden
+
+
+def _connector_health_state(meta: dict, text: object) -> tuple:
+    """An unstamped health note's side of an incident, read from the text the
+    older connectors posted; ``(None, None)`` for a stamped note."""
+    if bus.META_CONNECTOR_STATE in meta:
+        return None, None
+    words = str(text or "").strip()
+    head = words.split(" ", 1)[0]
+    if words.endswith("connector delivery is retrying after an error"):
+        return bus.CONNECTOR_FAILING, head
+    if words.endswith("connector delivery recovered"):
+        return bus.CONNECTOR_RECOVERED, head
+    return None, None
+
+
 def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = None) -> tuple:
     # deferred: cycle — lmer_platform.assistant_conversation imports this module at top (via lmer_platform.comms)
     from .assistant_conversation import digest_run
@@ -2825,6 +2953,8 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
     questions: dict = {}
     turns: list = []
     copies: list = []
+    blips = _connector_blips(events)
+    colors: dict = {}
     for event in events:
         record = event.message
         kind = record.get("kind")
@@ -2865,12 +2995,14 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                 source=dict(source) if source else None, comms_kind=label,
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
-                peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
+                peer=_peer_of(meta, colors) if channel == bus.CHANNEL_PEER_UL else None,
                 digest={
                     "kind": str(meta.get("digest_kind") or "event"),
                     "run": digest_run(meta.get("run")),
                 } if kind == "digest" else None,
                 private=_private_send(kind, source, meta, record.get("text")),
+                party=_party(kind, source, meta),
+                blip=event.cursor in blips,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``
@@ -2898,6 +3030,35 @@ def _comms_turns(events: list, session_id: str, assistant_name: Optional[str] = 
                             alias_line = line.replace(f"[{current}", f"[{alias}", 1)
                             copies.append(("user", _collapsed(_scrub(alias_line)), None))
     return turns, copies
+
+
+def _peer_of(meta: dict, colors: dict) -> Optional[dict]:
+    """A peer record's provenance, with the sending project's colour as it is now.
+
+    The colour is read here rather than stamped at send time so a recolored
+    project repaints its old messages too; *colors* memoises it per read.
+    """
+    if not isinstance(meta.get("peer"), dict):
+        return None
+    peer = _scrub_decoded(meta["peer"])
+    project = peer.get("project_id")
+    if isinstance(project, str) and project:
+        if project not in colors:
+            colors[project] = _project_color(project)
+        if colors[project]:
+            peer["project_color"] = colors[project]
+    return peer
+
+
+def _project_color(project_id: str) -> Optional[str]:
+    try:
+        if not projects.enabled():
+            return None
+        color = projects.get(project_id).get("color")
+    except Exception as exc:  # best-effort: an uncoloured peer draws in the fixed peer colour
+        logger.debug("platform_peer_color_unavailable project=%s error=%s", project_id, exc)
+        return None
+    return color if isinstance(color, str) and color else None
 
 
 def _private_send(kind: object, source: dict, meta: dict, text: object) -> Optional[dict]:

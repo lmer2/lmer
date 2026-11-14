@@ -79,6 +79,21 @@ The assistant's own state::
     rotate                          POST /api/assistant/handoff, then
                                     POST /api/assistant/rotate
 
+Time — for the person behind the request, never one you name::
+
+    time status                     GET  /api/time/status
+    time start --project P          POST /api/time/start
+    time stop                       POST /api/time/stop
+    time set --title T              PATCH /api/time/current
+    time auto on|off                PUT  /api/time/auto
+    time entries                    GET  /api/time/entries
+    time settings                   GET  /api/time/settings
+    time person add|set|remove KEY  POST|PATCH|DELETE /api/time/people (operator)
+    time defaults set               PATCH /api/time/defaults (operator)
+    time me --key K                 POST /api/time/me
+    time project set                PATCH /api/time/project
+    time handler check FILE         POST /api/time/handlers/check
+
 A run is named by one ``host/project/<slug|uid>`` key — see :func:`_run_fields`.
 
 Configuration
@@ -127,8 +142,10 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from urllib.parse import quote
 
 from lmer_cli import routing_receipts, runref
 from lmer_cli.comms import SUPERVISOR_AUTHORITY_LEVELS, assistant_display_name
@@ -177,6 +194,19 @@ ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
 #: per operation; ``tests/test_platform_ctl.py`` pins it against the index's.
 UID_RE = re.compile(r"^[0-9a-f]{32}\Z")
 
+#: How long ``spawn`` keeps resending a launch the daemon answered 503 with
+#: ``Retry-After`` (a thread check the chat transport rate limited), across
+#: every attempt, and how many attempts it makes. No attempt starts once the
+#: budget has passed. Spelled here rather than imported from
+#: :mod:`lmer_platform.spawn` for the reason :data:`UID_RE` is;
+#: ``tests/test_platform_ctl.py`` pins them against ``spawn``'s.
+SPAWN_WAIT_SECONDS = 30.0
+SPAWN_ATTEMPTS = 4
+SPAWN_MIN_PAUSE_SECONDS = 1.0
+#: The ``detail.code`` of the only 503 ``spawn`` resends, spelled here for the
+#: same reason and pinned against :data:`lmer_platform.api.THREAD_CHECK_RATE_LIMITED`.
+THREAD_CHECK_RATE_LIMITED = "thread_check_rate_limited"
+
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
 EXIT_FAILURE = 1
@@ -201,6 +231,11 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 #: answers HTML (a proxy's error page, say) should not paste a page into an agent's
 #: context to say so.
 _DETAIL_LIMIT = 2000
+
+#: ``lmer-ctl time defaults set`` flags, each the same key in PATCH /api/time/defaults
+#: (time_settings.DEFAULT_KEYS, which this client does not import).
+_TIME_DEFAULT_KEYS = ("default_person", "idle_grace_minutes", "min_entry_seconds", "pause_hours",
+                      "title_max_age_days", "sweep_seconds", "writer_name", "writer_email")
 
 
 def resolve_endpoint() -> Endpoint:
@@ -247,7 +282,8 @@ def _payload(text: str) -> Any:
 
 
 def _emit(
-    response: Any, endpoint: Endpoint, *, late_fails: bool = False, out=None, err=None,
+    response: Any, endpoint: Endpoint, *, late_fails: bool = False, extra: Optional[dict] = None,
+    out=None, err=None,
 ) -> int:
     """Print the reply and return the exit code.
 
@@ -258,6 +294,9 @@ def _emit(
     *late_fails* is ``answer`` sent by full bus id: ``/comms`` takes a late answer
     with a 200 where the answer route refuses it with a 409, and one verb keeps one
     exit status for the same outcome (#602).
+
+    *extra* goes beside ``status`` on a refusal: how many times a resent call
+    was made, and for how long (:func:`_resending_rate_limited`).
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
@@ -274,9 +313,68 @@ def _emit(
         print(json.dumps(payload), file=out)
         return 0
     print(
-        json.dumps({"error": "http", "status": status, "body": payload}), file=err
+        json.dumps({"error": "http", "status": status, **(extra or {}), "body": payload}), file=err
     )
     return EXIT_FAILURE
+
+
+#: The clock and the pause :func:`_resending_rate_limited` uses, as names a test
+#: can replace without slowing down a daemon running in the same process.
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def _retry_after(response: Any) -> Optional[float]:
+    """The seconds a rate-limited launch asks to wait, or ``None`` to report it as is.
+
+    Only a 503 whose ``detail`` is :data:`THREAD_CHECK_RATE_LIMITED` and
+    ``retryable``: the same route also answers the daemon's ``state_busy`` 503,
+    with ``Retry-After`` too, after a launch may already have happened, and
+    sending that again could start a second session. Only the delta-seconds
+    form: the daemon sends nothing else, and a reply without a number in it is a
+    refusal to report, not one to wait out.
+    """
+    if response.status_code != 503:
+        return None
+    detail = _payload(response.text)
+    detail = detail.get("detail") if isinstance(detail, dict) else None
+    if not isinstance(detail, dict) or detail.get("code") != THREAD_CHECK_RATE_LIMITED \
+            or detail.get("retryable") is not True:
+        return None
+    try:
+        seconds = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _resending_rate_limited(send) -> tuple:
+    """``send()``, made again while the daemon answers a rate-limited launch.
+
+    The daemon answers a launch that way when the chat transport rate limited
+    the check on who holds a thread target, and it waits nowhere itself: the
+    route runs inside the project operation, which every other change waits on.
+    So the wait is here, in the caller, and each resend is a fresh request whose
+    checks all run again.
+
+    Waits at least :data:`SPAWN_MIN_PAUSE_SECONDS`, makes at most
+    :data:`SPAWN_ATTEMPTS` calls, and starts none once
+    :data:`SPAWN_WAIT_SECONDS` have passed or would pass during the wait.
+    Returns the last reply, the number of calls and the seconds they took.
+    """
+    started = _clock()
+    attempts = 0
+    while True:
+        response = send()
+        attempts += 1
+        pause = _retry_after(response)
+        if pause is None or attempts >= SPAWN_ATTEMPTS:
+            break
+        pause = max(SPAWN_MIN_PAUSE_SECONDS, pause)
+        if _clock() - started + pause >= SPAWN_WAIT_SECONDS:
+            break
+        _sleep(pause)
+    return response, attempts, _clock() - started
 
 
 def _text(value: str) -> str:
@@ -552,6 +650,12 @@ def _call_threads_disconnect(args) -> Call:
     return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
 
 
+def _call_threads_release(args) -> Call:
+    return Call("POST", "/api/threads/release", body={
+        "permalink": _text(args.permalink), **_given(args, ("to", "reason")),
+    })
+
+
 def _call_threads_recover(args) -> Call:
     return Call("POST", f"/api/sessions/{args.session}/threads/{args.thread}/recover", body={
         "action": args.action, "operation": args.operation, "remote_ref": args.remote_ref,
@@ -609,13 +713,14 @@ def _call_runs_meta_get(args) -> Call:
 
 
 def _call_runs_meta_set(args) -> Call:
-    return Call(
-        "POST", "/api/runs/meta",
-        body={
-            **_run_fields(args.key),
-            **_given(args, ("title", "description")),
-        },
-    )
+    if args.issues and args.clear_issues:
+        raise CtlError("--issue and --clear-issues cannot be used together")
+    body = {**_run_fields(args.key), **_given(args, ("title", "description"))}
+    if args.issues:
+        body["issues"] = list(args.issues)
+    elif args.clear_issues:
+        body["issues"] = []
+    return Call("POST", "/api/runs/meta", body=body)
 
 
 def _mute_call(args, verb: str) -> Call:
@@ -679,6 +784,127 @@ def _call_handoff_set(args) -> Call:
 
 def _call_pending_take(args) -> Call:
     return Call("POST", "/api/assistant/pending", body={})
+
+
+def _field_values(pairs: Optional[Sequence[str]]) -> Optional[dict]:
+    """``--field key=value`` flags as the ``fields`` object; split at the first ``=``."""
+    if not pairs:
+        return None
+    fields = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise CtlError(f"--field {pair!r} is not key=value (a handler field key, then its value)")
+        fields[key.strip()] = value
+    return fields
+
+
+def _call_time_status(args) -> Call:
+    return Call("GET", "/api/time/status", params=_given(args, ("project", "record")))
+
+
+def _call_time_start(args) -> Call:
+    if args.project is None and args.prompt is None:
+        raise CtlError("time start needs --project, or --prompt to answer a prompt")
+    body = _given(args, ("project", "prompt", "client", "title", "record"))
+    fields = _field_values(args.fields)
+    if fields is not None:
+        body["fields"] = fields
+    return Call("POST", "/api/time/start", body=body)
+
+
+def _call_time_stop(args) -> Call:
+    return Call("POST", "/api/time/stop", body=_given(args, ("project", "record")))
+
+
+def _call_time_set(args) -> Call:
+    body = _given(args, ("client", "title", "record"))
+    fields = _field_values(args.fields)
+    if fields is not None:
+        body["fields"] = fields
+    if not body.keys() - {"record"}:
+        raise CtlError("time set needs --title, --client or --field: what to change on the running timer")
+    return Call("PATCH", "/api/time/current", body=body)
+
+
+def _call_time_auto(args) -> Call:
+    return Call("PUT", "/api/time/auto", body={"on": args.state == "on", **_given(args, ("record",))})
+
+
+def _call_time_entries(args) -> Call:
+    params = _given(args, ("project", "client", "handler", "status", "record"))
+    for flag, name in (("since", "from"), ("until", "to")):
+        if getattr(args, flag) is not None:
+            params[name] = getattr(args, flag)
+    return Call("GET", "/api/time/entries", params=params)
+
+
+def _call_time_settings(_args) -> Call:
+    return Call("GET", "/api/time/settings")
+
+
+def _person_body(args) -> dict:
+    body = _given(args, ("name",))
+    for transport in ("slack", "matrix"):
+        ids = getattr(args, transport)
+        if getattr(args, f"clear_{transport}", False):
+            body[transport] = []
+        elif ids is not None:
+            body[transport] = ids
+    return body
+
+
+def _call_time_person_add(args) -> Call:
+    return Call("POST", "/api/time/people", body={"key": args.key, **_person_body(args)})
+
+
+def _call_time_person_set(args) -> Call:
+    body = _person_body(args)
+    if args.add:
+        body["add"] = args.add
+    if not body:
+        raise CtlError("time person set needs --name, --slack, --matrix, --add or a --clear-* flag")
+    return Call("PATCH", f"/api/time/people/{quote(args.key, safe='')}", body=body)
+
+
+def _call_time_person_remove(args) -> Call:
+    return Call("DELETE", f"/api/time/people/{quote(args.key, safe='')}")
+
+
+def _call_time_defaults_set(args) -> Call:
+    body = {key: getattr(args, key) for key in _TIME_DEFAULT_KEYS if getattr(args, key) is not None}
+    if args.tracking is not None:
+        body["tracking"] = args.tracking == "on"
+    if not body:
+        raise CtlError("time defaults set needs at least one setting to change")
+    return Call("PATCH", "/api/time/defaults", body=body)
+
+
+def _call_time_me(args) -> Call:
+    return Call("POST", "/api/time/me", body=_given(args, ("key", "name", "record")))
+
+
+def _call_time_project_set(args) -> Call:
+    body = _given(args, ("project", "handler", "idle_grace_minutes"))
+    if args.key is not None:
+        body["project_key"] = args.key
+    if args.clear_clients:
+        body["clients"] = ""
+    elif args.clients is not None:
+        body["clients"] = args.clients
+    if not body.keys() - {"project"}:
+        raise CtlError("time project set needs --handler, --client, --clear-clients, "
+                       "--idle-grace-minutes or --key")
+    return Call("PATCH", "/api/time/project", body=body)
+
+
+def _call_time_handler_check(args) -> Call:
+    path = Path(args.file)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CtlError(f"cannot read {args.file}: {exc}") from exc
+    return Call("POST", "/api/time/handlers/check", body={"name": path.stem, "text": text})
 
 
 def _call_rotate(args) -> list:
@@ -818,7 +1044,7 @@ def create_parser() -> argparse.ArgumentParser:
     requests_reply.add_argument("text")
     requests_reply.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/reply",
                                                       body={"text": _text(args.text)}))
-    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining uncertain delivery.")
+    requests_park = requests_sub.add_parser("park", help="Operator-only: release independent work, retaining an uncertain reply or action.")
     requests_park.add_argument("identity")
     requests_park.add_argument("reason")
     requests_park.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/park",
@@ -1169,6 +1395,18 @@ def create_parser() -> argparse.ArgumentParser:
         "reference", help="Reference id, as `threads references` reports it.",
     )
     threads_unreference.set_defaults(call=_call_threads_unreference)
+    threads_release = threads_sub.add_parser(
+        "release",
+        help=(
+            "Give up this project's claim on a thread a mention gave it; with --to, "
+            "hand it to another project as a new request. Refused while a session "
+            "holds the thread (POST /api/threads/release)."
+        ),
+    )
+    threads_release.add_argument("permalink", help="Thread permalink.")
+    threads_release.add_argument("--to", metavar="PROJECT", help="Project id or name to hand the thread to.")
+    threads_release.add_argument("--reason", help="Why; required for the operator.")
+    threads_release.set_defaults(call=_call_threads_release)
 
     exit_p = sub.add_parser(
         "exit",
@@ -1191,6 +1429,7 @@ def create_parser() -> argparse.ArgumentParser:
     me.set_defaults(call=_call_me)
 
     _add_runs(sub)
+    _add_time(sub)
     _add_pair(
         sub, "orders",
         "The operator's standing orders (/api/assistant/instructions).",
@@ -1356,8 +1595,8 @@ def _add_runs(sub) -> None:
     meta = runs_sub.add_parser(
         "meta",
         help=(
-            "This orchestrator's title and description for a run — platform "
-            "state, never the work repo (/api/runs/meta)."
+            "This orchestrator's title, description and issues for a run — "
+            "platform state, never the work repo (/api/runs/meta)."
         ),
     )
     meta_sub = meta.add_subparsers(dest="leaf", metavar="get|set")
@@ -1370,6 +1609,14 @@ def _add_runs(sub) -> None:
     _add_run_key(meta_set)
     meta_set.add_argument("--title", help="The label the fleet view shows.")
     meta_set.add_argument("--description", help="A longer note.")
+    meta_set.add_argument(
+        "--issue", dest="issues", action="append", metavar="URL",
+        help="An issue or MR URL the run is about beyond its target; repeat for "
+             "several. Replaces the run's list. Time entries list them, and the "
+             "target (else the first of these) is the one their fields follow.",
+    )
+    meta_set.add_argument("--clear-issues", action="store_true",
+                          help="Empty the run's issue list.")
     meta_set.set_defaults(call=_call_runs_meta_set)
 
     for verb, call, summary in (
@@ -1426,6 +1673,196 @@ def _add_runs(sub) -> None:
     unrelate.set_defaults(call=_call_runs_unrelate)
 
 
+def _add_time(sub) -> None:
+    """The time routes (issue #604). None takes a person: the daemon reads who
+    asked from the request this credential is handling, or from ``--record``."""
+    time_p = sub.add_parser(
+        "time",
+        help=(
+            "Start, stop or check the time of the person who asked (/api/time/*). "
+            "Never name the person: the daemon resolves who asked."
+        ),
+    )
+    time_sub = time_p.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    record_help = (
+        "The bus record id (from `comms`) of the message that asked, when it is "
+        "not the request you are handling. Must be on your own session."
+    )
+
+    status = time_sub.add_parser(
+        "status",
+        help=(
+            "Their running timer, warnings and prompts, and the project's handler "
+            "fields, client labels and recent values (GET /api/time/status)."
+        ),
+    )
+    status.add_argument("--project", help="A project (workspace id) whose options to include.")
+    status.add_argument("--record", help=record_help)
+    status.set_defaults(call=_call_time_status)
+
+    start = time_sub.add_parser(
+        "start",
+        help=(
+            "Start their time by hand (POST /api/time/start). Refused, naming "
+            "`missing`, until every required handler field has a value."
+        ),
+    )
+    start.add_argument("--project", help="The project's workspace id (optional with --prompt).")
+    start.add_argument(
+        "--prompt", type=int, metavar="ID",
+        help="Answer a prompt from time status: its values are remembered for the "
+             "prompt's issue or run, and its time starts (#665).",
+    )
+    start.add_argument("--client", help="Client label; a new one is added to the project.")
+    start.add_argument("--title", help="What the time is for.")
+    start.add_argument(
+        "--field", dest="fields", action="append", metavar="KEY=VALUE",
+        help="A handler field value, e.g. --field task_id=abc123 (repeatable).",
+    )
+    start.add_argument("--record", help=record_help)
+    start.set_defaults(call=_call_time_start)
+
+    stop = time_sub.add_parser(
+        "stop",
+        help="Stop their time by hand; a pause follows only when time_pause_hours is set"
+             " (POST /api/time/stop).",
+    )
+    stop.add_argument("--project", help="Only if the running timer is on this project.")
+    stop.add_argument("--record", help=record_help)
+    stop.set_defaults(call=_call_time_stop)
+
+    set_p = time_sub.add_parser(
+        "set",
+        help=(
+            "Change the running timer's title, client or handler fields "
+            "(PATCH /api/time/current). An empty value clears it."
+        ),
+    )
+    set_p.add_argument("--title", help="What the time is for.")
+    set_p.add_argument("--client", help="Client label; a new one is added to the project.")
+    set_p.add_argument(
+        "--field", dest="fields", action="append", metavar="KEY=VALUE",
+        help="A handler field value, e.g. --field task_id=abc123 (repeatable).",
+    )
+    set_p.add_argument("--record", help=record_help)
+    set_p.set_defaults(call=_call_time_set)
+
+    auto = time_sub.add_parser(
+        "auto",
+        help=(
+            "Turn their automatic tracking on or off; off stays until turned on, "
+            "and manual start and stop still work (PUT /api/time/auto)."
+        ),
+    )
+    auto.add_argument("state", choices=("on", "off"))
+    auto.add_argument("--record", help=record_help)
+    auto.set_defaults(call=_call_time_auto)
+
+    entries = time_sub.add_parser(
+        "entries",
+        help=(
+            "Their entries, newest first, with each one's stage and ledger "
+            "status (GET /api/time/entries)."
+        ),
+    )
+    entries.add_argument("--from", dest="since", metavar="DATE", help="YYYY-MM-DD or a timestamp.")
+    entries.add_argument("--to", dest="until", metavar="DATE", help="YYYY-MM-DD (inclusive) or a timestamp.")
+    entries.add_argument("--project", help="Project key or workspace id.")
+    entries.add_argument("--client", help="Client label.")
+    entries.add_argument("--handler", help="Handler name.")
+    entries.add_argument(
+        "--status",
+        help="running, in_outbox, kept_locally, written, synced, held or pending.",
+    )
+    entries.add_argument("--record", help=record_help)
+    entries.set_defaults(call=_call_time_entries)
+
+    settings = time_sub.add_parser(
+        "settings",
+        help="The person registry, the time_tracking switch and the platform-wide "
+             "time defaults, each with its source (GET /api/time/settings).",
+    )
+    settings.set_defaults(call=_call_time_settings)
+
+    person = time_sub.add_parser(
+        "person",
+        help="Edit the person registry: the operator credential only "
+             "(/api/time/people). An assistant lists the person it talks to with `time me`.",
+    )
+    person_sub = person.add_subparsers(dest="person_action", metavar="ACTION")
+    for action, summary in (("add", "List a new person."), ("set", "Change a listed person.")):
+        parser = person_sub.add_parser(action, help=summary)
+        parser.add_argument("key", help="The person key: a slug, the directory under timesheet.d/.")
+        parser.add_argument("--name", help="Display name.")
+        parser.add_argument("--slack", action="append", metavar="USER_ID",
+                            help="A Slack user id (repeatable; replaces the list).")
+        parser.add_argument("--matrix", action="append", metavar="MXID",
+                            help="A Matrix id, @user:server (repeatable; replaces the list).")
+        if action == "set":
+            parser.add_argument("--add", action="append", metavar="IDENTITY",
+                                help="Add slack:<id> or matrix:<mxid>, moving it from whoever had it.")
+            parser.add_argument("--clear-slack", action="store_true", help="Remove every Slack id.")
+            parser.add_argument("--clear-matrix", action="store_true", help="Remove every Matrix id.")
+            parser.set_defaults(call=_call_time_person_set)
+        else:
+            parser.set_defaults(call=_call_time_person_add)
+    remove = person_sub.add_parser("remove", help="Remove a person; a default_person naming them is cleared.")
+    remove.add_argument("key")
+    remove.set_defaults(call=_call_time_person_remove)
+
+    defaults = time_sub.add_parser(
+        "defaults",
+        help="The platform-wide time settings: the operator credential only (PATCH /api/time/defaults).",
+    )
+    defaults_sub = defaults.add_subparsers(dest="defaults_action", metavar="ACTION")
+    defaults_set = defaults_sub.add_parser("set", help="Change them; an empty value clears one.")
+    defaults_set.add_argument("--tracking", choices=("on", "off"), help="The time_tracking switch.")
+    defaults_set.add_argument("--default-person", metavar="KEY",
+                              help="The person the operator credential acts for.")
+    for flag, unit in (("idle-grace-minutes", "minutes"), ("min-entry-seconds", "seconds"),
+                       ("pause-hours", "hours"), ("title-max-age-days", "days"),
+                       ("sweep-seconds", "seconds")):
+        defaults_set.add_argument(f"--{flag}", metavar=unit.upper())
+    defaults_set.add_argument("--writer-name", help="The timesheet writer's commit author name.")
+    defaults_set.add_argument("--writer-email", help="The timesheet writer's commit author email.")
+    defaults_set.set_defaults(call=_call_time_defaults_set)
+
+    me = time_sub.add_parser(
+        "me",
+        help="List the person who asked under --key, or rename them with --name "
+             "(POST /api/time/me). Their Slack or Matrix id comes from the request, never a flag.",
+    )
+    me.add_argument("--key", help="The person key to list them under (a new one).")
+    me.add_argument("--name", help="Their display name.")
+    me.add_argument("--record", help=record_help)
+    me.set_defaults(call=_call_time_me)
+
+    project = time_sub.add_parser(
+        "project",
+        help="A project's time settings (PATCH /api/time/project); an assistant sets only its own.",
+    )
+    project_sub = project.add_subparsers(dest="project_action", metavar="ACTION")
+    project_set = project_sub.add_parser("set", help="Change them; an empty value clears one.")
+    project_set.add_argument("--project", help="The workspace id (an assistant's own by default).")
+    project_set.add_argument("--handler", help="The tracking handler; empty is the built-in timesheet.")
+    project_set.add_argument("--client", dest="clients", action="append", metavar="LABEL",
+                             help="A client label (repeatable; replaces the list, the first is the default).")
+    project_set.add_argument("--clear-clients", action="store_true", help="Remove every client label.")
+    project_set.add_argument("--idle-grace-minutes", metavar="MINUTES",
+                             help="This project's idle grace; empty inherits the platform's.")
+    project_set.add_argument("--key", help="The project key entries are filed under.")
+    project_set.set_defaults(call=_call_time_project_set)
+
+    handler = time_sub.add_parser(
+        "handler",
+        help="Check a handler definition with the daemon's own parser before pushing it.",
+    )
+    handler_sub = handler.add_subparsers(dest="handler_action", metavar="ACTION")
+    check = handler_sub.add_parser("check", help="POST /api/time/handlers/check; the name is the file's stem.")
+    check.add_argument("file", help="The YAML file, e.g. /work/timesheet.d/.handlers/board.yaml.")
+    check.set_defaults(call=_call_time_handler_check)
+
+
 def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     """Parse, issue the verb's requests, print the last reply. Returns the exit code.
 
@@ -1460,10 +1897,18 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
                 headers["X-Lmer-Workspace-ID"] = args.workspace_id
             if args.request_id:
                 headers["X-Lmer-Request-ID"] = args.request_id
-            response = _request(
-                endpoint, call, timeout=args.timeout, transport=transport,
-                **({"headers": headers} if headers else {}),
-            )
+            def send(call=call, headers=headers):
+                return _request(
+                    endpoint, call, timeout=args.timeout, transport=transport,
+                    **({"headers": headers} if headers else {}),
+                )
+            extra = None
+            if call.method == "POST" and call.path == "/api/sessions":
+                response, attempts, elapsed = _resending_rate_limited(send)
+                if attempts > 1:
+                    extra = {"attempts": attempts, "elapsed_seconds": round(elapsed, 1)}
+            else:
+                response = send()
             if call.method == "POST" and call.path == "/api/comms/thread" and 200 <= response.status_code < 300:
                 payload = _payload(response.text)
                 posted = payload.get("posted") if isinstance(payload, dict) else None
@@ -1480,6 +1925,7 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     return _emit(
         response, endpoint,
         late_fails=call.path.endswith("/comms") and (call.body or {}).get("kind") == "answer",
+        extra=extra,
     )
 
 

@@ -51,6 +51,8 @@ __all__ = [
     "option_conflict", "RESERVED_META_KEYS", "relay_payload", "relay_label", "one_turn",
     "utc_now_iso", "SUPERVISOR_AUTHORITY_LEVELS", "AUTHORITY_NONE",
     "META_AUTHORITY", "META_OPERATOR_ONLY", "ASSISTANT_CHANNELS", "CHANNEL_PEER_UL",
+    "NOTIFICATION_CONNECTOR_HEALTH", "NOTIFICATION_CONNECTOR_STATUS", "META_CONNECTOR_STATE",
+    "CONNECTOR_FAILING", "CONNECTOR_RECOVERED",
 ]
 
 SCHEMA_VERSION = 1
@@ -163,6 +165,25 @@ ASSISTANT_CHANNELS = frozenset({CHANNEL_UBER, CHANNEL_PEER_UL})
 #: ``meta`` flag for a record the Slack/Matrix threads neither show nor bind a
 #: reply to. An open question so flagged still reaches uber lmer as live.
 META_OFF_THREAD = "off_thread"
+
+#: ``meta`` key on a record a Slack or Matrix connector relays: who posted it in
+#: the thread — a human, a bot, or a ``thread_posts`` origin (#674).
+META_POSTER = "poster"
+POSTER_HUMAN = "human"
+POSTER_BOT = "bot"
+
+#: ``meta.notification_class`` of a thread connector's delivery-health note. Its
+#: readers keep it out of the assistant's feed and digests: routine noise.
+NOTIFICATION_CONNECTOR_HEALTH = "connector_health"
+#: ``meta.notification_class`` of a direct connector supervisor's own status
+#: note ("connector exited", "recovery required"). Unlike a health note it still
+#: reaches the assistant, which may have to act on it.
+NOTIFICATION_CONNECTOR_STATUS = "connector_status"
+#: ``meta`` key on a health note naming its side of an incident, one of
+#: :data:`CONNECTOR_FAILING` and :data:`CONNECTOR_RECOVERED`.
+META_CONNECTOR_STATE = "connector_state"
+CONNECTOR_FAILING = "failing"
+CONNECTOR_RECOVERED = "recovered"
 
 
 def off_thread(record: Optional[Mapping]) -> bool:
@@ -290,11 +311,15 @@ def parse_message_ref(ref: object, session: str) -> Optional[int]:
 @dataclass(frozen=True)
 class Source:
     """Who a record came from: a channel and, when known, a person and the
-    channel's own id for the message."""
+    channel's own id for the message.
+
+    ``author`` is display text; ``author_id`` is the channel's stable id for a
+    human sender (a Slack user id, a Matrix MXID), set only on a human's post."""
 
     channel: str
     author: Optional[str] = None
     ref: Optional[str] = None
+    author_id: Optional[str] = None
 
     @property
     def label(self) -> str:
@@ -310,6 +335,8 @@ class Source:
             out["author"] = self.author
         if self.ref:
             out["ref"] = self.ref
+        if self.author_id:
+            out["author_id"] = self.author_id
         return out
 
     @classmethod
@@ -326,7 +353,8 @@ class Source:
             )
         author = _optional_text(raw.get("author"), MAX_AUTHOR_CHARS, "source.author")
         ref = _optional_text(raw.get("ref"), MAX_REF_CHARS, "source.ref")
-        return cls(channel=channel, author=author, ref=ref)
+        author_id = _optional_text(raw.get("author_id"), MAX_AUTHOR_CHARS, "source.author_id")
+        return cls(channel=channel, author=author, ref=ref, author_id=author_id)
 
 
 @dataclass(frozen=True)

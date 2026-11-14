@@ -82,6 +82,8 @@ REAP = stretch(5.0)
 BACKLOG = stretch(900.0)
 #: Deliberately expired by tests of connection failure.
 CONNECT_EXPIRED = stretch(0.3)
+#: Deliberately expired to interrupt a connector's finalization.
+FINALIZE_EXPIRED = stretch(0.3)
 
 # Project-index render budgets (pure-Python PyYAML, no libyaml, must pass).
 

@@ -270,7 +270,7 @@ def _run_hook(payload, env_extra):
     env = os.environ.copy()
     # Every variable the hook reads as "this is a chat session": a chat-bridged
     # session running this suite exports one of them.
-    for name in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL"):
+    for name in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL", "LMER_NONINTERACTIVE", "LMER_FANOUT_CHILD"):
         env.pop(name, None)
     env.update(env_extra)
     return subprocess.run(
@@ -534,7 +534,7 @@ class TestChatChannelTrigger:
     def _run(self, env_extra, tmp_path):
         transcript = tmp_path / "t.jsonl"
         transcript.write_text(json.dumps(_assistant_text(LONG)) + "\n", encoding="utf-8")
-        env = {k: v for k, v in os.environ.items() if k not in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL")}
+        env = {k: v for k, v in os.environ.items() if k not in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL", "LMER_NONINTERACTIVE", "LMER_FANOUT_CHILD")}
         env.update(env_extra)
         return subprocess.run(
             [sys.executable, str(Path(__file__).resolve().parents[1] / "hooks" / "slack_reply_guard.py")],

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, mergeProps, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, mergeProps, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useDisplay, useTheme } from 'vuetify'
 import {
   mdiAlertOutline,
@@ -7,6 +7,7 @@ import {
   mdiArrowCollapseHorizontal,
   mdiArrowExpandHorizontal,
   mdiBroom,
+  mdiClose,
   mdiCogOutline,
   mdiMagnify,
   mdiMapOutline,
@@ -34,8 +35,16 @@ import ProjectSlots from './components/ProjectSlots.vue'
 import ProjectSettings from './components/ProjectSettings.vue'
 import WorkRepoSchema from './components/WorkRepoSchema.vue'
 import ProjectSwitcher from './components/ProjectSwitcher.vue'
+import StaleDaemon from './components/StaleDaemon.vue'
+import TimeIndicator from './components/TimeIndicator.vue'
+import TimeEntries from './components/TimeEntries.vue'
+import TimeTrackingBar from './components/TimeTrackingBar.vue'
+import UsageRollup from './components/UsageRollup.vue'
+import UsageStrip from './components/UsageStrip.vue'
 import { applyAssistantName, assistantName, faceUrl, moodOf, moodReason, offReason } from './ratchet.js'
-import { createProject, fetchProjects, fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
+import {
+  createProject, fetchProjects, fetchRunRelations, fetchState, fetchTimeStatus, forgetRun, prune, rescan,
+} from './api.js'
 import { projectColor, projectTextColor } from './projects.js'
 import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
@@ -44,6 +53,7 @@ import {
   rememberChoice, rememberFlag, rememberId, rememberIds, storedChoice, storedFlag, storedId, storedIds,
 } from './preferences.js'
 import { onRunRef, runKey } from './runref.js'
+import { burnLabel, usageComparator, usageRanking } from './usage.js'
 
 const POLL_MS = 10000
 
@@ -99,6 +109,21 @@ function rememberFleetView(value) {
   )
 }
 // --- end of fleet view mode --------------------------------------------------
+
+// --- list order --------------------------------------------------------------
+// The order the list was always in, or the most expensive run now (issue 315):
+// remembered for the same reason as the view mode above.
+const LIST_ORDERS = ['listed', 'cost']
+const LIST_ORDER_STORAGE_KEY = 'lmer.fleet.order'
+
+function storedListOrder() {
+  return storedChoice(() => window.localStorage.getItem(LIST_ORDER_STORAGE_KEY), LIST_ORDERS)
+}
+
+function rememberListOrder(value) {
+  rememberChoice((stored) => window.localStorage.setItem(LIST_ORDER_STORAGE_KEY, stored), LIST_ORDERS, value)
+}
+// --- end of list order -------------------------------------------------------
 
 // --- projects this browser comes back to (#627) ------------------------------
 // A page loads on its link's project, else the default, else the last one open
@@ -173,6 +198,34 @@ const linkedProject = ownUrl ? '' : urlProject
 // nothing: the URL may still name the default the operator has since cleared.
 if (ownUrl && urlProject && lastProject !== '') restoreCandidates.push(urlProject)
 const activeProject = ref(linkedProject || restoreCandidates[0] || '')
+// Leaving Platform settings with unsaved edits asks first (issue 652). The view is
+// put back at once, so the page keeps its edits while the question is open, and
+// so is the project or run the same tap chose just before it changed the view.
+const platformSettings = ref(null)
+let leaveFrom = null
+watch([activeProject, selectedKey], (_, [project, key]) => {
+  if (view.value !== 'platform-settings' || leaveFrom) return
+  leaveFrom = { project, key }
+  queueMicrotask(() => { leaveFrom = null })
+}, { flush: 'sync' })
+// Set while carrying out an answered Discard: the operator has decided, so a card
+// that still reads as unsaved afterwards must not ask again.
+let discarded = false
+watch(view, (next, previous) => {
+  if (discarded || previous !== 'platform-settings' || !platformSettings.value?.hasUnsavedChanges()) return
+  const target = { project: activeProject.value, key: selectedKey.value }
+  if (leaveFrom) { activeProject.value = leaveFrom.project; selectedKey.value = leaveFrom.key }
+  view.value = previous
+  platformSettings.value.confirmLeave().then((leave) => {
+    if (!leave) return
+    discarded = true
+    try {
+      activeProject.value = target.project
+      selectedKey.value = target.key
+      view.value = next
+    } finally { discarded = false }
+  })
+}, { flush: 'sync' })
 // What storage chose; a link is never second-guessed, it gets the unavailable notice.
 const restoredProject = linkedProject ? '' : activeProject.value
 // No "unavailable" notice for a restored id until the first list: a failed fetch is not a dead project.
@@ -193,7 +246,12 @@ const chatWorkspace = computed(() => projects.value.find(project => project.id =
 // is gone) leaves the theme's own bar.
 const barProject = computed(() => (workspace.value && !workspace.value.archived ? workspace.value : null))
 const barColor = computed(() => (barProject.value ? projectColor(barProject.value.color) : undefined))
-const barStyle = computed(() => (barProject.value ? { color: projectTextColor(barProject.value.color) } : undefined))
+// The bar's ink is also its buttons' focus ring: the page's primary ring can match the project colour.
+const barStyle = computed(() => {
+  if (!barProject.value) return undefined
+  const ink = projectTextColor(barProject.value.color)
+  return { color: ink, '--focus-ring': ink }
+})
 const switcherEvents = {
   choose: chooseProject,
   settings: () => { projectSettingsFocus.value = null; view.value = 'project-settings' },
@@ -716,6 +774,9 @@ function haystack(run) {
     // rendered relative and a query never means one — the same reason `updated`
     // is not in here.
     run.checkin?.stale && 'unchecked',
+    // The burn reading, as the row words it: "burn" finds the runs that are
+    // spending at all, and the numbers are what the row shows beside it.
+    burnLabel(run.usage),
     ...(run.ports || []).map((port) => `:${port.host}`),
   ].filter(Boolean).join(' ').toLowerCase()
 }
@@ -737,8 +798,22 @@ function visible(list) {
 // learn the exceptions to; and `nothingMatches` then means the same thing in both
 // views, which is what lets one message serve them.
 const mapRows = computed(() => visible(runs.value))
-const attentionRows = computed(() => visible(attention.value))
-const calmRows = computed(() => visible(calm.value))
+const listOrder = ref(storedListOrder())
+watch(listOrder, rememberListOrder)
+// Offered only once some run has a burn reading: before that every run ties.
+const orderable = computed(() => runs.value.some((run) => run.usage))
+// One comparator for both groups, so both rank by the same measure: cost only
+// when every run is priced. Sorted inside each group, never across them, so a
+// run waiting on somebody still comes first.
+const byCost = computed(() => (
+  listOrder.value === 'cost' && orderable.value ? usageComparator(runs.value) : null
+))
+const ordered = (list) => (byCost.value ? [...list].sort(byCost.value) : list)
+const rankedBy = computed(() => (
+  usageRanking(runs.value) === 'cost' ? 'by cost' : 'by unpriced token weight (cost is not priced for every run)'
+))
+const attentionRows = computed(() => visible(ordered(attention.value)))
+const calmRows = computed(() => visible(ordered(calm.value)))
 // Said out loud, because a tracked fleet with an empty list on screen otherwise
 // reads as the fleet having been lost rather than as the search having matched
 // nothing.
@@ -770,6 +845,7 @@ let inFlight = null
 
 function load() {
   if (inFlight) return inFlight
+  loadTime()
   inFlight = (async () => {
     try {
       state.value = await fetchState()
@@ -814,6 +890,94 @@ function load() {
     }
   })()
   return inFlight
+}
+
+// --- time tracking (#604, spec D3) -------------------------------------------
+//
+// Read on the fleet's own cadence, from load(), so the header and the bar cost no
+// timer of their own. Its failures are its own too: time tracking that is off
+// (503) or a daemon without the routes (404) is not a fleet problem, so the
+// indicator and the bar simply are not there; an operator credential that acts
+// for nobody (409) leaves a short hint in the header instead. Anything else holds
+// the last reading, as the mood does across a failed poll.
+const timeStatus = ref(null)
+const timeHint = ref(null)
+const timeReadAt = ref(0)
+// Not remembered. While a timer runs the bar is shown whatever this says.
+const timeBarOpen = ref(false)
+const timeBarEditing = ref(false)
+const timeBarSize = ref(0)
+const timeFocus = ref(null)
+const timeRunning = computed(() => timeStatus.value?.running || null)
+const timeBarShown = computed(() => !!timeRunning.value || timeBarOpen.value)
+// A bar that hides (a Stop with it closed) opens next time in its slim view.
+watch(timeBarShown, shown => { if (!shown) timeBarEditing.value = false })
+// The entries (spec D18) open in a dialog over the view, so the run being read keeps
+// its place; the filters are what it opens with, e.g. `{ status: 'held' }`.
+const timeEntriesOpen = ref(false)
+const timeEntriesFilters = ref({})
+let timeInFlight = null
+// A read asked for after a start or stop must not be answered by one already in
+// flight, which may have left before the change.
+let timeAgain = false
+let timeNonce = 0
+
+function loadTime({ fresh = false } = {}) {
+  if (timeInFlight) {
+    if (fresh) timeAgain = true
+    return timeInFlight
+  }
+  timeInFlight = (async () => {
+    try {
+      const reply = await fetchTimeStatus()
+      timeStatus.value = reply?.person ? reply : null
+      timeReadAt.value = Date.now()
+      timeHint.value = null
+    } catch (exc) {
+      if (exc.status === 503 || exc.status === 404) {
+        timeStatus.value = null
+        timeHint.value = null
+      } else if (exc.code === 'time_no_default_person') {
+        timeStatus.value = null
+        timeHint.value = exc.message
+      }
+    } finally {
+      timeInFlight = null
+      if (timeAgain) {
+        timeAgain = false
+        loadTime()
+      }
+    }
+  })()
+  return timeInFlight
+}
+
+function timeChanged() {
+  loadTime({ fresh: true })
+  load()
+}
+
+// Opened from code rather than an activator, the dialog leaves Vuetify nothing to
+// return focus to on close, so it goes back to whatever opened it.
+let timeEntriesOpener = null
+function openTimeEntries(filters = {}) {
+  timeEntriesFilters.value = { ...filters }
+  timeEntriesOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  timeEntriesOpen.value = true
+}
+watch(timeEntriesOpen, (open) => {
+  if (open) return
+  const opener = timeEntriesOpener
+  timeEntriesOpener = null
+  if (opener?.isConnected) nextTick(() => opener.focus())
+})
+
+// A suppressed automatic start (D19) is fixed in the bar, on that project.
+function openTimePrompt(prompt) {
+  timeBarOpen.value = true
+  timeBarEditing.value = true
+  timeNonce += 1
+  timeFocus.value = { id: prompt.workspace_id, nonce: timeNonce, prompt: prompt.id != null ? prompt : null }
 }
 
 // Coming back to the app, which the interval alone does not cover: a phone throttles
@@ -911,6 +1075,9 @@ function openRunRef(ref) {
   }
   runRefNotice.value = null
   open(run)
+  // Focus belongs to the run that was followed, not to what opened the entries.
+  timeEntriesOpener = null
+  timeEntriesOpen.value = false
   // On a phone the assistant's drawer is an overlay over the run it just opened.
   if (mobile.value) uberOpen.value = false
 }
@@ -997,6 +1164,8 @@ onUnmounted(() => {
           </v-tooltip>
         </div>
         <div class="bar-actions">
+          <TimeIndicator :status="timeStatus" :hint="timeHint" :open="timeBarShown" :editing="timeBarEditing"
+            :tint="barColor || null" @toggle="timeBarOpen = !timeBarOpen" @edit="timeBarEditing = !timeBarEditing" />
           <template v-if="view === 'fleet'">
             <v-btn-toggle v-model="fleetView" :class="{ 'me-1': !mobile }" density="compact" mandatory variant="text">
               <v-tooltip text="read the fleet as a list" location="bottom" open-on-focus>
@@ -1064,6 +1233,17 @@ onUnmounted(() => {
       </template>
     </v-app-bar>
 
+    <!-- Full width under the header, so registered before the drawers (issue 668): the
+         layout reserves the bar's reported height, and the drawers and the view start
+         below it. Shown while a timer runs, else while the clock has it open. -->
+    <v-layout-item v-if="timeStatus" position="top" class="time-bar-slot" :size="timeBarShown ? timeBarSize : 0"
+      :model-value="timeBarShown">
+      <TimeTrackingBar v-show="timeBarShown" :status="timeStatus" :default-project="activeProject"
+        :focus="timeFocus" :editing="timeBarEditing" :read-at="timeReadAt" :now="now" @changed="timeChanged"
+        @entries="openTimeEntries" @prompt="openTimePrompt" @edit="timeBarEditing = !timeBarEditing"
+        @size="timeBarSize = $event" />
+    </v-layout-item>
+
     <!-- The run list, reachable from wherever you are. Without it the detail
          view is a dead end: switching runs means going back to the fleet first,
          which is three taps to answer the second of two waiting questions.
@@ -1084,6 +1264,7 @@ onUnmounted(() => {
         :selected="project.id === activeProject" :runs="projectRuns(project.id)" :attention="projectAttention(project.id)"
         :current-key="view === 'detail' && selected?.workspace_id === project.id ? selectedKey : null" :now="now"
         :face="projectFaces[project.id]" :collapsed="collapsedProjects.includes(project.id)"
+        :tracking="timeRunning?.workspace_id === project.id ? timeRunning.mode : null"
         @open="open" @chat="showProjectChat" @toggle="rememberCollapsed" />
       <section v-if="unassignedRuns.length || unassignedAttention.length" aria-label="Unassigned" class="unassigned-runs">
         <h2 class="text-title-small pa-3">Unassigned</h2>
@@ -1123,15 +1304,17 @@ onUnmounted(() => {
 
     <v-main>
       <v-container max-width="900" class="pa-3">
+        <StaleDaemon />
+        <UsageStrip v-if="view === 'fleet'" :now="now" />
         <v-alert v-if="!loading && activeProject && activeProject !== unconfirmedProject && (!workspace || workspace.archived)"
           type="warning" class="mb-3">
           This project link is unavailable or archived. Choose another project, or restore it from Platform settings.
         </v-alert>
         <ProjectSettings v-if="view === 'project-settings' && workspace && !workspace.archived" :key="workspace.id"
           :project="workspace" :focus="projectSettingsFocus" :now="now" :is-default="defaultProject === workspace.id"
-          @changed="load" @close="view = 'fleet'" @focused="projectSettingsFocus = null"
+          :time="timeStatus" @changed="load" @close="view = 'fleet'" @focused="projectSettingsFocus = null"
           @default="setDefaultProject" />
-        <PlatformSettings :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
+        <PlatformSettings ref="platformSettings" :state="state" :loading="loading" v-else-if="view === 'platform-settings'" :projects="projects" :slots="slots"
           :runs="state?.runs || []" :now="now" :focus-section="platformSection" @changed="load" @open="open" />
         <!-- Keyed by the run, so switching from the drawer starts the detail
              view over instead of reusing one that still holds the last run's
@@ -1188,6 +1371,7 @@ onUnmounted(() => {
                daemon) is not assumed to be one — so a legacy fleet mounts nothing
                and sends no request. -->
           <WorkRepoSchema v-if="mirror?.form === 'schema'" :head-sha="mirror.head_sha || null" />
+          <UsageRollup :runs="state?.runs || []" />
         </template>
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
@@ -1280,6 +1464,12 @@ onUnmounted(() => {
                  between them are one view, and conditioning them separately is
                  how they drift out of step. -->
             <template v-if="fleetView === 'list'">
+              <div v-if="orderable" class="d-flex justify-end mb-1">
+                <v-btn-toggle v-model="listOrder" density="compact" mandatory variant="text" aria-label="list order">
+                  <v-btn value="listed" size="small">as listed</v-btn>
+                  <v-btn value="cost" size="small" :title="`burn over the last 15 minutes, ${rankedBy}`">most expensive now</v-btn>
+                </v-btn-toggle>
+              </div>
               <!-- Runs needing a human come first, always: it is the one thing this
                    view exists to tell you. The split is inside the search results
                    rather than around them, so filtering never buries a run that is
@@ -1337,6 +1527,19 @@ onUnmounted(() => {
         </template>
       </v-container>
     </v-main>
+
+    <v-dialog v-model="timeEntriesOpen" class="time-entries-dialog" max-width="1100" scrollable :fullscreen="mobile"
+      aria-labelledby="time-entries-title">
+      <v-card>
+        <v-card-title class="d-flex align-center">
+          <span id="time-entries-title" class="text-title-large">Time entries</span><v-spacer />
+          <v-btn :icon="mdiClose" variant="text" aria-label="close the time entries" @click="timeEntriesOpen = false" />
+        </v-card-title>
+        <v-card-text class="pa-3">
+          <TimeEntries v-if="timeEntriesOpen" :filters="timeEntriesFilters" :status="timeStatus" />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="projectDialog" max-width="480">
       <v-card title="New project">
@@ -1571,6 +1774,12 @@ onUnmounted(() => {
    these elements — the open/closed transform, the z-index, the heights — is left to
    the framework. */
 .app-narrow .v-app-bar {
+  left: var(--app-inset) !important;
+  right: var(--app-inset) !important;
+  width: auto !important;
+}
+
+.app-narrow .time-bar-slot {
   left: var(--app-inset) !important;
   right: var(--app-inset) !important;
   width: auto !important;

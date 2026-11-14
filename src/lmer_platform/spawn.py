@@ -334,6 +334,16 @@ LAUNCH_UID_FLAG = "--launch-uid"
 #: there so that case is a refusal rather than a spin.
 _LAUNCH_UID_ATTEMPTS = 8
 
+#: The longest a spawn waits out a transport's rate limit on its thread
+#: targets, across every attempt: ``lmer-ctl`` gives a whole spawn 120 s. No
+#: attempt starts once it has passed.
+THREAD_CHECK_WAIT_SECONDS = 30.0
+#: And how many times it asks, since every attempt spends the same budget.
+THREAD_CHECK_ATTEMPTS = 4
+#: The shortest wait between two attempts, so ``Retry-After: 0`` is not four
+#: calls in a row against a budget that is already spent.
+THREAD_CHECK_MIN_PAUSE_SECONDS = 1.0
+
 #: How ``lmer`` is told that something else runs the connectors for its thread
 #: targets. Emitted whenever this module passes thread permalinks: the daemon
 #: runs one connector process per (session, thread) so a connection can be made
@@ -480,7 +490,17 @@ class ThreadHeld(SpawnError):
 
     Its own class because the route answers it 409 rather than 400: the request
     is well formed and works once the holding session lets the thread go.
+
+    Also raised when who holds it could not be asked; *transient* and
+    *retry_after* are then the transport's, as on
+    :class:`lmer_cli.threads.ThreadError`.
     """
+
+    def __init__(self, message: str, *, transient: bool = False,
+                 retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.transient = transient
+        self.retry_after = retry_after
 
 
 class SlotOccupied(SpawnError):
@@ -3166,7 +3186,7 @@ def _refuse_if_threads_are_held(targets) -> None:
     try:
         component.refuse_held_targets(targets)
     except thread_connectors.ThreadError as exc:
-        raise ThreadHeld(str(exc)) from None
+        raise ThreadHeld(str(exc), transient=exc.transient, retry_after=exc.retry_after) from None
 
 
 def _claimed_control_ports() -> set:
@@ -3799,15 +3819,66 @@ def spawn_session(
     live session holds. *refuse_held_targets* turns that off for the one caller
     that decides it elsewhere: the assistant's targets are its **standing** list,
     and a standing thread that is held defers rather than refusing, so uber lmer
-    still comes up (:func:`lmer_platform.assistant.start`).
+    still comes up (:func:`lmer_platform.assistant.start`). A check the transport
+    could not answer because of a rate limit is tried again after the wait it
+    asked for (:func:`waiting_out_rate_limits`), with every lock released.
     """
-    # Launch checks and publication must be exclusive, including the Popen gap.
-    with projects.operation(), _LAUNCH_LOCK, project_context.bound(request.workspace_id or project_context.current()):
-        _cleanup_failed_publications()
-        return _spawn_session(
-            config, request, kind=kind, publish_registration=publish_registration,
-            refuse_held_targets=refuse_held_targets,
-        )
+    def attempt() -> SpawnResult:
+        # Launch checks and publication must be exclusive, including the Popen gap.
+        with projects.operation(), _LAUNCH_LOCK, project_context.bound(request.workspace_id or project_context.current()):
+            _cleanup_failed_publications()
+            return _spawn_session(
+                config, request, kind=kind, publish_registration=publish_registration,
+                refuse_held_targets=refuse_held_targets,
+            )
+
+    return waiting_out_rate_limits(attempt)
+
+
+def rate_limit_pause(exc: ThreadHeld) -> Optional[float]:
+    """How long to wait before asking again, or ``None`` if waiting would not help.
+
+    Only a refusal the transport rate limited says so: it is transient and
+    carries the transport's ``retry_after``, raised to at least
+    :data:`THREAD_CHECK_MIN_PAUSE_SECONDS`. One answer for the loop below and
+    for ``POST /api/sessions``, which hands the wait to its caller.
+    """
+    if not exc.transient or exc.retry_after is None:
+        return None
+    return max(THREAD_CHECK_MIN_PAUSE_SECONDS, exc.retry_after)
+
+
+def waiting_out_rate_limits(attempt: Callable[[], SpawnResult]) -> SpawnResult:
+    """*attempt*, made again while its thread check is only rate limited.
+
+    A :class:`ThreadHeld` that is transient and carries the transport's
+    ``retry_after`` is waited out: at least
+    :data:`THREAD_CHECK_MIN_PAUSE_SECONDS`, at most
+    :data:`THREAD_CHECK_ATTEMPTS` attempts, and none starting once
+    :data:`THREAD_CHECK_WAIT_SECONDS` have passed since the first. A timeout
+    or a 5xx has no ``retry_after`` and is refused at once, as is any refusal
+    while a ``projects.operation()`` is held here, since sleeping would hold
+    it. *attempt* must hold no lock of its own when it raises.
+    """
+    started = time.monotonic()
+    for number in range(1, THREAD_CHECK_ATTEMPTS + 1):
+        try:
+            return attempt()
+        except ThreadHeld as exc:
+            pause = rate_limit_pause(exc)
+            if pause is None or projects.operation_held():
+                raise
+            elapsed = time.monotonic() - started
+            if number < THREAD_CHECK_ATTEMPTS and elapsed + pause < THREAD_CHECK_WAIT_SECONDS:
+                time.sleep(pause)
+                continue
+            if number == 1:
+                raise
+            raise ThreadHeld(
+                f"{exc}; gave up after {number} attempts in {elapsed:.0f}s of {THREAD_CHECK_WAIT_SECONDS:g}s",
+                transient=True, retry_after=exc.retry_after,
+            ) from None
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _requests_codex(request: SpawnRequest) -> bool:
@@ -4053,6 +4124,10 @@ def _spawn_session(
                 # entry is a debugging artifact people paste around.
                 "agents": request.agents,
                 "harness": request.harness,
+                # Host-side provenance for the usage view's headroom groups
+                # (#315): the same value the container gets as
+                # LMER_SESSION_METADATA.operator, kept where it cannot write.
+                "operator": _session_metadata(request).get("operator"),
                 # What the spawn *asked* for, which is ``None`` for the ordinary
                 # request that names no model. The session overwrites it with what
                 # it actually resolved as soon as it reports back (absorb_ports), so

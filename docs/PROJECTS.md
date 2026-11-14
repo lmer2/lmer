@@ -50,11 +50,25 @@ its name, so the chip shows it.
 
 The **Platform settings** cog in the global app header is available on desktop
 and phone views, separately from the selected project's **Project settings**.
-Platform settings contains shared worker capacity, assistant capacity, execution
-and display defaults, transport infrastructure, slot administration and archived
-projects. Defaults affect subsequent assistant launches; project execution
-settings override them. Thread addresses, instructions, history and memory are
-never inherited from another project.
+Platform settings shows one section at a time, picked from a side nav on desktop
+or a **Section** select on a phone:
+
+| Section | Cards |
+|---|---|
+| Fleet | Capacity: shared worker and assistant limits |
+| Assistants | Launch defaults, Reminders, Rotate all |
+| Chat and display | Chat display (working transcript, tint my messages), Operator channel dock |
+| Graph | Graph groups |
+| Service slots | Slot administration |
+| Projects | Archived projects, with Restore |
+| Inbound chat | Message ingress status, conversation requests needing attention |
+
+Each editable card has its own Save, enabled only while the card holds unsaved edits; an
+edited card shows **Unsaved** and its section is marked in the nav. Switching
+section, leaving Platform settings or closing the tab with unsaved edits asks
+first. Defaults affect subsequent assistant launches; project execution settings
+override them. Thread addresses, instructions, history and memory are never
+inherited from another project.
 
 ## Admission and recovery
 
@@ -562,6 +576,101 @@ source-thread request can authorize new work. Uncertain action or reply outcomes
 cannot use this release path; inspect them without blind retries. Existing
 operator parking for uncertain replies remains separate, as described below.
 
+### Releasing or handing off a thread claim
+
+A mention gives the project it lands on a claim on its thread, and every later
+spawn or post there by another project is refused as "belongs to another
+project". When the mention belongs elsewhere, the owning project's assistant (or
+the operator) gives the claim up. This works after the request was answered too:
+
+```sh
+lmer-ctl threads release PERMALINK --to PROJECT --reason 'Billing owns this request'
+lmer-ctl --workspace-id ID threads release PERMALINK --reason 'Not ours'
+```
+
+`POST /api/threads/release {permalink, to?, reason?}` acts for the calling
+project. That is the assistant's own project, or the operator's `workspace_id`.
+`--to` takes a project id or a case-insensitive name. The reason is optional for
+an assistant and required (1–2000 characters) for the operator. Other credentials,
+such as a chat connector's, are refused with 403.
+
+The release removes the calling project's `choice` and `project:<id>` owner rows.
+It also removes `run:<key>` rows of runs homed in that project when no session
+still holds the thread. It never steals, so it is refused (HTTP 409) when:
+
+- **a session holds the thread.** That is any session with a connector record
+  for it, live or ended, including the caller's own assistant. The refusal names
+  the session and the exact `lmer-ctl threads disconnect SESSION THREAD_ID` to
+  run first. A connection would re-seed its owner row on the next read.
+- **the owners span more than one project.**
+- **the thread is in the project's standing `threads` setting.** Remove it there
+  first, for the same reason as a connection.
+- **an assistant is handling a different conversation request.** Finish that
+  request first.
+
+A project with no owner row and no request for the thread gets 403. That
+includes a Slack reply link that is not the thread's root link. An unknown `--to`
+gets 404. Naming the releasing project itself gets 400. An archived target is
+refused.
+
+The checks run under the projects operation lock. The owner-row, request,
+receipt and handoff-queue writes then commit in one transaction, so a failure
+before the commit changes nothing and the call can be retried. The
+`thread_released` event and the two conversation notes are written after that
+commit. If one of them fails, the call reports an error although the release
+stands, and a retry returns `duplicate: true` without writing the missing note.
+
+When the thread had a recorded request, repeating a release that already
+happened returns `duplicate: true` with `released: []`. That applies to an
+assistant whose answered request still binds it, too. A thread claimed with no
+request (only an owner row) records no receipt, so repeating its plain release
+is 403, the same as a release by a project that holds nothing.
+
+With `--to`, the target gets a `choice` owner row and a new conversation request
+queued like any other:
+
+- **Request id.** It is derived from the old request, the releasing project and
+  the target. Repeating the call while the target still holds the thread returns
+  `duplicate: true` and the same id. If the thread comes back and is handed on
+  again, the new handoff gets a new request.
+- **Payload.** It carries the original source, sender, message and permalink,
+  plus `handoff: {from_project, from_project_name, from_request, reason, by}`.
+  With no recorded request, the message points at the thread instead.
+- **Receipts.** It has no action receipts, and nothing is replayed. When the
+  releasing project's requests on the thread have actions whose outcome is
+  unknown, `handoff.uncertain_actions` lists them (`request_id`, `method`,
+  `path`, `state`) as data only. The target's instruction says to check with
+  the operator before repeating any of them.
+
+Every request the releasing project has for the thread changes as follows:
+
+- **Replied:** left as it was.
+- **Queued or delivered with no uncertain reply or action:** closed as
+  `invalid`. Its binding is cleared, so the assistant can take its next request.
+  An uncertain source-thread notice ("Request … retained") does not stop this,
+  because closing sends nothing. The notice's state stays on the record.
+- **Uncertain reply or action:** its state and receipts stay as they are, and
+  the handoff still goes ahead. A delivered request with uncertain effects still
+  binds the releasing assistant, and its ownership no longer matches, so that
+  assistant's writes are refused until the operator parks it (below). The
+  response's `previous.instruction` says so and gives the park command for each
+  such request.
+
+`previous` describes the newest request. Other requests the release closed are
+listed in `previous.also_closed`. The newest request also gets a completed
+`POST /api/threads/release` action receipt.
+The daemon records a `thread_released` event and notes the release in both
+projects' assistant conversations. Nothing is posted into the source thread.
+Tell the sender there first, with `requests reply` or `thread post`, if they
+should know.
+
+In Platform settings → Conversation requests, each listed request that a
+project still holds has **Release thread…**. An answered request is not listed,
+so the usual case of a mention that was answered and then found to be another
+project's goes through **Release a thread…**, which takes a permalink. Both open
+one dialog: the owning project, an optional hand-off target and the required
+reason. A refusal shows in the dialog.
+
 Action receipts identify request, method, route and payload, excluding redundant
 workspace/request identity fields. Existing receipts using those fields remain
 recognized. Repeating a
@@ -589,8 +698,12 @@ uncertain external outcomes. They remain visible in Platform settings even after
 a source-thread reply, and unresolved action outcomes block archive.
 
 An uncertain reply retains the project's execution context until an operator
-explicitly parks it. In Platform settings, choose **Park uncertain reply** and
-record a reason, or use an operator-authenticated CLI:
+explicitly parks it. So does a delivered request with an uncertain action, such
+as a spawn whose response was lost, including one that rotation recovery has
+queued again for the next assistant generation. A parked request is never
+delivered again. In Platform settings, choose **Park
+uncertain reply** (or **Park uncertain request**) and record a reason, or use an
+operator-authenticated CLI:
 
 ```sh
 lmer-ctl --workspace-id ID requests park REQUEST_ID 'Delivery remains unknown; continue independent work'

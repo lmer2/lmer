@@ -565,3 +565,73 @@ def test_inflight_authority_from_crashed_assistant_cannot_start_worker_before_re
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "assistant_generation_changed"
     assert spawn._live_worker_count() == 0
+
+
+@pytest.mark.parametrize("path", ["/api/settings", "/api/projects", "/api/prune"])
+def test_a_non_operator_settings_change_is_refused_with_the_binding_sentence(client, path):
+    """Plan test 8 (#561): the binding's operator-only refusal, status and
+    sentence, unchanged by moving the binding off the event loop."""
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+    with scope.bound(alpha["id"]):
+        token = config.active_assistant_credential()
+    response = client.post(path, headers={"Authorization": f"Bearer {token}"}, json={})
+    assert response.status_code == 403, response.text
+    assert "Only an operator may change platform or project settings." in response.text
+
+
+SLACK_THREAD = "https://team.slack.com/archives/C1/p1700000000000001"
+
+
+def _rate_limited_check(monkeypatch, *, limited, retry_after):
+    """The held-thread check, rate limited for its first *limited* calls and clear after.
+
+    Patched onto the daemon's own connectors component, so the launch that
+    follows a clear check goes through the real bookkeeping. Returns the calls,
+    each noting whether the project operation was held."""
+    component = connectors.ensure_connectors()
+    calls = []
+
+    def refuse_held_targets(targets, *, besides=None):
+        calls.append(projects.operation_held())
+        if len(calls) <= limited:
+            raise connectors.ThreadError("cannot check who holds it", status=502,
+                                         transient=True, retry_after=retry_after)
+
+    monkeypatch.setattr(component, "refuse_held_targets", refuse_held_targets)
+    return calls
+
+
+@pytest.mark.parametrize("retry_after, header", [(5, "5"), (0.2, "1"), (0, "1")])
+def test_a_rate_limited_thread_check_is_a_503_the_daemon_does_not_wait_out(client, monkeypatch, retry_after, header):
+    calls = _rate_limited_check(monkeypatch, limited=99, retry_after=retry_after)
+    monkeypatch.setattr(spawn.time, "sleep", lambda seconds: pytest.fail(f"the daemon slept {seconds}s"))
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+
+    refused = client.post("/api/sessions", json={
+        "taskdef": "chat", "target": "fleet", "targets": [SLACK_THREAD], "no_repo": True, "workspace_id": alpha["id"],
+    })
+
+    assert calls == [True], "one check, inside the route's project operation"
+    assert (refused.status_code, refused.headers.get("retry-after")) == (503, header), refused.text
+    detail = refused.json()["detail"]
+    assert (detail["code"], detail["retryable"]) == (api.THREAD_CHECK_RATE_LIMITED, True)
+    assert "cannot check who holds it" in detail["message"]
+    assert spawn._live_worker_count() == 0
+
+
+def test_ctl_spawn_waits_out_a_rate_limited_thread_check_and_starts_one_session(client, fleet, monkeypatch, capsys):
+    calls = _rate_limited_check(monkeypatch, limited=1, retry_after=2)
+    slept = []
+    monkeypatch.setattr(ctl, "_sleep", slept.append)
+    monkeypatch.setenv(ctl.ENV_PLATFORM_URL, "http://testserver")
+    monkeypatch.setenv(ctl.ENV_PLATFORM_CREDENTIAL, config.ensure_secret(fleet))
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+
+    code = ctl.main(["--workspace-id", alpha["id"], "spawn", "chat", "fleet", "--target-thread", SLACK_THREAD,
+                     "--repo-url", "https://forge.test/repository"], transport=Local(client))
+
+    out, err = capsys.readouterr()
+    assert code == 0, err
+    assert (calls, slept) == ([True, True], [2.0])
+    assert json.loads(out)["session_id"]
+    assert spawn._live_worker_count() == 1

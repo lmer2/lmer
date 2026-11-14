@@ -78,7 +78,7 @@ line in the log and the same object on the wire.
   "seq": 42,
   "session": "20260904-153332-7-21957",
   "at": "2026-09-04T16:02:11.482Z",
-  "source": {"channel": "slack", "author": "tester", "ref": "1725465731.001200"},
+  "source": {"channel": "slack", "author": "tester", "ref": "1725465731.001200", "author_id": "U0123ABCD"},
   "kind": "answer",
   "text": "prep-release",
   "in_reply_to": "20260904-153332-7-21957/000039",
@@ -97,14 +97,15 @@ line in the log and the same object on the wire.
 | `at` | str | UTC ISO-8601 with milliseconds, stamped on acceptance. Order by `seq`, not `at`. |
 | `source.channel` | str | `agent`, `supervisor`, `terminal`, `platform`, `uber-lmer`, `slack`, `matrix`, or a future connector's name (lowercase, letters/digits/dashes). Stamped by the party that vouches for it, never taken from the body alone. |
 | `source.author` | str? | Who spoke, for rendering: a Slack display name, an MXID, an operator identity. Absent for `agent`, `uber-lmer` and an unnamed terminal. |
-| `source.ref` | str? | The origin channel's own id for the message (Slack `channel:thread_ts:message_ts`, matrix `event_id`, a request id). Dedupe key for retries, and how a connector recognises its own message. |
+| `source.ref` | str? | The origin channel's own id for the message (Slack `channel:thread_ts:message_ts`, matrix `<thread tag>:<event_id>`, where the tag is the first 16 hex digits of the SHA-256 of `<room id>\n<thread root>` and an older connector posts the bare `event_id`; a request id). Dedupe key for retries, and how a connector recognises its own message. |
+| `source.author_id` | str? | The channel's stable id for a **human** sender, at most 200 characters: the Slack user id, or the sender's MXID on matrix. Set by the Slack and matrix connectors on a human's post only, never on another run's or the platform's post through the shared bot account, nor on the bot's own. `author` stays the display text. Human time tracking maps a person by it ([TIME-TRACKING.md](./TIME-TRACKING.md#people)). Absent on older records, which parse unchanged. |
 | `kind` | str | `message`, `note`, `milestone`, `question`, `answer`, `close`, `command`. An unknown kind is stored, fanned out and rendered as plain text labelled with the kind. |
 | `text` | str | Body. Caps enforced on post: question 8192, note 4096, milestone 1000, message/answer 16384, close 500, command 4096 characters. |
 | `in_reply_to` | str? | An `id` on the same session. Required on `answer` and `close`; optional on `message`. |
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
 | `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
-| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, and `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6). |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), `session_origin` on a session's own record posted for it, `off_thread` on a question it keeps off the chat threads and on every answer or close to one (§6), and `authority` on an assistant record the daemon stamped with its delegated level (§4). Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. The platform daemon stamps `credential` (`operator` or `connector`) on a record it posts through its API with that credential and drops a caller's own copy; a session's post cannot carry it onto a human channel, because the supervisor refuses a session post on any channel but `agent`. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included, `operator_only: true` on a question the agent asked with `lmer-signal ask --operator-only` (§6), and `poster` on a record a Slack or Matrix connector relayed: `human`, `bot`, or the `thread_posts` origin (`session` for another lmer run, `platform` for the daemon's post button). Only a connector can post on its channel, so `work decisions` reads a thread post as a human's only with `poster: human` (#674). |
 
 ### Kinds
 
@@ -214,7 +215,7 @@ environment is readable from any shell in it (`/proc/1/environ`, same user).
 ### `POST /messages` — post a record
 
 ```
-body: {kind, text?, source: {channel, author?, ref?}, in_reply_to?, option?, options?, attachments?, meta?}
+body: {kind, text?, source: {channel, author?, ref?, author_id?}, in_reply_to?, option?, options?, attachments?, meta?}
 200:  {"message": <record>, "accepted_as": "new" | "duplicate" | "late", "relay": {...} | null}
 400:  {"detail": "<why>"}  — empty text, over a cap, unknown in_reply_to, kind/channel
       mismatch, an out-of-range `option`, `option` on a kind other than `answer`,
@@ -229,8 +230,9 @@ and on a `close`.
 - A post naming no `source.channel` is taken as the agent's own (`agent`).
   The agent may post `message`, `note`, `milestone`, `question`, `close`.
 - **403** when a post made with the session's own token claims any other
-  channel, or an author: the source is stamped by the party that vouches for
-  it, and the session vouches for nobody but itself.
+  channel, an author or an `author_id`: the source is stamped by the party that
+  vouches for it, and the session vouches for nobody but itself. `author_id` is
+  set by the holder of the control token, which is how a connector posts.
 - **`duplicate`**: a record with the same `(source.channel, source.ref)` is
   already stored. The stored record is returned; nothing is appended or
   relayed. This is what makes a connector's retry after a timeout safe.
@@ -342,6 +344,9 @@ traffic. It reads no file a container wrote.
 | the shared secret | `platform` | body `author`, else `operator` |
 | the assistant's minted credential | `uber-lmer` | none |
 | a connector credential | the channel bound to it | body `author` |
+
+No daemon route sets `source.author_id`; only a connector posting to the
+supervisor directly does (§1).
 
 `lmer platform connector add <name> --channel <channel>` mints a connector
 credential (printed once, stored owner-only under `<platform state>/connectors/`);
@@ -534,6 +539,28 @@ Removing the position from the run-chat read path is issue 419; a client that ne
 a shift can withdraw, replace and insert as well as append. Until then the pane's
 window is also unbounded — it grows as the session runs — which is the same issue.
 
+### Who said a turn
+
+Each bus turn on the messages route carries `party`, derived from the record's
+stamped provenance and never from its text. The pane draws only `operator`
+on the right, on the operator's ground.
+
+| `party` | Records | Drawn |
+|---|---|---|
+| `operator` | channel `platform` with an author and no platform ref; a connector channel with `meta.poster` `human`, or `slack`/`matrix` with no poster (written before connectors stamped it); `terminal` | right, operator ground |
+| `agent` | the session's own records (`agent`, or `session_origin`) | left, agent ground |
+| `ratchet` | channel `uber-lmer` | left, agent ground, Ratchet's name |
+| `peer` | channel `peer-ul` | left, peer ground, "from Ratchet · project"; the sending project's hue while **Tint my messages** is on (`peer.project_color`) |
+| `platform` | channel `supervisor`; `platform` with no author; `connector_health` and `connector_status` notes on a connector channel; `command` and `digest` records; refs `rotate-request:*` and `reference:*` | left, action ground, "lmer platform" (a command keeps its sender's name) |
+| `relay` | a connector channel with a poster other than `human` (a bot, another run, the platform), or another bridge's channel with no poster | left, relay ground |
+
+A transcript turn has no `party` and is drawn by its role. Some inbound turns
+cannot be told apart from the operator's, and are still drawn as the
+operator's: a connector supervisor's status note written before it carried
+`connector_status`, a command copy typed without a tag, the terminal mirror, an answer
+taken from an ask directory before the bus, a launch or resume prompt, untagged
+`/input`, and a relay copy older than the bus read window.
+
 ### What a turn is, and what each view draws
 
 A **turn** is one harness response cycle. It starts when an input lands — an
@@ -550,7 +577,7 @@ prose blocks in the file, 132 served, and a time-ordered replay of the pane's
 polling delivered all 491 served turns once each.
 
 The Ratchet pane has two views, chosen by the **Show Ratchet's working
-transcript** switch in its settings dialog — `chat_show_transcript` on
+transcript** switch under Platform settings → Chat and display — `chat_show_transcript` on
 `GET`/`POST /api/assistant/config`, stored in `config.json`, applied on the pane's
 next config refresh in every browser. The run chat keeps its older rendering
 (spoken turns, the harness's internals behind a button) and is not in this table.
@@ -848,6 +875,12 @@ what they refuse. A session whose host side is a shell `lmer` process is
 refused by name: that process takes its threads as launch arguments and cannot
 change them while it runs.
 
+An accepted answer that `ask`, `wait` or `close` hands back is also
+recorded in the run, with who answered and at what authority, through
+`work decision --ref` ([RUN-STATE.md](RUN-STATE.md), "Decisions"). Recording
+is best effort: a failure is one line on stderr, and stdout and the exit code
+are unchanged.
+
 Exit codes: `0` posted/answered/closed/listed · `1` a real error · `2`
 waited, no answer yet (the question is open; `lmer-signal wait <id>`
 resumes) · `3` no channel (no control plane in the environment, or a
@@ -933,8 +966,8 @@ The daemon also stamps `LMER_SESSION_KIND` from the session kind it owns.
 For posts authenticated with the session credential, the supervisor uses that
 launch identity to stamp its own outgoing records as `uber-lmer`, rendered
 `[Ratchet]`; workers remain `agent`.
-The session credential still may claim only `agent`, may not name an author,
-may not post commands, and may not ack. The supervisor sets
+The session credential still may claim only `agent`, may not name an author
+or an `author_id`, may not post commands, and may not ack. The supervisor sets
 `meta.session_origin` on its own assistant records, discarding any caller's
 value; this prevents self-relay and keeps the chat pane's reply on the assistant
 side. It also counts those records against the existing agent caps. A human
@@ -985,11 +1018,14 @@ is never blindly replayed. The connector runs until stopped:
   original option. `post_thread` and `open_thread` scrub the same way on both
   transports. Direct messages to a person are not scrubbed (tracked separately);
 - **inbound**: Slack polls `conversations.replies` every
-  `LMER_SLACK_POLL_SECONDS` (default 3); matrix `/sync`s with a filter on the
+  `LMER_SLACK_POLL_SECONDS` (default 3) while the thread is active, slowing to
+  `LMER_SLACK_IDLE_POLL_SECONDS` (default 30) when it is quiet (see "The
+  `conversations.replies` budget" below); matrix `/sync`s with a filter on the
   one room. Each new human message — and each post another run or the platform
   made, below — becomes `POST /messages` with `source
   {channel, author, ref}` — the Slack display name (from `users.info`) or the
-  MXID, and the message's own `ts` / `event_id`. While the session has an open
+  MXID, and the message's own `ts` / `event_id` — plus, on a human's message
+  only, `author_id`: the Slack user id or the sender's MXID. While the session has an open
   question the message is an `answer` to the oldest one, and a reply that is
   exactly an option's number or text is that option, and the rest of §6's
   binding rule decides whether anything else does; otherwise it is a
@@ -999,7 +1035,23 @@ is never blindly replayed. The connector runs until stopped:
 - **files**: a file in a live thread message is downloaded into the session's upload
   store — capped at the same size a read of a thread copies in — and the record
   names it with the `[lmer upload] <path> (<type>, <size>)` reference #246
-  defines. The agent's `--attach` goes the other way, under one set of rules
+  defines. A file that does not come in is never dropped: the record's text
+  carries a line for it, with the reasons listed under §12's thread reads. On
+  Slack it is the line `lmer-signal read` prints,
+  `📎 <name> (<type>, <size> B) — not copied in: <reason>`. On Matrix it is
+  `[m.image <name> — not stored: <reason>]`. Downloading a Slack file needs the
+  **`files:read`** scope. The connector reads the token's scopes from the
+  `auth.test` it already makes, and the Slack listener from the `auth.test` it
+  makes at startup. When `files:read` is missing, the thread's connect
+  announcement says that files posted in the thread will not reach the session:
+  the connector's attach notice, or, for a session the listener spawned (whose
+  connector runs with the attach notice off), the listener's own announcement.
+  It names neither the app nor the scope, because people outside the team may
+  read the thread. Each fetch is still tried, because the scopes are read only once and a
+  scope granted since then must take effect. A fetch that Slack refuses (an HTTP
+  error, a web page, or bytes other than the file) then names the scope in its
+  line. Scopes that Slack did not
+  report are *not knowing*. The agent's `--attach` goes the other way, under one set of rules
   for both transports and both doors (the connector and `post --thread`). The
   message text names each file (`📎 <name>`). Each file then follows as its own
   thread item, either uploaded or replaced by a
@@ -1112,7 +1164,23 @@ class from its durable checkpoint. Recovery clears that status after a successfu
 iteration. The existing consecutive-failure limit can restart a persistently
 failing connector; its checkpoint retains cursors and pending delivery identity.
 Routine retry/recovery notes retain `connector_health` metadata and do not wake
-project assistants (#512).
+project assistants (#512). The chat hears of a failure only once delivery has
+failed for 60 seconds with no success in between, and a "recovered" note only
+follows a posted failing note. A recovery the bus refuses is posted again on
+the next success, and only an accepted one starts the cooldown: after a
+recovery, a new failure stays out of the chat for five minutes, so a flapping
+connector reads as one incident. Both notes carry `meta.direction` and
+`meta.connector_state` (`failing` or `recovered`). A connector that gives up
+posts no health note of its own: a direct connector's supervisor posts
+"connector exited (…)" (class `connector_status`, which does reach project
+assistants), and a platform-owned connector's give-up shows in the connectors
+panel. Notes from connectors older than this rule carry no `connector_state`;
+on read, such a failing note whose recovery on the same channel and direction
+came within 60 seconds is served with `blip: true` along with that recovery,
+and the pane does not draw either. They stay in place, so positions a live pane
+polls by never move, and a note a pane drew before its recovery arrived stays
+drawn until the pane reloads. The journal keeps both. Stamped notes are never
+blips.
 
 **Limits stated plainly.** The matrix connector speaks the client-server API
 as a bot account. It handles an end-to-end encrypted room only when it acts as
@@ -1128,6 +1196,42 @@ The matrix chat connector is not the fleet bridge (`lmer-matrix-bridge`,
 `docs/MATRIX-CHAT.md`), which announces runs wanting a human into one room per
 orchestrator as an appservice. The two coexist; the connector reuses the
 bridge's scrub and, in an encrypted room, the bridge's device.
+
+### The `conversations.replies` budget
+
+Slack rate-limits each method per app and workspace, so everything holding the
+one bot token draws on one `conversations.replies` budget. Slack documents the
+method as Tier 3, about 50 calls a minute, for internal apps. The callers:
+
+| Caller | Process | Rate | On a 429 |
+|---|---|---|---|
+| Each live Slack connector | its own | one call every `LMER_SLACK_POLL_SECONDS` (3 s) while the thread is active, up to 20 a minute | sleeps `Retry-After`, up to 3 retries |
+| `lmer-signal read` / `lmer-ctl thread read`, and resolving a link to post or open | the servicer: the daemon, or a host `lmer` | one call per page of the thread, per read | sleeps `Retry-After`, up to 3 retries |
+| A launch's held-thread check (below) | the daemon | one call per attempt, for the thread's first message only | the check refuses at once; `POST /api/sessions` answers 503 `thread_check_rate_limited` with `Retry-After` and `lmer-ctl spawn` resends, up to 4 attempts within 30 s |
+| A live connect | the daemon | one call per page | no retry; connects with the link as given |
+| `receipt`, recovering a connector's uncertain post ([CONNECTOR-RECOVERY.md](CONNECTOR-RECOVERY.md)) | the daemon | one whole-thread read per recovery | no retry |
+| `lmer-slack history`, `poll` and `watch` | the caller's | one call per read; `poll` and `watch` repeat every `--interval` (5 s) | sleeps `Retry-After`, up to 3 retries |
+
+Mention ingress uses `conversations.history`, not this method.
+
+Three connectors on active threads reach Slack's figure on their own. Their
+retries are silent, so the limit can be real while nobody is reading by hand,
+and a one-shot caller is the one that sees the 429. A connector therefore slows
+down once its thread has been quiet for two minutes. It doubles its interval
+on each poll that finds nothing, up to `LMER_SLACK_IDLE_POLL_SECONDS` (30 s).
+It returns to the fast interval once a poll finds a new message, or once the
+connector posts into the thread itself. A wait already under way is not cut
+short, so after a quiet spell the first reply can take up to the idle interval
+to arrive. A setting at or below `LMER_SLACK_POLL_SECONDS` turns this off.
+Either interval is at most 300 s. One shared poll per bot token instead of one
+per connector is #687.
+
+A launch refused because Slack would not answer says how much of the budget
+this daemon is spending. It gives the `conversations.replies` calls made from
+the daemon's own process in the last 60 s, measured, and the number of live
+Slack connectors it runs with their configured interval, which is configured
+rather than measured, since each polls from a process of its own. A host `lmer`
+on the same token appears in neither figure.
 
 ### Posts from other runs, and from the platform
 
@@ -1288,7 +1392,14 @@ lmer-ctl threads connect SESSION THREAD_PERMALINK
 lmer-ctl threads open SESSION CHANNEL [--title "…"]
 lmer-ctl threads disconnect SESSION THREAD_ID
 lmer-ctl threads recover SESSION THREAD_ID inspect
+lmer-ctl threads release THREAD_PERMALINK [--to PROJECT] [--reason "…"]
 ```
+
+`threads release` is project-scoped rather than session-scoped. It gives up the
+calling project's ownership claim on a thread, usually one a mention gave it, and
+can hand the thread to another project. It refuses while any session holds the
+thread, so disconnect first. See
+[Releasing or handing off a thread claim](PROJECTS.md#releasing-or-handing-off-a-thread-claim).
 
 The daemon automatically settles saved receipts and permits one safe recovery
 retry. Unknown send outcomes remain parked, with one assistant digest per
@@ -1424,9 +1535,13 @@ noise.
 live-connect route's. A spawn whose launch `targets` name a thread another live
 run holds — `POST /api/sessions`, `lmer-ctl spawn --target-thread` — is refused
 **409** naming that run, before a command line is built, a control port drawn or
-a directory made: no session starts and the thread is posted nothing. The same
-409 answers an **explicit** `threads` override on `POST /api/assistant/start` or
-`/rotate`, and `lmer-ctl` relays status and text to the agent that asked. What
+a directory made: no session starts and the thread is posted nothing. When
+the transport rate limited the check, the answer is a **503** with
+`Retry-After` and `detail.code` `thread_check_rate_limited` instead, and
+`lmer-ctl spawn` sends the launch again (see the held-thread check below). The
+same 409 answers an **explicit** `threads` override on
+`POST /api/assistant/start` or `/rotate`, and `lmer-ctl` relays status and text
+to the agent that asked. What
 does *not* refuse is Ratchet's **standing** `threads` list: a worker can take
 one of those threads during the seconds a rotation is between incarnations, and
 an orchestrator that will not come back up over one thread is worse than one
@@ -1476,16 +1591,45 @@ record's identity as it stands, so a rotation reads no history from Slack for it
 on a 2,000-message thread that read was what a 429 refused for seven hours, while
 posts to the same thread went through. (The successor's launch adoption still
 resolves its targets best-effort, as every launch does; a failure there only
-logs.) Any other named thread must still resolve, and a failure refuses the
-launch with a message naming the method (`conversations.replies`, or the matrix
-alias lookup) and the error. When the transport said "not now" (an HTTP 429 or
-5xx, or no answer at all) rather than "no", the message adds the wait a 429 asked
-for (Slack's `Retry-After`, matrix's `retry_after_ms`) or says that none was
-given. A definite answer without a status, such as an alias that names no room,
-is not "not now". Reused records
-include ones a launch adopted best-effort, and the check on them cannot see
-another live session holding the same conversation under a different spelling
-(a reply link rather than its root, an alias rather than the `!room` id).
+logs.) Any other named thread must still resolve. For Slack that is one
+`conversations.replies` call for the thread's first message, not a read of the
+thread. The check runs under the daemon's launch lock and never sleeps there,
+for a matrix 429 included.
+
+Only a rate limit is waited out: a 429 that says how long (Slack's
+`Retry-After`, matrix's `retry_after_ms`). The wait is at least 1 s, a spawn
+makes at most 4 attempts within 30 s, and a wait that would not end inside the
+30 s is not started. Where the wait happens depends on who holds what:
+
+- `POST /api/sessions` runs inside the daemon's project operation, which every
+  other change waits on, so the daemon does not wait. It answers **503 with
+  `Retry-After`** and a `detail` of `{code: "thread_check_rate_limited",
+  message, retryable: true}`, the shape of the daemon's `state_busy` 503.
+  `lmer-ctl spawn` waits that long and sends the launch again, for that code
+  only: a `state_busy` 503 on the same route can follow a launch that already
+  happened, so it is reported, not resent. Each resend is a new request whose
+  checks all run again. When it gives
+  up, `lmer-ctl` prints the last refusal with `attempts` and `elapsed_seconds`
+  beside its `status`. The web UI and other HTTP callers get the 503 and decide
+  for themselves. A request's action receipt records the refusal as made before
+  any effect, so a resend under the same `X-Lmer-Request-ID` is not refused as
+  uncertain.
+- `lmer platform spawn` holds no project operation. It waits in the daemon
+  process, with the launch lock released, and runs all its checks again.
+- The assistant's start and rotation do not wait, and neither do a resume or an
+  answer, whose routes hold the project operation too.
+
+A failure refuses the launch with a message naming the method
+(`conversations.replies`, or the matrix alias lookup) and the error. When the
+transport said "not now" (an HTTP 429 or 5xx, or no answer at all) rather than
+"no", the message adds the wait a 429 asked for (Slack's `Retry-After`,
+matrix's `retry_after_ms`) or says that none was given. For Slack it also adds
+the call volume described under "The `conversations.replies` budget". A
+definite answer without a status, such as an alias that names no room, is not
+"not now". Reused records include ones a launch adopted best-effort, and the
+check on them cannot see another live session holding the same conversation
+under a different spelling (a reply link rather than its root, an alias rather
+than the `!room` id).
 
 **Where the connectors run.** For a session the platform spawned — Ratchet
 included — the **daemon** runs them, one process per connection, with the
@@ -1658,7 +1802,8 @@ ask-directory readers and the steering form of `POST /api/sessions/{id}/input`.
 | `LMER_COMMS_TERMINAL_MIRROR` | container, bool (default on) | the terminal line tracker |
 | `LMER_CHAT_CHANNEL` | container, set by a chat-thread target handler | `slack` or `matrix`; arms the reply guard and the chat taskdef |
 | `SLACK_BOT_TOKEN` | host (the `lmer` process, the listener) | the Slack bot; required for a Slack thread target, never forwarded into the container |
-| `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval (default 3) |
+| `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval while its thread is active (default 3) |
+| `LMER_SLACK_IDLE_POLL_SECONDS` | host | the slowest a quiet thread is polled (default 30, at most 300); at or below `LMER_SLACK_POLL_SECONDS`, polling never slows |
 | `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID`, `LMER_MATRIX_ACCESS_TOKEN` | host | the bot account the matrix connector and listener act as; required for a matrix thread target, never forwarded |
 | `LMER_MATRIX_BRIDGE_URL` | host | where `lmer-matrix-bridge`'s listener is reached from this host; lets the connector and thread verbs work in encrypted rooms through the bridge's device, acting as its appservice user; never forwarded |
 | `LMER_MATRIX_AUTHENTICATED_MEDIA` | host, bool | the operator's assertion that the homeserver requires authentication for media; the agent's attachments are withheld until set |
@@ -1900,6 +2045,35 @@ bounded (25 MiB) and so is a whole read (100 MiB), counted as the bytes arrive
 rather than after they are resident — the files are posted by whoever is in the
 thread, and on the platform route the process fetching them serves the fleet. A
 description that could not become a copy says which of those reasons it was.
+A fetch that failed tells its failures apart with fixed phrases. It never quotes
+the error, which carries the file's URL: over the size this copies in;
+`Slack answered HTTP <status>` or `the homeserver answered HTTP <status>`; the
+download timed out; the download was cut off (Matrix); the homeserver could not
+be reached; `lmer-matrix-bridge answered HTTP <status>`; lmer-matrix-bridge
+could not be reached (no status at all); an encrypted Matrix file that could
+not be decrypted; the kind of any other transport failure
+(`ConnectionError`, `SSLError`); and, on a connected Slack thread only, the
+missing `files:read` scope (§9). A read makes no `auth.test`, so it shows Slack's
+own answer instead.
+
+A Slack answer that is not the file that was posted is not staged. Two checks
+decide, in this order:
+
+- An answer labelled `text/html` is refused as a web page unless Slack declared
+  the file as HTML.
+- When Slack declares the file as PNG, JPEG, GIF, WebP or PDF, the first bytes
+  must carry one of those signatures, however the answer is labelled (no label,
+  `application/octet-stream`, the declared type). It need not be the declared
+  one: Slack's mimetype can name a different image format than the bytes, and
+  that is still the file, so JPEG bytes declared as `image/png` are staged.
+  Bytes with no known signature (an HTML or JSON error body) are refused. The
+  line says Slack answered with a web page instead of the file when they start
+  with markup, and with something other than the file when they do not.
+
+For any other declared type the bytes have no signature to check, so only the
+label can show that a page came back. Both types are compared without
+parameters or case. The full error stays in the host log, on the
+`thread_read_file_failed` line.
 
 `meta.thread` on a record is the one field the pane turns into a link, so the
 daemon drops it unless it parses as a thread permalink — the marker still renders

@@ -131,6 +131,7 @@ from work_repo import run_state
 from . import assistant, meta, transcripts
 from .config import DEFAULT_STALL_BACKSTOP_SECONDS, DEFAULT_STALL_IDLE_SECONDS
 from .lifecycle import VERB_WIND_DOWN
+from .mr_activity import REVIEW_NOTE_EVENT, REVIEW_POSTED_EVENT
 from .reattach import OUTPUT_CONTROL_PLANE, OUTPUT_SESSION_LOG, detached_record
 from .registry import is_live
 from .runs import UID_RE, RunIndexError, key_parts, run_key, run_key_of_entry
@@ -353,6 +354,16 @@ class RunView:
     session: Optional[dict] = None
     ledger: Optional[dict] = None
     events: list = field(default_factory=list)
+    #: When the run last recorded ``review_posted`` in ``events.jsonl``, or
+    #: ``None``. Read from the whole log rather than :attr:`events`, which keeps
+    #: only the last few: the check-in digest compares the run's MR against it
+    #: (:mod:`lmer_platform.mr_activity`, #401).
+    review_posted_at: Optional[str] = None
+    #: The GitLab note ids this run's review sessions wrote to its MR, oldest
+    #: first, from its ``review_note`` events (recorded by ``gitlab-review``,
+    #: :mod:`gitlab_reviewer.review_notes`). The reviewer replies after posting;
+    #: a comment among these is its own, never its author's (#401 F3).
+    review_note_ids: list = field(default_factory=list)
     #: Questions the run's *live* session is waiting on, oldest first, from its
     #: ask channel (:mod:`lmer_platform.ask`). Carried on the row rather than
     #: fetched per run by the client, because the fleet view is polled from a
@@ -574,6 +585,8 @@ class RunView:
             "last_session_id": self.session_id_for_history,
             "ledger": self.ledger,
             "events": self.events,
+            "review_posted_at": self.review_posted_at,
+            "review_note_ids": self.review_note_ids,
             "ports": self.ports,
             "questions": self.questions,
             # Beside the session block rather than inside it: SESSION_FIELDS
@@ -735,13 +748,38 @@ def _ledger_summary(ref: RunDirRef) -> Optional[dict]:
         return None
 
 
-def _recent_events(ref: RunDirRef, last_n: int) -> list:
-    if last_n <= 0:
-        return []
+def _all_events(ref: RunDirRef) -> list:
     try:
-        return run_state.read_events(ref.path, last_n=last_n)
+        return run_state.read_events(ref.path, last_n=0)
     except OSError:
         return []
+
+
+def _recent_events(events: list, last_n: int) -> list:
+    return events[-last_n:] if last_n > 0 else []
+
+
+def _review_times(events: list) -> tuple:
+    """``(review_posted_at, review_note_ids)`` from a run's whole event log.
+
+    The ``ts`` of the latest ``review_posted`` (``None`` without one, or when it
+    has no usable ``ts``), and every integer ``data.note_id`` of a
+    ``review_note`` event, in log order and without repeats.
+    """
+    posted = None
+    note_ids: list = []
+    for event in events:
+        kind = event.get("type")
+        if kind == REVIEW_POSTED_EVENT:
+            ts = event.get("ts")
+            posted = ts if isinstance(ts, str) and ts else None
+        elif kind == REVIEW_NOTE_EVENT:
+            data = event.get("data")
+            note_id = data.get("note_id") if isinstance(data, dict) else None
+            if isinstance(note_id, int) and not isinstance(note_id, bool) \
+                    and note_id not in note_ids:
+                note_ids.append(note_id)
+    return posted, note_ids
 
 
 def _session_key(entry: dict) -> Optional[tuple]:
@@ -1199,6 +1237,8 @@ def _view_from_run_dir(
         state, session, unreadable=error, questions=questions, stall=stall
     )
     state = state or {}
+    events = _all_events(ref)
+    review_posted_at, review_note_ids = _review_times(events)
     return RunView(
         questions=list(questions or []),
         statusline=statusline,
@@ -1221,7 +1261,9 @@ def _view_from_run_dir(
         attention=attention,
         session=session,
         ledger=_ledger_summary(ref),
-        events=_recent_events(ref, event_count),
+        events=_recent_events(events, event_count),
+        review_posted_at=review_posted_at,
+        review_note_ids=review_note_ids,
     )
 
 
